@@ -29,7 +29,9 @@ fn main() -> anyhow::Result<()> {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(async {
                 let engine = komet_engine::Engine::new(komet_engine::EngineConfig {
-                    data_dir: dirs_data_dir(),
+                    data_dir: std::env::var_os("KOMET_DATA_DIR")
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_else(dirs_data_dir),
                     edge_url: std::env::var("KOMET_EDGE_URL")
                         .unwrap_or_else(|_| "http://localhost:26640".into()),
                     // TODO(M4): real auth; until then an explicit token enables sync.
@@ -44,8 +46,21 @@ fn main() -> anyhow::Result<()> {
             })
         }
         None => {
-            // TODO(M3): connect-or-embed engine before opening the window.
-            komet_ui::run_app();
+            // Headed: the UI probes KOMET_IPC_PORT and connects to a running
+            // daemon, or embeds the engine in-process (ARCHITECTURE §1).
+            komet_ui::run_app(komet_ui::UiConfig {
+                data_dir: std::env::var_os("KOMET_DATA_DIR")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(dirs_data_dir),
+                ipc_port: std::env::var("KOMET_IPC_PORT")
+                    .ok()
+                    .and_then(|p| p.parse().ok())
+                    .unwrap_or(26654),
+                edge_url: std::env::var("KOMET_EDGE_URL")
+                    .unwrap_or_else(|_| "http://localhost:26640".into()),
+                edge_token: std::env::var("KOMET_EDGE_TOKEN").ok(),
+                default_harness: komet_ui::HarnessId::ClaudeCode,
+            });
             Ok(())
         }
     }
