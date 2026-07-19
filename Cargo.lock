@@ -1113,6 +1113,7 @@ name = "komet-engine"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chrono",
  "komet-doc",
  "komet-harness",
@@ -1120,6 +1121,7 @@ dependencies = [
  "komet-rpc",
  "komet-sync",
  "futures",
+ "loro",
  "notify",
  "portable-pty",
  "reqwest",
@@ -1127,6 +1129,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "thiserror 2.0.19",
  "tokio",
  "tracing",
@@ -1141,11 +1144,14 @@ dependencies = [
  "async-trait",
  "komet-proto",
  "futures",
+ "libc",
  "serde",
  "serde_json",
  "thiserror 2.0.19",
  "tokio",
+ "tokio-util",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -1163,6 +1169,7 @@ name = "komet-rpc"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "komet-proto",
  "futures",
  "serde",
