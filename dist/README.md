@@ -1,0 +1,52 @@
+# Packaging
+
+## Linux (implemented)
+
+```sh
+scripts/package-linux.sh            # release build (thin LTO, stripped)
+PROFILE=debug scripts/package-linux.sh   # fast smoke package
+```
+
+Produces `target/package/komet-<version>-linux-<arch>.tar.gz` containing:
+
+- `komet` — the binary (headed by default; `komet headless` runs the engine alone)
+- `komet.desktop` — XDG desktop entry
+- `komet.png` — 256×256 placeholder icon (replace before shipping)
+- `install.sh` — installs into `~/.local/{bin,share/applications,share/icons}`
+
+The release profile in the root `Cargo.toml` sets `lto = "thin"` and
+`strip = "symbols"` for distribution builds.
+
+## macOS (config only — not yet executed)
+
+The `dist/macos/Info.plist` template is ready; the bundling steps, to be run on a
+macOS host (gpui needs Metal; no cross-build from Linux):
+
+1. Build the universal (or per-arch) binary:
+   ```sh
+   cargo build --release -p komet --target aarch64-apple-darwin
+   cargo build --release -p komet --target x86_64-apple-darwin
+   lipo -create -output komet \
+     target/aarch64-apple-darwin/release/komet \
+     target/x86_64-apple-darwin/release/komet
+   ```
+2. Assemble the bundle:
+   ```sh
+   mkdir -p Komet.app/Contents/{MacOS,Resources}
+   cp komet Komet.app/Contents/MacOS/komet
+   sed "s/__VERSION__/$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')/" \
+     dist/macos/Info.plist > Komet.app/Contents/Info.plist
+   ```
+3. Icon: generate `komet.icns` from `dist/komet.png` (`iconutil`) and place it at
+   `Komet.app/Contents/Resources/komet.icns`:
+   ```sh
+   mkdir komet.iconset && sips -z 256 256 dist/komet.png --out komet.iconset/icon_256x256.png
+   iconutil -c icns komet.iconset -o Komet.app/Contents/Resources/komet.icns
+   ```
+4. Sign + notarize (required for distribution):
+   ```sh
+   codesign --deep --force --options runtime --sign "Developer ID Application: …" Komet.app
+   xcrun notarytool submit Komet.zip --keychain-profile … --wait
+   xcrun stapler staple Komet.app
+   ```
+5. Ship as a `.dmg` (`hdiutil create -volname Komet -srcfolder Komet.app -ov -format UDZO Komet.dmg`).
