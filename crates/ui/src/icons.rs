@@ -98,6 +98,7 @@ icon_assets![
     (CLOSE, "close"),
     (STOP, "stop"),
     (CHECK, "check"),
+    (COPY, "copy"),
     (KOMET_LOGO, "komet-logo"),
     // Harness brand marks (icons.tsx).
     (CLAUDE_MARK, "claude-mark"),
