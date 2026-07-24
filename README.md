@@ -69,8 +69,29 @@ curl -fsSL https://komet.komet.sh/install.sh | sh
 Installs the self-contained binary to `~/.komet-native/app`, links `komet` into
 `~/.local/bin`, and sets up a systemd user service. Production endpoints
 (`https://edge.komet.komet.sh` + WorkOS auth) are baked in — no configuration
-needed. First run `komet headless` to sign in (paste-code flow), then
+needed. Sign in with `komet login` (paste-code flow), then
 `systemctl --user start komet-native`.
+
+## Auth & daemon CLI
+
+Authentication is decoupled from the long-running engine: `komet login` runs the
+paste-code sign-in + workspace onboarding, persists `~/.komet-native/session.json`
+(0600), and exits. A service-managed `komet headless` loads that session — off a
+TTY it exits with "run `komet login` first" instead of waiting on a prompt.
+
+```bash
+komet login       # sign in, persist the session, exit
+komet logout      # remove the saved session
+komet status      # auth + engine liveness; exits nonzero when sign-in is needed
+
+komet daemon install    # install + enable + start (launchd on macOS, systemd --user on Linux)
+komet daemon start|stop|restart|status|uninstall
+```
+
+`komet daemon install` captures the current `KOMET_*` env (and `PATH`, for the
+harness CLIs) into the unit, and manages the same `komet-native.service` the
+installer creates on Linux. While an engine is running it owns the session
+(refresh tokens rotate), so `login`/`logout` refuse until it is stopped.
 
 ## Run (from source)
 

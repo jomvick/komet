@@ -62,8 +62,9 @@ mkdir -p "$HOME/.local/bin"
 ln -sf "$app_root/current/komet" "$HOME/.local/bin/komet"
 
 # --- service -----------------------------------------------------------------
-# The engine holds an exclusive data-dir lock, so the service starts only after
-# first sign-in (`komet headless` prompts the paste-code flow on a TTY).
+# Auth is decoupled from the daemon: `komet login` persists the session and a
+# service-managed `komet headless` loads it (exiting with "run komet login
+# first" otherwise) — so the service starts only after first sign-in.
 signed_in=no
 [ -f "$data_root/session.json" ] && signed_in=yes
 
@@ -74,11 +75,13 @@ if command -v systemctl >/dev/null 2>&1 && [ -n "${XDG_RUNTIME_DIR:-}" ]; then
 [Unit]
 Description=Komet native headless engine
 After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 ExecStart=%h/.komet-native/app/current/komet headless
-Restart=always
-RestartSec=2
+Restart=on-failure
+RestartSec=5
 EnvironmentFile=-%h/.komet-native/env
 
 [Install]
@@ -119,10 +122,10 @@ case "$service" in
     ;;
   ready)
     echo "next steps:"
-    echo "  komet headless                           first run prompts sign-in (paste-code)"
-    echo "  then Ctrl-C and:  systemctl --user start komet-native"
+    echo "  komet login                              sign in (paste-code) and exit"
+    echo "  systemctl --user start komet-native      then start the engine"
     ;;
   manual)
-    echo "next: run \`komet headless\` — the first run prompts sign-in."
+    echo "next: \`komet login\` to sign in, then run the engine with \`komet headless\`."
     ;;
 esac
