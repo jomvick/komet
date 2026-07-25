@@ -240,7 +240,10 @@ final class SessionStore {
     var openInputRequest: (entryId: String, requestId: String, questions: [UserInputQuestion])? {
         for entry in entries.reversed() {
             for part in entry.parts.reversed() {
-                if case .input(_, let requestId, let questions, let resolved) = part, !resolved {
+                // An empty question list can't be answered, so it must not take
+                // the composer's place — leaving the user with no way to type.
+                if case .input(_, let requestId, let questions, let resolved) = part,
+                   !resolved, !questions.isEmpty {
                     return (entry.id, requestId, questions)
                 }
             }

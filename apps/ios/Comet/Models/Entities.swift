@@ -143,16 +143,15 @@ enum MessageStatus: String {
     case streaming, complete, aborted
 }
 
-struct UserInputOption: Hashable, Codable {
-    var label: String
-    var description: String?
-}
-
 struct UserInputQuestion: Hashable, Codable {
     var id: String
     var header: String
     var question: String
-    var options: [UserInputOption]
+    /// Plain labels — `proto::agent::UserInputQuestion.options` is a
+    /// `Vec<String>`. This was modelled as `{label, description}` objects,
+    /// which NEVER decoded: every question arrived empty, so the panel had no
+    /// options to show and an unresolved request crashed the app.
+    var options: [String]
     var multiSelect: Bool?
 }
 

@@ -176,7 +176,17 @@ struct QuestionPanel: View {
     @State private var autoAdvanceTask: Task<Void, Never>?
 
     var body: some View {
-        let question = questions[min(page, questions.count - 1)]
+        // `questions[min(page, count - 1)]` traps on an empty list (count - 1
+        // is -1). A request whose questions fail to decode reaches here empty,
+        // so this crashed the app on any session holding one.
+        if questions.isEmpty {
+            EmptyView()
+        } else {
+            panel(for: questions[min(max(page, 0), questions.count - 1)])
+        }
+    }
+
+    private func panel(for question: UserInputQuestion) -> some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
                 Text(question.header.uppercased())
@@ -250,24 +260,18 @@ struct QuestionPanel: View {
         .transition(.opacity)
     }
 
-    private func optionRow(question: UserInputQuestion, ix: Int, option: UserInputOption) -> some View {
+    private func optionRow(question: UserInputQuestion, ix: Int, option: String) -> some View {
         let isPicked = (typed[question.id] ?? "").isEmpty
-            && picked[question.id, default: []].contains(option.label)
+            && picked[question.id, default: []].contains(option)
         return Button {
             pick(question: question, option: option)
         } label: {
             HStack(spacing: 10) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(option.label)
+                    Text(option)
                         .font(Theme.sans(13.5, weight: .medium))
                         .foregroundStyle(Theme.text)
                         .multilineTextAlignment(.leading)
-                    if let description = option.description, !description.isEmpty {
-                        Text(description)
-                            .font(Theme.sans(12))
-                            .foregroundStyle(Theme.textMuted)
-                            .multilineTextAlignment(.leading)
-                    }
                 }
                 Spacer(minLength: 0)
                 if ix < 9 {
@@ -288,14 +292,14 @@ struct QuestionPanel: View {
         .buttonStyle(.plain)
     }
 
-    private func pick(question: UserInputQuestion, option: UserInputOption) {
+    private func pick(question: UserInputQuestion, option: String) {
         typed[question.id] = nil
         if question.multiSelect == true {
             var set = picked[question.id, default: []]
-            if set.contains(option.label) { set.remove(option.label) } else { set.insert(option.label) }
+            if set.contains(option) { set.remove(option) } else { set.insert(option) }
             picked[question.id] = set
         } else {
-            picked[question.id] = [option.label]
+            picked[question.id] = [option]
             // Single-select auto-advances after 220ms (AUTO_ADVANCE_MS).
             autoAdvanceTask?.cancel()
             autoAdvanceTask = Task {
