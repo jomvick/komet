@@ -156,16 +156,23 @@ pub(crate) fn static_models() -> Vec<Model> {
             vec![context_window()],
         ),
         model(
+            "claude-opus-5",
+            "Opus 5",
+            "Powerful model for complex work",
+            FULL_LADDER,
+            vec![context_window(), toggle("fastMode", "Fast Mode")],
+        ),
+        model(
             "claude-opus-4-8",
             "Opus 4.8",
-            "Powerful model for complex work",
+            "Previous generation Opus",
             FULL_LADDER,
             vec![toggle("fastMode", "Fast Mode")],
         ),
         model(
             "claude-opus-4-7",
             "Opus 4.7",
-            "Previous generation Opus",
+            "Older generation Opus",
             XHIGH_LADDER,
             vec![toggle("fastMode", "Fast Mode")],
         ),
@@ -218,6 +225,8 @@ mod tests {
     #[test]
     fn xhigh_family_matching() {
         assert!(supports_xhigh("claude-fable-5"));
+        assert!(supports_xhigh("claude-opus-5"));
+        assert!(supports_xhigh("claude-opus-5[1m]"));
         assert!(supports_xhigh("claude-opus-4-7-20260101"));
         assert!(!supports_xhigh("claude-opus-4-5"));
         assert!(!supports_xhigh("claude-sonnet-4-5"));
