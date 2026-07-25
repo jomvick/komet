@@ -227,6 +227,42 @@ export class SessionRoom implements DurableObject {
       }
       return json({ ok: true });
     }
+    if (url.pathname === "/reset-log" && request.method === "POST") {
+      // WEDGE BREAK: drop the persisted update log + snapshot so the NEXT cold
+      // `ensureDoc` starts from empty instead of replaying a log so large it
+      // exceeds the DO CPU limit and resets before any client can join (which
+      // also blocks the compaction that would have shrunk it — a permanent
+      // wedge). Deliberately does NOT call `ensureDoc`, so it stays cheap
+      // enough to land on an already-wedged DO. State is not lost: every engine
+      // holds the full workspace doc locally and re-uploads it on the next join
+      // (CRDT merge), exactly like the `ws3` fresh-namespace recovery. Presence
+      // is ephemeral and simply re-published. Owner/chatId meta are preserved.
+      if (!workspace) {
+        if (!owner) return json({ error: "not_found" }, 404);
+        if (owner !== userId) return json({ error: "forbidden" }, 403);
+      }
+      const before = [...this.ctx.storage.sql.exec("SELECT COUNT(*) AS n FROM updates")][0]?.n as
+        | number
+        | undefined;
+      this.ctx.storage.sql.exec("DELETE FROM updates");
+      this.blobs.delete("snapshot");
+      this.setMeta("updateBytes", "0");
+      this.setMeta("checkpoints", "[]");
+      this.setMeta("lastTrimAt", "");
+      this.pending = [];
+      this.pendingBytes = 0;
+      this.doc = undefined; // force a fresh (empty) materialization next join
+      // Boot any currently-attached %LOR/%EPH sockets so their hung/half-cold
+      // sessions bail and reconnect into the now-empty doc.
+      for (const sock of this.ctx.getWebSockets()) {
+        try {
+          sock.close(4410, "room reset");
+        } catch {
+          /* already gone */
+        }
+      }
+      return json({ ok: true, clearedUpdateRows: before ?? 0 });
+    }
     return new Response("not found", { status: 404 });
   }
 

@@ -45,6 +45,22 @@ const PRESENCE_INTERVAL_MS: u64 = 15_000;
 const PRESENCE_FRESH_MS: i64 = 45_000;
 /// Debounce window for local snapshot saves after a doc change.
 const SNAPSHOT_DEBOUNCE_MS: u64 = 1_000;
+/// Initial-join retry backoff (base, cap). A first workspace-room join that
+/// fails must not strand the device offline until an app restart — retry until
+/// it lands. Jittered so N devices restarting together don't resynchronize
+/// their retries into a thundering herd on the cold DO.
+const JOIN_RETRY_BASE: std::time::Duration = std::time::Duration::from_millis(500);
+const JOIN_RETRY_CAP: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Cheap decorrelation jitter (0–500ms) without pulling in a rng — derived from
+/// the sub-nanosecond wall clock. Mirrors the device relay's `jitter()`.
+fn join_retry_jitter() -> std::time::Duration {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    std::time::Duration::from_millis(u64::from(nanos) % 500)
+}
 
 #[derive(Debug, Clone)]
 pub struct WorkspaceHostConfig {
@@ -184,32 +200,55 @@ impl WorkspaceHost {
         let device_id = self.inner.config.device_id.clone();
         let weak = Arc::downgrade(&self.inner);
         tokio::spawn(async move {
-            match RoomClient::connect_via(url, &room_id, room_doc).await {
-                Ok(client) => {
-                    client.ephemeral().set(&presence_key(&device_id), now_ms());
-                    let mut events = client.events();
-                    if let Some(inner) = weak.upgrade() {
+            // `RoomClient` only self-reconnects AFTER a first successful join;
+            // an INITIAL failure (a 500 from an overloaded workspace DO, a token
+            // racing a refresh, an edge deploy) used to end this task and leave
+            // the device offline until an app restart — presence stuck "offline"
+            // while the relay and per-chat rooms worked. Retry the first join on
+            // a capped, jittered backoff so a transient edge blip self-heals.
+            let mut backoff = JOIN_RETRY_BASE;
+            loop {
+                if weak.upgrade().is_none() {
+                    return; // host dropped
+                }
+                match RoomClient::connect_via(url.clone(), &room_id, room_doc.clone()).await {
+                    Ok(client) => {
+                        client.ephemeral().set(&presence_key(&device_id), now_ms());
+                        let mut events = client.events();
+                        let Some(inner) = weak.upgrade() else { return };
                         *lock(&inner.room) = Some(client);
                         tracing::info!(room = %room_id, "workspace room joined");
-                    }
-                    // Presence rides `%EPH`, never the doc — remote heartbeats
-                    // must re-publish the device watch themselves (this is the
-                    // signal that distinguishes "host offline" from slow sync).
-                    loop {
-                        match events.recv().await {
-                            Ok(komet_sync::RoomEvent::EphemeralUpdate) => {
-                                let Some(inner) = weak.upgrade() else { break };
-                                inner.publish();
+                        drop(inner);
+                        // Presence rides `%EPH`, never the doc — remote
+                        // heartbeats must re-publish the device watch themselves
+                        // (the signal that distinguishes "host offline" from slow
+                        // sync). This loop ends only when the RoomClient closes
+                        // (host shutdown), which drops us out to a rejoin.
+                        loop {
+                            match events.recv().await {
+                                Ok(komet_sync::RoomEvent::EphemeralUpdate) => {
+                                    let Some(inner) = weak.upgrade() else { return };
+                                    inner.publish();
+                                }
+                                Ok(_) => {}
+                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                             }
-                            Ok(_) => {}
-                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                         }
+                        // The established client gave up (host shutdown): clear
+                        // the slot and stop — nothing to rejoin into.
+                        if let Some(inner) = weak.upgrade() {
+                            *lock(&inner.room) = None;
+                        }
+                        return;
+                    }
+                    Err(err) => {
+                        tracing::warn!(room = %room_id, error = %err, backoff_ms = backoff.as_millis() as u64,
+                            "workspace room join failed; retrying");
                     }
                 }
-                Err(err) => {
-                    tracing::warn!(room = %room_id, error = %err, "workspace room join failed; staying offline");
-                }
+                tokio::time::sleep(backoff + join_retry_jitter()).await;
+                backoff = (backoff * 2).min(JOIN_RETRY_CAP);
             }
         });
     }

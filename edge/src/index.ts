@@ -193,6 +193,12 @@ export default {
       if (parts[2] === "stats" && request.method === "GET") {
         return forward(env.SESSION_ROOMS, room, request, auth.userId, "/stats", "", "workspace");
       }
+      // Operator wedge-break: clear a workspace room whose update log grew big
+      // enough to CPU-reset the DO on every cold start (org-membership already
+      // checked; state re-uploads from each device's local doc on rejoin).
+      if (parts[2] === "reset-log" && request.method === "POST") {
+        return forward(env.SESSION_ROOMS, room, request, auth.userId, "/reset-log", "", "workspace");
+      }
     }
 
     // ── device rooms ────────────────────────────────────────────────────────
