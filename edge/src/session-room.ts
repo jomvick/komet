@@ -40,7 +40,13 @@ import {
   type JoinRequest,
   type ProtocolMessage
 } from "loro-protocol";
-import { COMPACT_LOG_BYTES, DO_FLUSH_MS, RETAIN_DAYS, materializeTail } from "./session-doc";
+import {
+  COMPACT_LOG_BYTES,
+  COMPACT_LOG_ROWS,
+  DO_FLUSH_MS,
+  RETAIN_DAYS,
+  materializeTail
+} from "./session-doc";
 import { createBlobStore, getJsonBlob, putJsonBlob, type BlobStore } from "./blobs";
 import { AUTH_USER_HEADER, ROOM_KIND_HEADER, type Env } from "./env";
 
@@ -512,7 +518,18 @@ export class SessionRoom implements DurableObject {
     this.setMeta("updateBytes", String(logBytes));
     this.pending = [];
     this.pendingBytes = 0;
-    if (logBytes > COMPACT_LOG_BYTES) this.foldLog();
+    // Fold on EITHER budget: bytes bounds one huge update, rows bounds many
+    // tiny ones — a cold `ensureDoc` replay pays per-import overhead per row,
+    // so a high row count is as expensive as a high byte count (see
+    // COMPACT_LOG_ROWS). COUNT(*) is a cheap indexed read, once per flush.
+    if (logBytes > COMPACT_LOG_BYTES) {
+      this.foldLog();
+      return;
+    }
+    const rows = [...this.ctx.storage.sql.exec("SELECT COUNT(*) AS n FROM updates")][0]?.n as
+      | number
+      | undefined;
+    if ((rows ?? 0) > COMPACT_LOG_ROWS) this.foldLog();
   }
 
   /** LOG FOLD: full snapshot re-export + clear the update log. Lossless. */

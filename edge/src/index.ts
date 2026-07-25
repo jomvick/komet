@@ -186,6 +186,13 @@ export default {
       if (parts[2] === "tail" && request.method === "GET") {
         return forward(env.SESSION_ROOMS, room, request, auth.userId, "/tail", "", "workspace");
       }
+      // Observability: log/snapshot sizes for the per-user workspace room, so a
+      // human can see whether the compaction budget is holding (org-membership
+      // was already checked above; the DO bypasses the owner gate for
+      // workspace kind).
+      if (parts[2] === "stats" && request.method === "GET") {
+        return forward(env.SESSION_ROOMS, room, request, auth.userId, "/stats", "", "workspace");
+      }
     }
 
     // ── device rooms ────────────────────────────────────────────────────────
