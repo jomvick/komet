@@ -13,6 +13,16 @@ struct TranscriptView: View {
     let store: SessionStore
     let chatId: String
 
+    init(store: SessionStore, chatId: String) {
+        self.store = store
+        self.chatId = chatId
+        // Seeded, not defaulted to false: a transcript that has already been
+        // revealed must come back visible on the FIRST frame after any view
+        // re-creation, or it blinks out mid-typing when the composer resizes.
+        _settled = State(initialValue: store.hasRevealed)
+        _hydrated = State(initialValue: store.hasRevealed)
+    }
+
     static let gapTurn: CGFloat = 14
     static let gapBlock: CGFloat = 8
     static let maxContentWidth: CGFloat = 736
@@ -64,9 +74,10 @@ struct TranscriptView: View {
         }
         .onChange(of: rows.isEmpty) { _, isEmpty in
             // Projection is off-main, so a cached transcript usually lands after
-            // the pass above ran on an empty list. Nothing is on screen yet, so
-            // re-hiding to settle costs no visible flash.
-            guard !isEmpty, !hydrated else { return }
+            // the pass above ran on an empty list. Only ever hides a transcript
+            // that has never been shown — re-hiding a visible one is what made
+            // it blink out mid-typing.
+            guard !isEmpty, !hydrated, !store.hasRevealed else { return }
             hydrated = true
             settled = false
             Task { await settleToBottom() }
@@ -179,6 +190,7 @@ struct TranscriptView: View {
             try? await Task.sleep(nanoseconds: 30_000_000)
         }
         settled = true
+        store.hasRevealed = true
     }
 
     // Streamed growth signature: last row id + version + count. Any append or

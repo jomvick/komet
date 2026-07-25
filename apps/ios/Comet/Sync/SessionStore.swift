@@ -19,6 +19,13 @@ final class SessionStore {
     /// row builder memoizes on it, so a body re-eval that was triggered by
     /// something else (scrolling) costs O(1) instead of re-deriving every row.
     private(set) var revision: UInt64 = 0
+    /// Whether this chat's transcript has already been revealed once.
+    ///
+    /// Lives on the store, not the view: the reveal gate is `@State`, so any
+    /// re-creation of TranscriptView reset it to "hidden" and blanked an
+    /// already-visible transcript until the settle loop finished. The store is
+    /// cached per chat, so it outlives that churn.
+    @ObservationIgnored var hasRevealed = false
     private(set) var connected = false
     /// Client-minted ids of sends the host hasn't materialized yet.
     private(set) var pendingSends: [(messageId: String, text: String, at: Int64)] = []
