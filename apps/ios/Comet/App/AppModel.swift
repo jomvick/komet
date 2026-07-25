@@ -62,6 +62,10 @@ final class AppModel {
         override("-setmode") { authModeRaw = $0 }
         override("-setuser") { storedUserId = $0 }
         override("-setorg") { storedOrgId = $0 }
+        if args.contains("-bench") {
+            Task { await BenchRunner.run() }
+            return
+        }
         if args.contains("-e2e") {
             Task { await E2ERunner.run(model: self) }
             return
@@ -81,6 +85,16 @@ final class AppModel {
                 if spec.hasPrefix("chat:") {
                     let chatId = String(spec.dropFirst("chat:".count))
                     launchRoute = .chat(chatId)
+                    if args.contains("-big"), let demo {
+                        // Scroll-settle stress. Injected BEFORE the transcript
+                        // appears, which is the warm-session case: rows are
+                        // already there at first layout, so neither the
+                        // rows-arrived nor the streamed-growth anchor ever
+                        // fires and `.task` is the only thing holding the
+                        // bottom — against hundreds of lazily-estimated rows.
+                        demo.sessionStore(for: chatId)
+                            .setEntries(BenchRunner.syntheticEntries(turns: 120))
+                    }
                     if args.contains("-stream"), let demo {
                         // Screenshot rig: kick off the scripted streaming reply.
                         let store = demo.sessionStore(for: chatId)
@@ -204,15 +218,14 @@ final class AppModel {
         if let demo {
             let liveIds = Set(demo.spaces.map(\.id))
             let live = demo.chats.filter { !$0.archived && $0.spaceId.map(liveIds.contains) == true }
-            return attentionSort(live) { indicator(for: $0) }
+            return sortActive(live)
         }
         return workspace?.overviewChats ?? []
     }
 
     func chats(in spaceId: String) -> [Chat] {
         if let demo {
-            return demo.chats.filter { !$0.archived && $0.spaceId == spaceId }
-                .sorted { ($0.createdAt, $0.id) < ($1.createdAt, $1.id) }
+            return sortActive(demo.chats.filter { !$0.archived && $0.spaceId == spaceId })
         }
         return workspace?.chats(in: spaceId) ?? []
     }

@@ -152,6 +152,14 @@ struct ComposerView: View {
             store.sendRun(prompt: prompt, chat: chat)
         }
         text = ""
+        // The clear above is unconditional, so a prompt left sitting in the
+        // composer after a successful send is not this path failing to run —
+        // it is the text view writing the pre-send string back. A focused
+        // multiline TextField commits pending autocorrect/marked text through
+        // the binding AFTER a programmatic change, which restores the prompt.
+        // Re-clear once that has drained; a keystroke can't land inside the
+        // same main-actor turn, so this can never eat real input.
+        Task { @MainActor in text = "" }
     }
 }
 

@@ -205,12 +205,17 @@ final class WorkspaceStore {
     var overviewChats: [Chat] {
         let liveSpaceIds = Set(spaces.map(\.id))
         let live = chats.filter { !$0.archived && $0.spaceId.map(liveSpaceIds.contains) == true }
-        return attentionSort(live) { indicator(for: $0) }
+        return sortActive(live)
     }
 
+    /// A space's sessions, in the sidebar's Sessions order (recency).
+    ///
+    /// NOT desktop's `chats_in_space`, which is creation order because there
+    /// the rows are TABS and activity must never reorder tabs. The phone has
+    /// no tabs — a space opens into the same list, with the same rows, as the
+    /// Sessions section — so it follows that list's ordering instead.
     func chats(in spaceId: String) -> [Chat] {
-        chats.filter { !$0.archived && $0.spaceId == spaceId }
-            .sorted { ($0.createdAt, $0.id) < ($1.createdAt, $1.id) }
+        sortActive(chats.filter { !$0.archived && $0.spaceId == spaceId })
     }
 
     func indicator(for chat: Chat) -> ChatIndicator {

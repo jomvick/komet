@@ -118,11 +118,15 @@ func chatIndicator(chat: Chat, live: SessionStatus?) -> ChatIndicator {
     }
 }
 
-/// state.rs:311 — attention buckets, then recency, then id.
-func attentionSort(_ chats: [Chat], indicator: (Chat) -> ChatIndicator) -> [Chat] {
+/// The Sessions list order: PURE RECENCY, id tiebreak — a port of state.rs
+/// `sort_active`. Status drives the dot, never the position.
+///
+/// This used to bucket by attention first, which is what the desktop did
+/// before 55e1845: opening a completed session marks it seen (completed →
+/// idle), and the row then dropped a bucket out from under the pointer. The
+/// dots carry urgency instead, so the order never moves on its own.
+func sortActive(_ chats: [Chat]) -> [Chat] {
     chats.sorted { a, b in
-        let ra = indicator(a).rawValue, rb = indicator(b).rawValue
-        if ra != rb { return ra < rb }
         let ta = a.lastMessageAt ?? a.createdAt, tb = b.lastMessageAt ?? b.createdAt
         if ta != tb { return ta > tb }
         return a.id < b.id

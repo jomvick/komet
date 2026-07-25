@@ -23,18 +23,25 @@ struct TranscriptView: View {
     @State private var veils = VeilStore()
     @State private var folds: [String: Bool] = [:]
     @State private var pinned = true
+    /// One-shot guard for the first non-empty projection.
+    @State private var hydrated = false
+    /// Gates the reveal: false until the transcript has landed at the bottom.
+    @State private var settled = false
+    /// Live content height — the settle loop's "layout stopped moving" signal.
+    @State private var contentHeight: CGFloat = 0
     @State private var distanceFromBottom: CGFloat = 0
     @State private var userScrolling = false
     @State private var scrollPosition = ScrollPosition(edge: .bottom)
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        let rows = builder.rows(entries: store.entries, pendingSends: store.pendingSends)
+        let rows = builder.rows(revision: store.revision,
+                                entries: store.entries,
+                                pendingSends: store.pendingSends)
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 0) {
-                ForEach(Array(rows.enumerated()), id: \.element.id) { ix, row in
-                    rowView(row, previous: ix > 0 ? rows[ix - 1] : nil, isFirst: ix == 0)
-                        .id(row.id)
+                ForEach(rows) { row in
+                    rowView(row).id(row.id)
                 }
                 Color.clear.frame(height: 44)  // bottom pad clears the fade + floating status strip
             }
@@ -43,13 +50,29 @@ struct TranscriptView: View {
         }
         .scrollPosition($scrollPosition)
         .defaultScrollAnchor(.bottom)
+        // Held invisible until it has settled at the bottom, then faded in.
+        // The settling itself is unavoidable (see settleToBottom) — what is
+        // avoidable is WATCHING it: painting mid-settle is what read as the
+        // transcript sliding on load.
+        .opacity(settled ? 1 : 0)
+        .motionAnimation(Motion.fadeQuick, value: settled)
         .background(Theme.bg)
         .task {
-            // Preloaded transcripts (disk hydration, demo) exist at first
-            // layout, and lazy row materialization drifts the default bottom
-            // anchor — snap once the first pass settles.
-            try? await Task.sleep(nanoseconds: 80_000_000)
-            scrollPosition.scrollTo(edge: .bottom)
+            // Warm sessions already have rows at first layout, and `onChange`
+            // never fires for an initial value — this is the only hook for them.
+            await settleToBottom()
+        }
+        .onChange(of: rows.isEmpty) { _, isEmpty in
+            // Projection is off-main, so a cached transcript usually lands after
+            // the pass above ran on an empty list. Nothing is on screen yet, so
+            // re-hiding to settle costs no visible flash.
+            guard !isEmpty, !hydrated else { return }
+            hydrated = true
+            settled = false
+            Task { await settleToBottom() }
+        }
+        .onScrollGeometryChange(for: CGFloat.self) { $0.contentSize.height } action: { _, new in
+            contentHeight = new
         }
         .onScrollPhaseChange { _, newPhase in
             // Desktop rule: the pin breaks only on USER input (wheel-up/drag),
@@ -132,6 +155,32 @@ struct TranscriptView: View {
         .motionAnimation(Motion.fadeQuick, value: distanceFromBottom > Self.jumpThreshold)
     }
 
+    /// Hold the bottom until layout stops moving, then reveal.
+    ///
+    /// A lazy stack only measures the rows near the viewport; the rest carry
+    /// ESTIMATED heights that resolve over the next frames, growing the content
+    /// and moving the real bottom. One snap at any single instant lands short —
+    /// measured, up to ~37 turns short on a 120-turn transcript. SwiftUI's own
+    /// `.defaultScrollAnchor(.bottom, for: .sizeChanges)` does not help: it
+    /// PRESERVES the initial estimated position rather than correcting to the
+    /// true bottom, which lands short every time instead of sometimes.
+    ///
+    /// So: re-anchor each frame until the height repeats. Bounded (~480ms worst
+    /// case) so a pathological reflow can't spin, and it yields the moment the
+    /// user takes the scroll view — their drag wins. `settled` flips either way,
+    /// so the transcript can never be left invisible.
+    private func settleToBottom() async {
+        var lastHeight: CGFloat = -1
+        for _ in 0..<16 {
+            guard pinned, !userScrolling else { break }
+            scrollPosition.scrollTo(edge: .bottom)
+            if contentHeight == lastHeight { break }
+            lastHeight = contentHeight
+            try? await Task.sleep(nanoseconds: 30_000_000)
+        }
+        settled = true
+    }
+
     // Streamed growth signature: last row id + version + count. Any append or
     // reflow of the tail bumps it; scroll-back through history doesn't.
     private func contentSignature(_ rows: [TranscriptRow]) -> String {
@@ -142,13 +191,7 @@ struct TranscriptView: View {
     // MARK: Row rendering
 
     @ViewBuilder
-    private func rowView(_ row: TranscriptRow, previous: TranscriptRow?, isFirst: Bool) -> some View {
-        let gap: CGFloat = isFirst
-            ? Self.gapTurn + 10
-            : row.turnStart ? Self.gapTurn
-            : sameMarkdownPart(row, previous) ? MD.blockGap
-            : Self.gapBlock
-
+    private func rowView(_ row: TranscriptRow) -> some View {
         Group {
             switch row.kind {
             case .user(let text):
@@ -173,27 +216,31 @@ struct TranscriptView: View {
                 ErrorChipView(message: message)
             }
         }
-        .padding(.top, gap)
+        .padding(.top, row.topGap)
         .padding(.horizontal, 16)
-    }
-
-    private func sameMarkdownPart(_ row: TranscriptRow, _ previous: TranscriptRow?) -> Bool {
-        guard let previous, case .markdown = row.kind, case .markdown = previous.kind else { return false }
-        // Ids are "{entry}#{part}.{ix}" — same prefix ⇒ same part.
-        return row.id.split(separator: ".").dropLast().joined() ==
-            previous.id.split(separator: ".").dropLast().joined()
     }
 }
 
-/// Row-build cache: one incremental parser per streaming part, reused across
-/// body evaluations (a reference type, so building rows never mutates state
-/// mid-render).
+/// Row-build cache: one incremental parser per streaming part plus a memo of
+/// settled parses, reused across body evaluations (a reference type, so
+/// building rows never mutates state mid-render).
 final class TranscriptBuilderCache {
     private var parsers: [String: IncrementalMarkdownParser] = [:]
+    private var completed: [String: CompletedParse] = [:]
+    private var cachedRevision: UInt64?
+    private var cachedRows: [TranscriptRow] = []
 
-    func rows(entries: [MessageEntry],
+    /// Rows for the store's current `revision`. The body re-runs on every
+    /// scroll frame (it reads `distanceFromBottom`), and rows only change when
+    /// the doc does — so gate on the revision and hand back the same array.
+    func rows(revision: UInt64,
+              entries: [MessageEntry],
               pendingSends: [(messageId: String, text: String, at: Int64)]) -> [TranscriptRow] {
-        TranscriptRowBuilder.rows(entries: entries, pendingSends: pendingSends, parsers: &parsers)
+        if cachedRevision == revision { return cachedRows }
+        cachedRows = TranscriptRowBuilder.rows(entries: entries, pendingSends: pendingSends,
+                                               parsers: &parsers, completed: &completed)
+        cachedRevision = revision
+        return cachedRows
     }
 }
 

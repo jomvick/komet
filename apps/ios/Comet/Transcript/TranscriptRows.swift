@@ -32,17 +32,35 @@ struct TranscriptRow: Identifiable {
     var kind: RowKind
     var entryId: String
     var timestamp: Int64?
+    /// "{entryId}#{partId}" for markdown rows, nil otherwise — two adjacent
+    /// rows sharing it are blocks of the same part (the tighter gap).
+    var partKey: String?
+    /// Leading gap, resolved at build time. It depends on the PREVIOUS row, so
+    /// deriving it in the view body forced an `enumerated()` copy of the whole
+    /// row array on every frame; now the body just reads it.
+    var topGap: CGFloat = 0
+}
+
+/// A settled part's parse, keyed by content so a completed block is parsed
+/// once rather than on every rebuild.
+struct CompletedParse {
+    var source: String
+    var blocks: [TopBlock]
 }
 
 enum TranscriptRowBuilder {
     /// Split entries into rows. `parsers` caches one incremental parser per
-    /// "{entryId}#{partId}" so the streaming tail re-parses O(delta + tail).
+    /// "{entryId}#{partId}" so the streaming tail re-parses O(delta + tail);
+    /// `completed` memoizes settled parts so they parse exactly once.
     static func rows(entries: [MessageEntry],
                      pendingSends: [(messageId: String, text: String, at: Int64)],
-                     parsers: inout [String: IncrementalMarkdownParser]) -> [TranscriptRow] {
+                     parsers: inout [String: IncrementalMarkdownParser],
+                     completed: inout [String: CompletedParse]) -> [TranscriptRow] {
         var rows: [TranscriptRow] = []
+        var live = Set<String>()
         for entry in entries {
-            rowsForEntry(entry, into: &rows, parsers: &parsers)
+            rowsForEntry(entry, into: &rows, parsers: &parsers,
+                         completed: &completed, live: &live)
         }
         // Optimistic echo: pending sends share their client-minted id, so the
         // host's real entry replaces them without a flicker.
@@ -53,14 +71,37 @@ enum TranscriptRowBuilder {
                                       turnStart: true,
                                       kind: .user(text: pending.text),
                                       entryId: pending.messageId,
-                                      timestamp: nil))
+                                      timestamp: nil,
+                                      partKey: nil))
+        }
+        // Drop memos for parts that no longer exist. The count guard keeps the
+        // common (append-only) rebuild from copying the dict every token.
+        if completed.count > live.count {
+            completed = completed.filter { live.contains($0.key) }
+        }
+        for ix in rows.indices {
+            rows[ix].topGap = gap(for: rows[ix],
+                                  previous: ix > 0 ? rows[ix - 1] : nil,
+                                  isFirst: ix == 0)
         }
         return rows
     }
 
+    private static func gap(for row: TranscriptRow,
+                            previous: TranscriptRow?,
+                            isFirst: Bool) -> CGFloat {
+        if isFirst { return TranscriptView.gapTurn + 10 }
+        if row.turnStart { return TranscriptView.gapTurn }
+        // Same part ⇒ these are sibling markdown blocks, not a new turn.
+        if let key = row.partKey, key == previous?.partKey { return MD.blockGap }
+        return TranscriptView.gapBlock
+    }
+
     private static func rowsForEntry(_ entry: MessageEntry,
                                      into rows: inout [TranscriptRow],
-                                     parsers: inout [String: IncrementalMarkdownParser]) {
+                                     parsers: inout [String: IncrementalMarkdownParser],
+                                     completed: inout [String: CompletedParse],
+                                     live: inout Set<String>) {
         let streaming = entry.status == .streaming
         let settled = entry.status != nil && !streaming
 
@@ -73,7 +114,8 @@ enum TranscriptRowBuilder {
             guard !text.isEmpty else { return }
             rows.append(TranscriptRow(id: entry.id, version: fnv1a(text),
                                       turnStart: true, kind: .user(text: text),
-                                      entryId: entry.id, timestamp: entry.createdAt))
+                                      entryId: entry.id, timestamp: entry.createdAt,
+                                      partKey: nil))
             return
         }
 
@@ -90,7 +132,7 @@ enum TranscriptRowBuilder {
             if autoOpen { version ^= 1 }
             rows.append(TranscriptRow(id: id, version: version, turnStart: first,
                                       kind: .toolGroup(tools: pendingTools, autoOpen: autoOpen),
-                                      entryId: entry.id, timestamp: nil))
+                                      entryId: entry.id, timestamp: nil, partKey: nil))
             first = false
             pendingTools = []
             groupIx += 1
@@ -106,8 +148,10 @@ enum TranscriptRowBuilder {
                 flushTools(lastIx: ix - 1)
                 guard !text.isEmpty else { continue }
                 let key = "\(entry.id)#\(partId)"
+                live.insert(key)
                 let isLiveTail = streaming && ix == lastPartIx
-                let blocks = parse(text: text, key: key, streaming: isLiveTail, parsers: &parsers)
+                let blocks = parse(text: text, key: key, streaming: isLiveTail,
+                                   parsers: &parsers, completed: &completed)
                 for (blockIx, top) in blocks.enumerated() {
                     var version = (top.fingerprint << 1) | (isLiveTail && blockIx == blocks.count - 1 ? 1 : 0)
                     if settled, ix == lastPartIx, blockIx == blocks.count - 1 {
@@ -119,7 +163,8 @@ enum TranscriptRowBuilder {
                                         streaming: isLiveTail && blockIx == blocks.count - 1),
                         entryId: entry.id,
                         timestamp: settled && ix == lastPartIx && blockIx == blocks.count - 1
-                            ? entry.createdAt : nil))
+                            ? entry.createdAt : nil,
+                        partKey: key))
                     first = false
                 }
 
@@ -130,7 +175,7 @@ enum TranscriptRowBuilder {
                                           version: fnv1a(header) | (resolved ? 1 : 0),
                                           turnStart: first,
                                           kind: .inputChip(header: header, resolved: resolved),
-                                          entryId: entry.id, timestamp: nil))
+                                          entryId: entry.id, timestamp: nil, partKey: nil))
                 first = false
 
             case .error(let partId, let message):
@@ -138,7 +183,7 @@ enum TranscriptRowBuilder {
                 rows.append(TranscriptRow(id: "\(entry.id)#\(partId)", version: fnv1a(message),
                                           turnStart: first,
                                           kind: .errorChip(message: message),
-                                          entryId: entry.id, timestamp: nil))
+                                          entryId: entry.id, timestamp: nil, partKey: nil))
                 first = false
             }
         }
@@ -146,19 +191,28 @@ enum TranscriptRowBuilder {
     }
 
     private static func parse(text: String, key: String, streaming: Bool,
-                              parsers: inout [String: IncrementalMarkdownParser]) -> [TopBlock] {
+                              parsers: inout [String: IncrementalMarkdownParser],
+                              completed: inout [String: CompletedParse]) -> [TopBlock] {
         if streaming {
             let parser = parsers[key] ?? IncrementalMarkdownParser()
             parser.setText(text)
             parsers[key] = parser
             return parser.blocks
         }
-        // Completed: adopt the live parser's tree when the flip happens
-        // (handoff), else parse fresh; drop the live parser either way.
-        if let live = parsers.removeValue(forKey: key), live.source == text {
-            return live.blocks
+        // Completed. Drop the live parser either way, then serve from the memo:
+        // rows are rebuilt on every doc update, and re-parsing every settled
+        // part each time made a rebuild O(whole transcript) — the dominant cost
+        // of opening a long cached session, and paid again per streamed token.
+        let handoff = parsers.removeValue(forKey: key)
+        if let hit = completed[key], hit.source == text {
+            return hit.blocks
         }
-        return MarkdownParser.parse(text)
+        // Adopt the live parser's tree on the live→complete flip, else parse.
+        let blocks = handoff?.source == text
+            ? (handoff?.blocks ?? MarkdownParser.parse(text))
+            : MarkdownParser.parse(text)
+        completed[key] = CompletedParse(source: text, blocks: blocks)
+        return blocks
     }
 
     private static func toolFingerprint(_ tools: [ToolItem]) -> UInt64 {

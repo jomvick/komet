@@ -19,9 +19,6 @@ struct HomeView: View {
     var body: some View {
         NavigationStack(path: $path) {
             List {
-                if !model.connected {
-                    connectingNotice
-                }
                 spacesSection
                 sessionsSection
             }
@@ -42,6 +39,18 @@ struct HomeView: View {
                 }
             }
             .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    // In the bar, not the list: as a list row it appeared and
+                    // vanished with the connection and shoved the content down.
+                    if !model.connected {
+                        ProgressView()
+                            .controlSize(.mini)
+                            .tint(Theme.textMuted)
+                            .accessibilityLabel("Connecting")
+                    }
+                }
+                // Bare spinner — no glass capsule behind it.
+                .sharedBackgroundVisibility(.hidden)
                 ToolbarItem(placement: .topBarTrailing) {
                     Button {
                         showNewSpace = true
@@ -87,22 +96,6 @@ struct HomeView: View {
                 }
             }
         }
-    }
-
-    /// Shown only while disconnected — no chrome when everything is fine.
-    private var connectingNotice: some View {
-        HStack(spacing: 8) {
-            ProgressView()
-                .controlSize(.mini)
-                .tint(Theme.textMuted)
-            Text("Connecting to edge…")
-                .font(Theme.sans(12))
-                .foregroundStyle(Theme.textMuted)
-        }
-        .frame(maxWidth: .infinity)
-        .padding(.vertical, 8)
-        .listRowBackground(Color.clear)
-        .listRowSeparator(.hidden)
     }
 
     // MARK: Spaces

@@ -11,6 +11,14 @@ struct SessionView: View {
     @State private var refs: [RepoRef] = []
     @State private var catalogs: [String: [ModelInfo]] = [:]
 
+    /// Width the nav bar's own controls need either side of the title — the
+    /// back button leading, breathing room trailing.
+    private static let headerChromeInset: CGFloat = 132
+
+    /// The view's own width, the only reliable basis for capping the principal
+    /// toolbar item (its container proposes an unbounded width).
+    @State private var viewWidth: CGFloat = 0
+
     private var chat: Chat? { model.chat(id: chatId) }
 
     private var chatSpace: Space? {
@@ -22,6 +30,7 @@ struct SessionView: View {
         Group {
             if let chat, let store = model.sessionStore(for: chat) {
                 content(chat: chat, store: store)
+                    .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { viewWidth = $0 }
             } else {
                 VStack(spacing: 12) {
                     KometPulse()
@@ -47,21 +56,39 @@ struct SessionView: View {
                         VStack(spacing: 1) {
                             HStack(spacing: 6) {
                                 HarnessBadge(harness: chat.config?.harness ?? "claude-code", size: 12)
+                                // The badge and chevron are fixed; only the
+                                // title gives way, so a long name truncates
+                                // instead of pushing the chevron off-screen.
                                 Text(chat.displayTitle)
                                     .font(Theme.sans(13, weight: .medium))
                                     .foregroundStyle(Theme.text)
                                     .lineLimit(1)
+                                    .truncationMode(.tail)
+                                    .layoutPriority(1)
                                 Image(systemName: "chevron.down")
                                     .font(.system(size: 8, weight: .semibold))
                                     .foregroundStyle(Theme.textFaint)
+                                    .layoutPriority(2)
                             }
                             if let subtitle {
+                                // Middle-truncated: the tail (device) identifies
+                                // the session as much as the leading repo does.
                                 Text(subtitle)
                                     .font(Theme.sans(10.5))
                                     .foregroundStyle(Theme.textMuted.opacity(0.6))
                                     .lineLimit(1)
+                                    .truncationMode(.middle)
                             }
                         }
+                        // A principal toolbar item is handed its IDEAL width, so
+                        // an unconstrained header just runs past the bar and off
+                        // the screen. Cap it to the centre region — the back
+                        // button and any trailing item own the rest.
+                        // A principal toolbar item is handed its IDEAL width, so
+                        // an unconstrained header runs past the bar and off the
+                        // screen. Cap it against the view's own width, leaving
+                        // the back button and trailing padding their room.
+                        .frame(maxWidth: max(140, viewWidth - Self.headerChromeInset))
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
