@@ -42,6 +42,12 @@ pub const MAX_PATCH_BYTES: usize = 3 * 1024 * 1024;
 const WATCH_DEBOUNCE: Duration = Duration::from_millis(500);
 /// Slow repair pass: re-reconcile + re-sync every checkout.
 const REPAIR_INTERVAL: Duration = Duration::from_secs(120);
+/// Max subdirectories a checkout may have before we skip its live recursive
+/// watch (one OS watch per dir; past this the watcher thread's own bookkeeping
+/// costs more than instant diffs are worth). A normal source tree is well
+/// under this; a node_modules/vendored tree blows past it. The repair tick
+/// still covers skipped checkouts.
+const MAX_WATCH_DIRS: usize = 8_000;
 /// `git hash-object -t tree /dev/null` — diff base for repos with no commits yet.
 const EMPTY_TREE_SHA: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 
@@ -229,6 +235,35 @@ async fn reconcile(inner: &Arc<DiffSyncInner>, chats: Vec<Chat>) {
     }
 }
 
+/// True if `root`'s directory tree exceeds [`MAX_WATCH_DIRS`] — the signal that
+/// a live recursive watch would cost more than it's worth. Bounded BFS: stops
+/// the moment the budget is blown (never walks a whole node_modules), skips
+/// symlinks (a symlinked dep cycle must not send this into a spin), and treats
+/// unreadable dirs as leaves. `.git` internal churn is real diff signal, so it
+/// counts toward the budget rather than being skipped.
+fn exceeds_watch_budget(root: &Path) -> bool {
+    let mut queue = std::collections::VecDeque::from([root.to_path_buf()]);
+    let mut seen = 0usize;
+    while let Some(dir) = queue.pop_front() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            // `file_type()` on the dirent does NOT follow symlinks — a symlinked
+            // directory reports as a symlink and is skipped, so cyclic deps
+            // (pnpm/npm) can't blow up the walk.
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                seen += 1;
+                if seen > MAX_WATCH_DIRS {
+                    return true;
+                }
+                queue.push_back(entry.path());
+            }
+        }
+    }
+    false
+}
+
 fn add_entry(inner: &Arc<DiffSyncInner>, identity: CheckoutIdentity, chats: Vec<Chat>) {
     let (kick_tx, kick_rx) = mpsc::unbounded_channel();
 
@@ -241,6 +276,21 @@ fn add_entry(inner: &Arc<DiffSyncInner>, identity: CheckoutIdentity, chats: Vec<
         targets.push(&identity.git_dir);
     }
     for target in targets {
+        // A recursive `notify` watch installs one OS watch per subdirectory and
+        // has no way to prune subtrees. On a checkout carrying big dependency
+        // trees (node_modules, vendored deps) that is tens of thousands of
+        // watches: the watcher thread pegs a core just maintaining them — even
+        // with the tree completely idle — which starved a real device's whole
+        // async runtime (presence heartbeats and IPC stalled; it showed
+        // permanently offline). If the tree blows the budget, skip the live
+        // watch entirely; the 2-minute repair tick still keeps the diff
+        // correct, just not instantly. Bounded so the probe itself stays cheap
+        // on a pathological tree.
+        if exceeds_watch_budget(target) {
+            tracing::info!(path = %target.display(),
+                "diff-sync: tree too large to watch live; relying on the repair tick");
+            continue;
+        }
         let tx = kick_tx.clone();
         let watcher =
             notify::recommended_watcher(move |event: Result<notify::Event, notify::Error>| {
@@ -776,4 +826,42 @@ pub async fn capture_diff(repos: &Repos, root: &Path) -> Result<DiffSnapshot, En
         truncated,
         checksum,
     })
+}
+
+#[cfg(test)]
+mod watch_budget_tests {
+    use super::{exceeds_watch_budget, MAX_WATCH_DIRS};
+
+    #[test]
+    fn small_tree_is_watchable() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("src/a/b")).unwrap();
+        std::fs::create_dir_all(root.join("src/c")).unwrap();
+        std::fs::write(root.join("src/a/f.txt"), "x").unwrap();
+        assert!(!exceeds_watch_budget(root));
+    }
+
+    #[test]
+    fn budget_is_exceeded_and_probe_stays_bounded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // One flat directory of MAX_WATCH_DIRS + 50 subdirs trips the budget;
+        // the BFS must stop right after the threshold, not enumerate the rest.
+        for i in 0..(MAX_WATCH_DIRS + 50) {
+            std::fs::create_dir(root.join(format!("d{i}"))).unwrap();
+        }
+        assert!(exceeds_watch_budget(root));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_dir_is_not_followed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join("real/inner")).unwrap();
+        // A self-referential symlink cycle must not send the walk into a spin.
+        std::os::unix::fs::symlink(root.join("real"), root.join("real/inner/loop")).unwrap();
+        assert!(!exceeds_watch_budget(root)); // terminates, under budget
+    }
 }
