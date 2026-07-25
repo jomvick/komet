@@ -27,35 +27,40 @@ struct ComposerShell<Chips: View>: View {
         Chips.self != EmptyView.self || draft.contains("\n") || draft.count > 26
     }
 
+    // Switching between VStack/HStack via AnyLayout (rather than an if/else
+    // that swaps container types) keeps `input`'s view identity stable across
+    // the compact↔expanded flip — an if/else here would tear down and rebuild
+    // the TextField, dropping keyboard focus mid-type.
+    private var shellLayout: AnyLayout {
+        expanded
+            ? AnyLayout(VStackLayout(alignment: .leading, spacing: 0))
+            : AnyLayout(HStackLayout(alignment: .center, spacing: 12))
+    }
+
     var body: some View {
-        Group {
+        shellLayout {
+            input
+                .padding(.horizontal, expanded ? 20 : 0)
+                .padding(.leading, expanded ? 0 : 20)
+                .padding(.top, expanded ? 15 : 0)
+                .padding(.vertical, expanded ? 0 : 15)
             if expanded {
-                VStack(alignment: .leading, spacing: 0) {
-                    input
-                        .padding(.horizontal, 20)
-                        .padding(.top, 15)
-                    HStack(spacing: 10) {
-                        // Chips scroll; the send button stays pinned.
-                        ScrollView(.horizontal, showsIndicators: false) {
-                            HStack(spacing: 8) {
-                                chips
-                            }
+                HStack(spacing: 10) {
+                    // Chips scroll; the send button stays pinned.
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 8) {
+                            chips
                         }
-                        .scrollClipDisabled(false)
-                        actionButton
                     }
-                    .padding(.horizontal, 10)
-                    .padding(.top, 10)
-                    .padding(.bottom, 10)
-                }
-            } else {
-                HStack(alignment: .center, spacing: 12) {
-                    input
-                        .padding(.leading, 20)
-                        .padding(.vertical, 15)
+                    .scrollClipDisabled(false)
                     actionButton
-                        .padding(.trailing, 7)
                 }
+                .padding(.horizontal, 10)
+                .padding(.top, 10)
+                .padding(.bottom, 10)
+            } else {
+                actionButton
+                    .padding(.trailing, 7)
             }
         }
         .background(whiteAlpha(0.04), in: RoundedRectangle(cornerRadius: 28))

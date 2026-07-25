@@ -308,9 +308,10 @@ struct ToolGroupView: View {
             // Header stays quiet even on failure — chips carry the red.
             Button(action: toggle) {
                 HStack(spacing: 8) {
-                    Text(open ? "▾" : "▸")
-                        .font(.system(size: 10))
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
                         .foregroundStyle(Theme.textMuted)
+                        .rotationEffect(.degrees(open ? 90 : 0))
                         .frame(width: 18, height: 18)
                         .background(whiteAlpha(0.06), in: RoundedRectangle(cornerRadius: 5))
                     Text(toolGroupSummary(tools))

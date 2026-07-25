@@ -23,11 +23,7 @@ struct SpaceView: View {
                 Button {
                     path.append(.chat(chat.id))
                 } label: {
-                    HStack(spacing: 10) {
-                        HarnessBadge(harness: chat.config?.harness ?? "claude-code",
-                                     size: 15, dimmed: true)
-                        ChatRow(chat: chat, showLocation: false)
-                    }
+                    ChatRow(chat: chat, showLocation: true)
                 }
                 .buttonStyle(PressWashButtonStyle())
                 .listRowBackground(Color.clear)

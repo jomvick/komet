@@ -47,12 +47,17 @@ enum E2ERunner {
         }
         log("OK workspace synced; engine device \(device.id) (\(device.name))")
 
-        // 2. Device relay: ListFolders on the engine.
-        let listing = await workspace.listFolders(deviceId: device.id, path: nil)
-        if let listing {
-            log("OK relay ListFolders: \(listing.path) → \(listing.entries.count) entries")
-        } else {
-            log("FAIL relay ListFolders returned nil")
+        // 2. Device relay: ListFolders on every engine device (stale rig
+        // devices linger in the dev workspace doc — report each).
+        var listing: FolderListing?
+        for candidate in workspace.devices where candidate.platform != "ios" {
+            do {
+                let l = try await workspace.listFoldersDetailed(deviceId: candidate.id, path: nil)
+                log("OK relay ListFolders[\(candidate.name)/\(candidate.id.prefix(8))]: \(l.path) → \(l.entries.count) entries")
+                listing = l
+            } catch {
+                log("FAIL relay ListFolders[\(candidate.name)/\(candidate.id.prefix(8))]: \(error.localizedDescription)")
+            }
         }
 
         // 2b. Live model catalog over the relay.
@@ -124,5 +129,46 @@ enum E2ERunner {
         }
         log("timeout waiting for \(label)")
         return nil
+    }
+}
+
+extension E2ERunner {
+    /// Live-relay probe: runs inside the user's real signed-in session and
+    /// interrogates every engine device — workspace presence, the device
+    /// room's host attachment, and a real ListFolders with the exact error.
+    @MainActor
+    static func runLive(model: AppModel) async {
+        try? FileManager.default.removeItem(at: logURL)
+        log("live start edge=\(model.edgeURLString) mode=\(model.authModeRaw) user=\(model.storedUserId.prefix(18)) org=\(model.storedOrgId.prefix(18))")
+        let workspace = await poll(timeout: 25, label: "workspace connect") {
+            model.workspace?.connected == true ? model.workspace : nil
+        }
+        guard let workspace else {
+            log("FAIL workspace never connected: store=\(model.workspace != nil) "
+                + "userId=\(model.storedUserId.isEmpty ? "EMPTY" : "set") "
+                + "orgId=\(model.storedOrgId.isEmpty ? "EMPTY" : "set") "
+                + "access=\(Keychain.load(key: "accessToken") != nil) "
+                + "refresh=\(Keychain.load(key: "refreshToken") != nil) "
+                + "mode=\(model.authModeRaw)")
+            return
+        }
+        log("devices: " + workspace.devices.map {
+            "\($0.name)[\($0.platform)] id=\($0.id) presence=\(workspace.deviceOnline($0.id))"
+        }.joined(separator: ", "))
+        guard let config = model.diagnosticsConfig else {
+            log("FAIL no config")
+            return
+        }
+        for device in workspace.devices where device.platform != "ios" {
+            let status = await config.deviceStatus(deviceId: device.id)
+            log("\(device.name) /status → \(status)")
+            do {
+                let listing = try await workspace.listFoldersDetailed(deviceId: device.id, path: nil)
+                log("OK \(device.name) ListFolders → \(listing.path) (\(listing.entries.count) entries)")
+            } catch {
+                log("FAIL \(device.name) ListFolders → \(error.localizedDescription)")
+            }
+        }
+        log("done")
     }
 }

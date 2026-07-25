@@ -2,7 +2,8 @@
 // over the workspace doc (crates/doc/src/workspace.rs). Joins the per-user
 // `ws3/{orgId}/{userId}` room, projects the doc into typed rows, and performs
 // the writes the writer discipline allows a viewer device: chat creates,
-// archives, seen marks, plus its own device row and presence heartbeat.
+// archives and seen marks. iOS is a viewport, not an engine device, so it
+// deliberately owns neither a device row nor a presence heartbeat.
 
 import Foundation
 import Loro
@@ -21,7 +22,6 @@ final class WorkspaceStore {
     let doc = LoroDoc()
     private var room: RoomClient?
     private var subscriptions: [Subscription] = []
-    private var heartbeatTask: Task<Void, Never>?
     private let config: AppConfig
 
     init(config: AppConfig) {
@@ -57,8 +57,6 @@ final class WorkspaceStore {
         subscriptions.append(localSub)
 
         Task { await client.start() }
-        startHeartbeat(client: client)
-        registerOwnDevice()
         project()
     }
 
@@ -68,8 +66,6 @@ final class WorkspaceStore {
     }
 
     func stop() {
-        heartbeatTask?.cancel()
-        heartbeatTask = nil
         subscriptions.removeAll()
         saver?.flush()
         if let room {
@@ -83,10 +79,12 @@ final class WorkspaceStore {
         switch event {
         case .connected:
             connected = true
+            purgeLegacyMobileDevices()
             project()
         case .disconnected:
             connected = false
         case .remoteUpdate:
+            purgeLegacyMobileDevices()
             project()
             saver?.poke()
         case .ephemeralUpdate:
@@ -94,19 +92,28 @@ final class WorkspaceStore {
         }
     }
 
-    // MARK: Presence
-
-    private func startHeartbeat(client: RoomClient) {
-        heartbeatTask = Task { [config] in
-            while !Task.isCancelled {
-                let key = "presence/\(config.deviceId)"
-                await client.eph.set(key: key, value: nowMs())
-                let delta = await client.eph.encode(key: key)
-                await client.sendEphemeralUpdate([UInt8](delta))
-                try? await Task.sleep(nanoseconds: 15_000_000_000)  // PRESENCE_INTERVAL_MS
+    /// Older iOS builds registered themselves as engine devices. Mobile is a
+    /// controller only: remove those synced rows so desktop device pickers do
+    /// not retain simulator/phone model names forever.
+    private func purgeLegacyMobileDevices() {
+        guard let root = doc.getDeepValue().mapValue,
+              let deviceRows = root["devices"]?.mapValue else { return }
+        let staleIds = deviceRows.compactMap { id, value -> String? in
+            value.mapValue?["platform"]?.stringValue == "ios" ? id : nil
+        }
+        guard !staleIds.isEmpty else { return }
+        let map = doc.getMap(id: "devices")
+        do {
+            for id in staleIds {
+                try map.delete(key: id)
             }
+            doc.commit()
+        } catch {
+            // Cleanup is a migration; projection/sync remain usable if it fails.
         }
     }
+
+    // MARK: Presence
 
     private func projectPresence() {
         guard let room else { return }
@@ -227,12 +234,24 @@ final class WorkspaceStore {
         return client
     }
 
+    /// The last relay failure, for surfacing in UI/diagnostics.
+    private(set) var lastRelayError: String?
+
     /// ListFolders on the target device (engine caps at 500 entries, hides
     /// dotfiles, stamps isRepo). nil path = the device's home directory.
     func listFolders(deviceId: String, path: String?) async -> FolderListing? {
+        do {
+            return try await listFoldersDetailed(deviceId: deviceId, path: path)
+        } catch {
+            lastRelayError = error.localizedDescription
+            return nil
+        }
+    }
+
+    func listFoldersDetailed(deviceId: String, path: String?) async throws -> FolderListing {
         var params: [String: Any] = [:]
         if let path { params["path"] = path }
-        return try? await relay(for: deviceId).call(method: "ListFolders", params: params)
+        return try await relay(for: deviceId).call(method: "ListFolders", params: params)
     }
 
     /// ListRefs on the target device — branches with current/worktree markers
@@ -292,23 +311,6 @@ final class WorkspaceStore {
     }
 
     // MARK: Writes (viewer-device discipline)
-
-    private func registerOwnDevice() {
-        let map = doc.getMap(id: "devices")
-        do {
-            let row = try map.getOrCreateContainer(key: config.deviceId, child: LoroMap())
-            try row.insert(key: "id", v: config.deviceId)
-            try row.insert(key: "name", v: config.deviceName)
-            try row.insert(key: "platform", v: "ios")
-            try row.insert(key: "lastSeenAt", v: nowMs())
-            if row.get(key: "createdAt") == nil {
-                try row.insert(key: "createdAt", v: nowMs())
-            }
-            doc.commit()
-        } catch {
-            // Registration is cosmetic; sync continues without it.
-        }
-    }
 
     /// Mint a new chat onto a space (workspace_host.rs create_chat shape).
     /// The host = the space's owning device picks it up via the doc.

@@ -99,6 +99,17 @@ final class AppConfig: @unchecked Sendable {
         return Date().timeIntervalSince1970 > exp - 60
     }
 
+    /// GET /device/{deviceId}/status → whether the device's relay HOST socket
+    /// is currently attached (distinct from workspace presence).
+    func deviceStatus(deviceId: String) async -> String {
+        guard let token = await currentToken() else { return "no-token" }
+        var request = URLRequest(url: edgeURL.appending(path: "device/\(deviceId)/status"))
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        guard let (data, response) = try? await URLSession.shared.data(for: request),
+              let http = response as? HTTPURLResponse else { return "unreachable" }
+        return "http=\(http.statusCode) body=\(String(data: data, encoding: .utf8) ?? "")"
+    }
+
     /// POST /device/{deviceId}/nudge {chatId} — wake a cold host to drain the
     /// command queue.
     func nudge(deviceId: String, chatId: String) async {

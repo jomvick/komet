@@ -51,9 +51,28 @@ final class AppModel {
         if demo != nil { return }
         DocDisk.prune(keep: 80)
         let args = ProcessInfo.processInfo.arguments
+        // Debug-rig config overrides (cfprefsd caching defeats external
+        // defaults writes; the app applying them itself always sticks).
+        func override(_ flag: String, _ apply: (String) -> Void) {
+            if let ix = args.firstIndex(of: flag), ix + 1 < args.count {
+                apply(args[ix + 1])
+            }
+        }
+        override("-setedge") { edgeURLString = $0 }
+        override("-setmode") { authModeRaw = $0 }
+        override("-setuser") { storedUserId = $0 }
+        override("-setorg") { storedOrgId = $0 }
         if args.contains("-e2e") {
             Task { await E2ERunner.run(model: self) }
             return
+        }
+        if args.contains("-e2e-live") {
+            // Reuse the signed-in session, then probe the live relay paths.
+            Task {
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                await E2ERunner.runLive(model: self)
+            }
+            // fall through to the normal restore below
         }
         if args.contains("-demo") {
             enterDemoMode()
@@ -385,6 +404,9 @@ final class AppModel {
         sessionStores.values.forEach { $0.flushToDisk() }
     }
 
+    /// Diagnostics access (live e2e probe).
+    var diagnosticsConfig: AppConfig? { config }
+
     // MARK: Session stores
 
     func sessionStore(for chat: Chat) -> SessionStore? {
@@ -402,10 +424,15 @@ final class AppModel {
     }
 
     func releaseSessionStore(chatId: String) {
-        // Keep recent stores warm; cap the cache to avoid socket sprawl.
-        if sessionStores.count > 6, let victim = sessionStores.keys.first(where: { $0 != chatId }) {
-            sessionStores[victim]?.stop()
-            sessionStores.removeValue(forKey: victim)
+        // Preloaded stores stay warm — nothing to evict on navigation.
+    }
+
+    /// Warm every non-archived session: stores hydrate from disk instantly
+    /// and keep their rooms syncing, so opening a session never shows a
+    /// loading state.
+    func preloadSessions() {
+        for chat in overviewChats {
+            _ = sessionStore(for: chat)
         }
     }
 }

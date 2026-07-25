@@ -33,7 +33,6 @@ actor DeviceRelayClient {
 
     private let deviceId: String
     private let config: AppConfig
-    private let connId = UUID().uuidString.lowercased()
 
     private var socket: URLSessionWebSocketTask?
     private var receiveTask: Task<Void, Never>?
@@ -57,7 +56,10 @@ actor DeviceRelayClient {
         components.scheme = components.scheme == "http" ? "ws" : "wss"
         components.queryItems = [
             URLQueryItem(name: "role", value: "client"),
-            URLQueryItem(name: "connId", value: connId),
+            // A reconnect is a new relay peer. Reusing a connId can briefly
+            // leave two tagged sockets in the hibernating DO and route the
+            // host's response to the stale predecessor.
+            URLQueryItem(name: "connId", value: UUID().uuidString.lowercased()),
             URLQueryItem(name: "token", value: token),
         ]
         let task = URLSession.shared.webSocketTask(with: components.url!)
@@ -113,6 +115,27 @@ actor DeviceRelayClient {
     /// One unary ControlRpc call to the host engine, 10s deadline (the engine
     /// itself caps folder listing at 6s).
     func call<Response: Decodable>(method: String, params: [String: Any]) async throws -> Response {
+        for attempt in 0..<3 {
+            do {
+                return try await callOnce(method: method, params: params)
+            } catch let error as RelayError {
+                guard attempt < 2 else { throw error }
+                switch error {
+                case .hostOffline, .notConnected:
+                    teardown(error: error)
+                    try? await Task.sleep(nanoseconds: UInt64(attempt + 1) * 250_000_000)
+                case .rpc, .timeout:
+                    throw error
+                }
+            }
+        }
+        throw RelayError.notConnected
+    }
+
+    private func callOnce<Response: Decodable>(
+        method: String,
+        params: [String: Any]
+    ) async throws -> Response {
         try await connect()
         let id = nextId
         nextId += 1
@@ -122,11 +145,14 @@ actor DeviceRelayClient {
         let payload = try JSONSerialization.data(withJSONObject: frame)
         let data = Self.encodeFrame(header: #"{"s":"rpc","k":"rpc"}"#, payload: payload)
 
-        guard let socket else { throw RelayError.notConnected }
-        try await socket.send(.data(data))
-
+        // Install the waiter before sending. URLSession's async send may yield
+        // long enough for a fast host reply to reach handleInbound; registering
+        // afterward loses that reply and turns a successful call into a timeout.
         let result: Result<Data, RelayError> = await withCheckedContinuation { continuation in
             pending[id] = continuation
+            Task {
+                await self.send(data, for: id)
+            }
             Task {
                 try? await Task.sleep(nanoseconds: 10_000_000_000)
                 self.timeoutCall(id: id)
@@ -139,10 +165,27 @@ actor DeviceRelayClient {
         }
     }
 
-    private func timeoutCall(id: UInt64) {
-        if let continuation = pending.removeValue(forKey: id) {
-            continuation.resume(returning: .failure(.timeout))
+    private func send(_ data: Data, for id: UInt64) async {
+        guard let socket else {
+            failCall(id: id, error: .notConnected)
+            return
         }
+        do {
+            try await socket.send(.data(data))
+        } catch {
+            failCall(id: id, error: .notConnected)
+            teardown(error: .notConnected)
+        }
+    }
+
+    private func failCall(id: UInt64, error: RelayError) {
+        if let continuation = pending.removeValue(forKey: id) {
+            continuation.resume(returning: .failure(error))
+        }
+    }
+
+    private func timeoutCall(id: UInt64) {
+        failCall(id: id, error: .timeout)
     }
 
     // MARK: Inbound

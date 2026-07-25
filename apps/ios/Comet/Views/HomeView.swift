@@ -66,6 +66,9 @@ struct HomeView: View {
                     path.append(.space(spaceId))
                 }
             }
+            .task(id: model.overviewChats.map(\.id).joined()) {
+                model.preloadSessions()
+            }
             .onAppear {
                 if let route = model.launchRoute {
                     model.launchRoute = nil
