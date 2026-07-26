@@ -844,9 +844,8 @@ fn the_sessions_list_is_flat_and_global_not_grouped_by_space() {
     assert!(beta < alpha, "recency order:\n{sidebar:#?}");
     assert_eq!(
         alpha,
-        beta + 3,
-        "consecutive rows: title, sub-line, and the row of air that gives the \
-         entry its vertical padding:\n{sidebar:#?}"
+        beta + 2,
+        "the rows must be consecutive (title, sub-line, title, sub-line):\n{sidebar:#?}"
     );
 }
 

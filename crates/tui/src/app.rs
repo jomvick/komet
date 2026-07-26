@@ -149,12 +149,11 @@ impl Row {
     /// Lines this row occupies.
     pub fn height(&self) -> u16 {
         match self {
-            // Title, sub-line, and a trailing row of air. The air is part of the
-            // row rather than a gap between rows so the selection fill covers it
-            // too — a cursor that stopped at the text would read as a highlight
-            // rather than as a row you have landed on.
-            Row::Chat { .. } => 3,
-            Row::Space { .. } => 2,
+            // Title and sub-line, with no row of air between entries: at one
+            // blank row per session the list reads as a set of loose cards
+            // rather than a list, and a terminal has no half-row to spend
+            // instead. The breathing room comes from the pane's own padding.
+            Row::Chat { .. } => 2,
             // An account with no display name is one line, not one line and a
             // blank: the second row exists to carry the email *under* a name.
             Row::User { name, email } => {

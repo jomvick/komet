@@ -576,11 +576,13 @@ const TAB_MORE_RIGHT: &str = "›";
 /// Padding inside a tab, per side.
 const TAB_PAD: u16 = 2;
 
-/// Rows the tab strip occupies. A tab needs vertical padding as much as
-/// horizontal, and in a terminal the only way to give a one-line label room
-/// above and below it is to make the thing it sits in three rows tall and run
-/// the fill through all of them.
-const TAB_ROWS: u16 = 3;
+/// Rows the tab strip occupies: a row of padding, then the labels.
+///
+/// A tab needs vertical padding as much as horizontal, and a terminal's only
+/// unit is the row — so one row is the whole budget. It goes above the labels,
+/// where it keeps them off the terminal's top edge; the blank row the strip
+/// already had beneath it does the same job on the other side.
+const TAB_ROWS: u16 = 2;
 
 /// The session tab strip: every non-archived session of the selected space,
 /// with `+` to start another. The active tab carries the selection wash.
@@ -600,7 +602,7 @@ fn draw_tab_strip(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
                 theme.hint(),
             )),
             Rect {
-                y: area.y + 1,
+                y: area.y + TAB_ROWS - 1,
                 width: strip_width.max(1),
                 height: 1,
                 ..area
@@ -625,10 +627,9 @@ fn draw_tab_strip(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
         let first = active.saturating_sub(visible.saturating_sub(1));
         let last = (first + visible).min(tabs.len());
 
-        // The label row. The strip is three rows tall and the active tab's fill
-        // runs all of them, which is the only way to give a one-line label air
-        // above and below it.
-        let label_y = area.y + 1;
+        // The active tab's fill runs the strip's full height; the labels sit on
+        // its last row, under that one row of padding.
+        let label_y = area.y + TAB_ROWS - 1;
         let mut x = area.x;
         if first > 0 {
             frame.render_widget(
