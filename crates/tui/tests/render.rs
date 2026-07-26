@@ -178,16 +178,12 @@ fn a_populated_frame_shows_the_chrome_sidebar_and_transcript() {
     let screen = joined(&rows);
 
     // The tab strip is the header: the selected space's sessions, plus `+`.
-    assert!(rows[1].contains("Rework the diff"), "{}", rows[1]);
+    assert!(rows[0].contains("Rework the diff"), "{}", rows[0]);
     assert!(
-        rows[1].contains("Chase the flaky"),
+        rows[0].contains("Chase the flaky"),
         "both tabs: {}",
-        rows[1]
+        rows[0]
     );
-    // The engine label sits on the status line, not in the strip — it was
-    // costing the tabs a dozen columns.
-    let last = rows.last().expect("the status line");
-    assert!(last.trim_end().ends_with("engine ready"), "{last}");
 
     // Sidebar: two sections.
     assert!(screen.contains("Spaces"), "{screen}");
@@ -237,16 +233,13 @@ fn a_populated_frame_shows_the_chrome_sidebar_and_transcript() {
          margin — found at {indent}:\n{screen}"
     );
 
-    // Hint bar: focus-aware — the fixture starts in the composer, where `q` is a
-    // literal and Ctrl-C is the way out.
-    let status = rows.last().unwrap();
-    assert!(status.contains("Ctrl-C detach"), "{status}");
-    app.focus = Focus::Transcript;
-    let rows = snapshot(&mut app, 100, 24);
+    // Both panes run the terminal's full height: there is no status bar under
+    // them any more, so the last row belongs to the sidebar and the prompt
+    // rather than to chrome spanning both.
+    let last = rows.last().unwrap();
     assert!(
-        rows.last().unwrap().contains("q detach"),
-        "{:?}",
-        rows.last()
+        !last.contains("detach") && !last.contains("engine"),
+        "no chrome bar should remain: {last}"
     );
 }
 
@@ -444,18 +437,22 @@ fn the_composer_grows_with_its_content_and_places_the_caret() {
 }
 
 #[test]
-fn a_notice_takes_over_the_status_line_then_gives_it_back() {
+fn a_notice_takes_over_the_working_strip_then_gives_it_back() {
+    // There is no status bar any more, so a notice lands on the row above the
+    // prompt — already reserved for the working line, and the closest thing to
+    // the prompt that is not the prompt.
     let mut app = populated();
     app.notify("Couldn't send: engine unreachable".into());
-    let rows = snapshot(&mut app, 80, 20);
-    let status = rows.last().unwrap();
-    assert!(status.contains("engine unreachable"), "{status}");
+    let screen = joined(&snapshot(&mut app, 80, 20));
+    assert!(screen.contains("engine unreachable"), "{screen}");
 
     app.notice.as_mut().unwrap().until = std::time::Instant::now();
     assert!(app.expire_notice());
-    let rows = snapshot(&mut app, 80, 20);
-    let status = rows.last().unwrap();
-    assert!(status.contains("detach"), "hints must return: {status}");
+    let screen = joined(&snapshot(&mut app, 80, 20));
+    assert!(
+        !screen.contains("engine unreachable"),
+        "the notice must clear: {screen}"
+    );
 }
 
 #[test]
@@ -869,9 +866,9 @@ fn the_tab_strip_shows_only_the_selected_spaces_sessions() {
 
     app.selected_space = Some("s1".into());
     let rows = snapshot(&mut app, 100, 24);
-    assert!(rows[1].contains("Alpha session"), "{}", rows[1]);
+    assert!(rows[0].contains("Alpha session"), "{}", rows[0]);
     assert!(
-        !rows[1].contains("Beta session"),
+        !rows[0].contains("Beta session"),
         "another space's session must not be a tab: {}",
         rows[0]
     );
@@ -879,8 +876,8 @@ fn the_tab_strip_shows_only_the_selected_spaces_sessions() {
     // Switching space swaps the strip.
     app.selected_space = Some("s2".into());
     let rows = snapshot(&mut app, 100, 24);
-    assert!(rows[1].contains("Beta session"), "{}", rows[1]);
-    assert!(!rows[1].contains("Alpha session"), "{}", rows[1]);
+    assert!(rows[0].contains("Beta session"), "{}", rows[0]);
+    assert!(!rows[0].contains("Alpha session"), "{}", rows[0]);
 }
 
 #[test]
@@ -1003,7 +1000,7 @@ fn clicking_a_space_activates_it_and_swaps_the_tabs() {
     app.click(x, y);
     assert_eq!(app.selected_space.as_deref(), Some("s2"));
     let rows = snapshot(&mut app, 100, 24);
-    assert!(rows[1].contains("Beta session"), "{}", rows[1]);
+    assert!(rows[0].contains("Beta session"), "{}", rows[0]);
 }
 
 #[test]
@@ -1011,9 +1008,9 @@ fn clicking_a_tab_switches_to_it() {
     let mut app = populated();
     app.selected_space = Some("s1".into());
     app.select_chat(Some("c1".into()));
-    // Tabs live on the header row, under the frame's top inset.
+    // Tabs are the header row.
     let (x, y) = cell_of(&mut app, 100, 24, "Chase the flaky");
-    assert_eq!(y, 1, "tabs are the header row");
+    assert_eq!(y, 0, "tabs are the header row");
     app.click(x, y);
     assert_eq!(app.selected_chat.as_deref(), Some("c2"));
 }
@@ -1025,8 +1022,8 @@ fn clicking_plus_starts_a_session_and_the_panes_take_focus() {
     let before = app.selected_chat.clone();
     // The tab strip's `+`, not the Spaces header's — both are on screen.
     let rows = snapshot(&mut app, 100, 24);
-    let x = column_of(&rows[1], rows[1].rfind('+').expect("the tab strip's +"));
-    app.click(x, 1);
+    let x = column_of(&rows[0], rows[0].rfind('+').expect("the tab strip's +"));
+    app.click(x, 0);
     // `+` opens a draft, as the desktop canvas does — nothing is created until
     // the first send.
     assert!(app.draft.is_some(), "a draft was opened");
@@ -1077,9 +1074,6 @@ fn clicks_outside_any_target_do_nothing() {
     let mut app = populated();
     snapshot(&mut app, 100, 24);
     let before = (app.selected_chat.clone(), app.focus, app.cursor);
-    // The hint bar is the last row and registers no target.
-    app.click(10, 23);
-    assert_eq!((app.selected_chat.clone(), app.focus, app.cursor), before);
     // Far outside the frame entirely.
     app.click(500, 500);
     assert_eq!((app.selected_chat.clone(), app.focus, app.cursor), before);
@@ -1379,7 +1373,7 @@ fn a_draft_shows_its_pending_tab_and_where_it_will_run() {
     let screen = joined(&rows);
 
     // A pending tab, so the pane is not simply blank.
-    assert!(rows[1].contains("New session"), "{}", rows[1]);
+    assert!(rows[0].contains("New session"), "{}", rows[0]);
     // The chips say where it will run — the choice only exists before send.
     assert!(
         screen.contains("Current checkout"),
@@ -1883,11 +1877,10 @@ fn a_picker_is_a_filled_surface_not_a_box() {
 }
 
 #[test]
-fn a_tool_group_is_a_block_with_air_around_it() {
-    // The old layout ran text, tool group and text together into one wall. What
-    // the agent *did* is now a filled band, the same as what it said is, so a run
-    // of tool calls reads as one object you can skip rather than loose rows
-    // sharing the prose column.
+fn a_tool_group_is_plain_rows_with_air_around_it() {
+    // A tool run is the agent's bookkeeping, not something it said to you.
+    // Giving it a fill of its own made every reply look like it had been
+    // interrupted by a panel; the chevron and the indent are enough.
     use komet_proto::ToolCall;
     let mut app = populated();
     app.apply(Update::Transcript {
@@ -1923,21 +1916,17 @@ fn a_tool_group_is_a_block_with_air_around_it() {
     );
     assert!(second > group + 1, "and below:\n{screen}");
 
-    // The band runs the content column's full width, so it has a right edge.
     let mut terminal = Terminal::new(TestBackend::new(100, 26)).unwrap();
     terminal
         .draw(|frame| render::draw(frame, &mut app))
         .unwrap();
     let buffer = terminal.backend().buffer();
-    let y = group as u16;
     let x = column_of(&rows[group], rows[group].find("Ran 1").unwrap());
-    assert_eq!(buffer[(x, y)].bg, app.theme.element);
     assert_eq!(
-        buffer[(96, y)].bg,
-        app.theme.element,
-        "the band should reach the far side of the column:\n{screen}"
+        buffer[(x, group as u16)].bg,
+        app.theme.base,
+        "a tool group sits on the app surface, not on a fill of its own"
     );
-    // And no rail: the fill is the whole boundary.
     assert!(
         !rows[group].contains('│'),
         "a rail survived beside the group:\n{screen}"

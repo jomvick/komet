@@ -589,23 +589,39 @@ fn render_bubble(
 ) {
     let fill = theme.bubble();
     let bar = Some(theme.accent_bar());
-    let inner = width.saturating_sub(4).max(1);
-    out.push(block_pad(width, fill, bar));
+    // Capped, then shrunk to the longest line it actually used. A block sized to
+    // the whole column makes a three-word question look like a paragraph; sized
+    // to its text, the bar and the fill say "you said this" and the block's
+    // right edge says how much of it there was.
+    let cap = ((width * 4) / 5).saturating_sub(4).max(8);
+    let mut rows: Vec<String> = Vec::new();
     for paragraph in wrap::sanitize(text).split('\n') {
-        for row in wrap::wrap(paragraph, inner, "") {
-            out.push(block_row(vec![Span::styled(row, fill)], width, fill, bar));
-        }
+        rows.extend(wrap::wrap(paragraph, cap, ""));
+    }
+    let clock = format_clock(created_at);
+    // Wide enough for the text, and never so narrow that the timestamp on the
+    // closing row has to overrun it.
+    let widest = rows
+        .iter()
+        .map(|row| wrap::width_of(row))
+        .max()
+        .unwrap_or(0)
+        .max(wrap::width_of(&clock));
+    let block = (widest + 4).min(width);
+
+    out.push(block_pad(block, fill, bar));
+    for row in rows {
+        out.push(block_row(vec![Span::styled(row, fill)], block, fill, bar));
     }
     // The timestamp closes the block from inside it, right-aligned, so the block
     // ends on a padded row either way.
-    let clock = format_clock(created_at);
-    let pad = width.saturating_sub(2 + wrap::width_of(&clock) + 1);
+    let pad = block.saturating_sub(2 + wrap::width_of(&clock) + 2);
     out.push(block_row(
         vec![
             Span::styled(" ".repeat(pad), fill),
             Span::styled(clock, fill.patch(Style::default().fg(theme.faint))),
         ],
-        width,
+        block,
         fill,
         bar,
     ));
@@ -625,60 +641,43 @@ fn render_tool_group(
         .collect();
     let summary = komet_proto::view::tool_group_summary(&pairs);
     let chevron = if expanded { "⌄" } else { "›" };
-    // What the agent *did* is a block, the same as what it said to you is: a
-    // filled band, so a run of tool calls reads as one object you can skip over
-    // rather than as loose rows sharing the prose column.
-    let fill = theme.element();
-    out.push(block_pad(width, fill, None));
-    out.push(block_row(
-        vec![
-            Span::styled(
-                format!("{chevron} "),
-                fill.patch(Style::default().fg(theme.faint)),
-            ),
-            Span::styled(
-                wrap::truncate(&summary, width.saturating_sub(5)),
-                fill.patch(Style::default().fg(theme.muted)),
-            ),
-        ],
-        width,
-        fill,
-        None,
-    ));
+    // Not a block. A tool run is the agent's own bookkeeping, not something it
+    // said to you, and giving it a fill of its own made every reply look like it
+    // was interrupted by a panel. The chevron and the indent are enough.
+    out.push(indented(vec![
+        Span::styled(format!("{chevron} "), theme.hint()),
+        Span::styled(
+            wrap::truncate(&summary, width.saturating_sub(4)),
+            theme.subtle(),
+        ),
+    ]));
     if !expanded {
-        out.push(block_pad(width, fill, None));
         return;
     }
     // Indented under the chevron rather than railed beside it: the summary above
     // already brackets the run, so a vertical stroke is a second bracket.
     for (call, is_error, resolved) in tools {
         let (label, detail) = komet_proto::view::tool_chip_content(call);
-        let label_style = fill.patch(Style::default().fg(if *is_error {
+        let label_style = Style::default().fg(if *is_error {
             theme.danger
         } else if *resolved {
             theme.muted
         } else {
             theme.faint
-        }));
+        });
         let used = 4 + wrap::width_of(label) + 2;
-        out.push(block_row(
-            vec![
-                Span::styled("  ".to_string(), fill),
-                Span::styled(label.to_string(), label_style),
-                Span::styled(
-                    format!(
-                        "  {}",
-                        wrap::truncate(&wrap::sanitize(&detail), width.saturating_sub(used))
-                    ),
-                    fill.patch(Style::default().fg(theme.faint)),
+        out.push(indented(vec![
+            Span::raw("  ".to_string()),
+            Span::styled(label.to_string(), label_style),
+            Span::styled(
+                format!(
+                    "  {}",
+                    wrap::truncate(&wrap::sanitize(&detail), width.saturating_sub(used))
                 ),
-            ],
-            width,
-            fill,
-            None,
-        ));
+                theme.hint(),
+            ),
+        ]));
     }
-    out.push(block_pad(width, fill, None));
 }
 
 fn render_error(message: &str, width: usize, theme: &Theme, out: &mut Vec<Line<'static>>) {

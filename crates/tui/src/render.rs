@@ -63,7 +63,6 @@ use ratatui::widgets::{Block, Clear, Paragraph, Widget};
 use komet_proto::view::{ConnectionStatus, GatePhase};
 
 use crate::app::{App, ChipKind, Hit, Overlay, Row};
-use crate::daemon::Attachment;
 use crate::keys::{Focus, HELP};
 use crate::loaders;
 use crate::theme::{self, Theme};
@@ -76,9 +75,6 @@ const SIDEBAR_MAX: u16 = 30;
 const SIDEBAR_MIN: u16 = 20;
 /// The composer grows with its content up to this many text rows.
 const COMPOSER_MAX_ROWS: u16 = 8;
-/// Reading measure for the transcript. The original caps its content column
-/// rather than letting prose run the full width of a wide window.
-const CONTENT_MAX: u16 = 96;
 /// The main pane's own margin — one column of terminal background down each
 /// side, so a filled region inside it has somewhere to end.
 const MAIN_PAD: u16 = 1;
@@ -112,15 +108,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // only reads as raised against a surface it can be compared to.
     fill(frame, area, theme.base());
 
-    // One row of air at the top, matching the one the hint bar leaves at the
-    // bottom, so the chrome is inset from the terminal's edges rather than
-    // clamped to them.
-    let [_, body, hints] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(6),
-        Constraint::Length(1),
-    ])
-    .areas(area);
+    // Both panes run the terminal's full height. A pane that stops short of the
+    // top or bottom reads as a floating card rather than as one side of the
+    // window, and the sidebar's fill is doing the work a divider used to.
+    let body = area;
 
     let sidebar_width = if app.sidebar_visible {
         SIDEBAR_MAX
@@ -137,7 +128,6 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_sidebar(frame, sidebar, app, &theme);
     }
     draw_main(frame, main, app, &theme);
-    draw_hints(frame, hints, app, &theme);
 
     if let Some(overlay) = &app.overlay {
         let panel = draw_overlay(frame, body, app, overlay, &theme);
@@ -146,9 +136,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 
     if app.help {
-        // Everything below the top row: the header (and the sidebar's device row,
-        // which shares that row) stay readable, so you keep your place while
-        // reading the key map.
+        // Everything below the top row: the tab strip (and the sidebar's Spaces
+        // header, which shares that row) stay readable, so you keep your place
+        // while reading the key map.
         let panel = Rect {
             y: body.y + 1,
             height: body.height.saturating_sub(1),
@@ -558,17 +548,18 @@ fn draw_main(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
 const TAB_WIDTH: usize = 26;
 
 /// The narrowest a tab is allowed to get before the strip starts overflowing
-/// instead. Tabs shrink to fit first, because a strip showing every session
-/// narrowly is more navigable than one showing two of them widely.
-const TAB_MIN: usize = 18;
-
-/// Air between tabs — the desktop's `gap(6px)`.
+/// instead.
 ///
-/// Without it the tabs share edges, and since the active one is the only filled
-/// block, the strip reads as a single bar with a bright patch somewhere in it
-/// rather than as a row of separate things. The gap is what turns the fill into
-/// a tab, so it is worth more than one column.
-const TAB_GAP: u16 = 3;
+/// Tabs shrink to fit first, but only so far: a strip of eight sessions all
+/// truncated to "Rebuild C…" is not more navigable than four you can actually
+/// read plus a marker saying there are more. This floor is what decides which
+/// of those two you get.
+const TAB_MIN: usize = 22;
+
+/// Air between tabs. One column: the separation a tab needs comes from the
+/// padding *inside* its own fill, not from pushing its neighbours away — a wide
+/// gap just spreads the strip out without making any single tab easier to read.
+const TAB_GAP: u16 = 1;
 
 /// Shown in place of a tab when the strip has more either side than it can fit.
 /// A strip that silently drops tabs is one you cannot navigate, because nothing
@@ -576,10 +567,10 @@ const TAB_GAP: u16 = 3;
 const TAB_MORE_LEFT: &str = "‹";
 const TAB_MORE_RIGHT: &str = "›";
 
-/// Padding inside a tab, per side, so a filled tab does not clamp its own text.
-/// Set so a tab's contents land on the same column as the transcript's and the
-/// prompt's.
-const TAB_PAD: u16 = PAD as u16;
+/// Padding inside a tab, per side. Wider than the pane's own [`PAD`], because
+/// this is what stops the active tab's fill from clamping the title inside it —
+/// the thing that made the strip feel cramped.
+const TAB_PAD: u16 = 3;
 
 /// The session tab strip: every non-archived session of the selected space,
 /// with `+` to start another. The active tab carries the selection wash.
@@ -710,24 +701,11 @@ fn draw_tab_strip(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
     }
 }
 
-fn engine_label(app: &App) -> String {
-    match (&app.connection, &app.attachment) {
-        (ConnectionStatus::Connecting, _) => "connecting… ".to_string(),
-        (ConnectionStatus::Failed(_), _) => "engine down ".to_string(),
-        (ConnectionStatus::Ready, Some(Attachment::Spawned { pid })) => {
-            format!("engine {pid} · started here ")
-        }
-        (ConnectionStatus::Ready, Some(Attachment::Attached)) => "engine attached ".to_string(),
-        (ConnectionStatus::Ready, None) => "engine ready ".to_string(),
-    }
-}
-
 fn draw_transcript(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
-    // Cap the reading measure, as the original caps its content column.
-    let column = Rect {
-        width: area.width.min(CONTENT_MAX),
-        ..area
-    };
+    // The full pane. A capped reading measure left a band of dead space down the
+    // right of every wide terminal, and the blocks inside stopped short of the
+    // pane they were supposed to be filling.
+    let column = area;
     // Lay out against the real column before reading anything from it; this is
     // the only place the transcript learns its width, so a resize lands here.
     app.lay_out_transcript(column.width, column.height as usize);
@@ -781,6 +759,26 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) 
 /// indicator, or the scroll notice. Reserved even when empty so the composer
 /// never shifts under the cursor.
 fn draw_status_strip(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
+    // A notice outranks everything else here: it is the only channel the app has
+    // for "that didn't work", and it used to live on a status bar that no longer
+    // exists. This row is already reserved, so it costs nothing to land here.
+    if let Some(notice) = &app.notice {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                format!(
+                    "{}{}",
+                    " ".repeat(PAD),
+                    wrap::truncate(
+                        &wrap::sanitize(&notice.text),
+                        (area.width as usize).saturating_sub(PAD)
+                    )
+                ),
+                Style::default().fg(theme.warning),
+            )),
+            area,
+        );
+        return;
+    }
     if let Some(elapsed) = app.working_elapsed() {
         let seconds = elapsed.as_secs();
         // The same indicator the session rows and tabs use. One running session
@@ -830,9 +828,11 @@ const COMPOSER_PAD: u16 = PAD as u16;
 const BAR: &str = "┃";
 
 /// Rows the composer block adds around its text: a row of air on top, a row of
-/// air under the text, and the meta row itself. The meta row is *always* one of
-/// them — see [`App::composer_meta`] for why it can never be conditional.
-const COMPOSER_CHROME: u16 = 3;
+/// air under the text, the meta row, and a row of air under *that*. The bottom
+/// pad is not optional — without it the meta row sits flush on the block's edge
+/// and the whole prompt reads as clipped. The meta row is always present too;
+/// see [`App::composer_meta`] for why it can never be conditional.
+const COMPOSER_CHROME: u16 = 4;
 
 fn draw_composer(frame: &mut Frame, area: Rect, text_rows: u16, app: &mut App, theme: &Theme) {
     if area.height == 0 || area.width < 6 {
@@ -868,12 +868,13 @@ fn draw_composer(frame: &mut Frame, area: Rect, text_rows: u16, app: &mut App, t
         height: text_rows,
     };
 
-    // The meta row is the last row of the block, under a row of air.
+    // The meta row is the second-to-last row: the last one is the block's bottom
+    // padding, which is what keeps the meta row off the edge.
     if area.height >= COMPOSER_CHROME {
         draw_composer_meta(
             frame,
             Rect {
-                y: area.y + area.height - 1,
+                y: area.y + area.height - 2,
                 height: 1,
                 ..text_area
             },
@@ -1057,74 +1058,6 @@ fn draw_caret(frame: &mut Frame, x: u16, y: u16, theme: &Theme) {
 // ---------------------------------------------------------------------------
 // Hints, gates, overlays
 // ---------------------------------------------------------------------------
-
-fn draw_hints(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
-    if let Some(notice) = &app.notice {
-        frame.render_widget(
-            Paragraph::new(Span::styled(
-                format!(
-                    " {}",
-                    wrap::truncate(&wrap::sanitize(&notice.text), area.width as usize)
-                ),
-                Style::default().fg(theme.warning),
-            )),
-            area,
-        );
-        return;
-    }
-
-    // Focus-aware, because in the composer every letter is text: advertising
-    // "q detach" there would be a lie that types a `q`.
-    let composing = app.focus == Focus::Composer;
-    let mut hints: Vec<(&str, &str)> = vec![match app.focus {
-        Focus::Composer => ("Enter", "send"),
-        Focus::Sidebar => ("Enter", "open"),
-        Focus::Transcript => ("i", "prompt"),
-    }];
-    hints.push(("Tab", "pane"));
-    if !composing {
-        hints.push(("n", "new"));
-        hints.push(("?", "help"));
-    }
-    // Only while there is something to stop. Advertising an interrupt over an
-    // idle session is a key that does nothing, which is worse than no hint.
-    if app.working_elapsed().is_some() {
-        hints.push(("Ctrl-X", "stop"));
-    }
-    hints.push(if composing {
-        ("Ctrl-C", "detach")
-    } else {
-        ("q", "detach")
-    });
-
-    let mut spans = vec![Span::raw(" ".to_string())];
-    for (key, what) in hints {
-        if spans.len() > 1 {
-            spans.push(Span::raw("   ".to_string()));
-        }
-        spans.push(Span::styled(key.to_string(), theme.subtle()));
-        spans.push(Span::styled(format!(" {what}"), theme.hint()));
-    }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
-
-    // The engine label lives here rather than in the tab strip. Whether quitting
-    // leaves work running is the one thing about this app you must never have to
-    // guess, so it is always on screen — but it was costing the strip a dozen
-    // columns, and a tab truncated to "Unpeel A…" is a tab you cannot tell from
-    // its neighbour. Status belongs on the status line.
-    let engine = engine_label(app);
-    let width = wrap::width_of(&engine) as u16;
-    if width + 2 < area.width {
-        frame.render_widget(
-            Paragraph::new(Span::styled(engine, theme.hint())),
-            Rect {
-                x: area.x + area.width - width - 1,
-                width,
-                ..area
-            },
-        );
-    }
-}
 
 fn draw_gate(frame: &mut Frame, area: Rect, app: &App, theme: &Theme, phase: GatePhase) {
     let (title, body): (String, Vec<String>) = match phase {

@@ -103,11 +103,8 @@ def main() -> int:
             "the boot gate cleared (engine reachable)",
             screen.text(),
         )
-        check(
-            "engine" in screen.lines()[-1],
-            "the status line names the engine we attached to",
-            screen.lines()[0],
-        )
+        # The engine label left the viewport with the status bar; `--probe` is
+        # the check that it is really attached, and it runs immediately below.
         check(probe(), "a daemon is listening")
 
         print("\n3. create a space and a session, then send a prompt")
