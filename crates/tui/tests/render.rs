@@ -174,18 +174,20 @@ fn sidebar_of(rows: &[String], width: u16) -> Vec<String> {
 #[test]
 fn a_populated_frame_shows_the_chrome_sidebar_and_transcript() {
     let mut app = populated();
-    let rows = snapshot(&mut app, 100, 24);
+    let rows = snapshot(&mut app, 100, 30);
     let screen = joined(&rows);
 
-    // The tab strip is the header: the selected space's sessions, plus `+`,
-    // with the engine label right-aligned.
-    assert!(rows[0].contains("Rework the diff"), "{}", rows[0]);
+    // The tab strip is the header: the selected space's sessions, plus `+`.
+    assert!(rows[1].contains("Rework the diff"), "{}", rows[1]);
     assert!(
-        rows[0].contains("Chase the flaky"),
+        rows[1].contains("Chase the flaky"),
         "both tabs: {}",
-        rows[0]
+        rows[1]
     );
-    assert!(rows[0].trim_end().ends_with("engine ready"), "{}", rows[0]);
+    // The engine label sits on the status line, not in the strip — it was
+    // costing the tabs a dozen columns.
+    let last = rows.last().expect("the status line");
+    assert!(last.trim_end().ends_with("engine ready"), "{last}");
 
     // Sidebar: two sections.
     assert!(screen.contains("Spaces"), "{screen}");
@@ -216,15 +218,23 @@ fn a_populated_frame_shows_the_chrome_sidebar_and_transcript() {
     );
     assert!(screen.contains("retry once"), "bullet missing:\n{screen}");
 
-    // The user's own prompt is a right-aligned bubble, not a gutter marker.
+    // The user's own message is a full-width block carrying the accent bar —
+    // opencode's shape, not the desktop's right-aligned bubble. A narrow bubble
+    // at the right margin left a long tail of dead space on every user turn and
+    // moved the reading column; the bar says "you said this" without either.
     let prompt_row = rows
         .iter()
         .position(|row| row.contains("why is the room test flaky?"))
         .expect("the prompt");
+    assert!(
+        rows[prompt_row].contains('┃'),
+        "the user's message should carry the accent bar:\n{screen}"
+    );
     let indent = rows[prompt_row].find("why is").expect("prompt column");
     assert!(
-        indent > 40,
-        "the prompt should be right-aligned, found at column {indent}:\n{screen}"
+        indent < 40,
+        "the message should start at the reading column, not at the right \
+         margin — found at {indent}:\n{screen}"
     );
 
     // Hint bar: focus-aware — the fixture starts in the composer, where `q` is a
@@ -859,9 +869,9 @@ fn the_tab_strip_shows_only_the_selected_spaces_sessions() {
 
     app.selected_space = Some("s1".into());
     let rows = snapshot(&mut app, 100, 24);
-    assert!(rows[0].contains("Alpha session"), "{}", rows[0]);
+    assert!(rows[1].contains("Alpha session"), "{}", rows[1]);
     assert!(
-        !rows[0].contains("Beta session"),
+        !rows[1].contains("Beta session"),
         "another space's session must not be a tab: {}",
         rows[0]
     );
@@ -869,8 +879,8 @@ fn the_tab_strip_shows_only_the_selected_spaces_sessions() {
     // Switching space swaps the strip.
     app.selected_space = Some("s2".into());
     let rows = snapshot(&mut app, 100, 24);
-    assert!(rows[0].contains("Beta session"), "{}", rows[0]);
-    assert!(!rows[0].contains("Alpha session"), "{}", rows[0]);
+    assert!(rows[1].contains("Beta session"), "{}", rows[1]);
+    assert!(!rows[1].contains("Alpha session"), "{}", rows[1]);
 }
 
 #[test]
@@ -993,7 +1003,7 @@ fn clicking_a_space_activates_it_and_swaps_the_tabs() {
     app.click(x, y);
     assert_eq!(app.selected_space.as_deref(), Some("s2"));
     let rows = snapshot(&mut app, 100, 24);
-    assert!(rows[0].contains("Beta session"), "{}", rows[0]);
+    assert!(rows[1].contains("Beta session"), "{}", rows[1]);
 }
 
 #[test]
@@ -1001,9 +1011,9 @@ fn clicking_a_tab_switches_to_it() {
     let mut app = populated();
     app.selected_space = Some("s1".into());
     app.select_chat(Some("c1".into()));
-    // Tabs live on row 0; find the inactive one and click it.
+    // Tabs live on the header row, under the frame's top inset.
     let (x, y) = cell_of(&mut app, 100, 24, "Chase the flaky");
-    assert_eq!(y, 0, "tabs are the header row");
+    assert_eq!(y, 1, "tabs are the header row");
     app.click(x, y);
     assert_eq!(app.selected_chat.as_deref(), Some("c2"));
 }
@@ -1015,8 +1025,8 @@ fn clicking_plus_starts_a_session_and_the_panes_take_focus() {
     let before = app.selected_chat.clone();
     // The tab strip's `+`, not the Spaces header's — both are on screen.
     let rows = snapshot(&mut app, 100, 24);
-    let x = column_of(&rows[0], rows[0].rfind('+').expect("the tab strip's +"));
-    app.click(x, 0);
+    let x = column_of(&rows[1], rows[1].rfind('+').expect("the tab strip's +"));
+    app.click(x, 1);
     // `+` opens a draft, as the desktop canvas does — nothing is created until
     // the first send.
     assert!(app.draft.is_some(), "a draft was opened");
@@ -1264,21 +1274,27 @@ fn nothing_in_the_steady_state_view_is_drawn_with_a_line() {
     let mut app = populated();
     let screen = joined(&snapshot(&mut app, 100, 26));
     for stroke in [
-        '│', '┃', '─', '━', '├', '┤', '┬', '┴', '┼', '╭', '╮', '╰', '╯', '┌', '┐', '└', '┘',
+        '│', '─', '━', '├', '┤', '┬', '┴', '┼', '╭', '╮', '╰', '╯', '┌', '┐', '└', '┘',
     ] {
         assert!(
             !screen.contains(stroke),
             "{stroke:?} is line work the fills replaced:\n{screen}"
         );
     }
+    // The one exception, and it is not a border: the accent bar down the left of
+    // the prompt and of the user's own messages. opencode marks both the same
+    // way, it is the only colour in the chrome, and it encloses nothing.
+    assert!(
+        screen.contains('┃'),
+        "the accent bar should mark what is yours:\n{screen}"
+    );
 }
 
 #[test]
-fn the_sidebar_is_a_fill_and_the_transcript_is_not() {
+fn the_sidebar_and_the_transcript_sit_at_different_levels() {
     // The two panes are separated by the sidebar's fill ending, and by nothing
-    // else. The transcript stays on the terminal's own background — it is the
-    // largest and most-scrolled region, and a fill there would cost both the
-    // user's background and its transparency.
+    // else. The transcript keeps the app's own base surface — one step below the
+    // sidebar — so the blocks drawn on it have something to be raised against.
     let mut app = populated();
     let mut terminal = Terminal::new(TestBackend::new(100, 26)).unwrap();
     terminal
@@ -1287,23 +1303,24 @@ fn the_sidebar_is_a_fill_and_the_transcript_is_not() {
     let buffer = terminal.backend().buffer();
     let panel = app.theme.panel;
 
-    // A row well clear of the header and the prompt.
-    let y = 6u16;
+    // A row well clear of the header, the selection and the prompt.
+    let y = 9u16;
     for x in 0..30u16 {
         assert_eq!(buffer[(x, y)].bg, panel, "sidebar column {x} is not filled");
     }
     assert_eq!(
         buffer[(30, y)].bg,
-        ratatui::style::Color::Reset,
-        "the transcript must start on the terminal's own background"
+        app.theme.base,
+        "the transcript sits on the app's base surface"
     );
+    assert_ne!(app.theme.base, panel, "and the two are distinguishable");
 }
 
 #[test]
-fn taking_focus_lifts_the_prompt_one_step_of_the_ramp() {
-    // Focus is a level, not a stroke — the same move a menu row makes when the
-    // cursor lands on it. Nothing changes shape, so nothing reflows under the
-    // caret while you are typing.
+fn taking_focus_lights_the_prompts_accent_bar() {
+    // The prompt is a block like the user's messages above it and carries the
+    // same accent bar; focus is that bar going indigo. Nothing changes shape or
+    // level, so nothing reflows under the caret while you are typing.
     let mut app = populated();
     app.focus = Focus::Composer;
     let rows = snapshot(&mut app, 100, 26);
@@ -1322,27 +1339,36 @@ fn taking_focus_lifts_the_prompt_one_step_of_the_ramp() {
     terminal
         .draw(|frame| render::draw(frame, &mut app))
         .unwrap();
+    let buffer = terminal.backend().buffer();
     assert_eq!(
-        terminal.backend().buffer()[(x, y)].bg,
+        buffer[(x, y)].bg,
         app.theme.element,
-        "a focused prompt sits at element level"
+        "the prompt is a block"
     );
+    // The bar is the block's leftmost column.
+    let bar_x = column_of(
+        &rows[y as usize],
+        rows[y as usize].rfind('┃').expect("the prompt's bar"),
+    );
+    assert_eq!(buffer[(bar_x, y)].fg, app.theme.accent, "focused: indigo");
 
     app.focus = Focus::Transcript;
     let mut terminal = Terminal::new(TestBackend::new(100, 26)).unwrap();
     terminal
         .draw(|frame| render::draw(frame, &mut app))
         .unwrap();
-    let cell = &terminal.backend().buffer()[(x, y)];
+    let buffer = terminal.backend().buffer();
     assert_eq!(
-        cell.bg, app.theme.panel,
-        "an unfocused prompt drops back to panel level"
+        buffer[(bar_x, y)].symbol(),
+        "┃",
+        "the bar does not move when the prompt loses focus"
     );
     assert_eq!(
-        cell.symbol(),
-        "n",
-        "and the prompt does not move when it loses focus"
+        buffer[(bar_x, y)].fg,
+        app.theme.faint,
+        "unfocused: the bar drops to the block's own muted edge"
     );
+    assert_eq!(buffer[(x, y)].bg, app.theme.element, "and stays a block");
 }
 
 #[test]
@@ -1353,7 +1379,7 @@ fn a_draft_shows_its_pending_tab_and_where_it_will_run() {
     let screen = joined(&rows);
 
     // A pending tab, so the pane is not simply blank.
-    assert!(rows[0].contains("New session"), "{}", rows[0]);
+    assert!(rows[1].contains("New session"), "{}", rows[1]);
     // The chips say where it will run — the choice only exists before send.
     assert!(
         screen.contains("Current checkout"),
@@ -1441,7 +1467,16 @@ fn the_prompt_has_air_around_it() {
     // The main pane past the sidebar. Both rows around the prompt are inside the
     // prompt's own fill: the block reserves a row of air on top, and a row below
     // that separates the text from the meta row.
-    let main = |row: &str| row.chars().skip(31).collect::<String>().trim().to_string();
+    // Past the sidebar *and* past the prompt's accent bar, which is a mark on
+    // the block rather than content in it.
+    let main = |row: &str| {
+        row.chars()
+            .skip(31)
+            .collect::<String>()
+            .replace('┃', " ")
+            .trim()
+            .to_string()
+    };
     assert!(
         main(&rows[prompt - 1]).is_empty(),
         "no air above the prompt:\n{}",
@@ -1848,10 +1883,11 @@ fn a_picker_is_a_filled_surface_not_a_box() {
 }
 
 #[test]
-fn blocks_inside_a_message_get_air_only_where_they_need_it() {
-    // The old layout ran text, tool group and text together into one wall.
-    // opencode's rule — a block taller than a row is separated, a run of
-    // one-liners is not — is what makes a transcript scannable.
+fn a_tool_group_is_a_block_with_air_around_it() {
+    // The old layout ran text, tool group and text together into one wall. What
+    // the agent *did* is now a filled band, the same as what it said is, so a run
+    // of tool calls reads as one object you can skip rather than loose rows
+    // sharing the prose column.
     use komet_proto::ToolCall;
     let mut app = populated();
     app.apply(Update::Transcript {
@@ -1881,27 +1917,38 @@ fn blocks_inside_a_message_get_air_only_where_they_need_it() {
             .unwrap_or_else(|| panic!("{needle:?} missing:\n{screen}"))
     };
     let (first, group, second) = (at("first"), at("Ran 1 command"), at("second"));
-    assert_eq!(
-        group,
-        first + 2,
+    assert!(
+        group > first + 1,
         "the tool group needs air above:\n{screen}"
     );
+    assert!(second > group + 1, "and below:\n{screen}");
+
+    // The band runs the content column's full width, so it has a right edge.
+    let mut terminal = Terminal::new(TestBackend::new(100, 26)).unwrap();
+    terminal
+        .draw(|frame| render::draw(frame, &mut app))
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    let y = group as u16;
+    let x = column_of(&rows[group], rows[group].find("Ran 1").unwrap());
+    assert_eq!(buffer[(x, y)].bg, app.theme.element);
     assert_eq!(
-        second,
-        group + 3,
-        "and below — the chip row makes it two lines tall:\n{screen}"
+        buffer[(96, y)].bg,
+        app.theme.element,
+        "the band should reach the far side of the column:\n{screen}"
     );
-    // The chips themselves are indented under the chevron, not railed beside it.
+    // And no rail: the fill is the whole boundary.
     assert!(
-        !rows[group + 1].contains('│') || rows[group + 1].matches('│').count() == 1,
-        "a rail survived beside the chips:\n{screen}"
+        !rows[group].contains('│'),
+        "a rail survived beside the group:\n{screen}"
     );
 }
 
 #[test]
-fn fenced_code_is_a_wash_card_sized_to_its_widest_line() {
-    // Inline `code` is a wash, so block code is too — the same decision at block
-    // scale, and a card needs no rail to say where it starts.
+fn fenced_code_is_a_full_width_band() {
+    // Sized to the column, not to its widest line. A card that shrinks to its
+    // content makes every code block a different width, and a column of
+    // different-width cards is the ragged look the fills were meant to fix.
     let mut app = populated();
     app.apply(Update::Transcript {
         chat_id: "c1".into(),
@@ -1930,18 +1977,13 @@ fn fenced_code_is_a_wash_card_sized_to_its_widest_line() {
         wash,
         "code should sit on a wash:\n{screen}"
     );
-    // Sized to the widest line, so the short one is padded to match rather than
-    // leaving a ragged edge.
-    let widest = "let yy = 22;".len() as u16;
-    assert_eq!(buffer[(x + widest, y)].bg, wash, "ragged card:\n{screen}");
-    assert_ne!(
-        buffer[(x + widest + 1, y)].bg,
-        wash,
-        "the card should stop at its widest line + padding:\n{screen}"
-    );
-    // And no rail: the wash is the whole boundary.
+    // Both the short line and the long one reach the same right edge.
+    assert_eq!(buffer[(96, y)].bg, wash, "ragged right edge:\n{screen}");
+    assert_eq!(buffer[(96, y + 1)].bg, wash, "ragged right edge:\n{screen}");
+    // Recessed rather than raised: code quoted inside a reply reads as below it.
+    assert_ne!(wash, app.theme.element);
     assert!(
-        !rows[y as usize].contains('│') || rows[y as usize].matches('│').count() == 1,
+        !rows[y as usize].contains('│'),
         "a rail survived beside the code:\n{screen}"
     );
 }

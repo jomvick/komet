@@ -43,18 +43,25 @@ pub struct Theme {
     pub faint: Color,
     /// Indigo. Reserved for Send and focus, per the original.
     pub accent: Color,
-    /// `grays[2]`. The sidebar, the composer footer, a dialog — a region that is
-    /// a *place*. opencode's `backgroundPanel`.
+    /// The app's own background, painted across the whole frame.
+    ///
+    /// opencode ships `background: transparent` so the terminal shows through,
+    /// and that is the right default for a tool that is mostly text on nothing.
+    /// It is the wrong default here: this app is made of filled blocks, and a
+    /// block only reads as raised against a surface it can be *compared to*. On
+    /// a coloured terminal the fills stopped looking like structure and started
+    /// looking like stains, so the app brings its own surface.
+    pub base: Color,
+    /// The sidebar and a menu — a region that is a *place*, one step above
+    /// [`Self::base`]. opencode's `backgroundPanel`.
     pub panel: Color,
-    /// `grays[3]`. A thing you act on sitting inside a panel: the prompt box, the
-    /// active tab, a chip, a menu row. opencode's `backgroundElement`, which is
-    /// also their `backgroundMenu`.
+    /// A block: a message, a tool group, the prompt, the active tab. opencode's
+    /// `backgroundElement`, which is also their `backgroundMenu`.
     pub element: Color,
-    /// `grays[5]`. The selected row of a menu. [`Self::element`] is the menu's own
-    /// fill, so the cursor needs a step clear of it.
+    /// The selected row of a list or menu — a step clear of whatever it sits on.
     pub selection: Color,
-    /// Inline and fenced code. Deliberately *below* `panel`: code is a quotation,
-    /// not a control, and reads as recessed rather than raised.
+    /// Fenced and inline code. Below [`Self::element`], because code quoted
+    /// inside a block should read as recessed within it, not stacked on top.
     pub code_wash: Color,
     pub danger: Color,
     pub warning: Color,
@@ -75,10 +82,11 @@ impl Theme {
             muted: Color::Rgb(0xa1, 0xa1, 0xa1),
             faint: Color::Rgb(0x73, 0x73, 0x73),
             accent: Color::Rgb(0x7c, 0x86, 0xff),
-            panel: Color::Rgb(0x11, 0x11, 0x11),
-            element: Color::Rgb(0x19, 0x19, 0x19),
-            selection: Color::Rgb(0x2a, 0x2a, 0x2a),
-            code_wash: Color::Rgb(0x0d, 0x0d, 0x0d),
+            base: Color::Rgb(0x0b, 0x0b, 0x0d),
+            panel: Color::Rgb(0x12, 0x12, 0x15),
+            element: Color::Rgb(0x1c, 0x1c, 0x21),
+            selection: Color::Rgb(0x2c, 0x2c, 0x33),
+            code_wash: Color::Rgb(0x16, 0x16, 0x1a),
             danger: Color::Rgb(0xff, 0x64, 0x67),
             warning: Color::Rgb(0xff, 0xb9, 0x00),
             dot_working: Color::Rgb(0xfb, 0x64, 0xb6),
@@ -99,6 +107,7 @@ impl Theme {
             muted: reset,
             faint: reset,
             accent: reset,
+            base: reset,
             panel: reset,
             element: reset,
             selection: reset,
@@ -123,6 +132,12 @@ impl Theme {
         }
     }
 
+    /// The app's own surface, painted across the whole frame before anything
+    /// else. Everything below is drawn over it.
+    pub fn base(&self) -> Style {
+        self.at(self.base, self.text)
+    }
+
     pub fn body(&self) -> Style {
         Style::default().fg(self.text)
     }
@@ -133,6 +148,17 @@ impl Theme {
 
     pub fn hint(&self) -> Style {
         Style::default().fg(self.faint)
+    }
+
+    /// The indigo bar down the left of a block that is *yours* — your message,
+    /// your prompt. opencode marks both the same way, and it is the only place
+    /// colour appears in the chrome.
+    pub fn accent_bar(&self) -> Style {
+        if self.plain {
+            Style::default().add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(self.accent).bg(self.element)
+        }
     }
 
     /// Section labels ("Sessions").
@@ -315,23 +341,27 @@ mod tests {
     }
 
     #[test]
-    fn the_ramp_is_opencodes_grayscale_for_komets_background() {
-        // opencode's `generateGrayScale`, dark branch, luminance < 10 (komet's
-        // #060606 is 6): grays[i] = floor(i / 12 * 0.4 * 255). If this drifts the
-        // two TUIs stop being the same product, which is the whole point.
+    fn every_level_of_the_ramp_is_distinguishable_from_the_one_below() {
+        // The ramp follows opencode's `generateGrayScale` in shape — a low, even
+        // walk up from the background — but it is anchored on the app's own
+        // `base` rather than on the terminal's, so the steps have to be checked
+        // against each other rather than pinned to their formula.
         let t = Theme::dark();
         let gray = |i: u32| {
             let v = ((i as f32 / 12.0) * 0.4 * 255.0).floor() as u8;
             Color::Rgb(v, v, v)
         };
-        assert_eq!(t.panel, gray(2), "backgroundPanel");
-        assert_eq!(t.element, gray(3), "backgroundElement / backgroundMenu");
+        let _ = gray;
         // Each level has to be distinguishable from the one it sits on, or the
-        // structure the fills are carrying disappears.
+        // structure the fills are carrying disappears — and every one of them
+        // has to be distinguishable from the surface the app paints under all of
+        // them, or the block is invisible on its own background.
         for (over, under) in [
+            (t.panel, t.base),
             (t.element, t.panel),
             (t.selection, t.element),
-            (t.panel, t.code_wash),
+            (t.code_wash, t.element),
+            (t.element, t.base),
         ] {
             assert_ne!(over, under);
         }
@@ -385,9 +415,16 @@ mod tests {
         // transcript body draws with, so they must not fill.
         let t = Theme::dark();
         for style in [t.body(), t.subtle(), t.hint(), t.label()] {
-            assert_eq!(style.bg, None, "transcript text must not paint a fill");
+            assert_eq!(style.bg, None, "text drawn over a fill must not repaint it");
         }
-        for style in [t.panel(), t.element(), t.selected(), t.bubble(), t.code()] {
+        for style in [
+            t.base(),
+            t.panel(),
+            t.element(),
+            t.selected(),
+            t.bubble(),
+            t.code(),
+        ] {
             assert!(style.bg.is_some(), "a region fill must paint");
         }
     }

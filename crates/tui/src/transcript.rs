@@ -358,6 +358,45 @@ fn status_tag(status: MessageStatus) -> u8 {
 /// `is_last` marks the final message, whose last tool group stays expanded —
 /// what you want to see is what it is doing *now*. It is part of the cache
 /// fingerprint, so a message stops being last without going stale.
+/// Is this row visually empty — nothing but spaces, whatever its styling?
+///
+/// A block's own padding row is "blank" in this sense but carries the block's
+/// fill, which is why [`collapse_blanks`] cannot just compare against
+/// `Line::default()`.
+fn is_blank(line: &Line<'static>) -> bool {
+    line.spans
+        .iter()
+        .all(|span| span.content.chars().all(|c| c == ' '))
+}
+
+/// Does this row paint a fill?
+fn is_filled(line: &Line<'static>) -> bool {
+    line.spans.iter().any(|span| span.style.bg.is_some())
+}
+
+/// Collapse runs of blank rows of the same kind down to one.
+///
+/// Markdown brings its own blank lines, the separator between groups adds
+/// another and every block pads itself, so without this a paragraph ending
+/// `\n\n` in front of a tool group opens a three-row hole.
+fn collapse_blanks(lines: &mut Vec<Line<'static>>) {
+    let mut out: Vec<Line<'static>> = Vec::with_capacity(lines.len());
+    for line in lines.drain(..) {
+        let duplicate = out.last().is_some_and(|previous| {
+            // Two blanks of the *same kind* in a row are one blank too many. A
+            // plain blank followed by a block's own padding is not a duplicate,
+            // though: the plain row is the gap between the block and the text
+            // above it, and the padded row is the block's top edge. Collapsing
+            // those into one is what made the bands abut the prose.
+            is_blank(previous) && is_blank(&line) && is_filled(previous) == is_filled(&line)
+        });
+        if !duplicate {
+            out.push(line);
+        }
+    }
+    *lines = out;
+}
+
 /// Push a blank row, unless the last row already is one (or there is no row yet).
 ///
 /// Markdown brings its own blank lines and the block separator adds another, so
@@ -441,6 +480,7 @@ fn render_entry(
         )]));
     }
 
+    collapse_blanks(&mut lines);
     // One blank row between messages. Part of the block, so it scrolls with it —
     // and only one, since a reply that ended on a trailing newline has already
     // left its own.
@@ -478,7 +518,7 @@ fn group_parts(parts: &[MessagePart]) -> Vec<PartGroup<'_>> {
 }
 
 /// Left inset of the content column. The original keeps its prose well off the
-/// pane edge; three columns is the terminal equivalent, and lines the transcript
+/// pane edge; two columns is the terminal equivalent, and lines the transcript
 /// up with the composer's text and the working strip below it.
 const INSET: &str = "  ";
 
@@ -487,10 +527,59 @@ fn indented(mut spans: Vec<Span<'static>>) -> Line<'static> {
     Line::from(spans)
 }
 
-/// The user's prompt: right-aligned on a raised wash, timestamp beneath.
+/// The bar down the left of a block that is *yours*. opencode marks the user's
+/// message and the prompt with the same stroke, and it is the only colour in the
+/// whole transcript.
+const BAR: &str = "┃";
+
+/// One row of a full-width block.
 ///
-/// Capped at 80% of the pane, as the original caps its bubble, so a long prompt
-/// still reads as *sent* rather than filling the column like a reply.
+/// This is the shape opencode's transcript is made of: a filled band running the
+/// content column's full width, optionally with an accent bar down its left
+/// edge. Padding out to the full width is the whole point — a fill that stops
+/// where the glyphs stop reads as a highlighter stain, while one that runs the
+/// column reads as a region. It is also why these rows do not use [`indented`]:
+/// the padding has to be *inside* the fill, not before it.
+fn block_row(
+    body: Vec<Span<'static>>,
+    width: usize,
+    fill: Style,
+    bar: Option<Style>,
+) -> Line<'static> {
+    let used: usize = body.iter().map(|span| wrap::width_of(&span.content)).sum();
+    let lead = if bar.is_some() { 2 } else { INSET.len() };
+    let mut spans = Vec::with_capacity(body.len() + 3);
+    match bar {
+        Some(style) => {
+            spans.push(Span::styled(BAR.to_string(), style));
+            spans.push(Span::styled(" ".to_string(), fill));
+        }
+        None => spans.push(Span::styled(" ".repeat(lead), fill)),
+    }
+    spans.extend(body);
+    // Trailing padding closes the band; without it the fill ends ragged at the
+    // longest line and the block loses its right edge.
+    let pad = width.saturating_sub(lead + used);
+    if pad > 0 {
+        spans.push(Span::styled(" ".repeat(pad), fill));
+    }
+    Line::from(spans)
+}
+
+/// A blank row of a block, so the fill has vertical padding of its own.
+fn block_pad(width: usize, fill: Style, bar: Option<Style>) -> Line<'static> {
+    block_row(Vec::new(), width, fill, bar)
+}
+
+/// The user's message: a full-width block with the accent bar down its left.
+///
+/// This is opencode's shape rather than the desktop's right-aligned bubble. A
+/// narrow bubble floating at the right margin is what made this transcript read
+/// as ragged: at terminal widths it leaves a long tail of dead space on every
+/// user turn, and the eye has to travel to find where the message starts. A band
+/// with a coloured edge says "you said this" without moving the reading column,
+/// and it is the same mark the prompt below carries — the two things that are
+/// yours look alike.
 fn render_bubble(
     text: &str,
     created_at: i64,
@@ -498,34 +587,28 @@ fn render_bubble(
     theme: &Theme,
     out: &mut Vec<Line<'static>>,
 ) {
-    let bubble_max = ((width * 4) / 5).max(8);
-    // One space of padding inside the wash on each side.
-    let inner = bubble_max.saturating_sub(2).max(1);
-    let mut rows: Vec<String> = Vec::new();
+    let fill = theme.bubble();
+    let bar = Some(theme.accent_bar());
+    let inner = width.saturating_sub(4).max(1);
+    out.push(block_pad(width, fill, bar));
     for paragraph in wrap::sanitize(text).split('\n') {
-        rows.extend(wrap::wrap(paragraph, inner, ""));
+        for row in wrap::wrap(paragraph, inner, "") {
+            out.push(block_row(vec![Span::styled(row, fill)], width, fill, bar));
+        }
     }
-    // The bubble is only as wide as its widest line, not the full cap.
-    let widest = rows.iter().map(|r| wrap::width_of(r)).max().unwrap_or(0);
-    // [lead][ text pad ][gutter] == width, so the wash never touches the edge.
-    let boxed = widest + 2;
-    let lead = width.saturating_sub(boxed + 1);
-    for row in &rows {
-        let padding = widest.saturating_sub(wrap::width_of(row));
-        out.push(Line::from(vec![
-            Span::raw(" ".repeat(lead)),
-            Span::styled(format!(" {row}{} ", " ".repeat(padding)), theme.bubble()),
-        ]));
-    }
-    // The timestamp hangs under the bubble's right edge, as in the reference.
+    // The timestamp closes the block from inside it, right-aligned, so the block
+    // ends on a padded row either way.
     let clock = format_clock(created_at);
-    if !clock.is_empty() {
-        let clock_lead = width.saturating_sub(wrap::width_of(&clock) + 1);
-        out.push(Line::from(vec![
-            Span::raw(" ".repeat(clock_lead)),
-            Span::styled(clock, theme.hint()),
-        ]));
-    }
+    let pad = width.saturating_sub(2 + wrap::width_of(&clock) + 1);
+    out.push(block_row(
+        vec![
+            Span::styled(" ".repeat(pad), fill),
+            Span::styled(clock, fill.patch(Style::default().fg(theme.faint))),
+        ],
+        width,
+        fill,
+        bar,
+    ));
 }
 
 /// A tool group: a summary row, and the chips when expanded.
@@ -542,40 +625,60 @@ fn render_tool_group(
         .collect();
     let summary = komet_proto::view::tool_group_summary(&pairs);
     let chevron = if expanded { "⌄" } else { "›" };
-    out.push(indented(vec![
-        Span::styled(format!("{chevron} "), theme.hint()),
-        Span::styled(
-            wrap::truncate(&summary, width.saturating_sub(3)),
-            theme.subtle(),
-        ),
-    ]));
+    // What the agent *did* is a block, the same as what it said to you is: a
+    // filled band, so a run of tool calls reads as one object you can skip over
+    // rather than as loose rows sharing the prose column.
+    let fill = theme.element();
+    out.push(block_pad(width, fill, None));
+    out.push(block_row(
+        vec![
+            Span::styled(
+                format!("{chevron} "),
+                fill.patch(Style::default().fg(theme.faint)),
+            ),
+            Span::styled(
+                wrap::truncate(&summary, width.saturating_sub(5)),
+                fill.patch(Style::default().fg(theme.muted)),
+            ),
+        ],
+        width,
+        fill,
+        None,
+    ));
     if !expanded {
+        out.push(block_pad(width, fill, None));
         return;
     }
     // Indented under the chevron rather than railed beside it: the summary above
     // already brackets the run, so a vertical stroke is a second bracket.
     for (call, is_error, resolved) in tools {
         let (label, detail) = komet_proto::view::tool_chip_content(call);
-        let label_style = if *is_error {
-            Style::default().fg(theme.danger)
+        let label_style = fill.patch(Style::default().fg(if *is_error {
+            theme.danger
         } else if *resolved {
-            theme.subtle()
+            theme.muted
         } else {
-            theme.hint()
-        };
+            theme.faint
+        }));
         let used = 4 + wrap::width_of(label) + 2;
-        out.push(indented(vec![
-            Span::raw("  ".to_string()),
-            Span::styled(label.to_string(), label_style),
-            Span::styled(
-                format!(
-                    "  {}",
-                    wrap::truncate(&wrap::sanitize(&detail), width.saturating_sub(used))
+        out.push(block_row(
+            vec![
+                Span::styled("  ".to_string(), fill),
+                Span::styled(label.to_string(), label_style),
+                Span::styled(
+                    format!(
+                        "  {}",
+                        wrap::truncate(&wrap::sanitize(&detail), width.saturating_sub(used))
+                    ),
+                    fill.patch(Style::default().fg(theme.faint)),
                 ),
-                theme.hint(),
-            ),
-        ]));
+            ],
+            width,
+            fill,
+            None,
+        ));
     }
+    out.push(block_pad(width, fill, None));
 }
 
 fn render_error(message: &str, width: usize, theme: &Theme, out: &mut Vec<Line<'static>>) {
@@ -746,22 +849,21 @@ fn render_code_block(rows: Vec<String>, width: usize, theme: &Theme, out: &mut V
         .position(|row| !row.trim().is_empty())
         .unwrap_or(0);
 
-    let room = width.saturating_sub(2).max(4);
-    let body = &rows[start..=end];
-    let widest = body
-        .iter()
-        .map(|row| wrap::width_of(row))
-        .max()
-        .unwrap_or(0)
-        .min(room);
-    for row in body {
-        let text = wrap::truncate(row, widest);
-        let padding = widest.saturating_sub(wrap::width_of(&text));
-        out.push(indented(vec![Span::styled(
-            format!(" {text}{} ", " ".repeat(padding)),
-            theme.code(),
-        )]));
+    // Full width, not sized to the widest line. A card that shrinks to its
+    // content makes every code block a different width, and a column of
+    // different-width cards is the ragged look this was trying to avoid.
+    let fill = theme.code();
+    let room = width.saturating_sub(4).max(4);
+    out.push(block_pad(width, fill, None));
+    for row in &rows[start..=end] {
+        out.push(block_row(
+            vec![Span::styled(wrap::truncate(row, room), fill)],
+            width,
+            fill,
+            None,
+        ));
     }
+    out.push(block_pad(width, fill, None));
 }
 
 /// Length of a leading list marker (`- `, `* `, `1. `), if the line has one.

@@ -104,8 +104,8 @@ def main() -> int:
             screen.text(),
         )
         check(
-            "engine" in screen.lines()[0],
-            "the header names the engine we attached to",
+            "engine" in screen.lines()[-1],
+            "the status line names the engine we attached to",
             screen.lines()[0],
         )
         check(probe(), "a daemon is listening")
@@ -141,9 +141,13 @@ def main() -> int:
         )
         screen = tui.send(b"\r", 8.0)
         screen.show("after send")
-        # Prompts render as right-aligned bubbles now — no "you" header.
+        # The reply is long and the transcript is bottom-anchored, so the prompt
+        # that started it has scrolled off; escape to the transcript and page up
+        # to it. (It used to fit only because the blocks had no padding.)
+        tui.send(b"\x1b", 0.4)
+        scrolled = tui.send(b"k" * 30, 1.0)
         check(
-            "explain the streaming" in screen.text(),
+            "explain the streaming" in scrolled.text(),
             "the prompt echoed into the transcript",
             screen.text(),
         )
@@ -172,8 +176,10 @@ def main() -> int:
             "attached without starting anything",
             screen.text(),
         )
+        again.send(b"\x1b", 0.4)
+        scrolled = again.send(b"k" * 30, 1.0)
         check(
-            "explain the streaming" in screen.text(),
+            "explain the streaming" in scrolled.text(),
             "the earlier conversation is still there",
             screen.text(),
         )

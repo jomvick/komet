@@ -107,7 +107,20 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // rebuilds as it goes.
     app.clear_hits();
 
-    let [body, hints] = Layout::vertical([Constraint::Min(6), Constraint::Length(1)]).areas(area);
+    // The app's own surface, under everything. Without it the blocks are judged
+    // against whatever colour the user's terminal happens to be, and a block
+    // only reads as raised against a surface it can be compared to.
+    fill(frame, area, theme.base());
+
+    // One row of air at the top, matching the one the hint bar leaves at the
+    // bottom, so the chrome is inset from the terminal's edges rather than
+    // clamped to them.
+    let [_, body, hints] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(6),
+        Constraint::Length(1),
+    ])
+    .areas(area);
 
     let sidebar_width = if app.sidebar_visible {
         SIDEBAR_MAX
@@ -539,16 +552,29 @@ fn draw_main(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
 }
 
 /// Width of one tab. The desktop strip uses a fixed 140px; a fixed column width
-/// is the same idea, and keeps tabs from jittering as titles stream in.
-const TAB_WIDTH: usize = 22;
+/// is the same idea, and keeps tabs from jittering as titles stream in. Wide
+/// enough that a real session title gets a few words in before the ellipsis —
+/// at 22 nearly every tab truncated to the same unhelpful prefix.
+const TAB_WIDTH: usize = 26;
+
+/// The narrowest a tab is allowed to get before the strip starts overflowing
+/// instead. Tabs shrink to fit first, because a strip showing every session
+/// narrowly is more navigable than one showing two of them widely.
+const TAB_MIN: usize = 18;
 
 /// Air between tabs — the desktop's `gap(6px)`.
 ///
 /// Without it the tabs share edges, and since the active one is the only filled
 /// block, the strip reads as a single bar with a bright patch somewhere in it
 /// rather than as a row of separate things. The gap is what turns the fill into
-/// a tab.
-const TAB_GAP: u16 = 1;
+/// a tab, so it is worth more than one column.
+const TAB_GAP: u16 = 3;
+
+/// Shown in place of a tab when the strip has more either side than it can fit.
+/// A strip that silently drops tabs is one you cannot navigate, because nothing
+/// on screen says there is anywhere to navigate *to*.
+const TAB_MORE_LEFT: &str = "‹";
+const TAB_MORE_RIGHT: &str = "›";
 
 /// Padding inside a tab, per side, so a filled tab does not clamp its own text.
 /// Set so a tab's contents land on the same column as the transcript's and the
@@ -558,11 +584,9 @@ const TAB_PAD: u16 = PAD as u16;
 /// The session tab strip: every non-archived session of the selected space,
 /// with `+` to start another. The active tab carries the selection wash.
 fn draw_tab_strip(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
-    let engine = engine_label(app);
-    let engine_width = wrap::width_of(&engine) as u16;
-    // Reserve the engine label first: whether quitting leaves work running is
-    // the one thing about this app a user must never have to guess.
-    let strip_width = area.width.saturating_sub(engine_width + 1);
+    // The whole row is the strip; the engine label moved to the status line so
+    // the tabs could have these columns.
+    let strip_width = area.width;
 
     let tabs = app.tabs();
     if tabs.is_empty() {
@@ -581,16 +605,42 @@ fn draw_tab_strip(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
         );
     } else {
         // Scroll so the active tab is visible; `+` always trails the last tab.
-        let stride = TAB_WIDTH + TAB_GAP as usize;
-        let visible = (strip_width as usize / stride).max(1);
+        // Both ends reserve a column for an overflow marker whenever there is
+        // something past them, so the window never sits flush against a tab it
+        // is hiding.
         let active = tabs.iter().position(|tab| tab.active).unwrap_or(0);
+        // Reserve the overflow markers either side and the trailing `+`, so a
+        // full strip never pushes the one control that starts a session off the
+        // end of the row.
+        let room = strip_width.saturating_sub(8) as usize;
+        // Fit them all if they will fit at a readable width; only then overflow.
+        let tab_width = (room / tabs.len().max(1))
+            .saturating_sub(TAB_GAP as usize)
+            .clamp(TAB_MIN, TAB_WIDTH);
+        let stride = tab_width + TAB_GAP as usize;
+        let visible = (room / stride).max(1);
         let first = active.saturating_sub(visible.saturating_sub(1));
+        let last = (first + visible).min(tabs.len());
+
         let mut x = area.x;
+        if first > 0 {
+            frame.render_widget(
+                Paragraph::new(Span::styled(TAB_MORE_LEFT, theme.hint())),
+                Rect {
+                    x,
+                    width: 1,
+                    height: 1,
+                    ..area
+                },
+            );
+        }
+        x += 2;
+
         for (offset, tab) in tabs.iter().enumerate().skip(first).take(visible) {
             let remaining = (area.x + strip_width).saturating_sub(x);
             let slot = Rect {
                 x,
-                width: (TAB_WIDTH as u16).min(remaining),
+                width: (tab_width as u16).min(remaining),
                 height: 1,
                 ..area
             };
@@ -635,6 +685,18 @@ fn draw_tab_strip(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
             );
             x += slot.width + TAB_GAP;
         }
+        if last < tabs.len() {
+            frame.render_widget(
+                Paragraph::new(Span::styled(TAB_MORE_RIGHT, theme.hint())),
+                Rect {
+                    x: x.saturating_sub(TAB_GAP),
+                    width: 1,
+                    height: 1,
+                    ..area
+                },
+            );
+            x += 1;
+        }
         if x + 3 <= area.x + strip_width {
             let plus = Rect {
                 x,
@@ -645,17 +707,6 @@ fn draw_tab_strip(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
             app.push_hit(plus, Hit::NewSession);
             frame.render_widget(Paragraph::new(Span::styled(" + ", theme.hint())), plus);
         }
-    }
-
-    if engine_width + 2 < area.width {
-        frame.render_widget(
-            Paragraph::new(Span::styled(engine, theme.hint())),
-            Rect {
-                x: area.x + area.width - engine_width,
-                width: engine_width,
-                ..area
-            },
-        );
     }
 }
 
@@ -774,6 +825,10 @@ fn composer_text_width(width: u16) -> u16 {
 /// two, and at one the text reads as stuck to the edge of the block).
 const COMPOSER_PAD: u16 = PAD as u16;
 
+/// The prompt's accent bar. opencode marks its prompt with a `SplitBorder` — one
+/// heavy stroke down the left — and the user's messages carry the same mark.
+const BAR: &str = "┃";
+
 /// Rows the composer block adds around its text: a row of air on top, a row of
 /// air under the text, and the meta row itself. The meta row is *always* one of
 /// them — see [`App::composer_meta`] for why it can never be conditional.
@@ -785,16 +840,26 @@ fn draw_composer(frame: &mut Frame, area: Rect, text_rows: u16, app: &mut App, t
     }
     let focused = app.focus == Focus::Composer;
 
-    // Focus is the fill level, not a stroke. An unfocused prompt sits at panel
-    // level like the rest of the furniture; taking focus lifts it one step to
-    // element, which is the same move a menu row makes when the cursor lands on
-    // it. Nothing changes shape, so nothing reflows.
-    let surface = if focused {
-        theme.element()
-    } else {
-        theme.panel()
-    };
+    // The prompt is a block like the user's messages above it, and carries the
+    // same accent bar — the two things in the transcript that are *yours* look
+    // alike. The bar is where focus lives: indigo while you are in it, and the
+    // fill's own muted edge when you are not. Nothing changes shape, so nothing
+    // reflows under the caret.
+    let surface = theme.element();
     fill(frame, area, surface);
+    let bar_style =
+        surface.patch(Style::default().fg(if focused { theme.accent } else { theme.faint }));
+    for offset in 0..area.height {
+        frame.render_widget(
+            Paragraph::new(Span::styled(BAR, bar_style)),
+            Rect {
+                x: area.x,
+                y: area.y + offset,
+                width: 1,
+                height: 1,
+            },
+        );
+    }
 
     let text_area = Rect {
         x: area.x + COMPOSER_PAD,
@@ -1041,6 +1106,24 @@ fn draw_hints(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         spans.push(Span::styled(format!(" {what}"), theme.hint()));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+
+    // The engine label lives here rather than in the tab strip. Whether quitting
+    // leaves work running is the one thing about this app you must never have to
+    // guess, so it is always on screen — but it was costing the strip a dozen
+    // columns, and a tab truncated to "Unpeel A…" is a tab you cannot tell from
+    // its neighbour. Status belongs on the status line.
+    let engine = engine_label(app);
+    let width = wrap::width_of(&engine) as u16;
+    if width + 2 < area.width {
+        frame.render_widget(
+            Paragraph::new(Span::styled(engine, theme.hint())),
+            Rect {
+                x: area.x + area.width - width - 1,
+                width,
+                ..area
+            },
+        );
+    }
 }
 
 fn draw_gate(frame: &mut Frame, area: Rect, app: &App, theme: &Theme, phase: GatePhase) {
