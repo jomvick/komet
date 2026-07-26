@@ -545,10 +545,16 @@ fn block_row(
     width: usize,
     fill: Style,
     bar: Option<Style>,
+    offset: usize,
 ) -> Line<'static> {
     let used: usize = body.iter().map(|span| wrap::width_of(&span.content)).sum();
     let lead = if bar.is_some() { 2 } else { INSET.len() };
-    let mut spans = Vec::with_capacity(body.len() + 3);
+    let mut spans = Vec::with_capacity(body.len() + 4);
+    // Unstyled, so a right-aligned block sits on the app surface rather than
+    // dragging its own fill across the column it was pushed away from.
+    if offset > 0 {
+        spans.push(Span::raw(" ".repeat(offset)));
+    }
     match bar {
         Some(style) => {
             spans.push(Span::styled(BAR.to_string(), style));
@@ -567,8 +573,8 @@ fn block_row(
 }
 
 /// A blank row of a block, so the fill has vertical padding of its own.
-fn block_pad(width: usize, fill: Style, bar: Option<Style>) -> Line<'static> {
-    block_row(Vec::new(), width, fill, bar)
+fn block_pad(width: usize, fill: Style, bar: Option<Style>, offset: usize) -> Line<'static> {
+    block_row(Vec::new(), width, fill, bar, offset)
 }
 
 /// The user's message: a full-width block with the accent bar down its left.
@@ -608,10 +614,21 @@ fn render_bubble(
         .unwrap_or(0)
         .max(wrap::width_of(&clock));
     let block = (widest + 4).min(width);
+    // Pushed to the right margin, as the desktop bubble is: a message that is
+    // yours reads as *sent* when it sits opposite the replies rather than in the
+    // same column as them, and the block's own width is what makes that legible
+    // at a glance.
+    let offset = width.saturating_sub(block);
 
-    out.push(block_pad(block, fill, bar));
+    out.push(block_pad(block, fill, bar, offset));
     for row in rows {
-        out.push(block_row(vec![Span::styled(row, fill)], block, fill, bar));
+        out.push(block_row(
+            vec![Span::styled(row, fill)],
+            block,
+            fill,
+            bar,
+            offset,
+        ));
     }
     // The timestamp closes the block from inside it, right-aligned, so the block
     // ends on a padded row either way.
@@ -624,6 +641,7 @@ fn render_bubble(
         block,
         fill,
         bar,
+        offset,
     ));
 }
 
@@ -853,16 +871,17 @@ fn render_code_block(rows: Vec<String>, width: usize, theme: &Theme, out: &mut V
     // different-width cards is the ragged look this was trying to avoid.
     let fill = theme.code();
     let room = width.saturating_sub(4).max(4);
-    out.push(block_pad(width, fill, None));
+    out.push(block_pad(width, fill, None, 0));
     for row in &rows[start..=end] {
         out.push(block_row(
             vec![Span::styled(wrap::truncate(row, room), fill)],
             width,
             fill,
             None,
+            0,
         ));
     }
-    out.push(block_pad(width, fill, None));
+    out.push(block_pad(width, fill, None, 0));
 }
 
 /// Length of a leading list marker (`- `, `* `, `1. `), if the line has one.

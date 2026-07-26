@@ -159,7 +159,7 @@ fn joined(rows: &[String]) -> String {
 /// its edge is where the fill stops — so this slices by width, mirroring
 /// `render`'s own sizing.
 fn sidebar_of(rows: &[String], width: u16) -> Vec<String> {
-    let sidebar = 30u16.min(width / 3).max(20u16.min(width / 2)) as usize;
+    let sidebar = 32u16.min(width / 3).max(22u16.min(width / 2)) as usize;
     rows.iter()
         .map(|row| {
             row.chars()
@@ -178,11 +178,11 @@ fn a_populated_frame_shows_the_chrome_sidebar_and_transcript() {
     let screen = joined(&rows);
 
     // The tab strip is the header: the selected space's sessions, plus `+`.
-    assert!(rows[0].contains("Rework the diff"), "{}", rows[0]);
+    assert!(rows[1].contains("Rework the diff"), "{}", rows[1]);
     assert!(
-        rows[0].contains("Chase the flaky"),
+        rows[1].contains("Chase the flaky"),
         "both tabs: {}",
-        rows[0]
+        rows[1]
     );
 
     // Sidebar: two sections.
@@ -214,10 +214,10 @@ fn a_populated_frame_shows_the_chrome_sidebar_and_transcript() {
     );
     assert!(screen.contains("retry once"), "bullet missing:\n{screen}");
 
-    // The user's own message is a full-width block carrying the accent bar —
-    // opencode's shape, not the desktop's right-aligned bubble. A narrow bubble
-    // at the right margin left a long tail of dead space on every user turn and
-    // moved the reading column; the bar says "you said this" without either.
+    // The user's own message is a block that shrinks to its text and sits at the
+    // right margin, so a turn of yours reads as *sent* rather than as another
+    // paragraph in the reply column. It carries the accent bar, which is the
+    // same mark the prompt below it carries.
     let prompt_row = rows
         .iter()
         .position(|row| row.contains("why is the room test flaky?"))
@@ -228,9 +228,8 @@ fn a_populated_frame_shows_the_chrome_sidebar_and_transcript() {
     );
     let indent = rows[prompt_row].find("why is").expect("prompt column");
     assert!(
-        indent < 40,
-        "the message should start at the reading column, not at the right \
-         margin — found at {indent}:\n{screen}"
+        indent > 40,
+        "the message should sit at the right margin, found at {indent}:\n{screen}"
     );
 
     // Both panes run the terminal's full height: there is no status bar under
@@ -845,8 +844,9 @@ fn the_sessions_list_is_flat_and_global_not_grouped_by_space() {
     assert!(beta < alpha, "recency order:\n{sidebar:#?}");
     assert_eq!(
         alpha,
-        beta + 2,
-        "the rows must be consecutive (title, sub-line, title, sub-line):\n{sidebar:#?}"
+        beta + 3,
+        "consecutive rows: title, sub-line, and the row of air that gives the \
+         entry its vertical padding:\n{sidebar:#?}"
     );
 }
 
@@ -866,9 +866,9 @@ fn the_tab_strip_shows_only_the_selected_spaces_sessions() {
 
     app.selected_space = Some("s1".into());
     let rows = snapshot(&mut app, 100, 24);
-    assert!(rows[0].contains("Alpha session"), "{}", rows[0]);
+    assert!(rows[1].contains("Alpha session"), "{}", rows[1]);
     assert!(
-        !rows[0].contains("Beta session"),
+        !rows[1].contains("Beta session"),
         "another space's session must not be a tab: {}",
         rows[0]
     );
@@ -876,8 +876,8 @@ fn the_tab_strip_shows_only_the_selected_spaces_sessions() {
     // Switching space swaps the strip.
     app.selected_space = Some("s2".into());
     let rows = snapshot(&mut app, 100, 24);
-    assert!(rows[0].contains("Beta session"), "{}", rows[0]);
-    assert!(!rows[0].contains("Alpha session"), "{}", rows[0]);
+    assert!(rows[1].contains("Beta session"), "{}", rows[1]);
+    assert!(!rows[1].contains("Alpha session"), "{}", rows[1]);
 }
 
 #[test]
@@ -1000,7 +1000,7 @@ fn clicking_a_space_activates_it_and_swaps_the_tabs() {
     app.click(x, y);
     assert_eq!(app.selected_space.as_deref(), Some("s2"));
     let rows = snapshot(&mut app, 100, 24);
-    assert!(rows[0].contains("Beta session"), "{}", rows[0]);
+    assert!(rows[1].contains("Beta session"), "{}", rows[1]);
 }
 
 #[test]
@@ -1008,9 +1008,10 @@ fn clicking_a_tab_switches_to_it() {
     let mut app = populated();
     app.selected_space = Some("s1".into());
     app.select_chat(Some("c1".into()));
-    // Tabs are the header row.
+    // The strip is three rows tall so its tabs have vertical padding; the labels
+    // sit on the middle one.
     let (x, y) = cell_of(&mut app, 100, 24, "Chase the flaky");
-    assert_eq!(y, 0, "tabs are the header row");
+    assert_eq!(y, 1, "tab labels are the strip's middle row");
     app.click(x, y);
     assert_eq!(app.selected_chat.as_deref(), Some("c2"));
 }
@@ -1022,8 +1023,8 @@ fn clicking_plus_starts_a_session_and_the_panes_take_focus() {
     let before = app.selected_chat.clone();
     // The tab strip's `+`, not the Spaces header's — both are on screen.
     let rows = snapshot(&mut app, 100, 24);
-    let x = column_of(&rows[0], rows[0].rfind('+').expect("the tab strip's +"));
-    app.click(x, 0);
+    let x = column_of(&rows[1], rows[1].rfind('+').expect("the tab strip's +"));
+    app.click(x, 1);
     // `+` opens a draft, as the desktop canvas does — nothing is created until
     // the first send.
     assert!(app.draft.is_some(), "a draft was opened");
@@ -1046,7 +1047,7 @@ fn clicking_plus_starts_a_session_and_the_panes_take_focus() {
     let rows = snapshot(&mut app, 100, 24);
     let header = rows
         .iter()
-        .position(|row| row.starts_with(" Sessions"))
+        .position(|row| row.trim_start().starts_with("Sessions"))
         .expect("the Sessions header") as u16;
     let before = app.selected_chat.clone();
     app.click(4, header);
@@ -1299,11 +1300,11 @@ fn the_sidebar_and_the_transcript_sit_at_different_levels() {
 
     // A row well clear of the header, the selection and the prompt.
     let y = 9u16;
-    for x in 0..30u16 {
+    for x in 0..32u16 {
         assert_eq!(buffer[(x, y)].bg, panel, "sidebar column {x} is not filled");
     }
     assert_eq!(
-        buffer[(30, y)].bg,
+        buffer[(32, y)].bg,
         app.theme.base,
         "the transcript sits on the app's base surface"
     );
@@ -1373,7 +1374,7 @@ fn a_draft_shows_its_pending_tab_and_where_it_will_run() {
     let screen = joined(&rows);
 
     // A pending tab, so the pane is not simply blank.
-    assert!(rows[0].contains("New session"), "{}", rows[0]);
+    assert!(rows[1].contains("New session"), "{}", rows[1]);
     // The chips say where it will run — the choice only exists before send.
     assert!(
         screen.contains("Current checkout"),

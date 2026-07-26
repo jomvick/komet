@@ -71,8 +71,11 @@ use crate::wrap;
 /// Sidebar width. Wide enough for a title plus a time column and a readable
 /// "project · branch" sub-line, capped so a narrow terminal keeps a usable
 /// transcript.
-const SIDEBAR_MAX: u16 = 30;
-const SIDEBAR_MIN: u16 = 20;
+const SIDEBAR_MAX: u16 = 32;
+const SIDEBAR_MIN: u16 = 22;
+
+/// Columns the sidebar insets its rows from its own fill, per side.
+const SIDEBAR_PAD: u16 = 2;
 /// The composer grows with its content up to this many text rows.
 const COMPOSER_MAX_ROWS: u16 = 8;
 /// The main pane's own margin — one column of terminal background down each
@@ -136,12 +139,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 
     if app.help {
-        // Everything below the top row: the tab strip (and the sidebar's Spaces
-        // header, which shares that row) stay readable, so you keep your place
-        // while reading the key map.
+        // Everything below the tab strip, which stays readable (along with the
+        // sidebar's Spaces header opposite it) so you keep your place while
+        // reading the key map.
         let panel = Rect {
-            y: body.y + 1,
-            height: body.height.saturating_sub(1),
+            y: body.y + TAB_ROWS,
+            height: body.height.saturating_sub(TAB_ROWS),
             ..body
         };
         // Registered last, so it wins over everything beneath it.
@@ -187,13 +190,14 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
     // `backgroundPanel` box with no border at all, and a stroke drawn along a
     // colour change is that boundary stated twice.
     fill(frame, area, theme.panel());
-    // A column of padding each side, so text never touches the fill's edge. No
-    // top pad: "Spaces" is this pane's header and the tab strip is the other's,
-    // and two headers that sit on the same row read as one band across the app.
+    // The fill reaches every edge; the *content* is inset from them. Two columns
+    // each side and a row at the top, which puts "Spaces" on the same row as the
+    // tab titles opposite it.
     let inner = Rect {
-        x: area.x + 1,
-        width: area.width.saturating_sub(2),
-        ..area
+        x: area.x + SIDEBAR_PAD,
+        y: area.y + 1,
+        width: area.width.saturating_sub(SIDEBAR_PAD * 2),
+        height: area.height.saturating_sub(1),
     };
     if inner.height == 0 || inner.width < 4 {
         return;
@@ -503,7 +507,7 @@ fn draw_main(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
     // rule, separates it from the transcript: the active tab already carries a
     // fill, so a stroke underneath would be the same boundary drawn twice.
     let [tabs, gap, rest] = Layout::vertical([
-        Constraint::Length(1),
+        Constraint::Length(TAB_ROWS),
         Constraint::Length(1),
         Constraint::Min(4),
     ])
@@ -523,16 +527,18 @@ fn draw_main(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
     // strip, the prompt block and the footer all keep their row whether or not
     // they have anything to say. A pane that resizes as state arrives makes the
     // prompt jump under the cursor while you are typing into it.
-    // No pad under the prompt: it is filled and the hint bar is not, so the
-    // colour change already separates them. A blank row there would be air
-    // between two things that are not touching.
+    // A row of base under the prompt. The prompt is a block, not a pane: a block
+    // that runs into the terminal's bottom edge reads as clipped, the same way
+    // its meta row read as clipped when it sat on the fill's edge.
     let text_rows = composer_rows(app, rest.width);
-    let [transcript, strip, composer] = Layout::vertical([
+    let [transcript, strip, composer, floor] = Layout::vertical([
         Constraint::Min(2),
         Constraint::Length(1),
         Constraint::Length(text_rows + COMPOSER_CHROME),
+        Constraint::Length(1),
     ])
     .areas(rest);
+    let _ = floor;
 
     app.push_hit(transcript, Hit::Pane(Focus::Transcript));
     app.push_hit(composer, Hit::Pane(Focus::Composer));
@@ -567,10 +573,14 @@ const TAB_GAP: u16 = 1;
 const TAB_MORE_LEFT: &str = "‹";
 const TAB_MORE_RIGHT: &str = "›";
 
-/// Padding inside a tab, per side. Wider than the pane's own [`PAD`], because
-/// this is what stops the active tab's fill from clamping the title inside it —
-/// the thing that made the strip feel cramped.
-const TAB_PAD: u16 = 3;
+/// Padding inside a tab, per side.
+const TAB_PAD: u16 = 2;
+
+/// Rows the tab strip occupies. A tab needs vertical padding as much as
+/// horizontal, and in a terminal the only way to give a one-line label room
+/// above and below it is to make the thing it sits in three rows tall and run
+/// the fill through all of them.
+const TAB_ROWS: u16 = 3;
 
 /// The session tab strip: every non-archived session of the selected space,
 /// with `+` to start another. The active tab carries the selection wash.
@@ -590,7 +600,9 @@ fn draw_tab_strip(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
                 theme.hint(),
             )),
             Rect {
+                y: area.y + 1,
                 width: strip_width.max(1),
+                height: 1,
                 ..area
             },
         );
@@ -613,15 +625,19 @@ fn draw_tab_strip(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
         let first = active.saturating_sub(visible.saturating_sub(1));
         let last = (first + visible).min(tabs.len());
 
+        // The label row. The strip is three rows tall and the active tab's fill
+        // runs all of them, which is the only way to give a one-line label air
+        // above and below it.
+        let label_y = area.y + 1;
         let mut x = area.x;
         if first > 0 {
             frame.render_widget(
                 Paragraph::new(Span::styled(TAB_MORE_LEFT, theme.hint())),
                 Rect {
                     x,
+                    y: label_y,
                     width: 1,
                     height: 1,
-                    ..area
                 },
             );
         }
@@ -631,9 +647,9 @@ fn draw_tab_strip(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
             let remaining = (area.x + strip_width).saturating_sub(x);
             let slot = Rect {
                 x,
+                y: area.y,
                 width: (tab_width as u16).min(remaining),
-                height: 1,
-                ..area
+                height: TAB_ROWS,
             };
             if slot.width < 6 {
                 break;
@@ -653,8 +669,9 @@ fn draw_tab_strip(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
             }
             let inner = Rect {
                 x: slot.x + TAB_PAD,
+                y: label_y,
                 width: slot.width.saturating_sub(TAB_PAD * 2),
-                ..slot
+                height: 1,
             };
             let title_width = (inner.width as usize).saturating_sub(2);
             frame.render_widget(
@@ -681,9 +698,9 @@ fn draw_tab_strip(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
                 Paragraph::new(Span::styled(TAB_MORE_RIGHT, theme.hint())),
                 Rect {
                     x: x.saturating_sub(TAB_GAP),
+                    y: label_y,
                     width: 1,
                     height: 1,
-                    ..area
                 },
             );
             x += 1;
@@ -691,9 +708,9 @@ fn draw_tab_strip(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
         if x + 3 <= area.x + strip_width {
             let plus = Rect {
                 x,
+                y: label_y,
                 width: 3,
                 height: 1,
-                ..area
             };
             app.push_hit(plus, Hit::NewSession);
             frame.render_widget(Paragraph::new(Span::styled(" + ", theme.hint())), plus);
