@@ -390,12 +390,18 @@ fn the_composer_grows_with_its_content_and_places_the_caret() {
     let three_lines = snapshot(&mut app, 60, 20);
     assert_ne!(one_line, three_lines);
     let screen = joined(&three_lines);
-    // The composer is a rule plus a prompt marker — no box, so nothing collides
-    // with the sidebar divider.
-    assert!(screen.contains('›'), "prompt marker missing:\n{screen}");
+    // The composer is a single left bar — no box, so nothing collides with the
+    // sidebar divider.
+    assert!(screen.contains('┃'), "composer bar missing:\n{screen}");
     assert!(
         !screen.contains('╭'),
         "the composer must not be boxed:\n{screen}"
+    );
+    // The bar runs the height of the block: a prompt that grew to three rows is
+    // one object, not three loose lines.
+    assert!(
+        three_lines.iter().filter(|row| row.contains('┃')).count() >= 3,
+        "the bar should span the grown prompt:\n{screen}"
     );
 
     // The caret is inside the frame — placing it outside is a real bug that
@@ -688,10 +694,10 @@ fn a_short_transcript_sits_above_the_composer() {
         .expect("the reply");
     let composer = rows
         .iter()
-        .position(|row| row.contains('›'))
+        .position(|row| row.contains('┃'))
         .expect("the composer");
     // Bottom-anchored: the reply sits low in the pane, a couple of rows above
-    // the composer (its own trailing blank, then the status strip and rule).
+    // the composer (its own trailing blank, then the status strip).
     assert!(
         at > rows.len() / 2,
         "content floated to the top:\n{}",
@@ -1007,7 +1013,7 @@ fn clicking_plus_starts_a_session_and_the_panes_take_focus() {
     // Panes take focus when clicked.
     let mut app = populated();
     let rows = snapshot(&mut app, 100, 24);
-    let composer_y = rows.iter().position(|r| r.contains('›')).unwrap() as u16;
+    let composer_y = rows.iter().position(|r| r.contains('┃')).unwrap() as u16;
     app.focus = Focus::Sidebar;
     app.click(60, composer_y);
     assert_eq!(app.focus, Focus::Composer);
@@ -1242,18 +1248,71 @@ fn a_failed_model_fetch_closes_the_picker() {
 }
 
 #[test]
-fn rules_join_the_sidebar_divider_instead_of_leaving_a_notch() {
-    // A rule that starts one column right of the divider reads as two loose
-    // strokes; the tee is what makes it a frame.
+fn the_sidebar_divider_is_the_only_line_drawn() {
+    // The whole steady-state view is one stroke. Rules under the header, above
+    // the composer and inside the sidebar each drew a boundary that position and
+    // a wash had already drawn, so they are gone — and with them every tee, box
+    // and notch they needed to not look broken.
     let mut app = populated();
     let rows = snapshot(&mut app, 100, 26);
-    let tees = rows.iter().filter(|row| row.contains('├')).count();
-    assert!(tees >= 2, "expected joined rules:\n{}", joined(&rows));
-    // And no double vertical: the composer is not boxed.
+    let screen = joined(&rows);
+    for stroke in ['├', '┤', '┬', '┴', '┼', '╭', '╮', '╰', '╯', '─'] {
+        assert!(
+            !screen.contains(stroke),
+            "{stroke:?} is chrome the view no longer needs:\n{screen}"
+        );
+    }
+    // Every row still carries the divider, so the two panes stay two panes.
+    let divided = rows.iter().filter(|row| row.contains('│')).count();
     assert!(
-        !joined(&rows).contains("│╭"),
-        "a box abutting the divider:\n{}",
-        joined(&rows)
+        divided >= rows.len() - 2,
+        "the divider should run the pane's height:\n{screen}"
+    );
+}
+
+#[test]
+fn the_composer_is_a_bar_that_lights_up_when_focused() {
+    // One stroke doing the work a box used to: it marks the prompt, and its
+    // weight and colour mark the focus. Indigo is komet's focus colour, which is
+    // why the bar is allowed to carry it.
+    use ratatui::style::Color;
+    let mut app = populated();
+    app.focus = Focus::Composer;
+    let rows = snapshot(&mut app, 100, 26);
+    let y = rows
+        .iter()
+        .position(|row| row.contains('┃'))
+        .expect("the focused composer bar");
+
+    let mut terminal = Terminal::new(TestBackend::new(100, 26)).unwrap();
+    terminal
+        .draw(|frame| render::draw(frame, &mut app))
+        .unwrap();
+    let x = column_of(&rows[y], rows[y].find('┃').unwrap());
+    assert_eq!(
+        terminal.backend().buffer()[(x, y as u16)].fg,
+        Color::Rgb(0x7c, 0x86, 0xff),
+        "a focused prompt should carry the accent"
+    );
+
+    // Unfocused the bar stays put and drops to a hairline: the shape is where
+    // the prompt is, the colour is whether you are in it, and only one thing on
+    // screen is ever lit.
+    app.focus = Focus::Transcript;
+    let mut terminal = Terminal::new(TestBackend::new(100, 26)).unwrap();
+    terminal
+        .draw(|frame| render::draw(frame, &mut app))
+        .unwrap();
+    let cell = &terminal.backend().buffer()[(x, y as u16)];
+    assert_eq!(
+        cell.symbol(),
+        "┃",
+        "the bar should not move or change shape"
+    );
+    assert_eq!(
+        cell.fg,
+        Color::Rgb(0x3a, 0x3a, 0x3a),
+        "an unfocused prompt should be a hairline"
     );
 }
 
@@ -1342,20 +1401,20 @@ fn the_branch_picker_tags_current_and_materialized_refs() {
 
 #[test]
 fn the_prompt_has_air_around_it() {
-    // One row wedged between a rule and the hint bar reads as an afterthought.
+    // One row jammed against the transcript and the hint bar reads as an
+    // afterthought.
     let mut app = populated();
     let rows = snapshot(&mut app, 100, 28);
     let prompt = rows
         .iter()
-        .position(|row| row.contains('›'))
+        .position(|row| row.contains('┃'))
         .expect("the prompt");
-    let rule = rows
-        .iter()
-        .rposition(|row| row.contains('├'))
-        .expect("the composer rule");
+    // A blank row above it — the status strip, which is reserved and empty while
+    // nothing is running, so the prompt never shifts when work starts.
+    let above = rows[prompt - 1].split('│').nth(1).unwrap_or("").trim();
     assert!(
-        prompt > rule + 1,
-        "no air above the prompt:\n{}",
+        above.is_empty(),
+        "no air above the prompt: {above:?}\n{}",
         joined(&rows)
     );
     // And a blank row below it, before the hint bar. Only the main pane matters
@@ -1719,4 +1778,144 @@ fn clicking_a_session_while_drafting_switches_to_it() {
     app.click(x, y);
     assert!(app.draft.is_none());
     assert_eq!(app.selected_chat.as_deref(), Some("a2"));
+}
+
+#[test]
+fn a_picker_is_a_raised_surface_not_a_box() {
+    // opencode's dialogs are a wash and nothing else, and so are komet's own
+    // desktop menus. A hairline box around a surface that is already a different
+    // colour draws the same edge twice — and costs two rows and two columns of
+    // the list it surrounds.
+    use ratatui::style::Color;
+    let mut app = populated();
+    app.act(Action::NewSession);
+    app.act(Action::PickCheckout);
+    let rows = snapshot(&mut app, 100, 28);
+    let screen = joined(&rows);
+    for stroke in [
+        '\u{256d}', '\u{256e}', '\u{2570}', '\u{256f}', '\u{2502}', '\u{2500}',
+    ] {
+        assert!(
+            !rows
+                .iter()
+                .skip_while(|row| !row.contains("Run in"))
+                .take(4)
+                .any(|row| row.contains(stroke)),
+            "the picker is framed with {stroke:?}:\n{screen}"
+        );
+    }
+
+    let mut terminal = Terminal::new(TestBackend::new(100, 28)).unwrap();
+    terminal
+        .draw(|frame| render::draw(frame, &mut app))
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    let y = rows.iter().position(|row| row.contains("Run in")).unwrap() as u16;
+    let x = column_of(&rows[y as usize], rows[y as usize].find("Run in").unwrap());
+    // The title row carries the wash…
+    assert_eq!(buffer[(x, y)].bg, Color::Rgb(0x1e, 0x1e, 0x1e));
+    // …and the selected row is a lighter step of it, so the cursor is visible
+    // on a surface the body selection would have vanished into.
+    assert_eq!(buffer[(x, y + 1)].bg, Color::Rgb(0x30, 0x30, 0x30));
+    assert_eq!(buffer[(x, y + 2)].bg, Color::Rgb(0x1e, 0x1e, 0x1e));
+}
+
+#[test]
+fn blocks_inside_a_message_get_air_only_where_they_need_it() {
+    // The old layout ran text, tool group and text together into one wall.
+    // opencode's rule — a block taller than a row is separated, a run of
+    // one-liners is not — is what makes a transcript scannable.
+    use komet_proto::ToolCall;
+    let mut app = populated();
+    app.apply(Update::Transcript {
+        chat_id: "c1".into(),
+        entries: vec![entry(
+            "m1",
+            MessageRole::Assistant,
+            vec![
+                text("t0", "first"),
+                MessagePart::Tool {
+                    id: "p1".into(),
+                    call: ToolCall::Exec {
+                        command: "cargo test".into(),
+                    },
+                    is_error: false,
+                    resolved: true,
+                },
+                text("t1", "second"),
+            ],
+        )],
+    });
+    let rows = snapshot(&mut app, 100, 26);
+    let screen = joined(&rows);
+    let at = |needle: &str| {
+        rows.iter()
+            .position(|row| row.contains(needle))
+            .unwrap_or_else(|| panic!("{needle:?} missing:\n{screen}"))
+    };
+    let (first, group, second) = (at("first"), at("Ran 1 command"), at("second"));
+    assert_eq!(
+        group,
+        first + 2,
+        "the tool group needs air above:\n{screen}"
+    );
+    assert_eq!(
+        second,
+        group + 3,
+        "and below — the chip row makes it two lines tall:\n{screen}"
+    );
+    // The chips themselves are indented under the chevron, not railed beside it.
+    assert!(
+        !rows[group + 1].contains('│') || rows[group + 1].matches('│').count() == 1,
+        "a rail survived beside the chips:\n{screen}"
+    );
+}
+
+#[test]
+fn fenced_code_is_a_wash_card_sized_to_its_widest_line() {
+    // Inline `code` is a wash, so block code is too — the same decision at block
+    // scale, and a card needs no rail to say where it starts.
+    use ratatui::style::Color;
+    let mut app = populated();
+    app.apply(Update::Transcript {
+        chat_id: "c1".into(),
+        entries: vec![entry(
+            "m1",
+            MessageRole::Assistant,
+            vec![text("t0", "```\nlet x = 1;\nlet yy = 22;\n```")],
+        )],
+    });
+    let rows = snapshot(&mut app, 100, 26);
+    let screen = joined(&rows);
+    let y = rows
+        .iter()
+        .position(|row| row.contains("let x = 1;"))
+        .expect("the code") as u16;
+
+    let mut terminal = Terminal::new(TestBackend::new(100, 26)).unwrap();
+    terminal
+        .draw(|frame| render::draw(frame, &mut app))
+        .unwrap();
+    let buffer = terminal.backend().buffer();
+    let wash = Color::Rgb(0x15, 0x15, 0x15);
+    let x = column_of(&rows[y as usize], rows[y as usize].find("let x").unwrap());
+    assert_eq!(
+        buffer[(x, y)].bg,
+        wash,
+        "code should sit on a wash:\n{screen}"
+    );
+    // Sized to the widest line, so the short one is padded to match rather than
+    // leaving a ragged edge.
+    let widest = "let yy = 22;".len() as u16;
+    assert_eq!(buffer[(x + widest, y)].bg, wash, "ragged card:\n{screen}");
+    assert_ne!(
+        buffer[(x + widest + 1, y)].bg,
+        wash,
+        "the card should stop at its widest line + padding:\n{screen}"
+    );
+    // And no rail: the wash is the whole boundary.
+    assert!(
+        !rows[y as usize].contains('│') || rows[y as usize].matches('│').count() == 1,
+        "a rail survived beside the code:\n{screen}"
+    );
 }

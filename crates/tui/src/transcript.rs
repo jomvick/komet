@@ -35,8 +35,9 @@ use crate::theme::Theme;
 use crate::wrap;
 
 /// Columns the content column is inset from the pane edge — must match
-/// [`INSET`], which is what actually paints it.
-const CONTENT_INSET: usize = 2;
+/// [`INSET`], which is what actually paints it, and `render::GUTTER`, which is
+/// where every other line in the main pane starts.
+const CONTENT_INSET: usize = 3;
 
 /// One message's laid-out lines plus the fingerprint they were laid out from.
 struct Block {
@@ -369,7 +370,16 @@ fn render_entry(
         .iter()
         .rposition(|g| matches!(g, PartGroup::Tools(_)));
 
+    // Air between blocks, but only where one is needed: a run of one-liners
+    // stays a list, while anything taller than a row gets a blank on both sides.
+    // Reply-tools-reply otherwise arrives as one undifferentiated wall, which is
+    // the single biggest reason a transcript reads as cluttered.
+    let mut previous_height = 0usize;
     for (index, group) in groups.iter().enumerate() {
+        if index > 0 && previous_height > 1 {
+            lines.push(Line::default());
+        }
+        let start = lines.len();
         match group {
             PartGroup::Single(part) => match part {
                 MessagePart::Text { text, .. } => match entry.role {
@@ -397,6 +407,17 @@ fn render_entry(
                 let newest = is_last && last_group == Some(index);
                 render_tool_group(tools, running || newest, width, theme, &mut lines);
             }
+        }
+        previous_height = lines.len() - start;
+        // This block is tall but the one above it was not, so the blank that
+        // would have preceded it was never pushed. Slot it in now.
+        if previous_height > 1
+            && start > 0
+            && lines
+                .get(start - 1)
+                .is_some_and(|line| !line.spans.is_empty())
+        {
+            lines.insert(start, Line::default());
         }
     }
 
@@ -442,9 +463,9 @@ fn group_parts(parts: &[MessagePart]) -> Vec<PartGroup<'_>> {
 }
 
 /// Left inset of the content column. The original keeps its prose well off the
-/// pane edge; two columns is the terminal equivalent without spending real
-/// estate a narrow window needs.
-const INSET: &str = "  ";
+/// pane edge; three columns is the terminal equivalent, and lines the transcript
+/// up with the composer's text and the working strip below it.
+const INSET: &str = "   ";
 
 fn indented(mut spans: Vec<Span<'static>>) -> Line<'static> {
     spans.insert(0, Span::raw(INSET.to_string()));
@@ -516,7 +537,8 @@ fn render_tool_group(
     if !expanded {
         return;
     }
-    // A guide rail under the summary, as the original draws beside its chips.
+    // Indented under the chevron rather than railed beside it: the summary above
+    // already brackets the run, so a vertical stroke is a second bracket.
     for (call, is_error, resolved) in tools {
         let (label, detail) = komet_proto::view::tool_chip_content(call);
         let label_style = if *is_error {
@@ -526,9 +548,9 @@ fn render_tool_group(
         } else {
             theme.hint()
         };
-        let used = 3 + wrap::width_of(label) + 2;
+        let used = 4 + wrap::width_of(label) + 2;
         out.push(indented(vec![
-            Span::styled("│ ".to_string(), theme.rule()),
+            Span::raw("  ".to_string()),
             Span::styled(label.to_string(), label_style),
             Span::styled(
                 format!(
@@ -602,26 +624,24 @@ fn render_questions(
 /// Monochrome throughout: the original tints nothing here, using weight and a
 /// wash for emphasis instead.
 fn render_markdown(text: &str, width: usize, theme: &Theme, out: &mut Vec<Line<'static>>) {
-    let mut in_fence = false;
+    // Fenced code is buffered rather than emitted line by line, because the card
+    // it becomes is only as wide as its widest line and that isn't known until
+    // the fence closes.
+    let mut fence: Option<Vec<String>> = None;
     for raw in text.split('\n') {
         let line = wrap::sanitize(raw);
         let trimmed = line.trim_start();
 
         if trimmed.starts_with("```") {
-            in_fence = !in_fence;
+            match fence.take() {
+                Some(rows) => render_code_block(rows, width, theme, out),
+                None => fence = Some(Vec::new()),
+            }
             continue;
         }
 
-        if in_fence {
-            // Code is never re-wrapped at word boundaries — indentation is
-            // meaning. Overlong lines are truncated with a marker instead.
-            out.push(indented(vec![
-                Span::styled("│ ".to_string(), theme.rule()),
-                Span::styled(
-                    wrap::truncate(&line, width.saturating_sub(3)),
-                    theme.subtle(),
-                ),
-            ]));
+        if let Some(rows) = fence.as_mut() {
+            rows.push(line);
             continue;
         }
 
@@ -685,6 +705,47 @@ fn render_markdown(text: &str, width: usize, theme: &Theme, out: &mut Vec<Line<'
             spans.extend(inline_spans(&chunk, theme, &mut inline));
             out.push(indented(spans));
         }
+    }
+
+    // A fence still open at the end of the text is a code block mid-stream, not
+    // a mistake: draw what has arrived instead of swallowing it until the model
+    // types the closing backticks.
+    if let Some(rows) = fence {
+        render_code_block(rows, width, theme, out);
+    }
+}
+
+/// A fenced code block: a wash card, sized to its own widest line.
+///
+/// The same decision inline `code` makes, at block scale — the original washes
+/// code rather than tinting or framing it, and a card needs no rail to say where
+/// it starts. Code is never re-wrapped at word boundaries (indentation is
+/// meaning); overlong lines are truncated instead.
+fn render_code_block(rows: Vec<String>, width: usize, theme: &Theme, out: &mut Vec<Line<'static>>) {
+    // Trailing blank lines before the closing fence are the model's formatting,
+    // not content, and washing them paints an empty band.
+    let end = rows.iter().rposition(|row| !row.trim().is_empty());
+    let Some(end) = end else { return };
+    let start = rows
+        .iter()
+        .position(|row| !row.trim().is_empty())
+        .unwrap_or(0);
+
+    let room = width.saturating_sub(2).max(4);
+    let body = &rows[start..=end];
+    let widest = body
+        .iter()
+        .map(|row| wrap::width_of(row))
+        .max()
+        .unwrap_or(0)
+        .min(room);
+    for row in body {
+        let text = wrap::truncate(row, widest);
+        let padding = widest.saturating_sub(wrap::width_of(&text));
+        out.push(indented(vec![Span::styled(
+            format!(" {text}{} ", " ".repeat(padding)),
+            theme.code(),
+        )]));
     }
 }
 

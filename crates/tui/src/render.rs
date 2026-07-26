@@ -9,25 +9,31 @@
 //!   transcript, which is also the header (it replaced one).
 //!
 //! The visual language is herdr's, since that is the terminal app this lives
-//! beside: no boxes and no frames — one vertical divider, one horizontal rule,
-//! a section label on the left with its affordance right-aligned on the same
-//! row, single-column insets, and a lot of air.
+//! beside — and it is deliberately spare in the way opencode's is: **exactly one
+//! line is drawn in the whole steady-state view**, the sidebar divider. Nothing
+//! else is framed, ruled or tee'd. Structure comes from a shared left gutter
+//! ([`GUTTER`]), a wash on the one row that is selected, and air.
+//!
+//! Where a boundary used to be a rule it is now blank space, because a rule and
+//! the thing it separates say the same thing twice; where the prompt used to be
+//! a box it is now a single left bar, indigo while focused, which says both
+//! "this is the prompt" and "you are in it" with one stroke instead of four.
 //!
 //! ```text
 //!  Spaces                +  │  ● Ratatui terminal…   ● Diff sidebar…   +
-//!  ▪ komet-native  this dev │ ─────────────────────────────────────────────
-//!  ▪ soccertcg     this dev │                       ╭───────────────────╮
-//!                           │                       │ the user's prompt │
-//!  Sessions                 │                       ╰───────────────────╯
-//!  ● Ratatui terminal…  now │                                      14:32
-//!    komet-native · komet/… │  The assistant replies as plain text.
+//!  ▪ komet-native  this dev │
+//!  ▪ soccertcg     this dev │                         the user's prompt
+//!                           │                                     14:32
+//!  Sessions                 │
+//!  ● Ratatui terminal…  now │
+//!    komet-native · komet/… │    The assistant replies as plain text.
 //!  ● Rebalance player…   2h │
-//!    soccertcg · komet/re…  │  ⌄ Ran 2 commands
-//!                           │  │ Run   cargo test --workspace
-//!  ────────────────────     │  ◜ Working · 11s · Ctrl-X to interrupt
-//!  Wing Lee                 │ ╭─────────────────────────────────────────╮
-//!  w@example.com            │ │ Do anything…                            │
-//!                           │ ╰──────────────────── Fable 5 · High ─────╯
+//!    soccertcg · komet/re…  │    ⌄ Ran 2 commands
+//!                           │      Run   cargo test --workspace
+//!                           │
+//!  Wing Lee                 │    ◜ Working · 11s · Ctrl-X to interrupt
+//!  w@example.com            │  ┃ Do anything…
+//!                           │  ┃ Fable 5 · High
 //! ```
 //!
 //! Two habits keep the per-frame cost flat:
@@ -44,7 +50,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Widget};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
 
 use komet_proto::view::{ConnectionStatus, GatePhase};
 
@@ -65,6 +71,12 @@ const COMPOSER_MAX_ROWS: u16 = 8;
 /// Reading measure for the transcript. The original caps its content column
 /// rather than letting prose run the full width of a wide window.
 const CONTENT_MAX: u16 = 96;
+/// Columns every line of content in the main pane starts at.
+///
+/// One number, used by the transcript, the working strip and the composer, so
+/// the pane reads as a single column instead of three that nearly line up. It is
+/// also the width of the composer's gutter: bar, air, text.
+pub(crate) const GUTTER: usize = 3;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let theme = app.theme;
@@ -348,23 +360,6 @@ fn draw_sidebar_row(
                 area,
             );
         }
-        Row::Rule => {
-            // Full width, then a tee into the divider — an inset rule leaves the
-            // same notch the horizontal rules used to.
-            frame.render_widget(
-                Paragraph::new(Span::styled("─".repeat(width), theme.rule())),
-                area,
-            );
-            frame.render_widget(
-                Paragraph::new(Span::styled("┤", theme.rule())),
-                Rect {
-                    x: area.x + area.width,
-                    width: 1,
-                    height: 1,
-                    ..area
-                },
-            );
-        }
         Row::Chat {
             id,
             title,
@@ -475,15 +470,17 @@ fn draw_sidebar_row(
 
 fn draw_main(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
     // The tab strip IS the header — in the desktop shell it replaced one
-    // (`shell/tabs.rs`), so there is no separate title row.
-    let [tabs, rule, rest] = Layout::vertical([
+    // (`shell/tabs.rs`), so there is no separate title row. A blank row, not a
+    // rule, separates it from the transcript: the active tab already carries a
+    // wash, so a stroke underneath would be the same boundary drawn twice.
+    let [tabs, gap, rest] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
         Constraint::Min(4),
     ])
     .areas(area);
     draw_tab_strip(frame, tabs, app, theme);
-    draw_rule(frame, rule, app, theme);
+    let _ = gap;
 
     match app.gate() {
         GatePhase::Ready => {}
@@ -493,53 +490,26 @@ fn draw_main(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
         }
     }
 
-    // The prompt gets air above and below it: at one row tall, wedged between a
-    // rule and the hint bar, it reads as a cramped afterthought rather than the
-    // thing you are meant to type into.
+    // The prompt gets air below it: hard against the hint bar it reads as a
+    // cramped afterthought rather than the thing you are meant to type into. Air
+    // above is the status strip, which is blank whenever nothing is running — a
+    // second reserved pad on top of it was one gap too many.
     let text_rows = composer_rows(app, rest.width);
-    let [transcript, strip, divider, pad_top, composer, pad_bottom] = Layout::vertical([
+    let chip_rows = u16::from(!app.composer_chips().is_empty());
+    let [transcript, strip, composer, pad_bottom] = Layout::vertical([
         Constraint::Min(2),
         Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(text_rows),
+        Constraint::Length(text_rows + chip_rows),
         Constraint::Length(1),
     ])
     .areas(rest);
-    let _ = (pad_top, pad_bottom);
+    let _ = pad_bottom;
 
     app.push_hit(transcript, Hit::Pane(Focus::Transcript));
     app.push_hit(composer, Hit::Pane(Focus::Composer));
     draw_transcript(frame, transcript, app, theme);
     draw_status_strip(frame, strip, app, theme);
-    draw_rule(frame, divider, app, theme);
-    draw_composer(frame, composer, app, theme);
-}
-
-/// A full-width horizontal rule that *joins* the sidebar divider.
-///
-/// Without the tee, a rule that starts one column right of the divider reads as
-/// two unrelated lines with a notch between them. Drawing `├` in the divider's
-/// column is the difference between a frame and a set of loose strokes.
-fn draw_rule(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
-    if area.width == 0 {
-        return;
-    }
-    frame.render_widget(
-        Paragraph::new(Span::styled("─".repeat(area.width as usize), theme.rule())),
-        area,
-    );
-    if app.sidebar_visible && area.x > 0 {
-        frame.render_widget(
-            Paragraph::new(Span::styled("├", theme.rule())),
-            Rect {
-                x: area.x - 1,
-                width: 1,
-                height: 1,
-                ..area
-            },
-        );
-    }
+    draw_composer(frame, composer, text_rows, app, theme);
 }
 
 /// Width of one tab. The desktop strip uses a fixed 140px; a fixed column width
@@ -663,12 +633,19 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) 
     // the only place the transcript learns its width, so a resize lands here.
     app.lay_out_transcript(column.width, column.height as usize);
 
+    let inset = " ".repeat(GUTTER);
     if app.selected_chat.is_none() {
         frame.render_widget(
             Paragraph::new(vec![
                 Line::default(),
-                Line::from(Span::styled("  No session open.", theme.subtle())),
-                Line::from(Span::styled("  Press n to start one.", theme.hint())),
+                Line::from(Span::styled(
+                    format!("{inset}No session open."),
+                    theme.subtle(),
+                )),
+                Line::from(Span::styled(
+                    format!("{inset}Press n to start one."),
+                    theme.hint(),
+                )),
             ]),
             column,
         );
@@ -677,7 +654,7 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) 
     if app.transcript.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "  Nothing here yet.",
+                format!("{inset}Nothing here yet."),
                 theme.hint(),
             ))),
             column,
@@ -711,7 +688,7 @@ fn draw_status_strip(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         // must not be drawn two different ways depending on where you look.
         let (glyph, tint) = loaders::mini_spinner(app.elapsed());
         let mut spans = vec![
-            Span::raw(" ".to_string()),
+            Span::raw(" ".repeat(GUTTER)),
             Span::styled(glyph, Style::default().fg(tint)),
         ];
         spans.push(Span::styled(" Working".to_string(), theme.subtle()));
@@ -724,7 +701,10 @@ fn draw_status_strip(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     }
     if !app.transcript.following() {
         frame.render_widget(
-            Paragraph::new(Span::styled(" Scrolled back · G to follow", theme.hint())),
+            Paragraph::new(Span::styled(
+                format!("{}Scrolled back · G to follow", " ".repeat(GUTTER)),
+                theme.hint(),
+            )),
             area,
         );
     }
@@ -737,74 +717,67 @@ fn composer_rows(app: &App, width: u16) -> u16 {
     rows.clamp(1, COMPOSER_MAX_ROWS)
 }
 
-/// Text width inside the composer: the pane, less the prompt marker and a
-/// trailing column of air.
+/// Text width inside the composer: the pane, less the gutter bar and a trailing
+/// column of air.
 fn composer_text_width(width: u16) -> u16 {
-    width.saturating_sub(4).max(1)
+    width.saturating_sub(GUTTER as u16 + 1).max(1)
 }
 
-fn draw_composer(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
-    if area.height == 0 || area.width < 4 {
+/// The composer's left gutter bar: one mark that says both "this is the prompt"
+/// and "you are typing in it", where a box would have needed four strokes to say
+/// less. Heavy, so it is never mistaken for the pane divider; indigo while
+/// focused and hairline otherwise, so colour carries the state and the shape
+/// stays put.
+const BAR: &str = "┃";
+
+fn draw_composer(frame: &mut Frame, area: Rect, text_rows: u16, app: &mut App, theme: &Theme) {
+    if area.height == 0 || area.width < 6 {
         return;
     }
     let focused = app.focus == Focus::Composer;
 
-    // The chips ride the rule above, right-aligned — the terminal analogue of
-    // the desktop pill's inline chips. Each is its own click target: they open
-    // different pickers, so one lumped region would send every click to the
-    // same place.
-    let chips = app.composer_chips();
-    if !chips.is_empty() {
-        let widths: Vec<u16> = chips
-            .iter()
-            .map(|(_, label)| wrap::width_of(label) as u16 + 2)
-            .collect();
-        let total: u16 = widths.iter().sum::<u16>() + widths.len() as u16 + 1;
-        if total + 4 < area.width {
-            let mut x = area.x + area.width - total;
-            for ((kind, label), width) in chips.iter().zip(&widths) {
-                let slot = Rect {
-                    x,
-                    y: area.y - 1,
-                    width: *width,
-                    height: 1,
-                };
-                app.push_hit(slot, Hit::Chip(*kind));
-                // A wash makes it read as a button rather than as text that
-                // happens to sit on a rule.
-                frame.render_widget(
-                    Paragraph::new(Span::styled(
-                        format!(" {label} "),
-                        Style::default().fg(theme.muted).bg(theme.raised),
-                    )),
-                    slot,
-                );
-                x += width + 1;
-            }
-        }
+    // The bar runs the full height of the block, chips included, so a growing
+    // prompt stays one object rather than becoming a stack of rows.
+    let bar_style = if focused {
+        Style::default().fg(theme.accent)
+    } else {
+        theme.rule()
+    };
+    for offset in 0..area.height {
+        frame.render_widget(
+            Paragraph::new(Span::styled(BAR, bar_style)),
+            Rect {
+                x: area.x + 1,
+                y: area.y + offset,
+                width: 1,
+                height: 1,
+            },
+        );
     }
 
-    // "› " prompt marker, then the text.
-    frame.render_widget(
-        Paragraph::new(Span::styled(
-            " › ",
-            if focused {
-                theme.subtle()
-            } else {
-                theme.hint()
-            },
-        )),
-        Rect {
-            width: 3,
-            height: 1,
-            ..area
-        },
-    );
     let text_area = Rect {
-        x: area.x + 3,
-        width: area.width.saturating_sub(4),
+        x: area.x + GUTTER as u16,
+        width: composer_text_width(area.width),
+        height: text_rows,
         ..area
     };
+
+    // The chips sit on their own row inside the bar, left-aligned and quiet —
+    // the desktop pill's inline chips, read as a caption rather than dressed up
+    // as buttons. Each is still its own click target: they open different
+    // pickers, so one lumped region would send every click to the same place.
+    if area.height > text_rows {
+        draw_composer_chips(
+            frame,
+            Rect {
+                y: area.y + text_rows,
+                height: 1,
+                ..text_area
+            },
+            app,
+            theme,
+        );
+    }
 
     if app.composer.is_empty() {
         // The original's placeholder, verbatim.
@@ -843,6 +816,51 @@ fn draw_composer(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
             draw_caret(frame, x, y, theme);
             frame.set_cursor_position(Position { x, y });
         }
+    }
+}
+
+/// The composer's caption row: `main · Current checkout · Fable 5 · High`.
+///
+/// Separated by the same middle dot the sidebar sub-lines and the working strip
+/// use, so one glyph means "and also" everywhere in the app.
+fn draw_composer_chips(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
+    let chips = app.composer_chips();
+    if chips.is_empty() || area.width == 0 {
+        return;
+    }
+    let mut x = area.x;
+    for (index, (kind, label)) in chips.iter().enumerate() {
+        if index > 0 {
+            if x + 3 > area.right() {
+                return;
+            }
+            frame.render_widget(
+                Paragraph::new(Span::styled(" · ", theme.rule())),
+                Rect {
+                    x,
+                    width: 3,
+                    height: 1,
+                    ..area
+                },
+            );
+            x += 3;
+        }
+        let width = wrap::width_of(label) as u16;
+        if x + width > area.right() {
+            return;
+        }
+        let slot = Rect {
+            x,
+            width,
+            height: 1,
+            ..area
+        };
+        app.push_hit(slot, Hit::Chip(*kind));
+        frame.render_widget(
+            Paragraph::new(Span::styled(label.clone(), theme.hint())),
+            slot,
+        );
+        x += width;
     }
 }
 
@@ -910,7 +928,11 @@ fn draw_hints(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         hints.push(("n", "new"));
         hints.push(("?", "help"));
     }
-    hints.push(("Ctrl-X", "stop"));
+    // Only while there is something to stop. Advertising an interrupt over an
+    // idle session is a key that does nothing, which is worse than no hint.
+    if app.working_elapsed().is_some() {
+        hints.push(("Ctrl-X", "stop"));
+    }
     hints.push(if composing {
         ("Ctrl-C", "detach")
     } else {
@@ -1019,41 +1041,33 @@ fn draw_help(frame: &mut Frame, area: Rect, theme: &Theme) {
         .map(|(key, what)| wrap::width_of(key) + 2 + wrap::width_of(what))
         .max()
         .unwrap_or(40) as u16;
-    let width = (widest + 4).min(area.width.saturating_sub(2));
-    let height = (HELP.len() as u16 + 2).min(area.height);
-    let panel = Rect {
-        x: area.x + (area.width - width) / 2,
-        y: area.y + (area.height.saturating_sub(height)) / 2,
-        width,
-        height,
-    };
-
-    let block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(theme.rule())
-        .title(Span::styled(" Keys ", theme.label()));
-    let inner = block.inner(panel);
-    frame.render_widget(block, panel);
+    let width = (widest + 6).min(area.width.saturating_sub(2));
+    let height = (HELP.len() as u16 + 3).min(area.height);
+    let panel = centred(area, width, height);
+    let inner = draw_panel(frame, panel, theme, "Keys");
 
     let key_column = HELP
         .iter()
         .map(|(key, _)| wrap::width_of(key))
         .max()
         .unwrap_or(0);
-    let lines: Vec<Line> = HELP
-        .iter()
-        .take(inner.height as usize)
-        .map(|(key, what)| {
-            Line::from(vec![
-                Span::styled(format!("{key:>key_column$}  "), theme.subtle()),
+    for (index, (key, what)) in HELP.iter().take(inner.height as usize).enumerate() {
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(format!("{key:>key_column$}  "), theme.panel()),
                 Span::styled(
                     wrap::truncate(what, (inner.width as usize).saturating_sub(key_column + 2)),
-                    theme.hint(),
+                    theme.panel_hint(),
                 ),
-            ])
-        })
-        .collect();
-    frame.render_widget(Paragraph::new(lines), inner);
+            ]))
+            .style(theme.panel()),
+            Rect {
+                y: inner.y + index as u16,
+                height: 1,
+                ..inner
+            },
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1062,9 +1076,9 @@ fn draw_help(frame: &mut Frame, area: Rect, theme: &Theme) {
 
 /// A right-click menu, the model picker, or a rename prompt.
 ///
-/// All three are the same card: a rounded hairline box on a cleared rect. Only
-/// the menu is anchored at the pointer — the others are centred, because they
-/// are about the session rather than about the row you happened to click.
+/// All three are the same panel: a raised wash on a cleared rect ([`draw_panel`]).
+/// Only the menu is anchored at the pointer — the others are centred, because
+/// they are about the session rather than about the row you happened to click.
 fn draw_overlay(
     frame: &mut Frame,
     body: Rect,
@@ -1087,6 +1101,8 @@ fn draw_overlay(
                 .max()
                 .unwrap_or(12) as u16
                 + 4;
+            // A separated item gets a blank row above it, not a rule: inside a
+            // wash, air already groups.
             let separators = items.iter().filter(|item| item.separated).count() as u16;
             let height = items.len() as u16 + separators + 2;
             // Flip the anchor when the menu would run off an edge.
@@ -1102,49 +1118,27 @@ fn draw_overlay(
                 width: width.min(body.width),
                 height: height.min(body.height),
             };
-            let block = card(theme, title);
-            let inner = block.inner(panel);
-            frame.render_widget(Clear, panel);
-            frame.render_widget(block, panel);
+            let inner = draw_panel(frame, panel, theme, title);
 
             let mut y = inner.y;
             for (index, item) in items.iter().enumerate() {
                 if item.separated && y < inner.bottom() {
-                    frame.render_widget(
-                        Paragraph::new(Span::styled(
-                            "─".repeat(inner.width as usize),
-                            theme.rule(),
-                        )),
-                        Rect {
-                            y,
-                            height: 1,
-                            ..inner
-                        },
-                    );
                     y += 1;
                 }
                 if y >= inner.bottom() {
                     break;
                 }
-                let slot = Rect {
-                    y,
-                    height: 1,
-                    ..inner
-                };
-                let selected = index == *active;
-                if selected {
-                    frame.render_widget(Paragraph::new("").style(theme.selected()), slot);
-                }
-                frame.render_widget(
-                    Paragraph::new(Span::styled(
-                        format!(" {}", item.label),
-                        if selected {
-                            theme.selected().patch(theme.body())
-                        } else {
-                            theme.subtle()
-                        },
-                    )),
-                    slot,
+                draw_panel_row(
+                    frame,
+                    Rect {
+                        y,
+                        height: 1,
+                        ..inner
+                    },
+                    theme,
+                    &item.label,
+                    None,
+                    index == *active,
                 );
                 y += 1;
             }
@@ -1218,77 +1212,44 @@ fn draw_overlay(
                 Some(_) => vec![("No models for this harness".into(), None)],
                 None => vec![("Loading…".into(), None)],
             };
-            let width = 52u16.min(body.width.saturating_sub(4));
-            let height = (rows.len() as u16 + 2).min(body.height.saturating_sub(2));
-            let panel = centred(body, width, height);
-            let block = card(theme, "Model");
-            let inner = block.inner(panel);
-            frame.render_widget(Clear, panel);
-            frame.render_widget(block, panel);
-
-            for (index, (label, description)) in rows.iter().enumerate() {
-                let y = inner.y + index as u16;
-                if y >= inner.bottom() {
-                    break;
-                }
-                let slot = Rect {
-                    y,
-                    height: 1,
-                    ..inner
-                };
-                let selected = models.is_some() && index == *active;
-                if selected {
-                    frame.render_widget(Paragraph::new("").style(theme.selected()), slot);
-                }
-                let mut spans = vec![Span::styled(
-                    format!(" {label}"),
-                    if selected {
-                        theme.selected().patch(theme.body())
-                    } else {
-                        theme.subtle()
-                    },
-                )];
-                if let Some(description) = description {
-                    let room = (inner.width as usize).saturating_sub(wrap::width_of(label) + 3);
-                    if room > 4 {
-                        spans.push(Span::styled(
-                            format!("  {}", wrap::truncate(description, room)),
-                            theme.hint(),
-                        ));
-                    }
-                }
-                frame.render_widget(Paragraph::new(Line::from(spans)), slot);
-            }
-            panel
+            // Same panel as every other picker — a model list is a list.
+            list_card(
+                frame,
+                body,
+                theme,
+                "Model",
+                &rows,
+                models.is_some(),
+                *active,
+            )
         }
 
         Overlay::Prompt { title, input, .. } => {
             let width = 52u16.min(body.width.saturating_sub(4));
             let panel = centred(body, width, 4);
-            let block = card(theme, title);
-            let inner = block.inner(panel);
-            frame.render_widget(Clear, panel);
-            frame.render_widget(block, panel);
-            let laid = input.lay_out(inner.width.saturating_sub(2) as usize);
+            let inner = draw_panel(frame, panel, theme, title);
+            let laid = input.lay_out(inner.width as usize);
             frame.render_widget(
                 Paragraph::new(Span::styled(
-                    format!(" {}", laid.rows.first().cloned().unwrap_or_default()),
-                    theme.body(),
-                )),
+                    laid.rows.first().cloned().unwrap_or_default(),
+                    theme.panel(),
+                ))
+                .style(theme.panel()),
                 Rect { height: 1, ..inner },
             );
             frame.render_widget(
                 Paragraph::new(Span::styled(
-                    " Enter to confirm · Esc to cancel",
-                    theme.hint(),
-                )),
+                    "Enter to confirm · Esc to cancel",
+                    theme.panel_hint(),
+                ))
+                .style(theme.panel()),
                 Rect {
                     y: inner.y + 1,
                     height: 1,
                     ..inner
                 },
             );
-            let caret_x = inner.x + 1 + (laid.cursor_col as u16).min(inner.width.saturating_sub(2));
+            let caret_x = inner.x + (laid.cursor_col as u16).min(inner.width.saturating_sub(1));
             draw_caret(frame, caret_x, inner.y, theme);
             frame.set_cursor_position(Position {
                 x: caret_x,
@@ -1318,53 +1279,88 @@ fn list_card(
     let width = 56u16.min(body.width.saturating_sub(4));
     let height = (rows.len() as u16 + 2).min(body.height.saturating_sub(2));
     let panel = centred(body, width, height);
-    let block = card(theme, title);
-    let inner = block.inner(panel);
-    frame.render_widget(Clear, panel);
-    frame.render_widget(block, panel);
+    let inner = draw_panel(frame, panel, theme, title);
 
     for (index, (label, detail)) in rows.iter().enumerate() {
         let y = inner.y + index as u16;
         if y >= inner.bottom() {
             break;
         }
-        let slot = Rect {
-            y,
-            height: 1,
-            ..inner
-        };
-        let selected = selectable && index == active;
-        if selected {
-            frame.render_widget(Paragraph::new("").style(theme.selected()), slot);
-        }
-        let mut spans = vec![Span::styled(
-            format!(" {label}"),
-            if selected {
-                theme.selected().patch(theme.body())
-            } else {
-                theme.subtle()
+        draw_panel_row(
+            frame,
+            Rect {
+                y,
+                height: 1,
+                ..inner
             },
-        )];
-        if let Some(detail) = detail {
-            let room = (inner.width as usize).saturating_sub(wrap::width_of(label) + 3);
-            if room > 4 {
-                spans.push(Span::styled(
-                    format!("  {}", wrap::truncate(detail, room)),
-                    theme.hint(),
-                ));
-            }
-        }
-        frame.render_widget(Paragraph::new(Line::from(spans)), slot);
+            theme,
+            label,
+            detail.as_deref(),
+            selectable && index == active,
+        );
     }
     panel
 }
 
-/// The shared card chrome: rounded hairline box with a title.
-fn card<'a>(theme: &Theme, title: &'a str) -> Block<'a> {
-    Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(theme.rule())
-        .title(Span::styled(format!(" {title} "), theme.label()))
+/// One row of a floating panel: a label, an optional muted detail after it, and
+/// the selection wash when it is the active one.
+fn draw_panel_row(
+    frame: &mut Frame,
+    slot: Rect,
+    theme: &Theme,
+    label: &str,
+    detail: Option<&str>,
+    selected: bool,
+) {
+    let base = if selected {
+        theme.panel_selected()
+    } else {
+        theme.panel()
+    };
+    let mut spans = vec![Span::styled(
+        format!(" {}", wrap::truncate(label, slot.width as usize)),
+        if selected { base } else { base.fg(theme.muted) },
+    )];
+    if let Some(detail) = detail {
+        let room = (slot.width as usize).saturating_sub(wrap::width_of(label) + 3);
+        if room > 4 {
+            spans.push(Span::styled(
+                format!("  {}", wrap::truncate(detail, room)),
+                base.fg(theme.faint),
+            ));
+        }
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)).style(base), slot);
+}
+
+/// The shared panel chrome: a raised wash on a cleared rect, its title on the
+/// first row. Returns the rows the caller fills.
+///
+/// No border, because the wash already *is* one — a hairline box around a
+/// surface that is already a different colour is the same edge drawn twice, and
+/// on a terminal the box also costs two columns and two rows of the content it
+/// surrounds. This is the desktop app's own menu: a raised surface, a title, and
+/// rows.
+fn draw_panel(frame: &mut Frame, panel: Rect, theme: &Theme, title: &str) -> Rect {
+    frame.render_widget(Clear, panel);
+    frame.render_widget(Paragraph::new("").style(theme.panel()), panel);
+    if panel.height == 0 || panel.width < 4 {
+        return panel;
+    }
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            format!(" {}", wrap::truncate(title, panel.width as usize - 2)),
+            theme.panel_hint(),
+        ))
+        .style(theme.panel()),
+        Rect { height: 1, ..panel },
+    );
+    Rect {
+        x: panel.x + 1,
+        y: panel.y + 1,
+        width: panel.width - 2,
+        height: panel.height - 2,
+    }
 }
 
 fn centred(body: Rect, width: u16, height: u16) -> Rect {

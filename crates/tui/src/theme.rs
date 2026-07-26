@@ -34,8 +34,12 @@ pub struct Theme {
     pub accent: Color,
     /// Selected-row wash — white@8% over the sidebar surface.
     pub selection: Color,
-    /// Raised surface: the user bubble, tool chips — neutral(0.235).
+    /// Raised surface: the user bubble, floating panels — neutral(0.235).
     pub raised: Color,
+    /// A selected row *on* a raised surface. The plain [`Self::selection`] is
+    /// seven values off `raised` and would vanish there, so menus get their own
+    /// step — white@8% over the raised surface, as the desktop menus do.
+    pub raised_selection: Color,
     /// Inline-code wash — white@6% over the main surface.
     pub code_wash: Color,
     pub danger: Color,
@@ -60,6 +64,7 @@ impl Theme {
             accent: Color::Rgb(0x7c, 0x86, 0xff),
             selection: Color::Rgb(0x20, 0x20, 0x20),
             raised: Color::Rgb(0x1e, 0x1e, 0x1e),
+            raised_selection: Color::Rgb(0x30, 0x30, 0x30),
             code_wash: Color::Rgb(0x15, 0x15, 0x15),
             danger: Color::Rgb(0xff, 0x64, 0x67),
             warning: Color::Rgb(0xff, 0xb9, 0x00),
@@ -84,6 +89,7 @@ impl Theme {
             accent: reset,
             selection: reset,
             raised: reset,
+            raised_selection: reset,
             code_wash: reset,
             danger: reset,
             warning: reset,
@@ -146,6 +152,37 @@ impl Theme {
             Style::default().add_modifier(Modifier::REVERSED)
         } else {
             Style::default().fg(self.text).bg(self.raised)
+        }
+    }
+
+    /// A floating panel — menu, picker, help. The wash *is* the boundary; the
+    /// original's menus are a raised surface, not a framed one.
+    /// Under `NO_COLOR` a panel has no wash to be raised above — the `Clear`
+    /// beneath it is what separates it from the body, and the selected row
+    /// carries the only mark.
+    pub fn panel(&self) -> Style {
+        if self.plain {
+            Style::default()
+        } else {
+            Style::default().fg(self.text).bg(self.raised)
+        }
+    }
+
+    /// The active row of a floating panel.
+    pub fn panel_selected(&self) -> Style {
+        if self.plain {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default().fg(self.text).bg(self.raised_selection)
+        }
+    }
+
+    /// A panel's own muted text, on its wash rather than the terminal default.
+    pub fn panel_hint(&self) -> Style {
+        if self.plain {
+            Style::default()
+        } else {
+            Style::default().fg(self.faint).bg(self.raised)
         }
     }
 
@@ -244,6 +281,20 @@ mod tests {
         assert_eq!(t.dot_completed, oklch(d.0, d.1, d.2), "emerald");
         // Awaiting is the accent, exactly as in the original.
         assert_eq!(t.dot_awaiting, t.accent);
+    }
+
+    #[test]
+    fn a_panels_selection_is_visible_on_its_own_wash() {
+        // The body selection is seven values off `raised`; on a panel it would
+        // be invisible, which is how a picker ends up with no apparent cursor.
+        let t = Theme::dark();
+        let blend = |over: u8| (0x1e as f32 * 0.92 + over as f32 * 0.08).round() as u8;
+        assert_eq!(
+            t.raised_selection,
+            Color::Rgb(blend(0xff), blend(0xff), blend(0xff)),
+            "white@8% over the raised surface, as the desktop menus paint it"
+        );
+        assert_ne!(t.panel_selected().bg, t.panel().bg);
     }
 
     #[test]

@@ -133,8 +133,6 @@ pub enum Row {
     Empty { label: String },
     /// Vertical air between sections (the desktop sidebar's 12px lead-in).
     Blank,
-    /// A hairline rule.
-    Rule,
     /// The signed-in user, pinned at the bottom.
     User { name: String, email: String },
 }
@@ -627,7 +625,7 @@ impl App {
             }
             Action::Reconnect => vec![Command::Reconnect],
 
-            // Rules, section headers and the user row are decoration: the
+            // Blanks, section headers and the user row are decoration: the
             // cursor steps over them rather than stopping on nothing.
             Action::ListUp => {
                 if let Some(at) = self.next_selectable(self.cursor, -1) {
@@ -754,8 +752,7 @@ impl App {
             Some(Row::Space { id, .. }) => self.activate_space(id),
             // Decoration isn't selectable, so nothing else can be under the
             // cursor; a defensive arm keeps this total.
-            Some(Row::Rule)
-            | Some(Row::Blank)
+            Some(Row::Blank)
             | Some(Row::Section { .. })
             | Some(Row::Empty { .. })
             | Some(Row::User { .. })
@@ -1339,7 +1336,10 @@ impl App {
         }
 
         if let Some((name, email)) = user_row {
-            rows.push(Row::Rule);
+            // Air, not a hairline: the user row is already pinned to the bottom
+            // of the pane, so a rule above it is a second answer to a question
+            // position has already answered.
+            rows.push(Row::Blank);
             rows.push(Row::User { name, email });
         }
 
