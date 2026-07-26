@@ -8,7 +8,9 @@ members = [
     "crates/engine",
     "crates/rpc",
     "crates/ui",
+    "crates/tui",
     "apps/komet",
+    "apps/tui",
 ]
 
 [workspace.package]
@@ -25,6 +27,7 @@ komet-harness = { path = "crates/harness" }
 komet-engine = { path = "crates/engine" }
 komet-rpc = { path = "crates/rpc" }
 komet-ui = { path = "crates/ui" }
+komet-tui = { path = "crates/tui" }
 
 # CRDT
 loro = "1.13"
@@ -45,6 +48,17 @@ gpui_platform = { git = "https://github.com/wingleeio/zed", rev = "a6bf17cf02861
     "runtime_shaders",
 ] }
 gpui_tokio = { git = "https://github.com/wingleeio/zed", rev = "a6bf17cf028612a6eea80c32645a3305bd7cded4" }
+
+# ratatui — the terminal viewport (`komet-tui`). Deliberately narrow features:
+# `widget-calendar` (a default) drags in `time`, and we render no calendar.
+# `layout-cache` memoizes the cassowary solve, which is the one per-frame cost
+# in ratatui that isn't already diffed away.
+ratatui = { version = "0.30", default-features = false, features = [
+    "std",
+    "crossterm",
+    "layout-cache",
+    "underline-color",
+] }
 
 # async / net
 tokio = { version = "1", features = ["full"] }

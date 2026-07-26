@@ -16,32 +16,11 @@ use crate::motion::{
 };
 use crate::theme::Theme;
 
-/// Cells in the komet wave loader.
-pub const KOMET_CELLS: usize = 5;
-/// Side length of the gradient spinner matrix.
-pub const MATRIX_SIDE: usize = 3;
-
-/// The komet mark's pixels — `[x, y]` of each 100×100 cell on the 820×940
-/// canvas (komet logo.tsx `CELLS`; shared by the static mark asset and the
-/// animated [`komet_mark_loader`]).
-pub const MARK_CELLS: [(f32, f32); 34] = [
-    (0., 600.), (0., 720.), (240., 840.), (240., 720.), (120., 840.), (120., 600.), (240., 600.),
-    (0., 480.), (0., 360.), (480., 840.), (480., 720.), (120., 360.), (120., 240.), (240., 360.),
-    (600., 720.), (480., 600.), (360., 360.), (240., 240.), (600., 600.), (720., 600.), (720., 480.),
-    (240., 120.), (600., 380.), (720., 240.), (720., 0.), (480., 240.), (480., 0.), (120., 480.),
-    (240., 480.), (360., 840.), (360., 720.), (360., 600.), (360., 480.), (120., 720.),
-];
-
-/// Fraction of the pulse cycle the light sweep occupies (komet-loader.tsx `SPREAD`).
-pub const MARK_SPREAD: f32 = 0.55;
-
-/// Per-cell stagger fraction along the komet's flight axis — tail tip
-/// `(720, 0)` leads, head `(0, 840)` trails (komet-loader.tsx `delayFor`,
-/// normalized into the repeating animation's phase space).
-pub fn mark_cell_stagger(x: f32, y: f32) -> f32 {
-    let t = (820.0 - x + y) / 1660.0;
-    (1.0 - t) * MARK_SPREAD
-}
+// Shared with the terminal viewport (`komet_proto::motion`) so both animate the
+// same loaders from the same numbers.
+pub use komet_proto::motion::{
+    KOMET_CELLS, MARK_CELLS, MARK_SPREAD, MATRIX_SIDE, mark_cell_stagger,
+};
 
 /// The animated komet mark (komet-loader.tsx `KometLoader`): the full logo
 /// pixel grid with a light wave sweeping tail→head. Each cell rests dim
@@ -117,12 +96,7 @@ pub fn komet_loader(id: &'static str, theme: &Theme, cell_px: f32) -> impl IntoE
         }))
 }
 
-/// Per-row tints of the gradient matrix spinner — komet's "sunrise" gradient
-/// (gradient-spin.tsx SUNRISE) sampled at each row: cool blue at the top,
-/// through amber, to pink at the bottom.
-pub const GSPIN_ROW_TINTS: [u32; MATRIX_SIDE] = [0xB6D3EF, 0xEDB185, 0xF888A0];
-/// Opacity a cell rests at between pulses.
-pub const GSPIN_DIM: f32 = 0.1;
+pub use komet_proto::motion::{GSPIN_DIM, GSPIN_ROW_TINTS};
 
 /// The gradient matrix spinner (WorkingIndicator), ported from komet's
 /// gradient-spin.tsx: a 3×3 grid of round cells tinted per row from the
@@ -236,7 +210,9 @@ pub fn loading_word(theme: &Theme) -> impl IntoElement {
     div()
         .text_size(px(11.0))
         .text_color(theme.text_muted.opacity(0.7))
-        .child(SharedString::from("L\u{2009}O\u{2009}A\u{2009}D\u{2009}I\u{2009}N\u{2009}G"))
+        .child(SharedString::from(
+            "L\u{2009}O\u{2009}A\u{2009}D\u{2009}I\u{2009}N\u{2009}G",
+        ))
 }
 
 // Compile-time proof the specs referenced here stay wired to the catalog.
@@ -262,7 +238,10 @@ mod tests {
         // Every logo cell stays inside [0, SPREAD].
         for &(x, y) in &MARK_CELLS {
             let s = mark_cell_stagger(x, y);
-            assert!((0.0..=MARK_SPREAD + 1e-6).contains(&s), "cell ({x},{y}) stagger {s}");
+            assert!(
+                (0.0..=MARK_SPREAD + 1e-6).contains(&s),
+                "cell ({x},{y}) stagger {s}"
+            );
         }
     }
 }

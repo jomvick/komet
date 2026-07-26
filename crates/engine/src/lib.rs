@@ -445,12 +445,10 @@ impl Engine {
 
         let runtime = Self::assemble_runtime(&config, auth).await?;
 
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", config.ipc_port)).await?;
-        tracing::info!(port = config.ipc_port, "IPC server listening");
-        let server = tokio::spawn(komet_rpc::serve_ws_listener(
-            listener,
-            runtime.core().rpc_service(),
-        ));
+        // A daemon exists to serve this port, so a bind failure is fatal here —
+        // unlike the headed app, which can still work over its in-process
+        // transport (see `serve_ipc`).
+        let server = serve_ipc(config.ipc_port, runtime.core().rpc_service()).await?;
 
         tokio::signal::ctrl_c().await?;
         tracing::info!("shutting down");
@@ -458,6 +456,27 @@ impl Engine {
         runtime.shutdown().await;
         Ok(())
     }
+}
+
+/// Serve the typed RPC on the localhost IPC port.
+///
+/// Both engines call this: the headless daemon, and the headed app's embedded
+/// engine. That second case is the point — an embedded engine that keeps the
+/// port to itself forces anyone wanting a second viewport (the terminal app) to
+/// stop the desktop app, start a daemon, and start it again in the right order.
+/// Serving here means any viewport can just attach.
+///
+/// Localhost only, exactly as before: this widens *which process* can serve the
+/// port, not who can reach it.
+pub async fn serve_ipc(
+    port: u16,
+    service: std::sync::Arc<dyn komet_rpc::RpcService>,
+) -> std::io::Result<tokio::task::JoinHandle<()>> {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
+    tracing::info!(port, "IPC server listening");
+    Ok(tokio::spawn(komet_rpc::serve_ws_listener(
+        listener, service,
+    )))
 }
 
 /// Block until the WorkOS session is signed in AND org-scoped. On a TTY, print the

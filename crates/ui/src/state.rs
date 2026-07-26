@@ -29,9 +29,7 @@ use serde::de::DeserializeOwned;
 
 use komet_doc::SessionMessageEntry;
 use komet_engine::{Engine, EngineConfig, EngineRuntime, rpc::AuthRpc};
-use komet_proto::{
-    AuthState, Chat, ChatIndicator, Device, HarnessId, Session, SessionStatus, Space,
-};
+use komet_proto::{AuthState, Chat, ChatIndicator, Device, HarnessId, Session, Space};
 use komet_rpc::{RpcClient, RpcError, RpcReply, RpcService, connect_ws, memory_client, methods};
 
 // ---------------------------------------------------------------------------
@@ -82,6 +80,9 @@ struct InProcessEngine {
     runtime: Arc<tokio::sync::Mutex<Option<EngineRuntime>>>,
     boot_task: tokio::task::JoinHandle<()>,
     refresh_task: tokio::task::JoinHandle<()>,
+    /// Serves this engine to other viewports over the IPC port. `None` when the
+    /// port was already taken — the window still works over its own transport.
+    ipc_task: Option<tokio::task::JoinHandle<()>>,
     client: RpcClient,
 }
 
@@ -95,6 +96,11 @@ impl EngineBackend for InProcessEngine {
     }
     async fn shutdown(&self) {
         self.boot_task.abort();
+        // Stop accepting first: a viewport must not connect midway through the
+        // drain and queue work against stores that are closing.
+        if let Some(ipc) = &self.ipc_task {
+            ipc.abort();
+        }
         if let Some(runtime) = self.runtime.lock().await.take() {
             runtime.shutdown().await;
         }
@@ -179,10 +185,17 @@ impl EngineHandle {
         .await;
         if matches!(probe, Ok(Ok(_))) {
             tracing::info!(%url, "engine daemon detected; connecting");
-            let client = connect_ws(&url).await?;
-            return Ok(EngineHandle {
-                inner: Arc::new(RemoteEngine { client, url }),
-            });
+            match connect_ws(&url).await {
+                Ok(client) => {
+                    return Ok(EngineHandle {
+                        inner: Arc::new(RemoteEngine { client, url }),
+                    });
+                }
+                // Something is on the port but it is not an engine (or it is
+                // wedged). Fall through and embed: a stranger holding 27654
+                // should cost other viewports, not this window.
+                Err(err) => tracing::warn!(%url, error = %err, "not an engine; embedding instead"),
+            }
         }
 
         tracing::info!(data_dir = %config.data_dir.display(), "no daemon on port; embedding engine");
@@ -198,10 +211,31 @@ impl EngineHandle {
         let auth = Engine::build_auth(&engine_config).await;
         let refresh_task = auth.spawn_refresh_loop();
         let (state_tx, state_rx) = tokio::sync::watch::channel(DeferredEngineState::Waiting);
-        let client = memory_client(Arc::new(DeferredEngineRpc {
+        let service: Arc<dyn RpcService> = Arc::new(DeferredEngineRpc {
             auth: AuthRpc::new(auth.clone()),
             state: state_rx,
-        }));
+        });
+        let client = memory_client(service.clone());
+
+        // Serve the same service on the IPC port so a terminal viewport can
+        // attach to this window's engine with no setup. Deliberately the
+        // *deferred* service, not the assembled one: a viewport that connects
+        // before sign-in gets AuthRpc (so it can show its own gate) and its
+        // data subscriptions wait exactly as this window's do.
+        //
+        // Best-effort — losing the bind race with another engine costs other
+        // viewports, not this one.
+        let ipc_task = match komet_engine::serve_ipc(engine_config.ipc_port, service).await {
+            Ok(task) => Some(task),
+            Err(err) => {
+                tracing::warn!(
+                    port = engine_config.ipc_port,
+                    error = %err,
+                    "IPC port unavailable; other viewports cannot attach to this window"
+                );
+                None
+            }
+        };
         let runtime = Arc::new(tokio::sync::Mutex::new(None));
         let runtime_for_boot = runtime.clone();
         let boot_task = tokio::spawn(async move {
@@ -232,6 +266,7 @@ impl EngineHandle {
                 runtime,
                 boot_task,
                 refresh_task,
+                ipc_task,
                 client,
             }),
         })
@@ -254,271 +289,16 @@ impl EngineHandle {
 // Pure state + reducers
 // ---------------------------------------------------------------------------
 
-/// UI ⇄ engine connection lifecycle.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ConnectionStatus {
-    Connecting,
-    Ready,
-    Failed(String),
-}
-
-/// What a chat's status dot / working indicator should show right now.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Indicator {
-    None,
-    Working,
-    AwaitingInput,
-    Errored,
-}
-
-/// A `Working`/`AwaitingInput` session older than this is treated as dead — a
-/// crashed backend must never show an eternal "Working" (feature-inventory
-/// §1.12). Engines heartbeat sessions well inside this window.
-pub const SESSION_STALE_MS: i64 = 45_000;
-
-/// Staleness-checked indicator for a session row. Pure.
-pub fn effective_indicator(session: Option<&Session>, now: DateTime<Utc>) -> Indicator {
-    let Some(session) = session else {
-        return Indicator::None;
-    };
-    match session.status {
-        SessionStatus::Idle => Indicator::None,
-        SessionStatus::Errored => Indicator::Errored,
-        SessionStatus::Working | SessionStatus::AwaitingInput => {
-            let age_ms = now
-                .signed_duration_since(session.updated_at)
-                .num_milliseconds();
-            if age_ms > SESSION_STALE_MS {
-                Indicator::None
-            } else if session.status == SessionStatus::Working {
-                Indicator::Working
-            } else {
-                Indicator::AwaitingInput
-            }
-        }
-    }
-}
-
-/// The full display status for a chat row / tab dot: live states win, then the
-/// synced seen marker decides completed-vs-idle. Staleness gating rides on
-/// [`effective_indicator`]; the derivation itself is `komet_proto::chat_indicator`.
-pub fn display_status(chat: &Chat, session: Option<&Session>, now: DateTime<Utc>) -> ChatIndicator {
-    let live = session.filter(|s| effective_indicator(Some(s), now) != Indicator::None);
-    komet_proto::chat_indicator(chat, live)
-}
-
-/// Attention bucket for the sidebar's Active list — lower is more urgent.
-pub fn attention_rank(status: ChatIndicator) -> u8 {
-    match status {
-        ChatIndicator::AwaitingInput => 0,
-        ChatIndicator::Errored => 1,
-        ChatIndicator::Working => 2,
-        ChatIndicator::Completed => 3,
-        ChatIndicator::Idle => 4,
-    }
-}
-
-/// Active-list order: pure recency (`last_message_at` desc, `created_at`
-/// fallback), id tiebreak so the sort is total. Deliberately NOT
-/// attention-bucketed: status drives the DOT, never the position — bucketing
-/// meant that merely OPENING a completed session (completed → seen → idle)
-/// dropped its row under the pointer (user report: "their position in the
-/// scrollbar changes"). Matches the old sidebar, which rendered chats in
-/// recency order and let the dots carry urgency; [`attention_rank`] still
-/// aggregates the space rows' urgency dot.
-pub fn sort_active(rows: &mut Vec<(ChatIndicator, &Chat)>) {
-    rows.sort_by(|(_, a), (_, b)| {
-        let ka = a.last_message_at.unwrap_or(a.created_at);
-        let kb = b.last_message_at.unwrap_or(b.created_at);
-        kb.cmp(&ka).then_with(|| a.id.cmp(&b.id))
-    });
-}
-
-/// Session-tab order for a space: creation order (activity never reorders
-/// tabs), id tiebreak. Pure.
-pub fn sort_tabs(chats: &mut [&Chat]) {
-    chats.sort_by(|a, b| {
-        a.created_at
-            .cmp(&b.created_at)
-            .then_with(|| a.id.cmp(&b.id))
-    });
-}
-
-/// Spaces list order: creation order, id tiebreak — total and stable across
-/// devices. Pure.
-pub fn sort_spaces(spaces: &mut [Space]) {
-    spaces.sort_by(|a, b| {
-        a.created_at
-            .cmp(&b.created_at)
-            .then_with(|| a.id.cmp(&b.id))
-    });
-}
-
-/// Sidebar order: `last_message_at` desc, falling back to `created_at`; ties
-/// break by `created_at` desc then id so the sort is total and stable across
-/// devices. Pure.
-pub fn sort_chats(chats: &mut [Chat]) {
-    chats.sort_by(|a, b| {
-        let ka = a.last_message_at.unwrap_or(a.created_at);
-        let kb = b.last_message_at.unwrap_or(b.created_at);
-        kb.cmp(&ka)
-            .then_with(|| b.created_at.cmp(&a.created_at))
-            .then_with(|| a.id.cmp(&b.id))
-    });
-}
-
-/// The app gate (komet's App.tsx phases). Pure.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum GatePhase {
-    /// Booting / probing — splash covers this.
-    Loading,
-    /// Engine unreachable and embedding failed.
-    Failed(String),
-    /// Engine up, but signed out — show the sign-in card (M4 wires the flow).
-    SignIn,
-    /// Signed in but no organization selected — "Create your workspace".
-    OrgGate,
-    /// Render the shell.
-    Ready,
-}
-
-/// `auth = None` means "engine doesn't report auth yet" (pre-M4 / dev mode) and
-/// gates nothing.
-pub fn gate_phase(connection: &ConnectionStatus, auth: Option<&AuthState>) -> GatePhase {
-    match connection {
-        ConnectionStatus::Connecting => GatePhase::Loading,
-        ConnectionStatus::Failed(err) => GatePhase::Failed(err.clone()),
-        ConnectionStatus::Ready => match auth {
-            Some(AuthState::SignedOut) => GatePhase::SignIn,
-            Some(AuthState::NeedsOrganization { .. }) => GatePhase::OrgGate,
-            _ => GatePhase::Ready,
-        },
-    }
-}
-
-/// Parse an `AuthStatus` frame tolerantly. The engine currently serializes its
-/// own enum (`{"_tag": "SignedIn", ...}`) while the proto type expects
-/// `{"state": "signedIn", ...}` — accept both so either side can converge
-/// without breaking the viewport.
-pub fn parse_auth_state(value: &serde_json::Value) -> Option<AuthState> {
-    if let Ok(state) = serde_json::from_value::<AuthState>(value.clone()) {
-        return Some(state);
-    }
-    let tag = value.get("_tag").and_then(|t| t.as_str())?;
-    let user = || -> Option<komet_proto::UserProfile> {
-        let u = value.get("user")?;
-        Some(komet_proto::UserProfile {
-            id: u.get("id")?.as_str()?.to_string(),
-            email: u.get("email")?.as_str()?.to_string(),
-            name: u.get("name").and_then(|n| n.as_str()).map(str::to_string),
-        })
-    };
-    match tag {
-        "SignedOut" => Some(AuthState::SignedOut),
-        "NeedsOrganization" => Some(AuthState::NeedsOrganization { user: user()? }),
-        "SignedIn" => Some(AuthState::SignedIn {
-            user: user()?,
-            org_id: value
-                .get("orgId")
-                .and_then(|v| v.as_str())
-                .map(str::to_string),
-        }),
-        _ => None,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Sidebar grouping (pure)
-// ---------------------------------------------------------------------------
-
-/// One grouped-by-project sidebar section.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ChatGroup<'a> {
-    pub label: String,
-    pub chats: Vec<&'a Chat>,
-}
-
-/// Project label for a chat: the basename of its cwd, or "No project".
-pub fn project_label(cwd: Option<&str>) -> String {
-    let Some(cwd) = cwd.map(str::trim).filter(|c| !c.is_empty()) else {
-        return "No project".to_string();
-    };
-    std::path::Path::new(cwd.trim_end_matches(['/', '\\']))
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .filter(|n| !n.is_empty())
-        .unwrap_or_else(|| cwd.to_string())
-}
-
-/// Group chats by project label, preserving the incoming (recency) order both
-/// for groups (by their most recent chat) and rows within a group. Pure.
-pub fn group_chats<'a>(chats: impl IntoIterator<Item = &'a Chat>) -> Vec<ChatGroup<'a>> {
-    let mut groups: Vec<ChatGroup<'a>> = Vec::new();
-    for chat in chats {
-        let label = project_label(chat.cwd.as_deref());
-        match groups.iter_mut().find(|g| g.label == label) {
-            Some(group) => group.chats.push(chat),
-            None => groups.push(ChatGroup {
-                label,
-                chats: vec![chat],
-            }),
-        }
-    }
-    groups
-}
-
-/// Compact relative time ("now", "5m", "3h", "2d", "1w", …) — no "ago" suffix;
-/// port of komet's `formatTimeAgo`.
-pub fn format_time_ago(then: chrono::DateTime<Utc>, now: chrono::DateTime<Utc>) -> String {
-    let s = now.signed_duration_since(then).num_seconds().max(0);
-    // Under a minute reads as "now" — otherwise 45–59s floors to a bare "0m".
-    if s < 60 {
-        return "now".to_string();
-    }
-    let m = s / 60;
-    if m < 60 {
-        return format!("{m}m");
-    }
-    let h = m / 60;
-    if h < 24 {
-        return format!("{h}h");
-    }
-    let d = h / 24;
-    if d < 7 {
-        return format!("{d}d");
-    }
-    let w = d / 7;
-    if w < 5 {
-        return format!("{w}w");
-    }
-    let mo = d / 30;
-    if mo < 12 {
-        return format!("{mo}mo");
-    }
-    format!("{}y", d / 365)
-}
-
-/// Session-row sub-line, "project · branch" (komet `chatLocation`): the repo
-/// checkout identity. Either part may be missing; empty when both are.
-pub fn chat_location(chat: &Chat) -> Option<String> {
-    let project = chat
-        .cwd
-        .as_deref()
-        .map(str::trim)
-        .filter(|c| !c.is_empty())
-        .map(|c| project_label(Some(c)));
-    let reference = chat
-        .branch
-        .as_deref()
-        .map(str::trim)
-        .filter(|b| !b.is_empty());
-    match (project, reference) {
-        (Some(p), Some(r)) => Some(format!("{p} · {r}")),
-        (Some(p), None) => Some(p),
-        (None, Some(r)) => Some(r.to_string()),
-        (None, None) => None,
-    }
-}
+// The frontend-agnostic derivations (sort orders, staleness gating, sidebar
+// grouping, the boot gate, relative times) live in `komet_proto::view` so the
+// terminal viewport (`komet-tui`) shares one implementation and one test suite
+// with this one — a sort order that differs per surface is a bug. Re-exported
+// here because every call site in this crate reads them as `state::…`.
+pub use komet_proto::view::{
+    ChatGroup, ConnectionStatus, GatePhase, Indicator, SESSION_STALE_MS, attention_rank,
+    chat_location, display_status, effective_indicator, format_time_ago, gate_phase, group_chats,
+    parse_auth_state, project_label, sort_active, sort_chats, sort_spaces, sort_tabs,
+};
 
 // ---------------------------------------------------------------------------
 // Org gate (pure)
@@ -1132,7 +912,9 @@ mod tests {
     use super::*;
     use chrono::TimeDelta;
     use komet_engine::{EngineCore, default_registry};
-    use komet_proto::UserProfile;
+    // `SessionStatus` is only needed to build the fixtures below — the module
+    // itself derives everything through `komet_proto::view`.
+    use komet_proto::{SessionStatus, UserProfile};
 
     /// A localhost port that was just free (bind :0, read, drop).
     async fn free_port() -> u16 {
@@ -1163,6 +945,82 @@ mod tests {
             .unwrap();
         assert!(harnesses.as_array().is_some_and(|h| !h.is_empty()));
         handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn an_embedded_engine_serves_the_ipc_port_for_other_viewports() {
+        // The whole point of embedding-and-serving: a second viewport (the
+        // terminal app) can attach to this window's engine with no setup, no
+        // separate daemon, and no launch ordering.
+        let dir = tempfile::tempdir().unwrap();
+        let port = free_port().await;
+        let handle = EngineHandle::bootstrap(EngineBootConfig {
+            data_dir: dir.path().to_path_buf(),
+            ipc_port: port,
+            edge_url: "http://127.0.0.1:1".into(),
+            edge_token: None, // offline
+            org_id: None,
+            workos_client_id: None,
+            default_harness: HarnessId::Mock,
+        })
+        .await
+        .unwrap();
+        assert_eq!(handle.mode(), EngineMode::InProcess);
+
+        // Attach the way `komet-tui` does, and speak the same protocol.
+        let attached = connect_ws(&format!("ws://127.0.0.1:{port}"))
+            .await
+            .expect("a second viewport must be able to attach");
+        let harnesses = attached
+            .call(methods::LIST_HARNESSES, serde_json::json!({}))
+            .await
+            .unwrap();
+        assert!(harnesses.as_array().is_some_and(|h| !h.is_empty()));
+
+        // Shutting the window down stops accepting, so the next viewport
+        // starts its own engine rather than talking to closing stores.
+        handle.shutdown().await;
+        assert!(
+            tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_err(),
+            "the port must be released on shutdown"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stranger_on_the_ipc_port_does_not_wedge_the_window() {
+        // The port probe only proves *something* is listening. A process that
+        // accepts TCP and never speaks WebSocket used to hang the dial forever;
+        // now it times out and we embed instead, losing only the ability to
+        // serve other viewports.
+        let squatter = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = squatter.local_addr().unwrap().port();
+        let dir = tempfile::tempdir().unwrap();
+        let handle = EngineHandle::bootstrap(EngineBootConfig {
+            data_dir: dir.path().to_path_buf(),
+            ipc_port: port,
+            edge_url: "http://127.0.0.1:1".into(),
+            edge_token: None,
+            org_id: None,
+            workos_client_id: None,
+            default_harness: HarnessId::Mock,
+        })
+        .await
+        .expect("a taken port must not fail the boot");
+        assert_eq!(handle.mode(), EngineMode::InProcess);
+        assert!(
+            handle
+                .client()
+                .call(methods::LIST_HARNESSES, serde_json::json!({}))
+                .await
+                .is_ok(),
+            "the window still works over its own transport"
+        );
+        handle.shutdown().await;
+        drop(squatter);
     }
 
     #[tokio::test]

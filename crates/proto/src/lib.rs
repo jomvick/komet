@@ -6,6 +6,8 @@
 
 pub mod agent;
 pub mod entities;
+pub mod motion;
+pub mod view;
 
 pub use agent::*;
 pub use entities::*;

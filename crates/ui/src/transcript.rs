@@ -651,133 +651,21 @@ pub fn diff_rows(old: &[Row], new: &[Row]) -> Option<(Range<usize>, usize)> {
 // Tool summaries / chips (pure)
 // ---------------------------------------------------------------------------
 
-fn plural(n: usize, one: &str, many: &str) -> String {
-    if n == 1 {
-        format!("{n} {one}")
-    } else {
-        format!("{n} {many}")
-    }
-}
-
 /// The ToolGroup summary line — "Ran 3 commands · edited 2 files".
+///
+/// The rule lives in `komet_proto::view` so the terminal viewport reports the
+/// same summary; this only adapts the row model's [`ToolItem`] to it.
 pub fn tool_group_summary(tools: &[ToolItem]) -> String {
-    let mut commands = 0usize;
-    let mut edited: Vec<&str> = Vec::new();
-    let mut reads = 0usize;
-    let mut searches = 0usize;
-    let mut fetches = 0usize;
-    let mut todos = 0usize;
-    let mut other = 0usize;
-    let mut failed = 0usize;
-    for t in tools {
-        if t.is_error {
-            failed += 1;
-        }
-        match &t.call {
-            ToolCall::Exec { .. } => commands += 1,
-            ToolCall::WriteFile { path, .. } | ToolCall::EditFile { path, .. } => {
-                if !edited.contains(&path.as_str()) {
-                    edited.push(path);
-                }
-            }
-            ToolCall::ApplyPatch { path } => {
-                let p = path.as_deref().unwrap_or("patch");
-                if !edited.contains(&p) {
-                    edited.push(p);
-                }
-            }
-            ToolCall::ReadFile { .. } => reads += 1,
-            ToolCall::Search { .. } | ToolCall::Glob { .. } | ToolCall::WebSearch { .. } => {
-                searches += 1
-            }
-            ToolCall::WebFetch { .. } => fetches += 1,
-            ToolCall::Todo { .. } => todos += 1,
-            ToolCall::Mcp { .. } | ToolCall::Unknown { .. } => other += 1,
-        }
-    }
-    let mut segments: Vec<String> = Vec::new();
-    if commands > 0 {
-        segments.push(format!("ran {}", plural(commands, "command", "commands")));
-    }
-    if !edited.is_empty() {
-        segments.push(format!("edited {}", plural(edited.len(), "file", "files")));
-    }
-    if reads > 0 {
-        segments.push(format!("read {}", plural(reads, "file", "files")));
-    }
-    if searches > 0 {
-        segments.push(format!("searched {}", plural(searches, "time", "times")));
-    }
-    if fetches > 0 {
-        segments.push(format!("fetched {}", plural(fetches, "page", "pages")));
-    }
-    if todos > 0 {
-        segments.push("updated todos".to_string());
-    }
-    if other > 0 {
-        segments.push(format!("called {}", plural(other, "tool", "tools")));
-    }
-    if segments.is_empty() {
-        segments.push(plural(tools.len(), "tool", "tools"));
-    }
-    if failed > 0 {
-        segments.push(format!("{failed} failed"));
-    }
-    let mut summary = segments.join(" · ");
-    // Capitalize the first segment only (komet's style).
-    if let Some(first) = summary.get(0..1) {
-        let upper = first.to_uppercase();
-        summary.replace_range(0..1, &upper);
-    }
-    summary
+    let pairs: Vec<(ToolCall, bool)> = tools.iter().map(|t| (t.call.clone(), t.is_error)).collect();
+    komet_proto::view::tool_group_summary(&pairs)
 }
 
-/// Collapse model-generated text onto ONE line for single-line surfaces
-/// (tool-chip details, chip messages, titles, previews): newlines, tabs and
-/// runs of whitespace become single spaces, trimmed. This is what the
-/// original's CSS `truncate` (`whitespace-nowrap`) does implicitly — gpui's
-/// `.truncate()` still hard-breaks on literal `\n` BEFORE the ellipsis logic,
-/// so a multiline Exec command would wrap and blow the fixed 30px chip row.
-pub fn single_line(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-/// Per-kind chip label + one-line detail (detail always [`single_line`]d —
-/// Exec commands, MCP inputs and search queries are model-generated and can
-/// contain newlines; the chip is a fixed-height single-line surface).
-pub fn tool_chip_content(call: &ToolCall) -> (&'static str, String) {
-    let (label, detail) = tool_chip_content_raw(call);
-    (label, single_line(&detail))
-}
-
-fn tool_chip_content_raw(call: &ToolCall) -> (&'static str, String) {
-    // Labels match komet tool-chip.tsx `describeTool` exactly.
-    match call {
-        ToolCall::Exec { command } => ("Run", command.clone()),
-        ToolCall::ReadFile { path } => ("Read", path.clone()),
-        ToolCall::WriteFile { path, .. } => ("Write", path.clone()),
-        ToolCall::EditFile { path, .. } => ("Edit", path.clone()),
-        ToolCall::ApplyPatch { path } => {
-            ("Patch", path.clone().unwrap_or_else(|| "workspace".into()))
-        }
-        ToolCall::Search { pattern, path } => (
-            "Search",
-            match path {
-                Some(path) => format!("{pattern} in {path}"),
-                None => pattern.clone(),
-            },
-        ),
-        ToolCall::Glob { pattern } => ("Glob", pattern.clone()),
-        ToolCall::WebFetch { url, .. } => ("Fetch", url.clone()),
-        ToolCall::WebSearch { query } => ("Web", query.clone()),
-        ToolCall::Todo { items } => {
-            let done = items.iter().filter(|i| i.done).count();
-            ("Todo", format!("{done}/{} done", items.len()))
-        }
-        ToolCall::Mcp { server, tool, .. } => ("MCP", format!("{server} · {tool}")),
-        ToolCall::Unknown { name, .. } => ("Tool", name.clone()),
-    }
-}
+// `single_line` and the per-kind chip label/detail are shared with the terminal
+// viewport (`komet_proto::view`): a tool must be named identically on every
+// surface, and the one-line collapse is needed for the same reason in both (a
+// literal newline breaks gpui's ellipsis logic and would be a cursor move in a
+// cell grid).
+pub use komet_proto::view::{single_line, tool_chip_content};
 
 /// Analytic expanded-chips height — no measurement needed for the fold tween.
 pub fn chips_height(count: usize) -> f32 {

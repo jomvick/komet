@@ -12,6 +12,7 @@ path = "src/main.rs"
 [dependencies]
 komet-engine.workspace = true
 komet-ui.workspace = true
+komet-tui.workspace = true
 tokio.workspace = true
 clap.workspace = true
 anyhow.workspace = true

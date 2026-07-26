@@ -293,32 +293,14 @@ where
 // ---------------------------------------------------------------------------
 
 /// Komet-pulse floor opacity.
-pub const PULSE_MIN_OPACITY: f32 = 0.08;
-/// Komet-pulse floor scale.
-pub const PULSE_MIN_SCALE: f32 = 0.9;
-/// Per-cell stagger of the komet pulse, as a fraction of the 2.4s period
-/// (komet delays each cell by 0.15s).
-pub const PULSE_STAGGER: f32 = 0.15 / 2.4;
-
-/// Shift a repeating raw delta by a per-cell stagger, wrapping into [0,1).
-pub fn staggered_phase(raw_delta: f32, index: usize, stagger: f32) -> f32 {
-    (raw_delta - index as f32 * stagger).rem_euclid(1.0)
-}
-
-/// Cosine pulse: 0 at phase 0, 1 at phase 0.5, back to 0 at phase 1.
-pub fn pulse_wave(phase: f32) -> f32 {
-    0.5 - 0.5 * (phase * std::f32::consts::TAU).cos()
-}
-
-/// Komet loader cell opacity for a phase: 0.08 → 1 → 0.08.
-pub fn pulse_opacity(phase: f32) -> f32 {
-    PULSE_MIN_OPACITY + (1.0 - PULSE_MIN_OPACITY) * pulse_wave(phase)
-}
-
-/// Komet loader cell scale for a phase: 0.9 → 1 → 0.9.
-pub fn pulse_scale(phase: f32) -> f32 {
-    PULSE_MIN_SCALE + (1.0 - PULSE_MIN_SCALE) * pulse_wave(phase)
-}
+// The loader curves are shared with the terminal viewport
+// (`komet_proto::motion`): a loading indicator is a brand surface, and two of
+// them that disagree read as two products. The constants and the math live
+// there; this crate animates them with gpui, `komet-tui` with cell colours.
+pub use komet_proto::motion::{
+    PULSE_MIN_OPACITY, PULSE_MIN_SCALE, PULSE_STAGGER, gspin_opacity, pulse_opacity, pulse_scale,
+    pulse_wave, staggered_phase,
+};
 
 /// Gradient-matrix spinner wave: intensity (0..1) of cell `wave_index` out of
 /// `wave_count` diagonals, at raw delta `raw_delta` of the 750ms period. The wave
@@ -326,21 +308,6 @@ pub fn pulse_scale(phase: f32) -> f32 {
 pub fn matrix_wave(raw_delta: f32, wave_index: usize, wave_count: usize) -> f32 {
     let count = wave_count.max(1) as f32;
     pulse_wave(staggered_phase(raw_delta, wave_index, 1.0 / count))
-}
-
-/// Gradient-spin cell opacity for a local phase `t` (0..1 of the period),
-/// ported from komet's `gradient-spin-pulse` keyframes: full at the cycle
-/// start, easing down to `dim` by 45%, resting at `dim` until 92%, then rising
-/// back to full — the per-cell phase offset sweeps this pulse across the grid.
-pub fn gspin_opacity(t: f32, dim: f32) -> f32 {
-    let t = t.rem_euclid(1.0);
-    if t < 0.45 {
-        lerp(1.0, dim, t / 0.45)
-    } else if t < 0.92 {
-        dim
-    } else {
-        lerp(dim, 1.0, (t - 0.92) / 0.08)
-    }
 }
 
 /// Linear interpolation (layout tweens).
