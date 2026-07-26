@@ -149,7 +149,16 @@ impl Row {
     /// Lines this row occupies.
     pub fn height(&self) -> u16 {
         match self {
-            Row::Chat { .. } | Row::User { .. } => 2,
+            Row::Chat { .. } => 2,
+            // An account with no display name is one line, not one line and a
+            // blank: the second row exists to carry the email *under* a name.
+            Row::User { name, email } => {
+                if name.is_empty() || email.is_empty() || name == email {
+                    1
+                } else {
+                    2
+                }
+            }
             _ => 1,
         }
     }
@@ -283,6 +292,24 @@ pub enum ChipKind {
     Checkout,
     Model,
     Reasoning,
+}
+
+/// Which model answers, and at what effort. See [`App::composer_meta`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComposerMeta {
+    /// Never empty — a placeholder stands in while the real label loads.
+    pub model: String,
+    /// Absent when the model exposes no effort levels, or none is chosen.
+    pub effort: Option<String>,
+}
+
+/// The ref this work sits on and where it runs. See [`App::composer_footer`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ComposerFooter {
+    pub reference: String,
+    pub checkout: String,
+    /// False for an open session, whose checkout kind was fixed at creation.
+    pub checkout_live: bool,
 }
 
 /// One row of a context menu.
@@ -1520,43 +1547,108 @@ impl App {
             .or(Some(std::time::Duration::ZERO))
     }
 
-    /// The composer's right-aligned chips: model and reasoning, as the desktop
-    /// composer shows them. Empty when the chat has no config yet.
-    /// The composer's buttons, in order. A draft advertises where it will run;
-    /// every session advertises its model and effort.
-    pub fn composer_chips(&self) -> Vec<(ChipKind, String)> {
-        let mut chips = Vec::new();
-        if let Some(draft) = &self.draft {
-            chips.push((ChipKind::Branch, draft.ref_label()));
-            chips.push((ChipKind::Checkout, draft.checkout_label().to_string()));
-            if let Some(model) = &draft.model {
-                chips.push((ChipKind::Model, model.label.clone()));
-            } else {
-                chips.push((ChipKind::Model, "Model".into()));
-            }
-            if let Some(level) = draft.reasoning {
-                chips.push((ChipKind::Reasoning, reasoning_label(level).into()));
-            }
-            return chips;
-        }
-        let Some(config) = self
-            .selected_chat_row()
-            .and_then(|chat| chat.config.as_ref())
-        else {
-            return chips;
+    /// The composer's meta row: which model will answer, and at what effort.
+    ///
+    /// This is the desktop's single combined model+effort chip (`pickers.rs`,
+    /// `combined_chip`) and it follows that chip's central rule — **it is never
+    /// absent**. The desktop resolves the label down a chain (loaded model →
+    /// remembered default → the configured id) precisely so the toolbar never
+    /// blinks through an empty state while a session's config is in flight; the
+    /// note there reads "Never 'Default model'". The TUI had the opposite
+    /// behaviour: no config yet meant no chips at all, so tabbing between
+    /// sessions made the whole row appear and disappear.
+    ///
+    /// Effort is the only optional half, and it costs nothing when missing —
+    /// it is a suffix inside one row, not a row of its own.
+    pub fn composer_meta(&self) -> ComposerMeta {
+        let (model, reasoning) = match &self.draft {
+            Some(draft) => (
+                draft.model.as_ref().map(|model| model.label.clone()),
+                draft.reasoning,
+            ),
+            None => match self
+                .selected_chat_row()
+                .and_then(|chat| chat.config.as_ref())
+            {
+                Some(config) => (
+                    config
+                        .model
+                        .clone()
+                        .filter(|model| !model.trim().is_empty()),
+                    config.reasoning,
+                ),
+                None => (None, None),
+            },
         };
-        chips.push((
-            ChipKind::Model,
-            config
-                .model
-                .clone()
-                .filter(|model| !model.trim().is_empty())
-                .unwrap_or_else(|| "Model".into()),
-        ));
-        if let Some(level) = config.reasoning {
-            chips.push((ChipKind::Reasoning, reasoning_label(level).into()));
+        ComposerMeta {
+            model: model.unwrap_or_else(|| "Model".into()),
+            effort: reasoning.map(|level| reasoning_label(level).to_string()),
         }
-        chips
+    }
+
+    /// The composer's footer: the ref this work sits on, and where it runs.
+    ///
+    /// Ported from the desktop's `render_footer`, including the three rules that
+    /// made it stop flickering there:
+    ///
+    /// 1. **Git gates the whole row.** A space that is not a checkout has no ref
+    ///    and no worktree, so the row is absent rather than empty.
+    /// 2. **Both modes get it.** The ref side is live for a draft *and* for an
+    ///    open session — t3code keeps its branch selector interactive mid-session
+    ///    and so does komet. The TUI previously showed this only while drafting,
+    ///    which is why it vanished the moment you opened a tab.
+    /// 3. **A selected chat whose row hasn't synced yet still renders the draft
+    ///    footer.** The values are identical, so the toolbar never blinks through
+    ///    a half-empty locked state in the moment right after send mints a
+    ///    session.
+    ///
+    /// The checkout side differs by mode: a session's checkout kind is fixed at
+    /// creation (harness resume is cwd-scoped — the session never moves folders),
+    /// so it is a label there and a button only on a draft.
+    pub fn composer_footer(&self) -> Option<ComposerFooter> {
+        let space = self.selected_space_row()?;
+        if !space.git_detected {
+            return None;
+        }
+        // Rule 3: `selected_chat_row` is None for a chat that exists but has not
+        // synced, and that falls through to the draft arm on purpose.
+        let session = self
+            .selected_chat
+            .as_ref()
+            .and_then(|_| self.selected_chat_row());
+        Some(match session {
+            Some(chat) => ComposerFooter {
+                reference: chat
+                    .branch
+                    .clone()
+                    .unwrap_or_else(|| "Select ref".to_string()),
+                checkout: if chat.cwd.as_deref().is_some_and(|cwd| cwd != space.path) {
+                    "Worktree".to_string()
+                } else {
+                    "Current checkout".to_string()
+                },
+                checkout_live: false,
+            },
+            None => ComposerFooter {
+                reference: self
+                    .draft
+                    .as_ref()
+                    .map(Draft::ref_label)
+                    .unwrap_or_else(|| "Select ref".to_string()),
+                checkout: self
+                    .draft
+                    .as_ref()
+                    .map(|draft| draft.checkout_label().to_string())
+                    .unwrap_or_else(|| "Current checkout".to_string()),
+                checkout_live: true,
+            },
+        })
+    }
+
+    /// The space the sidebar has selected.
+    pub fn selected_space_row(&self) -> Option<&komet_proto::Space> {
+        let id = self.selected_space.as_deref()?;
+        self.spaces.iter().find(|space| space.id == id)
     }
 
     /// The effort levels the active model offers, or a sensible default set
@@ -2678,14 +2770,11 @@ mod tests {
                 branch: "feat".into()
             }
         );
-        // And the chips say so, since the choice is only offered before send.
-        let chips: Vec<String> = app
-            .composer_chips()
-            .into_iter()
-            .map(|(_, label)| label)
-            .collect();
-        assert!(chips.contains(&"feat".to_string()), "{chips:?}");
-        assert!(chips.contains(&"Current worktree".to_string()), "{chips:?}");
+        // And the footer says so, since the choice is only offered before send.
+        let footer = app.composer_footer().expect("a git space has a footer");
+        assert_eq!(footer.reference, "feat");
+        assert_eq!(footer.checkout, "Current worktree");
+        assert!(footer.checkout_live, "a draft can still move");
     }
 
     #[test]

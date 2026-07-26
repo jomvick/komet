@@ -11,11 +11,25 @@
 //! 1. **Near-monochrome.** Text is a three-step neutral ramp. Color appears only
 //!    on status dots and, per the original's own note, *indigo is reserved for
 //!    Send*. Nothing else is tinted — no colored tool names, no green code.
-//! 2. **Never paint a background we don't need.** komet's surfaces differ by
-//!    seven values out of 255 (`#060606` main, `#0d0d0d` sidebar) — invisible in
-//!    a terminal, and every non-default cell is an SGR sequence ratatui must
-//!    emit. Only the selected row, the user bubble, and inline code get a wash,
-//!    which is also what lets the user's own terminal background show through.
+//! 2. **Structure is background, not line work.** This is opencode's rule and it
+//!    replaces every border this renderer used to draw. Their whole TUI has one
+//!    background ramp — `background` (the terminal's own, left untouched),
+//!    `backgroundPanel`, `backgroundElement` — and regions are told apart by
+//!    which step they are filled with. A sidebar is a panel fill, a prompt is an
+//!    element fill, a selected row is one step up from whatever it sits on.
+//!    Nothing is ruled, boxed or tee'd.
+//!
+//! The ramp below is opencode's own `generateGrayScale` evaluated for komet's
+//! near-black `#060606`. Their dark branch for a background this dark ignores
+//! the hue and walks a neutral: `grays[i] = floor(i / 12 * 0.4 * 255)`. So
+//! `panel` is `grays[2]`, `element` is `grays[3]`, and the menu selection step
+//! is `grays[5]` — the same three the TypeScript reads for the same jobs.
+//!
+//! The cost this trades against is real: every filled cell is an SGR sequence
+//! ratatui must emit, and a filled pane no longer lets the user's terminal
+//! background (or its transparency) through. opencode pays it for the sidebar,
+//! the prompt and menus while leaving the transcript on the terminal default —
+//! the largest, most-scrolled region stays free — and so does this.
 
 use ratatui::style::{Color, Modifier, Style};
 
@@ -25,22 +39,22 @@ pub struct Theme {
     pub text: Color,
     /// Secondary text: sub-lines, section labels — neutral(0.708).
     pub muted: Color,
-    /// Tertiary: timestamps, hints, hairlines — neutral(0.556).
+    /// Tertiary: timestamps, hints — neutral(0.556).
     pub faint: Color,
-    /// Hairline rules and pane dividers. Dimmer than `faint`, as in the original
-    /// where borders are white at 8% alpha.
-    pub hairline: Color,
     /// Indigo. Reserved for Send and focus, per the original.
     pub accent: Color,
-    /// Selected-row wash — white@8% over the sidebar surface.
+    /// `grays[2]`. The sidebar, the composer footer, a dialog — a region that is
+    /// a *place*. opencode's `backgroundPanel`.
+    pub panel: Color,
+    /// `grays[3]`. A thing you act on sitting inside a panel: the prompt box, the
+    /// active tab, a chip, a menu row. opencode's `backgroundElement`, which is
+    /// also their `backgroundMenu`.
+    pub element: Color,
+    /// `grays[5]`. The selected row of a menu. [`Self::element`] is the menu's own
+    /// fill, so the cursor needs a step clear of it.
     pub selection: Color,
-    /// Raised surface: the user bubble, floating panels — neutral(0.235).
-    pub raised: Color,
-    /// A selected row *on* a raised surface. The plain [`Self::selection`] is
-    /// seven values off `raised` and would vanish there, so menus get their own
-    /// step — white@8% over the raised surface, as the desktop menus do.
-    pub raised_selection: Color,
-    /// Inline-code wash — white@6% over the main surface.
+    /// Inline and fenced code. Deliberately *below* `panel`: code is a quotation,
+    /// not a control, and reads as recessed rather than raised.
     pub code_wash: Color,
     pub danger: Color,
     pub warning: Color,
@@ -60,12 +74,11 @@ impl Theme {
             text: Color::Rgb(0xe5, 0xe5, 0xe5),
             muted: Color::Rgb(0xa1, 0xa1, 0xa1),
             faint: Color::Rgb(0x73, 0x73, 0x73),
-            hairline: Color::Rgb(0x3a, 0x3a, 0x3a),
             accent: Color::Rgb(0x7c, 0x86, 0xff),
-            selection: Color::Rgb(0x20, 0x20, 0x20),
-            raised: Color::Rgb(0x1e, 0x1e, 0x1e),
-            raised_selection: Color::Rgb(0x30, 0x30, 0x30),
-            code_wash: Color::Rgb(0x15, 0x15, 0x15),
+            panel: Color::Rgb(0x11, 0x11, 0x11),
+            element: Color::Rgb(0x19, 0x19, 0x19),
+            selection: Color::Rgb(0x2a, 0x2a, 0x2a),
+            code_wash: Color::Rgb(0x0d, 0x0d, 0x0d),
             danger: Color::Rgb(0xff, 0x64, 0x67),
             warning: Color::Rgb(0xff, 0xb9, 0x00),
             dot_working: Color::Rgb(0xfb, 0x64, 0xb6),
@@ -85,11 +98,10 @@ impl Theme {
             text: reset,
             muted: reset,
             faint: reset,
-            hairline: reset,
             accent: reset,
+            panel: reset,
+            element: reset,
             selection: reset,
-            raised: reset,
-            raised_selection: reset,
             code_wash: reset,
             danger: reset,
             warning: reset,
@@ -123,11 +135,7 @@ impl Theme {
         Style::default().fg(self.faint)
     }
 
-    pub fn rule(&self) -> Style {
-        Style::default().fg(self.hairline)
-    }
-
-    /// Section labels ("Sessions") and the focused pane's edge.
+    /// Section labels ("Sessions").
     pub fn label(&self) -> Style {
         let style = Style::default().fg(self.muted);
         if self.plain {
@@ -137,7 +145,52 @@ impl Theme {
         }
     }
 
-    /// A selected sidebar row. Under `NO_COLOR` reversed video carries it.
+    // -- The ramp ----------------------------------------------------------
+    //
+    // Each level comes as a trio — primary, muted, faint — because text drawn
+    // *on* a fill has to name that fill as its own background too. A span left
+    // at the terminal default punches a hole in the region it sits in, which is
+    // the one failure mode a fill-based layout has.
+
+    /// A region that is a place: the sidebar, the composer footer, a menu.
+    pub fn panel(&self) -> Style {
+        self.at(self.panel, self.text)
+    }
+
+    pub fn panel_subtle(&self) -> Style {
+        self.at(self.panel, self.muted)
+    }
+
+    pub fn panel_hint(&self) -> Style {
+        self.at(self.panel, self.faint)
+    }
+
+    /// A thing you act on inside a panel: the prompt, the active tab, a chip.
+    pub fn element(&self) -> Style {
+        self.at(self.element, self.text)
+    }
+
+    pub fn element_subtle(&self) -> Style {
+        self.at(self.element, self.muted)
+    }
+
+    pub fn element_hint(&self) -> Style {
+        self.at(self.element, self.faint)
+    }
+
+    /// The user's own message. opencode fills user messages at element level;
+    /// so does komet's desktop bubble. Under `NO_COLOR` it reverses instead —
+    /// whose turn it is survives losing the ramp.
+    pub fn bubble(&self) -> Style {
+        if self.plain {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            self.element()
+        }
+    }
+
+    /// The cursor row of a list or menu — a step clear of whatever it sits on.
+    /// Under `NO_COLOR` reversed video carries it, since there is no ramp left.
     pub fn selected(&self) -> Style {
         if self.plain {
             Style::default().add_modifier(Modifier::REVERSED)
@@ -146,52 +199,31 @@ impl Theme {
         }
     }
 
-    /// The user's own message — komet's raised bubble.
-    pub fn bubble(&self) -> Style {
+    /// Muted text on a selected row.
+    pub fn selected_hint(&self) -> Style {
         if self.plain {
             Style::default().add_modifier(Modifier::REVERSED)
         } else {
-            Style::default().fg(self.text).bg(self.raised)
+            self.at(self.selection, self.muted)
         }
     }
 
-    /// A floating panel — menu, picker, help. The wash *is* the boundary; the
-    /// original's menus are a raised surface, not a framed one.
-    /// Under `NO_COLOR` a panel has no wash to be raised above — the `Clear`
-    /// beneath it is what separates it from the body, and the selected row
-    /// carries the only mark.
-    pub fn panel(&self) -> Style {
-        if self.plain {
-            Style::default()
-        } else {
-            Style::default().fg(self.text).bg(self.raised)
-        }
-    }
-
-    /// The active row of a floating panel.
-    pub fn panel_selected(&self) -> Style {
-        if self.plain {
-            Style::default().add_modifier(Modifier::REVERSED)
-        } else {
-            Style::default().fg(self.text).bg(self.raised_selection)
-        }
-    }
-
-    /// A panel's own muted text, on its wash rather than the terminal default.
-    pub fn panel_hint(&self) -> Style {
-        if self.plain {
-            Style::default()
-        } else {
-            Style::default().fg(self.faint).bg(self.raised)
-        }
-    }
-
-    /// Inline `code`: a wash, as in the original — not a hue.
+    /// Code — inline and fenced. Recessed, not raised.
     pub fn code(&self) -> Style {
         if self.plain {
             Style::default().add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(self.text).bg(self.code_wash)
+        }
+    }
+
+    /// Foreground `fg` over background `bg`, collapsing to nothing under
+    /// `NO_COLOR` — where the fills are all `Reset` and would erase each other.
+    fn at(&self, bg: Color, fg: Color) -> Style {
+        if self.plain {
+            Style::default()
+        } else {
+            Style::default().fg(fg).bg(bg)
         }
     }
 
@@ -261,7 +293,6 @@ mod tests {
         assert_eq!(t.text, oklch(0.922, 0.0, 0.0), "neutral-200 body text");
         assert_eq!(t.muted, oklch(0.708, 0.0, 0.0), "neutral-400 sub-lines");
         assert_eq!(t.faint, oklch(0.556, 0.0, 0.0), "neutral-500 timestamps");
-        assert_eq!(t.raised, oklch(0.235, 0.0, 0.0), "raised surface");
         assert_eq!(t.accent, oklch(0.673, 0.182, 276.935), "indigo-400");
         assert_eq!(t.danger, oklch(0.704, 0.191, 22.216), "red-400");
         assert_eq!(t.warning, oklch(0.828, 0.189, 84.429), "amber-400");
@@ -284,17 +315,41 @@ mod tests {
     }
 
     #[test]
-    fn a_panels_selection_is_visible_on_its_own_wash() {
-        // The body selection is seven values off `raised`; on a panel it would
-        // be invisible, which is how a picker ends up with no apparent cursor.
+    fn the_ramp_is_opencodes_grayscale_for_komets_background() {
+        // opencode's `generateGrayScale`, dark branch, luminance < 10 (komet's
+        // #060606 is 6): grays[i] = floor(i / 12 * 0.4 * 255). If this drifts the
+        // two TUIs stop being the same product, which is the whole point.
         let t = Theme::dark();
-        let blend = |over: u8| (0x1e as f32 * 0.92 + over as f32 * 0.08).round() as u8;
-        assert_eq!(
-            t.raised_selection,
-            Color::Rgb(blend(0xff), blend(0xff), blend(0xff)),
-            "white@8% over the raised surface, as the desktop menus paint it"
-        );
-        assert_ne!(t.panel_selected().bg, t.panel().bg);
+        let gray = |i: u32| {
+            let v = ((i as f32 / 12.0) * 0.4 * 255.0).floor() as u8;
+            Color::Rgb(v, v, v)
+        };
+        assert_eq!(t.panel, gray(2), "backgroundPanel");
+        assert_eq!(t.element, gray(3), "backgroundElement / backgroundMenu");
+        // Each level has to be distinguishable from the one it sits on, or the
+        // structure the fills are carrying disappears.
+        for (over, under) in [
+            (t.element, t.panel),
+            (t.selection, t.element),
+            (t.panel, t.code_wash),
+        ] {
+            assert_ne!(over, under);
+        }
+    }
+
+    #[test]
+    fn text_on_a_fill_names_that_fill_as_its_background() {
+        // A span left at the terminal default punches a hole in the region it
+        // sits in — the one failure mode a fill-based layout has.
+        let t = Theme::dark();
+        for style in [t.panel(), t.panel_subtle(), t.panel_hint()] {
+            assert_eq!(style.bg, Some(t.panel));
+        }
+        for style in [t.element(), t.element_subtle(), t.element_hint()] {
+            assert_eq!(style.bg, Some(t.element));
+        }
+        assert_eq!(t.selected().bg, Some(t.selection));
+        assert_eq!(t.selected_hint().bg, Some(t.selection));
     }
 
     #[test]
@@ -302,8 +357,14 @@ mod tests {
         let t = Theme::plain();
         assert!(t.plain);
         // Nothing paints a hue…
-        for color in [t.text, t.accent, t.dot_working, t.selection, t.raised] {
+        for color in [t.text, t.accent, t.dot_working, t.selection, t.element] {
             assert_eq!(color, Color::Reset);
+        }
+        // …and no fill survives to erase another: under NO_COLOR the ramp is
+        // gone, so every level must collapse to the terminal's own background
+        // rather than to `Reset`-on-`Reset`.
+        for style in [t.panel(), t.element(), t.panel_hint()] {
+            assert_eq!(style.bg, None, "a plain theme paints no fill");
         }
         // …so the states that need attention carry a modifier instead.
         use komet_proto::ChatIndicator as I;
@@ -317,15 +378,17 @@ mod tests {
     }
 
     #[test]
-    fn only_washes_paint_a_background() {
-        // Every non-default background cell is an escape sequence, so the set of
-        // styles that use one is deliberately tiny.
+    fn the_transcript_styles_stay_on_the_terminals_own_background() {
+        // opencode fills the sidebar, the prompt and its menus, and leaves
+        // `background` transparent — the largest, most-scrolled region keeps the
+        // user's own background and its transparency. These are the styles the
+        // transcript body draws with, so they must not fill.
         let t = Theme::dark();
-        for style in [t.body(), t.subtle(), t.hint(), t.rule(), t.label()] {
-            assert_eq!(style.bg, None, "body styles must not paint a background");
+        for style in [t.body(), t.subtle(), t.hint(), t.label()] {
+            assert_eq!(style.bg, None, "transcript text must not paint a fill");
         }
-        for style in [t.selected(), t.bubble(), t.code()] {
-            assert!(style.bg.is_some());
+        for style in [t.panel(), t.element(), t.selected(), t.bubble(), t.code()] {
+            assert!(style.bg.is_some(), "a region fill must paint");
         }
     }
 }

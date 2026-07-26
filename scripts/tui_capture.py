@@ -242,10 +242,17 @@ class Screen:
         return out
 
     def show(self, label: str) -> None:
+        # Trim blank rows at the top and bottom, but never in the middle: the
+        # renderer uses blank rows as its only separator, so dropping them makes
+        # a correctly-spaced frame look like a wall of text. (This used to drop
+        # them everywhere and got away with it only because a sidebar divider
+        # made every row non-empty.)
+        lines = self.lines()
+        body = [i for i, line in enumerate(lines) if line.strip()]
         print(f"  ┌─ {label} " + "─" * max(0, 70 - len(label)))
-        for line in self.lines():
-            if line.strip():
-                print("  │ " + line[: self.cols])
+        if body:
+            for line in lines[body[0] : body[-1] + 1]:
+                print("  │ " + line[: self.cols].rstrip())
         print("  └" + "─" * 72)
 
 

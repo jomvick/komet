@@ -31,13 +31,14 @@ use komet_proto::ToolCall;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
+use crate::render;
 use crate::theme::Theme;
 use crate::wrap;
 
 /// Columns the content column is inset from the pane edge — must match
-/// [`INSET`], which is what actually paints it, and `render::GUTTER`, which is
+/// [`INSET`], which is what actually paints it, and [`render::PAD`], which is
 /// where every other line in the main pane starts.
-const CONTENT_INSET: usize = 3;
+const CONTENT_INSET: usize = render::PAD;
 
 /// One message's laid-out lines plus the fingerprint they were laid out from.
 struct Block {
@@ -357,6 +358,18 @@ fn status_tag(status: MessageStatus) -> u8 {
 /// `is_last` marks the final message, whose last tool group stays expanded —
 /// what you want to see is what it is doing *now*. It is part of the cache
 /// fingerprint, so a message stops being last without going stale.
+/// Push a blank row, unless the last row already is one (or there is no row yet).
+///
+/// Markdown brings its own blank lines and the block separator adds another, so
+/// a paragraph that ends `\n\n` in front of a tool group would otherwise open a
+/// three-row hole. One blank is a separator; three is a hole.
+fn push_blank(out: &mut Vec<Line<'static>>) {
+    if out.last().is_none_or(|line| line.spans.is_empty()) {
+        return;
+    }
+    out.push(Line::default());
+}
+
 fn render_entry(
     entry: &SessionMessageEntry,
     width: usize,
@@ -377,7 +390,7 @@ fn render_entry(
     let mut previous_height = 0usize;
     for (index, group) in groups.iter().enumerate() {
         if index > 0 && previous_height > 1 {
-            lines.push(Line::default());
+            push_blank(&mut lines);
         }
         let start = lines.len();
         match group {
@@ -428,8 +441,10 @@ fn render_entry(
         )]));
     }
 
-    // One blank row between messages. Part of the block, so it scrolls with it.
-    lines.push(Line::default());
+    // One blank row between messages. Part of the block, so it scrolls with it —
+    // and only one, since a reply that ended on a trailing newline has already
+    // left its own.
+    push_blank(&mut lines);
     lines
 }
 
@@ -465,7 +480,7 @@ fn group_parts(parts: &[MessagePart]) -> Vec<PartGroup<'_>> {
 /// Left inset of the content column. The original keeps its prose well off the
 /// pane edge; three columns is the terminal equivalent, and lines the transcript
 /// up with the composer's text and the working strip below it.
-const INSET: &str = "   ";
+const INSET: &str = "  ";
 
 fn indented(mut spans: Vec<Span<'static>>) -> Line<'static> {
     spans.insert(0, Span::raw(INSET.to_string()));
@@ -646,7 +661,7 @@ fn render_markdown(text: &str, width: usize, theme: &Theme, out: &mut Vec<Line<'
         }
 
         if line.trim().is_empty() {
-            out.push(Line::default());
+            push_blank(out);
             continue;
         }
 

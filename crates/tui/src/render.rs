@@ -8,32 +8,39 @@
 //! - the selected space's own sessions are the **tab strip** above the
 //!   transcript, which is also the header (it replaced one).
 //!
-//! The visual language is herdr's, since that is the terminal app this lives
-//! beside — and it is deliberately spare in the way opencode's is: **exactly one
-//! line is drawn in the whole steady-state view**, the sidebar divider. Nothing
-//! else is framed, ruled or tee'd. Structure comes from a shared left gutter
-//! ([`GUTTER`]), a wash on the one row that is selected, and air.
+//! The visual language is opencode's: **nothing in the steady-state view is
+//! drawn with a line**. No borders, no rules, no boxes, no tees, not even a
+//! divider between the panes. Regions are told apart by which step of the
+//! background ramp they are filled with — see [`crate::theme`], which carries
+//! that ramp and the reasoning behind it.
 //!
-//! Where a boundary used to be a rule it is now blank space, because a rule and
-//! the thing it separates say the same thing twice; where the prompt used to be
-//! a box it is now a single left bar, indigo while focused, which says both
-//! "this is the prompt" and "you are in it" with one stroke instead of four.
+//! Three fills do all the work. The sidebar is a panel. The prompt is a block
+//! that lifts from panel to element when it takes focus — the same move a menu
+//! row makes when the cursor lands on it, so focus is a *level*, not a stroke.
+//! The active tab is the one filled block in its row, which is what makes it the
+//! active one. Everything else is the terminal's own background.
+//!
+//! Two numbers keep it aligned: [`MAIN_PAD`], the column of terminal background
+//! down each side of the main pane that gives a fill somewhere to end, and
+//! [`PAD`], the padding every region puts inside itself. Their sum is the one
+//! column all content in the pane starts at.
 //!
 //! ```text
-//!  Spaces                +  │  ● Ratatui terminal…   ● Diff sidebar…   +
-//!  ▪ komet-native  this dev │
-//!  ▪ soccertcg     this dev │                         the user's prompt
-//!                           │                                     14:32
-//!  Sessions                 │
-//!  ● Ratatui terminal…  now │
-//!    komet-native · komet/… │    The assistant replies as plain text.
-//!  ● Rebalance player…   2h │
-//!    soccertcg · komet/re…  │    ⌄ Ran 2 commands
-//!                           │      Run   cargo test --workspace
-//!                           │
-//!  Wing Lee                 │    ◜ Working · 11s · Ctrl-X to interrupt
-//!  w@example.com            │  ┃ Do anything…
-//!                           │  ┃ Fable 5 · High
+//!  Spaces                +     ● Ratatui terminal…    ● Diff sidebar…    +
+//!  ▪ komet-native  this dev
+//!  ▪ soccertcg     this dev                            the user's prompt
+//!                                                                  14:32
+//!  Sessions
+//!  ● Ratatui terminal…  now    The assistant replies as plain text.
+//!    komet-native · komet/…
+//!  ● Rebalance player…   2h    ⌄ Ran 2 commands
+//!    soccertcg · komet/re…       Run   cargo test --workspace
+//!
+//!                              ◜ Working · 11s · Ctrl-X to interrupt
+//!  Wing Lee
+//!  w@example.com               Do anything…
+//!
+//!                              Fable 5  High        ⎇ main  Worktree
 //! ```
 //!
 //! Two habits keep the per-frame cost flat:
@@ -41,20 +48,21 @@
 //! - **Only visible rows are built.** The sidebar walks its row list until the
 //!   pane is full; the transcript hands out cached lines by reference
 //!   ([`Transcript::for_each_visible`]).
-//! - **Almost nothing paints a background.** ratatui diffs the buffer and emits
-//!   only changed cells, so leaving cells at the terminal default is the
-//!   difference between repainting a pane and repainting nothing — as well as
-//!   letting the user's own background (and its transparency) show through.
+//! - **The transcript is never filled.** Every filled cell is an SGR sequence
+//!   ratatui must emit, and a fill also takes away the user's own background and
+//!   its transparency. opencode spends that on the sidebar, the prompt and the
+//!   menus and leaves `background` transparent; the largest and most-scrolled
+//!   region here stays free for the same reason.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget};
+use ratatui::widgets::{Block, Clear, Paragraph, Widget};
 
 use komet_proto::view::{ConnectionStatus, GatePhase};
 
-use crate::app::{App, Hit, Overlay, Row};
+use crate::app::{App, ChipKind, Hit, Overlay, Row};
 use crate::daemon::Attachment;
 use crate::keys::{Focus, HELP};
 use crate::loaders;
@@ -71,12 +79,18 @@ const COMPOSER_MAX_ROWS: u16 = 8;
 /// Reading measure for the transcript. The original caps its content column
 /// rather than letting prose run the full width of a wide window.
 const CONTENT_MAX: u16 = 96;
-/// Columns every line of content in the main pane starts at.
+/// The main pane's own margin — one column of terminal background down each
+/// side, so a filled region inside it has somewhere to end.
+const MAIN_PAD: u16 = 1;
+
+/// Padding inside every region of the main pane, per side.
 ///
-/// One number, used by the transcript, the working strip and the composer, so
-/// the pane reads as a single column instead of three that nearly line up. It is
-/// also the width of the composer's gutter: bar, air, text.
-pub(crate) const GUTTER: usize = 3;
+/// The tabs, the transcript, the working strip and the prompt all use this one
+/// number, so a single content column runs down the whole pane instead of four
+/// that nearly line up. Everything that consumes it is handed an
+/// area already inset by [`MAIN_PAD`], so content lands at `MAIN_PAD + PAD` from
+/// the pane's edge.
+pub(crate) const PAD: usize = 2;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let theme = app.theme;
@@ -153,18 +167,31 @@ fn status_dot(
 // Sidebar
 // ---------------------------------------------------------------------------
 
+/// Paint a region's background.
+///
+/// This is the whole separation mechanic. ratatui's `Cell::set_style` patches
+/// per-field, so a span carrying only a foreground leaves the fill underneath
+/// intact — fill once here, then draw text with plain `fg` styles and the region
+/// keeps its colour. It also means the *order* matters: fill before text.
+pub(crate) fn fill(frame: &mut Frame, area: Rect, style: Style) {
+    if area.width > 0 && area.height > 0 {
+        frame.render_widget(Block::default().style(style), area);
+    }
+}
+
 fn draw_sidebar(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
-    // A single hairline divider — the original has no boxes, just this edge.
-    let block =
-        Block::default()
-            .borders(Borders::RIGHT)
-            .border_style(if app.focus == Focus::Sidebar {
-                theme.subtle()
-            } else {
-                theme.rule()
-            });
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    // No divider. The fill's own edge is the boundary — opencode's sidebar is a
+    // `backgroundPanel` box with no border at all, and a stroke drawn along a
+    // colour change is that boundary stated twice.
+    fill(frame, area, theme.panel());
+    // A column of padding each side, so text never touches the fill's edge. No
+    // top pad: "Spaces" is this pane's header and the tab strip is the other's,
+    // and two headers that sit on the same row read as one band across the app.
+    let inner = Rect {
+        x: area.x + 1,
+        width: area.width.saturating_sub(2),
+        ..area
+    };
     if inner.height == 0 || inner.width < 4 {
         return;
     }
@@ -274,14 +301,14 @@ fn draw_sidebar_row(
         // Label left, affordance right — herdr's header row.
         Row::Section { label, action } => {
             frame.render_widget(
-                Paragraph::new(Span::styled(format!(" {label}"), theme.label())),
+                Paragraph::new(Span::styled(label.clone(), theme.label())),
                 area,
             );
             if let Some(action) = action {
-                let action_width = wrap::width_of(action) as u16 + 1;
+                let action_width = wrap::width_of(action) as u16;
                 if action_width < area.width {
                     frame.render_widget(
-                        Paragraph::new(Span::styled(format!("{action} "), theme.hint())),
+                        Paragraph::new(Span::styled(action.clone(), theme.hint())),
                         Rect {
                             x: area.x + area.width - action_width,
                             width: action_width,
@@ -304,7 +331,7 @@ fn draw_sidebar_row(
                 Style::default()
             };
             if selected {
-                frame.render_widget(Paragraph::new("").style(theme.selected()), area);
+                fill(frame, area, theme.selected());
             }
             // The attention dot only appears when a member session is live, so a
             // quiet space stays quiet.
@@ -318,10 +345,9 @@ fn draw_sidebar_row(
                 device.clone()
             };
             let device_width = wrap::width_of(&device);
-            let label_width = width.saturating_sub(4 + device_width).max(1);
+            let label_width = width.saturating_sub(3 + device_width).max(1);
             frame.render_widget(
                 Paragraph::new(Line::from(vec![
-                    Span::styled(" ".to_string(), base),
                     Span::styled(dot.to_string(), dot_style),
                     Span::styled(
                         format!(" {}", wrap::truncate(label, label_width)),
@@ -334,11 +360,11 @@ fn draw_sidebar_row(
                 ])),
                 area,
             );
-            let tail = device_width as u16 + 1;
+            let tail = device_width as u16;
             if tail < area.width {
                 frame.render_widget(
                     Paragraph::new(Span::styled(
-                        format!("{device} "),
+                        device.clone(),
                         base.patch(if *offline {
                             Style::default().fg(theme.warning)
                         } else {
@@ -356,7 +382,7 @@ fn draw_sidebar_row(
         Row::Blank => {}
         Row::Empty { label } => {
             frame.render_widget(
-                Paragraph::new(Span::styled(format!(" {label}"), theme.hint())),
+                Paragraph::new(Span::styled(label.clone(), theme.hint())),
                 area,
             );
         }
@@ -375,24 +401,14 @@ fn draw_sidebar_row(
                 Style::default()
             };
             if selected {
-                for offset in 0..area.height {
-                    frame.render_widget(
-                        Paragraph::new("").style(theme.selected()),
-                        Rect {
-                            y: area.y + offset,
-                            height: 1,
-                            ..area
-                        },
-                    );
-                }
+                fill(frame, area, theme.selected());
             }
             let open = app.selected_chat.as_deref() == Some(id.as_str());
             let when = app.relative_time(*activity);
-            // inset(1) + dot(1) + gap(1) + a column of air + the time column.
-            let title_width = width.saturating_sub(5 + wrap::width_of(&when)).max(1);
+            // dot(1) + gap(1) + a column of air + the time column.
+            let title_width = width.saturating_sub(3 + wrap::width_of(&when)).max(1);
             frame.render_widget(
                 Paragraph::new(Line::from(vec![
-                    Span::styled(" ".to_string(), base),
                     {
                         let (glyph, style) = status_dot(*indicator, app, theme, base);
                         Span::styled(glyph, style)
@@ -404,10 +420,10 @@ fn draw_sidebar_row(
                 ])),
                 Rect { height: 1, ..area },
             );
-            let time_width = wrap::width_of(&when) as u16 + 1;
+            let time_width = wrap::width_of(&when) as u16;
             if time_width < area.width {
                 frame.render_widget(
-                    Paragraph::new(Span::styled(format!("{when} "), base.patch(theme.hint()))),
+                    Paragraph::new(Span::styled(when.clone(), base.patch(theme.hint()))),
                     Rect {
                         x: area.x + area.width - time_width,
                         width: time_width,
@@ -428,7 +444,9 @@ fn draw_sidebar_row(
                 }
                 frame.render_widget(
                     Paragraph::new(Span::styled(
-                        format!("   {}", wrap::truncate(&sub, width.saturating_sub(4))),
+                        // Aligned past the dot and its gap, so the sub-line hangs
+                        // under the title rather than under the status column.
+                        format!("  {}", wrap::truncate(&sub, width.saturating_sub(2))),
                         base.patch(theme.hint()),
                     )),
                     Rect {
@@ -440,19 +458,16 @@ fn draw_sidebar_row(
             }
         }
         Row::User { name, email } => {
+            // With no display name the email takes the top line rather than
+            // leaving a gap where a name would have been.
+            let lead = if name.is_empty() { email } else { name };
             frame.render_widget(
-                Paragraph::new(Span::styled(
-                    format!(" {}", wrap::truncate(name, width.saturating_sub(2))),
-                    theme.subtle(),
-                )),
+                Paragraph::new(Span::styled(wrap::truncate(lead, width), theme.subtle())),
                 Rect { height: 1, ..area },
             );
             if area.height > 1 && !email.is_empty() && email != name {
                 frame.render_widget(
-                    Paragraph::new(Span::styled(
-                        format!(" {}", wrap::truncate(email, width.saturating_sub(2))),
-                        theme.hint(),
-                    )),
+                    Paragraph::new(Span::styled(wrap::truncate(email, width), theme.hint())),
                     Rect {
                         y: area.y + 1,
                         height: 1,
@@ -469,10 +484,21 @@ fn draw_sidebar_row(
 // ---------------------------------------------------------------------------
 
 fn draw_main(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
+    // A column of terminal background down each side of the main pane.
+    //
+    // Not decoration: the sidebar is a panel fill and so is an unfocused prompt,
+    // so without this gutter the two would meet at the same colour and read as
+    // one continuous shape. A filled region needs somewhere to end, and on the
+    // left that somewhere is this column.
+    let area = Rect {
+        x: area.x + MAIN_PAD,
+        width: area.width.saturating_sub(MAIN_PAD * 2),
+        ..area
+    };
     // The tab strip IS the header — in the desktop shell it replaced one
     // (`shell/tabs.rs`), so there is no separate title row. A blank row, not a
     // rule, separates it from the transcript: the active tab already carries a
-    // wash, so a stroke underneath would be the same boundary drawn twice.
+    // fill, so a stroke underneath would be the same boundary drawn twice.
     let [tabs, gap, rest] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(1),
@@ -490,20 +516,20 @@ fn draw_main(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
         }
     }
 
-    // The prompt gets air below it: hard against the hint bar it reads as a
-    // cramped afterthought rather than the thing you are meant to type into. Air
-    // above is the status strip, which is blank whenever nothing is running — a
-    // second reserved pad on top of it was one gap too many.
+    // Every row below the transcript is a fixed height, and deliberately so: the
+    // strip, the prompt block and the footer all keep their row whether or not
+    // they have anything to say. A pane that resizes as state arrives makes the
+    // prompt jump under the cursor while you are typing into it.
+    // No pad under the prompt: it is filled and the hint bar is not, so the
+    // colour change already separates them. A blank row there would be air
+    // between two things that are not touching.
     let text_rows = composer_rows(app, rest.width);
-    let chip_rows = u16::from(!app.composer_chips().is_empty());
-    let [transcript, strip, composer, pad_bottom] = Layout::vertical([
+    let [transcript, strip, composer] = Layout::vertical([
         Constraint::Min(2),
         Constraint::Length(1),
-        Constraint::Length(text_rows + chip_rows),
-        Constraint::Length(1),
+        Constraint::Length(text_rows + COMPOSER_CHROME),
     ])
     .areas(rest);
-    let _ = pad_bottom;
 
     app.push_hit(transcript, Hit::Pane(Focus::Transcript));
     app.push_hit(composer, Hit::Pane(Focus::Composer));
@@ -515,6 +541,19 @@ fn draw_main(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
 /// Width of one tab. The desktop strip uses a fixed 140px; a fixed column width
 /// is the same idea, and keeps tabs from jittering as titles stream in.
 const TAB_WIDTH: usize = 22;
+
+/// Air between tabs — the desktop's `gap(6px)`.
+///
+/// Without it the tabs share edges, and since the active one is the only filled
+/// block, the strip reads as a single bar with a bright patch somewhere in it
+/// rather than as a row of separate things. The gap is what turns the fill into
+/// a tab.
+const TAB_GAP: u16 = 1;
+
+/// Padding inside a tab, per side, so a filled tab does not clamp its own text.
+/// Set so a tab's contents land on the same column as the transcript's and the
+/// prompt's.
+const TAB_PAD: u16 = PAD as u16;
 
 /// The session tab strip: every non-archived session of the selected space,
 /// with `+` to start another. The active tab carries the selection wash.
@@ -542,7 +581,8 @@ fn draw_tab_strip(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
         );
     } else {
         // Scroll so the active tab is visible; `+` always trails the last tab.
-        let visible = (strip_width as usize / TAB_WIDTH).max(1);
+        let stride = TAB_WIDTH + TAB_GAP as usize;
+        let visible = (strip_width as usize / stride).max(1);
         let active = tabs.iter().position(|tab| tab.active).unwrap_or(0);
         let first = active.saturating_sub(visible.saturating_sub(1));
         let mut x = area.x;
@@ -558,18 +598,26 @@ fn draw_tab_strip(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
                 break;
             }
             app.push_hit(slot, Hit::Tab(offset));
+            // The active tab is the only filled one — the desktop's
+            // `white_alpha(0.08)` against a transparent inactive tab. Being the
+            // one raised block in the row is what marks it, so nothing else has
+            // to: no underline, no brackets, no brighter dot.
             let base = if tab.active {
-                theme.selected()
+                theme.element()
             } else {
                 Style::default()
             };
             if tab.active {
-                frame.render_widget(Paragraph::new("").style(theme.selected()), slot);
+                fill(frame, slot, base);
             }
-            let title_width = (slot.width as usize).saturating_sub(4);
+            let inner = Rect {
+                x: slot.x + TAB_PAD,
+                width: slot.width.saturating_sub(TAB_PAD * 2),
+                ..slot
+            };
+            let title_width = (inner.width as usize).saturating_sub(2);
             frame.render_widget(
                 Paragraph::new(Line::from(vec![
-                    Span::styled(" ".to_string(), base),
                     {
                         let (glyph, style) = status_dot(tab.indicator, app, theme, base);
                         Span::styled(glyph, style)
@@ -583,9 +631,9 @@ fn draw_tab_strip(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
                         }),
                     ),
                 ])),
-                slot,
+                inner,
             );
-            x += slot.width;
+            x += slot.width + TAB_GAP;
         }
         if x + 3 <= area.x + strip_width {
             let plus = Rect {
@@ -633,7 +681,7 @@ fn draw_transcript(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) 
     // the only place the transcript learns its width, so a resize lands here.
     app.lay_out_transcript(column.width, column.height as usize);
 
-    let inset = " ".repeat(GUTTER);
+    let inset = " ".repeat(PAD);
     if app.selected_chat.is_none() {
         frame.render_widget(
             Paragraph::new(vec![
@@ -688,7 +736,7 @@ fn draw_status_strip(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
         // must not be drawn two different ways depending on where you look.
         let (glyph, tint) = loaders::mini_spinner(app.elapsed());
         let mut spans = vec![
-            Span::raw(" ".repeat(GUTTER)),
+            Span::raw(" ".repeat(PAD)),
             Span::styled(glyph, Style::default().fg(tint)),
         ];
         spans.push(Span::styled(" Working".to_string(), theme.subtle()));
@@ -702,7 +750,7 @@ fn draw_status_strip(frame: &mut Frame, area: Rect, app: &App, theme: &Theme) {
     if !app.transcript.following() {
         frame.render_widget(
             Paragraph::new(Span::styled(
-                format!("{}Scrolled back · G to follow", " ".repeat(GUTTER)),
+                format!("{}Scrolled back · G to follow", " ".repeat(PAD)),
                 theme.hint(),
             )),
             area,
@@ -717,18 +765,19 @@ fn composer_rows(app: &App, width: u16) -> u16 {
     rows.clamp(1, COMPOSER_MAX_ROWS)
 }
 
-/// Text width inside the composer: the pane, less the gutter bar and a trailing
-/// column of air.
+/// Text width inside the composer: the block, less its padding on both sides.
 fn composer_text_width(width: u16) -> u16 {
-    width.saturating_sub(GUTTER as u16 + 1).max(1)
+    width.saturating_sub(COMPOSER_PAD * 2).max(1)
 }
 
-/// The composer's left gutter bar: one mark that says both "this is the prompt"
-/// and "you are typing in it", where a box would have needed four strokes to say
-/// less. Heavy, so it is never mistaken for the pane divider; indigo while
-/// focused and hairline otherwise, so colour carries the state and the shape
-/// stays put.
-const BAR: &str = "┃";
+/// Columns of padding inside the composer fill, per side (opencode's prompt uses
+/// two, and at one the text reads as stuck to the edge of the block).
+const COMPOSER_PAD: u16 = PAD as u16;
+
+/// Rows the composer block adds around its text: a row of air on top, a row of
+/// air under the text, and the meta row itself. The meta row is *always* one of
+/// them — see [`App::composer_meta`] for why it can never be conditional.
+const COMPOSER_CHROME: u16 = 3;
 
 fn draw_composer(frame: &mut Frame, area: Rect, text_rows: u16, app: &mut App, theme: &Theme) {
     if area.height == 0 || area.width < 6 {
@@ -736,46 +785,36 @@ fn draw_composer(frame: &mut Frame, area: Rect, text_rows: u16, app: &mut App, t
     }
     let focused = app.focus == Focus::Composer;
 
-    // The bar runs the full height of the block, chips included, so a growing
-    // prompt stays one object rather than becoming a stack of rows.
-    let bar_style = if focused {
-        Style::default().fg(theme.accent)
+    // Focus is the fill level, not a stroke. An unfocused prompt sits at panel
+    // level like the rest of the furniture; taking focus lifts it one step to
+    // element, which is the same move a menu row makes when the cursor lands on
+    // it. Nothing changes shape, so nothing reflows.
+    let surface = if focused {
+        theme.element()
     } else {
-        theme.rule()
+        theme.panel()
     };
-    for offset in 0..area.height {
-        frame.render_widget(
-            Paragraph::new(Span::styled(BAR, bar_style)),
-            Rect {
-                x: area.x + 1,
-                y: area.y + offset,
-                width: 1,
-                height: 1,
-            },
-        );
-    }
+    fill(frame, area, surface);
 
     let text_area = Rect {
-        x: area.x + GUTTER as u16,
+        x: area.x + COMPOSER_PAD,
+        y: area.y + 1,
         width: composer_text_width(area.width),
         height: text_rows,
-        ..area
     };
 
-    // The chips sit on their own row inside the bar, left-aligned and quiet —
-    // the desktop pill's inline chips, read as a caption rather than dressed up
-    // as buttons. Each is still its own click target: they open different
-    // pickers, so one lumped region would send every click to the same place.
-    if area.height > text_rows {
-        draw_composer_chips(
+    // The meta row is the last row of the block, under a row of air.
+    if area.height >= COMPOSER_CHROME {
+        draw_composer_meta(
             frame,
             Rect {
-                y: area.y + text_rows,
+                y: area.y + area.height - 1,
                 height: 1,
                 ..text_area
             },
             app,
             theme,
+            surface,
         );
     }
 
@@ -819,48 +858,102 @@ fn draw_composer(frame: &mut Frame, area: Rect, text_rows: u16, app: &mut App, t
     }
 }
 
-/// The composer's caption row: `main · Current checkout · Fable 5 · High`.
+/// The composer's meta row: `Opus 5  High` on the left, `⎇ main  Worktree` on
+/// the right.
 ///
-/// Separated by the same middle dot the sidebar sub-lines and the working strip
-/// use, so one glyph means "and also" everywhere in the app.
-fn draw_composer_chips(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
-    let chips = app.composer_chips();
-    if chips.is_empty() || area.width == 0 {
+/// One row, two clusters, which is exactly how opencode builds its prompt's
+/// meta row — `justifyContent="space-between"`, agent and model on the left and
+/// `props.right` opposite. The desktop splits these across an actions row and a
+/// footer because it has the pixels; a terminal does not, and putting all four
+/// settings on one line groups them better than stacking them anyway.
+///
+/// Model and effort are one chip visually, as on the desktop where they were
+/// merged into a single button — the model at full weight because it answers
+/// "who is replying", the effort muted beside it because it qualifies that
+/// answer. Each stays its own hit target, though: the pickers behind them are
+/// genuinely different questions, and a terminal can afford the precision.
+fn draw_composer_meta(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme, surface: Style) {
+    if area.width == 0 {
         return;
     }
-    let mut x = area.x;
-    for (index, (kind, label)) in chips.iter().enumerate() {
-        if index > 0 {
-            if x + 3 > area.right() {
-                return;
+    let faint = surface.patch(Style::default().fg(theme.faint));
+    let muted = surface.patch(Style::default().fg(theme.muted));
+
+    // Right cluster first: it is the one that must not be pushed off, and its
+    // width decides how much room the model label has to truncate into.
+    let mut right = area.right();
+    if let Some(footer) = app.composer_footer() {
+        let checkout_width = wrap::width_of(&footer.checkout) as u16;
+        if right.saturating_sub(checkout_width) > area.x {
+            right -= checkout_width;
+            let slot = Rect {
+                x: right,
+                width: checkout_width,
+                height: 1,
+                ..area
+            };
+            // Only a draft can still move: a session's checkout kind was fixed
+            // when it was created, so a hit here would offer a choice that no
+            // longer exists.
+            if footer.checkout_live {
+                app.push_hit(slot, Hit::Chip(ChipKind::Checkout));
             }
             frame.render_widget(
-                Paragraph::new(Span::styled(" · ", theme.rule())),
-                Rect {
-                    x,
-                    width: 3,
-                    height: 1,
-                    ..area
-                },
+                Paragraph::new(Span::styled(footer.checkout.clone(), faint)),
+                slot,
             );
-            x += 3;
         }
-        let width = wrap::width_of(label) as u16;
-        if x + width > area.right() {
-            return;
+        let reference = format!("⎇ {}", footer.reference);
+        let width = wrap::width_of(&reference) as u16 + 2;
+        if right.saturating_sub(width) > area.x {
+            right -= width;
+            let slot = Rect {
+                x: right,
+                width,
+                height: 1,
+                ..area
+            };
+            app.push_hit(slot, Hit::Chip(ChipKind::Branch));
+            frame.render_widget(
+                Paragraph::new(Span::styled(format!("{reference}  "), muted)),
+                slot,
+            );
         }
-        let slot = Rect {
-            x,
-            width,
-            height: 1,
-            ..area
-        };
-        app.push_hit(slot, Hit::Chip(*kind));
-        frame.render_widget(
-            Paragraph::new(Span::styled(label.clone(), theme.hint())),
-            slot,
-        );
-        x += width;
+    }
+
+    // Left cluster, into whatever the right one left.
+    let mut x = area.x;
+    let room = right.saturating_sub(x) as usize;
+    let model = wrap::truncate(&app.composer_meta().model, room);
+    let model_width = wrap::width_of(&model) as u16;
+    if model_width == 0 {
+        return;
+    }
+    let slot = Rect {
+        x,
+        width: model_width,
+        height: 1,
+        ..area
+    };
+    app.push_hit(slot, Hit::Chip(ChipKind::Model));
+    frame.render_widget(Paragraph::new(Span::styled(model, surface)), slot);
+    x += model_width;
+
+    if let Some(effort) = app.composer_meta().effort {
+        let width = wrap::width_of(&effort) as u16 + 2;
+        if x + width <= right {
+            let slot = Rect {
+                x,
+                width,
+                height: 1,
+                ..area
+            };
+            app.push_hit(slot, Hit::Chip(ChipKind::Reasoning));
+            frame.render_widget(
+                Paragraph::new(Span::styled(format!("  {effort}"), faint)),
+                slot,
+            );
+        }
     }
 }
 
@@ -1138,6 +1231,7 @@ fn draw_overlay(
                     theme,
                     &item.label,
                     None,
+                    0,
                     index == *active,
                 );
                 y += 1;
@@ -1281,6 +1375,17 @@ fn list_card(
     let panel = centred(body, width, height);
     let inner = draw_panel(frame, panel, theme, title);
 
+    // Details start at one column for the whole card, so they read as a second
+    // column rather than as ragged tails chasing labels of different lengths.
+    // Capped at half the card, or one long label would push every detail off.
+    let detail_col = rows
+        .iter()
+        .filter(|(_, detail)| detail.is_some())
+        .map(|(label, _)| wrap::width_of(label) + 2)
+        .max()
+        .unwrap_or(0)
+        .min(width as usize / 2);
+
     for (index, (label, detail)) in rows.iter().enumerate() {
         let y = inner.y + index as u16;
         if y >= inner.bottom() {
@@ -1296,69 +1401,95 @@ fn list_card(
             theme,
             label,
             detail.as_deref(),
+            detail_col,
             selectable && index == active,
         );
     }
     panel
 }
 
-/// One row of a floating panel: a label, an optional muted detail after it, and
-/// the selection wash when it is the active one.
+/// One row of a floating panel: a label, an optional muted detail in a column
+/// beside it, and the selection fill when it is the active one.
 fn draw_panel_row(
     frame: &mut Frame,
     slot: Rect,
     theme: &Theme,
     label: &str,
     detail: Option<&str>,
+    detail_col: usize,
     selected: bool,
 ) {
+    // The selection spans the panel's full width — a cursor that stopped at the
+    // text's padding would read as a chip rather than as "you are here".
     let base = if selected {
-        theme.panel_selected()
+        theme.selected()
     } else {
         theme.panel()
     };
+    fill(frame, slot, base);
+    let inner = Rect {
+        x: slot.x + PANEL_PAD,
+        width: slot.width.saturating_sub(PANEL_PAD * 2),
+        ..slot
+    };
     let mut spans = vec![Span::styled(
-        format!(" {}", wrap::truncate(label, slot.width as usize)),
-        if selected { base } else { base.fg(theme.muted) },
+        wrap::truncate(label, inner.width as usize),
+        if selected {
+            base
+        } else {
+            base.patch(Style::default().fg(theme.muted))
+        },
     )];
     if let Some(detail) = detail {
-        let room = (slot.width as usize).saturating_sub(wrap::width_of(label) + 3);
+        // Pad out to the shared column; a label that overran it still gets its
+        // two spaces so the two never collide.
+        let gap = detail_col.saturating_sub(wrap::width_of(label)).max(2);
+        let room = (inner.width as usize).saturating_sub(wrap::width_of(label) + gap);
         if room > 4 {
             spans.push(Span::styled(
-                format!("  {}", wrap::truncate(detail, room)),
-                base.fg(theme.faint),
+                format!("{}{}", " ".repeat(gap), wrap::truncate(detail, room)),
+                base.patch(Style::default().fg(theme.faint)),
             ));
         }
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)).style(base), slot);
+    frame.render_widget(Paragraph::new(Line::from(spans)), inner);
 }
 
-/// The shared panel chrome: a raised wash on a cleared rect, its title on the
-/// first row. Returns the rows the caller fills.
+/// Padding inside a floating panel, per side. Matches the composer's, so every
+/// filled region in the app indents its contents by the same amount.
+const PANEL_PAD: u16 = 2;
+
+/// The shared panel chrome: a panel-level fill on a cleared rect, its title on
+/// the first row. Returns the rows the caller fills.
 ///
-/// No border, because the wash already *is* one — a hairline box around a
-/// surface that is already a different colour is the same edge drawn twice, and
-/// on a terminal the box also costs two columns and two rows of the content it
-/// surrounds. This is the desktop app's own menu: a raised surface, a title, and
-/// rows.
+/// No border, because the fill already *is* one — a hairline box around a region
+/// that is already a different colour is the same edge drawn twice, and on a
+/// terminal the box also costs two columns and two rows of the content it
+/// surrounds. This is both opencode's dialog (a `backgroundPanel` box, nothing
+/// else) and komet's own desktop menu.
 fn draw_panel(frame: &mut Frame, panel: Rect, theme: &Theme, title: &str) -> Rect {
     frame.render_widget(Clear, panel);
-    frame.render_widget(Paragraph::new("").style(theme.panel()), panel);
-    if panel.height == 0 || panel.width < 4 {
+    fill(frame, panel, theme.panel());
+    if panel.height == 0 || panel.width < PANEL_PAD * 2 + 2 {
         return panel;
     }
+    let inner_width = panel.width - PANEL_PAD * 2;
     frame.render_widget(
         Paragraph::new(Span::styled(
-            format!(" {}", wrap::truncate(title, panel.width as usize - 2)),
+            wrap::truncate(title, inner_width as usize),
             theme.panel_hint(),
-        ))
-        .style(theme.panel()),
-        Rect { height: 1, ..panel },
+        )),
+        Rect {
+            x: panel.x + PANEL_PAD,
+            width: inner_width,
+            height: 1,
+            ..panel
+        },
     );
     Rect {
-        x: panel.x + 1,
+        x: panel.x,
         y: panel.y + 1,
-        width: panel.width - 2,
+        width: panel.width,
         height: panel.height - 2,
     }
 }
