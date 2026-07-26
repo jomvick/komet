@@ -197,7 +197,7 @@ fn draw_sidebar(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
         x: area.x + SIDEBAR_PAD,
         y: area.y + 1,
         width: area.width.saturating_sub(SIDEBAR_PAD * 2),
-        height: area.height.saturating_sub(1),
+        height: area.height.saturating_sub(2),
     };
     if inner.height == 0 || inner.width < 4 {
         return;
@@ -304,6 +304,14 @@ fn draw_sidebar_row(
     theme: &Theme,
 ) {
     let width = area.width as usize;
+    // The cursor's fill runs the pane's full width, not the content column's: a
+    // fill that stopped at the text inset would read as a highlight on the words
+    // rather than as the row being selected.
+    let bleed = Rect {
+        x: area.x.saturating_sub(SIDEBAR_PAD),
+        width: area.width + SIDEBAR_PAD * 2,
+        ..area
+    };
     match row {
         // Label left, affordance right — herdr's header row.
         Row::Section { label, action } => {
@@ -338,7 +346,7 @@ fn draw_sidebar_row(
                 Style::default()
             };
             if selected {
-                fill(frame, area, theme.selected());
+                fill(frame, bleed, theme.selected());
             }
             // The attention dot only appears when a member session is live, so a
             // quiet space stays quiet.
@@ -408,7 +416,7 @@ fn draw_sidebar_row(
                 Style::default()
             };
             if selected {
-                fill(frame, area, theme.selected());
+                fill(frame, bleed, theme.selected());
             }
             let open = app.selected_chat.as_deref() == Some(id.as_str());
             let when = app.relative_time(*activity);
@@ -506,14 +514,9 @@ fn draw_main(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
     // (`shell/tabs.rs`), so there is no separate title row. A blank row, not a
     // rule, separates it from the transcript: the active tab already carries a
     // fill, so a stroke underneath would be the same boundary drawn twice.
-    let [tabs, gap, rest] = Layout::vertical([
-        Constraint::Length(TAB_ROWS),
-        Constraint::Length(1),
-        Constraint::Min(4),
-    ])
-    .areas(area);
+    let [tabs, rest] =
+        Layout::vertical([Constraint::Length(TAB_ROWS), Constraint::Min(4)]).areas(area);
     draw_tab_strip(frame, tabs, app, theme);
-    let _ = gap;
 
     match app.gate() {
         GatePhase::Ready => {}
@@ -576,13 +579,15 @@ const TAB_MORE_RIGHT: &str = "›";
 /// Padding inside a tab, per side.
 const TAB_PAD: u16 = 2;
 
-/// Rows the tab strip occupies: a row of padding, then the labels.
+/// Rows the tab strip occupies: the labels, with one row above and below.
 ///
-/// A tab needs vertical padding as much as horizontal, and a terminal's only
-/// unit is the row — so one row is the whole budget. It goes above the labels,
-/// where it keeps them off the terminal's top edge; the blank row the strip
-/// already had beneath it does the same job on the other side.
-const TAB_ROWS: u16 = 2;
+/// The rows either side are only *half* filled for the active tab — `▄` above,
+/// `▀` below — because a full row of fill on each side was too much and a bare
+/// label was too little, and half a cell is the one size between them a
+/// terminal can actually draw. (opencode plays the same trick on its prompt
+/// border with `╹`.) The empty halves double as the strip's separation from the
+/// terminal edge above and the transcript below, so no extra gap row is needed.
+const TAB_ROWS: u16 = 3;
 
 /// The session tab strip: every non-archived session of the selected space,
 /// with `+` to start another. The active tab carries the selection wash.
@@ -602,7 +607,7 @@ fn draw_tab_strip(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
                 theme.hint(),
             )),
             Rect {
-                y: area.y + TAB_ROWS - 1,
+                y: area.y + 1,
                 width: strip_width.max(1),
                 height: 1,
                 ..area
@@ -627,9 +632,9 @@ fn draw_tab_strip(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
         let first = active.saturating_sub(visible.saturating_sub(1));
         let last = (first + visible).min(tabs.len());
 
-        // The active tab's fill runs the strip's full height; the labels sit on
-        // its last row, under that one row of padding.
-        let label_y = area.y + TAB_ROWS - 1;
+        // Labels sit on the strip's middle row; the active tab's half-blocks
+        // occupy the rows either side.
+        let label_y = area.y + 1;
         let mut x = area.x;
         if first > 0 {
             frame.render_widget(
@@ -666,7 +671,33 @@ fn draw_tab_strip(frame: &mut Frame, area: Rect, app: &mut App, theme: &Theme) {
                 Style::default()
             };
             if tab.active {
-                fill(frame, slot, base);
+                fill(
+                    frame,
+                    Rect {
+                        y: label_y,
+                        height: 1,
+                        ..slot
+                    },
+                    base,
+                );
+                // Half a row of fill above and below the label. Under NO_COLOR
+                // there is no element colour to draw them in, and the plain
+                // theme's reversed label carries the tab alone.
+                if !theme.plain {
+                    for (glyph, y) in [("▄", slot.y), ("▀", slot.y + 2)] {
+                        frame.render_widget(
+                            Paragraph::new(Span::styled(
+                                glyph.repeat(slot.width as usize),
+                                Style::default().fg(theme.element),
+                            )),
+                            Rect {
+                                y,
+                                height: 1,
+                                ..slot
+                            },
+                        );
+                    }
+                }
             }
             let inner = Rect {
                 x: slot.x + TAB_PAD,
