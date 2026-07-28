@@ -43,6 +43,17 @@ const PRESENCE_INTERVAL_MS: u64 = 15_000;
 /// beats = offline). Also the "peer is reachable" signal that clears the
 /// peer-dial cooldown.
 const PRESENCE_FRESH_MS: i64 = 45_000;
+/// Relay-status probe cadence. Ephemeral heartbeats ride the workspace room,
+/// so any workspace-DO pathology (log-replay wedge, CPU reset, our own room
+/// connection being down) silently starves them — and every device looks
+/// offline while its relay works fine. Before believing "offline", ask the
+/// device's DeviceRoom (`GET /device/{id}/status` → `hostConnected`), which
+/// tracks the host socket authoritatively and shares no machinery with the
+/// workspace room. Probes only run for devices whose heartbeat is stale, so
+/// the steady state (healthy room, fresh beats) sends no extra traffic.
+const RELAY_PROBE_INTERVAL_MS: u64 = 30_000;
+/// Per-request timeout for a relay-status probe.
+const RELAY_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// Debounce window for local snapshot saves after a doc change.
 const SNAPSHOT_DEBOUNCE_MS: u64 = 1_000;
 /// Initial-join retry backoff (base, cap). A first workspace-room join that
@@ -181,6 +192,9 @@ impl WorkspaceHost {
         };
         host.join_room();
         tokio::spawn(workspace_task(Arc::downgrade(&host.inner), changed_rx));
+        if host.inner.config.edge.is_some() {
+            tokio::spawn(relay_probe_task(Arc::downgrade(&host.inner)));
+        }
         Ok(host)
     }
 
@@ -720,8 +734,11 @@ impl WorkspaceHostInner {
     fn overlay_presence(&self, devices: &mut [Device]) {
         let mut alive_peers: Vec<String> = Vec::new();
         {
+            // No live room handle is NOT "everyone is offline": the cache (fed
+            // by past heartbeats and the relay-status probe) still overlays —
+            // a wedged workspace DO must never fake an offline badge for
+            // devices whose relay connection is fine.
             let room = lock(&self.room);
-            let Some(room) = room.as_ref() else { return };
             let mut seen = lock(&self.presence_seen);
             let now = now_ms();
             for device in devices.iter_mut() {
@@ -730,10 +747,12 @@ impl WorkspaceHostInner {
                 // rejoin) must not erase freshness this engine already
                 // witnessed — the device is offline only once heartbeats
                 // genuinely stop arriving for the UI's whole online window.
-                let live = match room.ephemeral().get(&presence_key(&device.id)) {
-                    Some(loro::LoroValue::I64(ms)) => Some(ms),
-                    _ => None,
-                };
+                let live = room.as_ref().and_then(|room| {
+                    match room.ephemeral().get(&presence_key(&device.id)) {
+                        Some(loro::LoroValue::I64(ms)) => Some(ms),
+                        _ => None,
+                    }
+                });
                 let cached = seen.get(&device.id).copied();
                 let Some(ms) = live.into_iter().chain(cached).max() else {
                     continue;
@@ -797,6 +816,81 @@ fn merge_sessions(device_id: &str, rows: &[Session], local: &[Session]) -> Vec<S
     let mut list: Vec<Session> = merged.into_values().collect();
     list.sort_by(|a, b| a.chat_id.cmp(&b.chat_id));
     list
+}
+
+/// Background task: relay-verified presence. Every [`RELAY_PROBE_INTERVAL_MS`],
+/// for each known device whose merged heartbeat freshness has gone stale, ask
+/// its DeviceRoom whether the host socket is live (`/device/{id}/status`); a
+/// positive answer refreshes the presence cache so the overlay keeps the badge
+/// online. The DeviceRoom shares no machinery with the workspace room, so a
+/// false "offline" now requires BOTH independent paths to be down — at which
+/// point the device is, for every purpose the app has, genuinely offline.
+/// Steady state (healthy room, fresh heartbeats) probes nothing.
+async fn relay_probe_task(weak: Weak<WorkspaceHostInner>) {
+    let mut tick =
+        tokio::time::interval(std::time::Duration::from_millis(RELAY_PROBE_INTERVAL_MS));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    tick.tick().await; // consume the immediate first tick
+    let client = reqwest::Client::new();
+    loop {
+        tick.tick().await;
+        let Some(inner) = weak.upgrade() else { return };
+        let Some(edge) = inner.config.edge.clone() else { return };
+        let self_id = inner.config.device_id.clone();
+        let now = now_ms();
+        let stale: Vec<String> = {
+            let Ok(devices) = inner.doc.read_devices() else {
+                continue;
+            };
+            let seen = lock(&inner.presence_seen);
+            devices
+                .into_iter()
+                .filter(|d| d.id != self_id)
+                .filter(|d| {
+                    seen.get(&d.id)
+                        .is_none_or(|ms| now.saturating_sub(*ms) >= PRESENCE_FRESH_MS)
+                })
+                .map(|d| d.id)
+                .collect()
+        };
+        drop(inner);
+        if stale.is_empty() {
+            continue;
+        }
+        let Some(bearer) = edge.bearer().await else {
+            continue; // signed out
+        };
+        let mut refreshed = false;
+        for device_id in stale {
+            let url = format!(
+                "{}/device/{}/status",
+                edge.url.trim_end_matches('/'),
+                device_id
+            );
+            let response = client
+                .get(&url)
+                .bearer_auth(&bearer)
+                .timeout(RELAY_PROBE_TIMEOUT)
+                .send()
+                .await;
+            let Ok(response) = response else { continue };
+            if !response.status().is_success() {
+                continue;
+            }
+            let Ok(body) = response.json::<serde_json::Value>().await else {
+                continue;
+            };
+            if body.get("hostConnected").and_then(serde_json::Value::as_bool) == Some(true) {
+                let Some(inner) = weak.upgrade() else { return };
+                lock(&inner.presence_seen).insert(device_id.clone(), now_ms());
+                tracing::debug!(device = %device_id, "presence: relay-verified alive");
+                refreshed = true;
+            }
+        }
+        if refreshed && let Some(inner) = weak.upgrade() {
+            inner.publish();
+        }
+    }
 }
 
 /// Background task: reacts to doc changes (local commits and remote imports) by

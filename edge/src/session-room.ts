@@ -52,6 +52,9 @@ import { AUTH_USER_HEADER, ROOM_KIND_HEADER, type Env } from "./env";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const RETAIN_MS = RETAIN_DAYS * DAY_MS;
+/** Consecutive cold-replay deaths (CPU-limit kills mid-`ensureDoc`) before the
+ * room concludes it is wedged and drops its own log — see `ensureDoc`. */
+const REPLAY_CRASH_LIMIT = 3;
 /** Payload bytes per outbound fragment (leaves room for the envelope). */
 const FRAGMENT_BYTES = 200_000;
 /** Keep a rolling ~5 weeks of daily frontier checkpoints. */
@@ -163,7 +166,10 @@ export class SessionRoom implements DurableObject {
         diffPublished: this.blobs.get("diff") !== undefined,
         checkpoints: (JSON.parse(this.getMeta("checkpoints") ?? "[]") as unknown[]).length,
         lastTrimAt: this.getMeta("lastTrimAt") ?? null,
-        backupDirty: this.getMeta("backupDirty") === "1"
+        backupDirty: this.getMeta("backupDirty") === "1",
+        // Non-zero while a cold replay is in flight or has been dying — the
+        // wedge signature ensureDoc's automated reset watches for.
+        replayAttempts: Number(this.getMeta("replayAttempts") ?? "0")
       });
     }
     if (url.pathname === "/tail" && request.method === "GET") {
@@ -244,13 +250,7 @@ export class SessionRoom implements DurableObject {
       const before = [...this.ctx.storage.sql.exec("SELECT COUNT(*) AS n FROM updates")][0]?.n as
         | number
         | undefined;
-      this.ctx.storage.sql.exec("DELETE FROM updates");
-      this.blobs.delete("snapshot");
-      this.setMeta("updateBytes", "0");
-      this.setMeta("checkpoints", "[]");
-      this.setMeta("lastTrimAt", "");
-      this.pending = [];
-      this.pendingBytes = 0;
+      this.dropLog();
       this.doc = undefined; // force a fresh (empty) materialization next join
       // Boot any currently-attached %LOR/%EPH sockets so their hung/half-cold
       // sessions bail and reconnect into the now-empty doc.
@@ -500,6 +500,16 @@ export class SessionRoom implements DurableObject {
 
   private ensureDoc(): LoroDoc {
     if (this.doc) return this.doc;
+    // AUTOMATED WEDGE BREAK: a cold replay that exceeds the DO CPU limit kills
+    // the invocation before `replayAttempts` is cleared below — and every
+    // reconnecting client cold-starts the room into the same death, forever
+    // (the manual escape is POST /reset-log). Count consecutive replay deaths;
+    // past the limit, drop the log+snapshot exactly like /reset-log does.
+    // Recovery is by design lossless-enough: every engine holds the full doc
+    // locally and re-uploads whatever the server lacks on its next join.
+    const attempts = Number(this.getMeta("replayAttempts") ?? "0");
+    if (attempts >= REPLAY_CRASH_LIMIT) this.dropLog();
+    this.setMeta("replayAttempts", String(attempts + 1));
     const doc = new LoroDoc();
     const snapshot = this.blobs.get("snapshot");
     if (snapshot && snapshot.length > 0) doc.import(snapshot);
@@ -517,8 +527,22 @@ export class SessionRoom implements DurableObject {
         /* same */
       }
     }
+    this.setMeta("replayAttempts", "0");
     this.doc = doc;
     return doc;
+  }
+
+  /** Drop the persisted update log + snapshot (the /reset-log storage clear):
+   * the next materialization starts empty and engines re-upload state on
+   * rejoin. Preserves owner/chatId meta. */
+  private dropLog(): void {
+    this.ctx.storage.sql.exec("DELETE FROM updates");
+    this.blobs.delete("snapshot");
+    this.setMeta("updateBytes", "0");
+    this.setMeta("checkpoints", "[]");
+    this.setMeta("lastTrimAt", "");
+    this.pending = [];
+    this.pendingBytes = 0;
   }
 
   private ensureEph(): EphemeralStore {

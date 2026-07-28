@@ -87,8 +87,12 @@ fn main() -> anyhow::Result<()> {
     // subscriber entirely for it. Everything else logs to stdout: long-running
     // modes at info, one-shot CLI commands at warn (RUST_LOG overrides either).
     if !matches!(cli.command, Some(Command::Tui(_))) {
+        // loro's internal block-encode diagnostics log at info and flood
+        // journald on every snapshot export — enough to fill a disk on a
+        // long-running headless host. Quiet them by default (RUST_LOG still
+        // overrides the whole filter).
         let default_filter = match &cli.command {
-            None | Some(Command::Headless) => "info",
+            None | Some(Command::Headless) => "info,loro_internal=warn,loro=warn",
             Some(_) => "warn",
         };
         tracing_subscriber::fmt()

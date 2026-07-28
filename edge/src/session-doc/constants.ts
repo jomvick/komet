@@ -35,8 +35,11 @@ export const COMPACT_LOG_BYTES = 2 * 1024 * 1024;
  * each), not just their total bytes — a workspace room accumulates thousands
  * of tiny row/presence-adjacent updates well under {@link COMPACT_LOG_BYTES}.
  * Fold on row count too so many-small-updates can't blow the cold-start
- * budget the byte cap alone would miss. */
-export const COMPACT_LOG_ROWS = 1500;
+ * budget the byte cap alone would miss. 1500 proved too generous: a per-user
+ * workspace room wedged its cold replay at ~1400 rows (Jul 2026), under the
+ * trigger — folding is cheap while the doc is hot (one snapshot export), so
+ * fold early and keep cold replays trivially affordable. */
+export const COMPACT_LOG_ROWS = 400;
 
 /** Soft ceiling: past this much doc state the UI nudges toward a fresh
  * session. No enforcement machinery — a product stance, not a limit. */
