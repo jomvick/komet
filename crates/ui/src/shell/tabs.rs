@@ -208,6 +208,20 @@ impl Shell {
                 .collect()
         };
         let selected = self.state.read(cx).selected_chat.clone();
+        // Keep the selected tab visible: on selection change, scroll it into
+        // view (minimal movement — a new session's tab materializes at the far
+        // right of an overflowing strip and would otherwise be stranded
+        // off-screen).
+        match selected.as_deref() {
+            Some(sel) if self.tabs_scrolled_to.as_deref() != Some(sel) => {
+                if let Some(ix) = order.iter().position(|id| id == sel) {
+                    self.tabs_scroll.scroll_to_item(ix);
+                }
+                self.tabs_scrolled_to = Some(sel.to_string());
+            }
+            Some(_) => {}
+            None => self.tabs_scrolled_to = None,
+        }
         let has_space = space_id.is_some();
         let git = self.space_git_detected(cx);
         let hovered = self.tab_hover.clone();
@@ -307,7 +321,12 @@ impl Shell {
                     .bg(bg)
                     .cursor_pointer()
                     // Tabs sit inside the titlebar drag strip — carve them out.
-                    .occlude()
+                    // NOT `.occlude()`: a BlockMouse hitbox ends the hit test,
+                    // so the scroll container behind the tabs never saw wheel
+                    // events and an overflowing strip could not be scrolled
+                    // (tabs tile the whole region). ExceptScroll keeps the
+                    // drag-region carve-out and lets the strip scroll.
+                    .block_mouse_except_scroll()
                     .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
                     // Track hover in Shell state: the trailing slot flips
                     // between dot and close button (hover_blend only fades

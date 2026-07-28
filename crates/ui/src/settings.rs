@@ -55,6 +55,10 @@ pub struct UiSettings {
     /// Missing chats are skipped; new chats append in creation order.
     #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub tab_order: std::collections::HashMap<String, Vec<String>>,
+    /// Manual sidebar space order (drag-reorder; device-local). Missing spaces
+    /// are skipped; new spaces append in creation order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub space_order: Vec<String>,
     /// Session notification chimes (done / awaiting-input). `KOMET_DISABLE_SOUND`
     /// overrides.
     pub sound_enabled: bool,
@@ -78,6 +82,7 @@ impl Default for UiSettings {
             sidebar_grouped: false,
             last_space_id: None,
             tab_order: std::collections::HashMap::new(),
+            space_order: Vec::new(),
             sound_enabled: true,
             right_pane_width: RIGHT_PANE_DEFAULT,
             right_pane_open: false,
@@ -332,6 +337,7 @@ mod tests {
                 "space-1".to_string(),
                 vec!["b".to_string(), "a".to_string()],
             )]),
+            space_order: vec!["space-2".to_string(), "space-1".to_string()],
             sound_enabled: false,
             right_pane_width: 700.0,
             right_pane_open: true,

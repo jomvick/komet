@@ -22,6 +22,7 @@ use gpui::{
 };
 
 use komet_rpc::methods;
+use gpui_tokio::Tokio;
 
 use crate::changes::Changes;
 use crate::composer::{Composer, ComposerEvent, ComposerInput, ComposerInputEvent};
@@ -383,6 +384,15 @@ struct RenameChatDialog {
     _events: Subscription,
 }
 
+/// In-app update lifecycle (macOS bundle installs; see `render_update_strip`).
+enum UpdateFlow {
+    Idle,
+    Downloading,
+    /// Staged bundle ready to swap in — one click restarts into it.
+    Ready(PathBuf),
+    Failed(SharedString),
+}
+
 /// The "Create your workspace" gate (feature-inventory §1.2 OrgGate).
 struct OrgGateUi {
     name_input: Entity<ComposerInput>,
@@ -433,9 +443,16 @@ pub struct Shell {
     tab_hover: Option<String>,
     /// Session-tab drag-reorder in flight (see `tabs::TabDragState`).
     tab_drag: Option<tabs::TabDragState>,
+    /// Space-row drag-reorder in flight (see `spaces::SpaceDragState`).
+    space_drag: Option<spaces::SpaceDragState>,
     /// Scroll position of the session tab region (drives the edge fades and
     /// the drop-index math under horizontal overflow).
     tabs_scroll: gpui::ScrollHandle,
+    /// Chat id last auto-scrolled into view — scroll-to-selected fires once per
+    /// selection change, not every frame (which would fight manual scrolling).
+    tabs_scrolled_to: Option<String>,
+    /// Scroll position of the sidebar lists region (drives its edge fades).
+    sidebar_scroll: gpui::ScrollHandle,
     /// `settings.last_space_id` applied once after the first spaces frame.
     space_boot_applied: bool,
     /// Last seen session status per chat — the chime trigger compares against
@@ -447,6 +464,17 @@ pub struct Shell {
     user_menu_dismissed_at: Option<std::time::Instant>,
     /// Inline sidebar error strip (mutation failures); click dismisses.
     sidebar_notice: Option<SharedString>,
+    /// Local lifecycle of an in-app update (macOS bundle swap) — the engine's
+    /// UpdateStatus stream says WHETHER one exists; this says how far the
+    /// download/stage of it has come in this process.
+    update_flow: UpdateFlow,
+    update_task: Option<Task<()>>,
+    /// Version whose update strip the user dismissed (advisory installs only —
+    /// a newer release shows the strip again).
+    update_dismissed: Option<String>,
+    /// How this binary was installed — decides the strip's click behavior.
+    /// Cached: `detect_install` stats `current_exe` and this renders per frame.
+    install: komet_update::InstallKind,
     org: Option<OrgGateUi>,
     mutate_task: Option<Task<()>>,
     auth_task: Option<Task<()>>,
@@ -613,12 +641,19 @@ impl Shell {
             space_last_chat: std::collections::HashMap::new(),
             tab_hover: None,
             tab_drag: None,
+            space_drag: None,
             tabs_scroll: gpui::ScrollHandle::new(),
+            tabs_scrolled_to: None,
+            sidebar_scroll: gpui::ScrollHandle::new(),
             space_boot_applied: false,
             sound_prev: std::collections::HashMap::new(),
             user_menu_open: false,
             user_menu_dismissed_at: None,
             sidebar_notice: None,
+            update_flow: UpdateFlow::Idle,
+            update_task: None,
+            update_dismissed: None,
+            install: komet_update::detect_install(),
             org: None,
             mutate_task: None,
             auth_task: None,
@@ -1840,6 +1875,14 @@ impl Shell {
             })
             .collect();
 
+        // Overflow edge fades for the lists scroll region — the tab strip's
+        // idiom, vertical (offset from the LAST frame; the lag is invisible).
+        let lists_scrolled = -f32::from(self.sidebar_scroll.offset().y);
+        let lists_max_scroll = f32::from(self.sidebar_scroll.max_offset().y);
+        let lists_fade_top = lists_scrolled > 1.0;
+        let lists_fade_bottom = lists_scrolled < lists_max_scroll - 1.0;
+        let sidebar_bg = theme.bg;
+
         let user_line: SharedString = user
             .as_ref()
             .map(|u| u.name.clone().unwrap_or_else(|| u.email.clone()).into())
@@ -1869,14 +1912,19 @@ impl Shell {
             // Spaces + the global Active list share one scroll region.
             .child(
                 div()
-                    .id("sidebar-lists")
+                    .relative()
                     .flex_1()
                     .min_h_0()
-                    .overflow_y_scroll()
-                    .px(px(Theme::SPACE_SM))
-                    .flex()
-                    .flex_col()
-                    .child(spaces_section)
+                    .child(
+                        div()
+                            .id("sidebar-lists")
+                            .size_full()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.sidebar_scroll)
+                            .px(px(Theme::SPACE_SM))
+                            .flex()
+                            .flex_col()
+                            .child(spaces_section)
                     .child(
                         div()
                             .px(px(Theme::SPACE_SM))
@@ -1904,7 +1952,42 @@ impl Shell {
                             .child(SharedString::from("No sessions yet"))
                             .into_any_element()
                     }),
+                    )
+                    .when(lists_fade_top, |el| {
+                        el.child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .right_0()
+                                .h(px(24.0))
+                                .bg(gpui::linear_gradient(
+                                    180.0,
+                                    gpui::linear_color_stop(sidebar_bg, 0.0),
+                                    gpui::linear_color_stop(sidebar_bg.opacity(0.0), 1.0),
+                                )),
+                        )
+                    })
+                    .when(lists_fade_bottom, |el| {
+                        el.child(
+                            div()
+                                .absolute()
+                                .bottom_0()
+                                .left_0()
+                                .right_0()
+                                .h(px(24.0))
+                                .bg(gpui::linear_gradient(
+                                    0.0,
+                                    gpui::linear_color_stop(sidebar_bg, 0.0),
+                                    gpui::linear_color_stop(sidebar_bg.opacity(0.0), 1.0),
+                                )),
+                        )
+                    }),
             )
+            // Update strip (above the user menu; below the lists).
+            .when_some(self.render_update_strip(theme, cx), |el, strip| {
+                el.child(strip)
+            })
             // Inline mutation-failure notice.
             .when_some(self.sidebar_notice.clone(), |el, notice| {
                 el.child(
@@ -1929,6 +2012,151 @@ impl Shell {
             })
             .child(div().p(px(Theme::SPACE_SM)).flex_none().child(user_menu))
             .into_any_element()
+    }
+
+    /// Update strip: shown above the user menu whenever the engine's
+    /// UpdateStatus stream reports a newer release. On a macOS bundle install
+    /// it drives the whole flow — click to download, then click to restart into
+    /// the staged bundle. Elsewhere (managed/source installs) it is advisory
+    /// (`komet update`); click dismisses it for that version.
+    fn render_update_strip(
+        &mut self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let status = self.state.read(cx).update.clone()?;
+        if !status.update_available {
+            return None;
+        }
+        let latest = status.latest_version.clone()?;
+        if self.update_dismissed.as_deref() == Some(latest.as_str()) {
+            return None;
+        }
+        let mac_app = matches!(self.install, komet_update::InstallKind::MacApp { .. });
+
+        let (label, clickable): (SharedString, bool) = if mac_app {
+            match &self.update_flow {
+                UpdateFlow::Idle => (format!("Update available — v{latest}").into(), true),
+                UpdateFlow::Downloading => (format!("Downloading v{latest}…").into(), false),
+                UpdateFlow::Ready(_) => ("Update ready — restart to apply".into(), true),
+                UpdateFlow::Failed(message) => {
+                    (format!("Update failed: {message}").into(), true)
+                }
+            }
+        } else {
+            (
+                format!("Update available — v{latest} · run `komet update`").into(),
+                true,
+            )
+        };
+        let failed = matches!(self.update_flow, UpdateFlow::Failed(_));
+        let tone = if failed { theme.danger } else { theme.accent };
+
+        // Filled chip (no outline): a soft tone wash that brightens on hover —
+        // the sidebar's selection-wash language, tinted accent.
+        let mut strip = div()
+            .id("update-strip")
+            .mx(px(Theme::SPACE_SM))
+            .mb(px(Theme::SPACE_SM))
+            .px(px(Theme::SPACE_SM))
+            .py(px(6.0))
+            .rounded(px(Theme::CONTROL_RADIUS))
+            .bg(tone.opacity(0.12))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .text_size(px(11.0))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(tone)
+            .child(
+                icon(if failed {
+                    icons::DANGER_TRIANGLE
+                } else {
+                    icons::RESTART
+                })
+                .size(px(14.0))
+                .text_color(tone),
+            )
+            .child(div().flex_1().min_w_0().child(label));
+        if clickable {
+            strip = strip
+                .cursor_pointer()
+                .hover(|s| s.bg(tone.opacity(0.2)))
+                .on_click(cx.listener(move |this, _, _, cx| this.on_update_strip_click(cx)));
+        }
+        Some(strip.into_any_element())
+    }
+
+    /// Idle → download; Ready → swap + relaunch; Failed → retry; advisory
+    /// installs → dismiss for this version.
+    fn on_update_strip_click(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.install, komet_update::InstallKind::MacApp { .. }) {
+            self.update_dismissed = self
+                .state
+                .read(cx)
+                .update
+                .as_ref()
+                .and_then(|s| s.latest_version.clone());
+            cx.notify();
+            return;
+        }
+        match std::mem::replace(&mut self.update_flow, UpdateFlow::Idle) {
+            UpdateFlow::Idle | UpdateFlow::Failed(_) => self.begin_update_download(cx),
+            UpdateFlow::Downloading => self.update_flow = UpdateFlow::Downloading,
+            UpdateFlow::Ready(staged) => self.apply_staged_update(staged, cx),
+        }
+    }
+
+    /// Fetch the manifest and stage the new `Komet.app` under the data dir
+    /// (tokio — reqwest); the strip flips to "restart to apply" when done.
+    fn begin_update_download(&mut self, cx: &mut Context<Self>) {
+        let edge_url = self.boot.edge_url.clone();
+        let data_dir = self.data_dir.clone();
+        self.update_flow = UpdateFlow::Downloading;
+        let download = Tokio::spawn(cx, async move {
+            let manifest = komet_update::fetch_latest(&edge_url).await?;
+            komet_update::stage_mac_app(&edge_url, &manifest, &data_dir).await
+        });
+        self.update_task = Some(cx.spawn(async move |this, cx| {
+            let outcome = match download.await {
+                Ok(Ok(staged)) => Ok(staged),
+                Ok(Err(err)) => Err(format!("{err:#}")),
+                Err(join_err) => Err(join_err.to_string()),
+            };
+            this.update(cx, |shell, cx| {
+                shell.update_flow = match outcome {
+                    Ok(staged) => UpdateFlow::Ready(staged),
+                    Err(message) => {
+                        tracing::warn!(%message, "update download failed");
+                        UpdateFlow::Failed(message.into())
+                    }
+                };
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    /// Swap the staged bundle over the installed one, arm the detached
+    /// relauncher, and quit — the relauncher `open`s the new bundle once this
+    /// process (and its engine lock / IPC port) is gone.
+    fn apply_staged_update(&mut self, staged: PathBuf, cx: &mut Context<Self>) {
+        let komet_update::InstallKind::MacApp { bundle } = self.install.clone() else {
+            return;
+        };
+        match komet_update::apply_mac_app(&staged, &bundle) {
+            Ok(()) => {
+                komet_update::relaunch_app_after_exit(&bundle);
+                cx.quit();
+            }
+            Err(err) => {
+                tracing::error!(error = %err, "update apply failed");
+                self.update_flow = UpdateFlow::Failed(format!("{err:#}").into());
+                cx.notify();
+            }
+        }
     }
 
     /// UserMenu (§1.6): name/email trigger row; menu with plan badge, Open

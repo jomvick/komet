@@ -7,9 +7,63 @@
 //! `shell` so it renders straight off `Shell`'s private state.
 
 use super::*;
+use crate::motion::TAB_SLIDE;
 use crate::pickers::{breadcrumbs, browser_rows, parent_path};
+use crate::terminal::panel::{drop_index, reorder_tabs, slide_offset};
 use komet_proto::{ChatIndicator, Device, FolderListing, Space};
 use gpui::FocusHandle;
+
+/// Space-row slot height for drag drop-index math: py(6)×2 + 17px line ≈ 29,
+/// plus the 2px column gap.
+const SPACE_ROW_SLOT: f32 = 31.0;
+
+/// Drag-reorder state for the spaces list; `epoch` keys the 150ms slide
+/// animation restarts (the session-tab idiom, vertical).
+pub(super) struct SpaceDragState {
+    from: usize,
+    over: usize,
+    epoch: usize,
+    prev_over: usize,
+}
+
+/// The dragged-row payload (gpui drag-and-drop).
+struct SpaceDragPayload {
+    from: usize,
+    name: SharedString,
+}
+
+/// The floating row rendered at the cursor while dragging.
+struct SpaceGhost {
+    name: SharedString,
+}
+
+impl Render for SpaceGhost {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::of(cx);
+        div()
+            .w(px(200.0))
+            .h(px(29.0))
+            .px(px(Theme::SPACE_SM))
+            .flex()
+            .items_center()
+            .gap(px(Theme::SPACE_SM))
+            .rounded(px(8.0))
+            .bg(theme.surface_raised)
+            .border_1()
+            .border_color(theme.border_strong)
+            .text_size(px(13.0))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(theme.text)
+            .opacity(0.85)
+            .child(
+                icon(icons::FOLDER)
+                    .size(px(16.0))
+                    .flex_none()
+                    .text_color(theme.text_muted),
+            )
+            .child(div().truncate().child(self.name.clone()))
+    }
+}
 
 /// The add-space palette (a command-K-style surface): device tabs across the
 /// top, a search input that filters the folder list, keyboard-first
@@ -112,6 +166,11 @@ impl Shell {
 
     /// The "Spaces" section: tracked header + add button, then a row per space.
     pub(super) fn render_spaces_section(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        // A drag that ended off-list (no drop event) must not strand the
+        // sibling slide offsets.
+        if self.space_drag.is_some() && !cx.has_active_drag() {
+            self.space_drag = None;
+        }
         let (spaces, selected, device_names, offline_devices, attention): (
             Vec<Space>,
             Option<String>,
@@ -175,6 +234,15 @@ impl Shell {
                 offline_devices,
                 attention,
             )
+        };
+        // Manual (drag) order overrides the synced creation order — device-
+        // local, resolved exactly like the session-tab order.
+        let spaces: Vec<Space> = {
+            let created: Vec<String> = spaces.iter().map(|s| s.id.clone()).collect();
+            let order = super::tabs::resolve_tab_order(&created, &self.settings.space_order);
+            let mut by_id: std::collections::HashMap<String, Space> =
+                spaces.into_iter().map(|s| (s.id.clone(), s)).collect();
+            order.iter().filter_map(|id| by_id.remove(id)).collect()
         };
 
         let header = div()
@@ -251,8 +319,16 @@ impl Shell {
                     .child(SharedString::from("Add space")),
             );
         } else {
-            column = column.child(div().flex().flex_col().gap(px(2.0)).children(
-                spaces.into_iter().map(|space| {
+            let count = spaces.len();
+            let drag = self
+                .space_drag
+                .as_ref()
+                .map(|d| (d.from, d.over, d.epoch, d.prev_over));
+            let rows: Vec<AnyElement> = spaces
+                .into_iter()
+                .enumerate()
+                .map(|(ix, space)| {
+                    let id = space.id.clone();
                     let device_name = device_names
                         .get(&space.device_id)
                         .cloned()
@@ -260,7 +336,8 @@ impl Shell {
                     let host_offline = offline_devices.contains(&space.device_id);
                     let is_selected = selected.as_deref() == Some(space.id.as_str());
                     let attention = attention.get(&space.id).copied();
-                    self.render_space_row(
+                    let row = self.render_space_row(
+                        ix,
                         space,
                         device_name,
                         host_offline,
@@ -268,11 +345,103 @@ impl Shell {
                         attention,
                         theme,
                         cx,
-                    )
-                }),
-            ));
+                    );
+                    // Sliding transform while a sibling is dragged over —
+                    // the session-tab idiom, vertical.
+                    match drag {
+                        Some((from, over, epoch, prev_over)) if ix != from => {
+                            let target = slide_offset(ix, from, over) * SPACE_ROW_SLOT;
+                            let start = slide_offset(ix, from, prev_over) * SPACE_ROW_SLOT;
+                            div()
+                                .relative()
+                                .child(row.with_animation(
+                                    SharedString::from(format!("space-slide-{id}-{epoch}")),
+                                    TAB_SLIDE.animation(),
+                                    move |el, t| el.top(px(motion::lerp(start, target, t))),
+                                ))
+                                .into_any_element()
+                        }
+                        // The dragged row renders as an invisible spacer; the
+                        // cursor ghost represents it.
+                        Some((from, ..)) if ix == from => div()
+                            .h(px(SPACE_ROW_SLOT - 2.0))
+                            .flex_none()
+                            .into_any_element(),
+                        _ => row.into_any_element(),
+                    }
+                })
+                .collect();
+            column = column.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .on_drag_move::<SpaceDragPayload>(cx.listener(
+                        move |this, event: &gpui::DragMoveEvent<SpaceDragPayload>, _, cx| {
+                            let from = event.drag(cx).from;
+                            let rel_y = f32::from(event.event.position.y)
+                                - f32::from(event.bounds.top());
+                            let over = drop_index(rel_y, SPACE_ROW_SLOT, count);
+                            this.update_space_drag_over(from, over, cx);
+                        },
+                    ))
+                    .on_drop::<SpaceDragPayload>(cx.listener(
+                        move |this, payload: &SpaceDragPayload, _, cx| {
+                            let to = this
+                                .space_drag
+                                .as_ref()
+                                .map(|d| d.over)
+                                .unwrap_or(payload.from);
+                            this.commit_space_reorder(payload.from, to, cx);
+                        },
+                    ))
+                    .children(rows),
+            );
         }
         column.into_any_element()
+    }
+
+    /// Track the drop slot while a space row is dragged over the list (150ms
+    /// sibling slides restart per committed `over` change).
+    fn update_space_drag_over(&mut self, from: usize, over: usize, cx: &mut Context<Self>) {
+        match &mut self.space_drag {
+            Some(drag) if drag.from == from => {
+                if drag.over != over {
+                    drag.prev_over = drag.over;
+                    drag.over = over;
+                    drag.epoch += 1;
+                    cx.notify();
+                }
+            }
+            _ => {
+                self.space_drag = Some(SpaceDragState {
+                    from,
+                    over,
+                    epoch: 0,
+                    prev_over: from,
+                });
+                cx.notify();
+            }
+        }
+    }
+
+    /// Commit a drag: persist the new visual order (device-local).
+    fn commit_space_reorder(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
+        let created: Vec<String> = self
+            .state
+            .read(cx)
+            .spaces
+            .iter()
+            .map(|s| s.id.clone())
+            .collect();
+        let mut order = super::tabs::resolve_tab_order(&created, &self.settings.space_order);
+        if from < order.len() {
+            reorder_tabs(&mut order, from, to);
+            self.settings.space_order = order;
+            self.schedule_save(cx);
+        }
+        self.space_drag = None;
+        cx.notify();
     }
 
     /// One space row: folder icon + folder name, device name subline.
@@ -280,6 +449,7 @@ impl Shell {
     #[allow(clippy::too_many_arguments)]
     fn render_space_row(
         &self,
+        ix: usize,
         space: Space,
         device_name: String,
         host_offline: bool,
@@ -287,7 +457,7 @@ impl Shell {
         attention: Option<ChatIndicator>,
         theme: &Theme,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
+    ) -> gpui::Stateful<gpui::Div> {
         let id = space.id.clone();
         let name: SharedString = space.display_name().to_string().into();
         let fade_key = format!("space-row-{id}");
@@ -328,6 +498,17 @@ impl Shell {
                     this.space_menu = Some((menu_id.clone(), event.position));
                     cx.notify();
                 }),
+            )
+            .on_drag(
+                SpaceDragPayload {
+                    from: ix,
+                    name: name.clone(),
+                },
+                |payload, _point, _, cx| {
+                    let name = payload.name.clone();
+                    cx.stop_propagation();
+                    cx.new(|_| SpaceGhost { name })
+                },
             )
             // Status dot LEADS the row (like session rows) so its position is
             // stable — appearing/disappearing at the right edge made the row
@@ -375,7 +556,6 @@ impl Shell {
                         format!("@ {device_name}")
                     })),
             )
-            .into_any_element()
     }
 
     /// The global "Sessions" list: every session across all spaces (idle
