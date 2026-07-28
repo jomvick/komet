@@ -301,6 +301,12 @@ impl Terminals {
         Ok(())
     }
 
+    /// Any live PTY (the reaper prunes exited ones) — restarts kill shells, so
+    /// the auto-updater waits for none.
+    pub fn any_open(&self) -> bool {
+        !lock(&self.inner.sessions).is_empty()
+    }
+
     /// Engine shutdown: kill every live shell.
     pub fn shutdown(&self) {
         let sessions: Vec<_> = lock(&self.inner.sessions).drain().map(|(_, s)| s).collect();

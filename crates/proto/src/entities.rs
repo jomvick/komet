@@ -19,6 +19,10 @@ pub struct Device {
     /// "Added …" fragment). Optional so pre-existing docs stay readable.
     #[serde(default)]
     pub created_at: Option<DateTime<Utc>>,
+    /// App version the device's engine last booted with — fleet staleness at a
+    /// glance (Devices page). Optional so pre-existing docs stay readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
 }
 
 /// A synced (device, folder) pair — the unit of organization in the sidebar.

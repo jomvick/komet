@@ -921,6 +921,7 @@ fn a_space_shows_its_host_and_flags_a_lapsed_one() {
         platform: "linux".into(),
         last_seen_at: Some(Utc::now() - chrono::Duration::minutes(5)),
         created_at: None,
+        version: None,
     }]));
     let screen = joined(&snapshot(&mut app, 100, 24));
     assert!(
@@ -935,6 +936,7 @@ fn a_space_shows_its_host_and_flags_a_lapsed_one() {
         platform: "linux".into(),
         last_seen_at: Some(Utc::now()),
         created_at: None,
+        version: None,
     }]));
     let screen = joined(&snapshot(&mut app, 100, 24));
     assert!(screen.contains("devbox"), "{screen}");

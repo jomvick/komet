@@ -254,7 +254,8 @@ impl Render for DevicesPage {
                         })
                         .when(!online, |el| el.bg(crate::theme::white_alpha(0.22))),
                 );
-                // One quiet meta line: platform · (offline: last seen) · id chip.
+                // One quiet meta line: platform · version · (offline: last
+                // seen) · id chip.
                 let mut meta: Vec<AnyElement> = vec![
                     div()
                         .child(SharedString::from(
@@ -262,6 +263,13 @@ impl Render for DevicesPage {
                         ))
                         .into_any_element(),
                 ];
+                if let Some(version) = device.version.as_deref().filter(|v| !v.is_empty()) {
+                    meta.push(
+                        div()
+                            .child(SharedString::from(format!("v{version}")))
+                            .into_any_element(),
+                    );
+                }
                 if !online {
                     meta.push(
                         div()

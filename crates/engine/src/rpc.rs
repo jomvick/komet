@@ -324,6 +324,7 @@ pub struct EngineRpc {
     agent_accounts: AgentAccounts,
     auth: Option<Auth>,
     links: Option<std::sync::Arc<LinkCache>>,
+    updater: Option<komet_update::Updater>,
 }
 
 impl EngineRpc {
@@ -351,6 +352,7 @@ impl EngineRpc {
             agent_accounts,
             auth: None,
             links: None,
+            updater: None,
         }
     }
 
@@ -366,10 +368,22 @@ impl EngineRpc {
         self
     }
 
+    /// Attach the release checker (UpdateStatus stream + ApplyUpdate).
+    pub fn with_updater(mut self, updater: komet_update::Updater) -> Self {
+        self.updater = Some(updater);
+        self
+    }
+
     fn auth(&self) -> Result<&Auth, RpcError> {
         self.auth
             .as_ref()
             .ok_or_else(|| RpcError::Failed("auth unavailable".into()))
+    }
+
+    fn updater(&self) -> Result<&komet_update::Updater, RpcError> {
+        self.updater
+            .as_ref()
+            .ok_or_else(|| RpcError::Failed("updates unavailable".into()))
     }
 
     /// Forward a device-addressed call over the target device's relay. On transport
@@ -569,6 +583,9 @@ fn forwardable(method: &str) -> bool {
             | methods::UPLOAD_CHUNK
             | methods::UPLOAD_COMMIT
             | methods::READ_ATTACHMENT_CHUNK
+            // Updates report/apply on the device whose binary they concern.
+            | methods::UPDATE_STATUS
+            | methods::APPLY_UPDATE
     )
 }
 
@@ -576,7 +593,10 @@ fn forwardable(method: &str) -> bool {
 fn is_stream_method(method: &str) -> bool {
     matches!(
         method,
-        methods::WATCH_DOC_MESSAGES | methods::SUBSCRIBE_TERMINAL | methods::WATCH_CHECKOUT_DIFFS
+        methods::WATCH_DOC_MESSAGES
+            | methods::SUBSCRIBE_TERMINAL
+            | methods::WATCH_CHECKOUT_DIFFS
+            | methods::UPDATE_STATUS
     )
 }
 
@@ -763,6 +783,17 @@ impl RpcService for EngineRpc {
             }
             methods::LOCAL_DEVICE => {
                 RpcReply::value(&serde_json::json!({ "deviceId": self.doc_host.device_id() }))
+            }
+            methods::UPDATE_STATUS => {
+                Ok(RpcReply::Stream(watch_stream(self.updater()?.watch())))
+            }
+            methods::APPLY_UPDATE => {
+                let version = self
+                    .updater()?
+                    .apply()
+                    .await
+                    .map_err(|e| RpcError::Failed(format!("{e:#}")))?;
+                RpcReply::value(&serde_json::json!({ "ok": true, "version": version }))
             }
             methods::MUTATE => {
                 let p: MutateParams = parse_params(params)?;

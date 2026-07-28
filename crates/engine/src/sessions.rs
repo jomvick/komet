@@ -165,6 +165,17 @@ impl SessionsEngine {
         lock(&self.inner.statuses).get(chat_id).cloned()
     }
 
+    /// Any run currently working or blocked on input — the auto-updater's
+    /// "don't restart from under a session" gate.
+    pub fn any_active(&self) -> bool {
+        lock(&self.inner.statuses).values().any(|s| {
+            matches!(
+                s.status,
+                komet_proto::SessionStatus::Working | komet_proto::SessionStatus::AwaitingInput
+            )
+        })
+    }
+
     /// The last request dispatched for a chat (steer→new-turn fallback).
     pub fn last_request(&self, chat_id: &str) -> Option<RunRequest> {
         lock(&self.inner.last_requests).get(chat_id).cloned()

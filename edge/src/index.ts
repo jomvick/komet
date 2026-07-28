@@ -99,15 +99,16 @@ export default {
       if (key.length === 0 || key.includes("..")) return json({ error: "bad request" }, 400);
       const object = await env.RELEASES.get(key);
       if (!object) return json({ error: "not_found" }, 404);
+      // latest.txt / manifest.json flip on release; artifacts are immutable by name.
+      const mutable = key.endsWith(".txt") || key.endsWith(".json");
       const headers = new Headers({
         "content-type": key.endsWith(".txt")
           ? "text/plain; charset=utf-8"
-          : "application/octet-stream",
+          : key.endsWith(".json")
+            ? "application/json"
+            : "application/octet-stream",
         "content-length": String(object.size),
-        // latest.txt flips on release; artifacts are immutable by name.
-        "cache-control": key.endsWith(".txt")
-          ? "public, max-age=60"
-          : "public, max-age=86400, immutable",
+        "cache-control": mutable ? "public, max-age=60" : "public, max-age=86400, immutable",
         etag: object.httpEtag
       });
       return new Response(request.method === "HEAD" ? null : object.body, { headers });

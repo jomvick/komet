@@ -65,7 +65,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: macos-${{ runner.arch }}
-          path: target/package/*.dmg
+          path: |
+            target/package/*.dmg
+            target/package/*.tar.gz
           if-no-files-found: error
 
   publish:
@@ -100,6 +102,18 @@ jobs:
             npx wrangler@4 r2 object put "komet-native-releases/$(basename "$f")" \
               --file "$f" --remote
           done
+          # manifest.json: version + per-artifact sha256 — the auto-updater
+          # (crates/update) verifies downloads against it. Published before
+          # latest.txt so no client ever sees a version without its checksums.
+          manifest=$(jq -n --arg version "$VERSION" '{version: $version, files: {}}')
+          for f in dist/*; do
+            sha=$(sha256sum "$f" | cut -d' ' -f1)
+            manifest=$(jq --arg name "$(basename "$f")" --arg sha "$sha" \
+              '.files[$name] = {sha256: $sha}' <<<"$manifest")
+          done
+          printf '%s' "$manifest" > manifest.json
+          npx wrangler@4 r2 object put komet-native-releases/manifest.json \
+            --file manifest.json --remote
           printf '%s' "$VERSION" > latest.txt
           npx wrangler@4 r2 object put komet-native-releases/latest.txt \
             --file latest.txt --remote

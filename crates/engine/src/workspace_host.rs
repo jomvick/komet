@@ -163,6 +163,9 @@ impl WorkspaceHost {
             // First registration stamps `createdAt`; restarts keep the original
             // (the Devices page "Added …" fragment).
             created_at: existing.and_then(|d| d.created_at).or(Some(now)),
+            // Every boot restamps the running binary's version (fleet staleness
+            // on the Devices page; workspace version — same for every crate).
+            version: Some(env!("CARGO_PKG_VERSION").to_string()),
         })?;
 
         let (changed_tx, changed_rx) = watch::channel(0u64);

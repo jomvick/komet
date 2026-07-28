@@ -368,6 +368,8 @@ pub struct AppState {
     /// This engine's device id (best-effort `LocalDevice` probe; `None` until
     /// the engine serves it — views degrade gracefully).
     pub local_device_id: Option<String>,
+    /// Latest `UpdateStatus` frame — drives the sidebar update strip.
+    pub update: Option<komet_update::UpdateStatus>,
     /// Data directory (`ui-settings.json`, `composer-defaults.json`); set at
     /// bootstrap so child views can persist small preference files.
     pub data_dir: Option<PathBuf>,
@@ -396,6 +398,7 @@ impl AppState {
             transcript: Vec::new(),
             echoes: HashMap::new(),
             local_device_id: None,
+            update: None,
             data_dir: None,
             engine: None,
             watch_tasks: Vec::new(),
@@ -452,6 +455,10 @@ impl AppState {
 
     pub fn apply_devices(&mut self, devices: Vec<Device>) {
         self.devices = devices;
+    }
+
+    pub fn apply_update(&mut self, status: komet_update::UpdateStatus) {
+        self.update = Some(status);
     }
 
     pub fn apply_auth(&mut self, auth: AuthState) {
@@ -675,6 +682,12 @@ impl AppState {
                 handle.clone(),
                 methods::AUTH_STATUS,
                 AppState::apply_auth_value,
+            ),
+            spawn_watch(
+                cx,
+                handle.clone(),
+                methods::UPDATE_STATUS,
+                AppState::apply_update,
             ),
             spawn_local_device_probe(cx, handle.clone()),
         ];

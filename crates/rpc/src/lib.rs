@@ -90,6 +90,12 @@ pub mod methods {
     pub const UPLOAD_CHUNK: &str = "UploadChunk";
     pub const UPLOAD_COMMIT: &str = "UploadCommit";
     pub const READ_ATTACHMENT_CHUNK: &str = "ReadAttachmentChunk";
+    // Updates (ControlRpc, relay-forwardable — a device reports/applies its own
+    // binary's update). Stream: current UpdateStatus, then every change.
+    pub const UPDATE_STATUS: &str = "UpdateStatus";
+    /// Download + apply the newest release on the target device (symlink-managed
+    /// installs; the service restart is scheduled after the reply flushes).
+    pub const APPLY_UPDATE: &str = "ApplyUpdate";
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -4,6 +4,7 @@
 
 mod auth_cli;
 mod daemon;
+mod update_cli;
 
 use clap::{Parser, Subcommand};
 
@@ -28,6 +29,12 @@ enum Command {
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,
+    },
+    /// Check for a newer release and apply it (download → verify → swap →
+    /// service restart). `--check` only reports (exits 1 when one is available).
+    Update {
+        #[arg(long)]
+        check: bool,
     },
     /// Terminal viewport over the same engine — attaches to a running app or
     /// daemon, or starts one, and detaches (leaving work running) when it exits.
@@ -123,6 +130,10 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Status) => {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(auth_cli::status(engine_config_from_env()))
+        }
+        Some(Command::Update { check }) => {
+            let runtime = tokio::runtime::Runtime::new()?;
+            runtime.block_on(update_cli::update(&edge_url_from_env(), check))
         }
         Some(Command::Daemon { command }) => match command {
             DaemonCommand::Install => daemon::install(&engine_config_from_env().data_dir),

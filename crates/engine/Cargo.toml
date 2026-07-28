@@ -11,6 +11,7 @@ komet-doc.workspace = true
 komet-sync.workspace = true
 komet-harness.workspace = true
 komet-rpc.workspace = true
+komet-update.workspace = true
 loro.workspace = true
 tokio.workspace = true
 futures.workspace = true

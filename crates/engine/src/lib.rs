@@ -108,6 +108,9 @@ pub struct EngineCore {
     auth: std::sync::Mutex<Option<Auth>>,
     /// Peer link cache for `targetDeviceId` routing (attached when edge+auth are ready).
     links: std::sync::Mutex<Option<Arc<komet_rpc::LinkCache>>>,
+    /// Release checker (attached by [`Engine::assemble_runtime`]) — the
+    /// UpdateStatus stream + ApplyUpdate.
+    updater: std::sync::Mutex<Option<komet_update::Updater>>,
     /// Exclusive data-dir lock — held for the engine's lifetime (single-instance).
     _instance_lock: InstanceLock,
 }
@@ -204,6 +207,7 @@ impl EngineCore {
             device_id,
             auth: std::sync::Mutex::new(None),
             links: std::sync::Mutex::new(None),
+            updater: std::sync::Mutex::new(None),
             _instance_lock: lock,
         })
     }
@@ -245,6 +249,21 @@ impl EngineCore {
 
     pub fn links(&self) -> Option<Arc<komet_rpc::LinkCache>> {
         self.links
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Attach the release checker (before building the RPC service).
+    pub fn set_updater(&self, updater: komet_update::Updater) {
+        *self
+            .updater
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(updater);
+    }
+
+    pub fn updater(&self) -> Option<komet_update::Updater> {
+        self.updater
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
@@ -301,6 +320,9 @@ impl EngineCore {
         .with_auth(self.auth());
         if let Some(links) = self.links() {
             rpc = rpc.with_links(links);
+        }
+        if let Some(updater) = self.updater() {
+            rpc = rpc.with_updater(updater);
         }
         Arc::new(rpc)
     }
@@ -403,6 +425,18 @@ impl Engine {
             &user_id,
         )?;
         core.set_auth(auth.clone());
+        // Release checker: polls {edge}/releases on a 6h cadence; headless
+        // installs with KOMET_AUTO_UPDATE=1 apply + restart themselves — gated
+        // on quiescence so a restart never lands under a live run or open PTY.
+        let quiescent: komet_update::QuiescentCheck = {
+            let sessions = core.sessions.clone();
+            let terminals = core.terminals.clone();
+            Arc::new(move || !sessions.any_active() && !terminals.any_open())
+        };
+        core.set_updater(komet_update::Updater::spawn(
+            config.edge_url.clone(),
+            Some(quiescent),
+        ));
         tracing::info!(device_id = %core.device_id, "engine core assembled");
 
         let host_relay = edge.as_ref().map(|edge| {
@@ -450,11 +484,29 @@ impl Engine {
         // transport (see `serve_ipc`).
         let server = serve_ipc(config.ipc_port, runtime.core().rpc_service()).await?;
 
-        tokio::signal::ctrl_c().await?;
+        shutdown_signal().await?;
         tracing::info!("shutting down");
         server.abort();
         runtime.shutdown().await;
         Ok(())
+    }
+}
+
+/// Ctrl-C or SIGTERM. systemd/launchd stop (and the auto-updater's service
+/// restart) deliver SIGTERM — without catching it the daemon dies mid-write
+/// and every stop takes the crash-recovery path instead of the graceful drain.
+async fn shutdown_signal() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => result,
+            _ = sigterm.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await
     }
 }
 

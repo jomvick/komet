@@ -105,6 +105,7 @@ impl WorkspaceDoc {
         row.insert("platform", device.platform.as_str())?;
         set_opt_ms(&row, "lastSeenAt", device.last_seen_at)?;
         set_opt_ms(&row, "createdAt", device.created_at)?;
+        set_opt_str(&row, "version", device.version.as_deref())?;
         self.doc.commit();
         Ok(())
     }
@@ -553,6 +554,8 @@ struct RawDevice {
     last_seen_at: Option<i64>,
     #[serde(default)]
     created_at: Option<i64>,
+    #[serde(default)]
+    version: Option<String>,
 }
 
 impl From<RawDevice> for Device {
@@ -563,6 +566,7 @@ impl From<RawDevice> for Device {
             platform: raw.platform,
             last_seen_at: raw.last_seen_at.map(dt),
             created_at: raw.created_at.map(dt),
+            version: raw.version,
         }
     }
 }
@@ -695,6 +699,7 @@ mod tests {
             platform: "linux".into(),
             last_seen_at: Some(ts(1_000)),
             created_at: Some(ts(500)),
+            version: Some("0.1.0".into()),
         }
     }
 
