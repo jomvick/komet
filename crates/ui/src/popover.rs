@@ -178,14 +178,16 @@ fn pinned_layer(layer: AnyElement) -> AnyElement {
 /// Wrap popover content in a floating anchored layer attached to the trigger:
 /// the caller `.child(anchored_menu(...))`s this from the trigger element while
 /// open. Plays `menu-in` (0.14s fade + 2px drop). Dismissal is the caller's
-/// `.on_mouse_down_out` on the content.
+/// `.on_mouse_down_out` on the content. The layer `.occlude()`s: hitboxes are
+/// paint-order only in gpui, so without it clicks on menu rows would ALSO fire
+/// whatever clickable sits under the floating layer.
 pub fn anchored_menu(id: impl Into<ElementId>, content: AnyElement) -> AnyElement {
     pinned_layer(
         gpui::deferred(
             gpui::anchored()
                 .anchor(Anchor::TopLeft)
                 .snap_to_window_with_margin(px(8.0))
-                .child(motion::menu_in(id, div().pt(px(6.0)).child(content))),
+                .child(motion::menu_in(id, div().occlude().pt(px(6.0)).child(content))),
         )
         .priority(1)
         .into_any_element(),
@@ -201,7 +203,7 @@ pub fn anchored_menu_above(id: impl Into<ElementId>, content: AnyElement) -> Any
             gpui::anchored()
                 .anchor(Anchor::BottomLeft)
                 .snap_to_window_with_margin(px(8.0))
-                .child(motion::menu_in(id, div().pb(px(6.0)).child(content))),
+                .child(motion::menu_in(id, div().occlude().pb(px(6.0)).child(content))),
         )
         .priority(1)
         .into_any_element(),
@@ -222,7 +224,7 @@ pub fn anchored_menu_above_end(id: impl Into<ElementId>, content: AnyElement) ->
                 gpui::anchored()
                     .anchor(Anchor::BottomRight)
                     .snap_to_window_with_margin(px(8.0))
-                    .child(motion::menu_in(id, div().pb(px(6.0)).child(content))),
+                    .child(motion::menu_in(id, div().occlude().pb(px(6.0)).child(content))),
             )
             .priority(1)
             .into_any_element(),
@@ -230,7 +232,8 @@ pub fn anchored_menu_above_end(id: impl Into<ElementId>, content: AnyElement) ->
         .into_any_element()
 }
 
-/// A floating menu at an explicit window position (context menus).
+/// A floating menu at an explicit window position (context menus). Occludes
+/// like [`anchored_menu`] so row clicks never reach elements underneath.
 pub fn menu_at(
     id: impl Into<ElementId>,
     position: Point<Pixels>,
@@ -241,7 +244,7 @@ pub fn menu_at(
             .position(position)
             .anchor(Anchor::TopLeft)
             .snap_to_window_with_margin(px(8.0))
-            .child(motion::menu_in(id, div().child(content))),
+            .child(motion::menu_in(id, div().occlude().child(content))),
     )
     .priority(1)
     .into_any_element()
