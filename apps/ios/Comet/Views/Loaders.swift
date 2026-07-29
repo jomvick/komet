@@ -138,7 +138,9 @@ extension ChatIndicator {
 }
 
 /// The 6pt leading dot (leads so its position is stable); Working swaps in the
-/// mini spinner.
+/// mini spinner. Exactly 6 wide, like the desktop rail (shell.rs
+/// `render_chat_row`) — the session row's lower lines indent by rail + gap, so
+/// a wider rail here would push them out of line with the row's first line.
 struct StatusRail: View {
     let indicator: ChatIndicator
 
@@ -152,8 +154,10 @@ struct StatusRail: View {
                     .frame(width: 6, height: 6)
             }
         }
-        .frame(width: 8, height: 10)
+        .frame(width: StatusRail.width, height: 10)
     }
+
+    static let width: CGFloat = 6
 }
 
 /// Harness brand mark (pickers.rs harness_brand_icon) — the desktop's actual
@@ -163,10 +167,13 @@ struct HarnessBadge: View {
     let harness: String
     var size: CGFloat = 14
     var dimmed = false
+    /// Color for marks that carry no brand color of their own (codex, cursor).
+    /// Claude keeps its orange regardless.
+    var neutral: Color = Theme.text
 
     var body: some View {
         BrandMarkShape(mark: BrandMark.forHarness(harness))
-            .fill(BrandMark.tint(for: harness).opacity(dimmed ? 0.6 : 0.9))
+            .fill((BrandMark.brandTint(for: harness) ?? neutral).opacity(dimmed ? 0.6 : 0.9))
             .frame(width: size, height: size)
     }
 }

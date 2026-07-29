@@ -38,7 +38,15 @@ enum BrandMark {
 
     /// The mark's tint on a monochrome surface (icons.rs claude_brand).
     static func tint(for harness: String) -> Color {
-        harness == "codex" || harness == "cursor" ? Theme.text : Theme.claudeBrand
+        brandTint(for: harness) ?? Theme.text
+    }
+
+    /// The mark's OWN color, or nil when it has none and takes the caller's
+    /// (pickers.rs `harness_brand_icon` returns `Option<Hsla>` for exactly this
+    /// reason — the session row paints untinted marks in its subline color,
+    /// while pickers paint them in `text`).
+    static func brandTint(for harness: String) -> Color? {
+        harness == "codex" || harness == "cursor" ? nil : Theme.claudeBrand
     }
 }
 

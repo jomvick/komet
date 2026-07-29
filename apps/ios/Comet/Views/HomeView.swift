@@ -212,52 +212,90 @@ struct SpaceRow: View {
     }
 }
 
+/// The desktop session row (shell.rs `render_chat_row`), line for line: the
+/// status rail leads a muted context line carrying the space name and the
+/// relative time; the title sits on its own line below; harness mark and branch
+/// close it out. Lines 2 and 3 indent by rail + gap so they start exactly under
+/// the context line rather than beside the rail.
+///
+/// The one addition the phone needs: the desktop row names only the space
+/// because its sidebar sits on the machine running the work. Here the Sessions
+/// list interleaves every device, and a session whose host has gone offline
+/// can't be driven at all — so the context line reads "space · device".
 struct ChatRow: View {
     @Environment(AppModel.self) private var model
     let chat: Chat
     var showLocation: Bool
 
+    /// Rail (6) + gap (8) — see `render_chat_row`'s `pl(px(14.0))`.
+    private static let indent: CGFloat = StatusRail.width + 8
+
+    private var subline: Color { Theme.textMuted.opacity(0.5) }
+
     var body: some View {
         let indicator = model.indicator(for: chat)
-        HStack(alignment: .top, spacing: 8) {
-            StatusRail(indicator: indicator)
-                .padding(.top, 4)
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(alignment: .firstTextBaseline, spacing: 8) {
-                    Text(chat.displayTitle)
-                        .font(Theme.sans(13))
-                        .foregroundStyle(Theme.text)
-                        .lineLimit(1)
-                    Spacer(minLength: 4)
-                    Text(relativeTime(chat.lastMessageAt ?? chat.createdAt))
-                        .font(Theme.sans(11))
-                        .foregroundStyle(Theme.textMuted.opacity(0.5))
-                }
+        VStack(alignment: .leading, spacing: 2) {
+            // Line 1: status rail, space · device, time-ago.
+            HStack(spacing: 8) {
+                StatusRail(indicator: indicator)
                 if showLocation {
                     Text(location)
                         .font(Theme.sans(11))
-                        .foregroundStyle(Theme.textMuted.opacity(0.55))
+                        .foregroundStyle(subline)
                         .lineLimit(1)
+                        .truncationMode(.tail)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                } else {
+                    Spacer(minLength: 4)
                 }
+                Text(relativeTime(chat.lastMessageAt ?? chat.createdAt))
+                    .font(Theme.sans(11))
+                    .foregroundStyle(subline)
+                    .fixedSize()
             }
+
+            // Line 2: the session title.
+            Text(chat.displayTitle)
+                .font(Theme.sans(13))
+                .foregroundStyle(Theme.text)
+                .lineLimit(1)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.leading, Self.indent)
+
+            // Line 3: harness brand mark, then the branch when the engine
+            // stamped one.
+            HStack(spacing: 4) {
+                if let harness = chat.config?.harness {
+                    HarnessBadge(harness: harness, size: 11, neutral: subline)
+                }
+                if let branch = chat.branch?.trimmingCharacters(in: .whitespaces), !branch.isEmpty {
+                    LineIconView(.gitBranch, size: 11, color: subline)
+                    Text(branch)
+                        .font(Theme.sans(11))
+                        .foregroundStyle(subline)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.leading, Self.indent)
         }
         .padding(.horizontal, 8)
-        .padding(.vertical, 5)
+        .padding(.vertical, 6)
         .contentShape(RoundedRectangle(cornerRadius: 8))
     }
 
-    /// "folder · [branch ·] device", with offline marker (spaces.rs:414).
+    /// "space · device", with offline marker. The space name (not the cwd
+    /// basename) is what the desktop row shows — they differ once a space has
+    /// been renamed, or when the session runs in a worktree off to the side.
     private var location: String {
-        var parts: [String] = []
-        if let cwd = chat.cwd {
-            parts.append((cwd as NSString).lastPathComponent)
-        }
-        if let branch = chat.branch, !branch.isEmpty {
-            parts.append(branch)
-        }
+        let space = model.space(for: chat)?.displayName
+            ?? chat.cwd.map { ($0 as NSString).lastPathComponent }
+            ?? "?"
         let name = model.deviceName(chat.deviceId)
-        parts.append(model.deviceOnline(chat.deviceId) ? name : "\(name) (offline)")
-        return parts.joined(separator: " · ")
+        return model.deviceOnline(chat.deviceId)
+            ? "\(space) · \(name)"
+            : "\(space) · \(name) (offline)"
     }
 }
 
