@@ -16,6 +16,8 @@ pub mod app_menus;
 pub mod attachments;
 pub mod changes;
 pub mod composer;
+pub mod edge_fade;
+pub mod frost;
 pub mod icons;
 pub mod loaders;
 pub mod markdown;
@@ -195,20 +197,29 @@ fn open_main_window(state: gpui::Entity<state::AppState>, boot: EngineBootConfig
             // macOS: frameless-inset chrome like the original Electron app
             // (`titleBarStyle: "hiddenInset"`, traffic lights at 14,15 —
             // feature-inventory §1.1). No title text — the strip is
-            // custom-drawn (zed sets `title: None` the same way). The
-            // original is deliberately OPAQUE (no vibrancy), so
-            // window_background stays default. On Linux/Windows
-            // `appears_transparent` hides the system titlebar for our
-            // custom-drawn chrome; harmless where unsupported.
+            // custom-drawn (zed sets `title: None` the same way). On
+            // Linux/Windows `appears_transparent` hides the system titlebar
+            // for our custom-drawn chrome; harmless where unsupported.
             titlebar: Some(TitlebarOptions {
                 title: None,
                 appears_transparent: true,
-                traffic_light_position: Some(gpui::point(px(14.), px(15.))),
+                // Centered on the titlebar's content line (40px bar, content
+                // shifted 4px down, lights ~12px tall → center 22).
+                traffic_light_position: Some(gpui::point(px(14.), px(14.))),
             }),
             // Our own titlebar strip drags the window (WindowControlArea::
             // Drag + start_window_move) — mark the content view app-owned
             // so AppKit neither dead-zones the strip nor delays clicks.
             app_owns_titlebar_drag: true,
+            // Frosted shell (macOS): blur the desktop behind the window; the
+            // shell paints its frost surface translucent so the sidebar reads
+            // as glass (shell.rs root). Elsewhere blur support is compositor
+            // roulette — stay opaque.
+            window_background: if cfg!(target_os = "macos") {
+                gpui::WindowBackgroundAppearance::Blurred
+            } else {
+                gpui::WindowBackgroundAppearance::Opaque
+            },
             app_id: Some("komet".into()),
             ..Default::default()
         },

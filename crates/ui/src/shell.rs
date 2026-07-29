@@ -324,9 +324,15 @@ pub fn resort_offsets(
 /// Estimated sidebar row height for the resort diff (title line 17px inside
 /// 6px vertical padding + the location subline's 14px line + 2px gap — Active
 /// rows always carry the folder · device subline).
-const CHAT_ROW_WITH_LOCATION_HEIGHT: f32 = 45.0;
+/// Session row height (FLIP estimate): space line + title + meta line
+/// (harness mark, plus branch for worktrees).
+const CHAT_ROW_HEIGHT: f32 = 61.0;
 /// Flex gap between sidebar list items.
 const SIDEBAR_LIST_GAP: f32 = 2.0;
+
+/// Ramp height of the glass sidebar's scroll-edge fade (the gpui
+/// [`gpui::EdgeFade`] scope — per-primitive, so text fades per glyph).
+const SIDEBAR_GLASS_FADE_BAND: f32 = 32.0;
 
 /// Drag marker for the sidebar resize handle.
 struct SidebarResize;
@@ -508,11 +514,6 @@ pub struct Shell {
     fullscreen: Option<bool>,
     /// 200ms ease-out tween of the cluster start on fullscreen toggles.
     titlebar_tween: Option<WidthTween>,
-    /// 200ms ease-out tween of the header's left padding on sidebar toggles —
-    /// komet __root.tsx `transition-[padding-left] duration-200 ease-out` with
-    /// `paddingLeft: headerInset`: the title GLIDES to its new x, one element,
-    /// no remount (route changes swap the keyed header instantly instead).
-    header_inset_tween: Option<WidthTween>,
     /// Armed by mouse-down on a titlebar strip; the next mouse-move hands the
     /// drag to the compositor (zed's platform-titlebar pattern).
     titlebar_should_move: bool,
@@ -673,7 +674,6 @@ impl Shell {
             terminal_tween: None,
             fullscreen: None,
             titlebar_tween: None,
-            header_inset_tween: None,
             titlebar_should_move: false,
             terminal_tween_task: None,
             terminal_drag_anchor: None,
@@ -784,7 +784,7 @@ impl Shell {
             }
             self.right_tween = None;
             self.terminal_tween = None;
-            let panels = self.panels.get(&self.active_chat);
+            let panels = self.panels.get(&self.panel_key(cx));
             if let Some(panel) = self.terminal.clone() {
                 panel.update(cx, |panel, cx| panel.set_open(panels.terminal_open, cx));
             }
@@ -834,13 +834,30 @@ impl Shell {
     /// The current chat's changes-pane flag (per-session, in-memory), gated on
     /// the space having git at all: a stale per-chat open flag must not reopen
     /// the pane after switching into a non-git space.
+    /// The per-session panel key. The new-chat canvas (no selection) keys per
+    /// SPACE — one shared "" key made a canvas toggle read as global state
+    /// (user report).
+    fn panel_key(&self, cx: &App) -> String {
+        if self.active_chat.is_empty() {
+            let space = self
+                .state
+                .read(cx)
+                .selected_space
+                .clone()
+                .unwrap_or_default();
+            format!("space-canvas:{space}")
+        } else {
+            self.active_chat.clone()
+        }
+    }
+
     fn right_pane_open(&self, cx: &App) -> bool {
-        self.panels.get(&self.active_chat).changes_open && self.space_git_detected(cx)
+        self.panels.get(&self.panel_key(cx)).changes_open && self.space_git_detected(cx)
     }
 
     /// The current chat's terminal flag (per-session, in-memory).
-    fn terminal_open(&self) -> bool {
-        self.panels.get(&self.active_chat).terminal_open
+    fn terminal_open(&self, cx: &App) -> bool {
+        self.panels.get(&self.panel_key(cx)).terminal_open
     }
 
     fn right_target(&self, cx: &App) -> f32 {
@@ -851,32 +868,10 @@ impl Shell {
         }
     }
 
-    /// Header content left padding (komet __root.tsx `headerInset`): expanded
-    /// it hugs the container pad; collapsed it clears the persistent
-    /// window-control cluster (which never moves) plus the header's own 10px
-    /// child gap, so the title lands exactly where the old clearance spacer
-    /// put it.
-    fn header_inset_for(&self, fullscreen: bool) -> f32 {
-        let pad = Theme::SPACE_LG;
-        if self.settings.sidebar_collapsed {
-            pad + cluster_clearance(cfg!(target_os = "macos"), fullscreen, pad) + 10.0
-        } else {
-            pad
-        }
-    }
-
-    fn header_inset(&self) -> f32 {
-        self.header_inset_for(self.fullscreen.unwrap_or(false))
-    }
-
     fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
         let from = self.sidebar_target();
-        let inset_from = self.header_inset();
         self.settings.sidebar_collapsed = !self.settings.sidebar_collapsed;
         self.sidebar_tween = Some(WidthTween::new(from, self.sidebar_target()));
-        // The title glides with the same 200ms ease-out as the sidebar width
-        // (komet __root.tsx `transition-[padding-left]`).
-        self.header_inset_tween = Some(WidthTween::new(inset_from, self.header_inset()));
         self.schedule_save(cx);
         cx.notify();
     }
@@ -887,7 +882,7 @@ impl Shell {
             return;
         }
         let from = self.right_target(cx);
-        let key = self.active_chat.clone();
+        let key = self.panel_key(cx);
         let open = self.panels.toggle_changes(&key);
         self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
         if open {
@@ -917,8 +912,8 @@ impl Shell {
         terminal
     }
 
-    fn terminal_target(&self) -> f32 {
-        if self.terminal_open() {
+    fn terminal_target(&self, cx: &App) -> f32 {
+        if self.terminal_open(cx) {
             self.settings.terminal_height
         } else {
             0.0
@@ -929,10 +924,10 @@ impl Shell {
     /// animates 200 ms; closing detaches (PTYs stay alive), opening restores.
     /// The flag is per chat (komet `sessionPanels`).
     fn toggle_terminal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let from = self.terminal_target();
-        let key = self.active_chat.clone();
+        let from = self.terminal_target(cx);
+        let key = self.panel_key(cx);
         let open = self.panels.toggle_terminal(&key);
-        self.terminal_tween = Some(WidthTween::new(from, self.terminal_target()));
+        self.terminal_tween = Some(WidthTween::new(from, self.terminal_target(cx)));
         let panel = self.terminal_panel(cx);
         panel.update(cx, |panel, cx| panel.set_open(open, cx));
         if open {
@@ -990,7 +985,6 @@ impl Shell {
         self.settings.sidebar_width = x.clamp(SIDEBAR_MIN, SIDEBAR_MAX);
         self.settings.sidebar_collapsed = false;
         self.sidebar_tween = None; // live drag tracks the pointer directly
-        self.header_inset_tween = None;
         self.schedule_save(cx);
         cx.notify();
     }
@@ -1044,17 +1038,12 @@ impl Shell {
         self.nav.push(NavEntry::Settings(section));
         self.user_menu_open = false;
         self.chat_menu = None;
-        // Route changes swap the header INSTANTLY (komet keys the header
-        // variants, remounting them with no animation) — kill any in-flight
-        // padding glide so the title never slides across the swap.
-        self.header_inset_tween = None;
         cx.notify();
     }
 
     fn close_settings(&mut self, cx: &mut Context<Self>) {
         self.route = Route::Chat;
         self.nav.push(NavEntry::Chat(self.active_chat.clone()));
-        self.header_inset_tween = None;
         cx.notify();
     }
 
@@ -1090,8 +1079,6 @@ impl Shell {
         }
         self.user_menu_open = false;
         self.chat_menu = None;
-        // Any navigation snaps the header inset (route swaps are instant).
-        self.header_inset_tween = None;
         cx.notify();
     }
 
@@ -1456,9 +1443,45 @@ impl Shell {
     /// glides to its new x-position. Route changes SNAP: the tween is killed
     /// by every route transition (komet remounts the keyed header variants —
     /// instant swap, zero horizontal motion).
-    fn header_inset_container(&self, content: gpui::Div) -> AnyElement {
-        let pl = self.eval_tween(self.header_inset_tween, self.header_inset());
-        content.pl(px(pl)).into_any_element()
+    /// Where unified-titlebar content (tabs / the settings label) starts: past
+    /// the traffic lights + control cluster, riding the fullscreen inset tween.
+    pub(super) fn title_bar_content_start(&self) -> f32 {
+        let fullscreen = self.fullscreen.unwrap_or(false);
+        let is_macos = cfg!(target_os = "macos");
+        let cluster = self.eval_tween(
+            self.titlebar_tween,
+            cluster_buttons_start(is_macos, fullscreen),
+        );
+        cluster + CLUSTER_BUTTONS_WIDTH + 10.0
+    }
+
+    /// The unified window titlebar: chat → the session tab strip; settings →
+    /// the section label. Full-width on the glass shell; the traffic lights
+    /// and control cluster overlay its left end.
+    fn render_title_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        match self.route {
+            Route::Chat => self.render_session_tab_strip(cx),
+            Route::Settings(section) => {
+                let theme = Theme::of(cx).clone();
+                let inner = div()
+                    .size_full()
+                    .flex()
+                    .items_center()
+                    .pt(px(Theme::TITLEBAR_TOP_PAD))
+                    .pl(px(self.title_bar_content_start()))
+                    .pr(px(Theme::SPACE_LG))
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text)
+                            .child(SharedString::from(section.label())),
+                    );
+                let bar = div().h(px(Theme::TITLEBAR_HEIGHT)).flex_none().child(inner);
+                self.titlebar_drag_region("settings-header-titlebar", bar, cx)
+                    .into_any_element()
+            }
+        }
     }
 
     /// Make a titlebar strip drag the window — zed's platform-titlebar
@@ -1529,10 +1552,11 @@ impl Shell {
             .absolute()
             .top_0()
             .left_0()
-            .h(px(Theme::HEADER_HEIGHT))
+            .h(px(Theme::TITLEBAR_HEIGHT))
             .flex()
             .flex_row()
             .items_center()
+            .pt(px(Theme::TITLEBAR_TOP_PAD))
             .gap(px(2.0))
             .px(px(10.0))
             .children(self.titlebar_spacer(12.0))
@@ -1599,15 +1623,6 @@ impl Shell {
             .h_full()
             .flex()
             .flex_col()
-            .child({
-                // Bare drag strip — the control cluster is the shell overlay.
-                let strip = div()
-                    .h(px(Theme::HEADER_HEIGHT))
-                    .flex_none()
-                    .flex()
-                    .items_center();
-                self.titlebar_drag_region("settings-titlebar", strip, cx)
-            })
             .child(
                 div()
                     .flex_1()
@@ -1638,7 +1653,7 @@ impl Shell {
                                 .py(px(6.0))
                                 .text_size(px(13.0))
                                 .when(selected, |el| {
-                                    el.bg(crate::theme::white_alpha(0.08))
+                                    el.bg(crate::theme::wash(0.17))
                                         .font_weight(gpui::FontWeight::MEDIUM)
                                 })
                                 .text_color(if selected {
@@ -1648,7 +1663,7 @@ impl Shell {
                                 })
                                 .cursor_pointer()
                                 .hover(|s| {
-                                    s.bg(crate::theme::white_alpha(0.04))
+                                    s.bg(crate::theme::wash(0.11))
                                         .text_color(Theme::dark().text)
                                 })
                                 .on_click(
@@ -1679,7 +1694,7 @@ impl Shell {
                         .text_color(theme.text_muted)
                         .cursor_pointer()
                         .hover(|s| {
-                            s.bg(crate::theme::white_alpha(0.04))
+                            s.bg(crate::theme::wash(0.11))
                                 .text_color(Theme::dark().text)
                         })
                         .on_click(cx.listener(|this, _, _, cx| this.close_settings(cx)))
@@ -1706,7 +1721,9 @@ impl Shell {
         id: String,
         title: SharedString,
         time_ago: SharedString,
-        location: Option<SharedString>,
+        space_name: SharedString,
+        branch: Option<SharedString>,
+        harness: Option<komet_proto::HarnessId>,
         status: komet_proto::ChatIndicator,
         selected: bool,
         theme: &Theme,
@@ -1737,7 +1754,7 @@ impl Shell {
                 .into_any_element()
         };
         let (hover, text) = (theme.element_hover, theme.text);
-        let selected_wash = crate::theme::white_alpha(0.08);
+        let selected_wash = crate::theme::glass_selected_bg();
         let subline = theme.text_muted.opacity(0.5);
         let select_id = id.clone();
         let menu_id = id.clone();
@@ -1747,7 +1764,7 @@ impl Shell {
         let rest_bg = if selected {
             selected_wash
         } else {
-            gpui::transparent_black()
+            crate::theme::wash(0.0)
         };
         let rest_text = if selected { text } else { text.opacity(0.8) };
         div()
@@ -1760,6 +1777,7 @@ impl Shell {
             .py(px(6.0))
             .text_color(motion::hover_blend(&fade_key, rest_text, text))
             .bg(motion::hover_blend(&fade_key, rest_bg, hover))
+            .when(selected, |el| el.shadow(crate::theme::glass_selected_shadows()))
             .on_hover(motion::hover_listener(fade_key))
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -1773,6 +1791,7 @@ impl Shell {
                     cx.notify();
                 }),
             )
+            // Line 1: status rail, space name, time-ago.
             .child(
                 div()
                     .w_full()
@@ -1786,9 +1805,10 @@ impl Shell {
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .text_size(px(13.0))
-                            .line_height(px(17.0))
-                            .child(title),
+                            .text_size(px(11.0))
+                            .line_height(px(14.0))
+                            .text_color(subline)
+                            .child(space_name),
                     )
                     .child(
                         div()
@@ -1798,20 +1818,65 @@ impl Shell {
                             .child(time_ago),
                     ),
             )
-            .when_some(location, |el, location| {
-                el.child(
-                    div()
-                        .w_full()
-                        // Aligned under the title: rail(6) + gap(8).
-                        .pl(px(14.0))
-                        .truncate()
-                        .text_size(px(11.0))
-                        .line_height(px(14.0))
-                        .text_color(subline)
-                        .child(location),
-                )
-            })
+            // Line 2: the session title, aligned under the folder icon
+            // (rail 6 + gap 8).
+            .child(
+                div()
+                    .w_full()
+                    .pl(px(14.0))
+                    .truncate()
+                    .text_size(px(13.0))
+                    .line_height(px(17.0))
+                    .child(title),
+            )
+            // Line 3 (always): harness brand mark; worktree sessions append
+            // the branch icon + name.
+            .child(
+                div()
+                    .w_full()
+                    .pl(px(14.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(4.0))
+                    .when_some(
+                        harness.map(crate::pickers::harness_brand_icon),
+                        |el, (path, tint)| {
+                            el.child(
+                                icon(path)
+                                    .size(px(11.0))
+                                    .flex_none()
+                                    .text_color(tint.unwrap_or(subline).opacity(0.8)),
+                            )
+                        },
+                    )
+                    .when_some(branch, |el, branch| {
+                        el.child(
+                            icon(icons::GIT_BRANCH)
+                                .size(px(11.0))
+                                .flex_none()
+                                .text_color(subline),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(11.0))
+                                .line_height(px(14.0))
+                                .text_color(subline)
+                                .child(branch),
+                        )
+                    }),
+            )
             .into_any_element()
+    }
+
+    /// Which sidebar-list edges have hidden overflow (offset from the LAST
+    /// frame — the invisible one-frame lag every fade here rides).
+    pub(super) fn sidebar_fade_zones(&self) -> (bool, bool) {
+        let scrolled = -f32::from(self.sidebar_scroll.offset().y);
+        let max_scroll = f32::from(self.sidebar_scroll.max_offset().y);
+        (scrolled > 1.0, scrolled < max_scroll - 1.0)
     }
 
     /// Chat-mode sidebar (spaces overhaul): window-control strip, the Spaces
@@ -1877,11 +1942,15 @@ impl Shell {
 
         // Overflow edge fades for the lists scroll region — the tab strip's
         // idiom, vertical (offset from the LAST frame; the lag is invisible).
-        let lists_scrolled = -f32::from(self.sidebar_scroll.offset().y);
-        let lists_max_scroll = f32::from(self.sidebar_scroll.max_offset().y);
-        let lists_fade_top = lists_scrolled > 1.0;
-        let lists_fade_bottom = lists_scrolled < lists_max_scroll - 1.0;
-        let sidebar_bg = theme.bg;
+        let (lists_fade_top, lists_fade_bottom) = self.sidebar_fade_zones();
+        // Opaque platforms melt overflow into the surface tone with painted
+        // gradient overlays. Over GLASS no overlay can work — the backdrop is
+        // see-through blur, so tone stacks into a smudge and black reads as a
+        // shadow (user reports). Instead the ROWS fade themselves: prepaint-
+        // measured bounds drive per-row opacity toward the viewport edges
+        // ([`Shell::sidebar_row_alpha`]), dissolving the edge to pure glass.
+        let glass = Theme::GLASS_ALPHA < 1.0;
+        let sidebar_fade = theme.surface;
 
         let user_line: SharedString = user
             .as_ref()
@@ -1897,20 +1966,15 @@ impl Shell {
             .h_full()
             .flex()
             .flex_col()
-            // The h-11 titlebar strip: a bare drag region — the window-control
-            // cluster itself lives in the shell's persistent overlay
-            // ([`Shell::render_titlebar_cluster`]) so it never remounts or
-            // moves when the sidebar animates.
-            .child({
-                let strip = div()
-                    .h(px(Theme::HEADER_HEIGHT))
-                    .flex_none()
-                    .flex()
-                    .items_center();
-                self.titlebar_drag_region("sidebar-titlebar", strip, cx)
-            })
-            // Spaces + the global Active list share one scroll region.
-            .child(
+            // (No titlebar strip: the unified window titlebar spans the whole
+            // window above this column.)
+            // Spaces + the global Active list share one scroll region. On
+            // glass the whole region paints inside an EdgeFade scope — a true
+            // per-glyph gradient at active overflow edges.
+            .child(crate::edge_fade::edge_faded(
+                SIDEBAR_GLASS_FADE_BAND,
+                glass && lists_fade_top,
+                glass && lists_fade_bottom,
                 div()
                     .relative()
                     .flex_1()
@@ -1953,7 +2017,7 @@ impl Shell {
                             .into_any_element()
                     }),
                     )
-                    .when(lists_fade_top, |el| {
+                    .when(lists_fade_top && !glass, |el| {
                         el.child(
                             div()
                                 .absolute()
@@ -1963,12 +2027,12 @@ impl Shell {
                                 .h(px(24.0))
                                 .bg(gpui::linear_gradient(
                                     180.0,
-                                    gpui::linear_color_stop(sidebar_bg, 0.0),
-                                    gpui::linear_color_stop(sidebar_bg.opacity(0.0), 1.0),
+                                    gpui::linear_color_stop(sidebar_fade, 0.0),
+                                    gpui::linear_color_stop(sidebar_fade.opacity(0.0), 1.0),
                                 )),
                         )
                     })
-                    .when(lists_fade_bottom, |el| {
+                    .when(lists_fade_bottom && !glass, |el| {
                         el.child(
                             div()
                                 .absolute()
@@ -1978,12 +2042,12 @@ impl Shell {
                                 .h(px(24.0))
                                 .bg(gpui::linear_gradient(
                                     0.0,
-                                    gpui::linear_color_stop(sidebar_bg, 0.0),
-                                    gpui::linear_color_stop(sidebar_bg.opacity(0.0), 1.0),
+                                    gpui::linear_color_stop(sidebar_fade, 0.0),
+                                    gpui::linear_color_stop(sidebar_fade.opacity(0.0), 1.0),
                                 )),
                         )
                     }),
-            )
+            ))
             // Update strip (above the user menu; below the lists).
             .when_some(self.render_update_strip(theme, cx), |el, strip| {
                 el.child(strip)
@@ -2051,17 +2115,27 @@ impl Shell {
         };
         let failed = matches!(self.update_flow, UpdateFlow::Failed(_));
         let tone = if failed { theme.danger } else { theme.accent };
+        // The chip fill is the sidebar's WHITE wash language, not an accent
+        // tint: an indigo fill over the glass composited into a dark slab that
+        // blocked the blur (user report) — the accent lives in the icon/text.
+        let (chip_bg, chip_bg_hover) = if failed {
+            (theme.danger.opacity(0.14), theme.danger.opacity(0.22))
+        } else {
+            (
+                crate::theme::wash(0.11),
+                crate::theme::wash(0.16),
+            )
+        };
 
-        // Filled chip (no outline): a soft tone wash that brightens on hover —
-        // the sidebar's selection-wash language, tinted accent.
         let mut strip = div()
             .id("update-strip")
             .mx(px(Theme::SPACE_SM))
-            .mb(px(Theme::SPACE_SM))
+            // No bottom margin: the user-menu block below carries its own
+            // SPACE_SM padding — doubling it read as a hole (user report).
             .px(px(Theme::SPACE_SM))
             .py(px(6.0))
             .rounded(px(Theme::CONTROL_RADIUS))
-            .bg(tone.opacity(0.12))
+            .bg(chip_bg)
             .flex()
             .flex_row()
             .items_center()
@@ -2082,7 +2156,7 @@ impl Shell {
         if clickable {
             strip = strip
                 .cursor_pointer()
-                .hover(|s| s.bg(tone.opacity(0.2)))
+                .hover(move |s| s.bg(chip_bg_hover))
                 .on_click(cx.listener(move |this, _, _, cx| this.on_update_strip_click(cx)));
         }
         Some(strip.into_any_element())
@@ -2196,8 +2270,8 @@ impl Shell {
             } else {
                 motion::hover_blend(
                     "user-menu-trigger",
-                    gpui::transparent_black(),
-                    crate::theme::white_alpha(0.04),
+                    crate::theme::wash(0.0),
+                    crate::theme::wash(0.11),
                 )
             })
             .on_hover(motion::hover_listener("user-menu-trigger"))
@@ -2512,41 +2586,16 @@ impl Shell {
         let theme_bg = theme.bg;
         let (border, text, faint) = (theme.border, theme.text, theme.text_faint);
 
-        // Settings route: header title "Settings" + the section outlet — no
-        // composer/terminal/status strip (feature-inventory §1.3 header variants).
+        // Settings route: just the section outlet — the section label lives in
+        // the unified window titlebar now (render_title_bar).
         if let Route::Settings(section) = self.route {
             let outlet = self.settings_outlet(section, cx);
-            // One persistent row whose left padding glides on sidebar toggles
-            // (komet __root.tsx `key="header-settings"` + animated
-            // `paddingLeft: headerInset`); the section label itself swaps
-            // instantly, as in the original.
-            let inner = div()
-                .size_full()
-                .flex()
-                .items_center()
-                .gap(px(10.0))
-                .pr(px(Theme::SPACE_LG))
-                .child(
-                    div()
-                        .flex_1()
-                        .text_size(px(13.0))
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(text)
-                        .child(SharedString::from(section.label())),
-                );
-            let header = div()
-                .h(px(Theme::HEADER_HEIGHT))
-                .flex_none()
-                .border_b_1()
-                .border_color(border)
-                .child(self.header_inset_container(inner));
             return div()
                 .flex_1()
                 .min_w_0()
                 .h_full()
                 .flex()
                 .flex_col()
-                .child(self.titlebar_drag_region("settings-header-titlebar", header, cx))
                 .child(div().flex_1().min_h_0().child(outlet))
                 .into_any_element();
         }
@@ -2656,10 +2705,6 @@ impl Shell {
         };
 
         let status = self.render_status_strip(cx);
-        // The session tab strip is the chat header: it carries the titlebar
-        // duties (drag region, animated window-controls inset) plus every
-        // session of the space as a tab.
-        let header: AnyElement = self.render_session_tab_strip(cx);
         // File dropzone over the ENTIRE conversation column (transcript +
         // composer, not just the pill): dragging OS files anywhere across the
         // chat area shows the "Drop images to attach" veil; a drop stages the
@@ -2690,7 +2735,6 @@ impl Shell {
                     .update(cx, |composer, cx| composer.add_paths(paths, cx));
                 cx.notify();
             }))
-            .child(header)
             .child(
                 // The conversation fades out at its bottom edge instead of
                 // hard-cutting against the composer — a gradient overlay from
@@ -2808,14 +2852,14 @@ impl Shell {
     /// Terminal panel dock at the main-column bottom: a 5px height-drag handle
     /// over the panel, the whole container height-animated 200 ms on toggle.
     fn render_terminal_container(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let target = self.terminal_target();
+        let target = self.terminal_target(cx);
         let tween = self.terminal_tween;
         if target <= 0.0 && tween.is_none() {
             return gpui::Empty.into_any_element();
         }
         // Defensive: an open flag needs its entity (and set_open) even if
         // toggle_terminal never created one.
-        if self.terminal_open() && self.terminal.is_none() {
+        if self.terminal_open(cx) && self.terminal.is_none() {
             let panel = self.terminal_panel(cx);
             panel.update(cx, |panel, cx| panel.set_open(true, cx));
         }
@@ -2951,7 +2995,7 @@ impl Shell {
     /// Right "Changes" pane — hidden by default, drag-resizable; content is the
     /// lazy [`Changes`] diff viewer (created on first open).
     fn render_right_pane(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let theme = Theme::of(cx);
+        let theme = Theme::of(cx).clone();
         let bg = theme.bg;
         let content: AnyElement = if self.right_pane_open(cx) {
             let changes = self.changes_pane(cx);
@@ -2961,18 +3005,47 @@ impl Shell {
         } else {
             gpui::Empty.into_any_element()
         };
-        let inner = div()
-            .w(px(self.settings.right_pane_width))
-            .h_full()
+        // Its OWN inset card (user request): the conversation card's right
+        // gutter is the gap; padding (not margins) keeps the tweened width
+        // container clean, and the resize grabber floats over the gap.
+        let handle = self
+            .resize_handle(
+                "right-pane-resize",
+                || RightPaneResize,
+                |shell, _| shell.settings.right_pane_width = RIGHT_PANE_DEFAULT,
+                cx,
+            )
+            .absolute()
+            .top_0()
+            .bottom_0()
+            // INSIDE the width-clipped container (a negative inset was
+            // clipped into unreachability — user-reported dead resize),
+            // overlapping the card's left border.
+            .left(px(0.0));
+        let card = div()
+            .size_full()
+            .rounded(px(12.0))
+            .border_1()
+            .border_color(theme.border)
+            .bg(bg)
+            .overflow_hidden()
             .child(content);
         let target = self.right_target(cx);
-        // No chrome of its own: the pane is a plain column inside the window
-        // card — the divider hairline between it and the conversation is drawn
-        // by the card row (render, `right_divider`).
         self.pane_container(
             self.right_tween,
             target,
-            div().h_full().bg(bg).child(inner).into_any_element(),
+            // Mirrors the conversation card's box exactly: flush under the
+            // titlebar (no top pad), 8px bottom/right gutters — the
+            // conversation card's own right margin is the 8px gap between the
+            // two insets (user-reported height/gap mismatch).
+            div()
+                .h_full()
+                .relative()
+                .pb(px(8.0))
+                .pr(px(8.0))
+                .child(card)
+                .child(handle)
+                .into_any_element(),
         )
     }
 
@@ -3168,7 +3241,7 @@ impl Shell {
                                 .text_color(theme.text)
                                 .when(submitting, |el| el.opacity(0.5))
                                 .cursor_pointer()
-                                .hover(|s| s.bg(crate::theme::white_alpha(0.04)))
+                                .hover(|s| s.bg(crate::theme::wash(0.11)))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.select_org(org_id.clone(), cx);
                                 }))
@@ -3421,7 +3494,7 @@ fn window_control_button(
         // komet window-controls.tsx: `transition-colors` — the wash fades.
         .bg(motion::hover_blend(
             &fade_key,
-            gpui::transparent_black(),
+            crate::theme::wash(0.0),
             Theme::dark().element_hover,
         ))
         .on_hover(motion::hover_listener(fade_key))
@@ -3498,8 +3571,8 @@ fn header_icon_button(
         // komet __root.tsx header buttons: `transition-colors`.
         .bg(motion::hover_blend(
             &fade_key,
-            gpui::transparent_black(),
-            crate::theme::white_alpha(0.04),
+            crate::theme::wash(0.0),
+            crate::theme::wash(0.11),
         ))
         .on_hover(motion::hover_listener(fade_key))
         // Same occlusion + click-swallowing as [`window_control_button`]: this
@@ -3518,8 +3591,11 @@ impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx);
         // The shell tone (komet `.frost`): the surface the sidebar sits on and
-        // the main panel floats over as an inset rounded card.
-        let (frost, text, font) = (theme.surface, theme.text, theme.font_sans.clone());
+        // the main panel floats over as an inset rounded card. On macOS the
+        // window background is the blurred desktop (lib.rs `Blurred`), so the
+        // frost paints translucent — the sidebar and card margins read as
+        // glass while the opaque card keeps text off it.
+        let (frost, text, font) = (theme.glass(), theme.text, theme.font_sans.clone());
         let gate = self
             .debug_gate
             .clone()
@@ -3535,14 +3611,6 @@ impl Render for Shell {
                     titlebar_cluster_start(!fullscreen),
                     titlebar_cluster_start(fullscreen),
                 ));
-                // Collapsed headers inset past the traffic lights — glide the
-                // title with the cluster (komet `headerInset` 204 ↔ 128).
-                if self.settings.sidebar_collapsed {
-                    self.header_inset_tween = Some(WidthTween::new(
-                        self.header_inset_for(!fullscreen),
-                        self.header_inset_for(fullscreen),
-                    ));
-                }
             }
             self.fullscreen = Some(fullscreen);
         }
@@ -3640,45 +3708,16 @@ impl Render for Shell {
                 // around the diff column) — the per-session open flags stay
                 // intact for the return trip.
                 let on_chat = matches!(self.route, Route::Chat);
-                let right_open = on_chat && self.right_pane_open(cx);
-                // The conversation/pane divider: a single full-height hairline
-                // inside the card (the reference chrome), with the 5px resize
-                // grabber floating OVER it (absolute) so the hit area consumes
-                // no layout width — no dead gap breaking the header hairline.
-                let right_divider: Option<AnyElement> = right_open.then(|| {
-                    let border = Theme::of(cx).border;
-                    let handle = self
-                        .resize_handle(
-                            "right-pane-resize",
-                            || RightPaneResize,
-                            |shell, _| shell.settings.right_pane_width = RIGHT_PANE_DEFAULT,
-                            cx,
-                        )
-                        .absolute()
-                        .top_0()
-                        .bottom_0()
-                        .left(px(-2.0));
-                    div()
-                        .w(px(1.0))
-                        .h_full()
-                        .flex_none()
-                        .relative()
-                        .bg(border)
-                        .child(handle)
-                        .into_any_element()
-                });
                 let right: AnyElement = if on_chat {
                     self.render_right_pane(cx)
                 } else {
                     Empty.into_any_element()
                 };
                 let overlays = self.render_overlays(window.viewport_size(), window, cx);
-                // The signature frame: the content pane (main column + changes
-                // pane) is an inset rounded hairline-bordered card floating on
-                // the frost shell — ONE card; the changes pane is a column
-                // inside it, split off by the divider hairline. Collapsed
-                // sidebar → full-bleed (margins, radius, and border melt away;
-                // the header row IS the title bar).
+                // The signature frame: the conversation card and — when the
+                // changes pane is open — a SECOND inset card beside it, both
+                // rounded hairline-bordered floats on the frost shell (the
+                // changes card is built inside `render_right_pane`).
                 let inset = !self.settings.sidebar_collapsed;
                 let theme = Theme::of(cx);
                 // Margins, radius, and border-color MELT over the same 200ms
@@ -3696,9 +3735,7 @@ impl Render for Shell {
                     .overflow_hidden()
                     .bg(theme.bg)
                     .border_1()
-                    .child(main)
-                    .children(right_divider)
-                    .child(right);
+                    .child(main);
                 // Manual drive on the SAME clock as the sidebar width tween.
                 // Crucially there is no `with_animation` wrapper here: the
                 // wrapper's epoch-keyed id used to change every card
@@ -3706,6 +3743,11 @@ impl Render for Shell {
                 // reset gpui's per-element animation state and REPLAYED any
                 // stale pane/terminal tween from t=0 (the changes pane slid
                 // ~100px under the clip mid-toggle — round-6 §2/§3).
+                //
+                // The inset card persists in EVERY state (user request): top
+                // gutter under the unified titlebar, right/bottom gutters,
+                // constant radius + hairline. Collapsing the sidebar only
+                // fades in a LEFT gutter where the sidebar's used to be.
                 let melt_target = if inset { 1.0 } else { 0.0 };
                 let melt = self.eval_tween(
                     self.sidebar_tween.map(|tw| WidthTween {
@@ -3715,11 +3757,24 @@ impl Render for Shell {
                     }),
                     melt_target,
                 );
+                // No top margin: the titlebar's own internal air (44px bar,
+                // 28px tabs) is the gap — an extra gutter read as a hole
+                // between the header and the app (user report).
+                // The right margin is the window gutter when the changes
+                // pane is closed, but the SEAM between the two inset cards
+                // when it's open — a full gutter there read double-wide next
+                // to the two borders it separates (user report).
+                let right_gap = if on_chat && self.right_pane_open(cx) {
+                    4.0
+                } else {
+                    8.0
+                };
                 let card: AnyElement = card
-                    .my(px(8.0 * melt))
-                    .mr(px(8.0 * melt))
-                    .rounded(px(12.0 * melt))
-                    .border_color(border_color.opacity(melt))
+                    .mb(px(8.0))
+                    .mr(px(right_gap))
+                    .ml(px(8.0 * (1.0 - melt)))
+                    .rounded(px(12.0))
+                    .border_color(border_color)
                     .into_any_element();
                 // The whole app page is one keyed `animate-in` entrance (komet
                 // App.tsx `<div key={phase} className="animate-in h-full">`):
@@ -3741,13 +3796,23 @@ impl Render for Shell {
                             .bottom_0()
                             .left(px(-2.0)),
                     );
+                let title_bar = self.render_title_bar(cx);
                 let page = div()
                     .size_full()
                     .flex()
-                    .flex_row()
-                    .child(sidebar)
-                    .child(sidebar_seam)
-                    .child(card)
+                    .flex_col()
+                    .child(title_bar)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .flex()
+                            .flex_row()
+                            .child(sidebar)
+                            .child(sidebar_seam)
+                            .child(card)
+                            .child(right),
+                    )
                     .child(self.render_titlebar_cluster(cx))
                     .children(overlays);
                 root.child(motion::fade_in("phase-app", page))

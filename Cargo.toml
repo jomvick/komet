@@ -38,18 +38,20 @@ loro = "1.13"
 # frames, cross-checked by its js_snapshots tests).
 loro-protocol = "0.3"
 
-# gpui — the wingleeio/zed fork: upstream f14fea9 + one commit
-# (`komet/line-wrap-closing-punctuation`, a6bf17c) fixing BOTH wrap-rule copies
-# (LineWrapper + line_layout's shaped-text duplicate) so
-# Rebase that branch when bumping the upstream rev.
-gpui = { git = "https://github.com/wingleeio/zed", rev = "a6bf17cf028612a6eea80c32645a3305bd7cded4" }
-gpui_platform = { git = "https://github.com/wingleeio/zed", rev = "a6bf17cf028612a6eea80c32645a3305bd7cded4", features = [
+# gpui — the wingleeio/zed fork: upstream f14fea9 + two commits on
+# `komet/line-wrap-closing-punctuation` (rebase that branch when bumping the
+# upstream rev): a6bf17c fixes BOTH wrap-rule copies (LineWrapper +
+# line_layout's shaped-text duplicate); 14baea0 adds the EdgeFade primitive
+# (Window::with_edge_fade — per-primitive scroll-edge fades for the glass
+# sidebar).
+gpui = { git = "https://github.com/wingleeio/zed", rev = "a6c1ad501f90c9437d2553bde691958f150364c5" }
+gpui_platform = { git = "https://github.com/wingleeio/zed", rev = "a6c1ad501f90c9437d2553bde691958f150364c5", features = [
     "wayland",
     "x11",
     "font-kit",
     "runtime_shaders",
 ] }
-gpui_tokio = { git = "https://github.com/wingleeio/zed", rev = "a6bf17cf028612a6eea80c32645a3305bd7cded4" }
+gpui_tokio = { git = "https://github.com/wingleeio/zed", rev = "a6c1ad501f90c9437d2553bde691958f150364c5" }
 
 # ratatui — the terminal viewport (`komet-tui`). Deliberately narrow features:
 # `widget-calendar` (a default) drags in `time`, and we render no calendar.

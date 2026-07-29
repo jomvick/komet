@@ -483,7 +483,7 @@ impl Transcript {
                     .as_deref()
                     .map(|r| truncate_preview(r, PREVIEW_REPLY_CHARS));
                 let card: Option<AnyElement> = is_hovered.then(|| {
-                    popover::popover_card(&theme)
+                    let card = popover::popover_card(&theme)
                         .w(px(280.0))
                         .p(px(Theme::SPACE_SM))
                         .flex()
@@ -512,8 +512,10 @@ impl Transcript {
                                     .text_color(theme.text_muted.opacity(0.7))
                                     .child(SharedString::from(format!("{bucket_len} prompts"))),
                             )
-                        })
-                        .into_any_element()
+                        });
+                    // Mounted straight through deferred/anchored (not a popover
+                    // mount helper), so the frost wrap happens here.
+                    crate::frost::frosted(12.0, 16.0, card).into_any_element()
                 });
                 div()
                     .id(("rail-tick", ix))

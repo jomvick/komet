@@ -271,8 +271,8 @@ impl Shell {
                     .cursor_pointer()
                     .bg(motion::hover_blend(
                         "add-space",
-                        gpui::transparent_black(),
-                        crate::theme::white_alpha(0.06),
+                        crate::theme::wash(0.0),
+                        crate::theme::wash(0.14),
                     ))
                     .on_hover(motion::hover_listener("add-space"))
                     .on_click(cx.listener(|this, _, _, cx| this.open_add_space(cx)))
@@ -305,7 +305,7 @@ impl Shell {
                     ))
                     .bg(motion::hover_blend(
                         "add-space-ghost",
-                        gpui::transparent_black(),
+                        crate::theme::wash(0.0),
                         Theme::dark().element_hover,
                     ))
                     .on_hover(motion::hover_listener("add-space-ghost"))
@@ -462,9 +462,9 @@ impl Shell {
         let name: SharedString = space.display_name().to_string().into();
         let fade_key = format!("space-row-{id}");
         let rest_bg = if selected {
-            crate::theme::white_alpha(0.08)
+            crate::theme::glass_selected_bg()
         } else {
-            gpui::transparent_black()
+            crate::theme::wash(0.0)
         };
         let rest_text = if selected {
             theme.text
@@ -487,6 +487,7 @@ impl Shell {
             .py(px(6.0))
             .text_color(motion::hover_blend(&fade_key, rest_text, theme.text))
             .bg(motion::hover_blend(&fade_key, rest_bg, theme.element_hover))
+            .when(selected, |el| el.shadow(crate::theme::glass_selected_shadows()))
             .on_hover(motion::hover_listener(fade_key))
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| {
@@ -566,7 +567,7 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> Vec<(String, f32, AnyElement)> {
         let now = Utc::now();
-        let rows: Vec<(ChatIndicator, komet_proto::Chat, String)> = {
+        let rows: Vec<(ChatIndicator, komet_proto::Chat, String, Option<String>)> = {
             let state = self.state.read(cx);
             state
                 .overview_chats(now)
@@ -576,35 +577,26 @@ impl Shell {
                     let folder = space
                         .map(|s| s.display_name().to_string())
                         .unwrap_or_else(|| "?".to_string());
-                    let device = space
-                        .map(|s| {
-                            let name = state
-                                .device_name(&s.device_id)
-                                .unwrap_or("Unknown device")
-                                .to_string();
-                            // Host-presence: a lapsed heartbeat = host outage,
-                            // not slow sync — say so where the session lives.
-                            if state.device_online(&s.device_id, now) {
-                                name
-                            } else {
-                                format!("{name} (offline)")
-                            }
-                        })
-                        .unwrap_or_default();
-                    let mut location = format!("{folder} · {device}");
-                    if let Some(branch) = chat.branch.as_deref().filter(|b| !b.trim().is_empty()) {
-                        location = format!("{folder} · {branch} · {device}");
-                    }
-                    (status, chat.clone(), location)
+                    // The branch shows whenever the engine has stamped one —
+                    // main-checkout sessions included, not just worktrees.
+                    let branch = chat
+                        .branch
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|b| !b.is_empty())
+                        .map(str::to_string);
+                    (status, chat.clone(), folder, branch)
                 })
                 .collect()
         };
         let selected = self.state.read(cx).selected_chat.clone();
         rows.into_iter()
-            .map(|(status, chat, location)| {
+            .map(|(status, chat, folder, branch)| {
                 let time_ago: SharedString =
                     format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now).into();
                 let is_selected = selected.as_deref() == Some(chat.id.as_str());
+                let height = super::CHAT_ROW_HEIGHT;
+                let harness = chat.config.as_ref().map(|c| c.harness);
                 let element = self.render_chat_row(
                     chat.id.clone(),
                     transcript::single_line(
@@ -612,13 +604,15 @@ impl Shell {
                     )
                     .into(),
                     time_ago,
-                    Some(location.into()),
+                    folder.into(),
+                    branch.map(SharedString::from),
+                    harness,
                     status,
                     is_selected,
                     theme,
                     cx,
                 );
-                (format!("c:{}", chat.id), super::CHAT_ROW_WITH_LOCATION_HEIGHT, element)
+                (format!("c:{}", chat.id), height, element)
             })
             .collect()
     }
@@ -1024,7 +1018,7 @@ impl Shell {
                     .text_size(px(12.0))
                     .cursor_pointer()
                     .when(is_active, |el| {
-                        el.bg(crate::theme::white_alpha(0.08)).text_color(theme.text)
+                        el.bg(crate::theme::wash(0.17)).text_color(theme.text)
                     })
                     .when(!is_active, |el| {
                         el.text_color(theme.text_muted.opacity(0.6))

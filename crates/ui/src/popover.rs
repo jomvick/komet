@@ -142,8 +142,7 @@ pub fn classify_key(key: &str, cmd: bool, ctrl: bool) -> MenuKey {
 /// the near-opaque tone it composites to on the dark panels (~#161616), plus
 /// the same hairline + baked-in shadow.
 pub fn popover_card(theme: &Theme) -> gpui::Div {
-    div()
-        .bg(grey(0x16))
+    let card = div()
         .border_1()
         .border_color(white_alpha(0.10))
         .rounded(px(12.0))
@@ -151,7 +150,14 @@ pub fn popover_card(theme: &Theme) -> gpui::Div {
         .p(px(4.0))
         .overflow_hidden()
         .text_size(px(13.0))
-        .text_color(theme.text)
+        .text_color(theme.text);
+    if Theme::GLASS_ALPHA < 1.0 {
+        // Translucent tint — the backdrop blur beneath it comes from the
+        // [`crate::frost::frosted`] wrapper at the mount helpers below.
+        card.bg(grey(0x16).opacity(0.65))
+    } else {
+        card.bg(grey(0x16))
+    }
 }
 
 /// [`popover_card`] without the `p-1` inset — for popovers that manage their
@@ -182,6 +188,7 @@ fn pinned_layer(layer: AnyElement) -> AnyElement {
 /// paint-order only in gpui, so without it clicks on menu rows would ALSO fire
 /// whatever clickable sits under the floating layer.
 pub fn anchored_menu(id: impl Into<ElementId>, content: AnyElement) -> AnyElement {
+    let content = crate::frost::frosted(12.0, 16.0, content).into_any_element();
     pinned_layer(
         gpui::deferred(
             gpui::anchored()
@@ -198,6 +205,7 @@ pub fn anchored_menu(id: impl Into<ElementId>, content: AnyElement) -> AnyElemen
 /// user menu — anything anchored near the window bottom; Radix flips these
 /// automatically, gpui's `anchored` needs the side picked).
 pub fn anchored_menu_above(id: impl Into<ElementId>, content: AnyElement) -> AnyElement {
+    let content = crate::frost::frosted(12.0, 16.0, content).into_any_element();
     pinned_layer(
         gpui::deferred(
             gpui::anchored()
@@ -214,6 +222,7 @@ pub fn anchored_menu_above(id: impl Into<ElementId>, content: AnyElement) -> Any
 /// ComboboxPopup `align="end"` — right-side triggers like the composer's ref
 /// picker open leftward instead of running off the window).
 pub fn anchored_menu_above_end(id: impl Into<ElementId>, content: AnyElement) -> AnyElement {
+    let content = crate::frost::frosted(12.0, 16.0, content).into_any_element();
     div()
         .absolute()
         .top_0()
@@ -239,6 +248,7 @@ pub fn menu_at(
     position: Point<Pixels>,
     content: AnyElement,
 ) -> AnyElement {
+    let content = crate::frost::frosted(12.0, 16.0, content).into_any_element();
     gpui::deferred(
         gpui::anchored()
             .position(position)
@@ -259,6 +269,7 @@ pub fn modal(
     viewport: gpui::Size<Pixels>,
     card: AnyElement,
 ) -> AnyElement {
+    let card = crate::frost::frosted(12.0, 16.0, card).into_any_element();
     gpui::deferred(
         gpui::anchored()
             .position(gpui::point(px(0.0), px(0.0)))
@@ -296,7 +307,7 @@ pub fn menu_row(theme: &Theme, active: bool, fade_key: impl Into<SharedString>) 
         .text_size(px(13.0))
         .cursor_pointer();
     if active {
-        row.bg(white_alpha(0.10)).text_color(theme.text)
+        row.bg(crate::theme::wash(0.14)).text_color(theme.text)
     } else {
         let fade_key = fade_key.into();
         let mut row = row
@@ -307,8 +318,8 @@ pub fn menu_row(theme: &Theme, active: bool, fade_key: impl Into<SharedString>) 
             ))
             .bg(motion::hover_blend(
                 &fade_key,
-                gpui::transparent_black(),
-                white_alpha(0.08),
+                crate::theme::wash(0.0),
+                crate::theme::wash(0.14),
             ));
         // Imperative form — the caller's `.id(...)` makes the element stateful
         // (hover listeners need element state, `.on_hover` needs `Stateful`).
@@ -329,7 +340,7 @@ pub fn menu_row_nav(
 ) -> gpui::Div {
     let row = menu_row(theme, selected, fade_key);
     if !selected && highlighted {
-        row.bg(white_alpha(0.08)).text_color(theme.text)
+        row.bg(crate::theme::wash(0.14)).text_color(theme.text)
     } else {
         row
     }
@@ -368,7 +379,9 @@ pub fn tracked_upper(label: &str) -> String {
 /// Hairline divider between menu sections (komet `MenuSeparator`:
 /// `mx-1 my-1 h-px bg-white/[0.07]`).
 pub fn menu_separator() -> gpui::Div {
-    div().h(px(1.0)).mx(px(4.0)).my(px(4.0)).bg(white_alpha(0.07))
+    // Full-bleed: negative margins cancel the card's p-1 inset so the hairline
+    // runs border to border (user request).
+    div().h(px(1.0)).mx(px(-4.0)).my(px(4.0)).bg(white_alpha(0.07))
 }
 
 /// The trailing check on the selected row (komet `MenuCheck`): 14px,
@@ -493,7 +506,7 @@ pub fn btn_ghost(theme: &Theme, label: &str, fade_key: impl Into<SharedString>) 
         ))
         .bg(motion::hover_blend(
             &fade_key,
-            gpui::transparent_black(),
+            crate::theme::wash(0.0),
             white_alpha(0.06),
         ))
         .cursor_pointer()

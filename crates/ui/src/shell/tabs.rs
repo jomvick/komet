@@ -21,8 +21,9 @@ use komet_proto::ChatIndicator;
 pub(super) const SESSION_TAB_WIDTH: f32 = 140.0;
 /// Flex gap between tabs — part of the drop-index slot width.
 const TAB_GAP: f32 = 4.0;
-/// Width of the overflow edge fades.
-const FADE_WIDTH: f32 = 24.0;
+/// Width of the overflow edge fades. Wide enough that per-glyph fade steps
+/// (title text fades glyph-by-glyph on glass) stay gentle.
+const FADE_WIDTH: f32 = 36.0;
 
 /// Drag-reorder state; `epoch` keys the 150ms slide animation restarts.
 pub(super) struct TabDragState {
@@ -244,11 +245,11 @@ impl Shell {
                 // close), so the wash snaps off it too — gpui allows only one
                 // `on_hover` per element, and the state listener wins.
                 let (text_color, bg) = if is_selected {
-                    (theme.text, crate::theme::white_alpha(0.08))
+                    (theme.text, crate::theme::glass_selected_bg())
                 } else if is_hovered {
                     (theme.text_muted.opacity(0.8), theme.element_hover)
                 } else {
-                    (theme.text_muted.opacity(0.6), gpui::transparent_black())
+                    (theme.text_muted.opacity(0.6), crate::theme::wash(0.0))
                 };
                 let glyph_alpha = if is_selected { 0.9 } else { 0.6 };
                 let brand = harness.map(crate::pickers::harness_brand_icon);
@@ -270,7 +271,7 @@ impl Shell {
                         .items_center()
                         .justify_center()
                         .rounded(px(6.0))
-                        .hover(|s| s.bg(crate::theme::white_alpha(0.09)))
+                        .hover(|s| s.bg(crate::theme::wash(0.14)))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
                             this.close_session_tab(close_id.clone(), cx);
@@ -319,6 +320,9 @@ impl Shell {
                     .text_size(px(12.0))
                     .text_color(text_color)
                     .bg(bg)
+                    .when(is_selected, |el| {
+                        el.shadow(crate::theme::glass_selected_shadows())
+                    })
                     .cursor_pointer()
                     // Tabs sit inside the titlebar drag strip — carve them out.
                     // NOT `.occlude()`: a BlockMouse hitbox ends the hit test,
@@ -420,13 +424,16 @@ impl Shell {
             .rounded(px(8.0))
             .cursor_pointer()
             .bg(if on_canvas && has_space {
-                crate::theme::white_alpha(0.08)
+                crate::theme::glass_selected_bg()
             } else {
                 motion::hover_blend(
                     "session-tab-new",
-                    gpui::transparent_black(),
-                    crate::theme::white_alpha(0.05),
+                    crate::theme::wash(0.0),
+                    crate::theme::wash(0.12),
                 )
+            })
+            .when(on_canvas && has_space, |el| {
+                el.shadow(crate::theme::glass_selected_shadows())
             })
             .on_hover(motion::hover_listener("session-tab-new"))
             .occlude()
@@ -441,12 +448,15 @@ impl Shell {
 
         // Overflow: the tab region scrolls horizontally; edge fades appear on
         // whichever side has hidden tabs (offset from the LAST frame — a
-        // one-frame lag is invisible).
+        // one-frame lag is invisible). On GLASS the fades are an EdgeFade
+        // scope (per-glyph gradient); painted overlays only exist on opaque
+        // platforms, in the SHELL surface tone the strip now sits on.
         let scrolled = -f32::from(self.tabs_scroll.offset().x);
         let max_scroll = f32::from(self.tabs_scroll.max_offset().x);
         let fade_left = scrolled > 1.0;
         let fade_right = scrolled < max_scroll - 1.0;
-        let bar_bg = theme.bg;
+        let glass = Theme::GLASS_ALPHA < 1.0;
+        let bar_bg = theme.surface;
         let drag_move_space = space_id.clone().unwrap_or_default();
         let drop_space = space_id.clone().unwrap_or_default();
         let scroll_for_drag = self.tabs_scroll.clone();
@@ -497,7 +507,7 @@ impl Shell {
                     ))
                     .children(tab_elements),
             )
-            .when(fade_left, |el| {
+            .when(fade_left && !glass, |el| {
                 el.child(
                     div()
                         .absolute()
@@ -512,7 +522,7 @@ impl Shell {
                         )),
                 )
             })
-            .when(fade_right, |el| {
+            .when(fade_right && !glass, |el| {
                 el.child(
                     div()
                         .absolute()
@@ -527,17 +537,35 @@ impl Shell {
                         )),
                 )
             });
+        let tab_region: AnyElement = if glass {
+            crate::edge_fade::edge_faded(FADE_WIDTH, false, false, tab_region)
+                .fade_left(fade_left)
+                .fade_right(fade_right)
+                .into_any_element()
+        } else {
+            tab_region.into_any_element()
+        };
 
+        // Tabs live above the INSET CARD: sidebar open → they start at the
+        // card's left edge (+ its content pad); collapsed → they glide left
+        // (on the sidebar width tween) until they sit next to the control
+        // cluster.
+        let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
+        let tabs_left = (sidebar_now + Theme::SPACE_LG).max(self.title_bar_content_start());
         let inner = div()
             .size_full()
             .flex()
             .items_center()
+            .pt(px(Theme::TITLEBAR_TOP_PAD))
             .gap(px(6.0))
+            .pl(px(tabs_left))
             .pr(px(Theme::SPACE_LG))
             .child(tab_region)
             .when(has_space && has_tabs, |el| el.child(new_tab))
             .child(div().flex_1())
-            .when(!self.right_pane_open(cx) && git, |el| {
+            // Stable location: the toggle shows whether the pane is open or
+            // not (the pane's own header is gone).
+            .when(git, |el| {
                 el.child(header_icon_button(
                     "toggle-changes",
                     icons::SIDEBAR_MINIMALISTIC,
@@ -546,12 +574,10 @@ impl Shell {
                 ))
             });
 
-        let bar = div()
-            .h(px(Theme::HEADER_HEIGHT))
-            .flex_none()
-            .border_b_1()
-            .border_color(theme.border)
-            .child(self.header_inset_container(inner));
+        // The unified window titlebar: full-width on the glass shell, ABOVE
+        // the inset card. No bottom border — the card's own hairline is the
+        // separation; the glass gutter shows between.
+        let bar = div().h(px(Theme::TITLEBAR_HEIGHT)).flex_none().child(inner);
         self.titlebar_drag_region("chat-tabs-titlebar", bar, cx)
             .into_any_element()
     }

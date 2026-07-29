@@ -61,8 +61,23 @@ pub struct Theme {
 
 impl Theme {
     // ---- numbers drive layout (px) ----
-    /// Main-panel header height (komet `h-11`).
+    /// Frost translucency over the blurred window background (macOS vibrancy).
+    /// Opaque elsewhere: Linux/Windows get no compositor-blur guarantee, and a
+    /// merely transparent window would show raw desktop through the sidebar.
+    /// Darkness matched by eye to anara desktop's dark glass. Anara's scrim is
+    /// 0.76 over `hsl(0 0% 3%)`, but it sits on Electron's `under-window`
+    /// vibrancy MATERIAL, which pre-darkens the blur; our bare backdrop blur
+    /// has no material layer, so the scrim runs heavier to land on the same
+    /// perceived tone (see [`Theme::glass`]).
+    pub const GLASS_ALPHA: f32 = if cfg!(target_os = "macos") { 0.90 } else { 1.0 };
+    /// Main-panel header height (komet `h-11`) — in-card headers (changes pane).
     pub const HEADER_HEIGHT: f32 = 44.0;
+    /// The unified window titlebar (traffic lights + cluster + tabs). Content
+    /// rides [`Self::TITLEBAR_TOP_PAD`] lower than center so the air above
+    /// matches the perceived gap to the inset card below (border + card body).
+    pub const TITLEBAR_HEIGHT: f32 = 38.0;
+    /// Downward shift of titlebar content within the bar.
+    pub const TITLEBAR_TOP_PAD: f32 = 2.0;
     /// Reserved status strip under the content outlet (komet `h-6`) — the
     /// WorkingIndicator row; reserving it keeps the composer from shifting.
     pub const STATUS_STRIP_HEIGHT: f32 = 24.0;
@@ -78,6 +93,18 @@ impl Theme {
     pub const SPACE_MD: f32 = 12.0;
     pub const SPACE_LG: f32 = 16.0;
 
+    /// The frost tint painted over the blurred window background (macOS
+    /// glass). Darker than `surface` — matched to anara desktop's dark
+    /// vibrancy scrim: `hsl(0 0% 3%)` (#080808) at [`Self::GLASS_ALPHA`].
+    /// On opaque platforms this IS the surface tone (no tint swap).
+    pub fn glass(&self) -> Hsla {
+        if Self::GLASS_ALPHA < 1.0 {
+            grey(8).opacity(Self::GLASS_ALPHA)
+        } else {
+            self.surface
+        }
+    }
+
     /// Build the (only) theme. The surface tones are sampled straight from the
     /// reference screenshots of the original app (docs/reference): main panel
     /// `#060606`, shell/sidebar `#0d0d0d`.
@@ -86,8 +113,8 @@ impl Theme {
             bg: grey(6),      // main panel — sampled #060606
             surface: grey(13), // shell / sidebar — sampled #0d0d0d
             surface_raised: neutral(0.235),
-            element_hover: white_alpha(0.06),
-            element_active: white_alpha(0.10),
+            element_hover: wash(0.14),
+            element_active: wash(0.16),
             border: white_alpha(0.08),
             border_strong: white_alpha(0.14),
             text: neutral(0.922),                        // ~neutral-200
@@ -146,9 +173,41 @@ pub fn neutral(lightness: f32) -> Hsla {
     hsla(0.0, 0.0, v, 1.0)
 }
 
+/// Interactive-state wash: TRANSLUCENT soft-white, with alphas high enough to
+/// stay visible at the brightest backdrop the 0.90 glass scrim can produce
+/// (~L 0.13 over pure white — a 12% wash still adds ~+24 luma there). Fully
+/// opaque washes killed the glass and flashed dark mid-fade (user reports);
+/// hover fades must rest on `wash(0.0)`, never transparent BLACK, so the
+/// interpolation stays white-toned.
+pub fn wash(alpha: f32) -> Hsla {
+    hsla(0.0, 0.0, 0.92, alpha)
+}
+
 /// White at the given alpha — the hairline/wash primitive.
 pub fn white_alpha(alpha: f32) -> Hsla {
     hsla(0.0, 0.0, 1.0, alpha)
+}
+
+/// Selected-state glass treatment (tabs, session rows, space rows): a
+/// TRANSLUCENT wash the vibrancy reads through — heavier flat washes blocked
+/// the glass (user request).
+pub fn glass_selected_bg() -> Hsla {
+    wash(0.14)
+}
+
+/// The selected chip's bright outline, as an INSET shadow: gpui paints inset
+/// shadows ON TOP of the background, edges only — a border with zero layout
+/// cost. Drop shadows are filled rects painted BEHIND the element, and behind
+/// a 5% fill they showed straight through as an opaque dark plate with a
+/// greyed ring (user report) — nothing may paint behind a glass chip.
+pub fn glass_selected_shadows() -> Vec<gpui::BoxShadow> {
+    vec![gpui::BoxShadow {
+        color: white_alpha(0.09),
+        offset: gpui::point(gpui::px(0.0), gpui::px(0.0)),
+        blur_radius: gpui::px(0.0),
+        spread_radius: gpui::px(1.0),
+        inset: true,
+    }]
 }
 
 /// An exact achromatic tone from an 8-bit channel value (`grey(13)` ≡ `#0d0d0d`)
@@ -288,14 +347,23 @@ mod tests {
     }
 
     #[test]
-    fn hairlines_are_low_alpha_white() {
+    fn hairlines_are_white_and_washes_are_mid_grey() {
         let t = Theme::dark();
-        for c in [t.border, t.border_strong, t.element_hover, t.element_active] {
-            assert_eq!(c.l, 1.0, "hairlines/washes are white");
+        // Hairlines stay white — they only need to read on dark surfaces.
+        for c in [t.border, t.border_strong] {
+            assert_eq!(c.l, 1.0, "hairlines are white");
             assert!(c.a > 0.0 && c.a < 0.25, "low alpha, got {}", c.a);
         }
+        // Washes are translucent soft-white with enough alpha to read at the
+        // glass scrim's brightness ceiling.
+        for c in [t.element_hover, t.element_active] {
+            assert_eq!(c.l, 0.92, "washes are soft-white");
+            assert!(c.a >= 0.05 && c.a < 0.35, "alpha in band, got {}", c.a);
+        }
         assert!(t.border.a < t.border_strong.a);
-        assert!(t.element_hover.a < t.element_active.a);
+        // Hover intentionally equals the active fill (selection differs by
+        // its ring, not brightness — user request).
+        assert!(t.element_hover.a <= t.element_active.a);
     }
 
     #[test]
