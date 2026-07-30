@@ -1461,22 +1461,14 @@ impl Shell {
     fn render_title_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         match self.route {
             Route::Chat => self.render_session_tab_strip(cx),
-            Route::Settings(section) => {
-                let theme = Theme::of(cx).clone();
+            Route::Settings(_) => {
                 let inner = div()
                     .size_full()
                     .flex()
                     .items_center()
                     .pt(px(Theme::TITLEBAR_TOP_PAD))
                     .pl(px(self.title_bar_content_start()))
-                    .pr(px(Theme::SPACE_LG))
-                    .child(
-                        div()
-                            .text_size(px(13.0))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme.text)
-                            .child(SharedString::from(section.label())),
-                    );
+                    .pr(px(Theme::SPACE_LG));
                 let bar = div().h(px(Theme::TITLEBAR_HEIGHT)).flex_none().child(inner);
                 self.titlebar_drag_region("settings-header-titlebar", bar, cx)
                     .into_any_element()
@@ -3718,7 +3710,6 @@ impl Render for Shell {
                 // changes pane is open — a SECOND inset card beside it, both
                 // rounded hairline-bordered floats on the frost shell (the
                 // changes card is built inside `render_right_pane`).
-                let inset = !self.settings.sidebar_collapsed;
                 let theme = Theme::of(cx);
                 // Margins, radius, and border-color MELT over the same 200ms
                 // ease-out as the sidebar width (komet __root.tsx `<main>`
@@ -3745,18 +3736,9 @@ impl Render for Shell {
                 // ~100px under the clip mid-toggle — round-6 §2/§3).
                 //
                 // The inset card persists in EVERY state (user request): top
-                // gutter under the unified titlebar, right/bottom gutters,
-                // constant radius + hairline. Collapsing the sidebar only
-                // fades in a LEFT gutter where the sidebar's used to be.
-                let melt_target = if inset { 1.0 } else { 0.0 };
-                let melt = self.eval_tween(
-                    self.sidebar_tween.map(|tw| WidthTween {
-                        from: 1.0 - melt_target,
-                        to: melt_target,
-                        started: tw.started,
-                    }),
-                    melt_target,
-                );
+                // gutter under the unified titlebar, constant left/right/
+                // bottom gutters, constant radius + hairline — the 8px left
+                // gap holds whether it borders the sidebar or the window edge.
                 // No top margin: the titlebar's own internal air (44px bar,
                 // 28px tabs) is the gap — an extra gutter read as a hole
                 // between the header and the app (user report).
@@ -3772,7 +3754,7 @@ impl Render for Shell {
                 let card: AnyElement = card
                     .mb(px(8.0))
                     .mr(px(right_gap))
-                    .ml(px(8.0 * (1.0 - melt)))
+                    .ml(px(8.0))
                     .rounded(px(12.0))
                     .border_color(border_color)
                     .into_any_element();
@@ -3797,6 +3779,23 @@ impl Render for Shell {
                             .left(px(-2.0)),
                     );
                 let title_bar = self.render_title_bar(cx);
+                // Sidebar tone: a slightly lighter column behind the sidebar,
+                // spanning the FULL window height (under the traffic lights,
+                // through the titlebar, down to the bottom edge). Its width
+                // rides the same tween as the sidebar, so the tone melts away
+                // with the collapse instead of vanishing in a frame.
+                let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
+                // Hairline on its right edge — full height like the tone,
+                // so the sidebar column reads as its own surface.
+                let sidebar_tone = div()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left_0()
+                    .w(px(sidebar_now))
+                    .bg(crate::theme::wash(0.05))
+                    .border_r_1()
+                    .border_color(border_color);
                 let page = div()
                     .size_full()
                     .flex()
@@ -3815,7 +3814,8 @@ impl Render for Shell {
                     )
                     .child(self.render_titlebar_cluster(cx))
                     .children(overlays);
-                root.child(motion::fade_in("phase-app", page))
+                root.child(sidebar_tone)
+                    .child(motion::fade_in("phase-app", page))
             }
             GatePhase::Loading => root, // splash overlay covers boot
             GatePhase::OrgGate => {
