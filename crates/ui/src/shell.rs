@@ -717,12 +717,31 @@ impl Shell {
         // completion rings on the Working→Idle edge — for ANY session on any
         // device. A row's first appearance only seeds the baseline, so boot
         // (restored rows) and fresh sends stay silent.
+        //
+        // STALENESS-GATED like the dot (`effective_indicator`), for the same
+        // reason: raw row statuses include the past. A dead turn's Working row
+        // (host killed mid-run, Idle write lost to a wedged room) seeded
+        // prev=Working here, and the moment the old Idle finally synced in —
+        // typically piggybacked on the round-trip of a fresh send — the chime
+        // heard a phantom Working→Idle and rang "done" on send (user report
+        // 2026-07-31). The dot never showed that ghost; the chime must judge
+        // by the identical clock.
         {
+            let now = Utc::now();
             let sessions: Vec<(String, komet_proto::SessionStatus)> = state
                 .read(cx)
                 .sessions
                 .iter()
-                .map(|s| (s.chat_id.clone(), s.status))
+                .map(|s| {
+                    use komet_proto::view::Indicator;
+                    let status = match komet_proto::view::effective_indicator(Some(s), now) {
+                        Indicator::Working => komet_proto::SessionStatus::Working,
+                        Indicator::AwaitingInput => komet_proto::SessionStatus::AwaitingInput,
+                        Indicator::Errored => komet_proto::SessionStatus::Errored,
+                        Indicator::None => komet_proto::SessionStatus::Idle,
+                    };
+                    (s.chat_id.clone(), status)
+                })
                 .collect();
             for (chat_id, status) in sessions {
                 let prev = self.sound_prev.insert(chat_id, status);

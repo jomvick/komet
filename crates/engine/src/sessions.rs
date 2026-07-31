@@ -258,8 +258,13 @@ impl SessionsEngine {
                 let user_id = message_id.unwrap_or_else(new_id);
                 let handle = self.doc_handle(chat_id)?;
                 handle.write_user_message(&user_id, &request.prompt, now_ms())?;
-                self.inner.note_message(chat_id, &request.prompt);
+                // Working BEFORE the lastMessageAt bump: both ride the
+                // workspace doc from this one peer, so causal order makes it
+                // impossible for an observer to hold [new message, old status]
+                // — that gap read as unseen-with-no-live-run = a phantom
+                // "completed" flash on every remote send (2026-07-31).
                 self.set_status(chat_id, SessionStatus::Working, false);
+                self.inner.note_message(chat_id, &request.prompt);
                 return Ok(run_id);
             }
             // Mailbox closed (runtime mid-teardown / non-steering harness): replace it.
@@ -270,7 +275,6 @@ impl SessionsEngine {
         let handle = self.doc_handle(chat_id)?;
         let user_id = message_id.unwrap_or_else(new_id);
         handle.write_user_message(&user_id, &request.prompt, now_ms())?;
-        self.inner.note_message(chat_id, &request.prompt);
 
         // Engine-owned resume (komet sessions.ts:736 — every dispatch read the
         // chat's stored harness session): callers always send `resume: None`;
@@ -325,6 +329,9 @@ impl SessionsEngine {
             },
         );
         self.set_status(chat_id, SessionStatus::Working, true);
+        // AFTER Working (same causal-order guarantee as the steer path): the
+        // lastMessageAt bump must never be observable ahead of the live run.
+        self.inner.note_message(chat_id, &request.prompt);
 
         // Name the chat NOW, off the first prompt — not after the first
         // exchange completes ("called New session for a long time for no
