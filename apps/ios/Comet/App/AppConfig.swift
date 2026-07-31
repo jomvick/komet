@@ -56,6 +56,7 @@ final class AppConfig: @unchecked Sendable {
             let client = AuthClient(baseURL: edgeURL)
             guard let refreshed = try? await client.refresh(refreshToken: current.refreshToken,
                                                             organizationId: orgId) else {
+                roomLog.error("auth: token refresh failed; using expired access token (server will reject and rooms will redial)")
                 return current.accessToken  // let the server reject; backoff redials
             }
             updateTokens(refreshed)

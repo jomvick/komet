@@ -199,6 +199,12 @@ impl SessionDoc {
     }
 
     /// Read all entries (continuations NOT joined — see `join_continuation_entries`).
+    ///
+    /// Malformed entries are SKIPPED, not fatal: a torn intermediate state
+    /// (an entry map imported before the update that fills its fields) or a
+    /// peer on a newer schema must degrade to a missing row, never blank the
+    /// whole transcript — one bad entry took down every publish for the chat
+    /// (2026-07-31, "missing field `id`" during a multi-update import).
     pub fn read_entries(&self) -> Result<Vec<SessionMessageEntry>, DocError> {
         let value = self.doc.get_deep_value().to_json_value();
         let messages = value
@@ -206,10 +212,23 @@ impl SessionDoc {
             .cloned()
             .unwrap_or(serde_json::json!([]));
         let raw: Vec<serde_json::Value> = serde_json::from_value(messages)?;
-        raw.into_iter().map(entry_from_json).collect()
+        Ok(raw
+            .into_iter()
+            .filter_map(|v| match entry_from_json(v) {
+                Ok(entry) => Some(entry),
+                Err(err) => {
+                    tracing::warn!(error = %err, "skipping malformed transcript entry");
+                    None
+                }
+            })
+            .collect())
     }
 
     /// Read the commands ledger.
+    ///
+    /// Same skip-not-fail policy as `read_entries`: any device can append
+    /// here, and one malformed entry must not wedge command draining for the
+    /// chat forever (an unparseable command can't be executed anyway).
     pub fn read_commands(&self) -> Result<Vec<SessionCommandEntry>, DocError> {
         let value = self.doc.get_deep_value().to_json_value();
         let commands = value
@@ -217,9 +236,16 @@ impl SessionDoc {
             .cloned()
             .unwrap_or(serde_json::json!([]));
         let raw: Vec<serde_json::Value> = serde_json::from_value(commands)?;
-        raw.into_iter()
-            .map(|v| serde_json::from_value(v).map_err(DocError::from))
-            .collect()
+        Ok(raw
+            .into_iter()
+            .filter_map(|v| match serde_json::from_value(v) {
+                Ok(entry) => Some(entry),
+                Err(err) => {
+                    tracing::warn!(error = %err, "skipping malformed command entry");
+                    None
+                }
+            })
+            .collect())
     }
 
     /// Append a command entry (rule 1: own entries only, append-only).

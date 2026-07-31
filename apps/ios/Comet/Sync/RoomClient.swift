@@ -8,6 +8,7 @@
 
 import Foundation
 import Loro
+import os
 
 enum RoomEvent {
     case connected
@@ -15,6 +16,11 @@ enum RoomEvent {
     case remoteUpdate
     case ephemeralUpdate
 }
+
+/// Sync must never fail silently (2026-07-31: a send that never left the
+/// device was indistinguishable from a working one — `try?` all the way
+/// down). Visible in Console.app / `log stream` under this subsystem.
+let roomLog = Logger(subsystem: "dev.kometnative.Komet", category: "sync")
 
 actor RoomClient {
     // Constants mirrored from room.rs.
@@ -120,6 +126,10 @@ actor RoomClient {
 
         Task {
             guard let url = await urlProvider() else {
+                // No URL = no token (refresh failed or signed out) — the
+                // single most confusing silent failure: everything cached
+                // renders, nothing syncs.
+                roomLog.error("room \(self.roomId, privacy: .public): no socket URL (token unavailable); backing off")
                 await self.scheduleReconnect(gen: gen)
                 return
             }
@@ -174,6 +184,7 @@ actor RoomClient {
 
     private func onSocketError(gen: Int) {
         guard gen == generation, !closed else { return }
+        roomLog.warning("room \(self.roomId, privacy: .public): session ended (joined=\(self.joinedLor)); redialing in \(self.backoffMs)ms")
         events(.disconnected)
         scheduleReconnect(gen: gen)
     }
@@ -197,6 +208,7 @@ actor RoomClient {
         guard gen == generation, let socket else { return }
         let silence = DispatchTime.now().uptimeNanoseconds - lastInbound.uptimeNanoseconds
         if silence > RoomClient.silenceLeaseNs {
+            roomLog.warning("room \(self.roomId, privacy: .public): socket silent past lease; treating as dead")
             onSocketError(gen: gen)
             return
         }
@@ -220,6 +232,7 @@ actor RoomClient {
                 // The 2026-07-30 hang: a room that accepted the socket but
                 // never answered the join. Redial via the backoff loop — one
                 // fresh dial re-instantiates a wedged DO.
+                roomLog.warning("room \(self.roomId, privacy: .public): no JoinResponseOk within deadline; room presumed wedged, redialing")
                 onSocketError(gen: gen)
             }
             return
@@ -278,7 +291,8 @@ actor RoomClient {
         case .joinResponseOk(let crdt, _, _, let version, _):
             await onJoinOk(crdt: crdt, version: version)
 
-        case .joinError(let crdt, _, let code, _):
+        case .joinError(let crdt, _, let code, let message):
+            roomLog.error("room \(self.roomId, privacy: .public): join error \(String(describing: code), privacy: .public): \(message, privacy: .public)")
             if crdt == .loro {
                 if code == .versionUnknown {
                     // Server can't diff from our VV — full snapshot backfill.
@@ -364,6 +378,7 @@ actor RoomClient {
                 // re-broadcast .connected on a timer.
                 return
             }
+            roomLog.info("room \(self.roomId, privacy: .public): joined")
             // Join presence once the doc room is up.
             await send(.joinRequest(crdt: .loroEphemeral, roomId: roomId, auth: [], version: []))
             events(.connected)
@@ -385,6 +400,7 @@ actor RoomClient {
                     imported = true
                 } else if !fullResyncRequested {
                     fullResyncRequested = true
+                    roomLog.error("room \(self.roomId, privacy: .public): remote update failed to import; requesting full snapshot resync")
                     Task { await self.sendJoinLoro(version: []) }
                 }
             }
@@ -427,12 +443,14 @@ actor RoomClient {
                 await sendLoroUpdates(batch)
             }
         case .invalidUpdate, .permissionDenied:
+            roomLog.error("room \(self.roomId, privacy: .public): update rejected (\(String(describing: status), privacy: .public)); rejoining (\(self.invalidRejoins)/\(RoomClient.maxInvalidRejoins))")
             pending.removeValue(forKey: refId)
             if crdt == .loro, invalidRejoins < RoomClient.maxInvalidRejoins {
                 invalidRejoins += 1
                 await sendJoinLoro(version: localVersionBytes())
             }
         default:
+            roomLog.warning("room \(self.roomId, privacy: .public): ack status \(String(describing: status), privacy: .public)")
             pending.removeValue(forKey: refId)
         }
     }
@@ -441,7 +459,14 @@ actor RoomClient {
 
     /// Called by the doc store on local commit (subscribeLocalUpdate bytes).
     func sendLocalUpdate(_ update: [UInt8]) async {
-        guard joinedLor else { return }  // resubmit-from-VV covers pre-join commits
+        guard joinedLor else {
+            // Not lost — the commit is durable in the doc and the next
+            // successful join resubmits from VV. But it IS invisible to the
+            // user, so say so loudly (2026-07-31: sends queued behind a
+            // failing join looked exactly like a working app).
+            roomLog.warning("room \(self.roomId, privacy: .public): local update (\(update.count)B) deferred — not joined; will resubmit on join")
+            return
+        }
         await sendLoroUpdates([update])
     }
 
