@@ -1,6 +1,8 @@
-# komet-native
+# Komet
 
 Control your coding agents (Claude Code, Codex) from any of your devices.
+
+![Komet running a Claude Code session](docs/screenshot.png)
 
 Every device runs a small engine that keeps your sessions in sync: start an
 agent on one machine, follow and drive it from another. Install the engine as
