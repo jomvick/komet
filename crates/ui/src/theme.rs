@@ -64,11 +64,11 @@ impl Theme {
     /// Frost translucency over the blurred window background (macOS vibrancy).
     /// Opaque elsewhere: Linux/Windows get no compositor-blur guarantee, and a
     /// merely transparent window would show raw desktop through the sidebar.
-    /// Darkness matched by eye to anara desktop's dark glass. Anara's scrim is
-    /// 0.76 over `hsl(0 0% 3%)`, but it sits on Electron's `under-window`
-    /// vibrancy MATERIAL, which pre-darkens the blur; our bare backdrop blur
-    /// has no material layer, so the scrim runs heavier to land on the same
-    /// perceived tone (see [`Theme::glass`]).
+    /// Darkness matched by eye to a reference Electron app's dark glass. That
+    /// scrim is 0.76 over `hsl(0 0% 3%)`, but it sits on Electron's
+    /// `under-window` vibrancy MATERIAL, which pre-darkens the blur; our bare
+    /// backdrop blur has no material layer, so the scrim runs heavier to land
+    /// on the same perceived tone (see [`Theme::glass`]).
     pub const GLASS_ALPHA: f32 = if cfg!(target_os = "macos") { 0.90 } else { 1.0 };
     /// Main-panel header height (komet `h-11`) — in-card headers (changes pane).
     pub const HEADER_HEIGHT: f32 = 44.0;
@@ -94,7 +94,7 @@ impl Theme {
     pub const SPACE_LG: f32 = 16.0;
 
     /// The frost tint painted over the blurred window background (macOS
-    /// glass). Darker than `surface` — matched to anara desktop's dark
+    /// glass). Darker than `surface` — matched to the reference dark
     /// vibrancy scrim: `hsl(0 0% 3%)` (#080808) at [`Self::GLASS_ALPHA`].
     /// On opaque platforms this IS the surface tone (no tint swap).
     pub fn glass(&self) -> Hsla {

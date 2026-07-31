@@ -81,7 +81,7 @@ fn scene() -> App {
     })));
     app.apply(Update::Spaces(vec![
         space("s1", "/home/w/komet-native"),
-        space("s2", "/home/w/anara"),
+        space("s2", "/home/w/website"),
     ]));
     app.apply(Update::Chats(vec![
         chat("c1", "Unpeel App Decompilation", "s1", 24),
