@@ -37,6 +37,11 @@ pub struct ComposerDefaults {
     pub model_by_harness: HashMap<HarnessId, RememberedModel>,
     /// Last reasoning level picked (global, like komet's `reasoning` key).
     pub reasoning: Option<ReasoningLevel>,
+    /// Every model label ever seen (id → label), fed from catalog loads.
+    /// The chip's fallback while a harness's list is still loading — a
+    /// session whose configured model differs from the remembered pick
+    /// would otherwise flash the raw id on switch.
+    pub model_labels: HashMap<String, String>,
 }
 
 impl ComposerDefaults {
@@ -79,6 +84,27 @@ impl ComposerDefaults {
         self.harness = Some(harness);
         self.model_by_harness
             .insert(harness, RememberedModel { id, label });
+    }
+
+    /// The cached display label for a model id, if ever seen.
+    pub fn label_for(&self, id: &str) -> Option<&str> {
+        self.model_labels.get(id).map(String::as_str)
+    }
+
+    /// Merge a loaded catalog into the label cache. Returns whether anything
+    /// changed (callers only save when it did).
+    pub fn remember_labels<'a>(
+        &mut self,
+        models: impl Iterator<Item = (&'a str, &'a str)>,
+    ) -> bool {
+        let mut changed = false;
+        for (id, label) in models {
+            if self.model_labels.get(id).map(String::as_str) != Some(label) {
+                self.model_labels.insert(id.to_string(), label.to_string());
+                changed = true;
+            }
+        }
+        changed
     }
 }
 

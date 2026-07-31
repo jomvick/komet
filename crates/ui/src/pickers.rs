@@ -682,6 +682,14 @@ impl Pickers {
                     },
                     Err(err) => Loadable::Error(err.to_string()),
                 };
+                if let Loadable::Ready(models) = &loaded {
+                    let fresh = pickers.defaults.remember_labels(
+                        models.iter().map(|m| (m.id.as_str(), m.label.as_str())),
+                    );
+                    if fresh {
+                        pickers.save_defaults();
+                    }
+                }
                 pickers.models.insert(harness, loaded);
                 cx.notify();
             })
@@ -2390,6 +2398,7 @@ impl Render for Pickers {
                         remembered
                             .filter(|m| m.id == id)
                             .map(|m| m.label.clone())
+                            .or_else(|| self.defaults.label_for(id).map(str::to_string))
                             .unwrap_or_else(|| id.to_string()),
                     ),
                     None => remembered.map(|m| m.label.clone()),

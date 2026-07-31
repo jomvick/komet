@@ -952,9 +952,8 @@ impl Changes {
                             .px(px(6.0))
                             .py(px(2.0))
                             .rounded(px(4.0))
-                            .border_1()
-                            .border_color(theme.warning)
-                            .text_color(theme.warning)
+                            .bg(theme.warning.opacity(0.08))
+                            .text_color(theme.warning.opacity(0.75))
                             .child(SharedString::from("Partial snapshot")),
                     )
                 })
