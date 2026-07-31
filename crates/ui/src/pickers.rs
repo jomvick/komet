@@ -278,6 +278,9 @@ pub struct Pickers {
     refs_space: Option<String>,
     /// Highlighted row in the open list (keyboard nav).
     active: usize,
+    /// Models-list scroll — keyboard nav keeps the highlighted row in view
+    /// (`scroll_to_item`; the add-space palette standard).
+    model_scroll: gpui::ScrollHandle,
     /// Shared search / URL / name input, reused across popovers.
     search: Entity<ComposerInput>,
     focus: FocusHandle,
@@ -375,6 +378,7 @@ impl Pickers {
             refs: Loadable::Idle,
             refs_space: None,
             active: 0,
+            model_scroll: gpui::ScrollHandle::new(),
             search,
             focus: cx.focus_handle(),
             suppressed: None,
@@ -542,6 +546,14 @@ impl Pickers {
         cx.notify();
     }
 
+    /// Capture knob (`KOMET_OPEN_DIALOG=model`): open the combined
+    /// harness/model menu programmatically.
+    pub fn open_model_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.open != Some(PickerKind::HarnessModel) {
+            self.toggle(PickerKind::HarnessModel, window, cx);
+        }
+    }
+
     fn toggle(&mut self, kind: PickerKind, window: &mut Window, cx: &mut Context<Self>) {
         // Model + traits merged into ONE menu (user request): the traits chip
         // opens the combined harness/model/reasoning popover.
@@ -578,6 +590,9 @@ impl Pickers {
             PickerKind::Branch => self.selected_ref_index(cx),
             _ => 0,
         };
+        if kind == PickerKind::HarnessModel {
+            self.model_scroll.set_offset(gpui::Point::default());
+        }
         // Searchable pickers focus the filter input (it sits inside the frame,
         // so the frame's key handler still sees arrows/Enter); the rest focus
         // the frame itself for pure keyboard nav.
@@ -973,6 +988,7 @@ impl Pickers {
         self.config.harness = Some(harness);
         self.defaults.harness = Some(harness);
         self.save_defaults();
+        self.model_scroll.set_offset(gpui::Point::default());
         self.ensure_models(harness, cx);
         cx.notify();
     }
@@ -1307,6 +1323,15 @@ impl Pickers {
                     None => 0,
                 };
                 self.active = popover::menu_step(Some(self.active), count, delta).unwrap_or(0);
+                // Keep the highlighted MODEL row in view (the rows are the
+                // scroll container's direct children, so indices map 1:1);
+                // the traits chips below live in the pinned tray and never
+                // need scrolling into view.
+                if self.open == Some(PickerKind::HarnessModel)
+                    && self.active < self.model_rows_len(cx)
+                {
+                    self.model_scroll.scroll_to_item(self.active);
+                }
                 cx.notify();
             }
             MenuKey::Enter if !search_focused => {
@@ -1879,6 +1904,7 @@ impl Pickers {
         let theme = Theme::of(cx).clone();
         let locked = self.harness_locked(cx);
         let effective = self.effective_harness(cx);
+        let model_scroll = self.model_scroll.clone();
 
         let rail: AnyElement = match &self.harnesses {
             Loadable::Loading | Loadable::Idle => div()
@@ -1905,29 +1931,28 @@ impl Pickers {
                 {
                     descriptors.insert(0, descriptor.clone());
                 }
+                // Vertical agents rail (the palette's Devices-rail language):
+                // brand icon + name per row, active carries the glass ring.
                 div()
                     .flex()
-                    .flex_row()
-                    .gap(px(4.0))
+                    .flex_col()
+                    .gap(px(2.0))
                     .p(px(4.0))
+                    .child(popover::menu_heading(&theme, "Agents"))
                     .children(descriptors.into_iter().enumerate().map(|(ix, descriptor)| {
                         let harness = descriptor.id;
                         let is_viewed = effective == Some(harness);
                         let is_disabled = locked && !is_viewed;
                         let (icon_path, tint) = harness_brand_icon(harness);
-                        let _ = &descriptor.name;
-                        // Horizontal brand tab, ICON ONLY (user request):
-                        // active wash on the viewed harness; the menu heading
-                        // right below names it.
+                        let name: SharedString = descriptor.name.clone().into();
                         div()
                             .id(("harness-tab", ix))
-                            .flex_1()
-                            .h(px(32.0))
+                            .h(px(30.0))
+                            .px(px(8.0))
                             .flex()
                             .flex_row()
                             .items_center()
-                            .justify_center()
-                            .gap(px(6.0))
+                            .gap(px(8.0))
                             .rounded(px(8.0))
                             .text_size(px(12.0))
                             .font_weight(gpui::FontWeight::MEDIUM)
@@ -1936,7 +1961,10 @@ impl Pickers {
                             } else {
                                 theme.text_muted
                             })
-                            .when(is_viewed, |el| el.bg(crate::theme::white_alpha(0.10)))
+                            .when(is_viewed, |el| {
+                                el.bg(crate::theme::glass_selected_bg())
+                                    .shadow(crate::theme::glass_selected_shadows())
+                            })
                             .when(is_disabled, |el| el.opacity(0.35))
                             .when(!is_disabled, |el| {
                                 el.cursor_pointer()
@@ -1945,45 +1973,35 @@ impl Pickers {
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.pick_harness(harness, cx);
                             }))
-                            .child(crate::icons::icon(icon_path).size(px(18.0)).text_color(
+                            .child(crate::icons::icon(icon_path).size(px(16.0)).flex_none().text_color(
                                 tint.unwrap_or(if is_viewed {
                                     theme.text
                                 } else {
                                     theme.text_muted
                                 }),
                             ))
+                            .child(div().min_w_0().truncate().child(name))
                     }))
                     .into_any_element()
             }
         };
 
-        let heading_label = {
-            let name = self
-                .harnesses
-                .ready()
-                .and_then(|list| {
-                    list.iter()
-                        .find(|d| Some(d.id) == effective)
-                        .map(|d| d.name.clone())
-                })
-                .unwrap_or_else(|| "Models".to_string());
-            let _ = locked; // the lock still dims foreign tabs above
-            name
-        };
+        let _ = locked; // the lock still dims foreign rail rows above
 
-        let models: AnyElement = match effective.map(|h| (h, self.models.get(&h))) {
+        // The rows are collected FLAT — they become the scroll container's
+        // direct children so `scroll_to_item(active)` maps 1:1 (the palette's
+        // keyboard-follow standard).
+        let model_children: Vec<AnyElement> = match effective.map(|h| (h, self.models.get(&h))) {
             Some((_, Some(Loadable::Ready(models)))) => {
                 // The check mirrors the chip: the resolved concrete pick (draft
                 // / chat config / remembered, else the harness default row).
                 let selected = self.selected_model(cx).map(|m| m.id.clone());
                 let active = self.active;
                 let models = models.clone();
-                div()
-                    .id("model-list")
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.0))
-                    .children(models.into_iter().enumerate().map(|(ix, model)| {
+                models
+                    .into_iter()
+                    .enumerate()
+                    .map(|(ix, model)| {
                         let label: SharedString = model.label.clone().into();
                         let description: Option<SharedString> =
                             model.description.clone().map(Into::into);
@@ -1996,6 +2014,9 @@ impl Pickers {
                             ix == active,
                             format!("model-row-{ix}"),
                         )
+                        .when(is_selected || ix == active, |el| {
+                            el.shadow(crate::theme::glass_selected_shadows())
+                        })
                         .id(("model-row", ix))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.pick_model(id.clone(), cx);
@@ -2021,77 +2042,138 @@ impl Pickers {
                                 }),
                         )
                         .when(is_selected, |el| el.child(popover::menu_check(&theme)))
-                    }))
-                    .into_any_element()
+                        .into_any_element()
+                    })
+                    .collect()
             }
             Some((_, Some(Loadable::Error(message)))) => {
                 let message = message.clone();
-                self.retry_row(
+                vec![self.retry_row(
                     "model-retry",
                     &message,
                     PickerKind::HarnessModel,
                     &theme,
                     cx,
-                )
+                )]
             }
-            _ => div()
-                .px(px(8.0))
-                .py(px(24.0))
-                .text_size(px(12.0))
-                .text_color(theme.text_muted.opacity(0.6))
-                .text_center()
-                .child(SharedString::from("Loading models…"))
-                .into_any_element(),
+            _ => vec![
+                div()
+                    .px(px(8.0))
+                    .py(px(24.0))
+                    .text_size(px(12.0))
+                    .text_color(theme.text_muted.opacity(0.6))
+                    .text_center()
+                    .child(SharedString::from("Loading models…"))
+                    .into_any_element(),
+            ],
         };
 
         // One combined menu (user request): harness tabs across the top,
         // then the viewed harness's models, then the reasoning ladder and
         // model options that used to live in the separate traits popover.
         let traits = self.render_traits_sections(self.model_rows_len(cx), cx);
+        // The palette architecture: agents rail LEFT, models pane beside it
+        // with the traits INSPECTOR pinned below (models are the decision;
+        // reasoning/options are properties of it — they never scroll away
+        // with the list), legend footer under everything. FIXED height so
+        // harness switches and loading skeletons don't resize the card.
         div()
-            .max_h(px(420.0))
+            .h(px(420.0))
             .flex()
             .flex_col()
             .child(
                 div()
-                    .flex_none()
-                    .border_b_1()
-                    .border_color(crate::theme::white_alpha(0.07))
-                    .bg(crate::theme::white_alpha(0.02))
-                    .child(rail),
-            )
-            .child(
-                // ONE scroll surface for models + reasoning + options — a
-                // nested models scroller clipped the traits tail against the
-                // menu's max height.
-                div()
-                    .id("model-menu-scroll")
                     .flex_1()
                     .min_h_0()
                     .flex()
-                    .flex_col()
-                    .p(px(4.0))
-                    .overflow_y_scroll()
-                    .child(popover::menu_heading(&theme, &heading_label))
-                    .child(models)
+                    .flex_row()
+                    .items_stretch()
                     .child(
                         div()
-                            .mt(px(4.0))
-                            .pt(px(4.0))
-                            .border_t_1()
-                            .border_color(crate::theme::white_alpha(0.07))
-                            .child(traits),
+                            .w(px(148.0))
+                            .flex_none()
+                            .border_r_1()
+                            .border_color(crate::theme::white_alpha(0.06))
+                            .child(rail),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                // Pinned heading (the palette's crumbs slot).
+                                div()
+                                    .flex_none()
+                                    .px(px(4.0))
+                                    .pt(px(4.0))
+                                    .child(popover::menu_heading(&theme, "Models")),
+                            )
+                            .child(
+                                // Models scroll — gutters on the WRAPPER,
+                                // outside the scroll viewport (in-content
+                                // bottom padding is eaten by the extent), and
+                                // rows as DIRECT children so keyboard
+                                // `scroll_to_item` indices line up.
+                                div().flex_1().min_h_0().pb(px(4.0)).child(
+                                    div()
+                                        .id("model-menu-scroll")
+                                        .size_full()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(2.0))
+                                        .px(px(4.0))
+                                        .overflow_y_scroll()
+                                        .track_scroll(&model_scroll)
+                                        .children(model_children),
+                                ),
+                            )
+                            .child(
+                                // The pinned inspector tray (scrolls only if
+                                // a model advertises many option groups).
+                                div()
+                                    .id("model-traits-scroll")
+                                    .flex_none()
+                                    .max_h(px(190.0))
+                                    .overflow_y_scroll()
+                                    .border_t_1()
+                                    .border_color(crate::theme::white_alpha(0.06))
+                                    .p(px(4.0))
+                                    .child(traits),
+                            ),
                     ),
+            )
+            .child(
+                // The palette's legend footer, on the recessed band.
+                div()
+                    .flex_none()
+                    .bg(popover::band())
+                    .border_t_1()
+                    .border_color(crate::theme::white_alpha(0.06))
+                    .px(px(12.0))
+                    .py(px(8.0))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(12.0))
+                    .child(popover::key_hint_pair(
+                        &theme,
+                        crate::icons::ARROW_UP,
+                        crate::icons::ARROW_DOWN,
+                        "Navigate",
+                    ))
+                    .child(popover::key_hint(&theme, crate::icons::RETURN, "Select")),
             )
             .into_any_element()
     }
 
-    /// The reasoning ladder plus every advertised model option as headed row
-    /// sections (formerly the separate traits popover — komet
-    /// traits-picker.tsx; now the tail of the combined model menu). Selecting
-    /// keeps the menu open; the selected row carries the check. `nav_offset`
-    /// is the flat keyboard index where these rows start (the model rows
-    /// come first in the combined menu).
+    /// The traits INSPECTOR: the reasoning ladder plus every advertised
+    /// model option as headed segmented-chip sections, pinned under the
+    /// models pane (formerly menu rows in the shared scroll). Selecting
+    /// keeps the menu open; the active chip carries the wash + ring.
+    /// `nav_offset` is the flat keyboard index where these chips start (the
+    /// model rows come first in the combined index).
     fn render_traits_sections(&mut self, nav_offset: usize, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let Some(model) = self.selected_model(cx).cloned() else {
@@ -2112,29 +2194,24 @@ impl Pickers {
             div()
                 .flex()
                 .flex_col()
-                .gap(px(2.0))
                 .child(popover::menu_heading(&theme, "Reasoning"))
-                .children(levels.into_iter().enumerate().map(|(ix, level)| {
-                    let is_active = current == Some(level);
-                    popover::menu_row_nav(
-                        &theme,
-                        is_active,
-                        ix == nav_active,
-                        format!("reasoning-row-{ix}"),
-                    )
-                    .id(("reasoning-row", ix))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.pick_reasoning(level, cx);
-                    }))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .child(SharedString::from(reasoning_label(level))),
-                    )
-                    .when(is_active, |el| el.child(popover::menu_check(&theme)))
-                }))
+                .child(
+                    div()
+                        .px(px(4.0))
+                        .flex()
+                        .flex_row()
+                        .flex_wrap()
+                        .gap(px(4.0))
+                        .children(levels.into_iter().enumerate().map(|(ix, level)| {
+                            let is_active = current == Some(level);
+                            trait_chip(&theme, is_active, ix == nav_active)
+                                .id(("reasoning-row", ix))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.pick_reasoning(level, cx);
+                                }))
+                                .child(SharedString::from(reasoning_label(level)))
+                        })),
+                )
                 .into_any_element()
         };
 
@@ -2169,66 +2246,77 @@ impl Pickers {
                     div()
                         .flex()
                         .flex_col()
-                        .gap(px(2.0))
                         .child(popover::menu_heading(&theme, &option.label))
-                        .children(
-                            option
-                                .choices
-                                .iter()
-                                .enumerate()
-                                .map(|(choice_ix, choice)| {
-                                    let is_active = selected_choice == choice.id;
-                                    let choice_id = choice.id.clone();
-                                    let option_id = option_id.clone();
-                                    let is_default = choice.id == default_choice;
-                                    popover::menu_row_nav(
-                                        &theme,
-                                        is_active,
-                                        option_base + choice_ix == nav_active,
-                                        format!("trait-choice-{opt_ix}-{choice_ix}"),
-                                    )
-                                    .id(("trait-choice", opt_ix * 32 + choice_ix))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.pick_option(
-                                            option_id.clone(),
-                                            choice_id.clone(),
-                                            is_default,
-                                            cx,
-                                        );
-                                    }))
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .truncate()
-                                            .flex()
-                                            .flex_row()
-                                            .gap(px(4.0))
-                                            .child(SharedString::from(choice.label.clone()))
-                                            .when(is_default, |el| {
-                                                el.child(
-                                                    div()
-                                                        .text_color(theme.text_muted.opacity(0.5))
-                                                        .child(SharedString::from("(default)")),
-                                                )
-                                            }),
-                                    )
-                                    .when(is_active, |el| el.child(popover::menu_check(&theme)))
-                                }),
+                        .child(
+                            div()
+                                .px(px(4.0))
+                                .flex()
+                                .flex_row()
+                                .flex_wrap()
+                                .gap(px(4.0))
+                                .children(option.choices.iter().enumerate().map(
+                                    |(choice_ix, choice)| {
+                                        let is_active = selected_choice == choice.id;
+                                        let choice_id = choice.id.clone();
+                                        let option_id = option_id.clone();
+                                        let is_default = choice.id == default_choice;
+                                        trait_chip(
+                                            &theme,
+                                            is_active,
+                                            option_base + choice_ix == nav_active,
+                                        )
+                                        .id(("trait-choice", opt_ix * 32 + choice_ix))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.pick_option(
+                                                option_id.clone(),
+                                                choice_id.clone(),
+                                                is_default,
+                                                cx,
+                                            );
+                                        }))
+                                        .child(SharedString::from(choice.label.clone()))
+                                    },
+                                )),
                         )
                 }));
 
         div()
             .flex()
             .flex_col()
-            .gap(px(2.0))
-            // komet traits-picker.tsx `max-h-[min(640px,75vh)]` (the frame's
-            // own max-height caps it against short windows).
-            .max_h(px(640.0))
+            .gap(px(4.0))
+            .pb(px(4.0))
             .child(ladder)
             .child(options)
             .into_any_element()
     }
+}
+
+/// A segmented choice chip for the traits inspector (reasoning ladder /
+/// model options): the key-cap voice — every chip carries a faint fill so it
+/// reads as a pressable segment (bare text read as labels, not buttons);
+/// the active/keyboard-highlighted chip adds the app-wide wash + glass ring.
+/// The caller adds id/click/label.
+fn trait_chip(theme: &Theme, active: bool, highlighted: bool) -> gpui::Div {
+    div()
+        .h(px(24.0))
+        .px(px(10.0))
+        .rounded(px(6.0))
+        .flex()
+        .flex_row()
+        .items_center()
+        .text_size(px(11.5))
+        .cursor_pointer()
+        .when(active, |el| {
+            el.bg(crate::theme::glass_selected_bg()).text_color(theme.text)
+        })
+        .when(!active, |el| {
+            el.bg(crate::theme::white_alpha(0.04))
+                .text_color(theme.text_muted.opacity(0.7))
+                .hover(|s| s.bg(theme.element_hover))
+        })
+        .when(active || highlighted, |el| {
+            el.shadow(crate::theme::glass_selected_shadows())
+        })
 }
 
 /// Brand mark + optional tint for a harness (the Claude mark keeps its brand
@@ -2433,7 +2521,7 @@ impl Render for Pickers {
                 let content = self.render_harness_model_popover(cx);
                 Some((
                     PickerKind::HarnessModel,
-                    self.popover_frame_flush(320.0, content, cx),
+                    self.popover_frame_flush(460.0, content, cx),
                 ))
             }
             // Traits merged into the HarnessModel popover.

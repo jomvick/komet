@@ -1723,6 +1723,13 @@ impl Composer {
         composer
     }
 
+    /// Capture-knob passthrough (`KOMET_OPEN_DIALOG=model`): open the
+    /// combined harness/model menu.
+    pub fn debug_open_model_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.pickers
+            .update(cx, |pickers, cx| pickers.open_model_menu(window, cx));
+    }
+
     pub fn is_sending(&self) -> bool {
         self.sending
     }

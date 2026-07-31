@@ -52,7 +52,7 @@ mod tabs;
 
 use spaces::{AddSpaceFlow, RenameSpaceDialog};
 
-actions!(shell, [ToggleSidebar, ToggleChanges]);
+actions!(shell, [ToggleSidebar, ToggleChanges, AddSpacePalette]);
 
 // ---------------------------------------------------------------------------
 // Traffic-light-aware titlebar layout (feature-inventory §1.1)
@@ -131,6 +131,9 @@ pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
             ToggleTerminal,
             None,
         ),
+        // Fixed: ⌘K summons the add-space palette (the ⌘K chip in its search
+        // bar); pressing it again dismisses.
+        KeyBinding::new(&platform_combo("mod-k"), AddSpacePalette, None),
     ]);
 }
 
@@ -602,7 +605,8 @@ impl Shell {
             _ => Route::Chat,
         };
         // More capture knobs of the same kind: `KOMET_OPEN_DIALOG=rename|delete`
-        // opens that dialog for the first chat once chats land;
+        // opens that dialog for the first chat once chats land; `=model` pops
+        // the combined harness/model menu once the shell is Ready;
         // `KOMET_FORCE_GATE=signin|org|failed` renders that gate regardless of
         // real auth state (display-only — for styling passes).
         let debug_dialog = std::env::var("KOMET_OPEN_DIALOG").ok();
@@ -3679,6 +3683,14 @@ impl Render for Shell {
                 if matches!(this.route, Route::Chat) {
                     this.toggle_right_pane(cx)
                 }
+            }))
+            .on_action(cx.listener(|this, _: &AddSpacePalette, _, cx| {
+                if this.add_space.is_some() {
+                    this.add_space = None;
+                    cx.notify();
+                } else {
+                    this.open_add_space(cx);
+                }
             }));
 
         let root = match &gate {
@@ -3698,6 +3710,14 @@ impl Render for Shell {
                         self.state
                             .update(cx, |s, cx| s.mark_chat_seen(&chat_id, cx));
                     }
+                }
+                // Capture knob: `KOMET_OPEN_DIALOG=model` pops the combined
+                // harness/model menu (needs `window`, so it fires here rather
+                // than in `on_state_changed`).
+                if self.debug_dialog.as_deref() == Some("model") {
+                    self.debug_dialog = None;
+                    self.composer
+                        .update(cx, |c, cx| c.debug_open_model_menu(window, cx));
                 }
                 // MessageRail width gate: hide below 48rem of main-panel width.
                 let viewport = f32::from(window.viewport_size().width);

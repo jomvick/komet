@@ -69,6 +69,9 @@ icon_assets![
     (ARROW_LEFT, "arrow-left"),
     (ARROW_RIGHT, "arrow-right"),
     (ARROW_UP, "arrow-up"),
+    // arrow-up mirrored (like the sidebar flip) — the Solar Linear set here
+    // has no plain arrow-down.
+    (ARROW_DOWN, "arrow-down"),
     // Hand-drawn return/enter arrow in the Solar Linear style (like the
     // terminal/plus/close ports) — the set has no return glyph.
     (RETURN, "return"),
@@ -95,6 +98,9 @@ icon_assets![
     (CHECKLIST, "checklist"),
     (WIDGET, "widget"),
     (CLOSE_CIRCLE, "close-circle"),
+    // Hand-drawn info glyph in the Solar Linear style (like the terminal/
+    // plus/return ports) — the embedded set has no info-circle.
+    (INFO_CIRCLE, "info-circle"),
     (DANGER_TRIANGLE, "danger-triangle"),
     (CHAT_ROUND_LINE, "chat-round-line"),
     // Hand-drawn komet glyphs (terminal-panel.tsx / composer-actions.tsx /

@@ -392,6 +392,85 @@ pub fn menu_check(theme: &Theme) -> impl IntoElement {
         .text_color(theme.text.opacity(0.7))
 }
 
+/// The recessed band tone for a palette/picker header or footer strip — a
+/// translucent black so the glass still reads through (the add-space palette
+/// converged on this; measured subtler tones vanish against the dim scrim).
+pub fn band() -> gpui::Hsla {
+    gpui::hsla(0.0, 0.0, 0.0, 0.16)
+}
+
+/// One footer key-cap (22px, rounded-5, `white/[0.05]`) holding arbitrary
+/// children — the base of [`key_hint`]/[`key_hint_pair`] and the search-bar
+/// chips ("⌘K", "esc").
+pub fn key_cap(_theme: &Theme) -> gpui::Div {
+    div()
+        .h(px(22.0))
+        .px(px(5.0))
+        .rounded(px(5.0))
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_center()
+        .gap(px(4.0))
+        .bg(white_alpha(0.05))
+}
+
+/// The tiny verb after a key-cap.
+fn key_hint_label(theme: &Theme, label: &'static str) -> gpui::Div {
+    div()
+        .text_size(px(10.5))
+        .text_color(theme.text_muted.opacity(0.45))
+        .child(SharedString::from(label))
+}
+
+/// A footer legend: one icon key-cap + tiny verb (the add-space palette's
+/// footer voice, shared by the pickers).
+pub fn key_hint(theme: &Theme, icon_path: &'static str, label: &'static str) -> gpui::Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(5.0))
+        .child(
+            key_cap(theme).child(
+                crate::icons::icon(icon_path)
+                    .size(px(12.5))
+                    .text_color(theme.text_muted.opacity(0.7)),
+            ),
+        )
+        .child(key_hint_label(theme, label))
+}
+
+/// A footer legend whose cap holds TWO glyphs split by a hairline
+/// ("[ ↑ | ↓ ] Navigate") sharing one verb.
+pub fn key_hint_pair(
+    theme: &Theme,
+    first: &'static str,
+    second: &'static str,
+    label: &'static str,
+) -> gpui::Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(5.0))
+        .child(
+            key_cap(theme)
+                .child(
+                    crate::icons::icon(first)
+                        .size(px(12.5))
+                        .text_color(theme.text_muted.opacity(0.7)),
+                )
+                .child(div().w(px(1.0)).h(px(11.0)).bg(white_alpha(0.10)))
+                .child(
+                    crate::icons::icon(second)
+                        .size(px(12.5))
+                        .text_color(theme.text_muted.opacity(0.7)),
+                ),
+        )
+        .child(key_hint_label(theme, label))
+}
+
 /// A muted kbd hint chip inside menu rows (`⌘↵`-style accelerators).
 pub fn kbd_hint(theme: &Theme, label: &str) -> gpui::Div {
     div()
