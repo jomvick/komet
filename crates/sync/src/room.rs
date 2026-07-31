@@ -57,12 +57,76 @@ const EPHEMERAL_TIMEOUT_MS: i64 = 30_000;
 /// device relay's (crates/rpc/src/device_room.rs): an idle-flow reaper on a
 /// laptop's uplink can fire inside a minute, and a 30s keepalive races it.
 const PING_INTERVAL: Duration = Duration::from_secs(15);
-/// Silence lease: every ping elicits an auto-pong, so a healthy socket sees
-/// inbound traffic at least once per `PING_INTERVAL`. No inbound frame for a
-/// couple of intervals plus grace = the socket is dead (half-open TCP after a
-/// NAT timeout or sleep/wake) — drop it and let the reconnect loop take over
-/// instead of waiting minutes for a TCP write failure.
+/// Silence lease (TRANSPORT level): every ping elicits an auto-pong, so a
+/// healthy socket sees inbound traffic at least once per `PING_INTERVAL`. No
+/// inbound frame for a couple of intervals plus grace = the socket is dead
+/// (half-open TCP after a NAT timeout or sleep/wake) — drop it and let the
+/// reconnect loop take over instead of waiting minutes for a TCP write
+/// failure. Auto-pongs satisfy this lease ON PURPOSE: they are real proof the
+/// TCP path works. What they are NOT is proof the room works — the CF runtime
+/// answers them without ever waking the DO — so room-level liveness is
+/// enforced separately (`JOIN_RESPONSE_DEADLINE` / `ROOM_PROBE_AFTER` below).
 const SILENCE_LEASE: Duration = Duration::from_secs(40);
+/// Bound on one whole dial, enforced around `Connector::connect` in
+/// `RoomActor::run` so it covers every connector. For the production
+/// `WsConnector` both `provider.url()` (a token-endpoint HTTP call) and
+/// `connect_async` (a blackholed SYN on a dead uplink) can hang for minutes
+/// on their own, wedging the actor with no session, no error, and no log
+/// line. Expiry maps to `SyncError::WebSocket` and the normal backoff redial.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// INCIDENT (2026-07-30): the workspace DO (`ws3/{orgId}/{userId}`) refused
+/// upgrades for ~3 minutes, then accepted sockets whose JoinRequests it never
+/// processed. The ping→pong auto-response kept resetting the silence lease —
+/// pongs prove only that Cloudflare is up, never that the room is — and with
+/// `joined_lor` false nothing was ever pushed, so no binary frame arrived to
+/// betray the wedge either. All four engines sat on dead-but-healthy-looking
+/// sockets for 3+ hours with ZERO log lines; recovery took a manual engine
+/// restart. The two constants below make a mute room a redial, never a hang.
+///
+/// Every `%LOR` JoinRequest we send (initial join, stale-peer rejoin,
+/// liveness probe) must be answered within this window or the session ends
+/// `Lost` and the backoff loop redials. Armed only while a join is actually
+/// in flight — an established session with no join outstanding is never
+/// killed by it. Generous vs. the sub-second happy path because a cold DO
+/// replays its whole update log before answering.
+const JOIN_RESPONSE_DEADLINE: Duration = Duration::from_secs(15);
+/// Established sessions: after this long without a single %LOR frame from
+/// the room, rejoin on the same socket as a liveness probe. Only %LOR frames
+/// count: the edge's %EPH path never touches the doc machinery (ensureEph
+/// only), so presence acks/broadcasts keep flowing every ~15s from a
+/// doc-wedged DO — counting them made this probe unreachable on exactly the
+/// room that wedged (adversarial-review finding, round 2). Rejoin is the
+/// probe because it is already idempotent (the stale-peer and RejoinSuggested
+/// paths rejoin mid-session today), it forces a `JoinResponseOk` out of any
+/// healthy room, and its backfill diff is empty when we are in sync. A
+/// hibernating-but-healthy DO is simply woken by the probe and answers —
+/// hibernation is NOT treated as death, which is why this runs in minutes
+/// while the transport lease runs in seconds. The alternative (a server-push
+/// heartbeat from the DO) was rejected: emitting one needs a permanent
+/// short-interval alarm, i.e. abolishing hibernation for every room in the
+/// fleet to detect a failure only clients can act on anyway.
+///
+/// COST: each probe briefly wakes (and cold-materializes) the DO, so this is
+/// the hibernation duty-cycle knob. 15 min × N quiet clients keeps the room
+/// asleep >97% of an idle night; text-ping keepalives stay free (runtime
+/// auto-response, no wake). Detection latency for the rare mid-session wedge
+/// is probe interval + JOIN_RESPONSE_DEADLINE, and the durable replay-crash
+/// counter on the edge (session-room.ts ensureDoc) does the actual healing
+/// once redials start — the probe only needs to notice, not race. This is
+/// the BASE interval; consecutive quiet probes double it (see
+/// ROOM_PROBE_MAX) so dormant rooms decay to a handful of wakes a day.
+const ROOM_PROBE_AFTER: Duration = Duration::from_secs(900);
+/// Probe backoff cap. Every RoomClient probes — including the per-chat
+/// clients the engine keeps alive for every chat ever opened and never
+/// evicts — so a fixed 15-min cadence would wake (and cold-materialize)
+/// every dormant chat DO ~100×/day forever (adversarial-review finding).
+/// Doubling per quiet probe up to 4h makes a dormant room cost ~6 wakes/day;
+/// any real room traffic resets the cadence to ROOM_PROBE_AFTER.
+const ROOM_PROBE_MAX: Duration = Duration::from_secs(4 * 3600);
+/// Frames arriving this soon after a probe are the probe's own reply
+/// (JoinResponseOk + backfill envelope), not organic traffic — they must not
+/// reset the probe backoff or every probe would reset its own decay.
+const PROBE_REPLY_GRACE: Duration = Duration::from_secs(30);
 const BACKOFF_BASE: Duration = Duration::from_millis(250);
 const BACKOFF_CAP: Duration = Duration::from_secs(30);
 /// Stop resubmitting after this many InvalidUpdate-triggered rejoins in one
@@ -144,7 +208,9 @@ impl Connector for WsConnector {
         let provider = self.url.clone();
         Box::pin(async move {
             // Fresh URL (and therefore fresh `?token=`) on every attempt — an
-            // expired access token is never reused across a reconnect.
+            // expired access token is never reused across a reconnect. Both
+            // this fetch and the handshake below can hang; the actor bounds
+            // the whole dial with CONNECT_TIMEOUT.
             let url = provider.url().await?;
             let (ws, _) = tokio_tungstenite::connect_async(&url)
                 .await
@@ -195,7 +261,12 @@ async fn pump(
                     }
                 }
                 Some(Ok(_)) => {
-                    // Text "pong" / control frames: proof of life for the lease.
+                    // Text "pong" / control frames: proof of life for the
+                    // TRANSPORT lease only. The CF runtime auto-answers our
+                    // ping without waking the DO, so this says nothing about
+                    // the room (2026-07-30 — see JOIN_RESPONSE_DEADLINE);
+                    // room-level liveness is judged in `run_session`, which
+                    // only ever sees the binary frames forwarded below.
                     last_rx = tokio::time::Instant::now();
                 }
                 Some(Err(_)) | None => break,
@@ -390,9 +461,20 @@ impl RoomActor {
             if *self.shutdown.borrow() {
                 return;
             }
-            let (end, joined) = match self.connector.connect().await {
-                Ok(pipe) => self.run_session(pipe, &mut wake, &mut ready).await,
-                Err(err) => (SessionEnd::Lost(err), false),
+            let dial = tokio::time::timeout(CONNECT_TIMEOUT, self.connector.connect()).await;
+            let (end, joined) = match dial {
+                Ok(Ok(pipe)) => self.run_session(pipe, &mut wake, &mut ready).await,
+                Ok(Err(err)) => (SessionEnd::Lost(err), false),
+                Err(_) => {
+                    // The dial itself hung (URL provider stall, blackholed
+                    // handshake) — without this bound the actor wedged here
+                    // forever with no log line (see CONNECT_TIMEOUT).
+                    tracing::warn!(room = %self.room_id, timeout = ?CONNECT_TIMEOUT, "dial timed out; backing off to redial");
+                    (
+                        SessionEnd::Lost(SyncError::WebSocket("dial timeout".into())),
+                        false,
+                    )
+                }
             };
             match end {
                 SessionEnd::Shutdown => return,
@@ -464,6 +546,9 @@ impl RoomActor {
             joined_eph: false,
             invalid_rejoins: 0,
             full_resync_requested: false,
+            join_sent_at: None,
+            join_is_probe: false,
+            last_lor_rx: tokio::time::Instant::now(),
         };
 
         let version = sess.local_version_bytes();
@@ -471,8 +556,31 @@ impl RoomActor {
             return (SessionEnd::Lost(err), false);
         }
 
+        let mut probe_interval = ROOM_PROBE_AFTER;
+        let mut last_probe_at: Option<tokio::time::Instant> = None;
+
         let end = loop {
+            // Two-tier room liveness: an in-flight %LOR JoinRequest has a hard
+            // answer deadline; otherwise a long-quiet room gets probed. The
+            // deadline runs from the LATER of join-sent and last %LOR frame:
+            // a rejoin queued behind a large outbound backlog (slow uplink)
+            // keeps eliciting %LOR acks/backfill while it drains, and those
+            // prove the DOC machinery works — killing on pure arm-time
+            // redialed healthy sessions mid-push (adversarial-review
+            // finding). Only %LOR frames extend it (`sess.last_lor_rx`, see
+            // that field): %EPH presence keeps flowing from a doc-wedged DO,
+            // and letting it extend the deadline turned the hard deadline
+            // back into an unbounded hang (round-2 finding). The incident
+            // case (zero frames ever) is unchanged.
+            let (liveness_at, join_outstanding) = match sess.join_sent_at {
+                Some(sent) => (sent.max(sess.last_lor_rx) + JOIN_RESPONSE_DEADLINE, true),
+                None => (sess.last_lor_rx + probe_interval, false),
+            };
             tokio::select! {
+                // Biased so a buffered answer frame always beats an expired
+                // deadline in the same poll — never kill with the
+                // JoinResponseOk already readable.
+                biased;
                 // Post-suspend the socket is almost certainly half-open (NAT
                 // state gone); ending the session redials immediately with a
                 // freshly-provided URL/token instead of waiting out the
@@ -501,11 +609,22 @@ impl RoomActor {
                 }
                 frame = pipe.rx.recv() => match frame {
                     None => break SessionEnd::Lost(SyncError::WebSocket("connection closed".into())),
-                    Some(bytes) => match sess.handle_frame(&bytes, ready).await {
-                        Ok(None) => {}
-                        Ok(Some(end)) => break end,
-                        Err(err) => break SessionEnd::Lost(err),
-                    },
+                    Some(bytes) => {
+                        let lor_before = sess.last_lor_rx;
+                        match sess.handle_frame(&bytes, ready).await {
+                            Ok(None) => {}
+                            Ok(Some(end)) => break end,
+                            Err(err) => break SessionEnd::Lost(err),
+                        }
+                        // Organic %LOR traffic resets the probe cadence;
+                        // frames in a probe's own wake do not (see
+                        // PROBE_REPLY_GRACE), and %EPH frames never do.
+                        if sess.last_lor_rx > lor_before
+                            && last_probe_at.is_none_or(|at| at.elapsed() > PROBE_REPLY_GRACE)
+                        {
+                            probe_interval = ROOM_PROBE_AFTER;
+                        }
+                    }
                 },
                 update = self.local_rx.recv() => match update {
                     None => break SessionEnd::Shutdown, // client dropped
@@ -529,6 +648,34 @@ impl RoomActor {
                         }
                     }
                 },
+                _ = tokio::time::sleep_until(liveness_at) => {
+                    if join_outstanding {
+                        // The 2026-07-30 hang: a room that accepted the socket
+                        // but never answered the join. Kill the session so the
+                        // backoff loop redials — one fresh join re-instantiates
+                        // a wedged DO.
+                        tracing::warn!(
+                            room = %self.room_id,
+                            established = sess.joined_lor,
+                            deadline = ?JOIN_RESPONSE_DEADLINE,
+                            "no JoinResponseOk within deadline; room presumed wedged, redialing"
+                        );
+                        break SessionEnd::Lost(SyncError::WebSocket(
+                            "join deadline expired: room never answered JoinRequest".into(),
+                        ));
+                    }
+                    // Quiet room: send the rejoin probe. A send failure means
+                    // the pipe is gone; the answer is policed by the deadline
+                    // armed above on the next loop iteration.
+                    tracing::debug!(room = %self.room_id, quiet = ?probe_interval, "no room traffic; rejoining as liveness probe");
+                    let version = sess.local_version_bytes();
+                    if let Err(err) = sess.send_join_loro(version).await {
+                        break SessionEnd::Lost(err);
+                    }
+                    sess.join_is_probe = true;
+                    last_probe_at = Some(tokio::time::Instant::now());
+                    probe_interval = (probe_interval * 2).min(ROOM_PROBE_MAX);
+                }
             }
         };
         let joined = sess.joined_lor;
@@ -559,6 +706,23 @@ struct Session {
     joined_eph: bool,
     invalid_rejoins: u32,
     full_resync_requested: bool,
+    /// Instant of the last `%LOR` JoinRequest still awaiting `JoinResponseOk`
+    /// (initial join, stale-peer rejoin, or liveness probe); `None` once
+    /// answered. `run_session` enforces `JOIN_RESPONSE_DEADLINE` on it.
+    join_sent_at: Option<tokio::time::Instant>,
+    /// True while the outstanding join is a liveness probe on an established
+    /// session — its answer must not replay join side effects (%EPH rejoin,
+    /// Connected re-broadcast).
+    join_is_probe: bool,
+    /// Instant of the last inbound `%LOR` frame — the room-liveness clock
+    /// feeding both the join deadline and the probe timer. %EPH frames are
+    /// deliberately EXCLUDED: the edge's presence path never touches the doc
+    /// machinery, so eph acks/broadcasts keep arriving every ~15s from a
+    /// doc-wedged DO, and counting them silenced the probe and pinned the
+    /// join deadline open on exactly the room that wedged on 2026-07-30
+    /// (adversarial-review finding, round 2). Auto-pongs never reach this
+    /// layer at all (pump forwards only binary frames).
+    last_lor_rx: tokio::time::Instant,
 }
 
 impl Session {
@@ -580,7 +744,12 @@ impl Session {
             .map_err(|_| SyncError::WebSocket("connection closed".into()))
     }
 
-    async fn send_join_loro(&self, version: Vec<u8>) -> Result<(), SyncError> {
+    async fn send_join_loro(&mut self, version: Vec<u8>) -> Result<(), SyncError> {
+        // Arm the answer deadline BEFORE the frame leaves: an unanswered join
+        // used to hang the session forever (2026-07-30). Joins default to
+        // non-probe; the probe branch in run_session flags itself after.
+        self.join_sent_at = Some(tokio::time::Instant::now());
+        self.join_is_probe = false;
         // Auth rides the URL (`?token=`); the frame-level auth field is unused
         // by the edge.
         self.send(&ProtocolMessage::JoinRequest {
@@ -598,6 +767,22 @@ impl Session {
         ready: &mut Option<oneshot::Sender<Result<(), SyncError>>>,
     ) -> Result<Option<SessionEnd>, SyncError> {
         let message = decode(bytes).map_err(SyncError::Protocol)?;
+        // Advance the room-liveness clock for %LOR frames only (see
+        // `last_lor_rx` for why %EPH must not count).
+        let crdt = match &message {
+            ProtocolMessage::JoinRequest { crdt, .. }
+            | ProtocolMessage::JoinResponseOk { crdt, .. }
+            | ProtocolMessage::JoinError { crdt, .. }
+            | ProtocolMessage::DocUpdate { crdt, .. }
+            | ProtocolMessage::DocUpdateFragmentHeader { crdt, .. }
+            | ProtocolMessage::DocUpdateFragment { crdt, .. }
+            | ProtocolMessage::Ack { crdt, .. }
+            | ProtocolMessage::RoomError { crdt, .. }
+            | ProtocolMessage::Leave { crdt, .. } => *crdt,
+        };
+        if crdt == CrdtType::Loro {
+            self.last_lor_rx = tokio::time::Instant::now();
+        }
         match message {
             ProtocolMessage::JoinResponseOk {
                 crdt,
@@ -704,23 +889,42 @@ impl Session {
     ) -> Result<(), SyncError> {
         match crdt {
             CrdtType::Loro => {
+                self.join_sent_at = None; // join answered — disarm the deadline
+                let was_probe = std::mem::take(&mut self.join_is_probe);
                 self.joined_lor = true;
                 // Resubmit-from-VV: push everything the server lacks. This
                 // covers both fresh docs (first upload) and updates that went
-                // unacked across a reconnect or stale-peer resync.
+                // unacked across a reconnect or stale-peer resync. Gated on
+                // the VERSION VECTORS, not on the export bytes:
+                // `export(updates(&vv))` returns a non-empty envelope even
+                // when there is nothing to say, so a byte-length gate made
+                // every liveness probe upload a no-op DocUpdate that dirtied
+                // the room's tail/backup caches and re-armed its daily alarm
+                // — a fleet of idle rooms that could never actually go idle
+                // (adversarial-review finding).
                 if !self.doc.oplog_vv().is_empty() && self.invalid_rejoins < MAX_INVALID_REJOINS {
                     let server_vv = if version.is_empty() {
                         VersionVector::default()
                     } else {
                         VersionVector::decode(&version).unwrap_or_default()
                     };
-                    let missing = self
-                        .doc
-                        .export(ExportMode::updates(&server_vv))
-                        .map_err(|e| SyncError::Loro(e.to_string()))?;
-                    if !missing.is_empty() {
-                        self.send_loro_updates(vec![missing]).await?;
+                    if !server_vv.includes_vv(&self.doc.oplog_vv()) {
+                        let missing = self
+                            .doc
+                            .export(ExportMode::updates(&server_vv))
+                            .map_err(|e| SyncError::Loro(e.to_string()))?;
+                        if !missing.is_empty() {
+                            self.send_loro_updates(vec![missing]).await?;
+                        }
                     }
+                }
+                if was_probe {
+                    // A probe answer on an established session proves the
+                    // room is alive — that is ALL it is for. Re-running the
+                    // join side effects below every probe would re-join %EPH
+                    // (re-uploading full presence) and re-broadcast Connected
+                    // (consumers treat it as "resync underway") on a timer.
+                    return Ok(());
                 }
                 // Join presence once the doc room is up.
                 self.send(&ProtocolMessage::JoinRequest {

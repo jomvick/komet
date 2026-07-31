@@ -106,6 +106,12 @@ export class SessionRoom implements DurableObject {
     );
     this.blobs = createBlobStore(ctx.storage.sql);
     // Protocol-designed hibernation keepalive: ping → pong without waking us.
+    // NOTE (2026-07-30 incident): precisely BECAUSE the runtime answers these
+    // itself, a pong is NOT evidence this DO can still run — a wedged room
+    // kept auto-ponging for hours while never processing a join. Clients judge
+    // room liveness from protocol frames plus a join-response deadline
+    // (crates/sync/src/room.rs), never from these pongs. Do not "upgrade" this
+    // to an app-level handler: waking on every ping would abolish hibernation.
     ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
   }
 
@@ -152,7 +158,7 @@ export class SessionRoom implements DurableObject {
         if (!owner) return json({ error: "not_found" }, 404);
         if (owner !== userId) return json({ error: "forbidden" }, 403);
       }
-      this.flush();
+      await this.flush();
       const updateRows = [...this.ctx.storage.sql.exec("SELECT COUNT(*) AS n FROM updates")][0]
         ?.n as number;
       const snapshot = this.blobs.get("snapshot");
@@ -162,6 +168,13 @@ export class SessionRoom implements DurableObject {
         updateRows,
         updateLogBytes: Number(this.getMeta("updateBytes") ?? "0"),
         snapshotBytes: snapshot?.length ?? 0,
+        // Cold-start cost of the LAST materialization — the wedge-risk gauge
+        // (2026-07-30: this creeping toward the CPU limit was invisible).
+        lastReplayMs: Number(this.getMeta("lastReplayMs") ?? "0"),
+        lastReplayRows: Number(this.getMeta("lastReplayRows") ?? "0"),
+        // True between a wedge-break log drop and the first re-uploaded state
+        // (the nightly backup is paused in that window).
+        postReset: this.getMeta("postReset") === "1",
         tailCached: this.getMeta("tailDirty") !== "1" && this.blobs.get("tail") !== undefined,
         diffPublished: this.blobs.get("diff") !== undefined,
         checkpoints: (JSON.parse(this.getMeta("checkpoints") ?? "[]") as unknown[]).length,
@@ -177,7 +190,7 @@ export class SessionRoom implements DurableObject {
         if (!owner) return json({ error: "not_found" }, 404);
         if (owner !== userId) return json({ error: "forbidden" }, 403);
       }
-      return json(this.currentTail());
+      return json(await this.currentTail());
     }
     if (url.pathname === "/diff" && request.method === "GET") {
       if (!workspace) {
@@ -202,8 +215,8 @@ export class SessionRoom implements DurableObject {
         if (!owner) return json({ error: "not_found" }, 404);
         if (owner !== userId) return json({ error: "forbidden" }, 403);
       }
-      this.flush();
-      const doc = this.ensureDoc();
+      await this.flush();
+      const doc = await this.ensureDoc();
       const bytes = doc.export({ mode: "snapshot" });
       return new Response(bytes as unknown as BodyInit, {
         headers: { "content-type": "application/octet-stream" }
@@ -217,7 +230,7 @@ export class SessionRoom implements DurableObject {
         if (owner !== userId) return json({ error: "forbidden" }, 403);
       }
       const body = new Uint8Array(await request.arrayBuffer());
-      const doc = this.ensureDoc();
+      const doc = await this.ensureDoc();
       try {
         if (body.length > 0) doc.import(body);
       } catch {
@@ -280,16 +293,16 @@ export class SessionRoom implements DurableObject {
     const state = ws.deserializeAttachment() as SocketState;
     switch (decoded.type) {
       case MessageType.JoinRequest:
-        this.handleJoin(ws, state, decoded);
+        await this.handleJoin(ws, state, decoded);
         break;
       case MessageType.DocUpdate:
-        this.handleDocUpdate(ws, state, decoded);
+        await this.handleDocUpdate(ws, state, decoded);
         break;
       case MessageType.DocUpdateFragmentHeader:
         this.handleFragmentHeader(ws, state, decoded);
         break;
       case MessageType.DocUpdateFragment:
-        this.handleFragment(ws, state, decoded);
+        await this.handleFragment(ws, state, decoded);
         break;
       case MessageType.Leave:
         state.rooms = state.rooms.filter((r) => r !== decoded.crdt);
@@ -303,17 +316,17 @@ export class SessionRoom implements DurableObject {
     }
   }
 
-  webSocketClose(ws: WebSocket): void {
+  async webSocketClose(ws: WebSocket): Promise<void> {
     this.fragments.delete(ws);
-    this.flush();
+    await this.flush();
   }
 
-  webSocketError(ws: WebSocket): void {
+  async webSocketError(ws: WebSocket): Promise<void> {
     this.fragments.delete(ws);
-    this.flush();
+    await this.flush();
   }
 
-  private handleJoin(ws: WebSocket, state: SocketState, message: JoinRequest): void {
+  private async handleJoin(ws: WebSocket, state: SocketState, message: JoinRequest): Promise<void> {
     if (!state.workspace) {
       // Chat rooms: claim-on-first-join ownership, then owner-only forever.
       const owner = this.getMeta("owner");
@@ -332,7 +345,7 @@ export class SessionRoom implements DurableObject {
     if (!this.getMeta("chatId") && message.roomId) this.setMeta("chatId", message.roomId);
 
     if (message.crdt === CrdtType.Loro) {
-      const doc = this.ensureDoc();
+      const doc = await this.ensureDoc();
       if (!state.rooms.includes(message.crdt)) state.rooms.push(message.crdt);
       ws.serializeAttachment(state);
       this.send(ws, {
@@ -384,7 +397,7 @@ export class SessionRoom implements DurableObject {
     });
   }
 
-  private handleDocUpdate(ws: WebSocket, state: SocketState, message: DocUpdate): void {
+  private async handleDocUpdate(ws: WebSocket, state: SocketState, message: DocUpdate): Promise<void> {
     if (message.updates.some((u) => u.length > MAX_MESSAGE_SIZE)) {
       this.ack(ws, message, UpdateStatusCode.PayloadTooLarge);
       return;
@@ -393,20 +406,20 @@ export class SessionRoom implements DurableObject {
       this.ack(ws, message, UpdateStatusCode.PermissionDenied);
       return;
     }
-    this.applyUpdates(ws, state, message.crdt, message.roomId, message.batchId, message.updates);
+    await this.applyUpdates(ws, state, message.crdt, message.roomId, message.batchId, message.updates);
   }
 
   /** Shared apply path for whole and reassembled updates. */
-  private applyUpdates(
+  private async applyUpdates(
     ws: WebSocket,
     _state: SocketState,
     crdt: CrdtType,
     roomId: string,
     batchId: `0x${string}`,
     updates: Uint8Array[]
-  ): void {
+  ): Promise<void> {
     if (crdt === CrdtType.Loro) {
-      const doc = this.ensureDoc();
+      const doc = await this.ensureDoc();
       try {
         for (const update of updates) if (update.length > 0) doc.import(update);
       } catch {
@@ -438,13 +451,23 @@ export class SessionRoom implements DurableObject {
   /** Durability bookkeeping for accepted %LOR updates: buffer for the flush
    * batch, dirty the tail/backup caches, keep the daily alarm armed. */
   private recordLoroUpdates(updates: Uint8Array[]): void {
+    let real = false;
     for (const update of updates) {
       if (update.length === 0) continue;
+      real = true;
       this.pending.push(update);
       this.pendingBytes += update.length;
     }
+    // A batch of only zero-length updates (empty POST /append body, empty
+    // DocUpdate frame) recorded nothing: it must not dirty caches, arm the
+    // alarm, or — critically — clear postReset, which would re-expose the
+    // disaster backup to an empty-doc overwrite (round-2 review finding).
+    if (!real) return;
     this.setMeta("tailDirty", "1");
     this.setMeta("backupDirty", "1");
+    // Real state landed — the backup may advance past a wedge-break drop
+    // (the monotonic VV gate in alarm() still has the final say).
+    this.setMeta("postReset", "0");
     this.scheduleFlush();
     this.markActivity();
   }
@@ -471,11 +494,11 @@ export class SessionRoom implements DurableObject {
     });
   }
 
-  private handleFragment(
+  private async handleFragment(
     ws: WebSocket,
     state: SocketState,
     message: { crdt: CrdtType; roomId: string; batchId: `0x${string}`; index: number; fragment: Uint8Array }
-  ): void {
+  ): Promise<void> {
     const batch = this.fragments.get(ws)?.get(message.batchId);
     if (!batch) {
       // Unknown batch (e.g. header lost to hibernation) — tell the sender to
@@ -493,12 +516,12 @@ export class SessionRoom implements DurableObject {
       total.set(part, off);
       off += part.length;
     }
-    this.applyUpdates(ws, state, message.crdt, message.roomId, message.batchId, [total]);
+    await this.applyUpdates(ws, state, message.crdt, message.roomId, message.batchId, [total]);
   }
 
   // ── doc/ephemeral materialization ────────────────────────────────────────
 
-  private ensureDoc(): LoroDoc {
+  private async ensureDoc(): Promise<LoroDoc> {
     if (this.doc) return this.doc;
     // AUTOMATED WEDGE BREAK: a cold replay that exceeds the DO CPU limit kills
     // the invocation before `replayAttempts` is cleared below — and every
@@ -510,10 +533,23 @@ export class SessionRoom implements DurableObject {
     const attempts = Number(this.getMeta("replayAttempts") ?? "0");
     if (attempts >= REPLAY_CRASH_LIMIT) this.dropLog();
     this.setMeta("replayAttempts", String(attempts + 1));
+    // INCIDENT (2026-07-30): a CPU-limit kill ROLLS BACK the event's
+    // uncommitted storage writes — so the increment above died with every
+    // crash, the count never reached the limit, and the wedge break never
+    // fired on the exact failure it was built for. The ws3 workspace room
+    // died 7 times in two minutes and then sat wedged for 3+ hours until a
+    // manual engine restart. sync() makes the count durable BEFORE the risky
+    // replay below, so consecutive deaths are actually counted; clients
+    // redialing on their join deadline (crates/sync/src/room.rs) supply the
+    // attempts, and the room self-heals within REPLAY_CRASH_LIMIT dials.
+    await this.ctx.storage.sync();
+    const started = Date.now();
     const doc = new LoroDoc();
     const snapshot = this.blobs.get("snapshot");
     if (snapshot && snapshot.length > 0) doc.import(snapshot);
+    let rows = 0;
     for (const row of this.ctx.storage.sql.exec("SELECT bytes FROM updates ORDER BY seq")) {
+      rows++;
       try {
         doc.import(new Uint8Array(row.bytes as ArrayBuffer));
       } catch {
@@ -528,6 +564,26 @@ export class SessionRoom implements DurableObject {
       }
     }
     this.setMeta("replayAttempts", "0");
+    // Scope the crash budget to the replay ALONE: without this second sync, a
+    // CPU kill later in the same event (a backfill export for a fresh client,
+    // the alarm's shallow trim) would roll back this reset while the synced
+    // increment above survives — three such deaths would wedge-break a room
+    // whose replay is perfectly healthy (adversarial-review finding). One
+    // extra sync, cold path only. Deliberate consequence: a deterministic
+    // POST-replay death (a doc so big its snapshot export blows the CPU
+    // limit) gets no automatic wedge-break — destroying state over an export
+    // problem is worse than looping loudly. That class is watched via
+    // lastReplayMs creep and escaped manually with POST /reset-log.
+    await this.ctx.storage.sync();
+    // Cold-start telemetry (Workers Logs + /stats): the replay cost is the
+    // wedge risk — watch lastReplayMs trend toward the CPU limit to catch the
+    // next 2026-07-30 while it is still a statistic, not an incident.
+    const replayMs = Date.now() - started;
+    this.setMeta("lastReplayMs", String(replayMs));
+    this.setMeta("lastReplayRows", String(rows));
+    console.log(
+      `cold replay: ${replayMs}ms, ${rows} rows, snapshot ${snapshot?.length ?? 0}B, attempt ${attempts + 1}`
+    );
     this.doc = doc;
     return doc;
   }
@@ -543,6 +599,14 @@ export class SessionRoom implements DurableObject {
     this.setMeta("lastTrimAt", "");
     this.pending = [];
     this.pendingBytes = 0;
+    // Until an engine re-uploads real state, anything materialized from here
+    // is empty — postReset gates the nightly R2 put so the DISASTER backup
+    // cannot be overwritten by the emptied doc. Without it, the durable crash
+    // counter let alarm auto-retries complete a wedge break with ZERO clients
+    // connected and then back up the empty doc in the same invocation,
+    // destroying the one copy that exists for the engine-never-returns case
+    // (adversarial-review finding). Cleared by recordLoroUpdates.
+    this.setMeta("postReset", "1");
   }
 
   private ensureEph(): EphemeralStore {
@@ -556,11 +620,11 @@ export class SessionRoom implements DurableObject {
     if (this.flushTimer) return;
     this.flushTimer = setTimeout(() => {
       this.flushTimer = undefined;
-      this.flush();
+      void this.flush();
     }, DO_FLUSH_MS);
   }
 
-  private flush(): void {
+  private async flush(): Promise<void> {
     if (this.flushTimer) {
       clearTimeout(this.flushTimer);
       this.flushTimer = undefined;
@@ -583,18 +647,18 @@ export class SessionRoom implements DurableObject {
     // so a high row count is as expensive as a high byte count (see
     // COMPACT_LOG_ROWS). COUNT(*) is a cheap indexed read, once per flush.
     if (logBytes > COMPACT_LOG_BYTES) {
-      this.foldLog();
+      await this.foldLog();
       return;
     }
     const rows = [...this.ctx.storage.sql.exec("SELECT COUNT(*) AS n FROM updates")][0]?.n as
       | number
       | undefined;
-    if ((rows ?? 0) > COMPACT_LOG_ROWS) this.foldLog();
+    if ((rows ?? 0) > COMPACT_LOG_ROWS) await this.foldLog();
   }
 
   /** LOG FOLD: full snapshot re-export + clear the update log. Lossless. */
-  private foldLog(): void {
-    const doc = this.ensureDoc();
+  private async foldLog(): Promise<void> {
+    const doc = await this.ensureDoc();
     this.blobs.put("snapshot", doc.export({ mode: "snapshot" }));
     this.ctx.storage.sql.exec("DELETE FROM updates");
     this.setMeta("updateBytes", "0");
@@ -602,9 +666,9 @@ export class SessionRoom implements DurableObject {
 
   /** Daily alarm: frontier checkpoint, history trim, R2 backup. */
   async alarm(): Promise<void> {
-    this.flush();
+    await this.flush();
     if (this.getMeta("backupDirty") !== "1") return; // idle: stop the chain
-    const doc = this.ensureDoc();
+    const doc = await this.ensureDoc();
     const now = Date.now();
 
     // 1. Record today's frontier checkpoint.
@@ -638,11 +702,34 @@ export class SessionRoom implements DurableObject {
     this.setMeta("checkpoints", JSON.stringify(checkpoints));
 
     // 3. Nightly R2 backup (§3.3) — full current snapshot, disaster hatch.
+    // Two guards (round-2 review): postReset pauses the put between a
+    // wedge-break drop and the first re-uploaded state, and the put is
+    // MONOTONIC — the new snapshot must version-include the previously
+    // backed-up one, so even a post-drop doc that took a few fresh writes
+    // (clearing postReset) can never replace the last good copy with a
+    // hollow one. CRDT merge guarantees a genuinely recovered doc includes
+    // the old VV, at which point the put resumes; until then backupDirty
+    // stays set and the alarm chain keeps trying.
     const chatId = this.getMeta("chatId");
-    if (chatId) {
-      const snapshot = (this.doc ?? doc).export({ mode: "snapshot" });
-      await this.env.BLOBS.put(`backup/${chatId}/latest.loro`, snapshot);
-      this.setMeta("backupDirty", "0");
+    if (chatId && this.getMeta("postReset") !== "1") {
+      const current = this.doc ?? doc;
+      const prevVV = this.getMeta("backupVV");
+      let advances = true;
+      if (prevVV) {
+        try {
+          const prev = VersionVector.decode(Uint8Array.from(atob(prevVV), (c) => c.charCodeAt(0)));
+          const cmp = current.version().compare(prev);
+          advances = cmp !== undefined && cmp >= 0;
+        } catch {
+          /* unreadable meta: allow the put and rewrite it below */
+        }
+      }
+      if (advances) {
+        const snapshot = current.export({ mode: "snapshot" });
+        await this.env.BLOBS.put(`backup/${chatId}/latest.loro`, snapshot);
+        this.setMeta("backupVV", btoa(String.fromCharCode(...current.version().encode())));
+        this.setMeta("backupDirty", "0");
+      }
     }
     // Re-arm only while there is a reason to wake again; markActivity re-arms
     // on the next write otherwise.
@@ -655,13 +742,13 @@ export class SessionRoom implements DurableObject {
     });
   }
 
-  private currentTail(): unknown {
-    this.flush();
+  private async currentTail(): Promise<unknown> {
+    await this.flush();
     if (this.getMeta("tailDirty") !== "1") {
       const cached = getJsonBlob<unknown>(this.blobs, "tail");
       if (cached !== undefined) return cached;
     }
-    const doc = this.ensureDoc();
+    const doc = await this.ensureDoc();
     const tail = materializeTail(doc, Date.now());
     putJsonBlob(this.blobs, "tail", tail);
     this.setMeta("tailDirty", "0");

@@ -36,8 +36,16 @@ struct FakeEdge {
     /// When set, the next %LOR DocUpdate is rejected with InvalidUpdate
     /// without being imported (simulates the shallow-trim stale-peer case).
     reject_next_update: AtomicBool,
+    /// When set, frames are accepted but never answered — the 2026-07-30
+    /// wedged-DO shape: the runtime keeps the socket (and would keep
+    /// auto-ponging keepalives) while the room never speaks.
+    mute: AtomicBool,
     leaves: AtomicUsize,
     join_requests: AtomicUsize,
+    /// Connector dials (initial connect + every redial).
+    dials: AtomicUsize,
+    /// `%LOR` DocUpdate messages received (liveness probes must send none).
+    loro_doc_updates: AtomicUsize,
 }
 
 impl FakeEdge {
@@ -48,8 +56,11 @@ impl FakeEdge {
             conns: Mutex::new(Vec::new()),
             fragments: Mutex::new(HashMap::new()),
             reject_next_update: AtomicBool::new(false),
+            mute: AtomicBool::new(false),
             leaves: AtomicUsize::new(0),
             join_requests: AtomicUsize::new(0),
+            dials: AtomicUsize::new(0),
+            loro_doc_updates: AtomicUsize::new(0),
         })
     }
 
@@ -120,6 +131,21 @@ impl FakeEdge {
 
     async fn handle(&self, reply_to: &mpsc::Sender<Vec<u8>>, bytes: &[u8]) {
         let message = decode(bytes).expect("client sent an undecodable frame");
+        if self.mute.load(Ordering::SeqCst) {
+            // Wedged room: consume the frame, answer nothing. Joins are still
+            // counted so tests can assert each redial re-attempted the
+            // handshake.
+            if matches!(
+                message,
+                ProtocolMessage::JoinRequest {
+                    crdt: CrdtType::Loro,
+                    ..
+                }
+            ) {
+                self.join_requests.fetch_add(1, Ordering::SeqCst);
+            }
+            return;
+        }
         match message {
             ProtocolMessage::JoinRequest {
                 crdt: CrdtType::Loro,
@@ -181,6 +207,9 @@ impl FakeEdge {
                 updates,
                 batch_id,
             } => {
+                if crdt == CrdtType::Loro {
+                    self.loro_doc_updates.fetch_add(1, Ordering::SeqCst);
+                }
                 self.apply(reply_to, crdt, &room_id, batch_id, updates)
                     .await;
             }
@@ -326,6 +355,7 @@ impl Connector for FakeConnector {
     fn connect(&self) -> BoxFuture<'static, Result<Pipe, SyncError>> {
         let edge = self.edge.clone();
         Box::pin(async move {
+            edge.dials.fetch_add(1, Ordering::SeqCst);
             let (client_tx, mut server_rx) = mpsc::channel::<Vec<u8>>(256);
             let (server_tx, client_rx) = mpsc::channel::<Vec<u8>>(256);
             let reply_to = server_tx.clone();
@@ -546,4 +576,235 @@ async fn first_connect_failure_is_returned() {
         Ok(_) => panic!("connect must fail"),
         Err(err) => assert!(matches!(err, SyncError::WebSocket(_))),
     }
+}
+
+// ── 2026-07-30 sync-stall regressions ───────────────────────────────────────
+//
+// The workspace DO accepted sockets it never serviced: the runtime auto-ponged
+// our keepalives (satisfying the silence lease without waking the DO),
+// JoinResponseOk never came, and every engine hung mute for 3+ hours. These
+// tests pin the recovery behavior under a paused clock: a mute room and a hung
+// dial are redials on backoff, while a healthy-but-quiet (hibernating) room is
+// probed and left alone.
+
+/// Initial connect against a mute room must fail within the join deadline —
+/// not hang awaiting a JoinResponseOk that will never come.
+#[tokio::test(start_paused = true)]
+async fn initial_connect_to_mute_room_fails_within_join_deadline() {
+    let edge = FakeEdge::new();
+    edge.mute.store(true, Ordering::SeqCst);
+    let result = tokio::time::timeout(
+        JOIN_RESPONSE_DEADLINE + Duration::from_secs(5),
+        RoomClient::connect_with(edge.connector(), "room-1", LoroDoc::new()),
+    )
+    .await
+    .expect("connect must give up at the join deadline, not hang");
+    match result {
+        Ok(_) => panic!("connect must fail against a mute room"),
+        Err(err) => assert!(matches!(err, SyncError::WebSocket(_)), "got: {err}"),
+    }
+    assert!(
+        edge.join_requests.load(Ordering::SeqCst) >= 1,
+        "the join must actually have been sent"
+    );
+}
+
+/// The incident shape: an ESTABLISHED client reconnects into a room that keeps
+/// the socket open (keepalives still auto-answered) but never answers the
+/// join. The client must abandon the socket at the deadline and keep redialing
+/// on backoff — the old behavior was an unbounded, log-less hang.
+#[tokio::test(start_paused = true)]
+async fn established_client_redials_when_rejoin_goes_unanswered() {
+    let edge = FakeEdge::new();
+    let doc = LoroDoc::new();
+    let client = RoomClient::connect_with(edge.connector(), "room-1", doc.clone())
+        .await
+        .expect("connect");
+
+    let dials_before = edge.dials.load(Ordering::SeqCst);
+    let joins_before = edge.join_requests.load(Ordering::SeqCst);
+    edge.mute.store(true, Ordering::SeqCst);
+    edge.kick_all();
+
+    // The first redial lands right after the kick (backoff base) and sends a
+    // join that is never answered; the SECOND redial can only happen if the
+    // join deadline abandoned that socket.
+    tokio::time::sleep(JOIN_RESPONSE_DEADLINE + Duration::from_secs(5)).await;
+    let dials = edge.dials.load(Ordering::SeqCst);
+    assert!(
+        dials >= dials_before + 2,
+        "join deadline must abandon the mute socket within one deadline; saw {} redials",
+        dials - dials_before
+    );
+
+    // And the cycle keeps going (deadline → backoff → redial), each attempt
+    // re-sending a join.
+    tokio::time::sleep(Duration::from_secs(120)).await;
+    let dials = edge.dials.load(Ordering::SeqCst);
+    let joins = edge.join_requests.load(Ordering::SeqCst);
+    assert!(
+        dials >= dials_before + 4,
+        "redial cycle stalled after {} attempts",
+        dials - dials_before
+    );
+    assert!(
+        joins >= joins_before + 4,
+        "each redial must re-attempt the join handshake"
+    );
+    drop(client);
+}
+
+/// A dial that never resolves (`provider.url()` or `connect_async` hanging —
+/// the `WsConnector` shape) must be cut at CONNECT_TIMEOUT and retried, not
+/// wedge the actor forever.
+#[tokio::test(start_paused = true)]
+async fn hung_dial_times_out_and_redials() {
+    struct HangAfterFirst {
+        edge: Arc<FakeEdge>,
+        dials: AtomicUsize,
+    }
+    impl Connector for HangAfterFirst {
+        fn connect(&self) -> BoxFuture<'static, Result<Pipe, SyncError>> {
+            if self.dials.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.edge.connector().connect()
+            } else {
+                Box::pin(std::future::pending())
+            }
+        }
+    }
+
+    let edge = FakeEdge::new();
+    let connector = Arc::new(HangAfterFirst {
+        edge: edge.clone(),
+        dials: AtomicUsize::new(0),
+    });
+    let client = RoomClient::connect_with(connector.clone(), "room-1", LoroDoc::new())
+        .await
+        .expect("connect");
+
+    edge.kick_all();
+    // Every subsequent dial hangs; each must be cut at CONNECT_TIMEOUT and
+    // retried on backoff. A wedged dial would freeze the count at 2.
+    tokio::time::sleep(Duration::from_secs(120)).await;
+    let dials = connector.dials.load(Ordering::SeqCst);
+    assert!(dials >= 4, "hung dials must time out and be retried; saw {dials}");
+    drop(client);
+}
+
+/// An initial connect whose dial hangs must fail fast with a WebSocket error
+/// instead of hanging the caller.
+#[tokio::test(start_paused = true)]
+async fn initial_hung_dial_fails_within_connect_timeout() {
+    struct HangingConnector;
+    impl Connector for HangingConnector {
+        fn connect(&self) -> BoxFuture<'static, Result<Pipe, SyncError>> {
+            Box::pin(std::future::pending())
+        }
+    }
+    let result = tokio::time::timeout(
+        CONNECT_TIMEOUT + Duration::from_secs(5),
+        RoomClient::connect_with(Arc::new(HangingConnector), "room-1", LoroDoc::new()),
+    )
+    .await
+    .expect("connect must give up at CONNECT_TIMEOUT, not hang");
+    match result {
+        Ok(_) => panic!("connect must fail on a hung dial"),
+        Err(err) => assert!(matches!(err, SyncError::WebSocket(_)), "got: {err}"),
+    }
+}
+
+/// The counterpart guard: a healthy-but-QUIET room (a hibernating DO with no
+/// doc traffic) must never be treated as dead. The client probes it with an
+/// idempotent rejoin after ROOM_PROBE_AFTER; the room answers and the session
+/// survives with zero redials.
+#[tokio::test(start_paused = true)]
+async fn quiet_healthy_room_is_probed_not_killed() {
+    let edge = FakeEdge::new();
+    let doc = LoroDoc::new();
+    let client = RoomClient::connect_with(edge.connector(), "room-1", doc.clone())
+        .await
+        .expect("connect");
+    let mut events = client.events();
+
+    // Seed real history first: an empty local doc short-circuits the
+    // resubmit block before the includes_vv gate, which would mask a
+    // regression where probes upload no-op updates (round-2 review finding).
+    doc.get_text("t").insert(0, "seed").unwrap();
+    doc.commit();
+    wait_until(|| doc_text(&edge.doc) == "seed").await;
+
+    let joins_before = edge.join_requests.load(Ordering::SeqCst);
+    let updates_before = edge.loro_doc_updates.load(Ordering::SeqCst);
+
+    // Two hours of total silence — several probe intervals (the backoff
+    // doubles per quiet probe: 15m, +30m, +60m).
+    tokio::time::sleep(Duration::from_secs(2 * 60 * 60)).await;
+
+    assert_eq!(
+        edge.dials.load(Ordering::SeqCst),
+        1,
+        "a quiet healthy room must not be redialed"
+    );
+    assert!(
+        edge.join_requests.load(Ordering::SeqCst) > joins_before,
+        "liveness probes must have fired during the quiet stretch"
+    );
+    // Probes must be pure reads: a probe that uploads even a no-op DocUpdate
+    // dirties the room's caches and re-arms its daily alarm — the idle fleet
+    // would never actually go idle (adversarial-review finding).
+    assert_eq!(
+        edge.loro_doc_updates.load(Ordering::SeqCst),
+        updates_before,
+        "liveness probes must not upload DocUpdates"
+    );
+    while let Ok(event) = events.try_recv() {
+        assert_ne!(
+            event,
+            RoomEvent::Disconnected,
+            "quiet healthy room was spuriously dropped"
+        );
+    }
+
+    // The session is still fully live after the quiet stretch.
+    doc.get_text("t").insert(0, "still alive").unwrap();
+    doc.commit();
+    wait_until(|| doc_text(&edge.doc) == "still aliveseed").await;
+    client.shutdown().await.unwrap();
+}
+
+/// The most important regression guard: the normal join/backfill/reconnect
+/// cycle still works with the incident fixes in place.
+#[tokio::test]
+async fn healthy_session_join_backfill_reconnect_still_works() {
+    let edge = FakeEdge::new();
+    edge.doc.get_text("t").insert(0, "server state").unwrap();
+    edge.doc.commit();
+
+    let doc = LoroDoc::new();
+    let client = RoomClient::connect_with(edge.connector(), "room-1", doc.clone())
+        .await
+        .expect("initial connect");
+    // Backfill must complete.
+    wait_until(|| doc_text(&doc) == "server state").await;
+
+    // Local write must push and arrive on the server.
+    doc.get_text("t").insert(0, "client adds").unwrap();
+    doc.commit();
+    wait_until(|| doc_text(&edge.doc).contains("client adds")).await;
+
+    // Simulate a reconnect: kick all live connections.
+    let mut events = client.events();
+    edge.kick_all();
+
+    // The client must detect the close, reconnect with backoff, and converge.
+    wait_until(|| matches!(events.try_recv(), Ok(RoomEvent::Disconnected))).await;
+    wait_until(|| matches!(events.try_recv(), Ok(RoomEvent::Connected))).await;
+    assert_eq!(doc_text(&doc), doc_text(&edge.doc), "docs must converge");
+
+    // One more write to verify the re-joined session is fully functional.
+    doc.get_text("t").insert(0, "after reconnect").unwrap();
+    doc.commit();
+    wait_until(|| doc_text(&edge.doc).contains("after reconnect")).await;
+
+    client.shutdown().await.unwrap();
 }
