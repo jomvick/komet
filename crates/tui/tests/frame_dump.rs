@@ -84,7 +84,7 @@ fn scene() -> App {
         space("s2", "/home/w/website"),
     ]));
     app.apply(Update::Chats(vec![
-        chat("c1", "Unpeel App Decompilation", "s1", 24),
+        chat("c1", "Legacy App Decompilation", "s1", 24),
         chat("c2", "App Terminal TUI Monochrome", "s1", 5),
         chat("c3", "Rebuild CLI and Test Harness", "s1", 0),
         chat("c4", "Session Loading Virtualisation", "s1", 4),
@@ -112,7 +112,7 @@ fn scene() -> App {
                          navigable by real function name — no attribution heuristics needed.\n\n\
                          **What you actually get:**\n\n\
                          - `08-reconstructed/` — 479 Swift declarations, every stored-property type resolved\n\
-                         - `08-reconstructed/UnpeelShared/PROTOCOL.md` — the Mac↔iOS wire protocol, 75 types\n\
+                         - `08-reconstructed/SharedKit/PROTOCOL.md` — the Mac↔iOS wire protocol, 75 types\n\
                          - `04-rust/README.md` — recovered Cargo workspace layout for all four Rust binaries\n\n",
                     ),
                     MessagePart::Tool {
