@@ -18,6 +18,7 @@ uuid.workspace = true
 
 [dev-dependencies]
 komet-doc.workspace = true
+serde_json.workspace = true
 tempfile.workspace = true
 # `start_paused` virtual-clock tests (the 2026-07-30 sync-stall regressions).
 tokio = { workspace = true, features = ["test-util"] }
