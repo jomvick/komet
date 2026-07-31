@@ -696,7 +696,7 @@ impl Inner {
 
     /// Record the chat's harness-native session id (and its cwd): live-process
     /// cache plus the durable workspace chat row — the row is what survives an
-    /// engine restart (komet's `orbit.setChatHarnessSession`, sessions.ts:1039).
+    /// engine restart (komet sessions.ts:1039).
     fn remember_harness_session(&self, chat_id: &str, session_id: &str, cwd: &str) {
         if session_id.is_empty() {
             return;
@@ -730,7 +730,7 @@ impl Inner {
     }
 
     /// The session id to resume for a run in `chat_id` launching from `cwd`
-    /// (komet sessions.ts:736 `orbit.chatHarnessSession` on every dispatch):
+    /// (komet sessions.ts:736, looked up on every dispatch):
     /// live-process cache → workspace chat row → journal scan (the crash path
     /// where the debounced row write never landed — SessionStarted/Done events
     /// are journaled per event, flushed immediately). Cwd-gated throughout:

@@ -1,5 +1,5 @@
 //! Workspace doc schema over `loro` — the per-org entity index that replaces komet's
-//! residual Orbit sync (ARCHITECTURE.md §2.2). Lives in its own DO room (same
+//! residual entity sync (ARCHITECTURE.md §2.2). Lives in its own DO room (same
 //! SessionRoom class, doc id `ws/{orgId}`).
 //!
 //! Container layout — maps keyed by id, NOT lists: entity rows are LWW upserts, and a
@@ -369,7 +369,7 @@ impl WorkspaceDoc {
 
     /// Host-side resume continuity: the harness-native session id of the chat's
     /// latest run and the cwd it was created under (komet stored the same pair
-    /// on the chats table via `setChatHarness` — orbit-client.ts). An empty
+    /// on the chats table). An empty
     /// `session_id` is the explicit "do not resume" tombstone written after a
     /// harness rejects a resume. `false` when no such row.
     pub fn set_chat_harness_session(

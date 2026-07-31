@@ -1,6 +1,6 @@
 //! Synced entity rows (workspace doc) and local projections.
 //!
-//! In komet these were Orbit-synced Postgres rows; in komet-native they live in the per-org
+//! In komet these were synced Postgres rows; in komet-native they live in the per-org
 //! workspace Loro doc (see ARCHITECTURE.md §2.2) with the same field surface.
 
 use chrono::{DateTime, Utc};
@@ -100,8 +100,8 @@ pub struct Chat {
     pub last_message_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     /// Harness-native session id of the chat's latest run — engine-owned resume
-    /// continuity across engine restarts (komet's `chats.harness_session_id`,
-    /// written via `orbit.setChatHarnessSession`). Empty string = explicit
+    /// continuity across engine restarts (komet's `chats.harness_session_id`).
+    /// Empty string = explicit
     /// "do not resume" tombstone after a rejected resume.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub harness_session_id: Option<String>,

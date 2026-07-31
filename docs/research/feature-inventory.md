@@ -10,9 +10,9 @@ display EXCLUDED. File paths refer to the reference repo.
   DO on the edge (ControlRpc). WebRTC mesh is GONE (replaced by relay).
 - KEEP (Loro/DO): transcripts = per-chat Loro docs via session-room DO; commands
   (run/steer/interrupt/respondInput) = durable doc entries executed by the chat's host.
-- DROP (Orbit): messages sync over Postgres logical replication, device-addressed run RPCs,
+- DROP: messages sync over Postgres logical replication, device-addressed run RPCs,
   WatchMessages, WebRTC + signaling.
-- NOTE: chats/sessions/devices/checkout-diffs entity sync is STILL Orbit in komet — the rewrite
+- NOTE: chats/sessions/devices/checkout-diffs entity sync is STILL Postgres-based in komet — the rewrite
   must re-home it (decision: per-org workspace Loro doc, see ARCHITECTURE.md).
 
 ## 1. Desktop app
@@ -236,7 +236,7 @@ display EXCLUDED. File paths refer to the reference repo.
 
 ## 7. Server -> folded into edge for native
 - Keep: WorkOS code exchange/refresh, org list/create (move to edge Worker routes).
-- Drop: Orbit push/query, Postgres, signaling, Fly deploy of separate server.
+- Drop: entity push/query, Postgres, signaling, Fly deploy of separate server.
 
 ## 8. EXCLUDED (token usage display)
 - WatchUsage RPC, UsageStats/UsageDay, backend usage aggregation, profile heatmap/hero/stats,

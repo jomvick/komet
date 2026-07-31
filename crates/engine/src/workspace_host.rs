@@ -449,8 +449,8 @@ impl WorkspaceHost {
     }
 
     /// Resume continuity: stamp the chat row with the harness-native session id
-    /// of its latest run and the cwd it was created under (komet's
-    /// `orbit.setChatHarnessSession`, sessions.ts:1039). An empty `session_id`
+    /// of its latest run and the cwd it was created under (komet
+    /// sessions.ts:1039). An empty `session_id`
     /// tombstones the row ("do not resume" after a rejected resume). Best-effort:
     /// a missing chat row (claim happens on first command) just returns.
     pub fn set_chat_harness_session(&self, chat_id: &str, session_id: &str, cwd: &str) {

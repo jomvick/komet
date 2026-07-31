@@ -83,7 +83,7 @@ not built yet).
 | Item | Status | Notes |
 | --- | --- | --- |
 | WorkOS exchange/refresh, org list/create at edge | done | `/auth/*` routes; API key stays edge-side. |
-| Orbit/Postgres/signaling dropped | done | Nothing depends on them. |
+| Postgres/signaling dropped | done | Nothing depends on them. |
 
 ## §8 Exclusions
 

@@ -4,7 +4,7 @@ A ground-up native rewrite of [komet](../komet) — a multi-device controller fo
 (Claude Code / Codex) — in Rust, with a gpui UI. Fresh app; no backwards compatibility required.
 
 **Pillars (from the goal):**
-- No Orbit. Sync is Loro CRDT docs (loro-mirror model) through Cloudflare Durable Objects.
+- Sync is Loro CRDT docs (loro-mirror model) through Cloudflare Durable Objects.
 - Durable Objects stay **TypeScript** (decision + evidence: `docs/research/durable-objects-language.md`).
   Everything device-side is Rust.
 - Feature parity with komet **except token-usage display** (poor fit for CRDTs; excluded).
@@ -31,7 +31,7 @@ gpui UI ─ in-proc/localhost RPC ─ engine A ══ DeviceRoom DO relay ══
   new sessions are minted onto the space's device via relay-forwardable RPCs.
 - **Edge (TypeScript, ported from komet `apps/edge`)**: Worker + SessionRoom DO (per chat) +
   DeviceRoom DO (per device) + R2 attachments + WorkOS JWKS auth. Absorbs the old `apps/server`
-  responsibilities (WorkOS code exchange/refresh, orgs) so **Postgres, Orbit, the Hono server, and
+  responsibilities (WorkOS code exchange/refresh, orgs) so **Postgres, the Hono server, and
   the WebRTC/signaling stack are all gone**.
 
 ### Headed / headless
@@ -73,7 +73,7 @@ by reference, so scroll cost tracks the pane height, not the transcript length. 
 therefore zero wakeups and zero bytes — measured by `scripts/tui-smoke.py`, which also verifies
 the detach property end-to-end through a pty.
 
-## 2. Data model — all Loro, no Orbit
+## 2. Data model — all Loro
 
 Two doc kinds, one room protocol (loro-protocol over WebSocket, the same protocol the TS edge
 already speaks; Rust side uses the official `loro-protocol`/`loro-websocket-client` crates or a
@@ -88,7 +88,7 @@ thin hand-rolled client over `loro` 1.13.x — verify interop early, M1 exit cri
    run journal), tail/diff sidecars. Constants carried over (`STREAM_COMMIT_MS=120`,
    `DO_FLUSH_MS=5s`, compaction at 8MB, retain 30d, tail 64).
 
-2. **Workspace doc** (per org — NEW; replaces komet's residual Orbit entity sync) — **spaces**
+2. **Workspace doc** (per org — NEW; replaces komet's residual entity sync) — **spaces**
    registry (id, deviceId, path, name?, gitDetected, checkoutId — a space is a synced
    device+folder pair, the app's unit of organization; the owning device's SpacesSync stamps git
    presence so branch pickers / the diff sidebar gate on a synced bool, no RPC), chats index
@@ -243,7 +243,7 @@ sidecar slots, R2 attachments, JWKS auth). Additions:
 1. Workspace-doc rooms (`ws/{orgId}`) — same DO class, org-membership authz instead of
    claim-on-first-join.
 2. `/auth/*` routes absorbed from `apps/server` (WorkOS API key in Worker secret).
-3. Drop `/seed` migration path and legacy Orbit anything (fresh app).
+3. Drop `/seed` migration path and legacy sync anything (fresh app).
 Hibernation hygiene: no idle timers (flush timer only while dirty), auto-response ping/pong —
 per `docs/research/durable-objects-language.md`.
 
@@ -252,7 +252,7 @@ per `docs/research/durable-objects-language.md`.
 - **Excluded**: token-usage display (profile heatmap, lifetime stats, per-message token columns,
   `WatchUsage`). Rate-limit meters on agent accounts are *kept* (separate concern; probed from
   CLIs, not CRDT-synced).
-- **Changed**: Orbit/Postgres/server → workspace doc + edge; Electron/React/mugen → gpui with
+- **Changed**: Postgres entity sync/server → workspace doc + edge; Electron/React/mugen → gpui with
   ported techniques; Node harness SDKs → subprocess protocols; WebRTC → device-room relay (komet
   had already made this move); mobile app → out of scope for this repo.
 - **Kept verbatim**: session-doc schema shape + constants, command ledger rules, edge DO design,
