@@ -26,6 +26,17 @@ actor RoomClient {
     static let maxInvalidRejoins = 3
     static let maxFragmentCount: UInt64 = 4096
     static let maxReassembledBytes = 64 * 1024 * 1024
+    // Room-level liveness (room.rs, 2026-07-30 incident): the silence lease
+    // above is TRANSPORT-only — the CF runtime auto-answers our text pings
+    // without ever waking the DO, so a wedged room looks healthy forever if
+    // pongs are all we judge by. Room liveness is judged on %LOR frames plus
+    // a hard join-answer deadline; %EPH presence traffic deliberately does
+    // not count (the edge's eph path never touches the doc machinery).
+    static let joinDeadlineNs: UInt64 = 15_000_000_000
+    static let roomProbeAfterNs: UInt64 = 900_000_000_000
+    static let roomProbeMaxNs: UInt64 = 4 * 3_600_000_000_000
+    static let probeReplyGraceNs: UInt64 = 30_000_000_000
+    static let livenessTickNs: UInt64 = 5_000_000_000
 
     let roomId: String
     let doc: LoroDoc
@@ -36,6 +47,7 @@ actor RoomClient {
     private var socket: URLSessionWebSocketTask?
     private var receiveTask: Task<Void, Never>?
     private var pingTask: Task<Void, Never>?
+    private var livenessTask: Task<Void, Never>?
     private var pending: [BatchId: [[UInt8]]] = [:]
     private var fragments: [BatchId: FragmentBuffer] = [:]
     private var joinedLor = false
@@ -45,6 +57,16 @@ actor RoomClient {
     private var lastInbound = DispatchTime.now()
     private var closed = false
     private var generation = 0
+    // Room-liveness state (room.rs Session::{join_sent_at, join_is_probe,
+    // last_lor_rx}): the instant of the last %LOR JoinRequest still awaiting
+    // JoinResponseOk, whether that join is a liveness probe on an established
+    // session (its answer must not replay join side effects), and the last
+    // inbound %LOR frame — the clock feeding both the deadline and the probe.
+    private var joinSentAt: DispatchTime?
+    private var joinIsProbe = false
+    private var lastLorRx = DispatchTime.now()
+    private var probeIntervalNs = RoomClient.roomProbeAfterNs
+    private var lastProbeAt: DispatchTime?
 
     private struct FragmentBuffer {
         var crdt: CrdtType
@@ -77,6 +99,7 @@ actor RoomClient {
         generation += 1
         receiveTask?.cancel()
         pingTask?.cancel()
+        livenessTask?.cancel()
         socket?.cancel(with: .goingAway, reason: nil)
         socket = nil
         joinedLor = false
@@ -89,6 +112,11 @@ actor RoomClient {
         joinedLor = false
         fullResyncRequested = false
         fragments.removeAll()
+        joinSentAt = nil
+        joinIsProbe = false
+        lastLorRx = .now()
+        probeIntervalNs = RoomClient.roomProbeAfterNs
+        lastProbeAt = nil
 
         Task {
             guard let url = await urlProvider() else {
@@ -128,6 +156,14 @@ actor RoomClient {
             }
         }
 
+        livenessTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: RoomClient.livenessTickNs)
+                guard let self else { return }
+                await self.livenessTick(gen: gen)
+            }
+        }
+
         // Join the doc room with our local VV (empty VV asks for a snapshot).
         Task { await self.sendJoinLoro(version: self.localVersionBytes()) }
     }
@@ -148,6 +184,7 @@ actor RoomClient {
         socket = nil
         receiveTask?.cancel()
         pingTask?.cancel()
+        livenessTask?.cancel()
         let delay = backoffMs
         backoffMs = min(backoffMs * 2, RoomClient.backoffCapMs)
         Task {
@@ -164,6 +201,44 @@ actor RoomClient {
             return
         }
         try? await socket.send(.string("ping"))
+    }
+
+    /// Two-tier room liveness (room.rs run_session): an in-flight %LOR
+    /// JoinRequest has a hard answer deadline; otherwise a long-quiet room
+    /// gets an idempotent rejoin probe. The deadline runs from the LATER of
+    /// join-sent and last %LOR frame, so a join queued behind a draining
+    /// backfill that keeps producing %LOR acks is never killed mid-push. A
+    /// hibernating-but-healthy DO is simply woken by the probe and answers —
+    /// hibernation is NOT death, which is why probes run in minutes while
+    /// the transport lease runs in seconds.
+    private func livenessTick(gen: Int) async {
+        guard gen == generation, socket != nil, !closed else { return }
+        let now = DispatchTime.now().uptimeNanoseconds
+        if let sent = joinSentAt {
+            let base = max(sent.uptimeNanoseconds, lastLorRx.uptimeNanoseconds)
+            if now - base > RoomClient.joinDeadlineNs {
+                // The 2026-07-30 hang: a room that accepted the socket but
+                // never answered the join. Redial via the backoff loop — one
+                // fresh dial re-instantiates a wedged DO.
+                onSocketError(gen: gen)
+            }
+            return
+        }
+        if now - lastLorRx.uptimeNanoseconds > probeIntervalNs {
+            // Quiet room: rejoin as a liveness probe. Consecutive quiet
+            // probes back off so a dormant chat costs a handful of DO wakes
+            // a day; any organic %LOR traffic resets the cadence. Probe
+            // state is armed BEFORE the send suspends — the actor is
+            // reentrant across the await, so the answer could otherwise be
+            // handled while joinIsProbe is still false and replay join side
+            // effects.
+            joinSentAt = .now()
+            joinIsProbe = true
+            lastProbeAt = .now()
+            probeIntervalNs = min(probeIntervalNs * 2, RoomClient.roomProbeMaxNs)
+            await send(.joinRequest(crdt: .loro, roomId: roomId, auth: [],
+                                    version: localVersionBytes()))
+        }
     }
 
     // MARK: Inbound
@@ -183,6 +258,22 @@ actor RoomClient {
     }
 
     private func handleFrame(_ frame: ProtocolMessage, gen: Int) async {
+        // Advance the room-liveness clock for %LOR frames only: %EPH presence
+        // keeps flowing from a doc-wedged DO, so letting it count silenced
+        // the probe on exactly the room that wedged (room.rs, round-2
+        // adversarial finding). Frames arriving inside a probe's own reply
+        // window must not reset the probe backoff, or every probe would
+        // reset its own decay.
+        if crdtOf(frame) == .loro {
+            lastLorRx = .now()
+            if let at = lastProbeAt,
+               DispatchTime.now().uptimeNanoseconds - at.uptimeNanoseconds
+                   <= RoomClient.probeReplyGraceNs {
+                // Probe's own reply — leave the backoff decaying.
+            } else {
+                probeIntervalNs = RoomClient.roomProbeAfterNs
+            }
+        }
         switch frame {
         case .joinResponseOk(let crdt, _, _, let version, _):
             await onJoinOk(crdt: crdt, version: version)
@@ -199,8 +290,8 @@ actor RoomClient {
                 }
             }
 
-        case .docUpdate(_, _, let updates, _):
-            applyRemote(crdt: frameCrdt(frame), updates: updates)
+        case .docUpdate(let crdt, _, let updates, _):
+            applyRemote(crdt: crdt, updates: updates)
 
         case .docUpdateFragmentHeader(let crdt, _, let batchId, let count, let total):
             guard count > 0, count <= RoomClient.maxFragmentCount,
@@ -226,17 +317,34 @@ actor RoomClient {
         }
     }
 
-    private func frameCrdt(_ frame: ProtocolMessage) -> CrdtType {
-        if case .docUpdate(let crdt, _, _, _) = frame { return crdt }
-        return .loro
+    private func crdtOf(_ frame: ProtocolMessage) -> CrdtType {
+        switch frame {
+        case .joinRequest(let crdt, _, _, _),
+             .joinResponseOk(let crdt, _, _, _, _),
+             .joinError(let crdt, _, _, _),
+             .docUpdate(let crdt, _, _, _),
+             .docUpdateFragmentHeader(let crdt, _, _, _, _),
+             .docUpdateFragment(let crdt, _, _, _, _),
+             .roomError(let crdt, _, _, _),
+             .ack(let crdt, _, _, _),
+             .leave(let crdt, _):
+            return crdt
+        }
     }
 
     private func onJoinOk(crdt: CrdtType, version: [UInt8]) async {
         switch crdt {
         case .loro:
+            joinSentAt = nil  // join answered — disarm the deadline
+            let wasProbe = joinIsProbe
+            joinIsProbe = false
             joinedLor = true
             backoffMs = RoomClient.backoffBaseMs
-            // Resubmit-from-VV: push everything the server lacks.
+            // Resubmit-from-VV: push everything the server lacks. Gated on
+            // the VERSION VECTORS, not the export bytes: the export returns a
+            // non-empty envelope even when there is nothing to say, so a
+            // byte-length gate made every liveness probe upload a no-op
+            // DocUpdate that dirtied the room's caches (room.rs finding).
             if !doc.oplogVv().isEmpty(), invalidRejoins < RoomClient.maxInvalidRejoins {
                 let serverVv: VersionVector
                 if version.isEmpty {
@@ -244,9 +352,17 @@ actor RoomClient {
                 } else {
                     serverVv = (try? VersionVector.decode(bytes: Data(version))) ?? VersionVector()
                 }
-                if let missing = try? doc.export(mode: .updates(from: serverVv)), !missing.isEmpty {
+                if !serverVv.includesVv(other: doc.oplogVv()),
+                   let missing = try? doc.export(mode: .updates(from: serverVv)), !missing.isEmpty {
                     await sendLoroUpdates([[UInt8](missing)])
                 }
+            }
+            if wasProbe {
+                // A probe answer on an established session proves the room is
+                // alive — that is ALL it is for. Re-running the side effects
+                // below would re-join %EPH (re-uploading full presence) and
+                // re-broadcast .connected on a timer.
+                return
             }
             // Join presence once the doc room is up.
             await send(.joinRequest(crdt: .loroEphemeral, roomId: roomId, auth: [], version: []))
@@ -336,6 +452,12 @@ actor RoomClient {
     }
 
     private func sendJoinLoro(version: [UInt8]) async {
+        // Arm the answer deadline BEFORE the frame leaves: an unanswered join
+        // used to hang the session forever (room.rs, 2026-07-30). Joins
+        // default to non-probe; the probe branch in livenessTick flags itself
+        // after this returns.
+        joinSentAt = .now()
+        joinIsProbe = false
         await send(.joinRequest(crdt: .loro, roomId: roomId, auth: [], version: version))
     }
 
