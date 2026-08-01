@@ -1141,37 +1141,6 @@ impl Pickers {
             .unwrap_or_default()
     }
 
-    /// Keyboard-row count of the traits popover (ladder + all option choices).
-    fn trait_rows_len(&self, cx: &App) -> usize {
-        let ladder = self.trait_ladder(cx).len();
-        let choices = self
-            .selected_model(cx)
-            .map(|m| m.options.iter().map(|o| o.choices.len()).sum::<usize>())
-            .unwrap_or(0);
-        ladder + choices
-    }
-
-    /// Enter on the traits popover: ladder rows and choices select.
-    fn activate_trait_row(&mut self, cx: &mut Context<Self>) {
-        let ladder = self.trait_ladder(cx);
-        if let Some(level) = ladder.get(self.active).copied() {
-            self.pick_reasoning(level, cx);
-            return;
-        }
-        let mut ix = self.active - ladder.len();
-        let Some(model) = self.selected_model(cx).cloned() else {
-            return;
-        };
-        for option in &model.options {
-            if let Some(choice) = option.choices.get(ix) {
-                let is_default = choice.id == option.default_choice;
-                self.pick_option(option.id.clone(), choice.id.clone(), is_default, cx);
-                return;
-            }
-            ix -= option.choices.len();
-        }
-    }
-
     /// The viewed harness's model list, when loaded (keyboard nav rows).
     fn model_rows_len(&self, cx: &App) -> usize {
         self.effective_harness(cx)
@@ -1315,10 +1284,10 @@ impl Pickers {
                 let count = match self.open {
                     Some(PickerKind::Branch) => self.filtered_ref_rows(cx).len().min(MAX_REF_ROWS),
                     Some(PickerKind::Checkout) => 2,
-                    Some(PickerKind::HarnessModel) => {
-                        // Combined menu: models first, then the ladder/options.
-                        self.model_rows_len(cx) + self.trait_rows_len(cx)
-                    }
+                    // Keyboard nav walks the MODEL list only; the traits
+                    // chips below (reasoning ladder, model options) are
+                    // mouse-only.
+                    Some(PickerKind::HarnessModel) => self.model_rows_len(cx),
                     Some(PickerKind::Traits) => 0, // merged into HarnessModel
                     None => 0,
                 };
@@ -1336,16 +1305,7 @@ impl Pickers {
             }
             MenuKey::Enter if !search_focused => {
                 if self.open == Some(PickerKind::HarnessModel) {
-                    // Combined flat index: models, then ladder/options.
-                    let models = self.model_rows_len(cx);
-                    if self.active < models {
-                        self.activate_model_row(cx);
-                    } else {
-                        let saved = self.active;
-                        self.active = saved - models;
-                        self.activate_trait_row(cx);
-                        self.active = saved;
-                    }
+                    self.activate_model_row(cx);
                 } else if self.open == Some(PickerKind::Checkout) {
                     let kind = if self.active == 0 {
                         CheckoutKind::Local
@@ -2071,7 +2031,7 @@ impl Pickers {
         // One combined menu (user request): harness tabs across the top,
         // then the viewed harness's models, then the reasoning ladder and
         // model options that used to live in the separate traits popover.
-        let traits = self.render_traits_sections(self.model_rows_len(cx), cx);
+        let traits = self.render_traits_sections(cx);
         // The palette architecture: agents rail LEFT, models pane beside it
         // with the traits INSPECTOR pinned below (models are the decision;
         // reasoning/options are properties of it — they never scroll away
@@ -2172,9 +2132,8 @@ impl Pickers {
     /// model option as headed segmented-chip sections, pinned under the
     /// models pane (formerly menu rows in the shared scroll). Selecting
     /// keeps the menu open; the active chip carries the wash + ring.
-    /// `nav_offset` is the flat keyboard index where these chips start (the
-    /// model rows come first in the combined index).
-    fn render_traits_sections(&mut self, nav_offset: usize, cx: &mut Context<Self>) -> AnyElement {
+    /// Mouse-only — arrow keys walk the model list above, never these chips.
+    fn render_traits_sections(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let Some(model) = self.selected_model(cx).cloned() else {
             return popover::skeleton_rows("traits-skeleton", &theme, 3);
@@ -2183,10 +2142,6 @@ impl Pickers {
         // Display the effective level (draft pick or the chat's config), so
         // the ladder check mirrors the chip summary.
         let current = self.effective_reasoning(cx);
-        // Keyboard nav: flat row index — ladder first, then option choices in
-        // render order — offset past the model rows above.
-        let nav_active = self.active.wrapping_sub(nav_offset);
-        let ladder_len = levels.len();
 
         let ladder: AnyElement = if levels.is_empty() {
             gpui::Empty.into_any_element()
@@ -2204,7 +2159,7 @@ impl Pickers {
                         .gap(px(4.0))
                         .children(levels.into_iter().enumerate().map(|(ix, level)| {
                             let is_active = current == Some(level);
-                            trait_chip(&theme, is_active, ix == nav_active)
+                            trait_chip(&theme, is_active)
                                 .id(("reasoning-row", ix))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.pick_reasoning(level, cx);
@@ -2216,26 +2171,12 @@ impl Pickers {
         };
 
         let selections = self.explicit_options(cx);
-        // Per-option flat-index bases for the keyboard highlight.
-        let option_bases: Vec<usize> = {
-            let mut offset = ladder_len;
-            model
-                .options
-                .iter()
-                .map(|o| {
-                    let base = offset;
-                    offset += o.choices.len();
-                    base
-                })
-                .collect()
-        };
         let options =
             div()
                 .flex()
                 .flex_col()
                 .gap(px(2.0))
                 .children(model.options.iter().enumerate().map(|(opt_ix, option)| {
-                    let option_base = option_bases[opt_ix];
                     let selected_choice = selections
                         .get(&option.id)
                         .and_then(|v| v.as_str())
@@ -2260,21 +2201,17 @@ impl Pickers {
                                         let choice_id = choice.id.clone();
                                         let option_id = option_id.clone();
                                         let is_default = choice.id == default_choice;
-                                        trait_chip(
-                                            &theme,
-                                            is_active,
-                                            option_base + choice_ix == nav_active,
-                                        )
-                                        .id(("trait-choice", opt_ix * 32 + choice_ix))
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.pick_option(
-                                                option_id.clone(),
-                                                choice_id.clone(),
-                                                is_default,
-                                                cx,
-                                            );
-                                        }))
-                                        .child(SharedString::from(choice.label.clone()))
+                                        trait_chip(&theme, is_active)
+                                            .id(("trait-choice", opt_ix * 32 + choice_ix))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.pick_option(
+                                                    option_id.clone(),
+                                                    choice_id.clone(),
+                                                    is_default,
+                                                    cx,
+                                                );
+                                            }))
+                                            .child(SharedString::from(choice.label.clone()))
                                     },
                                 )),
                         )
@@ -2294,9 +2231,9 @@ impl Pickers {
 /// A segmented choice chip for the traits inspector (reasoning ladder /
 /// model options): the key-cap voice — every chip carries a faint fill so it
 /// reads as a pressable segment (bare text read as labels, not buttons);
-/// the active/keyboard-highlighted chip adds the app-wide wash + glass ring.
+/// the active chip adds the app-wide wash + glass ring.
 /// The caller adds id/click/label.
-fn trait_chip(theme: &Theme, active: bool, highlighted: bool) -> gpui::Div {
+fn trait_chip(theme: &Theme, active: bool) -> gpui::Div {
     div()
         .h(px(24.0))
         .px(px(10.0))
@@ -2314,7 +2251,7 @@ fn trait_chip(theme: &Theme, active: bool, highlighted: bool) -> gpui::Div {
                 .text_color(theme.text_muted.opacity(0.7))
                 .hover(|s| s.bg(theme.element_hover))
         })
-        .when(active || highlighted, |el| {
+        .when(active, |el| {
             el.shadow(crate::theme::glass_selected_shadows())
         })
 }
