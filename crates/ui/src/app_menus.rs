@@ -167,7 +167,10 @@ mod tests {
     fn about_is_disabled_placeholder() {
         let menus = app_menus();
         let first = &menus[0].items[0];
-        assert!(first.is_disabled(), "About stays disabled until implemented");
+        assert!(
+            first.is_disabled(),
+            "About stays disabled until implemented"
+        );
     }
 
     #[test]

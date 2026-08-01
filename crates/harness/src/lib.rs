@@ -130,9 +130,7 @@ pub(crate) fn prepend_exe_dir_to_path(cmd: &mut tokio::process::Command, exe: &s
 /// unexpectedly (<status>): <last stderr lines>" instead of a bare shrug —
 /// the proper background-crash message old komet showed (user requirement).
 #[derive(Clone, Default)]
-pub(crate) struct StderrTail(
-    std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
-);
+pub(crate) struct StderrTail(std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>);
 
 impl StderrTail {
     const KEEP_LINES: usize = 6;
@@ -143,7 +141,10 @@ impl StderrTail {
         if line.is_empty() {
             return;
         }
-        let mut tail = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut tail = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         tail.push_back(line.chars().take(Self::KEEP_BYTES).collect());
         while tail.len() > Self::KEEP_LINES {
             tail.pop_front();
@@ -152,7 +153,10 @@ impl StderrTail {
 
     /// The captured tail as one display string, `None` when nothing arrived.
     pub(crate) fn snapshot(&self) -> Option<String> {
-        let tail = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tail = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if tail.is_empty() {
             return None;
         }

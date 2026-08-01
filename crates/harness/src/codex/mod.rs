@@ -1145,7 +1145,10 @@ mod tests {
             std::fs::write(admin.join("HEAD"), format!("ref: refs/heads/{branch}\n")).unwrap();
             wt.display().to_string()
         };
-        assert!(worktree_on_slashed_branch(&make("slashed", "wing/prd-5645")));
+        assert!(worktree_on_slashed_branch(&make(
+            "slashed",
+            "wing/prd-5645"
+        )));
         assert!(!worktree_on_slashed_branch(&make("plain", "brave-ember")));
         // A main checkout (`.git` DIRECTORY) never escalates.
         let main = tmp.path().join("main");

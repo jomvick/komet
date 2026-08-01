@@ -698,9 +698,9 @@ impl Pickers {
                     Err(err) => Loadable::Error(err.to_string()),
                 };
                 if let Loadable::Ready(models) = &loaded {
-                    let fresh = pickers.defaults.remember_labels(
-                        models.iter().map(|m| (m.id.as_str(), m.label.as_str())),
-                    );
+                    let fresh = pickers
+                        .defaults
+                        .remember_labels(models.iter().map(|m| (m.id.as_str(), m.label.as_str())));
                     if fresh {
                         pickers.save_defaults();
                     }
@@ -1448,11 +1448,7 @@ impl Pickers {
 
     /// A read-only footer label (locked sessions — t3code's
     /// `resolveLockedWorkspaceLabel` span).
-    fn footer_label(
-        icon_path: &'static str,
-        label: SharedString,
-        theme: &Theme,
-    ) -> gpui::Div {
+    fn footer_label(icon_path: &'static str, label: SharedString, theme: &Theme) -> gpui::Div {
         div()
             .h(px(20.0))
             .max_w(px(280.0))
@@ -1685,80 +1681,81 @@ impl Pickers {
             .selected_chat_row()
             .and_then(|c| c.branch.clone());
         let switching = self.switching.clone();
-        let body: AnyElement = match &self.refs {
-            Loadable::Loading | Loadable::Idle => {
-                popover::skeleton_rows("branch-skeleton", &theme, 4)
-            }
-            Loadable::Error(message) => {
-                let message = message.clone();
-                self.retry_row("branch-retry", &message, PickerKind::Branch, &theme, cx)
-            }
-            Loadable::Ready(_) if rows.is_empty() => div()
-                .p(px(Theme::SPACE_SM))
-                .text_size(px(12.0))
-                .text_color(theme.text_faint)
-                .child(SharedString::from("No refs found."))
-                .into_any_element(),
-            Loadable::Ready(_) => {
-                let active = self.active;
-                let selected = session_branch.or_else(|| self.config.branch.clone());
-                div()
-                    .id("branch-list")
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.0))
-                    .max_h(px(224.0))
-                    .overflow_y_scroll()
-                    .children(rows.into_iter().take(MAX_REF_ROWS).enumerate().map(
-                        |(ix, row)| {
-                            let label: SharedString = row.name.clone().into();
-                            let is_selected = selected.as_deref() == Some(row.name.as_str());
-                            // Right-aligned muted tag (t3code `text-[10px]
-                            // text-muted-foreground/45`): current beats worktree.
-                            let tag: Option<&'static str> = if row.current {
-                                Some("current")
-                            } else if row.worktree_path.is_some() {
-                                Some("worktree")
-                            } else {
-                                None
-                            };
-                            let is_switching = switching.as_deref() == Some(row.name.as_str());
-                            popover::menu_row_nav(
-                                &theme,
-                                is_selected,
-                                ix == active,
-                                format!("branch-row-{ix}"),
-                            )
-                            .id(("branch-row", ix))
-                            .when(switching.is_some(), |el| el.opacity(0.55))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.pick_ref(row.clone(), cx);
-                            }))
-                            .child(div().flex_1().min_w_0().truncate().child(label))
-                            .when(is_switching, |el| {
-                                el.child(
-                                    div()
-                                        .flex_none()
-                                        .text_size(px(10.0))
-                                        .text_color(theme.text_muted.opacity(0.6))
-                                        .child(SharedString::from("switching…")),
+        let body: AnyElement =
+            match &self.refs {
+                Loadable::Loading | Loadable::Idle => {
+                    popover::skeleton_rows("branch-skeleton", &theme, 4)
+                }
+                Loadable::Error(message) => {
+                    let message = message.clone();
+                    self.retry_row("branch-retry", &message, PickerKind::Branch, &theme, cx)
+                }
+                Loadable::Ready(_) if rows.is_empty() => div()
+                    .p(px(Theme::SPACE_SM))
+                    .text_size(px(12.0))
+                    .text_color(theme.text_faint)
+                    .child(SharedString::from("No refs found."))
+                    .into_any_element(),
+                Loadable::Ready(_) => {
+                    let active = self.active;
+                    let selected = session_branch.or_else(|| self.config.branch.clone());
+                    div()
+                        .id("branch-list")
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .max_h(px(224.0))
+                        .overflow_y_scroll()
+                        .children(rows.into_iter().take(MAX_REF_ROWS).enumerate().map(
+                            |(ix, row)| {
+                                let label: SharedString = row.name.clone().into();
+                                let is_selected = selected.as_deref() == Some(row.name.as_str());
+                                // Right-aligned muted tag (t3code `text-[10px]
+                                // text-muted-foreground/45`): current beats worktree.
+                                let tag: Option<&'static str> = if row.current {
+                                    Some("current")
+                                } else if row.worktree_path.is_some() {
+                                    Some("worktree")
+                                } else {
+                                    None
+                                };
+                                let is_switching = switching.as_deref() == Some(row.name.as_str());
+                                popover::menu_row_nav(
+                                    &theme,
+                                    is_selected,
+                                    ix == active,
+                                    format!("branch-row-{ix}"),
                                 )
-                            })
-                            .when_some(tag, |el, tag| {
-                                el.child(
-                                    div()
-                                        .flex_none()
-                                        .text_size(px(10.0))
-                                        .text_color(theme.text_muted.opacity(0.45))
-                                        .child(SharedString::from(tag)),
-                                )
-                            })
-                            .when(is_selected, |el| el.child(popover::menu_check(&theme)))
-                        },
-                    ))
-                    .into_any_element()
-            }
-        };
+                                .id(("branch-row", ix))
+                                .when(switching.is_some(), |el| el.opacity(0.55))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.pick_ref(row.clone(), cx);
+                                }))
+                                .child(div().flex_1().min_w_0().truncate().child(label))
+                                .when(is_switching, |el| {
+                                    el.child(
+                                        div()
+                                            .flex_none()
+                                            .text_size(px(10.0))
+                                            .text_color(theme.text_muted.opacity(0.6))
+                                            .child(SharedString::from("switching…")),
+                                    )
+                                })
+                                .when_some(tag, |el, tag| {
+                                    el.child(
+                                        div()
+                                            .flex_none()
+                                            .text_size(px(10.0))
+                                            .text_color(theme.text_muted.opacity(0.45))
+                                            .child(SharedString::from(tag)),
+                                    )
+                                })
+                                .when(is_selected, |el| el.child(popover::menu_check(&theme)))
+                            },
+                        ))
+                        .into_any_element()
+                }
+            };
         let mut popover = div()
             .flex()
             .flex_col()
@@ -1767,14 +1764,16 @@ impl Pickers {
         // Mid-session switch failure (dirty tree, ref checked out elsewhere):
         // git's own message, under a hairline.
         if let Some(error) = &self.switch_error {
-            popover = popover.child(popover::menu_section().child(
-                div()
-                    .px(px(Theme::SPACE_SM))
-                    .py(px(4.0))
-                    .text_size(px(11.0))
-                    .text_color(theme.danger.opacity(0.9))
-                    .child(SharedString::from(error.clone())),
-            ));
+            popover = popover.child(
+                popover::menu_section().child(
+                    div()
+                        .px(px(Theme::SPACE_SM))
+                        .py(px(4.0))
+                        .text_size(px(11.0))
+                        .text_color(theme.danger.opacity(0.9))
+                        .child(SharedString::from(error.clone())),
+                ),
+            );
         }
         if total > shown {
             popover = popover.child(
@@ -1933,13 +1932,16 @@ impl Pickers {
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.pick_harness(harness, cx);
                             }))
-                            .child(crate::icons::icon(icon_path).size(px(16.0)).flex_none().text_color(
-                                tint.unwrap_or(if is_viewed {
-                                    theme.text
-                                } else {
-                                    theme.text_muted
-                                }),
-                            ))
+                            .child(
+                                crate::icons::icon(icon_path)
+                                    .size(px(16.0))
+                                    .flex_none()
+                                    .text_color(tint.unwrap_or(if is_viewed {
+                                        theme.text
+                                    } else {
+                                        theme.text_muted
+                                    })),
+                            )
                             .child(div().min_w_0().truncate().child(name))
                     }))
                     .into_any_element()
@@ -2244,7 +2246,8 @@ fn trait_chip(theme: &Theme, active: bool) -> gpui::Div {
         .text_size(px(11.5))
         .cursor_pointer()
         .when(active, |el| {
-            el.bg(crate::theme::glass_selected_bg()).text_color(theme.text)
+            el.bg(crate::theme::glass_selected_bg())
+                .text_color(theme.text)
         })
         .when(!active, |el| {
             el.bg(crate::theme::white_alpha(0.04))
@@ -2403,8 +2406,10 @@ impl Render for Pickers {
         }
         // A popover opened data-side (KOMET_OPEN_PICKER) never went through
         // `toggle`, so kick its loads here (all ensure_* are idempotent).
-        if matches!(self.open, Some(PickerKind::Branch) | Some(PickerKind::Checkout))
-            && matches!(self.refs, Loadable::Idle)
+        if matches!(
+            self.open,
+            Some(PickerKind::Branch) | Some(PickerKind::Checkout)
+        ) && matches!(self.refs, Loadable::Idle)
         {
             self.ensure_refs(false, cx);
         }
