@@ -576,7 +576,10 @@ pub fn parse_for_row(
         let parser = live_parsers.entry(key.to_string()).or_default();
         parser.set_text(text);
         (
-            Arc::new(parser.tree().clone()),
+            // Display tree: hanging inline markers mended so closers arriving
+            // later never reflow painted text (markdown/mend.rs). Completed
+            // rows below use the canonical tree — the honest settle.
+            Arc::new(parser.display_tree()),
             ParseOutcome::Incremental {
                 parsed_bytes: parser.last_parse_bytes(),
                 stable_prefix_blocks: parser.stable_prefix_blocks(),

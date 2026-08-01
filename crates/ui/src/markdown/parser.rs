@@ -458,6 +458,11 @@ fn heading_level(level: HeadingLevel) -> u8 {
 pub struct IncrementalParser {
     source: String,
     tree: BlockTree,
+    /// Display-only replacement for the last top-level block when its source
+    /// has hanging inline markers ([`super::mend`]): `None` means the display
+    /// tree is exactly [`Self::tree`]. Never fed back into the incremental
+    /// state — the canonical tree stays parity-exact with `parse_full`.
+    display_tail: Option<Vec<TopBlock>>,
     /// Link-reference definitions act at a distance — full reparses only.
     full_only: bool,
     /// Bytes fed through `parse_full` by the most recent `set_text`/`append`/
@@ -480,6 +485,22 @@ impl IncrementalParser {
 
     pub fn tree(&self) -> &BlockTree {
         &self.tree
+    }
+
+    /// The tree to render while streaming: the canonical tree with the last
+    /// block swapped for its mended parse when inline markers hang (an
+    /// unclosed `**bold`, a half-streamed `[link](url…`). Same shape and cost
+    /// as `tree().clone()` — the stable prefix is copied either way; only a
+    /// hanging tail adds one O(tail) reparse, done at append time.
+    pub fn display_tree(&self) -> BlockTree {
+        let Some(tail) = &self.display_tail else {
+            return self.tree.clone();
+        };
+        let stable = &self.tree.blocks[..self.tree.blocks.len() - 1];
+        let mut blocks = Vec::with_capacity(stable.len() + tail.len());
+        blocks.extend_from_slice(stable);
+        blocks.extend_from_slice(tail);
+        BlockTree { blocks }
     }
 
     /// Bytes actually reparsed by the last update (see field docs).
@@ -513,6 +534,7 @@ impl IncrementalParser {
         self.tree = parse_full(text);
         self.last_parse_bytes = text.len();
         self.stable_prefix_blocks = 0;
+        self.remend();
     }
 
     /// Append streamed text, reparsing from the last stable boundary.
@@ -533,6 +555,7 @@ impl IncrementalParser {
             self.tree = parse_full(&self.source);
             self.last_parse_bytes = self.source.len();
             self.stable_prefix_blocks = 0;
+            self.remend();
             return;
         }
 
@@ -562,6 +585,43 @@ impl IncrementalParser {
             top.range.end += boundary;
             self.tree.blocks.push(top);
         }
+        self.remend();
+    }
+
+    /// Recompute the display tail: mend hanging inline markers in the last
+    /// top-level block (only place they can hang — a blank line settles a
+    /// block, and CommonMark keeps unclosed markers literal across it) and
+    /// reparse just that block's source. `close_hanging` is one O(last block)
+    /// scan and returns `None` when nothing hangs, so the extra parse happens
+    /// only while a marker is actually open.
+    fn remend(&mut self) {
+        self.display_tail = None;
+        let Some(last) = self.tree.blocks.last() else {
+            return;
+        };
+        // Code blocks render an unclosed fence verbatim (already stable);
+        // rules and tables have no inline tail to mend.
+        if matches!(
+            last.block,
+            Block::CodeBlock { .. } | Block::Rule | Block::Table { .. }
+        ) {
+            return;
+        }
+        let start = last.range.start;
+        let Some(mended) = super::mend::close_hanging(&self.source[start..]) else {
+            return;
+        };
+        // Count toward the O(tail) instrumentation — this is real parse work,
+        // in the same bound as the reparse that produced the block.
+        self.last_parse_bytes += mended.len();
+        let mut tail = parse_full(&mended).blocks;
+        for top in &mut tail {
+            // Display ranges point back into the unmended source; synthetic
+            // closers at the end clamp away.
+            top.range.start += start;
+            top.range.end = (top.range.end + start).min(self.source.len());
+        }
+        self.display_tail = Some(tail);
     }
 }
 
@@ -789,6 +849,125 @@ mod tests {
                 .all(|w| w[0].range.start < w[1].range.start)
         );
         assert_eq!(&src[tree.blocks[1].range.clone()], "second\n");
+    }
+
+    /// Concatenated visible text of a block (what the user reads).
+    fn flat(block: &Block) -> String {
+        fn walk(b: &Block, out: &mut String) {
+            match b {
+                Block::Paragraph { runs } | Block::Heading { runs, .. } => {
+                    for r in runs {
+                        out.push_str(&r.text);
+                    }
+                }
+                Block::BlockQuote { children } => children.iter().for_each(|c| walk(c, out)),
+                Block::List { items, .. } => items.iter().flatten().for_each(|c| walk(c, out)),
+                _ => {}
+            }
+        }
+        let mut s = String::new();
+        walk(block, &mut s);
+        s
+    }
+
+    #[test]
+    fn display_tree_styles_hanging_bold_immediately() {
+        let mut p = IncrementalParser::new();
+        p.set_text("intro **bo");
+        let display = p.display_tree();
+        let Block::Paragraph { runs } = &display.blocks[0].block else {
+            panic!("expected paragraph");
+        };
+        let bold: Vec<_> = runs.iter().filter(|r| r.style.bold).collect();
+        assert_eq!(bold.len(), 1);
+        assert_eq!(bold[0].text, "bo");
+        assert!(!flat(&display.blocks[0].block).contains("**"));
+        // The canonical tree stays honest: literal markers until truly closed.
+        assert!(flat(&p.tree().blocks[0].block).contains("**"));
+    }
+
+    #[test]
+    fn display_tree_converges_to_canonical_when_balanced() {
+        let corpus = "a **b** *c* `d` [e](https://x.dev) ~~f~~";
+        let mut p = IncrementalParser::new();
+        p.set_text(corpus);
+        assert_eq!(p.display_tree(), *p.tree());
+        assert_eq!(p.tree(), &parse_full(corpus));
+    }
+
+    #[test]
+    fn display_tree_never_leaks_streaming_urls() {
+        let full = "read [docs](https://example.com/long/path) now";
+        let mut p = IncrementalParser::new();
+        for i in 1..=full.len() {
+            if !full.is_char_boundary(i) {
+                continue;
+            }
+            p.set_text(&full[..i]);
+            let text = flat(&p.display_tree().blocks[0].block);
+            assert!(!text.contains("http"), "url leaked at {i}: {text:?}");
+        }
+        // Mid-URL the link text carries the pending sentinel destination.
+        let mut p = IncrementalParser::new();
+        p.set_text("read [docs](https://exa");
+        let Block::Paragraph { runs } = &p.display_tree().blocks[0].block else {
+            panic!("expected paragraph");
+        };
+        let link = runs.iter().find(|r| r.style.link.is_some()).expect("link run");
+        assert_eq!(link.text, "docs");
+        assert_eq!(
+            link.style.link.as_deref(),
+            Some(crate::markdown::mend::PENDING_LINK_URL)
+        );
+    }
+
+    #[test]
+    fn display_tree_leaves_code_blocks_alone() {
+        let mut p = IncrementalParser::new();
+        p.set_text("intro\n\n```\nunclosed **fence");
+        assert_eq!(p.display_tree(), *p.tree());
+    }
+
+    #[test]
+    fn display_tree_suppresses_setext_flicker() {
+        // "para" + "\n-" parses as an H2 for exactly one chunk before the
+        // list item's text arrives; the display tree keeps it a paragraph.
+        let mut p = IncrementalParser::new();
+        p.set_text("para\n-");
+        let display = p.display_tree();
+        assert!(
+            matches!(display.blocks.last().unwrap().block, Block::Paragraph { .. }),
+            "expected paragraph, got {display:?}"
+        );
+    }
+
+    #[test]
+    fn display_tree_prefix_matches_canonical_across_streams() {
+        // Mending swaps only the last block: everything before it must be
+        // byte-identical to the canonical tree so render caches and row keys
+        // survive.
+        for corpus in CORPORA {
+            let mut p = IncrementalParser::new();
+            let bytes = corpus.as_bytes();
+            let mut start = 0;
+            while start < bytes.len() {
+                let mut end = (start + 3).min(bytes.len());
+                while end < bytes.len() && !corpus.is_char_boundary(end) {
+                    end += 1;
+                }
+                p.append(&corpus[start..end]);
+                start = end;
+
+                let display = p.display_tree();
+                let canonical = p.tree();
+                for i in 0..canonical.blocks.len().saturating_sub(1) {
+                    assert_eq!(
+                        display.blocks[i], canonical.blocks[i],
+                        "display prefix diverged:\n{corpus}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

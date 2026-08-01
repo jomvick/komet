@@ -551,12 +551,17 @@ fn flatten_runs_weighted(runs: &[InlineRun], theme: &Theme, base_weight: FontWei
             }
         }
         if let Some(url) = &run.style.link {
-            // Merge adjacent runs of the same link into one clickable range.
-            match links.last_mut() {
-                Some((range, last_url)) if range.end == start && last_url == url => {
-                    range.end = text.len();
+            // A still-streaming link (mend.rs sentinel) keeps link styling —
+            // so the URL's completion changes nothing visually — but is not
+            // clickable until the real destination exists.
+            if url != super::mend::PENDING_LINK_URL {
+                // Merge adjacent runs of the same link into one clickable range.
+                match links.last_mut() {
+                    Some((range, last_url)) if range.end == start && last_url == url => {
+                        range.end = text.len();
+                    }
+                    _ => links.push((start..text.len(), url.clone())),
                 }
-                _ => links.push((start..text.len(), url.clone())),
             }
         }
         out.push(TextRun {
