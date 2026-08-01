@@ -227,6 +227,25 @@ impl Harness for MockHarness {
                 | Sync | Session-room fan-out | 18ms |\n\n"
                 .into(),
         });
+        // Dev/testing knob: `KOMET_MOCK_MEND=1` appends a link/list-heavy
+        // passage — bold-led list items, inline links, emphasis, strikethrough
+        // — the shapes whose half-streamed markers the display mend
+        // (crates/ui markdown/mend.rs) must hold steady while streaming.
+        let mock_mend = std::env::var("KOMET_MOCK_MEND")
+            .ok()
+            .is_some_and(|v| !v.is_empty() && v != "0");
+        let mend_event = mock_mend.then(|| AgentEvent::TextDelta {
+            text: concat!(
+                "\n### Streaming mend check\n\n",
+                "Inline styles hold while text arrives: **bold stays bold**, ",
+                "*italic stays italic*, `code stays code`, and ~~this stays struck~~.\n\n",
+                "- **Fold** — parts diff into the [Loro doc](https://loro.dev) on a 120ms cadence\n",
+                "- **Relay** — commits fan out through the [session room](https://developers.cloudflare.com/durable-objects/) to every device\n",
+                "- **Paint** — the [display tree](https://github.com/pulldown-cmark/pulldown-cmark) mends hanging markers in the last block only\n\n",
+                "Links above never flash their URLs, and closing markers never reflow the paragraph.\n",
+            )
+            .into(),
+        });
         // With the code knob, also exercise a MULTILINE Exec command — the
         // round-9 chip breaker shape ("set -e\nfixture_in_original=0"): the
         // Run chip must stay one 30px line.
@@ -255,10 +274,36 @@ impl Harness for MockHarness {
             .chain(code_tool_events)
             .chain(code_event)
             .chain(table_event)
+            .chain(mend_event)
             .chain(error_event)
             .chain(tail.iter().cloned())
             .map(Ok)
             .collect();
+        // Dev/testing knob: `KOMET_MOCK_CHARS=N` re-chunks every TextDelta
+        // into N-char deltas, so `KOMET_MOCK_DELAY_MS` paces *characters*
+        // instead of whole scripted blocks — delta boundaries then land inside
+        // inline markers and links, which is the streaming shape real
+        // harnesses produce and the display mend exists for.
+        let chunk_chars = std::env::var("KOMET_MOCK_CHARS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0);
+        let events: Vec<Result<AgentEvent, HarnessError>> = match chunk_chars {
+            None => events,
+            Some(n) => events
+                .into_iter()
+                .flat_map(|event| match event {
+                    Ok(AgentEvent::TextDelta { text }) => {
+                        let chars: Vec<char> = text.chars().collect();
+                        chars
+                            .chunks(n)
+                            .map(|c| Ok(AgentEvent::TextDelta { text: c.iter().collect() }))
+                            .collect::<Vec<_>>()
+                    }
+                    other => vec![other],
+                })
+                .collect(),
+        };
         if delay_ms == 0 {
             return Ok(futures::stream::iter(events).boxed());
         }
