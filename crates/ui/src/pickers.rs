@@ -1369,7 +1369,7 @@ impl Pickers {
                 } else {
                     theme.text_muted
                 },
-                Theme::dark().text,
+                theme.text,
             ))
             .bg(if open {
                 theme.element_hover
@@ -1930,8 +1930,7 @@ impl Pickers {
                             })
                             .when(is_disabled, |el| el.opacity(0.35))
                             .when(!is_disabled, |el| {
-                                el.cursor_pointer()
-                                    .hover(|s| s.bg(crate::theme::white_alpha(0.06)))
+                                el.cursor_pointer().hover(|s| s.bg(crate::theme::ink(0.06)))
                             })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.pick_harness(harness, cx);
@@ -2059,7 +2058,7 @@ impl Pickers {
                             .w(px(148.0))
                             .flex_none()
                             .border_r_1()
-                            .border_color(crate::theme::white_alpha(0.06))
+                            .border_color(crate::theme::hairline(0.06))
                             .child(rail),
                     )
                     .child(
@@ -2104,7 +2103,7 @@ impl Pickers {
                                     .max_h(px(190.0))
                                     .overflow_y_scroll()
                                     .border_t_1()
-                                    .border_color(crate::theme::white_alpha(0.06))
+                                    .border_color(crate::theme::hairline(0.06))
                                     .p(px(4.0))
                                     .child(traits),
                             ),
@@ -2116,7 +2115,7 @@ impl Pickers {
                     .flex_none()
                     .bg(popover::band())
                     .border_t_1()
-                    .border_color(crate::theme::white_alpha(0.06))
+                    .border_color(crate::theme::hairline(0.06))
                     .px(px(12.0))
                     .py(px(8.0))
                     .flex()
@@ -2254,7 +2253,7 @@ fn trait_chip(theme: &Theme, active: bool) -> gpui::Div {
                 .text_color(theme.text)
         })
         .when(!active, |el| {
-            el.bg(crate::theme::white_alpha(0.04))
+            el.bg(crate::theme::ink(0.04))
                 .text_color(theme.text_muted.opacity(0.7))
                 .hover(|s| s.bg(theme.element_hover))
         })
@@ -2290,7 +2289,7 @@ fn toggle_switch(theme: &Theme, on: bool) -> gpui::Div {
         .bg(if on {
             theme.text
         } else {
-            crate::theme::white_alpha(0.15)
+            crate::theme::ink(0.15)
         })
         .relative()
         .child(
@@ -2301,9 +2300,9 @@ fn toggle_switch(theme: &Theme, on: bool) -> gpui::Div {
                 .size(px(14.0))
                 .rounded_full()
                 .bg(if on {
-                    crate::theme::grey(0x0e)
+                    theme.on_solid
                 } else {
-                    crate::theme::white_alpha(0.7)
+                    crate::theme::ink(0.7)
                 }),
         )
 }
