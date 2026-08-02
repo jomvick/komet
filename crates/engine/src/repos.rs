@@ -10,13 +10,14 @@
 //!
 //! All git access is via subprocess (`tokio::process`) — never libgit2.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
-use komet_proto::{FolderEntry, FolderListing, Repo, RepoRef, Worktree};
+use komet_proto::{FileSearchMatch, FolderEntry, FolderListing, Repo, RepoRef, Worktree};
 
 use crate::EngineError;
 
@@ -28,6 +29,10 @@ const PATH_EXISTS_TIMEOUT: Duration = Duration::from_secs(2);
 const FOLDER_LIST_TIMEOUT: Duration = Duration::from_secs(6);
 /// Cap on returned folder entries (bounds response size).
 const FOLDER_LIST_MAX_ENTRIES: usize = 500;
+/// File mentions should remain responsive even in very large checkouts.
+const FILE_SEARCH_MAX_RESULTS: usize = 8;
+/// A dead network mount must not leave the composer search spinning forever.
+const FILE_SEARCH_TIMEOUT: Duration = Duration::from_secs(6);
 
 const ADJECTIVES: &[&str] = &[
     "swift", "calm", "bright", "bold", "keen", "brave", "clever", "lucky", "quiet", "warm", "cool",
@@ -76,6 +81,7 @@ struct ReposInner {
     data_dir: PathBuf,
     device_id: String,
     worktrees_root: PathBuf,
+    file_searches: std::sync::Mutex<HashMap<PathBuf, std::sync::Weak<tokio::sync::Mutex<()>>>>,
 }
 
 #[derive(Clone)]
@@ -97,6 +103,7 @@ impl Repos {
                 data_dir: data_dir.to_path_buf(),
                 device_id: device_id.to_string(),
                 worktrees_root,
+                file_searches: std::sync::Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -426,6 +433,31 @@ impl Repos {
             .collect())
     }
 
+    /// Whether `candidate` is the repository root or one of its linked
+    /// worktrees. Filesystem resolution happens on a disposable thread because
+    /// user-selected paths may be dead mounts.
+    pub async fn workspace_checkout(&self, repo_path: &Path, candidate: &Path) -> Option<PathBuf> {
+        let repo_path = repo_path.to_path_buf();
+        let candidate = candidate.to_path_buf();
+        let worktrees: Vec<_> = self
+            .refs(&repo_path)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|row| row.worktree_path.map(PathBuf::from))
+            .collect();
+        disposable_worker("checkout-auth", move || {
+            let candidate = std::fs::canonicalize(candidate).ok()?;
+            std::iter::once(repo_path)
+                .chain(worktrees)
+                .filter_map(|path| std::fs::canonicalize(path).ok())
+                .any(|path| path == candidate)
+                .then_some(candidate)
+        })
+        .await
+        .flatten()
+    }
+
     /// Switch the checkout at `cwd` (a main folder OR a linked worktree) to
     /// `ref_name` — the t3code `switchRef` port: an existing local branch is
     /// checked out directly; a remote-only branch gets a local tracking
@@ -651,6 +683,56 @@ impl Repos {
             .await
     }
 
+    /// Search a checkout's files and directories by fuzzy relative path. The
+    /// `ignore` walker honors `.gitignore`, `.ignore`, and global git excludes.
+    /// Dotfiles remain searchable; only repository metadata is always pruned.
+    pub async fn search_files(
+        &self,
+        root: PathBuf,
+        query: String,
+        featured_paths: Vec<String>,
+    ) -> Result<Vec<FileSearchMatch>, EngineError> {
+        let deadline = tokio::time::Instant::now() + FILE_SEARCH_TIMEOUT;
+        let gate = {
+            let mut searches = self
+                .inner
+                .file_searches
+                .lock()
+                .map_err(|_| EngineError::Other("file search registry poisoned".into()))?;
+            if let Some(gate) = searches.get(&root).and_then(std::sync::Weak::upgrade) {
+                gate
+            } else {
+                let gate = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+                searches.insert(root.clone(), std::sync::Arc::downgrade(&gate));
+                gate
+            }
+        };
+        let gate = tokio::time::timeout_at(deadline, gate.lock_owned())
+            .await
+            .map_err(|_| EngineError::Other("file search timed out".into()))?;
+        let cancelled = std::sync::Arc::new(AtomicBool::new(false));
+        let _cancel_on_drop = CancelOnDrop(cancelled.clone());
+        let worker_cancelled = cancelled.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        std::thread::Builder::new()
+            .name("file-search".into())
+            .spawn(move || {
+                let _gate = gate;
+                let _ = tx.send(search_files_blocking_with_cancel(
+                    &root,
+                    &query,
+                    &featured_paths,
+                    || worker_cancelled.load(Ordering::Relaxed),
+                ));
+            })
+            .map_err(|e| EngineError::Other(format!("file search failed: {e}")))?;
+        match tokio::time::timeout_at(deadline, rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(EngineError::Other("file search worker exited".into())),
+            Err(_) => Err(EngineError::Other("file search timed out".into())),
+        }
+    }
+
     /// `hang_for_test` makes the worker never respond — exercises the timeout path.
     ///
     /// The walk runs on a DETACHED OS thread (not the tokio blocking pool): a
@@ -693,6 +775,28 @@ impl Repos {
     }
 }
 
+struct CancelOnDrop(std::sync::Arc<AtomicBool>);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+async fn disposable_worker<T: Send + 'static>(
+    name: &'static str,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Option<T> {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name(name.into())
+        .spawn(move || {
+            let _ = tx.send(work());
+        })
+        .ok()?;
+    rx.await.ok()
+}
+
 /// The blocking walk: ONE readdir of the target; `is_repo` is a cheap `.git`
 /// existence probe per directory entry.
 fn list_folders_blocking(target: &Path) -> Result<FolderListing, EngineError> {
@@ -729,6 +833,148 @@ fn list_folders_blocking(target: &Path) -> Result<FolderListing, EngineError> {
         entries,
         truncated,
     })
+}
+
+/// Case-insensitive subsequence score. Lower is better: adjacent and earlier
+/// characters win, while still allowing `cmp rs` to find `composer.rs`.
+fn fuzzy_score(query: &str, candidate: &str) -> Option<usize> {
+    let candidate = candidate.to_lowercase();
+    query
+        .split_whitespace()
+        .map(str::to_lowercase)
+        .try_fold(0usize, |total, term| {
+            let mut at = 0;
+            let mut score = 0usize;
+            let mut previous_end = None;
+            for needle in term.chars() {
+                let found = candidate[at..].find(needle)? + at;
+                score += found;
+                if previous_end == Some(found) {
+                    score = score.saturating_sub(2);
+                }
+                at = found + needle.len_utf8();
+                previous_end = Some(at);
+            }
+            Some(total.saturating_add(score))
+        })
+}
+
+type RankedFileMatch = (Option<usize>, usize, String, bool);
+
+fn compare_file_matches(
+    query: &str,
+    (featured_a, score_a, path_a, dir_a): &RankedFileMatch,
+    (featured_b, score_b, path_b, dir_b): &RankedFileMatch,
+) -> std::cmp::Ordering {
+    let empty_query = query.trim().is_empty();
+    featured_a
+        .is_none()
+        .cmp(&featured_b.is_none())
+        .then_with(|| featured_a.cmp(featured_b))
+        .then_with(|| score_a.cmp(score_b))
+        .then_with(|| {
+            empty_query
+                .then(|| path_a.split('/').count().cmp(&path_b.split('/').count()))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .then_with(|| {
+            empty_query
+                .then(|| dir_a.cmp(dir_b))
+                .unwrap_or_else(|| dir_b.cmp(dir_a))
+        })
+        .then_with(|| path_a.len().cmp(&path_b.len()))
+        .then_with(|| path_a.cmp(path_b))
+}
+
+#[cfg(test)]
+fn search_files_blocking(
+    root: &Path,
+    query: &str,
+    featured_paths: &[String],
+) -> Result<Vec<FileSearchMatch>, EngineError> {
+    search_files_blocking_with_cancel(root, query, featured_paths, || false)
+}
+
+fn search_files_blocking_with_cancel<F: Fn() -> bool>(
+    root: &Path,
+    query: &str,
+    featured_paths: &[String],
+    cancelled: F,
+) -> Result<Vec<FileSearchMatch>, EngineError> {
+    let root = std::fs::canonicalize(root)
+        .map_err(|e| EngineError::Other(format!("could not search workspace: {e}")))?;
+    let featured: HashMap<String, usize> = featured_paths
+        .iter()
+        .filter_map(|path| {
+            let path = Path::new(path);
+            let full = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                root.join(path)
+            };
+            let canonical = std::fs::canonicalize(full).ok()?;
+            let relative = canonical.strip_prefix(&root).ok()?;
+            Some(relative.to_string_lossy().replace('\\', "/"))
+        })
+        .enumerate()
+        .fold(HashMap::new(), |mut paths, (rank, path)| {
+            paths.entry(path).or_insert(rank);
+            paths
+        });
+    let mut matches = Vec::new();
+    let walker = ignore::WalkBuilder::new(&root)
+        .hidden(false)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .filter_entry(|entry| entry.depth() == 0 || entry.file_name() != ".git")
+        .build();
+    for entry in walker {
+        if cancelled() {
+            return Err(EngineError::Other("file search cancelled".into()));
+        }
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                tracing::debug!(%err, "file mention search walk skipped entry");
+                continue;
+            }
+        };
+        let path = entry.path();
+        if path == root {
+            continue;
+        }
+        let Ok(relative) = path.strip_prefix(&root) else {
+            continue;
+        };
+        let relative = relative.to_string_lossy().replace('\\', "/");
+        if relative.starts_with(".git/") || relative == ".git" {
+            continue;
+        }
+        let Some(path_score) = fuzzy_score(query, &relative) else {
+            continue;
+        };
+        let score = relative
+            .rsplit('/')
+            .next()
+            .and_then(|name| fuzzy_score(query, name))
+            .unwrap_or_else(|| path_score.saturating_add(1_000));
+        matches.push((
+            featured.get(&relative).copied(),
+            score,
+            relative,
+            entry.file_type().is_some_and(|kind| kind.is_dir()),
+        ));
+        if matches.len() > FILE_SEARCH_MAX_RESULTS {
+            matches.sort_by(|a, b| compare_file_matches(query, a, b));
+            matches.truncate(FILE_SEARCH_MAX_RESULTS);
+        }
+    }
+    matches.sort_by(|a, b| compare_file_matches(query, a, b));
+    Ok(matches
+        .into_iter()
+        .map(|(_, _, path, is_dir)| FileSearchMatch { path, is_dir })
+        .collect())
 }
 
 /// Turn a generated chat title into the semantic portion of a Komet branch
@@ -769,4 +1015,134 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
         out.push_str(&format!("{byte:02x}"));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fuzzy_score_matches_a_path_subsequence() {
+        assert!(fuzzy_score("cmp rs", "crates/ui/src/composer.rs").is_some());
+        assert!(fuzzy_score("composer crates", "crates/ui/src/composer.rs").is_some());
+        assert!(fuzzy_score("xyz", "crates/ui/src/composer.rs").is_none());
+    }
+
+    #[test]
+    fn search_files_obeys_gitignore_and_returns_directories() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".git")).unwrap();
+        std::fs::create_dir(root.path().join("src")).unwrap();
+        std::fs::write(root.path().join("src/composer.rs"), "").unwrap();
+        std::fs::write(root.path().join(".secret"), "").unwrap();
+        std::fs::write(root.path().join(".gitignore"), "ignored\n").unwrap();
+        std::fs::create_dir(root.path().join("ignored")).unwrap();
+        std::fs::write(root.path().join("ignored/nope.rs"), "").unwrap();
+
+        let matches = search_files_blocking(root.path(), "src", &[]).unwrap();
+        assert!(
+            matches
+                .iter()
+                .any(|entry| entry.path == "src" && entry.is_dir)
+        );
+        assert!(matches.iter().any(|entry| entry.path == "src/composer.rs"));
+        assert!(
+            !matches
+                .iter()
+                .any(|entry| entry.path.starts_with("ignored"))
+        );
+        assert!(
+            search_files_blocking(root.path(), "secret", &[])
+                .unwrap()
+                .iter()
+                .any(|entry| entry.path == ".secret")
+        );
+        assert!(!matches.iter().any(|entry| entry.path.starts_with(".git/")));
+    }
+
+    #[test]
+    fn empty_search_features_recent_paths_before_shallow_entries() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("src")).unwrap();
+        std::fs::write(root.path().join("README.md"), "").unwrap();
+        std::fs::write(root.path().join("src/deep.rs"), "").unwrap();
+
+        let matches = search_files_blocking(root.path(), "", &["src/deep.rs".into()]).unwrap();
+        assert_eq!(
+            matches.first().map(|entry| entry.path.as_str()),
+            Some("src/deep.rs")
+        );
+        assert!(matches.iter().any(|entry| entry.path == "README.md"));
+    }
+
+    #[test]
+    fn search_files_prefers_filename_matches() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("composer/docs")).unwrap();
+        std::fs::create_dir_all(root.path().join("src")).unwrap();
+        std::fs::write(root.path().join("composer/docs/readme.md"), "").unwrap();
+        std::fs::write(root.path().join("src/composer.rs"), "").unwrap();
+
+        let matches = search_files_blocking(root.path(), "composer", &[]).unwrap();
+        let composer = matches
+            .iter()
+            .position(|entry| entry.path == "src/composer.rs")
+            .unwrap();
+        let path_only = matches
+            .iter()
+            .position(|entry| entry.path == "composer/docs/readme.md")
+            .unwrap();
+        assert!(composer < path_only);
+    }
+
+    #[test]
+    fn cancelled_search_stops_before_walking() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("README.md"), "").unwrap();
+        let cancelled = AtomicBool::new(true);
+
+        let err = search_files_blocking_with_cancel(root.path(), "", &[], || {
+            cancelled.load(Ordering::Relaxed)
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("cancelled"));
+    }
+
+    #[tokio::test]
+    async fn workspace_checkout_rejects_sibling_paths() {
+        let data = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let sibling = tempfile::tempdir().unwrap();
+        let repos =
+            Repos::with_worktrees_root(data.path(), "device", data.path().join("worktrees"));
+
+        assert_eq!(
+            repos.workspace_checkout(root.path(), root.path()).await,
+            std::fs::canonicalize(root.path()).ok()
+        );
+        assert!(
+            repos
+                .workspace_checkout(root.path(), sibling.path())
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_searches_of_one_checkout_do_not_cancel_each_other() {
+        let data = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("alpha.rs"), "").unwrap();
+        std::fs::write(root.path().join("beta.rs"), "").unwrap();
+        let repos =
+            Repos::with_worktrees_root(data.path(), "device", data.path().join("worktrees"));
+
+        let alpha = repos.search_files(root.path().into(), "alpha".into(), Vec::new());
+        let beta = repos.search_files(root.path().into(), "beta".into(), Vec::new());
+        let (alpha, beta) = tokio::join!(alpha, beta);
+
+        assert_eq!(alpha.unwrap()[0].path, "alpha.rs");
+        assert_eq!(beta.unwrap()[0].path, "beta.rs");
+    }
 }
