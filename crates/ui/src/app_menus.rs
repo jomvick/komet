@@ -118,6 +118,11 @@ pub fn app_menus() -> Vec<Menu> {
         // input — zed wires its editor actions identically
         // (crates/zed/src/zed/app_menus.rs, Edit/Selection menus).
         Menu::new("Edit").items([
+            // Undo/Redo have no `OsAction` counterpart — they dispatch as plain
+            // actions to the focused input, same as the composer keymap.
+            MenuItem::action("Undo", composer::Undo),
+            MenuItem::action("Redo", composer::Redo),
+            MenuItem::separator(),
             MenuItem::os_action("Cut", composer::Cut, OsAction::Cut),
             MenuItem::os_action("Copy", composer::Copy, OsAction::Copy),
             MenuItem::os_action("Paste", composer::Paste, OsAction::Paste),
