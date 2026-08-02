@@ -67,6 +67,7 @@ pub trait Harness: Send + Sync {
 pub mod claude;
 pub mod codex;
 pub mod mock;
+pub mod shell_env;
 
 /// Bin directories where npm-installed CLIs land under Node version managers.
 /// GUI launches never see these on PATH — the managers shape PATH in shell
@@ -109,17 +110,24 @@ pub(crate) fn node_version_manager_bins() -> Vec<std::path::PathBuf> {
     dirs
 }
 
-/// Prepend the resolved executable's directory to the child's PATH. npm-shim
-/// CLIs are `#!/usr/bin/env node` scripts whose `node` lives beside them in
-/// the version manager's bin dir — a dir the GUI process's own PATH lacks.
-pub(crate) fn prepend_exe_dir_to_path(cmd: &mut tokio::process::Command, exe: &std::path::Path) {
-    let Some(dir) = exe.parent().filter(|d| !d.as_os_str().is_empty()) else {
-        return;
-    };
-    let mut paths = vec![dir.to_path_buf()];
+/// Compose the child's PATH: the resolved executable's directory first, then
+/// our own PATH, then the login-shell PATH snapshot — deduped. npm-shim CLIs
+/// are `#!/usr/bin/env node` scripts whose `node` lives beside them in the
+/// version manager's bin dir, and the CLIs themselves shell out to tools
+/// (git, rg, node) that a GUI/service launch's own PATH may lack.
+pub(crate) fn compose_child_path(cmd: &mut tokio::process::Command, exe: &std::path::Path) {
+    let mut paths: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(dir) = exe.parent().filter(|d| !d.as_os_str().is_empty()) {
+        paths.push(dir.to_path_buf());
+    }
     if let Some(path) = std::env::var_os("PATH") {
         paths.extend(std::env::split_paths(&path));
     }
+    if let Some(shell_path) = shell_env::login_shell_path() {
+        paths.extend(std::env::split_paths(shell_path));
+    }
+    let mut seen = std::collections::HashSet::new();
+    paths.retain(|p| !p.as_os_str().is_empty() && seen.insert(p.clone()));
     if let Ok(joined) = std::env::join_paths(paths) {
         cmd.env("PATH", joined);
     }
