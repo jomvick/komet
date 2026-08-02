@@ -75,8 +75,10 @@ pub enum CheckoutKind {
 /// [`Pickers::checkout_plan`]).
 #[derive(Debug, Clone, PartialEq)]
 pub enum CheckoutPlan {
-    /// Run in the space folder as-is.
-    CurrentCheckout,
+    /// Run in the space folder as-is. `branch` is the checkout's branch (the
+    /// picked or current ref), carried onto `createChat` so the session names
+    /// it from the first frame; `None` = refs never loaded.
+    CurrentCheckout { branch: Option<String> },
     /// Reuse the picked ref's existing worktree (a cwd override; no git).
     ReuseWorktree { path: String, branch: String },
     /// `CreateWorktree` off `base` on send (komet mints a `komet/<name>`
@@ -1229,7 +1231,9 @@ impl Pickers {
                     path,
                     branch: self.effective_ref_name().unwrap_or_default(),
                 },
-                None => CheckoutPlan::CurrentCheckout,
+                None => CheckoutPlan::CurrentCheckout {
+                    branch: self.effective_ref_name(),
+                },
             },
         }
     }

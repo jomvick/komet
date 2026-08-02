@@ -2469,7 +2469,9 @@ impl Composer {
                 let mut chat_branch: Option<String> = None;
                 if is_new {
                     match &plan {
-                        crate::pickers::CheckoutPlan::CurrentCheckout => {}
+                        crate::pickers::CheckoutPlan::CurrentCheckout { branch } => {
+                            chat_branch = branch.clone();
+                        }
                         crate::pickers::CheckoutPlan::ReuseWorktree { path, branch } => {
                             cwd = path.clone();
                             worktree_cwd = Some(path.clone());
