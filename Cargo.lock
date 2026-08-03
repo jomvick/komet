@@ -1195,7 +1195,7 @@ checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
 name = "komet"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "anyhow",
  "clap",
@@ -1210,7 +1210,7 @@ dependencies = [
 
 [[package]]
 name = "komet-doc"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "chrono",
  "komet-proto",
@@ -1223,7 +1223,7 @@ dependencies = [
 
 [[package]]
 name = "komet-engine"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1256,7 +1256,7 @@ dependencies = [
 
 [[package]]
 name = "komet-harness"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1276,7 +1276,7 @@ dependencies = [
 
 [[package]]
 name = "komet-proto"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "chrono",
  "serde",
@@ -1286,7 +1286,7 @@ dependencies = [
 
 [[package]]
 name = "komet-rpc"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1304,7 +1304,7 @@ dependencies = [
 
 [[package]]
 name = "komet-sync"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "komet-doc",
  "futures",
@@ -1322,7 +1322,7 @@ dependencies = [
 
 [[package]]
 name = "komet-tui"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1346,7 +1346,7 @@ dependencies = [
 
 [[package]]
 name = "komet-tui-bin"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "anyhow",
  "clap",
@@ -1355,7 +1355,7 @@ dependencies = [
 
 [[package]]
 name = "komet-ui"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -1384,7 +1384,7 @@ dependencies = [
 
 [[package]]
 name = "komet-update"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "anyhow",
  "futures",
