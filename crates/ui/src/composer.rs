@@ -3666,6 +3666,8 @@ impl Composer {
                 "file-mention-loading",
                 theme,
                 3,
+                cx.entity_id(),
+                cx,
             ));
         } else if let Some(error) = self.mention.error.clone() {
             card = card.child(

@@ -1240,7 +1240,13 @@ impl Shell {
             div()
                 .px(px(8.0))
                 .py(px(6.0))
-                .child(popover::skeleton_rows("add-space-skeleton", &theme, 6))
+                .child(popover::skeleton_rows(
+                    "add-space-skeleton",
+                    &theme,
+                    6,
+                    cx.entity_id(),
+                    cx,
+                ))
                 .into_any_element()
         } else if let Some(message) = load_error {
             let device_line = device

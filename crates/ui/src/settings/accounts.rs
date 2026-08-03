@@ -937,7 +937,13 @@ impl AccountsPage {
         let body: AnyElement = match login {
             LoginFlow::Starting { .. } => div()
                 .mt(px(8.0))
-                .child(popover::skeleton_rows("login-starting", &theme, 2))
+                .child(popover::skeleton_rows(
+                    "login-starting",
+                    &theme,
+                    2,
+                    cx.entity_id(),
+                    cx,
+                ))
                 .into_any_element(),
             LoginFlow::PasteCode {
                 start,
@@ -1035,7 +1041,13 @@ impl AccountsPage {
                                 .flex_row()
                                 .items_center()
                                 .gap(px(8.0))
-                                .child(crate::loaders::gradient_spinner("login-poll", &theme, 3.0))
+                                .child(crate::loaders::gradient_spinner(
+                                    "login-poll",
+                                    &theme,
+                                    3.0,
+                                    cx.entity_id(),
+                                    cx,
+                                ))
                                 .child(
                                     div()
                                         .text_size(px(12.5))
@@ -1081,12 +1093,14 @@ impl AccountsPage {
     /// row so loaded data lands without a layout jump. `dim` fades row two.
     fn render_skeleton_row(
         &self,
-        id: (&'static str, usize),
+        _id: (&'static str, usize),
         dim: bool,
         first: bool,
         theme: &Theme,
+        cx: &mut Context<Self>,
     ) -> AnyElement {
-        use crate::motion::{self, AnimationExt as _};
+        use crate::motion;
+        let delta = motion::pulse_delta(&motion::KOMET_PULSE, cx.entity_id(), cx);
         let ghost = |w: gpui::Length, h: f32, round_full: bool| {
             div()
                 .w(w)
@@ -1154,11 +1168,7 @@ impl AccountsPage {
             .py(px(14.0))
             .when(!first, |el| el.border_t_1().border_color(theme.border))
             .when(dim, |el| el.opacity(0.6))
-            .child(
-                inner.with_animation(id, motion::KOMET_PULSE.repeating(), move |el, delta| {
-                    el.opacity(0.55 + 0.35 * motion::pulse_wave(delta))
-                }),
-            )
+            .child(inner.opacity(0.55 + 0.35 * motion::pulse_wave(delta)))
             .into_any_element()
     }
 }
@@ -1240,12 +1250,14 @@ impl Render for AccountsPage {
                                     false,
                                     true,
                                     &theme,
+                                    cx,
                                 ))
                                 .child(self.render_skeleton_row(
                                     (skeleton_id, 1),
                                     true,
                                     false,
                                     &theme,
+                                    cx,
                                 )),
                         )
                         .into_any_element()

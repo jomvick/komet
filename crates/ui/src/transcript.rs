@@ -1524,10 +1524,13 @@ impl Transcript {
                     .border_1()
                     .border_color(crate::theme::hairline(0.08))
                     .bg(crate::theme::ink(0.055))
-                    .with_animation(
-                        SharedString::from(format!("{row_id}#att-pulse{aix}")),
-                        motion::KOMET_PULSE.repeating(),
-                        move |el, delta| el.opacity(0.35 + 0.4 * motion::pulse_wave(delta)),
+                    .opacity(
+                        0.35 + 0.4
+                            * motion::pulse_wave(motion::pulse_delta(
+                                &motion::KOMET_PULSE,
+                                cx.entity_id(),
+                                cx,
+                            )),
                     )
                     .into_any_element(),
             };

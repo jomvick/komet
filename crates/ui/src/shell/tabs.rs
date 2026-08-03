@@ -302,6 +302,8 @@ impl Shell {
                                 el.child(loaders::mini_gradient_spinner(
                                     format!("tab-working-{id}"),
                                     2.0,
+                                    cx.entity_id(),
+                                    cx,
                                 ))
                             })
                             .when(

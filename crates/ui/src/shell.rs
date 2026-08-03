@@ -1779,6 +1779,8 @@ impl Shell {
                 .child(loaders::mini_gradient_spinner(
                     format!("chat-working-{id}"),
                     2.0,
+                    cx.entity_id(),
+                    cx,
                 ))
                 .into_any_element()
         } else {
@@ -2984,7 +2986,13 @@ impl Shell {
                 let word =
                     transcript::flavour_word(transcript::flavour_seed(&chat_id), elapsed_secs);
                 strip
-                    .child(loaders::gradient_spinner("working-indicator", &theme, 2.5))
+                    .child(loaders::gradient_spinner(
+                        "working-indicator",
+                        &theme,
+                        2.5,
+                        cx.entity_id(),
+                        cx,
+                    ))
                     .child(
                         div()
                             .text_size(px(12.0))
@@ -3006,7 +3014,13 @@ impl Shell {
                 .child(SharedString::from("Run failed"))
                 .into_any_element(),
             Indicator::None if sending => strip
-                .child(loaders::gradient_spinner("sending-indicator", &theme, 2.5))
+                .child(loaders::gradient_spinner(
+                    "sending-indicator",
+                    &theme,
+                    2.5,
+                    cx.entity_id(),
+                    cx,
+                ))
                 .child(
                     div()
                         .text_size(px(12.0))
@@ -3216,7 +3230,13 @@ impl Shell {
             match &orgs {
                 Loadable::Idle | Loadable::Loading => div()
                     .mt(px(24.0))
-                    .child(popover::skeleton_rows("org-skeleton", &theme, 2))
+                    .child(popover::skeleton_rows(
+                        "org-skeleton",
+                        &theme,
+                        2,
+                        cx.entity_id(),
+                        cx,
+                    ))
                     .into_any_element(),
                 Loadable::Error(message) => div()
                     .mt(px(24.0))
@@ -3882,8 +3902,16 @@ impl Render for Shell {
 
         // Boot splash overlay: visible → crossfades out on Ready → removed.
         match self.splash {
-            SplashPhase::Visible => root.child(loaders::splash_overlay(Theme::of(cx), false)),
-            SplashPhase::FadingOut => root.child(loaders::splash_overlay(Theme::of(cx), true)),
+            SplashPhase::Visible => {
+                let theme = Theme::of(cx).clone();
+                let view = cx.entity_id();
+                root.child(loaders::splash_overlay(&theme, false, view, cx))
+            }
+            SplashPhase::FadingOut => {
+                let theme = Theme::of(cx).clone();
+                let view = cx.entity_id();
+                root.child(loaders::splash_overlay(&theme, true, view, cx))
+            }
             SplashPhase::Gone => root,
         }
     }

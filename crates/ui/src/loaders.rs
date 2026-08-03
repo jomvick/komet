@@ -9,11 +9,9 @@
 //! are paint-local and never move surrounding layout. Reduced motion snaps every
 //! cell to its rest state automatically (gpui `reduce_motion`).
 
-use gpui::{AnyElement, IntoElement, ParentElement, SharedString, Styled, div, px};
+use gpui::{AnyElement, App, EntityId, IntoElement, ParentElement, SharedString, Styled, div, px};
 
-use crate::motion::{
-    self, AnimationExt as _, KOMET_PULSE, GRADIENT_SPIN, PULSE_STAGGER, SPLASH_OUT,
-};
+use crate::motion::{self, KOMET_PULSE, GRADIENT_SPIN, PULSE_STAGGER, SPLASH_OUT};
 use crate::theme::Theme;
 
 // Shared with the terminal viewport (`komet_proto::motion`) so both animate the
@@ -27,15 +25,22 @@ pub use komet_proto::motion::{
 /// (opacity 0.08, scale 0.9) and flares to full as the crest passes; per-cell
 /// stagger follows the flight axis. `height_px` sets the mark's height (width
 /// follows the 820:940 canvas).
-pub fn komet_mark_loader(id: &'static str, theme: &Theme, height_px: f32) -> impl IntoElement {
+pub fn komet_mark_loader(
+    _id: &'static str,
+    theme: &Theme,
+    height_px: f32,
+    view: EntityId,
+    cx: &mut App,
+) -> impl IntoElement {
     let color = theme.text;
     let scale = height_px / 940.0;
     let cell = 100.0 * scale;
+    let delta = motion::pulse_delta(&KOMET_PULSE, view, cx);
     div()
         .relative()
         .w(px(820.0 * scale))
         .h(px(height_px))
-        .children(MARK_CELLS.iter().enumerate().map(move |(i, &(x, y))| {
+        .children(MARK_CELLS.iter().map(move |&(x, y)| {
             let stagger = mark_cell_stagger(x, y);
             // Fixed slot; the animated cell breathes inside it (paint-local).
             div()
@@ -46,19 +51,16 @@ pub fn komet_mark_loader(id: &'static str, theme: &Theme, height_px: f32) -> imp
                 .flex()
                 .items_center()
                 .justify_center()
-                .child(
+                .child({
+                    // Negative CSS delay ⇒ the cell starts mid-cycle:
+                    // the stagger ADDS phase (komet-loader.tsx delayFor).
+                    let phase = (delta + stagger).rem_euclid(1.0);
                     div()
                         .rounded(px(16.0 * scale))
                         .bg(color)
-                        .size(px(cell))
-                        .with_animation((id, i), KOMET_PULSE.repeating(), move |el, delta| {
-                            // Negative CSS delay ⇒ the cell starts mid-cycle:
-                            // the stagger ADDS phase (komet-loader.tsx delayFor).
-                            let phase = (delta + stagger).rem_euclid(1.0);
-                            el.opacity(motion::pulse_opacity(phase))
-                                .size(px(cell * motion::pulse_scale(phase)))
-                        }),
-                )
+                        .opacity(motion::pulse_opacity(phase))
+                        .size(px(cell * motion::pulse_scale(phase)))
+                })
         }))
 }
 
@@ -67,9 +69,16 @@ pub fn komet_mark_loader(id: &'static str, theme: &Theme, height_px: f32) -> imp
 ///
 /// `id` scopes the per-cell animation state — give each loader instance a
 /// distinct id.
-pub fn komet_loader(id: &'static str, theme: &Theme, cell_px: f32) -> impl IntoElement {
+pub fn komet_loader(
+    _id: &'static str,
+    theme: &Theme,
+    cell_px: f32,
+    view: EntityId,
+    cx: &mut App,
+) -> impl IntoElement {
     let color = theme.text;
     let slot = cell_px;
+    let delta = motion::pulse_delta(&KOMET_PULSE, view, cx);
     div()
         .flex()
         .flex_row()
@@ -82,17 +91,14 @@ pub fn komet_loader(id: &'static str, theme: &Theme, cell_px: f32) -> impl IntoE
                 .flex()
                 .items_center()
                 .justify_center()
-                .child(
+                .child({
+                    let phase = motion::staggered_phase(delta, i, PULSE_STAGGER);
                     div()
                         .rounded(px(slot / 4.0))
                         .bg(color)
-                        .size(px(slot))
-                        .with_animation((id, i), KOMET_PULSE.repeating(), move |el, delta| {
-                            let phase = motion::staggered_phase(delta, i, PULSE_STAGGER);
-                            el.opacity(motion::pulse_opacity(phase))
-                                .size(px(slot * motion::pulse_scale(phase)))
-                        }),
-                )
+                        .opacity(motion::pulse_opacity(phase))
+                        .size(px(slot * motion::pulse_scale(phase)))
+                })
         }))
 }
 
@@ -104,9 +110,16 @@ pub use komet_proto::motion::{GSPIN_DIM, GSPIN_ROW_TINTS};
 /// per-cell phase follows the "arrow-up" pattern (the pulse enters at the
 /// bottom edge and converges toward the top-center cell), so the wave reads
 /// as travelling upward.
-pub fn gradient_spinner(id: &'static str, _theme: &Theme, cell_px: f32) -> impl IntoElement {
+pub fn gradient_spinner(
+    _id: &'static str,
+    _theme: &Theme,
+    cell_px: f32,
+    view: EntityId,
+    cx: &mut App,
+) -> impl IntoElement {
     let center = (MATRIX_SIDE as f32 - 1.0) / 2.0;
     let max = MATRIX_SIDE as f32 - 1.0 + center;
+    let delta = motion::pulse_delta(&GRADIENT_SPIN, view, cx);
     div()
         .flex()
         .flex_col()
@@ -118,7 +131,6 @@ pub fn gradient_spinner(id: &'static str, _theme: &Theme, cell_px: f32) -> impl 
                 .flex_row()
                 .gap(px(cell_px / 2.0))
                 .children((0..MATRIX_SIDE).map(move |col| {
-                    let cell_ix = row * MATRIX_SIDE + col;
                     // Distance of this cell from the wave origin, normalized
                     // into a phase offset (gradient-spin's `--gspin-phase`).
                     let d = MATRIX_SIDE as f32 - 1.0 - row as f32 + (col as f32 - center).abs();
@@ -127,13 +139,7 @@ pub fn gradient_spinner(id: &'static str, _theme: &Theme, cell_px: f32) -> impl 
                         .size(px(cell_px))
                         .rounded(px(cell_px / 2.0))
                         .bg(tint)
-                        .with_animation(
-                            (id, cell_ix),
-                            GRADIENT_SPIN.repeating(),
-                            move |el, delta| {
-                                el.opacity(motion::gspin_opacity(delta + phase, GSPIN_DIM))
-                            },
-                        )
+                        .opacity(motion::gspin_opacity(delta + phase, GSPIN_DIM))
                 }))
         }))
 }
@@ -143,39 +149,37 @@ pub fn gradient_spinner(id: &'static str, _theme: &Theme, cell_px: f32) -> impl 
 /// brightness SNAKES around the grid's perimeter (every cell of a 2×3 grid is
 /// on the ring) instead of sweeping as a vertical wave — a tiny radial chase.
 /// ~6×10px footprint at the default 2.5px cells.
-pub fn mini_gradient_spinner(key: impl Into<SharedString>, cell_px: f32) -> impl IntoElement {
+pub fn mini_gradient_spinner(
+    key: impl Into<SharedString>,
+    cell_px: f32,
+    view: EntityId,
+    cx: &mut App,
+) -> impl IntoElement {
     const COLS: usize = 2;
     const ROWS: usize = 3;
     /// Clockwise ring position of each `(row, col)` cell, top-left first:
     /// (0,0) → (0,1) → (1,1) → (2,1) → (2,0) → (1,0).
     const RING: [[usize; COLS]; ROWS] = [[0, 1], [5, 2], [4, 3]];
     const RING_LEN: f32 = (COLS * ROWS) as f32;
-    let key = key.into();
+    let _key = key.into();
+    let delta = motion::pulse_delta(&GRADIENT_SPIN, view, cx);
     div()
         .flex()
         .flex_col()
         .gap(px(cell_px / 2.0))
         .children((0..ROWS).map(move |row| {
             let tint: gpui::Hsla = gpui::rgb(GSPIN_ROW_TINTS[row]).into();
-            let key = key.clone();
             div()
                 .flex()
                 .flex_row()
                 .gap(px(cell_px / 2.0))
                 .children((0..COLS).map(move |col| {
-                    let cell_ix = row * COLS + col;
                     let phase = RING[row][col] as f32 / RING_LEN;
                     div()
                         .size(px(cell_px))
                         .rounded(px(cell_px / 2.0))
                         .bg(tint)
-                        .with_animation(
-                            SharedString::from(format!("{key}-{cell_ix}")),
-                            GRADIENT_SPIN.repeating(),
-                            move |el, delta| {
-                                el.opacity(motion::gspin_opacity(delta + phase, GSPIN_DIM))
-                            },
-                        )
+                        .opacity(motion::gspin_opacity(delta + phase, GSPIN_DIM))
                 }))
         }))
 }
@@ -184,7 +188,7 @@ pub fn mini_gradient_spinner(key: impl Into<SharedString>, cell_px: f32) -> impl
 /// (`h-16`) over the app background with an uppercase tracked "Loading" line.
 /// While `fading` it plays `splash-out` (150ms hold, then 0.5s fade + 6px
 /// lift); the shell removes it once [`SPLASH_OUT`] has run its course.
-pub fn splash_overlay(theme: &Theme, fading: bool) -> AnyElement {
+pub fn splash_overlay(theme: &Theme, fading: bool, view: EntityId, cx: &mut App) -> AnyElement {
     let content = div()
         .absolute()
         .inset_0()
@@ -194,7 +198,7 @@ pub fn splash_overlay(theme: &Theme, fading: bool) -> AnyElement {
         .items_center()
         .justify_center()
         .gap(px(28.0))
-        .child(komet_mark_loader("boot-splash", theme, 64.0))
+        .child(komet_mark_loader("boot-splash", theme, 64.0, view, cx))
         .child(loading_word(theme));
     if fading {
         motion::splash_out("boot-splash-out", content).into_any_element()
