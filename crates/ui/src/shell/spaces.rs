@@ -590,9 +590,13 @@ impl Shell {
                 .into_iter()
                 .map(|(status, chat)| {
                     let space = state.space_for_chat(chat);
-                    let folder = space
+                    let mut folder = space
                         .map(|s| s.display_name().to_string())
                         .unwrap_or_else(|| "?".to_string());
+                    // Unknown device → no fragment, same as the archived list.
+                    if let Some(device) = state.device_name(&chat.device_id) {
+                        folder = format!("{folder}@{device}");
+                    }
                     // The branch shows whenever the engine has stamped one —
                     // main-checkout sessions included, not just worktrees.
                     let branch = chat
