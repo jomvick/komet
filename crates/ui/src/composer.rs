@@ -623,13 +623,12 @@ const UNDO_COALESCE: Duration = Duration::from_millis(700);
 /// Cap on retained undo steps — a long-lived composer must not grow forever.
 const UNDO_LIMIT: usize = 200;
 
-/// Invisible but shaped whitespace reserved for the SVG painted beside every
-/// mention label. Keeping this in the projection makes the icon participate in
-/// wrapping, hit testing, and selection without changing the raw Markdown.
-/// Three no-break spaces (0.25em each in Geist) rather than one em-space:
-/// Geist has no glyph for U+2003, so it shapes at fallback width — near zero
-/// on some platforms — which left the icon overlapping the label.
-const MENTION_ICON_SLOT: &str = "\u{00A0}\u{00A0}\u{00A0}";
+/// The literal `@` a chip displays before its file name. Projected as TEXT so
+/// it shapes, wraps, and hit-tests with the label — the earlier SVG icons
+/// painted into a reserved whitespace slot never sat right at text size
+/// (user report). Chips read as inline code: `@name` in the mono font over
+/// the code wash.
+const MENTION_PREFIX: char = '@';
 const MENTION_TOOLTIP_DELAY: Duration = Duration::from_millis(420);
 const MENTION_TOOLTIP_HEIGHT: f32 = 24.0;
 const MENTION_SIDE_PAD: &str = "\u{00A0}";
@@ -892,13 +891,13 @@ impl TextProjection {
         for (link, label) in links.into_iter().zip(labels) {
             projection.display.push_str(&raw[raw_at..link.range.start]);
             let display_start = projection.display.len();
-            // Text runs cannot host an inline element. Reserve a stable
-            // whitespace slot for the SVG which `ComposerTextElement::paint`
-            // draws into, then retain non-breaking side bearings around it.
-            // Every character here must exist in Geist — see MENTION_ICON_SLOT.
+            // The chip is plain projected text — `@` plus the label between
+            // non-breaking side bearings; the rounded code wash beneath it is
+            // painted by `ComposerTextElement::paint`. Every character here
+            // must exist in Geist (no exotic whitespace — U+2003/U+202F shape
+            // at fallback width and collapsed the chip once already).
             projection.display.push_str(MENTION_SIDE_PAD);
-            projection.display.push_str(MENTION_ICON_SLOT);
-            projection.display.push('\u{00A0}');
+            projection.display.push(MENTION_PREFIX);
             for ch in label.chars() {
                 projection
                     .display
@@ -1026,12 +1025,11 @@ fn mention_display_labels(links: &[FileMentionLink]) -> Vec<String> {
 }
 
 /// One chip in a *sent* message: its byte range over the projected display
-/// string, the em-space slot the icon paints into, and which icon. The
-/// transcript renders these read-only — no editing state, no tooltip machinery.
+/// string (`@label` between side bearings). The transcript renders these
+/// read-only — no editing state, no tooltip machinery.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SentMentionSpan {
     pub range: Range<usize>,
-    pub icon_slot: Range<usize>,
     /// Full workspace-relative path (labels can be shortened to basenames).
     pub path: SharedString,
     pub is_dir: bool,
@@ -1053,18 +1051,14 @@ pub fn sent_mention_display(raw: &str) -> Option<(String, Vec<SentMentionSpan>)>
     let spans = projection
         .mentions
         .iter()
-        .map(|(link, display)| {
-            let icon_start = display.start + MENTION_SIDE_PAD.len();
-            SentMentionSpan {
-                range: display.clone(),
-                icon_slot: icon_start..icon_start + MENTION_ICON_SLOT.len(),
-                path: SharedString::from(format!(
-                    "{}{}",
-                    link.path,
-                    if link.is_dir { "/" } else { "" }
-                )),
-                is_dir: link.is_dir,
-            }
+        .map(|(link, display)| SentMentionSpan {
+            range: display.clone(),
+            path: SharedString::from(format!(
+                "{}{}",
+                link.path,
+                if link.is_dir { "/" } else { "" }
+            )),
+            is_dir: link.is_dir,
         })
         .collect();
     Some((projection.display, spans))
@@ -2389,7 +2383,13 @@ impl ComposerInput {
 
     /// Shape the text at a width; store measured layout; return content height.
     /// Called from the element's measured-layout closure.
-    fn layout_text(&mut self, width: Pixels, style: &TextStyle, window: &mut Window) -> f32 {
+    fn layout_text(
+        &mut self,
+        width: Pixels,
+        style: &TextStyle,
+        window: &mut Window,
+        cx: &App,
+    ) -> f32 {
         // Rebuild this even for an empty draft. Otherwise deleting the final
         // mention can leave its previous paint geometry alive while the
         // placeholder is already being shaped, tinting "Do anything" for a
@@ -2403,10 +2403,20 @@ impl ComposerInput {
         let font_size = style.font_size.to_pixels(window.rem_size());
         self.line_height = px(INPUT_LINE_HEIGHT);
 
-        let run_for = |len: usize, underline: bool, _chip: bool| TextRun {
+        // Chips read as inline code: the markdown renderer's recipe (mono font
+        // + `code_text` violet) over the rounded `code_wash` painted beneath.
+        let (chip_font, chip_color) = {
+            let theme = Theme::of(cx);
+            (gpui::font(theme.font_mono.clone()), theme.code_text)
+        };
+        let run_for = |len: usize, underline: bool, chip: bool| TextRun {
             len,
-            font: style.font(),
-            color: style.color,
+            font: if chip {
+                chip_font.clone()
+            } else {
+                style.font()
+            },
+            color: if chip { chip_color } else { style.color },
             // Rounded mention washes are painted explicitly beneath the text;
             // TextRun backgrounds are square and can disappear in wrapped runs.
             background_color: None,
@@ -2696,7 +2706,6 @@ impl Render for MentionPathTooltip {
 struct ComposerTextPrepaint {
     cursor: Option<PaintQuad>,
     mention_quads: Vec<PaintQuad>,
-    mention_icons: Vec<(Bounds<Pixels>, &'static str)>,
     mention_hits: Vec<MentionHit>,
     selection_quads: Vec<PaintQuad>,
 }
@@ -2738,8 +2747,9 @@ impl gpui::Element for ComposerTextElement {
                     gpui::AvailableSpace::Definite(width) => width,
                     _ => px(320.0),
                 });
-                let content_height =
-                    input.update(cx, |input, _| input.layout_text(width, &text_style, window));
+                let content_height = input.update(cx, |input, cx| {
+                    input.layout_text(width, &text_style, window, cx)
+                });
                 size(width, px(content_height.min(max_content)))
             });
         (layout_id, ())
@@ -2766,10 +2776,10 @@ impl gpui::Element for ComposerTextElement {
         let origin = point(bounds.left(), bounds.top() - scroll);
         let selection_color = Theme::of(cx).selection;
         let caret_color = Theme::of(cx).caret;
-        let mention_color = Theme::of(cx).accent.opacity(0.22);
+        // The inline-code recipe: chips wash violet like `code` spans do.
+        let mention_color = Theme::of(cx).code_wash;
 
         let mut mention_quads = Vec::new();
-        let mut mention_icons = Vec::new();
         let mut mention_hits = Vec::new();
         for (mention, display) in &input.projection.mentions {
             let target = MentionTooltipTarget {
@@ -2817,33 +2827,6 @@ impl gpui::Element for ComposerTextElement {
                     anchor: point(chip_bounds.left(), anchor_y),
                 });
             }
-            let slot_start = display.start + MENTION_SIDE_PAD.len();
-            let slot_end = slot_start + MENTION_ICON_SLOT.len();
-            let Some(slot_bounds) = input
-                .bounds_for_display_range(slot_start..slot_end)
-                .into_iter()
-                .next()
-            else {
-                continue;
-            };
-            // Clamp to the slot's real advance so a shaping surprise shows as
-            // a small icon, never as paint over the label's first glyph.
-            let slot_width = slot_bounds.size.width;
-            let icon_size = slot_width.min(px(12.0));
-            mention_icons.push((
-                Bounds::new(
-                    point(
-                        origin.x + slot_bounds.origin.x + (slot_width - icon_size) / 2.0,
-                        origin.y + slot_bounds.origin.y + (input.line_height - icon_size) / 2.0,
-                    ),
-                    size(icon_size, icon_size),
-                ),
-                if mention.is_dir {
-                    crate::icons::FOLDER
-                } else {
-                    crate::icons::DOCUMENT
-                },
-            ));
         }
         let mut selection_quads = Vec::new();
         let mut cursor = None;
@@ -2919,7 +2902,6 @@ impl gpui::Element for ComposerTextElement {
         ComposerTextPrepaint {
             cursor,
             mention_quads,
-            mention_icons,
             mention_hits,
             selection_quads,
         }
@@ -2980,18 +2962,6 @@ impl gpui::Element for ComposerTextElement {
                     cx,
                 );
                 y += height;
-            }
-            // The icon paints after the filename text so selection washes and
-            // glyphs cannot cover it; its em-space slot is blank text.
-            for (bounds, icon) in prepaint.mention_icons.drain(..) {
-                let _ = window.paint_svg(
-                    bounds,
-                    SharedString::from(icon),
-                    None,
-                    gpui::TransformationMatrix::default(),
-                    Theme::of(cx).text_muted,
-                    cx,
-                );
             }
             // Caret only when this input is actually focused in an active
             // window (Electron hides it on window deactivation too), and only
@@ -5259,12 +5229,7 @@ mod tests {
         let (link, chip) = &projection.mentions[0];
         assert_eq!(
             &projection.display[chip.clone()],
-            "\u{00A0}\u{00A0}\u{00A0}\u{00A0}\u{00A0}composer.rs\u{00A0}"
-        );
-        assert_eq!(
-            &projection.display[chip.start + MENTION_SIDE_PAD.len()
-                ..chip.start + MENTION_SIDE_PAD.len() + MENTION_ICON_SLOT.len()],
-            MENTION_ICON_SLOT
+            "\u{00A0}@composer.rs\u{00A0}"
         );
         assert_eq!(projection.display_to_raw(chip.start + 1), link.range.start);
         assert_eq!(projection.display_to_raw(chip.end - 1), link.range.end);
@@ -5296,9 +5261,8 @@ mod tests {
         assert_eq!(spans.len(), 2);
         assert_eq!(
             &display[spans[0].range.clone()],
-            "\u{00A0}\u{00A0}\u{00A0}\u{00A0}\u{00A0}composer.rs\u{00A0}"
+            "\u{00A0}@composer.rs\u{00A0}"
         );
-        assert_eq!(&display[spans[0].icon_slot.clone()], MENTION_ICON_SLOT);
         assert!(!spans[0].is_dir);
         assert_eq!(spans[0].path.as_ref(), "src/composer.rs");
         assert!(spans[1].is_dir);

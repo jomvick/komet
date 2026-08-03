@@ -346,7 +346,10 @@ impl Theme {
             }
             Appearance::Light => {
                 if Self::GLASS_ALPHA_LIGHT < 1.0 {
-                    grey(0xf4).opacity(Self::GLASS_ALPHA_LIGHT)
+                    // 0xfa, not the surface's 0xf4-ish grey: at 90% coverage
+                    // the tint IS the sidebar tone, and the darker grey read
+                    // as a dingy pane next to the white content card.
+                    grey(0xfa).opacity(Self::GLASS_ALPHA_LIGHT)
                 } else {
                     self.surface
                 }
@@ -361,6 +364,19 @@ impl Theme {
     /// alpha (and with it whether glass is on at all) is per-appearance.
     pub fn is_glass(&self) -> bool {
         self.glass().a < 1.0
+    }
+
+    /// Hover wash for chrome that sits ON GLASS (sidebar rows, tabs, titlebar
+    /// buttons). Dark: the standard luminous hover. Light: a white wash one
+    /// step below [`glass_selected_bg`] — the appearance-neutral
+    /// `element_hover` is a *black* wash in light mode, which put a dark
+    /// hover next to a white selection on the same surface (user report).
+    /// Hover and selection must lift the same way.
+    pub fn glass_hover(&self) -> Hsla {
+        match self.appearance {
+            Appearance::Dark => self.element_hover,
+            Appearance::Light => hsla(0.0, 0.0, 1.0, 0.30),
+        }
     }
 
     /// The translucent tint floating cards paint over their backdrop blur
@@ -709,7 +725,10 @@ fn band_for(appearance: Appearance) -> Hsla {
 pub fn glass_selected_bg() -> Hsla {
     match current_appearance() {
         Appearance::Dark => wash(0.14),
-        Appearance::Light => hsla(0.0, 0.0, 1.0, 0.55),
+        // Near-opaque: at 0.55 the chip sank into the (bright) frost and the
+        // active tab lost its contrast — the ring and seat shadow in
+        // [`glass_selected_shadows`] carry the edge, the fill carries the pop.
+        Appearance::Light => hsla(0.0, 0.0, 1.0, 0.92),
     }
 }
 
@@ -732,21 +751,39 @@ pub fn card_selected_bg() -> Hsla {
 /// a 5% fill they showed straight through as an opaque dark plate with a
 /// greyed ring (user report) — nothing may paint behind a glass chip.
 ///
-/// Light pins the ring at a flat 10% black rather than the scaled hairline:
+/// Light pins the ring at a flat 12% black rather than the scaled hairline:
 /// the [`INK_HAIRLINE_SCALE`]d value outlined every selected chip in a heavy
 /// dark box (user report) — the ring should define the chip, not frame it.
+/// Light also adds a soft DROP shadow to seat the near-white chip on the
+/// bright frost (the standard light-UI lifted-plate recipe); that is safe
+/// here, unlike dark, because the light fill is near-opaque — nothing shows
+/// through it as a dark plate.
 pub fn glass_selected_shadows() -> Vec<gpui::BoxShadow> {
-    let color = match current_appearance() {
-        Appearance::Dark => hairline(0.09),
-        Appearance::Light => hsla(0.0, 0.0, 0.0, 0.10),
-    };
-    vec![gpui::BoxShadow {
-        color,
-        offset: gpui::point(gpui::px(0.0), gpui::px(0.0)),
-        blur_radius: gpui::px(0.0),
-        spread_radius: gpui::px(1.0),
-        inset: true,
-    }]
+    match current_appearance() {
+        Appearance::Dark => vec![gpui::BoxShadow {
+            color: hairline(0.09),
+            offset: gpui::point(gpui::px(0.0), gpui::px(0.0)),
+            blur_radius: gpui::px(0.0),
+            spread_radius: gpui::px(1.0),
+            inset: true,
+        }],
+        Appearance::Light => vec![
+            gpui::BoxShadow {
+                color: hsla(0.0, 0.0, 0.0, 0.12),
+                offset: gpui::point(gpui::px(0.0), gpui::px(0.0)),
+                blur_radius: gpui::px(0.0),
+                spread_radius: gpui::px(1.0),
+                inset: true,
+            },
+            gpui::BoxShadow {
+                color: hsla(0.0, 0.0, 0.0, 0.10),
+                offset: gpui::point(gpui::px(0.0), gpui::px(1.0)),
+                blur_radius: gpui::px(4.0),
+                spread_radius: gpui::px(0.0),
+                inset: false,
+            },
+        ],
+    }
 }
 
 /// An exact achromatic tone from an 8-bit channel value (`grey(13)` ≡ `#0d0d0d`)

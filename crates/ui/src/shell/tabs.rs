@@ -252,7 +252,7 @@ impl Shell {
                     let (text_color, bg) = if is_selected {
                         (theme.text, crate::theme::glass_selected_bg())
                     } else if is_hovered {
-                        (theme.text_muted.opacity(0.8), theme.element_hover)
+                        (theme.text_muted.opacity(0.8), theme.glass_hover())
                     } else {
                         (theme.text_muted.opacity(0.6), crate::theme::wash(0.0))
                     };
@@ -432,8 +432,8 @@ impl Shell {
             } else {
                 motion::hover_blend(
                     "session-tab-new",
-                    crate::theme::wash(0.0),
-                    crate::theme::wash(0.12),
+                    theme.glass_hover().opacity(0.0),
+                    theme.glass_hover(),
                 )
             })
             .when(on_canvas && has_space, |el| {

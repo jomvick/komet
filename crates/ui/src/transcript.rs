@@ -30,9 +30,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, BorderStyle, Bounds, ClipboardItem, Context, Entity, ListAlignment,
-    ListScrollEvent, ListState, ObjectFit, SharedString, StyledImage as _, StyledText,
-    Subscription, Task, TextRun, Window, canvas, div, img, list, point, prelude::*, px, quad, size,
+    AnyElement, BorderStyle, ClipboardItem, Context, Entity, ListAlignment, ListScrollEvent,
+    ListState, ObjectFit, SharedString, StyledImage as _, StyledText, Subscription, Task, TextRun,
+    Window, canvas, div, img, list, prelude::*, px, quad,
 };
 
 use komet_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
@@ -1945,12 +1945,12 @@ impl Transcript {
     }
 }
 
-/// A sent message's text with its file-mention chips. The same underlay recipe
-/// as the markdown renderer's inline-code wash (`flat_text_element`):
-/// [`StyledText`] supplies wrapped glyph geometry through its layout handle, a
-/// canvas paints the rounded washes *beneath* the glyphs and the file/folder
-/// icons into their reserved em-space slots — so chips wrap, clip, and scroll
-/// exactly like the text they decorate.
+/// A sent message's text with its file-mention chips. The same recipe as the
+/// markdown renderer's inline code (`flat_text_element`): chip ranges shape in
+/// the mono font at `code_text` violet, [`StyledText`] supplies wrapped glyph
+/// geometry through its layout handle, and a canvas paints the rounded
+/// `code_wash` *beneath* the glyphs — so chips wrap, clip, and scroll exactly
+/// like the text they decorate.
 ///
 /// Per-frame cost while an assistant message streams below: shaping hits
 /// gpui's line-layout cache (identical text + runs ⇒ reuse) and the underlay
@@ -1961,23 +1961,43 @@ fn user_mention_text(
     mentions: Arc<Vec<crate::composer::SentMentionSpan>>,
     theme: &Theme,
 ) -> AnyElement {
-    // One run: chips keep the body color; the wash and icon do the signaling.
-    // Font/size/line-height flow from the bubble's div like every text child.
-    let styled = StyledText::new(text.clone()).with_runs(vec![TextRun {
-        len: text.len(),
+    // Split runs at chip boundaries (spans are in order): body text keeps the
+    // sans font, chips read as inline code. Size/line-height flow from the
+    // bubble's div like every text child.
+    let body_run = |len: usize| TextRun {
+        len,
         font: gpui::font(theme.font_sans.clone()),
         color: theme.text,
         background_color: None,
         underline: None,
         strikethrough: None,
-    }]);
+    };
+    let chip_run = |len: usize| TextRun {
+        len,
+        font: gpui::font(theme.font_mono.clone()),
+        color: theme.code_text,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let mut runs = Vec::with_capacity(mentions.len() * 2 + 1);
+    let mut at = 0;
+    for span in mentions.iter() {
+        if at < span.range.start {
+            runs.push(body_run(span.range.start - at));
+        }
+        runs.push(chip_run(span.range.len()));
+        at = span.range.end;
+    }
+    if at < text.len() {
+        runs.push(body_run(text.len() - at));
+    }
+    let styled = StyledText::new(text.clone()).with_runs(runs);
     let layout = styled.layout().clone();
-    // The composer's chip wash, quoted from its prepaint (accent at 0.22).
-    let wash = theme.accent.opacity(0.22);
-    let icon_color = theme.text_muted;
+    let wash = theme.code_wash;
     let underlay = canvas(
         |_, _, _| (),
-        move |_, _, window, cx| {
+        move |_, _, window, _| {
             for span in mentions.iter() {
                 for rect in render::range_rects(&layout, &span.range, 0.0, 2.0) {
                     window.paint_quad(quad(
@@ -1989,32 +2009,6 @@ fn user_mention_text(
                         BorderStyle::default(),
                     ));
                 }
-                let Some(slot) = render::range_rects(&layout, &span.icon_slot, 0.0, 0.0)
-                    .into_iter()
-                    .next()
-                else {
-                    continue;
-                };
-                let icon_size = slot.size.width.min(px(12.0));
-                let icon_bounds = Bounds::new(
-                    point(
-                        slot.origin.x + (slot.size.width - icon_size) / 2.0,
-                        slot.origin.y + (slot.size.height - icon_size) / 2.0,
-                    ),
-                    size(icon_size, icon_size),
-                );
-                let _ = window.paint_svg(
-                    icon_bounds,
-                    SharedString::from(if span.is_dir {
-                        crate::icons::FOLDER
-                    } else {
-                        crate::icons::DOCUMENT
-                    }),
-                    None,
-                    gpui::TransformationMatrix::default(),
-                    icon_color,
-                    cx,
-                );
             }
         },
     )
@@ -2773,7 +2767,7 @@ mod tests {
         assert!(!mentions[0].is_dir);
         assert_eq!(mentions[0].path.as_ref(), "crates/ui/src/composer.rs");
         assert_eq!(&text[mentions[0].range.clone()], {
-            let projected: &str = "\u{00A0}\u{00A0}\u{00A0}\u{00A0}\u{00A0}composer.rs\u{00A0}";
+            let projected: &str = "\u{00A0}@composer.rs\u{00A0}";
             projected
         });
         assert_eq!(rows[0].version, (raw.len() as u64) << 1);

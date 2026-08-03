@@ -312,8 +312,8 @@ impl Shell {
                     ))
                     .bg(motion::hover_blend(
                         "add-space-ghost",
-                        crate::theme::wash(0.0),
-                        theme.element_hover,
+                        theme.glass_hover().opacity(0.0),
+                        theme.glass_hover(),
                     ))
                     .on_hover(motion::hover_listener("add-space-ghost"))
                     .cursor_pointer()
@@ -493,7 +493,7 @@ impl Shell {
             .px(px(Theme::SPACE_SM))
             .py(px(6.0))
             .text_color(motion::hover_blend(&fade_key, rest_text, theme.text))
-            .bg(motion::hover_blend(&fade_key, rest_bg, theme.element_hover))
+            .bg(motion::hover_blend(&fade_key, rest_bg, theme.glass_hover()))
             .when(selected, |el| {
                 el.shadow(crate::theme::glass_selected_shadows())
             })
