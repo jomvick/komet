@@ -548,12 +548,15 @@ pub fn attachment_snapshot(device_id: &str, path: &str) -> AttachmentSnapshot {
     }
 }
 
-/// Release gpui's decoded copies of evicted images (asset-system entries).
-/// Call with any `&mut App` on the render/update path; cheap when empty.
-pub fn flush_evicted(cx: &mut gpui::App) {
+/// Release gpui's decoded copies of evicted images: the asset-system entry
+/// AND the sprite-atlas tiles (`ImageSource::evict` — `remove_asset` alone
+/// left the tiles resident forever). Pass the window being updated when
+/// calling from a render path, since that window is detached from
+/// `App::windows` during its own update. Cheap when nothing was evicted.
+pub fn flush_evicted(mut window: Option<&mut gpui::Window>, cx: &mut gpui::App) {
     let evicted = std::mem::take(&mut cache().lock().unwrap().pending_free);
     for image in evicted {
-        gpui::ImageSource::Image(image).remove_asset(cx);
+        gpui::ImageSource::Image(image).evict(window.as_deref_mut(), cx);
     }
 }
 
