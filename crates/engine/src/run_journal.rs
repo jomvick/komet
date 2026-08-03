@@ -100,6 +100,14 @@ impl RunJournal {
     pub fn append(&self, chat_id: &str, event: &AgentEvent) -> Result<u64, JournalError> {
         let mut files = self.lock();
         if !files.contains_key(chat_id) {
+            // Bound the open-fd set: entries were never removed, so every chat
+            // ever run held a descriptor for the process lifetime. Dropping is
+            // safe — the next append reopens and rescans the tail. The cap
+            // comfortably exceeds concurrent runs, so eviction stays rare.
+            const OPEN_FILE_CAP: usize = 16;
+            if files.len() >= OPEN_FILE_CAP {
+                files.clear();
+            }
             let path = self.path_for(chat_id);
             let (next_seq, needs_newline) = scan_tail(&path)?;
             let file = OpenOptions::new().create(true).append(true).open(&path)?;

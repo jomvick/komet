@@ -27,7 +27,7 @@ use gpui::{App, Context, Entity, Task};
 use gpui_tokio::Tokio;
 use serde::de::DeserializeOwned;
 
-use komet_doc::SessionMessageEntry;
+use komet_doc::{SessionMessageEntry, TranscriptDesync, TranscriptFrame};
 use komet_engine::{Engine, EngineConfig, EngineRuntime, rpc::AuthRpc};
 use komet_proto::{AuthState, Chat, ChatIndicator, Device, HarnessId, Session, Space};
 use komet_rpc::{RpcClient, RpcError, RpcReply, RpcService, connect_ws, memory_client, methods};
@@ -491,6 +491,22 @@ impl AppState {
         self.transcript = entries;
     }
 
+    /// Apply a `WatchDocMessages` delta frame in place. `Err` = this copy has
+    /// diverged; the watch task resubscribes for a fresh reset.
+    pub fn apply_transcript_frame(
+        &mut self,
+        frame: TranscriptFrame,
+    ) -> Result<(), TranscriptDesync> {
+        komet_doc::apply_transcript_frame(&mut self.transcript, frame)?;
+        if let Some(chat_id) = self.selected_chat.as_deref()
+            && let Some(echoes) = self.echoes.get_mut(chat_id)
+        {
+            let transcript = &self.transcript;
+            echoes.retain(|echo| !transcript.iter().any(|e| e.id == echo.id));
+        }
+        Ok(())
+    }
+
     /// Add an optimistic user echo (composer send path).
     pub fn push_echo(&mut self, chat_id: &str, entry: SessionMessageEntry) {
         let echoes = self.echoes.entry(chat_id.to_string()).or_default();
@@ -886,36 +902,48 @@ fn spawn_transcript_watch(
     chat_id: String,
 ) -> Task<()> {
     cx.spawn(async move |this, cx| {
-        let params = serde_json::json!({ "chatId": chat_id });
-        let mut rx = match handle
-            .client()
-            .subscribe(methods::WATCH_DOC_MESSAGES, params)
-            .await
-        {
-            Ok(rx) => rx,
-            Err(err) => {
-                tracing::warn!(%chat_id, error = %err, "transcript watch failed");
-                return;
-            }
-        };
-        while let Some(value) = rx.recv().await {
-            let entries: Vec<SessionMessageEntry> = match serde_json::from_value(value) {
-                Ok(entries) => entries,
+        // Outer loop: a delta desync (missed frame, schema skew) resubscribes;
+        // the fresh stream opens with a full reset that heals the copy.
+        'resubscribe: loop {
+            let params = serde_json::json!({ "chatId": chat_id });
+            let mut rx = match handle
+                .client()
+                .subscribe(methods::WATCH_DOC_MESSAGES, params)
+                .await
+            {
+                Ok(rx) => rx,
                 Err(err) => {
-                    tracing::warn!(error = %err, "dropping malformed transcript frame");
-                    continue;
+                    tracing::warn!(%chat_id, error = %err, "transcript watch failed");
+                    return;
                 }
             };
-            let alive = this.update(cx, |state, cx| {
-                // Guard against a stale pump racing a newer selection.
-                if state.selected_chat.as_deref() == Some(chat_id.as_str()) {
-                    state.apply_transcript(entries);
-                    cx.notify();
+            while let Some(value) = rx.recv().await {
+                let frame: TranscriptFrame = match serde_json::from_value(value) {
+                    Ok(frame) => frame,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "dropping malformed transcript frame");
+                        continue;
+                    }
+                };
+                let mut desync = false;
+                let alive = this.update(cx, |state, cx| {
+                    // Guard against a stale pump racing a newer selection.
+                    if state.selected_chat.as_deref() == Some(chat_id.as_str()) {
+                        if let Err(err) = state.apply_transcript_frame(frame) {
+                            tracing::warn!(%chat_id, error = %err, "resubscribing transcript");
+                            desync = true;
+                        }
+                        cx.notify();
+                    }
+                });
+                if alive.is_err() {
+                    return;
                 }
-            });
-            if alive.is_err() {
-                break;
+                if desync {
+                    continue 'resubscribe;
+                }
             }
+            return; // stream ended: chat deleted or engine gone
         }
     })
 }

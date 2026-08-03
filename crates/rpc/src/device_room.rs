@@ -692,6 +692,11 @@ impl LinkCache {
         }
         let dial_lock = {
             let mut locks = lock(&self.dial_locks);
+            // The map only ever grew (one entry per peer ever dialed); prune
+            // idle locks once it's clearly beyond any real org's device count.
+            if locks.len() > 64 {
+                locks.retain(|_, l| Arc::strong_count(l) > 1);
+            }
             locks.entry(device_id.to_string()).or_default().clone()
         };
         let _guard = dial_lock.lock().await;

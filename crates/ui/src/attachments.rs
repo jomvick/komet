@@ -450,18 +450,78 @@ pub enum AttachmentSnapshot {
 }
 
 enum CacheEntry {
-    Loading { attempts: u32 },
-    Loaded(CachedAttachmentImage),
-    Error { attempts: u32, at: Instant },
+    Loading {
+        attempts: u32,
+    },
+    Loaded {
+        image: CachedAttachmentImage,
+        bytes: usize,
+        last_used: u64,
+    },
+    Error {
+        attempts: u32,
+        at: Instant,
+    },
 }
 
 fn retry_delay(attempts: u32) -> Duration {
     Duration::from_millis((2_000u64 << attempts.min(3)).min(15_000))
 }
 
-fn cache() -> &'static Mutex<HashMap<(String, String), CacheEntry>> {
-    static CACHE: OnceLock<Mutex<HashMap<(String, String), CacheEntry>>> = OnceLock::new();
-    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+/// Byte budget for retained encoded images. The decoded copies gpui holds are
+/// proportional (and usually larger), so bounding the encoded side bounds both
+/// — this cache previously grew for the process lifetime with no eviction.
+const IMAGE_CACHE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Default)]
+struct ImageCache {
+    map: HashMap<(String, String), CacheEntry>,
+    /// Monotonic access clock for LRU ordering.
+    tick: u64,
+    loaded_bytes: usize,
+    /// Evicted images awaiting `flush_evicted` (freeing needs `&mut App`,
+    /// which eviction sites — async load completions — don't always have).
+    pending_free: Vec<Arc<Image>>,
+}
+
+impl ImageCache {
+    fn insert_loaded(&mut self, key: (String, String), image: CachedAttachmentImage) {
+        let bytes = image.image.bytes.len();
+        self.tick += 1;
+        if let Some(CacheEntry::Loaded { image, bytes, .. }) = self.map.insert(
+            key.clone(),
+            CacheEntry::Loaded {
+                image,
+                bytes,
+                last_used: self.tick,
+            },
+        ) {
+            self.loaded_bytes = self.loaded_bytes.saturating_sub(bytes);
+            self.pending_free.push(image.image);
+        }
+        self.loaded_bytes += bytes;
+        while self.loaded_bytes > IMAGE_CACHE_BUDGET_BYTES {
+            let oldest = self
+                .map
+                .iter()
+                .filter(|(k, _)| **k != key)
+                .filter_map(|(k, e)| match e {
+                    CacheEntry::Loaded { last_used, .. } => Some((*last_used, k.clone())),
+                    _ => None,
+                })
+                .min();
+            let Some((_, evict_key)) = oldest else { break };
+            if let Some(CacheEntry::Loaded { image, bytes, .. }) = self.map.remove(&evict_key) {
+                self.loaded_bytes = self.loaded_bytes.saturating_sub(bytes);
+                self.pending_free.push(image.image);
+            }
+        }
+    }
+}
+
+fn cache() -> &'static Mutex<ImageCache> {
+    static CACHE: OnceLock<Mutex<ImageCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(ImageCache::default()))
 }
 
 fn key(device_id: &str, path: &str) -> (String, String) {
@@ -469,12 +529,31 @@ fn key(device_id: &str, path: &str) -> (String, String) {
 }
 
 pub fn attachment_snapshot(device_id: &str, path: &str) -> AttachmentSnapshot {
-    match cache().lock().unwrap().get(&key(device_id, path)) {
-        Some(CacheEntry::Loaded(image)) => AttachmentSnapshot::Loaded(image.clone()),
+    let mut cache = cache().lock().unwrap();
+    let tick = {
+        cache.tick += 1;
+        cache.tick
+    };
+    match cache.map.get_mut(&key(device_id, path)) {
+        Some(CacheEntry::Loaded {
+            image, last_used, ..
+        }) => {
+            *last_used = tick;
+            AttachmentSnapshot::Loaded(image.clone())
+        }
         Some(CacheEntry::Error { attempts, at }) => AttachmentSnapshot::Error {
             retry_in: retry_delay(attempts.saturating_sub(1)).saturating_sub(at.elapsed()),
         },
         _ => AttachmentSnapshot::Loading,
+    }
+}
+
+/// Release gpui's decoded copies of evicted images (asset-system entries).
+/// Call with any `&mut App` on the render/update path; cheap when empty.
+pub fn flush_evicted(cx: &mut gpui::App) {
+    let evicted = std::mem::take(&mut cache().lock().unwrap().pending_free);
+    for image in evicted {
+        gpui::ImageSource::Image(image).remove_asset(cx);
     }
 }
 
@@ -483,7 +562,7 @@ pub fn attachment_snapshot(device_id: &str, path: &str) -> AttachmentSnapshot {
 /// Errored sources hand out a retry only after their backoff has elapsed.
 pub fn begin_load(device_id: &str, path: &str) -> bool {
     let mut cache = cache().lock().unwrap();
-    let entry = cache.entry(key(device_id, path));
+    let entry = cache.map.entry(key(device_id, path));
     match entry {
         std::collections::hash_map::Entry::Vacant(v) => {
             v.insert(CacheEntry::Loading { attempts: 0 });
@@ -503,20 +582,20 @@ pub fn begin_load(device_id: &str, path: &str) -> bool {
 }
 
 pub fn store_loaded(device_id: &str, path: &str, name: SharedString, image: Arc<Image>) {
-    cache().lock().unwrap().insert(
-        key(device_id, path),
-        CacheEntry::Loaded(CachedAttachmentImage { name, image }),
-    );
+    cache()
+        .lock()
+        .unwrap()
+        .insert_loaded(key(device_id, path), CachedAttachmentImage { name, image });
 }
 
 pub fn store_error(device_id: &str, path: &str) {
     let mut cache = cache().lock().unwrap();
-    let attempts = match cache.get(&key(device_id, path)) {
+    let attempts = match cache.map.get(&key(device_id, path)) {
         Some(CacheEntry::Loading { attempts }) => attempts + 1,
         Some(CacheEntry::Error { attempts, .. }) => *attempts,
         _ => 1,
     };
-    cache.insert(
+    cache.map.insert(
         key(device_id, path),
         CacheEntry::Error {
             attempts,

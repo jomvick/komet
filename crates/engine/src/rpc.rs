@@ -639,12 +639,14 @@ impl EngineRpc {
                 // (the doc rows are already tombstoned; a straggler run would only
                 // write into an orphaned session doc).
                 let sessions = self.sessions.clone();
+                let doc_host = self.doc_host.clone();
                 let chat_ids = deleted.chat_ids;
                 tokio::spawn(async move {
                     for chat_id in chat_ids {
                         if let Err(err) = sessions.interrupt(&chat_id).await {
                             tracing::debug!(chat = %chat_id, error = %err, "deleteSpace interrupt skipped");
                         }
+                        doc_host.purge_chat(&chat_id);
                     }
                 });
                 Ok(())
@@ -688,11 +690,11 @@ impl EngineRpc {
                 .set_chat_config(&chat_id, &config)
                 .map_err(failed)
                 .map(drop),
-            MutateParams::DeleteChat { chat_id } => self
-                .workspace
-                .delete_chat(&chat_id)
-                .map_err(failed)
-                .map(drop),
+            MutateParams::DeleteChat { chat_id } => {
+                self.workspace.delete_chat(&chat_id).map_err(failed)?;
+                self.doc_host.purge_chat(&chat_id);
+                Ok(())
+            }
             MutateParams::RenameDevice { device_id, name } => self
                 .workspace
                 .rename_device(&device_id, &name)
@@ -787,6 +789,39 @@ where
         };
         Some((value, (rx, true)))
     })
+    .boxed()
+}
+
+/// The transcript watch as delta frames (`komet_doc::transcript_delta`): a
+/// full `reset` first, then only changed entries per commit — the whole-Vec
+/// serialization here was the per-tick cost that scaled with transcript size.
+fn doc_messages_stream(
+    rx: watch::Receiver<Vec<komet_doc::SessionMessageEntry>>,
+) -> BoxStream<'static, serde_json::Value> {
+    use komet_doc::transcript_delta::{TranscriptFrame, diff_transcript};
+    futures::stream::unfold(
+        (rx, None::<Vec<komet_doc::SessionMessageEntry>>),
+        |(mut rx, mut prev)| async move {
+            loop {
+                if prev.is_some() {
+                    rx.changed().await.ok()?;
+                }
+                let current: Vec<_> = rx.borrow_and_update().clone();
+                let frame = match prev.as_deref() {
+                    None => TranscriptFrame::reset(&current),
+                    Some(prev) => diff_transcript(prev, &current),
+                };
+                prev = Some(current);
+                // No-op commits (a second watcher attaching, command-only
+                // changes) produce empty deltas — skip the frame entirely.
+                if frame.is_empty_delta() {
+                    continue;
+                }
+                let value = serde_json::to_value(&frame).ok()?;
+                return Some((value, (rx, prev)));
+            }
+        },
+    )
     .boxed()
 }
 
@@ -935,7 +970,9 @@ impl RpcService for EngineRpc {
                     .doc_host
                     .open(&p.chat_id)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
-                Ok(RpcReply::Stream(watch_stream(handle.watch_messages())))
+                Ok(RpcReply::Stream(doc_messages_stream(
+                    handle.watch_messages(),
+                )))
             }
             methods::WATCH_CHATS => {
                 Ok(RpcReply::Stream(watch_stream(self.workspace.watch_chats())))

@@ -10,9 +10,15 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use crate::{ClientFrame, RpcError, ServerFrame};
 
+/// Per-stream queue depth. Bounded: route_frame awaits a full queue, pausing
+/// the connection reader — transport backpressure instead of unbounded growth
+/// when a consumer stalls behind a fast producer (watch frames every 120ms
+/// during streaming used to pile up whole-transcript payloads here).
+const STREAM_QUEUE_CAP: usize = 256;
+
 enum Pending {
     Call(oneshot::Sender<Result<serde_json::Value, RpcError>>),
-    Stream(mpsc::UnboundedSender<serde_json::Value>),
+    Stream(mpsc::Sender<serde_json::Value>),
 }
 
 struct Shared {
@@ -118,9 +124,9 @@ impl RpcClient {
         &self,
         method: &str,
         params: serde_json::Value,
-    ) -> Result<mpsc::UnboundedReceiver<serde_json::Value>, RpcError> {
+    ) -> Result<mpsc::Receiver<serde_json::Value>, RpcError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(STREAM_QUEUE_CAP);
         self.shared.lock().insert(id, Pending::Stream(tx));
         self.send(ClientFrame {
             id,
@@ -169,12 +175,15 @@ async fn route_frame(shared: &Arc<Shared>, out: &mpsc::Sender<String>, frame: Se
         return;
     }
     if let Some(item) = frame.item {
-        let dead = {
-            let pending = shared.lock();
-            match pending.get(&id) {
-                Some(Pending::Stream(tx)) => tx.send(item).is_err(),
-                _ => false,
-            }
+        // Clone the sender out of the lock: the bounded send must await
+        // (backpressure) without holding `shared`.
+        let tx = match shared.lock().get(&id) {
+            Some(Pending::Stream(tx)) => Some(tx.clone()),
+            _ => None,
+        };
+        let dead = match tx {
+            Some(tx) => tx.send(item).await.is_err(),
+            None => false,
         };
         if dead {
             // Receiver was dropped — cancel server-side and forget the stream.

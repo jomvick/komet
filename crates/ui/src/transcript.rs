@@ -2273,6 +2273,9 @@ fn entry_fingerprint(entry: &SessionMessageEntry, pending: bool) -> u64 {
 
 impl Render for Transcript {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Release gpui-side decoded copies of any images the attachment LRU
+        // evicted since the last frame (no-op when nothing was evicted).
+        crate::attachments::flush_evicted(cx);
         // Spring driver: one on_next_frame callback at a time; each tick
         // notifies, which re-enters render and schedules the next frame until
         // the spring parks. Reduced motion never schedules (sync snaps).

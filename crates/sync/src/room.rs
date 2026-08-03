@@ -508,13 +508,25 @@ impl RoomActor {
             if joined {
                 backoff = BACKOFF_BASE;
             }
-            tokio::select! {
-                _ = tokio::time::sleep(backoff) => {}
-                _ = wake.recv() => {
-                    backoff = BACKOFF_BASE; // redial NOW with fresh credentials
-                    continue;
+            // Backoff wait. Local update queues are drained-and-discarded the
+            // whole time: their entries are never replayed (session start
+            // drops them — the join's VV diff re-derives what the server is
+            // missing), so letting them accumulate across a long outage only
+            // duplicated every offline commit's bytes in memory.
+            let sleep = tokio::time::sleep(backoff);
+            tokio::pin!(sleep);
+            let woke = loop {
+                tokio::select! {
+                    _ = &mut sleep => break false,
+                    _ = wake.recv() => break true,
+                    _ = self.shutdown.changed() => return,
+                    Some(_) = self.local_rx.recv() => {}
+                    Some(_) = self.eph_rx.recv() => {}
                 }
-                _ = self.shutdown.changed() => return,
+            };
+            if woke {
+                backoff = BACKOFF_BASE; // redial NOW with fresh credentials
+                continue;
             }
             backoff = (backoff * 2).min(BACKOFF_CAP);
         }

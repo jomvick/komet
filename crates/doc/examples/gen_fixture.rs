@@ -34,11 +34,11 @@ fn main() {
         .expect("begin");
     let mut folded = Vec::new();
     for delta in ["Sure — ", "running", " them now."] {
-        folded = fold_event_into_parts(&folded, &AgentEvent::TextDelta { text: delta.into() });
+        fold_event_into_parts(&mut folded, &AgentEvent::TextDelta { text: delta.into() });
         writer.sync(&folded).expect("sync");
     }
-    folded = fold_event_into_parts(
-        &folded,
+    fold_event_into_parts(
+        &mut folded,
         &AgentEvent::ToolCall {
             id: "tool-1".into(),
             call: ToolCall::Exec {
@@ -47,15 +47,15 @@ fn main() {
         },
     );
     writer.sync(&folded).expect("sync");
-    folded = fold_event_into_parts(
-        &folded,
+    fold_event_into_parts(
+        &mut folded,
         &AgentEvent::ToolResult {
             id: "tool-1".into(),
             is_error: false,
         },
     );
-    folded = fold_event_into_parts(
-        &folded,
+    fold_event_into_parts(
+        &mut folded,
         &AgentEvent::TextDelta {
             text: "All green.".into(),
         },

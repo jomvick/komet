@@ -1262,6 +1262,8 @@ impl Shell {
         if self.state.read(cx).selected_chat.as_deref() == Some(chat_id.as_str()) {
             self.state.update(cx, |s, cx| s.select_chat(None, cx));
         }
+        self.composer
+            .update(cx, |composer, _| composer.purge_chat(&chat_id));
         self.mutate(
             serde_json::json!({ "op": "deleteChat", "chatId": chat_id }),
             cx,

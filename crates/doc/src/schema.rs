@@ -206,11 +206,13 @@ impl SessionDoc {
     /// whole transcript — one bad entry took down every publish for the chat
     /// (2026-07-31, "missing field `id`" during a multi-update import).
     pub fn read_entries(&self) -> Result<Vec<SessionMessageEntry>, DocError> {
-        let value = self.doc.get_deep_value().to_json_value();
-        let messages = value
-            .get("messages")
-            .cloned()
-            .unwrap_or(serde_json::json!([]));
+        // Materialize only the messages container — a whole-doc deep value
+        // here also serialized the commands ledger on every 120ms commit tick.
+        let messages = self
+            .doc
+            .get_list("messages")
+            .get_deep_value()
+            .to_json_value();
         let raw: Vec<serde_json::Value> = serde_json::from_value(messages)?;
         Ok(raw
             .into_iter()
@@ -230,11 +232,13 @@ impl SessionDoc {
     /// here, and one malformed entry must not wedge command draining for the
     /// chat forever (an unparseable command can't be executed anyway).
     pub fn read_commands(&self) -> Result<Vec<SessionCommandEntry>, DocError> {
-        let value = self.doc.get_deep_value().to_json_value();
-        let commands = value
-            .get("commands")
-            .cloned()
-            .unwrap_or(serde_json::json!([]));
+        // Container-scoped for the same reason as `read_entries`: the drain
+        // loop runs this per tick and must not pay for the transcript.
+        let commands = self
+            .doc
+            .get_list("commands")
+            .get_deep_value()
+            .to_json_value();
         let raw: Vec<serde_json::Value> = serde_json::from_value(commands)?;
         Ok(raw
             .into_iter()
@@ -884,12 +888,12 @@ mod tests {
         let mut writer = SegmentWriter::begin(&doc, "a1", "dev-a", 5).unwrap();
 
         let mut folded = Vec::new();
-        folded = fold_event_into_parts(&folded, &AgentEvent::TextDelta { text: "Hel".into() });
+        fold_event_into_parts(&mut folded, &AgentEvent::TextDelta { text: "Hel".into() });
         writer.sync(&folded).unwrap();
-        folded = fold_event_into_parts(&folded, &AgentEvent::TextDelta { text: "lo".into() });
+        fold_event_into_parts(&mut folded, &AgentEvent::TextDelta { text: "lo".into() });
         writer.sync(&folded).unwrap();
-        folded = fold_event_into_parts(
-            &folded,
+        fold_event_into_parts(
+            &mut folded,
             &AgentEvent::ToolCall {
                 id: "tool-1".into(),
                 call: ToolCall::Exec {
@@ -898,8 +902,8 @@ mod tests {
             },
         );
         writer.sync(&folded).unwrap();
-        folded = fold_event_into_parts(
-            &folded,
+        fold_event_into_parts(
+            &mut folded,
             &AgentEvent::ToolResult {
                 id: "tool-1".into(),
                 is_error: false,

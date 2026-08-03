@@ -711,7 +711,8 @@ async fn rpc_surface_over_in_memory_transport() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(initial, serde_json::json!([]));
+    // Delta protocol: the stream opens with a full reset frame.
+    assert_eq!(initial, serde_json::json!({ "reset": [] }));
 
     // QueueCommand (as this device's composer would over IPC).
     let command = serde_json::to_value(SessionCommandPayload::Run {
@@ -728,17 +729,20 @@ async fn rpc_surface_over_in_memory_transport() {
         .unwrap();
     assert!(queued["commandId"].is_string());
 
-    // The doc-messages stream re-emits until the transcript settles: user entry +
-    // completed assistant entry with the folded parts.
+    // The doc-messages stream emits delta frames until the transcript settles:
+    // user entry + completed assistant entry with the folded parts. Applying
+    // each frame client-side mirrors what both viewports do.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut materialized: Vec<SessionMessageEntry> = vec![];
     let settled = loop {
         let item = tokio::time::timeout_at(deadline, messages_stream.recv())
             .await
             .expect("doc messages before timeout")
             .expect("stream alive");
-        let list: Vec<SessionMessageEntry> = serde_json::from_value(item).unwrap();
-        if list.len() == 2 && list[1].status == Some(MessageStatus::Complete) {
-            break list;
+        let frame: komet_doc::TranscriptFrame = serde_json::from_value(item).unwrap();
+        komet_doc::apply_transcript_frame(&mut materialized, frame).unwrap();
+        if materialized.len() == 2 && materialized[1].status == Some(MessageStatus::Complete) {
+            break materialized;
         }
     };
     assert_eq!(settled[0].id, "m-rpc-1");

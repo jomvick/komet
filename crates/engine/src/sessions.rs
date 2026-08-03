@@ -1179,7 +1179,7 @@ async fn drive_run(
         // background re-invocations) must not wipe the segment being written.
         let skip_fold = matches!(&event, AgentEvent::SessionStarted { .. }) && !folded.is_empty();
         if !skip_fold {
-            folded = fold_event_into_parts(&folded, &event);
+            fold_event_into_parts(&mut folded, &event);
         }
 
         if let AgentEvent::Done { status, .. } = &event {

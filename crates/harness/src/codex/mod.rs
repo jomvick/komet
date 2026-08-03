@@ -660,6 +660,9 @@ async fn run_session(session: Session) {
                     "turn/completed" => {
                         let id = turn_id(&params);
                         router.note_completed(&id);
+                        // Item ids never span turns; without this the set grew
+                        // one entry per message for a persistent session's life.
+                        streamed_text.clear();
                         if let Some(usage) = pending_usage.take()
                             && !send(&event_tx, usage).await
                         {
