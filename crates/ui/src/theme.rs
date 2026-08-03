@@ -367,15 +367,23 @@ impl Theme {
     }
 
     /// Hover wash for chrome that sits ON GLASS (sidebar rows, tabs, titlebar
-    /// buttons). Dark: the standard luminous hover. Light: a white wash one
-    /// step below [`glass_selected_bg`] — the appearance-neutral
-    /// `element_hover` is a *black* wash in light mode, which put a dark
-    /// hover next to a white selection on the same surface (user report).
-    /// Hover and selection must lift the same way.
+    /// buttons). Dark: the standard luminous hover. Light: a white wash below
+    /// [`glass_selected_bg`] — the appearance-neutral `element_hover` is a
+    /// *black* wash in light mode, which put a dark hover next to a white
+    /// selection on the same surface (user report). Hover and selection must
+    /// lift the same way.
+    ///
+    /// Dark gives hover and selection the SAME fill (selection adds only the
+    /// ring) because the wash is a 14% translucent glow. Light cannot mirror
+    /// that literally — its selected fill is near-opaque white, and fill
+    /// parity would flash a solid card under every pointer pass — so hover
+    /// runs the same direction at roughly half the lift instead. 0.30 was
+    /// invisible against the bright frost: rest→hover has to be as legible a
+    /// step as dark's, or the sidebar feels dead under the pointer.
     pub fn glass_hover(&self) -> Hsla {
         match self.appearance {
             Appearance::Dark => self.element_hover,
-            Appearance::Light => hsla(0.0, 0.0, 1.0, 0.30),
+            Appearance::Light => hsla(0.0, 0.0, 1.0, 0.55),
         }
     }
 
@@ -751,39 +759,43 @@ pub fn card_selected_bg() -> Hsla {
 /// a 5% fill they showed straight through as an opaque dark plate with a
 /// greyed ring (user report) — nothing may paint behind a glass chip.
 ///
-/// Light pins the ring at a flat 12% black rather than the scaled hairline:
-/// the [`INK_HAIRLINE_SCALE`]d value outlined every selected chip in a heavy
-/// dark box (user report) — the ring should define the chip, not frame it.
-/// Light also adds a soft DROP shadow to seat the near-white chip on the
-/// bright frost (the standard light-UI lifted-plate recipe); that is safe
-/// here, unlike dark, because the light fill is near-opaque — nothing shows
-/// through it as a dark plate.
+/// Light pins the ring at a flat 7% black rather than the scaled hairline:
+/// heavier rings (the [`INK_HAIRLINE_SCALE`]d value, then 12%) outlined every
+/// selected chip in a dark box (user reports) — the ring should define the
+/// chip the way dark's 9% white ring does, not frame it.
+///
+/// There is deliberately NO drop-shadow seat under the light chip. Three
+/// recipes were tried (a tight 10% layer, a 6% contact + 5% ambient pair, a
+/// lone 4% whisper) and every one failed on sight: layers sum into a grey rim
+/// exactly where the chip meets the frost, gpui's small-radius blur reads
+/// coarse on a bright field, and the tab strip is a scroll container that
+/// clips its children vertically — any shadow escaping the chip gets cut off
+/// mid-fade. The near-opaque fill plus the ring carry selection, exactly as
+/// dark's wash plus ring does; the two appearances share one recipe now.
 pub fn glass_selected_shadows() -> Vec<gpui::BoxShadow> {
-    match current_appearance() {
-        Appearance::Dark => vec![gpui::BoxShadow {
-            color: hairline(0.09),
-            offset: gpui::point(gpui::px(0.0), gpui::px(0.0)),
-            blur_radius: gpui::px(0.0),
-            spread_radius: gpui::px(1.0),
-            inset: true,
-        }],
-        Appearance::Light => vec![
-            gpui::BoxShadow {
-                color: hsla(0.0, 0.0, 0.0, 0.12),
-                offset: gpui::point(gpui::px(0.0), gpui::px(0.0)),
-                blur_radius: gpui::px(0.0),
-                spread_radius: gpui::px(1.0),
-                inset: true,
-            },
-            gpui::BoxShadow {
-                color: hsla(0.0, 0.0, 0.0, 0.10),
-                offset: gpui::point(gpui::px(0.0), gpui::px(1.0)),
-                blur_radius: gpui::px(4.0),
-                spread_radius: gpui::px(0.0),
-                inset: false,
-            },
-        ],
-    }
+    card_selected_shadows()
+}
+
+/// Selection outline for rows and chips INSIDE a floating card (menu rows,
+/// the picker rail, segmented chips): the inset ring alone, in both
+/// appearances. Card rows fill with a translucent wash
+/// ([`card_selected_bg`]), and a drop shadow — a filled rect painted BEHIND
+/// the element — shows straight through a translucent fill as a grey plate
+/// (the same lesson [`glass_selected_shadows`] records for dark glass). The
+/// card already carries the elevation shadow; selection inside it only needs
+/// the edge.
+pub fn card_selected_shadows() -> Vec<gpui::BoxShadow> {
+    let color = match current_appearance() {
+        Appearance::Dark => hairline(0.09),
+        Appearance::Light => hsla(0.0, 0.0, 0.0, 0.07),
+    };
+    vec![gpui::BoxShadow {
+        color,
+        offset: gpui::point(gpui::px(0.0), gpui::px(0.0)),
+        blur_radius: gpui::px(0.0),
+        spread_radius: gpui::px(1.0),
+        inset: true,
+    }]
 }
 
 /// An exact achromatic tone from an 8-bit channel value (`grey(13)` ≡ `#0d0d0d`)
@@ -1353,6 +1365,50 @@ mod tests {
                 t.bg.l
             );
         }
+    }
+
+    /// Card rows fill with translucent washes, and a drop shadow behind a
+    /// translucent fill shows through as a grey plate — selection inside a
+    /// floating card must be edge-only. This regressed once: light menu rows
+    /// borrowed the glass-chip recipe, drop shadow included.
+    #[test]
+    fn card_selection_paints_nothing_behind_its_row() {
+        let _guard = lock_appearance();
+        for appearance in [Appearance::Dark, Appearance::Light] {
+            set_current_appearance(appearance);
+            for shadow in card_selected_shadows() {
+                assert!(
+                    shadow.inset,
+                    "{appearance:?}: card selection may only paint inset edges"
+                );
+            }
+        }
+        set_current_appearance(Appearance::Dark);
+    }
+
+    /// Glass selection is edge-only in BOTH appearances — no drop-shadow seat.
+    /// Every light seat tried (10% tight, 6%+5% pair, lone 4%) read as a grey
+    /// rim or a coarse smudge, and the tab strip clips escaping shadows
+    /// vertically (user reports). The ring must also stay subtle enough to
+    /// define the chip rather than frame it.
+    #[test]
+    fn glass_selection_is_edge_only_and_subtle() {
+        let _guard = lock_appearance();
+        for appearance in [Appearance::Dark, Appearance::Light] {
+            set_current_appearance(appearance);
+            let shadows = glass_selected_shadows();
+            assert!(
+                shadows.iter().all(|s| s.inset),
+                "{appearance:?}: glass selection may only paint inset edges"
+            );
+            let ring = shadows.iter().find(|s| s.inset).expect("selection ring");
+            assert!(
+                ring.color.a <= 0.09,
+                "{appearance:?}: ring at {:.2} alpha frames the chip instead of defining it",
+                ring.color.a
+            );
+        }
+        set_current_appearance(Appearance::Dark);
     }
 
     #[test]

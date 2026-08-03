@@ -1932,11 +1932,16 @@ impl Pickers {
                             })
                             .when(is_viewed, |el| {
                                 el.bg(crate::theme::card_selected_bg())
-                                    .shadow(crate::theme::glass_selected_shadows())
+                                    .shadow(crate::theme::card_selected_shadows())
                             })
                             .when(is_disabled, |el| el.opacity(0.35))
-                            .when(!is_disabled, |el| {
-                                el.cursor_pointer().hover(|s| s.bg(crate::theme::ink(0.06)))
+                            .when(!is_disabled, |el| el.cursor_pointer())
+                            // Hover must not replace the viewed row's selected
+                            // fill with the weaker wash — that dims the active
+                            // row under the pointer (same rule as the sidebar
+                            // rows in shell.rs).
+                            .when(!is_disabled && !is_viewed, |el| {
+                                el.hover(|s| s.bg(crate::theme::ink(0.06)))
                             })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.pick_harness(harness, cx);
@@ -1986,7 +1991,7 @@ impl Pickers {
                             format!("model-row-{ix}"),
                         )
                         .when(is_selected || ix == active, |el| {
-                            el.shadow(crate::theme::glass_selected_shadows())
+                            el.shadow(crate::theme::card_selected_shadows())
                         })
                         .id(("model-row", ix))
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -2264,7 +2269,7 @@ fn trait_chip(theme: &Theme, active: bool) -> gpui::Div {
                 .hover(|s| s.bg(theme.element_hover))
         })
         .when(active, |el| {
-            el.shadow(crate::theme::glass_selected_shadows())
+            el.shadow(crate::theme::card_selected_shadows())
         })
 }
 

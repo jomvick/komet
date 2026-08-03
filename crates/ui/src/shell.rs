@@ -1800,6 +1800,11 @@ impl Shell {
         } else {
             crate::theme::wash(0.0)
         };
+        // A selected row must NOT drift toward the hover wash: in dark the two
+        // fills are identical so the blend is a no-op, but light's hover sits
+        // below its near-opaque selected fill, and blending toward it visibly
+        // dimmed the active row under the pointer (user report).
+        let hover_bg = if selected { selected_wash } else { hover };
         let rest_text = if selected { text } else { text.opacity(0.8) };
         div()
             .id(SharedString::from(format!("chat-{id}")))
@@ -1810,7 +1815,7 @@ impl Shell {
             .px(px(Theme::SPACE_SM))
             .py(px(6.0))
             .text_color(motion::hover_blend(&fade_key, rest_text, text))
-            .bg(motion::hover_blend(&fade_key, rest_bg, hover))
+            .bg(motion::hover_blend(&fade_key, rest_bg, hover_bg))
             .when(selected, |el| {
                 el.shadow(crate::theme::glass_selected_shadows())
             })

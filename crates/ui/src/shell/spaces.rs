@@ -493,7 +493,18 @@ impl Shell {
             .px(px(Theme::SPACE_SM))
             .py(px(6.0))
             .text_color(motion::hover_blend(&fade_key, rest_text, theme.text))
-            .bg(motion::hover_blend(&fade_key, rest_bg, theme.glass_hover()))
+            // Selected rows pin their hover target to the selected fill — see
+            // the chat-row comment in shell.rs (light hover sits below the
+            // near-opaque selected fill; blending toward it dims the row).
+            .bg(motion::hover_blend(
+                &fade_key,
+                rest_bg,
+                if selected {
+                    rest_bg
+                } else {
+                    theme.glass_hover()
+                },
+            ))
             .when(selected, |el| {
                 el.shadow(crate::theme::glass_selected_shadows())
             })
@@ -1299,10 +1310,10 @@ impl Shell {
                                 ix == active,
                                 format!("add-space-folder-{ix}"),
                             )
-                            // The active-tab/session selection language: the wash
+                            // The floating-card selection language: the wash
                             // plus the ring-only inset outline.
                             .when(ix == active, |el| {
-                                el.shadow(crate::theme::glass_selected_shadows())
+                                el.shadow(crate::theme::card_selected_shadows())
                             })
                             .id(("add-space-folder", ix))
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -1380,7 +1391,7 @@ impl Shell {
                         // The floating-card selection language: wash +
                         // ring-only inset outline.
                         el.bg(crate::theme::card_selected_bg())
-                            .shadow(crate::theme::glass_selected_shadows())
+                            .shadow(crate::theme::card_selected_shadows())
                             .text_color(theme.text)
                     })
                     .when(!is_active, |el| {
