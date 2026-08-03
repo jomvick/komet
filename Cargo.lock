@@ -1371,6 +1371,7 @@ dependencies = [
  "gpui",
  "gpui_platform",
  "gpui_tokio",
+ "objc",
  "pulldown-cmark",
  "serde",
  "serde_json",

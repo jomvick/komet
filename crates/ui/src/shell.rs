@@ -1985,7 +1985,7 @@ impl Shell {
         // shadow (user reports). Instead the ROWS fade themselves: prepaint-
         // measured bounds drive per-row opacity toward the viewport edges
         // ([`Shell::sidebar_row_alpha`]), dissolving the edge to pure glass.
-        let glass = Theme::GLASS_ALPHA < 1.0;
+        let glass = theme.is_glass();
         let sidebar_fade = theme.surface;
 
         let user_line: SharedString = user

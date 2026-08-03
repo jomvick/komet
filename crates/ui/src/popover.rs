@@ -153,10 +153,10 @@ pub fn popover_card(theme: &Theme) -> gpui::Div {
         .overflow_hidden()
         .text_size(px(13.0))
         .text_color(theme.text);
-    if Theme::GLASS_ALPHA < 1.0 {
+    if theme.is_glass() {
         // Translucent tint — the backdrop blur beneath it comes from the
         // [`crate::frost::frosted`] wrapper at the mount helpers below.
-        card.bg(theme.surface_overlay.opacity(0.65))
+        card.bg(theme.glass_overlay())
     } else {
         card.bg(theme.surface_overlay)
     }
@@ -347,7 +347,8 @@ pub fn menu_row(theme: &Theme, active: bool, fade_key: impl Into<SharedString>) 
         .text_size(px(13.0))
         .cursor_pointer();
     if active {
-        row.bg(crate::theme::wash(0.14)).text_color(theme.text)
+        row.bg(crate::theme::card_selected_bg())
+            .text_color(theme.text)
     } else {
         let fade_key = fade_key.into();
         let mut row = row
@@ -359,7 +360,7 @@ pub fn menu_row(theme: &Theme, active: bool, fade_key: impl Into<SharedString>) 
             .bg(motion::hover_blend(
                 &fade_key,
                 crate::theme::wash(0.0),
-                crate::theme::wash(0.14),
+                crate::theme::card_selected_bg(),
             ));
         // Imperative form — the caller's `.id(...)` makes the element stateful
         // (hover listeners need element state, `.on_hover` needs `Stateful`).
@@ -381,7 +382,8 @@ pub fn menu_row_nav(
 ) -> gpui::Div {
     let row = menu_row(theme, selected, fade_key);
     if !selected && highlighted {
-        row.bg(crate::theme::wash(0.14)).text_color(theme.text)
+        row.bg(crate::theme::card_selected_bg())
+            .text_color(theme.text)
     } else {
         row
     }

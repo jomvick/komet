@@ -1931,7 +1931,7 @@ impl Pickers {
                                 theme.text_muted
                             })
                             .when(is_viewed, |el| {
-                                el.bg(crate::theme::glass_selected_bg())
+                                el.bg(crate::theme::card_selected_bg())
                                     .shadow(crate::theme::glass_selected_shadows())
                             })
                             .when(is_disabled, |el| el.opacity(0.35))
@@ -2255,7 +2255,7 @@ fn trait_chip(theme: &Theme, active: bool) -> gpui::Div {
         .text_size(px(11.5))
         .cursor_pointer()
         .when(active, |el| {
-            el.bg(crate::theme::glass_selected_bg())
+            el.bg(crate::theme::card_selected_bg())
                 .text_color(theme.text)
         })
         .when(!active, |el| {

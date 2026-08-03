@@ -463,7 +463,7 @@ impl Shell {
         let max_scroll = f32::from(self.tabs_scroll.max_offset().x);
         let fade_left = scrolled > 1.0;
         let fade_right = scrolled < max_scroll - 1.0;
-        let glass = Theme::GLASS_ALPHA < 1.0;
+        let glass = theme.is_glass();
         let bar_bg = theme.surface;
         let drag_move_space = space_id.clone().unwrap_or_default();
         let drop_space = space_id.clone().unwrap_or_default();

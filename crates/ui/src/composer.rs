@@ -26,7 +26,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use komet_doc::{MessagePart, MessageRole, SessionCommandPayload, SessionMessageEntry};
 use komet_proto::{FileSearchMatch, RunRequest, SandboxLevel, UserInputAnswer, UserInputQuestion};
-use komet_rpc::methods;
+use komet_rpc::{RpcError, methods};
 
 use crate::attachments::{self, StagedAttachment};
 use crate::motion;
@@ -623,10 +623,13 @@ const UNDO_COALESCE: Duration = Duration::from_millis(700);
 /// Cap on retained undo steps — a long-lived composer must not grow forever.
 const UNDO_LIMIT: usize = 200;
 
-/// Invisible but shaped em-space reserved for the SVG painted beside every
+/// Invisible but shaped whitespace reserved for the SVG painted beside every
 /// mention label. Keeping this in the projection makes the icon participate in
 /// wrapping, hit testing, and selection without changing the raw Markdown.
-const MENTION_ICON_SLOT: &str = "\u{2003}";
+/// Three no-break spaces (0.25em each in Geist) rather than one em-space:
+/// Geist has no glyph for U+2003, so it shapes at fallback width — near zero
+/// on some platforms — which left the icon overlapping the label.
+const MENTION_ICON_SLOT: &str = "\u{00A0}\u{00A0}\u{00A0}";
 const MENTION_TOOLTIP_DELAY: Duration = Duration::from_millis(420);
 const MENTION_TOOLTIP_HEIGHT: f32 = 24.0;
 const MENTION_SIDE_PAD: &str = "\u{00A0}";
@@ -890,11 +893,12 @@ impl TextProjection {
             projection.display.push_str(&raw[raw_at..link.range.start]);
             let display_start = projection.display.len();
             // Text runs cannot host an inline element. Reserve a stable
-            // em-space for the SVG which `ComposerTextElement::paint`
+            // whitespace slot for the SVG which `ComposerTextElement::paint`
             // draws into, then retain non-breaking side bearings around it.
+            // Every character here must exist in Geist — see MENTION_ICON_SLOT.
             projection.display.push_str(MENTION_SIDE_PAD);
             projection.display.push_str(MENTION_ICON_SLOT);
-            projection.display.push('\u{202F}');
+            projection.display.push('\u{00A0}');
             for ch in label.chars() {
                 projection
                     .display
@@ -2822,7 +2826,9 @@ impl gpui::Element for ComposerTextElement {
             else {
                 continue;
             };
-            let slot_width = slot_bounds.size.width.max(px(8.0));
+            // Clamp to the slot's real advance so a shaping surprise shows as
+            // a small icon, never as paint over the label's first glyph.
+            let slot_width = slot_bounds.size.width;
             let icon_size = slot_width.min(px(12.0));
             mention_icons.push((
                 Bounds::new(
@@ -3127,6 +3133,11 @@ struct FileMentionState {
     active: Option<usize>,
     request: u64,
     loading: bool,
+    /// Why the last search failed, for the popup. A failure MUST NOT render
+    /// as "No matching files": cross-device searches fail for reasons the
+    /// user can act on (host daemon too old for `SearchFiles`, device
+    /// offline), and the empty state hid them (user report).
+    error: Option<SharedString>,
     /// Full token text, not just the cursor-relative query: moving within a
     /// dismissed token keeps it closed, while any edit re-enables completion.
     dismissed: Option<(Range<usize>, String)>,
@@ -3134,6 +3145,20 @@ struct FileMentionState {
 
 fn mention_response_is_current(state: &FileMentionState, request: u64) -> bool {
     state.request == request && state.token.is_some()
+}
+
+/// A failed file search, translated for the popup. `UnknownMethod` is the
+/// version-skew case: `SearchFiles` shipped after v0.1.9, so a session hosted
+/// by a device on an older daemon answers "unknown method" while the same
+/// search works for local sessions.
+fn mention_error_message(err: &RpcError) -> SharedString {
+    match err {
+        RpcError::UnknownMethod(_) => {
+            "The session's device runs an older komet — update it to search its files".into()
+        }
+        RpcError::Transport(_) | RpcError::Closed => "The session's device is unreachable".into(),
+        RpcError::BadParams(_) | RpcError::Failed(_) => "File search failed".into(),
+    }
 }
 
 pub struct Composer {
@@ -3510,9 +3535,16 @@ impl Composer {
         }
         self.mention.request = self.mention.request.wrapping_add(1);
         self.mention_task = None;
+        // Refining an open menu keeps the stale rows visible until the new
+        // response lands — clearing here made the popup bounce through the
+        // skeleton (and a different height) on every keystroke.
+        let refining = self.mention.token.is_some() && token.is_some();
         self.mention.token = token.clone();
-        self.mention.results.clear();
-        self.mention.active = None;
+        if !refining {
+            self.mention.results.clear();
+            self.mention.active = None;
+        }
+        self.mention.error = None;
         self.mention.loading = token.is_some();
         self.sync_mention_controls(cx);
         let Some(token) = token else {
@@ -3562,7 +3594,19 @@ impl Composer {
             cx.background_executor()
                 .timer(Duration::from_millis(80))
                 .await;
-            let result = engine.client().call(methods::SEARCH_FILES, params).await;
+            let mut result = engine
+                .client()
+                .call(methods::SEARCH_FILES, params.clone())
+                .await;
+            if matches!(result, Err(RpcError::Transport(_)) | Err(RpcError::Closed)) {
+                // One retry rides out a cold relay dial to the host device
+                // (the diffs pane retries forever; a keystroke-scoped search
+                // gets a single second chance).
+                cx.background_executor()
+                    .timer(Duration::from_millis(250))
+                    .await;
+                result = engine.client().call(methods::SEARCH_FILES, params).await;
+            }
             this.update(cx, |composer, cx| {
                 if !mention_response_is_current(&composer.mention, request) {
                     return;
@@ -3571,12 +3615,18 @@ impl Composer {
                 match result {
                     Ok(value) => match serde_json::from_value::<Vec<FileSearchMatch>>(value) {
                         Ok(results) => {
+                            composer.mention.error = None;
                             composer.mention.active = (!results.is_empty()).then_some(0);
                             composer.mention.results = results;
                         }
                         Err(err) => tracing::warn!(%err, "file mention response decode failed"),
                     },
-                    Err(err) => tracing::debug!(%err, "file mention search failed"),
+                    Err(err) => {
+                        tracing::warn!(%err, "file mention search failed");
+                        composer.mention.results.clear();
+                        composer.mention.active = None;
+                        composer.mention.error = Some(mention_error_message(&err));
+                    }
                 }
                 composer.sync_mention_controls(cx);
                 cx.notify();
@@ -3635,12 +3685,21 @@ impl Composer {
             .max_h(px(280.0))
             .overflow_hidden()
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.dismiss_mention(cx)));
-        if self.mention.loading {
+        if self.mention.loading && self.mention.results.is_empty() {
             card = card.child(crate::popover::skeleton_rows(
                 "file-mention-loading",
                 theme,
                 3,
             ));
+        } else if let Some(error) = self.mention.error.clone() {
+            card = card.child(
+                div()
+                    .px(px(12.0))
+                    .py(px(10.0))
+                    .text_size(px(12.0))
+                    .text_color(theme.danger_muted)
+                    .child(error),
+            );
         } else if self.mention.results.is_empty() {
             card = card.child(
                 div()
@@ -5200,7 +5259,7 @@ mod tests {
         let (link, chip) = &projection.mentions[0];
         assert_eq!(
             &projection.display[chip.clone()],
-            "\u{00A0}\u{2003}\u{202F}composer.rs\u{00A0}"
+            "\u{00A0}\u{00A0}\u{00A0}\u{00A0}\u{00A0}composer.rs\u{00A0}"
         );
         assert_eq!(
             &projection.display[chip.start + MENTION_SIDE_PAD.len()
@@ -5237,7 +5296,7 @@ mod tests {
         assert_eq!(spans.len(), 2);
         assert_eq!(
             &display[spans[0].range.clone()],
-            "\u{00A0}\u{2003}\u{202F}composer.rs\u{00A0}"
+            "\u{00A0}\u{00A0}\u{00A0}\u{00A0}\u{00A0}composer.rs\u{00A0}"
         );
         assert_eq!(&display[spans[0].icon_slot.clone()], MENTION_ICON_SLOT);
         assert!(!spans[0].is_dir);

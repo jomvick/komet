@@ -86,6 +86,7 @@ pub fn init(mode: AppearanceMode, data_dir: impl Into<PathBuf>, cx: &mut App) {
         system,
         data_dir: data_dir.into(),
     });
+    sync_ns_appearance(mode);
     Theme::install(resolve(mode, system), cx);
 }
 
@@ -169,6 +170,7 @@ pub fn apply(cx: &mut App) {
     let Some(state) = cx.try_global::<AppearanceState>() else {
         return;
     };
+    sync_ns_appearance(state.mode);
     let wanted = resolve(state.mode, state.system);
     let changed = !cx
         .try_global::<Theme>()
@@ -187,6 +189,44 @@ pub fn apply(cx: &mut App) {
     // every settings change (`crates/zed/src/main.rs`).
     reapply_window_background(cx);
 }
+
+/// Tell AppKit which appearance the app's windows use, so the chrome *it*
+/// draws — the traffic lights above all — matches the palette *we* paint.
+/// gpui never sets `NSAppearance`, so before this a pinned in-app theme left
+/// the window chrome following the OS setting: a light window rendered
+/// dark-appearance inactive traffic lights when the system was dark (user
+/// report). Pinned modes name the appearance explicitly; `System` clears the
+/// override (`setAppearance: nil`) so AppKit follows the OS again — resolving
+/// to a name there too would freeze the chrome across OS sunset switches
+/// until our own notification round-trip repainted it.
+#[cfg(target_os = "macos")]
+fn sync_ns_appearance(mode: AppearanceMode) {
+    use objc::runtime::Object;
+    use objc::{class, msg_send, sel, sel_impl};
+    // NSAppearanceName constants are NSStrings whose value equals the
+    // constant's own name (AppKit documents them as stable identifiers), so
+    // building them from literals avoids linking the extern statics.
+    let name = match mode {
+        AppearanceMode::System => None,
+        AppearanceMode::Light => Some(c"NSAppearanceNameAqua"),
+        AppearanceMode::Dark => Some(c"NSAppearanceNameDarkAqua"),
+    };
+    unsafe {
+        let appearance: *mut Object = match name {
+            None => std::ptr::null_mut(),
+            Some(name) => {
+                let name: *mut Object =
+                    msg_send![class!(NSString), stringWithUTF8String: name.as_ptr()];
+                msg_send![class!(NSAppearance), appearanceNamed: name]
+            }
+        };
+        let app: *mut Object = msg_send![class!(NSApplication), sharedApplication];
+        let _: () = msg_send![app, setAppearance: appearance];
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn sync_ns_appearance(_mode: AppearanceMode) {}
 
 /// Push the theme's window background appearance onto every open window.
 pub fn reapply_window_background(cx: &mut App) {

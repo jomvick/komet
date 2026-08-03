@@ -2773,7 +2773,7 @@ mod tests {
         assert!(!mentions[0].is_dir);
         assert_eq!(mentions[0].path.as_ref(), "crates/ui/src/composer.rs");
         assert_eq!(&text[mentions[0].range.clone()], {
-            let projected: &str = "\u{00A0}\u{2003}\u{202F}composer.rs\u{00A0}";
+            let projected: &str = "\u{00A0}\u{00A0}\u{00A0}\u{00A0}\u{00A0}composer.rs\u{00A0}";
             projected
         });
         assert_eq!(rows[0].version, (raw.len() as u64) << 1);

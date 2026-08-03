@@ -297,20 +297,16 @@ impl Theme {
     /// backdrop blur has no material layer, so the scrim runs heavier to land
     /// on the same perceived tone (see [`Theme::glass`]).
     pub const GLASS_ALPHA: f32 = if cfg!(target_os = "macos") { 0.90 } else { 1.0 };
-    /// Light-mode frost alpha — **opaque, deliberately**.
+    /// Light-mode frost alpha — glass-forward, like dark mode.
     ///
-    /// Translucent chrome only works when the tint is dark enough to dominate
-    /// whatever is behind it. A light tint cannot: at any alpha loose enough to
-    /// actually show the blur, the desktop's colour bleeds through and the sidebar
-    /// takes on whatever the wallpaper happens to be — which reads as a dirty,
-    /// muddy grey rather than glass, and drags every label on it below its
-    /// contrast target because the background is no longer a known colour.
-    ///
-    /// Light UIs that get this right (Codex, Linear, Xcode) don't use vibrancy for
-    /// chrome at all: opaque panes, separated by hairlines. That is what this
-    /// does. Dark mode keeps its frost, where a near-black tint stays in control
-    /// of the result.
-    pub const GLASS_ALPHA_LIGHT: f32 = 1.0;
+    /// A light tint controls the blur less than a dark one: the desktop's
+    /// colour bleeds through more readily, so light frost runs *heavier* than
+    /// an equal-looking dark frost to keep the chrome on a known-enough
+    /// background for its labels (macOS light sidebars do the same — their
+    /// vibrancy material is mostly white). Floating cards compensate further:
+    /// see [`Self::glass_overlay`], where light coverage steps up to keep menu
+    /// text legible over an unknown backdrop.
+    pub const GLASS_ALPHA_LIGHT: f32 = if cfg!(target_os = "macos") { 0.90 } else { 1.0 };
     /// Main-panel header height (komet `h-11`) — in-card headers (changes pane).
     pub const HEADER_HEIGHT: f32 = 44.0;
     /// The unified window titlebar (traffic lights + cluster + tabs). Content
@@ -336,8 +332,9 @@ impl Theme {
 
     /// The frost tint painted over the blurred window background (macOS glass).
     /// Dark: darker than `surface`, matched to the reference vibrancy scrim
-    /// `hsl(0 0% 3%)`. Light: opaque — see [`Self::GLASS_ALPHA_LIGHT`]. On opaque
-    /// platforms this IS the surface tone (no tint swap).
+    /// `hsl(0 0% 3%)`. Light: a near-white frost run heavier than dark's — see
+    /// [`Self::GLASS_ALPHA_LIGHT`]. On opaque platforms this IS the surface
+    /// tone (no tint swap).
     pub fn glass(&self) -> Hsla {
         match self.appearance {
             Appearance::Dark => {
@@ -347,7 +344,34 @@ impl Theme {
                     self.surface
                 }
             }
-            Appearance::Light => self.surface,
+            Appearance::Light => {
+                if Self::GLASS_ALPHA_LIGHT < 1.0 {
+                    grey(0xf4).opacity(Self::GLASS_ALPHA_LIGHT)
+                } else {
+                    self.surface
+                }
+            }
+        }
+    }
+
+    /// Whether this appearance paints translucent chrome over the blurred
+    /// desktop. Glass-only recipes — backdrop blurs, translucent popover
+    /// tints, per-glyph edge fades — must gate on this, not on
+    /// [`Self::GLASS_ALPHA`]: that constant is platform-wide, while the frost
+    /// alpha (and with it whether glass is on at all) is per-appearance.
+    pub fn is_glass(&self) -> bool {
+        self.glass().a < 1.0
+    }
+
+    /// The translucent tint floating cards paint over their backdrop blur
+    /// (see [`crate::frost::frosted`]). Dark: 65% — a dark tint dominates the
+    /// blur at low coverage. Light: heavier — a white tint at 65% left menu
+    /// text ghosting over whatever sat behind the popover, so light coverage
+    /// steps up to keep rows on a known background.
+    pub fn glass_overlay(&self) -> Hsla {
+        match self.appearance {
+            Appearance::Dark => self.surface_overlay.opacity(0.65),
+            Appearance::Light => self.surface_overlay.opacity(0.85),
         }
     }
 
@@ -358,15 +382,17 @@ impl Theme {
 
     /// How the platform should composite the window behind our paint.
     ///
-    /// Both appearances want the blurred desktop on macOS — the frost tint on top
-    /// is what differs. This is a method rather than a constant because it has to
-    /// be *re-applied* after every theme swap: gpui's macOS backend tears the
-    /// `NSVisualEffectView` out of the hierarchy whenever the value is anything
-    /// but `Blurred`, so a single lost re-apply kills vibrancy permanently.
-    /// See `appearance::apply`, and zed's `crates/zed/src/main.rs`, which runs the
-    /// same loop on every settings change.
+    /// Only dark macOS wants the blurred desktop — light chrome is opaque by
+    /// design ([`Self::GLASS_ALPHA_LIGHT`]), so it keeps opaque compositing
+    /// (subpixel-friendly, no vibrancy cost for a blur nothing shows). This is
+    /// a method rather than a constant because it has to be *re-applied* after
+    /// every theme swap: gpui's macOS backend tears the `NSVisualEffectView`
+    /// out of the hierarchy whenever the value is anything but `Blurred`, and
+    /// the re-apply in `appearance::apply` is what restores vibrancy when the
+    /// user switches back to dark. See zed's `crates/zed/src/main.rs`, which
+    /// runs the same loop on every settings change.
     pub fn window_background_appearance(&self) -> gpui::WindowBackgroundAppearance {
-        if cfg!(target_os = "macos") {
+        if self.is_glass() {
             gpui::WindowBackgroundAppearance::Blurred
         } else {
             gpui::WindowBackgroundAppearance::Opaque
@@ -672,8 +698,32 @@ fn band_for(appearance: Appearance) -> Hsla {
 /// Selected-state glass treatment (tabs, session rows, space rows): a
 /// TRANSLUCENT wash the vibrancy reads through — heavier flat washes blocked
 /// the glass (user request).
+///
+/// The wash lifts toward the appearance's *luminous* end. Dark: soft white.
+/// Light: white too, NOT the literal translation to a black wash — 14% black
+/// over light frost reads as a pressed dent and muddies with whatever the
+/// wallpaper puts behind the glass. Thickening the frost toward white pops
+/// the chip forward the way dark's wash glows (the light-Safari active-tab
+/// recipe). Selection *inside floating cards* is different — see
+/// [`card_selected_bg`].
 pub fn glass_selected_bg() -> Hsla {
-    wash(0.14)
+    match current_appearance() {
+        Appearance::Dark => wash(0.14),
+        Appearance::Light => hsla(0.0, 0.0, 1.0, 0.55),
+    }
+}
+
+/// Selected/keyboard-active treatment for rows and chips INSIDE a floating
+/// card (menu rows, the picker rail, segmented chips). The card is already the
+/// bright plane in light mode, so a white lift can't read there — selection is
+/// a grey wash instead, at Primer/Radix "selected" weight (~8% black). The
+/// dark-mode card is translucent dark glass, where the standard luminous wash
+/// still applies.
+pub fn card_selected_bg() -> Hsla {
+    match current_appearance() {
+        Appearance::Dark => wash(0.14),
+        Appearance::Light => wash(0.08),
+    }
 }
 
 /// The selected chip's bright outline, as an INSET shadow: gpui paints inset
@@ -681,9 +731,17 @@ pub fn glass_selected_bg() -> Hsla {
 /// cost. Drop shadows are filled rects painted BEHIND the element, and behind
 /// a 5% fill they showed straight through as an opaque dark plate with a
 /// greyed ring (user report) — nothing may paint behind a glass chip.
+///
+/// Light pins the ring at a flat 10% black rather than the scaled hairline:
+/// the [`INK_HAIRLINE_SCALE`]d value outlined every selected chip in a heavy
+/// dark box (user report) — the ring should define the chip, not frame it.
 pub fn glass_selected_shadows() -> Vec<gpui::BoxShadow> {
+    let color = match current_appearance() {
+        Appearance::Dark => hairline(0.09),
+        Appearance::Light => hsla(0.0, 0.0, 0.0, 0.10),
+    };
     vec![gpui::BoxShadow {
-        color: hairline(0.09),
+        color,
         offset: gpui::point(gpui::px(0.0), gpui::px(0.0)),
         blur_radius: gpui::px(0.0),
         spread_radius: gpui::px(1.0),
@@ -1216,22 +1274,28 @@ mod tests {
         set_current_appearance(Appearance::Dark);
     }
 
-    /// Light chrome is opaque on purpose. A translucent light tint lets the
-    /// desktop's colour through, so the sidebar becomes whatever the wallpaper is
-    /// — muddy, and no longer a known background to compute contrast against.
-    /// Dark keeps its frost, where the tint stays in control.
+    /// Both appearances are glass-forward on macOS. Light frost runs heavier
+    /// than dark's (a light tint controls the blur less), and floating cards
+    /// step their tint coverage up in light so menu text stays on a
+    /// known-enough background — assert both relationships so the frost and
+    /// the overlay can't drift apart.
     #[test]
-    fn light_chrome_is_opaque_and_dark_stays_frosted() {
-        assert_eq!(
-            Theme::light().glass().a,
-            1.0,
-            "light chrome must not sample the desktop"
-        );
+    fn both_appearances_stay_frosted_and_light_runs_heavier() {
         if Theme::GLASS_ALPHA < 1.0 {
+            let (dark, light) = (Theme::dark(), Theme::light());
+            assert!(dark.glass().a < 1.0, "dark keeps its translucent frost");
+            assert!(light.glass().a < 1.0, "light is glass-forward like dark");
             assert!(
-                Theme::dark().glass().a < 1.0,
-                "dark mode keeps its translucent frost"
+                light.glass().a > dark.glass().a - f32::EPSILON,
+                "a light tint dominates the blur less, so it must not run looser than dark"
             );
+            assert!(
+                light.glass_overlay().a > dark.glass_overlay().a,
+                "light floating cards need more coverage over blur for legible rows"
+            );
+        } else {
+            assert_eq!(Theme::light().glass().a, 1.0);
+            assert_eq!(Theme::dark().glass().a, 1.0);
         }
     }
 

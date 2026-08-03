@@ -1377,9 +1377,9 @@ impl Shell {
                     .text_size(px(12.5))
                     .cursor_pointer()
                     .when(is_active, |el| {
-                        // The sidebar's selection language: glass wash +
+                        // The floating-card selection language: wash +
                         // ring-only inset outline.
-                        el.bg(crate::theme::glass_selected_bg())
+                        el.bg(crate::theme::card_selected_bg())
                             .shadow(crate::theme::glass_selected_shadows())
                             .text_color(theme.text)
                     })
@@ -1500,8 +1500,8 @@ impl Shell {
                 // The popover_card glass recipe: a translucent tint over the
                 // frosted backdrop blur (`popover::modal` wraps in `frosted`) —
                 // an opaque fill here killed the vibrancy every other float has.
-                .bg(if Theme::GLASS_ALPHA < 1.0 {
-                    theme.surface_overlay.opacity(0.65)
+                .bg(if theme.is_glass() {
+                    theme.glass_overlay()
                 } else {
                     theme.surface_overlay
                 })
