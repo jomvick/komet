@@ -197,6 +197,62 @@ pub enum RoomEvent {
     Evicted,
 }
 
+/// Live sync introspection for one room — the data behind the engine's
+/// `SyncStatus` RPC and `komet sync`. Every 2026-08 incident was debugged
+/// blind because none of this was observable at runtime.
+#[derive(Debug, Clone, Default)]
+pub struct RoomStatsSnapshot {
+    /// A `%LOR` join is currently established.
+    pub connected: bool,
+    /// Epoch ms of the last SERVER-PUSHED `%LOR` frame (broadcast, backfill,
+    /// join answer) — 0 = never. The deaf-socket tell: fresh acks + stale
+    /// pushes.
+    pub last_pushed_ms: i64,
+    /// Epoch ms of the last `%LOR` ack for our own writes — 0 = never.
+    pub last_ack_ms: i64,
+    /// Mid-session rejoins (reconnect resyncs, stale-peer, full resyncs).
+    pub rejoins: u64,
+    /// Liveness probes sent (background cadence + on-demand hints).
+    pub probes: u64,
+    /// Full-snapshot resyncs requested after failed imports.
+    pub full_resyncs: u64,
+    /// Sessions lost (transport drops, deadlines, requested redials).
+    pub disconnects: u64,
+}
+
+#[derive(Default)]
+struct RoomStatsShared {
+    connected: std::sync::atomic::AtomicBool,
+    last_pushed_ms: std::sync::atomic::AtomicI64,
+    last_ack_ms: std::sync::atomic::AtomicI64,
+    rejoins: std::sync::atomic::AtomicU64,
+    probes: std::sync::atomic::AtomicU64,
+    full_resyncs: std::sync::atomic::AtomicU64,
+    disconnects: std::sync::atomic::AtomicU64,
+}
+
+impl RoomStatsShared {
+    fn snapshot(&self) -> RoomStatsSnapshot {
+        use std::sync::atomic::Ordering::Relaxed;
+        RoomStatsSnapshot {
+            connected: self.connected.load(Relaxed),
+            last_pushed_ms: self.last_pushed_ms.load(Relaxed),
+            last_ack_ms: self.last_ack_ms.load(Relaxed),
+            rejoins: self.rejoins.load(Relaxed),
+            probes: self.probes.load(Relaxed),
+            full_resyncs: self.full_resyncs.load(Relaxed),
+            disconnects: self.disconnects.load(Relaxed),
+        }
+    }
+}
+
+fn epoch_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 /// Per-room tuning knobs. Defaults match the per-chat fleet economics
 /// documented on [`ROOM_PROBE_MAX`]; single-instance rooms whose steady state
 /// is %LOR-silent by design (the workspace doc — presence rides `%EPH`, which
@@ -330,6 +386,8 @@ pub struct RoomClient {
     events: broadcast::Sender<RoomEvent>,
     shutdown: watch::Sender<bool>,
     probe: mpsc::Sender<()>,
+    redial: mpsc::Sender<()>,
+    stats: Arc<RoomStatsShared>,
     task: Option<tokio::task::JoinHandle<()>>,
     /// Doc + ephemeral local-update subscriptions (drop = unsubscribe).
     _subs: Vec<loro::Subscription>,
@@ -407,6 +465,8 @@ impl RoomClient {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (ready_tx, ready_rx) = oneshot::channel();
         let (probe_tx, probe_rx) = mpsc::channel(1);
+        let (redial_tx, redial_rx) = mpsc::channel(1);
+        let stats = Arc::new(RoomStatsShared::default());
 
         let actor = RoomActor {
             doc: doc.clone(),
@@ -416,7 +476,9 @@ impl RoomClient {
             local_rx,
             eph_rx,
             probe_rx,
+            redial_rx,
             tuning,
+            stats: stats.clone(),
             events: events.clone(),
             shutdown: shutdown_rx,
         };
@@ -429,6 +491,8 @@ impl RoomClient {
                 events,
                 shutdown: shutdown_tx,
                 probe: probe_tx,
+                redial: redial_tx,
+                stats,
                 task: Some(task),
                 _subs: vec![sub_doc, sub_eph],
             }),
@@ -470,6 +534,20 @@ impl RoomClient {
         let _ = self.probe.try_send(());
     }
 
+    /// Escalation past [`Self::probe`]: end the current session and redial on
+    /// a FRESH socket. For the deaf-socket shape where even a probe's answer
+    /// can't arrive (server→client path dead while writes still flow), only
+    /// a new connection helps. Actor-gated on the same ≥30s pushed-quiet
+    /// check as probes, so false alarms on a healthy room are free.
+    pub fn redial(&self) {
+        let _ = self.redial.try_send(());
+    }
+
+    /// Live counters/clocks for this room (SyncStatus RPC / `komet sync`).
+    pub fn stats(&self) -> RoomStatsSnapshot {
+        self.stats.snapshot()
+    }
+
     /// Leave the room (protocol `Leave` frames + close handshake) and stop the
     /// background task.
     pub async fn shutdown(mut self) -> Result<(), SyncError> {
@@ -506,7 +584,9 @@ struct RoomActor {
     local_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     eph_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     probe_rx: mpsc::Receiver<()>,
+    redial_rx: mpsc::Receiver<()>,
     tuning: RoomTuning,
+    stats: Arc<RoomStatsShared>,
     events: broadcast::Sender<RoomEvent>,
     shutdown: watch::Receiver<bool>,
 }
@@ -547,6 +627,14 @@ impl RoomActor {
                     )
                 }
             };
+            self.stats
+                .connected
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            if !matches!(end, SessionEnd::Shutdown) {
+                self.stats
+                    .disconnects
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             match end {
                 SessionEnd::Shutdown => return,
                 SessionEnd::Evicted(reason) => {
@@ -593,9 +681,10 @@ impl RoomActor {
                     _ = self.shutdown.changed() => return,
                     Some(_) = self.local_rx.recv() => {}
                     Some(_) = self.eph_rx.recv() => {}
-                    // Probe hints while disconnected: the redial itself is
-                    // the probe, nothing to remember.
+                    // Probe/redial hints while disconnected: the redial
+                    // already underway is the answer, nothing to remember.
                     Some(_) = self.probe_rx.recv() => {}
+                    Some(_) = self.redial_rx.recv() => {}
                 }
             };
             if woke {
@@ -626,6 +715,7 @@ impl RoomActor {
             room_id: self.room_id.clone(),
             tx: pipe.tx.clone(),
             events: self.events.clone(),
+            stats: self.stats.clone(),
             pending: HashMap::new(),
             fragments: HashMap::new(),
             joined_lor: false,
@@ -754,9 +844,30 @@ impl RoomActor {
                         }
                         sess.join_is_probe = true;
                         last_probe_at = Some(tokio::time::Instant::now());
+                        sess.stats
+                            .probes
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         // Someone is actively relying on the room again —
                         // restart the background cadence from its base.
                         probe_interval = ROOM_PROBE_AFTER;
+                    }
+                }
+                Some(_) = self.redial_rx.recv() => {
+                    // Deaf-socket escalation (RoomClient::redial — e.g. all
+                    // peer presence went dark and a probe didn't help): only
+                    // a FRESH connection fixes a server→client path that
+                    // drops even join answers. Same pushed-quiet gate as
+                    // probes, so a healthy room never redials.
+                    if sess.joined_lor
+                        && sess.last_pushed_rx.elapsed() >= PROBE_ON_DEMAND_MIN_QUIET
+                    {
+                        tracing::warn!(
+                            room = %self.room_id,
+                            "redial requested (suspected deaf socket); reconnecting fresh"
+                        );
+                        break SessionEnd::Lost(SyncError::WebSocket(
+                            "redial requested: suspected deaf socket".into(),
+                        ));
                     }
                 }
                 _ = tokio::time::sleep_until(liveness_at) => {
@@ -785,6 +896,9 @@ impl RoomActor {
                     }
                     sess.join_is_probe = true;
                     last_probe_at = Some(tokio::time::Instant::now());
+                    sess.stats
+                        .probes
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     probe_interval = (probe_interval * 2).min(self.tuning.probe_max);
                 }
             }
@@ -809,6 +923,7 @@ struct Session {
     room_id: String,
     tx: mpsc::Sender<Vec<u8>>,
     events: broadcast::Sender<RoomEvent>,
+    stats: Arc<RoomStatsShared>,
     /// Sent-but-unacked outbound batches, kept for FragmentTimeout resends.
     pending: HashMap<BatchId, Vec<Vec<u8>>>,
     /// Inbound reassembly buffers.
@@ -905,13 +1020,17 @@ impl Session {
             | ProtocolMessage::Leave { crdt, .. } => *crdt,
         };
         if crdt == CrdtType::Loro {
+            use std::sync::atomic::Ordering::Relaxed;
             self.last_lor_rx = tokio::time::Instant::now();
             // The probe clock advances only on frames the SERVER chose to
             // push (broadcasts, backfill, join answers) — never on acks,
             // which a broadcast-skipping room keeps producing for our own
             // writes (see `last_pushed_rx`).
-            if !matches!(message, ProtocolMessage::Ack { .. }) {
+            if matches!(message, ProtocolMessage::Ack { .. }) {
+                self.stats.last_ack_ms.store(epoch_ms(), Relaxed);
+            } else {
                 self.last_pushed_rx = self.last_lor_rx;
+                self.stats.last_pushed_ms.store(epoch_ms(), Relaxed);
             }
         }
         match message {
@@ -1023,6 +1142,9 @@ impl Session {
                 self.join_sent_at = None; // join answered — disarm the deadline
                 let was_probe = std::mem::take(&mut self.join_is_probe);
                 self.joined_lor = true;
+                self.stats
+                    .connected
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
                 // Resubmit-from-VV: push everything the server lacks. This
                 // covers both fresh docs (first upload) and updates that went
                 // unacked across a reconnect or stale-peer resync. Gated on
@@ -1064,6 +1186,9 @@ impl Session {
                     // the recovery was silent, and the timeline was
                     // unreconstructable. Rejoins are rare; log them.
                     tracing::info!(room = %self.room_id, "room rejoined; backfill under way");
+                    self.stats
+                        .rejoins
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
                 // Join presence once the doc room is up.
                 self.send(&ProtocolMessage::JoinRequest {
@@ -1114,6 +1239,9 @@ impl Session {
                             // gap of a long-lived session.
                             if self.join_sent_at.is_none() && self.full_resyncs < MAX_FULL_RESYNCS {
                                 self.full_resyncs += 1;
+                                self.stats
+                                    .full_resyncs
+                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 self.send_join_loro(Vec::new()).await?;
                             }
                         }

@@ -25,6 +25,9 @@ enum Command {
     Logout,
     /// Show auth + engine status (exits nonzero when a sign-in is needed).
     Status,
+    /// Live sync introspection from the running engine: per-room connection
+    /// state, last pushed-frame/ack ages, rejoin/probe/resync counters.
+    Sync,
     /// Manage `komet headless` as a background service (launchd / systemd --user).
     Daemon {
         #[command(subcommand)]
@@ -159,6 +162,10 @@ fn main() -> anyhow::Result<()> {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(auth_cli::status(engine_config_from_env()))
         }
+        Some(Command::Sync) => {
+            let runtime = tokio::runtime::Runtime::new()?;
+            runtime.block_on(sync_cli(engine_config_from_env().ipc_port))
+        }
         Some(Command::Update { check }) => {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(update_cli::update(&edge_url_from_env(), check))
@@ -234,6 +241,85 @@ fn harness_from_env() -> komet_engine::HarnessId {
 fn dirs_data_dir() -> std::path::PathBuf {
     let home = std::env::var_os("HOME").expect("HOME not set");
     std::path::PathBuf::from(home).join(".komet-native")
+}
+
+/// `komet sync`: dial the running engine's IPC and print per-room sync state.
+/// The introspection surface every 2026-08 incident was missing — "is this
+/// device's workspace room actually receiving?" as a one-liner.
+async fn sync_cli(ipc_port: u16) -> anyhow::Result<()> {
+    let client = komet_rpc::connect_ws(&format!("ws://127.0.0.1:{ipc_port}"))
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!("no engine listening on 127.0.0.1:{ipc_port} ({e}) — is komet running?")
+        })?;
+    let status = client
+        .call(komet_rpc::methods::SYNC_STATUS, serde_json::json!({}))
+        .await
+        .map_err(|e| anyhow::anyhow!("SyncStatus failed: {e}"))?;
+    let now = status.get("nowMs").and_then(|v| v.as_i64()).unwrap_or(0);
+    let age = |ms: i64| -> String {
+        if ms <= 0 {
+            return "never".into();
+        }
+        let s = (now - ms).max(0) / 1000;
+        if s >= 3600 {
+            format!("{}h{}m ago", s / 3600, (s % 3600) / 60)
+        } else if s >= 60 {
+            format!("{}m{}s ago", s / 60, s % 60)
+        } else {
+            format!("{s}s ago")
+        }
+    };
+    let room_line = |room: Option<&serde_json::Value>| -> String {
+        let Some(room) = room else {
+            return "no room (dialing or edge-less)".into();
+        };
+        let get = |k: &str| room.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
+        format!(
+            "{} pushed {} · acked {} · rejoins {} probes {} resyncs {} drops {}",
+            if room.get("connected").and_then(|v| v.as_bool()) == Some(true) {
+                "connected ·"
+            } else {
+                "DISCONNECTED ·"
+            },
+            age(get("lastPushedMs")),
+            age(get("lastAckMs")),
+            get("rejoins"),
+            get("probes"),
+            get("fullResyncs"),
+            get("disconnects"),
+        )
+    };
+    println!(
+        "Device:    {}",
+        status
+            .get("deviceId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?")
+    );
+    println!(
+        "Workspace: {}",
+        room_line(status.get("workspace").filter(|v| !v.is_null()))
+    );
+    let chats = status
+        .get("chats")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if chats.is_empty() {
+        println!("Chats:     none open");
+    }
+    for chat in &chats {
+        println!(
+            "Chat {}: {}",
+            chat.get("chatId")
+                .and_then(|v| v.as_str())
+                .map(|s| &s[..s.len().min(8)])
+                .unwrap_or("?"),
+            room_line(chat.get("room").filter(|v| !v.is_null()))
+        );
+    }
+    Ok(())
 }
 
 /// `{data_dir}/logs/komet-{mode}.log`, previous launch preserved as `.old`.

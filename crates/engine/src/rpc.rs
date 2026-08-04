@@ -979,6 +979,37 @@ impl RpcService for EngineRpc {
                 self.doc_host.probe_open_chats();
                 RpcReply::value(&serde_json::json!({}))
             }
+            methods::SYNC_STATUS => {
+                fn room_json(s: &komet_sync::RoomStatsSnapshot) -> serde_json::Value {
+                    serde_json::json!({
+                        "connected": s.connected,
+                        "lastPushedMs": s.last_pushed_ms,
+                        "lastAckMs": s.last_ack_ms,
+                        "rejoins": s.rejoins,
+                        "probes": s.probes,
+                        "fullResyncs": s.full_resyncs,
+                        "disconnects": s.disconnects,
+                    })
+                }
+                let workspace = self.workspace.sync_status();
+                let chats: Vec<serde_json::Value> = self
+                    .doc_host
+                    .sync_statuses()
+                    .iter()
+                    .map(|(chat_id, room)| {
+                        serde_json::json!({
+                            "chatId": chat_id,
+                            "room": room.as_ref().map(room_json),
+                        })
+                    })
+                    .collect();
+                RpcReply::value(&serde_json::json!({
+                    "deviceId": self.doc_host.device_id(),
+                    "nowMs": crate::now_ms(),
+                    "workspace": workspace.as_ref().map(room_json),
+                    "chats": chats,
+                }))
+            }
             methods::WATCH_CHATS => {
                 Ok(RpcReply::Stream(watch_stream(self.workspace.watch_chats())))
             }

@@ -70,6 +70,11 @@ pub struct EdgeConfig {
     /// Fresh-bearer provider (the relay's `TokenSource`), consulted per
     /// connect/request. `None` from the provider = signed out.
     pub token: Arc<dyn komet_rpc::TokenSource>,
+    /// This engine's device id, carried on room dials (`&device=`) so the
+    /// edge can attribute sockets in logs. Debugging the 2026-08-04 deaf
+    /// socket meant reverse-engineering devices from rotating IPv6 privacy
+    /// addresses; never again. Empty = omitted (tests).
+    pub device_id: String,
 }
 
 impl std::fmt::Debug for EdgeConfig {
@@ -86,7 +91,14 @@ impl EdgeConfig {
         Self {
             url: url.into(),
             token,
+            device_id: String::new(),
         }
+    }
+
+    /// Attribute this engine's room sockets in edge logs.
+    pub fn with_device(mut self, device_id: impl Into<String>) -> Self {
+        self.device_id = device_id.into();
+        self
     }
 
     /// Fixed bearer — dev mode and tests, where tokens never expire.
@@ -107,6 +119,7 @@ impl EdgeConfig {
         Arc::new(EdgeRoomUrl {
             base: format!("{}{}", ws_base.trim_end_matches('/'), path.into()),
             token: self.token.clone(),
+            device_id: self.device_id.clone(),
         })
     }
 }
@@ -114,17 +127,23 @@ impl EdgeConfig {
 struct EdgeRoomUrl {
     base: String,
     token: Arc<dyn komet_rpc::TokenSource>,
+    device_id: String,
 }
 
 impl komet_sync::UrlProvider for EdgeRoomUrl {
     fn url(&self) -> futures::future::BoxFuture<'static, Result<String, komet_sync::SyncError>> {
         let token = self.token.clone();
         let base = self.base.clone();
+        let device = self.device_id.clone();
         Box::pin(async move {
             let token = token.token().await.ok_or_else(|| {
                 komet_sync::SyncError::Auth("no access token (signed out)".into())
             })?;
-            Ok(format!("{base}?token={token}"))
+            let mut url = format!("{base}?token={token}");
+            if !device.is_empty() {
+                url.push_str(&format!("&device={device}"));
+            }
+            Ok(url)
         })
     }
 }
@@ -535,6 +554,24 @@ impl DocHost {
                 room.probe();
             }
         }
+    }
+
+    /// Per-open-chat room introspection for SyncStatus / `komet sync`.
+    /// `None` room = still dialing (join retry loop) or edge-less.
+    pub fn sync_statuses(&self) -> Vec<(String, Option<komet_sync::RoomStatsSnapshot>)> {
+        let handles: Vec<Arc<ChatDocHandle>> =
+            lock(&self.inner.handles).values().cloned().collect();
+        let mut rows: Vec<(String, Option<komet_sync::RoomStatsSnapshot>)> = handles
+            .iter()
+            .map(|h| {
+                (
+                    h.chat_id.clone(),
+                    lock(&h.room).as_ref().map(RoomClient::stats),
+                )
+            })
+            .collect();
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        rows
     }
 
     /// Drop a chat's doc unconditionally and delete its local snapshot — the

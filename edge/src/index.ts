@@ -71,6 +71,15 @@ const requestInit = (request: Request): RequestInit => ({
   body: request.body
 });
 
+/** Carry the dialing engine's `&device=` through to the DO (socket
+ * attribution in logs — the 2026-08-04 deaf socket was only identifiable by
+ * reverse-engineering rotating IPv6 privacy addresses). Validated so a
+ * hand-crafted value can't inject into log lines or the DO's query. */
+const deviceParam = (url: URL): string => {
+  const device = url.searchParams.get("device") ?? "";
+  return ID_RE.test(device) ? `&device=${device}` : "";
+};
+
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
@@ -138,7 +147,7 @@ export default {
         request,
         auth.userId,
         "/ws",
-        `?chatId=${parts[1]}`
+        `?chatId=${parts[1]}${deviceParam(url)}`
       );
     }
     if (parts[0] === "tail" && parts[1] && ID_RE.test(parts[1]) && request.method === "GET") {
@@ -180,7 +189,7 @@ export default {
           request,
           auth.userId,
           "/ws",
-          `?chatId=${encodeURIComponent(room)}`,
+          `?chatId=${encodeURIComponent(room)}${deviceParam(url)}`,
           "workspace"
         );
       }

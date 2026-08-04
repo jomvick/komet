@@ -41,6 +41,11 @@ pub mod methods {
     /// app foregrounded). No params; IPC-only. Each room ignores the hint
     /// unless it has been broadcast-quiet ≥30s, so this is cheap to spam.
     pub const PROBE_SYNC: &str = "ProbeSync";
+    /// Live sync introspection (`komet sync` / debug surfaces): per-room
+    /// connection state, last pushed-frame/ack ages, rejoin/probe/resync
+    /// counters for the workspace room and every open chat doc. No params;
+    /// IPC-only.
+    pub const SYNC_STATUS: &str = "SyncStatus";
     pub const WATCH_CHATS: &str = "WatchChats";
     pub const WATCH_DEVICES: &str = "WatchDevices";
     pub const WATCH_SESSIONS: &str = "WatchSessions";

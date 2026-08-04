@@ -70,6 +70,28 @@ pub(crate) const JOIN_RETRY_CAP: std::time::Duration = std::time::Duration::from
 /// ("Working" indicators, finished sessions). One room per engine, so the
 /// fixed cadence costs ~100 DO wakes/day total, not per chat.
 const WORKSPACE_PROBE_MAX: std::time::Duration = std::time::Duration::from_secs(900);
+/// Deaf-socket escalation: live peer presence dark this long after the
+/// tripwire probe → redial on a fresh socket (see `check_presence_deafness`).
+const PRESENCE_DEAF_REDIAL_MS: i64 = 60_000;
+
+/// State for the presence deafness tripwire. Presence heartbeats ride the
+/// SAME socket and the same DO broadcast fan-out as doc updates, so "peers I
+/// was seeing live via this room all went dark at once" is a *delivery*
+/// signal, and it is bounded (~45-60s) at zero server cost — every device
+/// already heartbeats each 15s. The monotonic seen-cache and the relay
+/// status probe deliberately keep devices *fresh-looking* through other
+/// paths; they must never feed this tripwire (they'd mask exactly the
+/// failure it exists to catch — 2026-08-04 deaf-socket incident).
+#[derive(Default)]
+struct PresenceWatch {
+    /// Armed once at least one OTHER device has been seen live via the
+    /// room's ephemeral store this session.
+    armed: bool,
+    /// Epoch ms when live peers first all went dark (0 = not dark).
+    dark_since_ms: i64,
+    /// The cheap first response (same-socket rejoin) already fired.
+    probed: bool,
+}
 
 /// Cheap decorrelation jitter (0–500ms) without pulling in a rng — derived from
 /// the sub-nanosecond wall clock. Mirrors the device relay's `jitter()`.
@@ -116,6 +138,8 @@ struct WorkspaceHostInner {
     /// wired to `LinkCache::reset_cooldown` so a peer that comes back is dialed
     /// immediately instead of waiting out the failure backoff.
     peer_alive: Mutex<Option<PeerAliveHook>>,
+    /// Deaf-socket tripwire state — see `check_presence_deafness`.
+    presence_watch: Mutex<PresenceWatch>,
     /// Doc subscription (drop = unsubscribe) — bumps the change watch on every commit.
     _sub: loro::Subscription,
 }
@@ -198,6 +222,7 @@ impl WorkspaceHost {
                 room: Mutex::new(None),
                 presence_seen: Mutex::new(std::collections::HashMap::new()),
                 peer_alive: Mutex::new(None),
+                presence_watch: Mutex::new(PresenceWatch::default()),
                 _sub: sub,
             }),
         };
@@ -314,6 +339,12 @@ impl WorkspaceHost {
         if let Some(room) = lock(&self.inner.room).as_ref() {
             room.probe();
         }
+    }
+
+    /// Workspace room introspection for SyncStatus / `komet sync`.
+    /// `None` = no room yet (edge-less, or the initial join is still retrying).
+    pub fn sync_status(&self) -> Option<komet_sync::RoomStatsSnapshot> {
+        lock(&self.inner.room).as_ref().map(RoomClient::stats)
     }
 
     // ── watches (WatchChats / WatchDevices / merged WatchSessions) ──────────
@@ -768,6 +799,7 @@ impl WorkspaceHostInner {
             let room = lock(&self.room);
             let mut seen = lock(&self.presence_seen);
             let now = now_ms();
+            let mut live_fresh_peers = 0usize;
             for device in devices.iter_mut() {
                 // Freshest of the live ephemeral entry and the cache: the
                 // store's 30s TTL (and its empty state right after a room
@@ -780,6 +812,11 @@ impl WorkspaceHostInner {
                         _ => None,
                     }
                 });
+                if device.id != self.config.device_id
+                    && live.is_some_and(|ms| now.saturating_sub(ms) < PRESENCE_FRESH_MS)
+                {
+                    live_fresh_peers += 1;
+                }
                 let cached = seen.get(&device.id).copied();
                 let Some(ms) = live.into_iter().chain(cached).max() else {
                     continue;
@@ -794,6 +831,9 @@ impl WorkspaceHostInner {
                 {
                     alive_peers.push(device.id.clone());
                 }
+            }
+            if let Some(room) = room.as_ref() {
+                self.check_presence_deafness(room, live_fresh_peers, now);
             }
         }
         if alive_peers.is_empty() {
@@ -817,6 +857,46 @@ impl WorkspaceHostInner {
             Err(err) => {
                 tracing::warn!(error = %err, "workspace snapshot export failed");
             }
+        }
+    }
+
+    /// The deaf-socket tripwire (see [`PresenceWatch`]). LIVE ephemeral
+    /// freshness only — never the seen-cache or relay probe. Escalation
+    /// ladder: first all-dark observation → same-socket rejoin probe (free
+    /// on a healthy room — the actor gates it on ≥30s pushed-quiet); still
+    /// dark [`PRESENCE_DEAF_REDIAL_MS`] later → fresh-socket redial (the
+    /// only cure when the server→client path drops even join answers).
+    /// Disarms after the redial and re-arms when a peer is next seen live,
+    /// so a genuinely-offline fleet costs one probe + one redial, ever.
+    fn check_presence_deafness(&self, room: &RoomClient, live_fresh_peers: usize, now: i64) {
+        let mut watch = lock(&self.presence_watch);
+        if live_fresh_peers > 0 {
+            watch.armed = true;
+            watch.dark_since_ms = 0;
+            watch.probed = false;
+            return;
+        }
+        if !watch.armed {
+            return;
+        }
+        if watch.dark_since_ms == 0 {
+            watch.dark_since_ms = now;
+        }
+        if !watch.probed {
+            tracing::info!(
+                "all live peer presence went dark; probing workspace room (deaf-socket tripwire)"
+            );
+            room.probe();
+            watch.probed = true;
+        } else if now.saturating_sub(watch.dark_since_ms) > PRESENCE_DEAF_REDIAL_MS {
+            tracing::warn!(
+                dark_ms = now.saturating_sub(watch.dark_since_ms),
+                "peer presence still dark after probe; requesting workspace room redial"
+            );
+            room.redial();
+            watch.armed = false;
+            watch.dark_since_ms = 0;
+            watch.probed = false;
         }
     }
 

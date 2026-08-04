@@ -398,7 +398,10 @@ impl Engine {
     ) -> anyhow::Result<EngineRuntime> {
         let online = (auth.workos_enabled() || config.edge_token.is_some())
             && auth.access_token().await.is_some();
-        let edge = online.then(|| EdgeConfig::new(config.edge_url.clone(), Arc::new(auth.clone())));
+        let device_id = load_or_create_device_id(&config.data_dir)?;
+        let edge = online.then(|| {
+            EdgeConfig::new(config.edge_url.clone(), Arc::new(auth.clone())).with_device(device_id)
+        });
 
         let dev_token_org = config
             .edge_token

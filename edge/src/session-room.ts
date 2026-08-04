@@ -67,6 +67,9 @@ interface SocketState {
   /** True for sockets on a workspace-doc room — org membership was enforced
    * by the Worker, so the per-chat ownership discipline does not apply. */
   workspace?: boolean;
+  /** Dialing engine's device id (from `&device=`, Worker-validated) — pure
+   * log attribution; never used for authz. */
+  deviceId?: string;
 }
 
 interface FragmentBatch {
@@ -143,10 +146,22 @@ export class SessionRoom implements DurableObject {
     if (url.pathname === "/ws") {
       const chatId = url.searchParams.get("chatId") ?? "";
       if (chatId && !this.getMeta("chatId")) this.setMeta("chatId", chatId);
+      const deviceId = url.searchParams.get("device") ?? undefined;
       const pair = new WebSocketPair();
       this.ctx.acceptWebSocket(pair[1]);
-      const state: SocketState = { userId, rooms: [], ...(workspace ? { workspace } : {}) };
+      const state: SocketState = {
+        userId,
+        rooms: [],
+        ...(workspace ? { workspace } : {}),
+        ...(deviceId ? { deviceId } : {})
+      };
       pair[1].serializeAttachment(state);
+      console.log(
+        "socket accepted",
+        `room=${this.getMeta("chatId") ?? "?"}`,
+        `device=${deviceId ?? "unattributed"}`,
+        `sockets=${this.ctx.getWebSockets().length}`
+      );
       return new Response(null, { status: 101, webSocket: pair[0] });
     }
 
@@ -317,13 +332,25 @@ export class SessionRoom implements DurableObject {
   }
 
   async webSocketClose(ws: WebSocket): Promise<void> {
+    this.logSocketEnd(ws, "closed");
     this.fragments.delete(ws);
     await this.flush();
   }
 
   async webSocketError(ws: WebSocket): Promise<void> {
+    this.logSocketEnd(ws, "errored");
     this.fragments.delete(ws);
     await this.flush();
+  }
+
+  private logSocketEnd(ws: WebSocket, how: string): void {
+    const state = ws.deserializeAttachment() as SocketState | null;
+    console.log(
+      `socket ${how}`,
+      `room=${this.getMeta("chatId") ?? "?"}`,
+      `device=${state?.deviceId ?? "unattributed"}`,
+      `sockets=${Math.max(0, this.ctx.getWebSockets().length - 1)}`
+    );
   }
 
   private async handleJoin(ws: WebSocket, state: SocketState, message: JoinRequest): Promise<void> {
@@ -403,6 +430,15 @@ export class SessionRoom implements DurableObject {
       return;
     }
     if (!state.rooms.includes(message.crdt)) {
+      // A write from a socket that never (re)joined: PermissionDenied makes
+      // the client rejoin, but the condition itself is the `rooms: []`
+      // broadcast-exclusion state — log who hit it.
+      console.warn(
+        "update from non-member socket",
+        `room=${this.getMeta("chatId") ?? "?"}`,
+        `device=${state.deviceId ?? "unattributed"}`,
+        `crdt=${message.crdt}`
+      );
       this.ack(ws, message, UpdateStatusCode.PermissionDenied);
       return;
     }
@@ -817,7 +853,12 @@ export class SessionRoom implements DurableObject {
         // broadcast until an app restart (2026-08-04 incident). Close it so
         // the client's session ends and its redial + VV backfill heal the
         // gap within seconds.
-        console.warn("broadcast send failed; closing socket", this.getMeta("chatId") ?? "?", String(e));
+        console.warn(
+          "broadcast send failed; closing socket",
+          `room=${this.getMeta("chatId") ?? "?"}`,
+          `device=${state.deviceId ?? "unattributed"}`,
+          String(e)
+        );
         try {
           ws.close(1011, "broadcast delivery failed");
         } catch {
