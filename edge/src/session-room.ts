@@ -87,6 +87,22 @@ const DOC_IDLE_RELEASE_MS = 60_000;
  * recorded today) would have kept re-materializing their full history into
  * the pressed wasm heap for three more days of thrash. */
 const TRIM_FORCE_BYTES = 512 * 1024;
+/** A wasm-bindgen wrapper whose `free()` already ran has `__wbg_ptr === 0`;
+ * any method call on it throws `Error("null pointer passed to rust")`. Several
+ * flows (trim, fold, alarm, idle release) free-and-replace the cached doc
+ * around `await`s, so a stale wrapper can outlive its wasm memory. 2026-08-04
+ * evening: one such interleaving left `this.doc` dangling in a live instance —
+ * every join/update/tail on the ws3 workspace room threw for 2.5h fleet-wide,
+ * and nothing recycled the instance because the error is neither a RangeError
+ * nor a RuntimeError (the wasm-poison tripwire ignored it). Check liveness
+ * before every reuse; rematerialization is a ~tens-of-ms cold replay. */
+const isLive = (obj: unknown): boolean =>
+  (obj as { __wbg_ptr?: number } | undefined)?.__wbg_ptr !== 0;
+/** The use-after-free / detached-buffer signatures of a dangling wasm wrapper
+ * — same terminal shape as heap poisoning (nothing in-instance recovers it),
+ * so the tripwire must count these too. */
+const isWasmUseAfterFree = (e: unknown): boolean =>
+  e instanceof Error && /null pointer passed to rust|detached ArrayBuffer/i.test(e.message);
 
 interface SocketState {
   userId: string;
@@ -419,7 +435,9 @@ export class SessionRoom implements DurableObject {
    * within seconds instead of hot-looping against a deaf room until
    * Cloudflare's memory-limit reset finally fires. */
   private escalateWasmPoisoning(e: unknown): void {
-    if (!(e instanceof RangeError || e instanceof WebAssembly.RuntimeError)) return;
+    if (!(e instanceof RangeError || e instanceof WebAssembly.RuntimeError || isWasmUseAfterFree(e))) {
+      return;
+    }
     wasmPoisonStrikes++;
     if (wasmPoisonStrikes < WASM_POISON_ABORT_AFTER) return;
     console.error(`wasm heap poisoned (${wasmPoisonStrikes} strikes); aborting isolate for a fresh heap`);
@@ -671,7 +689,17 @@ export class SessionRoom implements DurableObject {
 
   private async ensureDoc(): Promise<LoroDoc> {
     this.touchDoc();
-    if (this.doc) return this.doc;
+    if (this.doc) {
+      if (isLive(this.doc)) return this.doc;
+      // Dangling wrapper (freed by a concurrent trim/release while another
+      // flow still held the instance): drop it and rematerialize instead of
+      // handing every caller a guaranteed throw (the 2026-08-04 ws3 wedge).
+      console.error(
+        "cached doc was freed (dangling wrapper); rematerializing",
+        `room=${this.getMeta("chatId") ?? "?"}`
+      );
+      this.doc = undefined;
+    }
     // AUTOMATED WEDGE BREAK: a cold replay that exceeds the DO CPU limit kills
     // the invocation before `replayAttempts` is cleared below — and every
     // reconnecting client cold-starts the room into the same death, forever
@@ -879,7 +907,11 @@ export class SessionRoom implements DurableObject {
   private async foldLog(): Promise<void> {
     const doc = await this.ensureDoc();
     if (await this.trimHistoryIfDue(doc, Date.now())) return;
-    this.blobs.put("snapshot", doc.export({ mode: "snapshot" }));
+    // Re-resolve after the await above: a concurrent trim may have replaced
+    // and FREED the wrapper captured in `doc` (guarded ensureDoc returns the
+    // live cached doc, or cheaply rematerializes).
+    const live = await this.ensureDoc();
+    this.blobs.put("snapshot", live.export({ mode: "snapshot" }));
     this.ctx.storage.sql.exec("DELETE FROM updates");
     this.setMeta("updateBytes", "0");
   }
@@ -933,11 +965,16 @@ export class SessionRoom implements DurableObject {
       await this.ctx.storage.sync();
       const fresh = new LoroDoc();
       fresh.import(shallow);
+      const old = this.doc;
       this.doc = fresh;
-      // Free the replaced full-history doc NOW — waiting on GC finalizers
-      // leaks it into the shared wasm heap exactly when trimming was
-      // supposed to relieve it (see handleJoin).
-      if (doc !== fresh) doc.free();
+      // Free the replaced cached doc AND the caller's (possibly distinct,
+      // stale) doc exactly once each — waiting on GC finalizers leaks them
+      // into the shared wasm heap exactly when trimming was supposed to
+      // relieve it (see handleJoin). The isLive guards keep a concurrent
+      // interleaved trim from double-freeing what a sibling already returned
+      // to the allocator.
+      if (old && old !== fresh && isLive(old)) old.free();
+      if (doc !== fresh && doc !== old && isLive(doc)) doc.free();
       return true;
     } catch {
       return false;
@@ -976,7 +1013,9 @@ export class SessionRoom implements DurableObject {
     // stays set and the alarm chain keeps trying.
     const chatId = this.getMeta("chatId");
     if (chatId && this.getMeta("postReset") !== "1") {
-      const current = this.doc ?? doc;
+      // Guarded re-resolve, not `this.doc ?? doc`: the trim above may have
+      // freed either reference, and `doc` was captured before several awaits.
+      const current = await this.ensureDoc();
       const prevVV = this.getMeta("backupVV");
       let advances = true;
       if (prevVV) {
@@ -997,14 +1036,18 @@ export class SessionRoom implements DurableObject {
         }
       }
       if (advances) {
+        // Read everything off the doc BEFORE the R2 await — a concurrent
+        // trim/release during the put can free `current` under us.
         const snapshot = current.export({ mode: "snapshot" });
-        await this.env.BLOBS.put(`backup/${chatId}/latest.loro`, snapshot);
         const vv = current.version();
+        let vvB64: string;
         try {
-          this.setMeta("backupVV", btoa(String.fromCharCode(...vv.encode())));
+          vvB64 = btoa(String.fromCharCode(...vv.encode()));
         } finally {
           vv.free();
         }
+        await this.env.BLOBS.put(`backup/${chatId}/latest.loro`, snapshot);
+        this.setMeta("backupVV", vvB64);
         this.setMeta("backupDirty", "0");
       }
     }
