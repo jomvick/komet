@@ -206,6 +206,33 @@ pub fn anchored_menu(id: impl Into<ElementId>, content: AnyElement) -> AnyElemen
     )
 }
 
+/// [`anchored_menu`] opening DOWNWARD from the trigger's bottom edge — a
+/// dropdown proper (the sidebar's space filter). The default variant pins to
+/// the trigger's top-left, which reads fine for context-style menus but
+/// covers a button-shaped trigger.
+pub fn anchored_menu_below(id: impl Into<ElementId>, content: AnyElement) -> AnyElement {
+    let content = crate::frost::frosted(12.0, 16.0, content).into_any_element();
+    div()
+        .absolute()
+        .bottom_0()
+        .left_0()
+        .size_0()
+        .child(
+            gpui::deferred(
+                gpui::anchored()
+                    .anchor(Anchor::TopLeft)
+                    .snap_to_window_with_margin(px(8.0))
+                    .child(motion::menu_in(
+                        id,
+                        div().occlude().pt(px(6.0)).child(content),
+                    )),
+            )
+            .priority(1)
+            .into_any_element(),
+        )
+        .into_any_element()
+}
+
 /// [`anchored_menu`] opening UPWARD from the trigger (composer pickers, the
 /// user menu — anything anchored near the window bottom; Radix flips these
 /// automatically, gpui's `anchored` needs the side picked).

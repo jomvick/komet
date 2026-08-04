@@ -322,7 +322,7 @@ impl Shell {
             let menu = self.render_spaces_menu(theme, cx);
             trigger
                 .relative()
-                .child(popover::anchored_menu("spaces-filter-menu", menu))
+                .child(popover::anchored_menu_below("spaces-filter-menu", menu))
         } else {
             trigger
         };
