@@ -591,6 +591,20 @@ impl AppState {
         }
     }
 
+    /// The "@ device" tag for a space (" · offline" appended when the host's
+    /// heartbeat is stale) — shared by the space pickers' rows, the sidebar
+    /// filter trigger, and the composer's space chip. Returns `(tag, offline)`.
+    pub fn space_device_tag(&self, space: &Space, now: DateTime<Utc>) -> (String, bool) {
+        let offline = !self.device_online(&space.device_id, now);
+        let device = self.device_name(&space.device_id).unwrap_or("Unknown device");
+        let tag = if offline {
+            format!("@ {device} · offline")
+        } else {
+            format!("@ {device}")
+        };
+        (tag, offline)
+    }
+
     /// Does the selected space's folder have git? Drives the branch picker and
     /// the diff sidebar (owner-stamped, synced — no RPC).
     pub fn selected_space_git(&self) -> bool {

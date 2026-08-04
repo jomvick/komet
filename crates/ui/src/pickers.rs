@@ -1490,7 +1490,7 @@ impl Pickers {
         label: SharedString,
         set: bool,
         chip_icon: Option<(&'static str, Option<gpui::Hsla>)>,
-        suffix: Option<SharedString>,
+        suffix: Option<(SharedString, Option<gpui::Hsla>)>,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
@@ -1545,13 +1545,14 @@ impl Pickers {
                 )
             })
             .child(div().min_w_0().truncate().child(label))
-            // The effort half of the combined model+effort chip: muted, no
-            // icon (user request) — one button, two tones.
-            .when_some(suffix, |el, suffix| {
+            // The effort half of the combined model+effort chip (and the space
+            // chip's "@ device" tag): muted, no icon — one button, two tones.
+            // `tint` overrides the muted tone (the offline warning).
+            .when_some(suffix, |el, (suffix, tint)| {
                 el.child(
                     div()
                         .flex_none()
-                        .text_color(theme.text_muted.opacity(0.7))
+                        .text_color(tint.unwrap_or(theme.text_muted.opacity(0.7)))
                         .child(suffix),
                 )
             })
@@ -2664,12 +2665,19 @@ impl Render for Pickers {
         // attach + send after this element (komet composer-actions.tsx
         // arrangement).
         let new_chat = self.state.read(cx).selected_chat.is_none();
-        let space_label: Option<SharedString> = new_chat
+        // Name + "@ device" tag (the space pickers' row format), so the chip
+        // says which host the session mints on without opening the picker.
+        let space_label: Option<(SharedString, SharedString, bool)> = new_chat
             .then(|| {
-                self.state
-                    .read(cx)
-                    .selected_space_row()
-                    .map(|s| SharedString::from(s.display_name().to_string()))
+                let state = self.state.read(cx);
+                state.selected_space_row().map(|s| {
+                    let (tag, offline) = state.space_device_tag(s, chrono::Utc::now());
+                    (
+                        SharedString::from(s.display_name().to_string()),
+                        SharedString::from(tag),
+                        offline,
+                    )
+                })
             })
             .flatten();
         let mut left = div()
@@ -2678,13 +2686,13 @@ impl Render for Pickers {
             .items_center()
             .min_w_0()
             .gap(px(4.0));
-        if let Some(label) = space_label {
+        if let Some((label, tag, offline)) = space_label {
             let space_chip = self.trigger_chip(
                 PickerKind::Space,
                 label,
                 true,
                 Some((crate::icons::FOLDER, None)),
-                None,
+                Some((tag, offline.then(|| theme.warning.opacity(0.8)))),
                 &theme,
                 cx,
             );
@@ -2704,7 +2712,7 @@ impl Render for Pickers {
             model_label,
             true,
             Some(harness_icon),
-            Some(traits_label),
+            Some((traits_label, None)),
             &theme,
             cx,
         );

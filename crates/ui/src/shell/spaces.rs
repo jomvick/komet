@@ -271,12 +271,20 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let filter = self.settings.space_filter.clone();
-        let label: SharedString = match filter
-            .as_deref()
-            .and_then(|id| self.state.read(cx).space_row(id))
-        {
-            Some(space) => space.display_name().to_string().into(),
-            None => SharedString::from("All spaces"),
+        // Name + the dropdown rows' "@ device" tag on the trigger itself, so
+        // the filtered space's host reads without opening the picker.
+        let (label, device_tag): (SharedString, Option<(SharedString, bool)>) = {
+            let state = self.state.read(cx);
+            match filter.as_deref().and_then(|id| state.space_row(id)) {
+                Some(space) => {
+                    let (tag, offline) = state.space_device_tag(space, Utc::now());
+                    (
+                        space.display_name().to_string().into(),
+                        Some((tag.into(), offline)),
+                    )
+                }
+                None => (SharedString::from("All spaces"), None),
+            }
         };
         let open = self.spaces_menu.is_open();
 
@@ -331,8 +339,32 @@ impl Shell {
                     .text_color(theme.text_muted),
             )
             // flex_1 pushes the caret to the trigger's right edge and gives
-            // long space names a bound to truncate against.
-            .child(div().flex_1().min_w_0().truncate().child(label))
+            // long space names a bound to truncate against; the "@ device"
+            // tag hugs the name inside it rather than sitting by the caret.
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(div().min_w_0().truncate().child(label))
+                    .when_some(device_tag, |el, (tag, offline)| {
+                        el.child(
+                            div()
+                                .flex_none()
+                                .text_size(px(10.0))
+                                .font_weight(gpui::FontWeight::NORMAL)
+                                .text_color(if offline {
+                                    theme.warning.opacity(0.8)
+                                } else {
+                                    theme.text_muted.opacity(0.45)
+                                })
+                                .child(tag),
+                        )
+                    }),
+            )
             .child(
                 icon(icons::ALT_ARROW_DOWN)
                     .size(px(14.0))
@@ -417,15 +449,7 @@ impl Shell {
                     }
                     SpacesMenuRow::Space(id) => match state.space_row(id) {
                         Some(space) => {
-                            let offline = !state.device_online(&space.device_id, now);
-                            let device = state
-                                .device_name(&space.device_id)
-                                .unwrap_or("Unknown device");
-                            let tag = if offline {
-                                format!("@ {device} · offline")
-                            } else {
-                                format!("@ {device}")
-                            };
+                            let (tag, offline) = state.space_device_tag(space, now);
                             (
                                 row.clone(),
                                 space.display_name().to_string().into(),
