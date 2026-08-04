@@ -945,7 +945,25 @@ export class SessionRoom implements DurableObject {
       // heap with the same megabytes.
       // No aged checkpoint but the full history is already a heap hazard:
       // trim at the current frontier (see TRIM_FORCE_BYTES).
-      frontiers = doc.frontiers().map((f) => ({ peer: String(f.peer) as `${number}`, counter: f.counter }));
+      if ((this.getMeta("chatId") ?? "").startsWith("ws3/")) {
+        // WORKSPACE rooms: never force-trim at the LIVE frontier. Every
+        // device writes this doc concurrently, so a live-frontier shallow
+        // start orphans any peer whose next ops depend on history just
+        // discarded — their pushes InvalidUpdate forever and, worse, a
+        // post-wedge-break trim can shallow-lock the room before all
+        // engines finish re-uploading (2026-08-04: the 20:34Z force-trim
+        // froze on a partial rebuild; the whole fleet needed manual doc
+        // surgery to converge). Trim only at a checkpoint ≥1 day old —
+        // every recently-active device has passed it, and dropLog clears
+        // checkpoints, so a freshly reset room gets a full day of grace to
+        // re-form before any trim. Chat rooms (single-owner, the 2026-08-04
+        // whale imports) keep the immediate live-frontier trim.
+        const aged = checkpoints.filter((c) => now - c.at >= DAY_MS).pop();
+        if (!aged) return false;
+        frontiers = aged.frontiers.map((f) => ({ peer: f.peer as `${number}`, counter: f.counter }));
+      } else {
+        frontiers = doc.frontiers().map((f) => ({ peer: String(f.peer) as `${number}`, counter: f.counter }));
+      }
     } else {
       return false;
     }
