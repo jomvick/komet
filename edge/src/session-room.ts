@@ -87,6 +87,10 @@ const DOC_IDLE_RELEASE_MS = 60_000;
  * recorded today) would have kept re-materializing their full history into
  * the pressed wasm heap for three more days of thrash. */
 const TRIM_FORCE_BYTES = 512 * 1024;
+/** Import penalty box (see `importPenalty`): consecutive failed %LOR imports
+ * before a device's pushes are short-circuited, and for how long. */
+const IMPORT_PENALTY_STRIKES = 3;
+const IMPORT_PENALTY_MS = 10 * 60 * 1000;
 /** A wasm-bindgen wrapper whose `free()` already ran has `__wbg_ptr === 0`;
  * any method call on it throws `Error("null pointer passed to rust")`. Several
  * flows (trim, fold, alarm, idle release) free-and-replace the cached doc
@@ -141,6 +145,17 @@ export class SessionRoom implements DurableObject {
   /** In-memory fragment reassembly. Lost on hibernation → the sender gets a
    * FragmentTimeout ack for the unknown batch and resends — self-healing. */
   private readonly fragments = new Map<WebSocket, Map<string, FragmentBatch>>();
+  /** Per-device import penalty box. A peer whose %LOR pushes repeatedly fail
+   * to import (a stale peer behind a shallow trim, a device on a diverged
+   * timeline) redials and re-pushes its ENTIRE unacceptable diff forever —
+   * 2026-08-04 ~23:44Z: home-laptop's ~1MB doomed re-uploads, reassembled and
+   * import-attempted every retry cycle, pressed the shared wasm heap into
+   * RangeErrors and the poison tripwire recycled the isolate over and over,
+   * dropping every device's sockets. After IMPORT_PENALTY_STRIKES consecutive
+   * failures a device's pushes are rejected WITHOUT reassembly or import for
+   * IMPORT_PENALTY_MS — zero wasm cost, bounded retry, and the room stays up
+   * for everyone else. In-memory: an instance recycle grants a fresh 3 tries. */
+  private readonly importPenalty = new Map<string, { strikes: number; until: number }>();
   /** Idle-doc release bookkeeping (see DOC_IDLE_RELEASE_MS / touchDoc). */
   private docIdleTimer: ReturnType<typeof setTimeout> | undefined;
   private lastDocUse = 0;
@@ -576,24 +591,53 @@ export class SessionRoom implements DurableObject {
   }
 
   /** Shared apply path for whole and reassembled updates. */
+  /** True (and refreshed) when the device is in the import penalty box —
+   * callers must reject its %LOR payloads without reassembly or import. */
+  private importPenalized(deviceId: string | undefined, now: number): boolean {
+    if (!deviceId) return false;
+    const entry = this.importPenalty.get(deviceId);
+    return !!entry && entry.strikes >= IMPORT_PENALTY_STRIKES && entry.until > now;
+  }
+
   private async applyUpdates(
     ws: WebSocket,
-    _state: SocketState,
+    state: SocketState,
     crdt: CrdtType,
     roomId: string,
     batchId: `0x${string}`,
     updates: Uint8Array[]
   ): Promise<void> {
     if (crdt === CrdtType.Loro) {
+      const now = Date.now();
+      if (this.importPenalized(state.deviceId, now)) {
+        this.ack(ws, { crdt, roomId }, UpdateStatusCode.InvalidUpdate, batchId);
+        return;
+      }
       const doc = await this.ensureDoc();
       try {
         for (const update of updates) if (update.length > 0) doc.import(update);
       } catch {
         // Includes imports concurrent to a shallow-snapshot start (§3.1 stale
         // peer) — the client resyncs fresh and re-submits at the app layer.
+        // Strike the device: past IMPORT_PENALTY_STRIKES its pushes are
+        // rejected without import for IMPORT_PENALTY_MS (see importPenalty).
+        if (state.deviceId) {
+          const entry = this.importPenalty.get(state.deviceId) ?? { strikes: 0, until: 0 };
+          entry.strikes++;
+          entry.until = now + IMPORT_PENALTY_MS;
+          this.importPenalty.set(state.deviceId, entry);
+          if (entry.strikes === IMPORT_PENALTY_STRIKES) {
+            console.warn(
+              "device entered import penalty box",
+              `room=${this.getMeta("chatId") ?? "?"}`,
+              `device=${state.deviceId}`
+            );
+          }
+        }
         this.ack(ws, { crdt, roomId }, UpdateStatusCode.InvalidUpdate, batchId);
         return;
       }
+      if (state.deviceId) this.importPenalty.delete(state.deviceId);
       this.recordLoroUpdates(updates);
       this.ack(ws, { crdt, roomId }, UpdateStatusCode.Ok, batchId);
       this.relay(ws, crdt, roomId, updates);
@@ -647,6 +691,13 @@ export class SessionRoom implements DurableObject {
       this.ack(ws, message, UpdateStatusCode.PermissionDenied, message.batchId);
       return;
     }
+    // Penalized devices get rejected at the HEADER — before any reassembly
+    // buffers exist. Their doomed multi-megabyte re-uploads are what pressed
+    // the wasm heap into the 2026-08-04 abort loop.
+    if (message.crdt === CrdtType.Loro && this.importPenalized(state.deviceId, Date.now())) {
+      this.ack(ws, message, UpdateStatusCode.InvalidUpdate, message.batchId);
+      return;
+    }
     let batches = this.fragments.get(ws);
     if (!batches) {
       batches = new Map();
@@ -667,6 +718,12 @@ export class SessionRoom implements DurableObject {
   ): Promise<void> {
     const batch = this.fragments.get(ws)?.get(message.batchId);
     if (!batch) {
+      if (message.crdt === CrdtType.Loro && this.importPenalized(state.deviceId, Date.now())) {
+        // Fragments of a batch whose header we rejected (penalty box): drop
+        // silently — a FragmentTimeout here would just solicit a resend of
+        // the same doomed megabytes.
+        return;
+      }
       // Unknown batch (e.g. header lost to hibernation) — tell the sender to
       // retry the whole batch.
       this.ack(ws, message, UpdateStatusCode.FragmentTimeout, message.batchId);
