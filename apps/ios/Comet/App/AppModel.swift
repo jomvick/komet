@@ -423,6 +423,15 @@ final class AppModel {
         sessionStores.values.forEach { $0.flushToDisk() }
     }
 
+    /// Foreground hook: kick every room NOW (see RoomClient.kick) — after a
+    /// suspension the workspace room in particular stayed dead while chat
+    /// views reconnected on open, freezing sidebar rows and Working
+    /// indicators against perfectly live transcripts (2026-08-04).
+    func foregrounded() {
+        workspace?.kickRoom()
+        sessionStores.values.forEach { $0.kickRoom() }
+    }
+
     /// Diagnostics access (live e2e probe).
     var diagnosticsConfig: AppConfig? { config }
 

@@ -22,6 +22,13 @@ struct KometApp: App {
                 .onChange(of: scenePhase) { _, phase in
                     if phase == .background {
                         model.flushDocs()
+                    } else if phase == .active {
+                        // Suspension kills sockets without running any
+                        // failure path — without this kick the workspace
+                        // room stays dead after foregrounding while chat
+                        // views reconnect on open (frozen sidebar/Working
+                        // indicators against live transcripts, 2026-08-04).
+                        model.foregrounded()
                     }
                 }
         }

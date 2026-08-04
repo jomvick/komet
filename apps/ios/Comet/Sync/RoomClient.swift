@@ -111,6 +111,32 @@ actor RoomClient {
         joinedLor = false
     }
 
+    /// Foreground hook (the iOS twin of the desktop's probe-on-focus,
+    /// shell.rs): suspension kills the socket without running ANY of our
+    /// failure paths — the reconnect task is frozen mid-sleep and can wait
+    /// out a full backoff (or never resume at all) after the app returns.
+    /// Observed 2026-08-04: chat views reconnected on open while the
+    /// workspace room stayed dead for the whole session — sidebar rows and
+    /// Working indicators frozen despite live transcripts. A dead or
+    /// unjoined room redials NOW on fresh backoff; a joined one gets an
+    /// immediate liveness probe (post-suspend sockets are half-open more
+    /// often than not).
+    func kick() async {
+        guard !closed else { return }
+        backoffMs = RoomClient.backoffBaseMs
+        if socket == nil || !joinedLor {
+            connect()
+            return
+        }
+        guard joinSentAt == nil else { return } // answer already policed
+        joinSentAt = .now()
+        joinIsProbe = true
+        lastProbeAt = .now()
+        probeIntervalNs = RoomClient.roomProbeAfterNs
+        await send(.joinRequest(crdt: .loro, roomId: roomId, auth: [],
+                                version: localVersionBytes()))
+    }
+
     private func connect() {
         guard !closed else { return }
         generation += 1
