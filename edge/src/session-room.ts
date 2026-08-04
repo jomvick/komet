@@ -878,9 +878,14 @@ export class SessionRoom implements DurableObject {
     const checkpoints = JSON.parse(this.getMeta("checkpoints") ?? "[]") as FrontierCheckpoint[];
     const cutoff = checkpoints.filter((c) => now - c.at >= RETAIN_MS).pop();
     let frontiers: { peer: `${number}`; counter: number }[];
-    if (cutoff && !(doc.isShallow() && this.getMeta("lastTrimAt") === String(cutoff.at))) {
+    // lastTrimAt alone gates the cutoff trim: the trim is durable (sync()
+    // below), and requiring doc.isShallow() re-fired it on EVERY cold start
+    // once a log fold re-exported the once-shallow doc as a regular
+    // snapshot (isShallow reads false after rematerializing from it) —
+    // observed as the same rooms "trimming" every few minutes all evening.
+    if (cutoff && this.getMeta("lastTrimAt") !== String(cutoff.at)) {
       frontiers = cutoff.frontiers.map((f) => ({ peer: f.peer as `${number}`, counter: f.counter }));
-    } else if (!doc.isShallow() && (this.blobs.get("snapshot")?.length ?? 0) > TRIM_FORCE_BYTES) {
+    } else if ((this.blobs.get("snapshot")?.length ?? 0) > TRIM_FORCE_BYTES) {
       // No aged checkpoint but the full history is already a heap hazard:
       // trim at the current frontier (see TRIM_FORCE_BYTES).
       frontiers = doc.frontiers().map((f) => ({ peer: String(f.peer) as `${number}`, counter: f.counter }));
