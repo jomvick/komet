@@ -680,7 +680,24 @@ export class SessionRoom implements DurableObject {
     // Recovery is by design lossless-enough: every engine holds the full doc
     // locally and re-uploads whatever the server lacks on its next join.
     const attempts = Number(this.getMeta("replayAttempts") ?? "0");
-    if (attempts >= REPLAY_CRASH_LIMIT) this.dropLog();
+    if (attempts >= REPLAY_CRASH_LIMIT) {
+      this.dropLog();
+      // Boot every attached socket, exactly like POST /reset-log. The
+      // automated wedge break used to swap the doc out from UNDER live
+      // sessions: their next writes carried deps the emptied doc lacks,
+      // imports failed, clients burned their capped invalid-rejoin resyncs
+      // and then sat LATCHED — rows frozen on a healthy-looking socket
+      // (2026-08-04: work-metal's workspace status never updated again
+      // after the 20:16Z wedge-break while its chat rooms streamed fine).
+      // A close → redial → empty-VV join re-uploads full state instead.
+      for (const sock of this.ctx.getWebSockets()) {
+        try {
+          sock.close(4410, "room reset");
+        } catch {
+          /* already gone */
+        }
+      }
+    }
     this.setMeta("replayAttempts", String(attempts + 1));
     // INCIDENT (2026-07-30): a CPU-limit kill ROLLS BACK the event's
     // uncommitted storage writes — so the increment above died with every
