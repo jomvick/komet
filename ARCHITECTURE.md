@@ -45,34 +45,6 @@ Single binary `komet`:
 - `komet headless` — engine only; prints sign-in URL on TTY (paste-code flow), serves IPC on
   localhost + hosts its DeviceRoom for remote control. A VPS runs this; a laptop's UI drives it.
 
-### Terminal viewport (`komet-tui`, `crates/tui` + `apps/tui`)
-A second frontend, a peer of the gpui app rather than a subset of it: same typed RPC, same
-derived view logic (`komet_proto::view` — sort orders, staleness gating, sidebar grouping, the
-boot gate — shared so row order can never diverge per surface), separate binary with **no gpui
-dependency** (12MB vs 60MB, seconds to build).
-
-One deliberate difference: **the TUI never embeds an engine.** The headed app may, because a
-desktop window and the work it drives have the same lifetime; a terminal does not — it closes,
-the SSH session drops, the lid shuts. So `komet-tui` probes the IPC port and attaches to whatever
-answers — a headless daemon or a running desktop app, which serves the port from its embedded
-engine for exactly this reason. Finding nothing, it starts `komet headless` in its own session
-(`setsid`, stdio to the daemon log) and attaches to that. Consequences, which are the point:
-- quitting the viewport is **detaching** — runs continue, docs keep syncing, the DeviceRoom
-  stays joined, and reattaching is instant because nothing was rebuilt;
-- SIGHUP from a closing terminal reaches the viewport and not the engine, because the engine has
-  no controlling terminal to lose;
-- the engine's own instance lock (`instance_lock.rs`) — not the port probe — is what guarantees
-  a single daemon, so a lost race costs the loser a clean exit, never a corrupt store.
-
-Performance shape (the reason the transcript is structured the way it is): the event loop has no
-tick, waking only for input, an engine frame, or a deadline it armed deliberately, and coalescing
-a burst of streaming commits into one draw per frame budget. Transcript layout is cached per
-message and invalidated by content fingerprint, so a streaming token re-wraps one message rather
-than the conversation; the visible window is found by binary search over prefix sums and rendered
-by reference, so scroll cost tracks the pane height, not the transcript length. Idle cost is
-therefore zero wakeups and zero bytes — measured by `scripts/tui-smoke.py`, which also verifies
-the detach property end-to-end through a pty.
-
 ## 2. Data model — all Loro
 
 Two doc kinds, one room protocol (loro-protocol over WebSocket, the same protocol the TS edge
@@ -150,12 +122,8 @@ komet-native/
                                  # sockets ({s,k,to,from} frames)
     ui/           komet-ui       # gpui app: shell, sidebar, conversation, composer,
                                  # terminal view, diff pane, settings, animation kit
-    tui/          komet-tui      # ratatui app: daemon attach/spawn, engine-link
-                                 # supervisor, fingerprinted transcript cache,
-                                 # coalescing event loop (no gpui dependency)
   apps/
     komet/                       # the binary (headed default, `headless` subcommand)
-    tui/                         # the `komet-tui` binary
   edge/                          # TypeScript Worker + DOs (ported from komet/apps/edge,
                                  # + auth-exchange routes absorbed from apps/server)
   docs/                          # this file + research reports

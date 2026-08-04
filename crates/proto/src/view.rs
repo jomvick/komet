@@ -2,12 +2,10 @@
 //! of them should own — sort orders, staleness gating, sidebar grouping, the
 //! boot gate, relative times.
 //!
-//! This lives in `proto` rather than in a viewport crate because komet-native
-//! has two of them (the gpui app in `komet-ui`, the terminal app in
-//! `komet-tui`) and a *divergent* sort order between them is a real bug: the
-//! same workspace doc must produce the same row order on every surface. Both
-//! crates re-export from here, so there is exactly one implementation and one
-//! test suite per rule.
+//! This lives in `proto` rather than in the viewport crate so the rules stay
+//! pure and independently testable: the same workspace doc must produce the
+//! same row order on every surface, and there is exactly one implementation
+//! and one test suite per rule.
 //!
 //! Everything in this module is pure. `chat_indicator` (the status derivation
 //! these gate on) is in [`crate::entities`].
@@ -432,11 +430,9 @@ pub fn tool_group_summary(tools: &[(crate::ToolCall, bool)]) -> String {
 
 /// The status-dot palette, as oklch triples (L, C, H°).
 ///
-/// Colors live here rather than in either viewport because the *meaning* of a
-/// dot must not differ between surfaces — a session that reads "running" in the
-/// desktop app cannot read "error" in the terminal. Each frontend converts to
-/// its own color type; `komet-ui` has the oklch→sRGB math, `komet-tui` pins the
-/// converted values with a test.
+/// Colors live here rather than in the viewport because the *meaning* of a
+/// dot is part of the protocol, not the presentation — a given status must
+/// read the same on every surface. `komet-ui` has the oklch→sRGB math.
 pub mod dot {
     /// Running. Pink, not amber: the harsh yellow read as a warning, and running
     /// is routine (user request).

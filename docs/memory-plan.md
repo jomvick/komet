@@ -43,7 +43,7 @@ verified 2026-08-03).
 - Reopen of an evicted chat: first paint < 100ms (measured 62ms debug worst
   case today); live deltas may land up to ~200ms after paint (one room RTT).
 - Streaming smoothness: unchanged or better (phase 2 removes per-tick work).
-- Reattach-after-detach (TUI property): unchanged — engine keeps hosting docs
+- Reattach-after-detach: unchanged — engine keeps hosting docs
   it has run/command obligations for.
 
 ## 3. Phase 0 — measurement first
@@ -58,7 +58,7 @@ verified 2026-08-03).
 
 | Item | Change | Evidence | Expected |
 |---|---|---|---|
-| Allocator | mimalloc (or jemalloc) as global alloc in `apps/komet` + `apps/tui` | system malloc watermark; churn sources below | watermark becomes recoverable; biggest single lever on macOS |
+| Allocator | mimalloc (or jemalloc) as global alloc in `apps/komet` | system malloc watermark; churn sources below | watermark becomes recoverable; biggest single lever on macOS |
 | Image lifecycle | Call gpui `remove_asset` when transcript rows drop / adopt an LRU image cache with byte budget; bound the global encoded-bytes cache `attachments.rs:462` (no eviction today); clear staged attachments on chat delete | decoded RGBA + atlas tile + encoded bytes ≈ 2.5× decoded size per image, permanent; one screenshot ≈ 48MB decoded | 100MB+ on image-heavy use |
 | Doc delete eviction | `DeleteChat`/`DeleteSpace` drop the doc handle, close the room, delete the snapshot row (`doc_host.rs:125` handles map is insert-only; `rpc.rs:636-693` leaks) | audit §1 | correctness + a few MB per deleted chat |
 | Bound channels | `RpcClient::subscribe` unbounded (`client.rs:123`) → conflating/bounded (watch semantics are latest-wins); terminal PTY + subscriber channels (`terminals.rs:211,243`) → bounded with drop policy; offline local-update queue (`room.rs:341`, drains only on connect) → byte cap + full-resync on overflow | leak-shaped under slow consumer / disconnect | removes the balloon modes (dev builds, sleep/wake, firehose terminals) |
@@ -121,7 +121,7 @@ delete; doc eviction on DeleteChat/DeleteSpace; doc LRU (12 warm docs / 80MB
 estimate, pinned: watched, live-writer, host-pending-commands) with lazy
 mirror; in-place event fold; container-scoped doc reads + single-row workspace
 `chat()`; delta `WatchDocMessages` protocol (reset + per-entry upserts + text-append
-ops, desync → resubscribe) across engine/UI/TUI — measured on a 1.6MB
+ops, desync → resubscribe) across engine/UI — measured on a 1.6MB
 streamed reply: 257MB of watch frames before, 2.3MB after (110×; median
 frame 2.7KB, one full-entry frame at turn completion); bounded RPC stream queues (256,
 backpressure); offline room queue drained during backoff; codex/journal-fd/

@@ -409,7 +409,7 @@ impl DocHost {
     /// LRU eviction: while the warm set exceeds [`WARM_DOC_CAP`] or the
     /// resident estimate exceeds `DOC_LRU_BYTE_BUDGET`, close the
     /// least-recently-touched unpinned docs. Pinned (never evicted):
-    /// - watched docs (`messages_tx` has receivers — a UI/TUI transcript);
+    /// - watched docs (`messages_tx` has receivers — a UI transcript);
     /// - docs with a live writer (`Arc<SessionDoc>` held outside the handle —
     ///   a run streaming into it);
     /// - host-side docs with pending commands (the executor owes them work).

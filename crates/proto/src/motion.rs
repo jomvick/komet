@@ -1,15 +1,14 @@
 //! Loader motion — the pure math behind komet's loading indicators.
 //!
 //! These are the curves and constants the gpui viewport animates with
-//! (`komet-ui/src/motion.rs`, `komet-ui/src/loaders.rs`), lifted here so the
-//! terminal viewport animates the *same* loaders rather than inventing its own
-//! spinner. A loading indicator is a brand surface; two of them that disagree
-//! read as two products.
+//! (`komet-ui/src/motion.rs`, `komet-ui/src/loaders.rs`), lifted here so any
+//! surface animates the *same* loaders rather than inventing its own spinner.
+//! A loading indicator is a brand surface; two of them that disagree read as
+//! two products.
 //!
-//! Everything is a pure function of a phase in `0..1`, so a caller can drive it
-//! from a frame delta (gpui) or from wall-clock elapsed time (a terminal
-//! redraw) and get identical output. Opacity translates to a terminal as a
-//! blend toward the background — see `komet-tui`'s `loaders` module.
+//! Everything is a pure function of a phase in `0..1`, so a caller can drive
+//! it from a frame delta or from wall-clock elapsed time and get identical
+//! output.
 
 /// Komet loader pulse period.
 pub const KOMET_PULSE_MS: u64 = 2_400;

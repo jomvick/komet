@@ -290,10 +290,9 @@ impl EngineHandle {
 // ---------------------------------------------------------------------------
 
 // The frontend-agnostic derivations (sort orders, staleness gating, sidebar
-// grouping, the boot gate, relative times) live in `komet_proto::view` so the
-// terminal viewport (`komet-tui`) shares one implementation and one test suite
-// with this one — a sort order that differs per surface is a bug. Re-exported
-// here because every call site in this crate reads them as `state::…`.
+// grouping, the boot gate, relative times) live in `komet_proto::view`, pure
+// and with their own test suite. Re-exported here because every call site in
+// this crate reads them as `state::…`.
 pub use komet_proto::view::{
     ChatGroup, ConnectionStatus, GatePhase, Indicator, SESSION_STALE_MS, attention_rank,
     chat_location, display_status, effective_indicator, format_time_ago, gate_phase, group_chats,
@@ -1008,7 +1007,7 @@ mod tests {
         .unwrap();
         assert_eq!(handle.mode(), EngineMode::InProcess);
 
-        // Attach the way `komet-tui` does, and speak the same protocol.
+        // Attach the way an external viewport would, and speak the same protocol.
         let attached = connect_ws(&format!("ws://127.0.0.1:{port}"))
             .await
             .expect("a second viewport must be able to attach");
