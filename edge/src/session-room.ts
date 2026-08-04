@@ -755,12 +755,47 @@ export class SessionRoom implements DurableObject {
     if ((rows ?? 0) > COMPACT_LOG_ROWS) await this.foldLog();
   }
 
-  /** LOG FOLD: full snapshot re-export + clear the update log. Lossless. */
+  /** LOG FOLD: snapshot re-export + clear the update log. Prefers a shallow
+   * trim when one is due — waiting for the DAILY alarm meant a heap-pressed
+   * colo (2026-08-04 wasm exhaustion) kept thrash-cycling for up to a day
+   * after the retention fix deployed; a high-churn room folds every ~400
+   * rows, so trimming here converges in minutes instead. Falls back to the
+   * lossless full snapshot when no trim is due (or the trim export fails). */
   private async foldLog(): Promise<void> {
     const doc = await this.ensureDoc();
+    if (this.trimHistoryIfDue(doc, Date.now())) return;
     this.blobs.put("snapshot", doc.export({ mode: "snapshot" }));
     this.ctx.storage.sql.exec("DELETE FROM updates");
     this.setMeta("updateBytes", "0");
+  }
+
+  /** HISTORY TRIM (§3.1): shallow snapshot at the newest recorded frontier
+   * checkpoint older than RETAIN_DAYS — history before it is discarded
+   * permanently, state fully preserved. Returns whether a trim landed (the
+   * snapshot + log + materialized doc were all replaced). Best-effort: any
+   * export failure leaves the room to the caller's lossless fold. */
+  private trimHistoryIfDue(doc: LoroDoc, now: number): boolean {
+    const checkpoints = JSON.parse(this.getMeta("checkpoints") ?? "[]") as FrontierCheckpoint[];
+    const cutoff = checkpoints.filter((c) => now - c.at >= RETAIN_MS).pop();
+    if (!cutoff || (doc.isShallow() && this.getMeta("lastTrimAt") === String(cutoff.at))) {
+      return false;
+    }
+    try {
+      const shallow = doc.export({
+        mode: "shallow-snapshot",
+        frontiers: cutoff.frontiers.map((f) => ({ peer: f.peer as `${number}`, counter: f.counter }))
+      });
+      this.blobs.put("snapshot", shallow);
+      this.ctx.storage.sql.exec("DELETE FROM updates");
+      this.setMeta("updateBytes", "0");
+      this.setMeta("lastTrimAt", String(cutoff.at));
+      const fresh = new LoroDoc();
+      fresh.import(shallow);
+      this.doc = fresh;
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   /** Daily alarm: frontier checkpoint, history trim, R2 backup. */
@@ -778,27 +813,11 @@ export class SessionRoom implements DurableObject {
     });
     while (checkpoints.length > MAX_CHECKPOINTS) checkpoints.shift();
 
-    // 2. HISTORY TRIM: shallow snapshot at the newest checkpoint older than
-    //    RETAIN_DAYS (history before it is discarded permanently — §3.1).
-    const cutoff = checkpoints.filter((c) => now - c.at >= RETAIN_MS).pop();
-    if (cutoff && !(doc.isShallow() && this.getMeta("lastTrimAt") === String(cutoff.at))) {
-      try {
-        const shallow = doc.export({
-          mode: "shallow-snapshot",
-          frontiers: cutoff.frontiers.map((f) => ({ peer: f.peer as `${number}`, counter: f.counter }))
-        });
-        this.blobs.put("snapshot", shallow);
-        this.ctx.storage.sql.exec("DELETE FROM updates");
-        this.setMeta("updateBytes", "0");
-        this.setMeta("lastTrimAt", String(cutoff.at));
-        const fresh = new LoroDoc();
-        fresh.import(shallow);
-        this.doc = fresh;
-      } catch {
-        /* trim is best-effort; the log fold keeps the room bounded */
-      }
-    }
+    // 2. HISTORY TRIM — must see today's checkpoint list, so persist first.
+    //    (Also fires from foldLog, which is what usually gets there first on
+    //    a high-churn room.)
     this.setMeta("checkpoints", JSON.stringify(checkpoints));
+    this.trimHistoryIfDue(doc, now);
 
     // 3. Nightly R2 backup (§3.3) — full current snapshot, disaster hatch.
     // Two guards (round-2 review): postReset pauses the put between a
