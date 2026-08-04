@@ -390,7 +390,6 @@ impl AccountsPage {
                                     .child(SharedString::from("You")),
                             )
                         })
-                        .when(is_active, |el| el.child(popover::menu_check(theme)))
                         .child(
                             div()
                                 .size(px(6.0))
