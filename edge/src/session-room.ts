@@ -885,7 +885,15 @@ export class SessionRoom implements DurableObject {
     // observed as the same rooms "trimming" every few minutes all evening.
     if (cutoff && this.getMeta("lastTrimAt") !== String(cutoff.at)) {
       frontiers = cutoff.frontiers.map((f) => ({ peer: f.peer as `${number}`, counter: f.counter }));
-    } else if ((this.blobs.get("snapshot")?.length ?? 0) > TRIM_FORCE_BYTES) {
+    } else if (
+      (this.blobs.get("snapshot")?.length ?? 0) + Number(this.getMeta("updateBytes") ?? "0") >
+      TRIM_FORCE_BYTES
+    ) {
+      // Snapshot AND log bytes: after a wedge-break reset the re-uploaded
+      // full histories live as LOG ROWS against an empty snapshot (observed
+      // live: 0B snapshot + 119 rows replaying for 7 SECONDS), so a
+      // snapshot-only gate never fired while every cold start ballooned the
+      // heap with the same megabytes.
       // No aged checkpoint but the full history is already a heap hazard:
       // trim at the current frontier (see TRIM_FORCE_BYTES).
       frontiers = doc.frontiers().map((f) => ({ peer: String(f.peer) as `${number}`, counter: f.counter }));
