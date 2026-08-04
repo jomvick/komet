@@ -359,6 +359,11 @@ pub struct AppState {
     pub selected_chat: Option<String>,
     /// Boot auto-select happened (or a manual selection superseded it).
     pub auto_selected: bool,
+    /// First chats / spaces watch frame has landed — device-local state that
+    /// prunes against the doc (open tabs, the sidebar space filter) must not
+    /// judge by the empty pre-sync lists.
+    pub chats_synced: bool,
+    pub spaces_synced: bool,
     /// Joined transcript of the selected chat (continuations folded engine-side).
     pub transcript: Vec<SessionMessageEntry>,
     /// Optimistic user echoes per chat id, shown until the doc frame carrying
@@ -403,6 +408,8 @@ impl AppState {
             watch_tasks: Vec::new(),
             transcript_task: None,
             auto_selected: false,
+            chats_synced: false,
+            spaces_synced: false,
         }
     }
 
@@ -411,6 +418,7 @@ impl AppState {
     pub fn apply_chats(&mut self, mut chats: Vec<Chat>) {
         sort_chats(&mut chats);
         self.chats = chats;
+        self.chats_synced = true;
         if let Some(selected) = &self.selected_chat
             && !self.chats.iter().any(|c| &c.id == selected)
         {
@@ -428,6 +436,7 @@ impl AppState {
     pub fn apply_spaces(&mut self, mut spaces: Vec<Space>) {
         sort_spaces(&mut spaces);
         self.spaces = spaces;
+        self.spaces_synced = true;
         // Heal a vanished selection (space deleted elsewhere): fall back to the
         // first space; its chats died with it, so a matching chat selection is
         // healed by the accompanying chats frame (`apply_chats`).
@@ -783,11 +792,9 @@ impl AppState {
     }
 }
 
-/// Subscribe to a watch method and pump each frame through `apply`. Runs on the
-/// gpui executor; ends when the stream closes or the entity is released.
-/// Chats watch with boot auto-select: komet's `/` route redirected to the
-/// last-used chat; we approximate by selecting the most recent unarchived chat
-/// on the first frame when nothing is selected yet (manual selection wins).
+/// Chats watch. Boot selection is the shell's job (it lands on the first
+/// restored open tab, device-local state this entity can't see); this task
+/// only pumps frames.
 fn spawn_chats_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<()> {
     cx.spawn(async move |this, cx| {
         let mut rx = match handle
@@ -811,17 +818,6 @@ fn spawn_chats_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<(
             };
             let alive = this.update(cx, |state, cx| {
                 state.apply_chats(parsed);
-                if state.selected_chat.is_none() && !state.auto_selected {
-                    let most_recent = state
-                        .chats
-                        .iter()
-                        .find(|c| !c.archived)
-                        .map(|c| c.id.clone());
-                    if let Some(chat_id) = most_recent {
-                        state.auto_selected = true;
-                        state.select_chat(Some(chat_id), cx);
-                    }
-                }
                 cx.notify();
             });
             if alive.is_err() {

@@ -442,7 +442,7 @@ pub struct Shell {
     rename_dialog: Option<RenameChatDialog>,
     /// Chat id awaiting delete confirmation.
     delete_confirm: Option<String>,
-    /// Space-row context menu: (space id, window position).
+    /// Space-row context menu (dropdown rows): (space id, window position).
     space_menu: Option<(String, Point<Pixels>)>,
     rename_space_dialog: Option<RenameSpaceDialog>,
     /// Space id awaiting delete confirmation (hard delete + session cascade).
@@ -450,15 +450,14 @@ pub struct Shell {
     /// The add-space palette (⌘K-style; device tabs + folder search), `Some`
     /// while open.
     add_space: Option<AddSpaceFlow>,
-    /// Last selected chat per space (in-memory, like [`SessionPanels`]) — a
-    /// space switch lands back on the tab you left.
-    space_last_chat: std::collections::HashMap<String, String>,
+    /// The sidebar's space-filter dropdown, `Some` while open.
+    spaces_menu: Option<spaces::SpacesMenu>,
     /// Session tab currently hovered (close button appears on hover).
     tab_hover: Option<String>,
+    /// Session-tab context menu: (chat id, window position).
+    tab_menu: Option<(String, Point<Pixels>)>,
     /// Session-tab drag-reorder in flight (see `tabs::TabDragState`).
     tab_drag: Option<tabs::TabDragState>,
-    /// Space-row drag-reorder in flight (see `spaces::SpaceDragState`).
-    space_drag: Option<spaces::SpaceDragState>,
     /// Scroll position of the session tab region (drives the edge fades and
     /// the drop-index math under horizontal overflow).
     tabs_scroll: gpui::ScrollHandle,
@@ -650,10 +649,10 @@ impl Shell {
             rename_space_dialog: None,
             delete_space_confirm: None,
             add_space: None,
-            space_last_chat: std::collections::HashMap::new(),
+            spaces_menu: None,
             tab_hover: None,
+            tab_menu: None,
             tab_drag: None,
-            space_drag: None,
             tabs_scroll: gpui::ScrollHandle::new(),
             tabs_scrolled_to: None,
             sidebar_scroll: gpui::ScrollHandle::new(),
@@ -775,24 +774,25 @@ impl Shell {
                 state.update(cx, |s, cx| s.select_space(Some(last), cx));
             }
         }
-        // Track the per-space last chat + persist the selected space.
+        // Persist the selected space (the new-tab fallback under "All").
         {
-            let (selected_space, selected_chat, chat_space) = {
-                let s = state.read(cx);
-                let chat_space = s.selected_chat_row().and_then(|c| c.space_id.clone());
-                (
-                    s.selected_space.clone(),
-                    s.selected_chat.clone(),
-                    chat_space,
-                )
-            };
-            if let (Some(space), Some(chat)) = (chat_space, selected_chat) {
-                self.space_last_chat.insert(space, chat);
-            }
+            let selected_space = state.read(cx).selected_space.clone();
             if selected_space != self.settings.last_space_id && selected_space.is_some() {
                 self.settings.last_space_id = selected_space;
                 self.schedule_save(cx);
             }
+        }
+        // Reconcile the device-local tab list (seed on upgrade, prune against
+        // the doc, selected-chat invariant, boot landing).
+        self.sync_open_tabs(cx);
+        // Heal a dangling sidebar filter (space deleted, possibly elsewhere):
+        // fall back to "All" rather than filtering everything out.
+        if state.read(cx).spaces_synced
+            && let Some(filter) = self.settings.space_filter.clone()
+            && state.read(cx).space_row(&filter).is_none()
+        {
+            self.settings.space_filter = None;
+            self.schedule_save(cx);
         }
         // Chat switch: restore THAT chat's panel state (per-session open flags;
         // snap, no tween — the panels belong to the destination chat).
@@ -1825,9 +1825,10 @@ impl Shell {
             })
             .on_hover(motion::hover_listener(fade_key))
             .cursor_pointer()
+            // A sidebar click opens the session as a tab (appends if absent,
+            // focuses if present) — the reopen path for locally closed tabs.
             .on_click(cx.listener(move |this, _, _, cx| {
-                let id = select_id.clone();
-                this.state.update(cx, |s, cx| s.select_chat(Some(id), cx));
+                this.open_chat_tab(select_id.clone(), cx);
             }))
             .on_mouse_down(
                 MouseButton::Right,
@@ -2004,7 +2005,9 @@ impl Shell {
         let user_email: Option<SharedString> = user.as_ref().map(|u| u.email.clone().into());
         let user_menu = self.render_user_menu(user_line.clone(), user_email.clone(), theme, cx);
 
-        let spaces_section = self.render_spaces_section(theme, cx);
+        // The space filter lives ABOVE the scroll region (fixed) so its
+        // dropdown can float without being clipped by the list's overflow.
+        let filter_row = self.render_spaces_filter(theme, cx);
 
         div()
             .w(px(self.settings.sidebar_width))
@@ -2013,9 +2016,10 @@ impl Shell {
             .flex_col()
             // (No titlebar strip: the unified window titlebar spans the whole
             // window above this column.)
-            // Spaces + the global Active list share one scroll region. On
-            // glass the whole region paints inside an EdgeFade scope — a true
-            // per-glyph gradient at active overflow edges.
+            .child(filter_row)
+            // The (filtered) Sessions list scrolls. On glass the whole region
+            // paints inside an EdgeFade scope — a true per-glyph gradient at
+            // active overflow edges.
             .child(crate::edge_fade::edge_faded(
                 SIDEBAR_GLASS_FADE_BAND,
                 glass && lists_fade_top,
@@ -2033,11 +2037,10 @@ impl Shell {
                             .px(px(Theme::SPACE_SM))
                             .flex()
                             .flex_col()
-                            .child(spaces_section)
                             .child(
                                 div()
                                     .px(px(Theme::SPACE_SM))
-                                    .pt(px(12.0))
+                                    .pt(px(4.0))
                                     .pb(px(4.0))
                                     .text_size(px(11.0))
                                     .font_weight(gpui::FontWeight::MEDIUM)
@@ -2524,6 +2527,9 @@ impl Shell {
             overlays.push(popover::modal("rename-chat-dialog", viewport, card));
         }
 
+        if let Some(menu) = self.render_tab_menu(cx) {
+            overlays.push(menu);
+        }
         overlays.extend(self.render_space_overlays(viewport, window, cx));
         if let Some(overlay) = self.render_add_space_overlay(viewport, window, cx) {
             overlays.push(overlay);
