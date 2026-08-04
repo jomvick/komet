@@ -681,10 +681,19 @@ export class SessionRoom implements DurableObject {
     this.setMeta("lastReplayMs", String(replayMs));
     this.setMeta("lastReplayRows", String(rows));
     console.log(
-      `cold replay: ${replayMs}ms, ${rows} rows, snapshot ${snapshot?.length ?? 0}B, attempt ${attempts + 1}`
+      `cold replay: ${replayMs}ms, ${rows} rows, snapshot ${snapshot?.length ?? 0}B, attempt ${attempts + 1}`,
+      `room=${this.getMeta("chatId") ?? "?"}`
     );
     this.doc = doc;
-    return doc;
+    // Trim on cold materialization too: fold and alarm both ride WRITES, so
+    // an idle-but-watched room NEVER trimmed — yet every isolate restart
+    // re-materializes its full history into the shared wasm heap (the
+    // 2026-08-04 exhaustion recurred post-fix on exactly those rooms). The
+    // one-off export cost here permanently shrinks the room.
+    if (this.trimHistoryIfDue(doc, Date.now())) {
+      console.log(`history trimmed on cold start room=${this.getMeta("chatId") ?? "?"}`);
+    }
+    return this.doc;
   }
 
   /** Drop the persisted update log + snapshot (the /reset-log storage clear):
