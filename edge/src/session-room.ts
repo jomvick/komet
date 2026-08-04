@@ -578,7 +578,7 @@ export class SessionRoom implements DurableObject {
       }
       this.recordLoroUpdates(updates);
       this.ack(ws, { crdt, roomId }, UpdateStatusCode.Ok, batchId);
-      this.broadcast(ws, crdt, { type: MessageType.DocUpdate, crdt, roomId, updates, batchId });
+      this.relay(ws, crdt, roomId, updates);
       return;
     }
     if (crdt === CrdtType.LoroEphemeralStore) {
@@ -590,7 +590,7 @@ export class SessionRoom implements DurableObject {
         return;
       }
       this.ack(ws, { crdt, roomId }, UpdateStatusCode.Ok, batchId);
-      this.broadcast(ws, crdt, { type: MessageType.DocUpdate, crdt, roomId, updates, batchId });
+      this.relay(ws, crdt, roomId, updates);
       return;
     }
     this.ack(ws, { crdt, roomId }, UpdateStatusCode.Unknown, batchId);
@@ -1004,60 +1004,91 @@ export class SessionRoom implements DurableObject {
 
   // ── wire helpers ─────────────────────────────────────────────────────────
 
-  private send(ws: WebSocket, message: ProtocolMessage): void {
+  /** Returns false when the frame could not be delivered (socket gone /
+   * runtime refused the send). Encode failures throw out instead — they are
+   * OUR bug, never the peer's, and must not be mistaken for a deaf socket. */
+  private send(ws: WebSocket, message: ProtocolMessage): boolean {
+    const bytes = encode(message);
     try {
-      ws.send(encode(message));
+      ws.send(bytes);
+      return true;
     } catch {
       /* socket already gone; hibernation API cleans it up */
+      return false;
     }
   }
 
-  /** Send updates, fragmenting any single update above the protocol cap. */
-  private sendUpdates(ws: WebSocket, crdt: CrdtType, roomId: string, updates: Uint8Array[]): void {
-    const small = updates.filter((u) => u.length <= MAX_MESSAGE_SIZE);
-    if (small.length > 0) {
-      this.send(ws, {
-        type: MessageType.DocUpdate,
-        crdt,
-        roomId,
-        updates: small,
-        batchId: this.newBatchId()
-      });
+  /** Send updates, fragmenting any single update above FRAGMENT_BYTES and
+   * chunking small ones so no encoded frame approaches the loro-protocol
+   * 256KB message cap (envelope overhead included). Returns false if any
+   * frame failed to deliver. */
+  private sendUpdates(ws: WebSocket, crdt: CrdtType, roomId: string, updates: Uint8Array[]): boolean {
+    let ok = true;
+    let batch: Uint8Array[] = [];
+    let batchBytes = 0;
+    const flushBatch = () => {
+      if (batch.length === 0) return;
+      ok =
+        this.send(ws, {
+          type: MessageType.DocUpdate,
+          crdt,
+          roomId,
+          updates: batch,
+          batchId: this.newBatchId()
+        }) && ok;
+      batch = [];
+      batchBytes = 0;
+    };
+    for (const u of updates) {
+      if (u.length > FRAGMENT_BYTES) continue;
+      if (batchBytes + u.length > FRAGMENT_BYTES) flushBatch();
+      batch.push(u);
+      batchBytes += u.length;
     }
+    flushBatch();
     for (const update of updates) {
-      if (update.length <= MAX_MESSAGE_SIZE) continue;
+      if (update.length <= FRAGMENT_BYTES) continue;
       const batchId = this.newBatchId();
       const fragmentCount = Math.ceil(update.length / FRAGMENT_BYTES);
-      this.send(ws, {
-        type: MessageType.DocUpdateFragmentHeader,
-        crdt,
-        roomId,
-        batchId,
-        fragmentCount,
-        totalSizeBytes: update.length
-      });
-      for (let i = 0; i < fragmentCount; i++) {
+      ok =
         this.send(ws, {
-          type: MessageType.DocUpdateFragment,
+          type: MessageType.DocUpdateFragmentHeader,
           crdt,
           roomId,
           batchId,
-          index: i,
-          fragment: update.subarray(i * FRAGMENT_BYTES, Math.min((i + 1) * FRAGMENT_BYTES, update.length))
-        });
+          fragmentCount,
+          totalSizeBytes: update.length
+        }) && ok;
+      for (let i = 0; i < fragmentCount; i++) {
+        ok =
+          this.send(ws, {
+            type: MessageType.DocUpdateFragment,
+            crdt,
+            roomId,
+            batchId,
+            index: i,
+            fragment: update.subarray(
+              i * FRAGMENT_BYTES,
+              Math.min((i + 1) * FRAGMENT_BYTES, update.length)
+            )
+          }) && ok;
       }
     }
+    return ok;
   }
 
-  private broadcast(from: WebSocket, crdt: CrdtType, message: ProtocolMessage): void {
-    const bytes = encode(message);
+  /** Relay accepted updates to every other member socket via sendUpdates —
+   * NOT a single pre-encoded frame. broadcast() used to encode the batch
+   * once, so a reassembled >256KB client push (a device re-uploading its
+   * full workspace history after a server reset) blew the loro-protocol
+   * message cap and NEVER reached peers live; they only converged via a
+   * later rejoin backfill (2026-08-04, the last silent-staleness path). */
+  private relay(from: WebSocket, crdt: CrdtType, roomId: string, updates: Uint8Array[]): void {
     for (const ws of this.ctx.getWebSockets()) {
       if (ws === from) continue;
       const state = ws.deserializeAttachment() as SocketState | null;
       if (!state?.rooms.includes(crdt)) continue;
-      try {
-        ws.send(bytes);
-      } catch (e) {
+      if (!this.sendUpdates(ws, crdt, roomId, updates)) {
         // A member socket we cannot send to is a DEAF PEER, not a skippable
         // one: swallowing the failure left it looking alive (runtime
         // auto-pongs, accepted writes) while it silently missed every
@@ -1065,10 +1096,9 @@ export class SessionRoom implements DurableObject {
         // the client's session ends and its redial + VV backfill heal the
         // gap within seconds.
         console.warn(
-          "broadcast send failed; closing socket",
+          "relay send failed; closing socket",
           `room=${this.getMeta("chatId") ?? "?"}`,
-          `device=${state.deviceId ?? "unattributed"}`,
-          String(e)
+          `device=${state.deviceId ?? "unattributed"}`
         );
         try {
           ws.close(1011, "broadcast delivery failed");
