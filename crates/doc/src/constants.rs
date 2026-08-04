@@ -3,8 +3,10 @@
 
 /// Max bytes for a single message entry before continuation splitting.
 pub const MSG_INLINE_MAX: usize = 256 * 1024;
-/// History retention window for shallow-snapshot trimming (days).
-pub const RETAIN_DAYS: u32 = 30;
+/// History retention window for shallow-snapshot trimming (days). Dropped
+/// 30 → 3 with the edge copy (2026-08-04): a month of op history per doc
+/// blew the shared loro-wasm heap on the edge isolate before any trim ran.
+pub const RETAIN_DAYS: u32 = 3;
 /// Session DO folds its update log into the snapshot at this size (lossless).
 pub const COMPACT_LOG_BYTES: usize = 8 * 1024 * 1024;
 /// Soft ceiling for total doc size before aggressive trim.

@@ -59,6 +59,18 @@ const REPLAY_CRASH_LIMIT = 3;
 const FRAGMENT_BYTES = 200_000;
 /** Keep a rolling ~5 weeks of daily frontier checkpoints. */
 const MAX_CHECKPOINTS = 36;
+/** Isolate-wide poisoned-wasm strike counter — MODULE state on purpose: every
+ * SessionRoom co-located in this isolate shares ONE loro-wasm linear memory,
+ * so heap exhaustion poisons them all at once (2026-08-04: every
+ * byte-exporting wasm call threw RangeError("Invalid array buffer length")
+ * while imports/relays kept working, silently wedging all joins fleet-wide). */
+let wasmPoisonStrikes = 0;
+/** Wasm-boundary failures before `ctx.abort()` recycles the isolate. Wasm
+ * memory only ever grows, so the poisoned state is permanent until the isolate
+ * dies — and Cloudflare's own memory-limit reset arrives only after minutes of
+ * thrash. Aborting early turns a silent hours-long wedge into a seconds-long
+ * blip (sockets close, clients redial into a fresh isolate). */
+const WASM_POISON_ABORT_AFTER = 3;
 
 interface SocketState {
   userId: string;
@@ -306,41 +318,92 @@ export class SessionRoom implements DurableObject {
       return;
     }
     const state = ws.deserializeAttachment() as SocketState;
-    switch (decoded.type) {
-      case MessageType.JoinRequest:
-        await this.handleJoin(ws, state, decoded);
-        break;
-      case MessageType.DocUpdate:
-        await this.handleDocUpdate(ws, state, decoded);
-        break;
-      case MessageType.DocUpdateFragmentHeader:
-        this.handleFragmentHeader(ws, state, decoded);
-        break;
-      case MessageType.DocUpdateFragment:
-        await this.handleFragment(ws, state, decoded);
-        break;
-      case MessageType.Leave:
-        state.rooms = state.rooms.filter((r) => r !== decoded.crdt);
-        ws.serializeAttachment(state);
-        break;
-      case MessageType.Ack:
-      case MessageType.RoomError:
-        break;
-      default:
-        ws.close(1002, "Unsupported message");
+    try {
+      switch (decoded.type) {
+        case MessageType.JoinRequest:
+          await this.handleJoin(ws, state, decoded);
+          break;
+        case MessageType.DocUpdate:
+          await this.handleDocUpdate(ws, state, decoded);
+          break;
+        case MessageType.DocUpdateFragmentHeader:
+          this.handleFragmentHeader(ws, state, decoded);
+          break;
+        case MessageType.DocUpdateFragment:
+          await this.handleFragment(ws, state, decoded);
+          break;
+        case MessageType.Leave:
+          state.rooms = state.rooms.filter((r) => r !== decoded.crdt);
+          ws.serializeAttachment(state);
+          break;
+        case MessageType.Ack:
+        case MessageType.RoomError:
+          break;
+        default:
+          ws.close(1002, "Unsupported message");
+      }
+    } catch (e) {
+      // A handler that dies pre-answer used to fail in SILENCE: the client
+      // waits out its 15s join deadline, redials, and dies the same way —
+      // the 2026-08-04 fleet-wide join wedge. Log attributed, answer an
+      // outstanding join so clients fail fast and VISIBLY (JoinError →
+      // long-backoff rejoin instead of a hot 15s dial loop), then escalate
+      // suspected wasm-heap poisoning to an isolate recycle.
+      console.error(
+        "ws message handler failed",
+        `room=${this.getMeta("chatId") ?? "?"}`,
+        `device=${state?.deviceId ?? "unattributed"}`,
+        `type=${decoded.type}`,
+        String(e)
+      );
+      if (decoded.type === MessageType.JoinRequest) {
+        this.send(ws, {
+          type: MessageType.JoinError,
+          crdt: decoded.crdt,
+          roomId: decoded.roomId,
+          code: JoinErrorCode.AppError,
+          message: "internal error"
+        });
+      }
+      this.escalateWasmPoisoning(e);
     }
   }
 
   async webSocketClose(ws: WebSocket): Promise<void> {
     this.logSocketEnd(ws, "closed");
     this.fragments.delete(ws);
-    await this.flush();
+    try {
+      await this.flush();
+    } catch (e) {
+      // Flush can fold the log (a wasm snapshot export); an uncaught throw
+      // here is invisible in a close handler. Same discipline as above.
+      console.error("flush on socket close failed", `room=${this.getMeta("chatId") ?? "?"}`, String(e));
+      this.escalateWasmPoisoning(e);
+    }
   }
 
   async webSocketError(ws: WebSocket): Promise<void> {
     this.logSocketEnd(ws, "errored");
     this.fragments.delete(ws);
-    await this.flush();
+    try {
+      await this.flush();
+    } catch (e) {
+      console.error("flush on socket error failed", `room=${this.getMeta("chatId") ?? "?"}`, String(e));
+      this.escalateWasmPoisoning(e);
+    }
+  }
+
+  /** RangeError("Invalid array buffer length") / wasm RuntimeError are the
+   * signature of an exhausted loro-wasm heap (see `wasmPoisonStrikes`).
+   * Strike out and `ctx.abort()` so clients redial into a fresh isolate
+   * within seconds instead of hot-looping against a deaf room until
+   * Cloudflare's memory-limit reset finally fires. */
+  private escalateWasmPoisoning(e: unknown): void {
+    if (!(e instanceof RangeError || e instanceof WebAssembly.RuntimeError)) return;
+    wasmPoisonStrikes++;
+    if (wasmPoisonStrikes < WASM_POISON_ABORT_AFTER) return;
+    console.error(`wasm heap poisoned (${wasmPoisonStrikes} strikes); aborting isolate for a fresh heap`);
+    this.ctx.abort("loro-wasm heap exhausted; recycling isolate");
   }
 
   private logSocketEnd(ws: WebSocket, how: string): void {
