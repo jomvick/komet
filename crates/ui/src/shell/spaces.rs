@@ -114,9 +114,19 @@ impl Shell {
             self.state
                 .update(cx, |s, cx| s.select_space(Some(space_id), cx));
         }
-        self.spaces_menu = None;
+        self.close_spaces_menu(cx);
         self.schedule_save(cx);
         cx.notify();
+    }
+
+    /// Close the space-filter dropdown through the exit animation (no-op when
+    /// it isn't open). Every close path funnels here so the menu always
+    /// animates out instead of vanishing.
+    fn close_spaces_menu(&mut self, cx: &mut Context<Self>) {
+        if self.spaces_menu.begin_close() {
+            popover::reap_popup(cx, |shell: &mut Self| &mut shell.spaces_menu);
+            cx.notify();
+        }
     }
 
     /// Land in a just-added space: filter the sidebar to it and open the
@@ -141,7 +151,7 @@ impl Shell {
     fn spaces_menu_rows(&self, cx: &App) -> Vec<SpacesMenuRow> {
         let query = self
             .spaces_menu
-            .as_ref()
+            .get()
             .map(|menu| menu.search.read(cx).text().to_string())
             .unwrap_or_default();
         let state = self.state.read(cx);
@@ -170,7 +180,7 @@ impl Shell {
             cx.new(|cx| ComposerInput::with_context("Search spaces…", "PaletteSearch", cx));
         let search_events = cx.subscribe(&search, |this: &mut Shell, _, event, cx| {
             if matches!(event, ComposerInputEvent::Edited) {
-                if let Some(menu) = this.spaces_menu.as_mut() {
+                if let Some(menu) = this.spaces_menu.open_mut() {
                     menu.active = 0;
                 }
                 cx.notify();
@@ -179,7 +189,7 @@ impl Shell {
         // The highlight starts ON the current filter row.
         let current = self.settings.space_filter.clone();
         let handle = search.read(cx).focus_handle(cx);
-        self.spaces_menu = Some(SpacesMenu {
+        self.spaces_menu.open(SpacesMenu {
             search,
             active: 0,
             focus: cx.focus_handle(),
@@ -194,7 +204,7 @@ impl Shell {
                 .position(|row| matches!(row, SpacesMenuRow::Space(s) if s == id))
                 .unwrap_or(0),
         };
-        if let Some(menu) = self.spaces_menu.as_mut() {
+        if let Some(menu) = self.spaces_menu.open_mut() {
             menu.active = start;
         }
         // Focusable before first paint (the add-space palette's proven order).
@@ -207,7 +217,7 @@ impl Shell {
             SpacesMenuRow::All => self.set_space_filter(None, cx),
             SpacesMenuRow::Space(id) => self.set_space_filter(Some(id), cx),
             SpacesMenuRow::AddSpace => {
-                self.spaces_menu = None;
+                self.close_spaces_menu(cx);
                 self.open_add_space(cx);
             }
         }
@@ -216,6 +226,11 @@ impl Shell {
     /// Dropdown keys (bubbling from the focused search input): ↑↓ navigate,
     /// ⏎ activates the highlighted row, esc closes.
     fn spaces_menu_key(&mut self, event: &gpui::KeyDownEvent, cx: &mut Context<Self>) {
+        // The card stays mounted (and focused) through the exit animation —
+        // keys must not drive a dying menu.
+        if !self.spaces_menu.is_open() {
+            return;
+        }
         let key = popover::classify_key(
             event.keystroke.key.as_str(),
             event.keystroke.modifiers.platform,
@@ -223,13 +238,12 @@ impl Shell {
         );
         match key {
             popover::MenuKey::Escape => {
-                self.spaces_menu = None;
-                cx.notify();
+                self.close_spaces_menu(cx);
             }
             popover::MenuKey::Up | popover::MenuKey::Down => {
                 let count = self.spaces_menu_rows(cx).len();
                 let delta = if key == popover::MenuKey::Up { -1 } else { 1 };
-                if let Some(menu) = self.spaces_menu.as_mut() {
+                if let Some(menu) = self.spaces_menu.open_mut() {
                     menu.active = popover::menu_step(Some(menu.active), count, delta).unwrap_or(0);
                     menu.list_scroll.scroll_to_item(menu.active);
                     cx.notify();
@@ -237,7 +251,7 @@ impl Shell {
             }
             popover::MenuKey::Enter | popover::MenuKey::ModEnter => {
                 let row = {
-                    let active = self.spaces_menu.as_ref().map(|m| m.active).unwrap_or(0);
+                    let active = self.spaces_menu.get().map(|m| m.active).unwrap_or(0);
                     self.spaces_menu_rows(cx).get(active).cloned()
                 };
                 if let Some(row) = row {
@@ -264,7 +278,7 @@ impl Shell {
             Some(space) => space.display_name().to_string().into(),
             None => SharedString::from("All spaces"),
         };
-        let open = self.spaces_menu.is_some();
+        let open = self.spaces_menu.is_open();
 
         let trigger = div()
             .id("spaces-filter")
@@ -296,10 +310,17 @@ impl Shell {
             .on_hover(motion::hover_listener("spaces-filter"))
             .cursor_pointer()
             .on_click(cx.listener(|this, _, window, cx| {
-                if this.spaces_menu.is_some() {
-                    this.spaces_menu = None;
-                    cx.notify();
-                } else {
+                // The menu's `on_mouse_down_out` already closed it on this
+                // click's mouse-down (the trigger is outside the card), so by
+                // the time the click lands the menu reads as closed — without
+                // the guard, clicking the open trigger would close-and-reopen.
+                let just_dismissed = this
+                    .spaces_menu_dismissed_at
+                    .is_some_and(|at| at.elapsed() < Duration::from_millis(400));
+                this.spaces_menu_dismissed_at = None;
+                if this.spaces_menu.is_open() {
+                    this.close_spaces_menu(cx);
+                } else if !just_dismissed {
                     this.open_spaces_menu(window, cx);
                 }
             }))
@@ -318,11 +339,14 @@ impl Shell {
                     .flex_none()
                     .text_color(theme.text_muted.opacity(0.6)),
             );
-        let trigger = if open {
+        let trigger = if self.spaces_menu.get().is_some() {
+            let closing = self.spaces_menu.closing_since();
             let menu = self.render_spaces_menu(theme, cx);
-            trigger
-                .relative()
-                .child(popover::anchored_menu_below("spaces-filter-menu", menu))
+            trigger.relative().child(popover::anchored_menu_below(
+                "spaces-filter-menu",
+                menu,
+                closing,
+            ))
         } else {
             trigger
         };
@@ -369,7 +393,7 @@ impl Shell {
     /// the active filter; right-click for rename/remove) + "Add space…".
     fn render_spaces_menu(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let (search, active, focus, list_scroll) = {
-            let Some(menu) = self.spaces_menu.as_ref() else {
+            let Some(menu) = self.spaces_menu.get() else {
                 return div().into_any_element();
             };
             (
@@ -459,7 +483,7 @@ impl Shell {
                             el.on_mouse_down(
                                 MouseButton::Right,
                                 cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                    this.space_menu = Some((space_id.clone(), event.position));
+                                    this.space_menu.open((space_id.clone(), event.position));
                                     cx.notify();
                                 }),
                             )
@@ -496,8 +520,8 @@ impl Shell {
                 this.spaces_menu_key(event, cx)
             }))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                this.spaces_menu = None;
-                cx.notify();
+                this.spaces_menu_dismissed_at = Some(std::time::Instant::now());
+                this.close_spaces_menu(cx);
             }))
             .flex()
             .flex_col()
@@ -1493,8 +1517,15 @@ impl Shell {
 
     // ---- space context menu / rename / delete overlays ----
 
+    fn close_space_menu(&mut self, cx: &mut Context<Self>) {
+        if self.space_menu.begin_close() {
+            popover::reap_popup(cx, |shell: &mut Self| &mut shell.space_menu);
+            cx.notify();
+        }
+    }
+
     pub(super) fn open_rename_space(&mut self, space_id: String, cx: &mut Context<Self>) {
-        self.space_menu = None;
+        self.close_space_menu(cx);
         let current = self
             .state
             .read(cx)
@@ -1551,14 +1582,14 @@ impl Shell {
         let theme = Theme::of(cx).clone();
         let mut overlays: Vec<AnyElement> = Vec::new();
 
-        if let Some((space_id, position)) = self.space_menu.clone() {
+        if let Some((space_id, position)) = self.space_menu.get().cloned() {
+            let closing = self.space_menu.closing_since();
             let rename_id = space_id.clone();
             let delete_id = space_id.clone();
             let menu = popover::popover_card(&theme)
                 .w(px(170.0))
                 .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                    this.space_menu = None;
-                    cx.notify();
+                    this.close_space_menu(cx);
                 }))
                 .flex()
                 .flex_col()
@@ -1577,7 +1608,7 @@ impl Shell {
                         .id("space-menu-delete")
                         .text_color(theme.danger)
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.space_menu = None;
+                            this.close_space_menu(cx);
                             this.delete_space_confirm = Some(delete_id.clone());
                             cx.notify();
                         }))
@@ -1589,7 +1620,12 @@ impl Shell {
                         .child(SharedString::from("Remove…")),
                 )
                 .into_any_element();
-            overlays.push(popover::menu_at("space-context-menu", position, menu));
+            overlays.push(popover::menu_at(
+                "space-context-menu",
+                position,
+                menu,
+                closing,
+            ));
         }
 
         if let Some(dialog) = &mut self.rename_space_dialog {

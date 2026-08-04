@@ -276,7 +276,7 @@ pub struct Pickers {
     draft_owner: Option<String>,
     /// Space the branch draft/cache belong to (see the state observer).
     space_owner: Option<String>,
-    open: Option<PickerKind>,
+    open: popover::Popup<PickerKind>,
     harnesses: Loadable<Vec<HarnessDescriptor>>,
     models: HashMap<HarnessId, Loadable<Vec<Model>>>,
     refs: Loadable<Vec<RepoRef>>,
@@ -361,13 +361,17 @@ impl Pickers {
         // Dev/testing knob: `KOMET_OPEN_PICKER=model|traits|repo|branch` boots
         // with that popover open — synthetic input can't reach the app on
         // headless compositors, so captures need a data-side path.
-        let open = match std::env::var("KOMET_OPEN_PICKER").ok().as_deref() {
+        let boot_open = match std::env::var("KOMET_OPEN_PICKER").ok().as_deref() {
             Some("model") => Some(PickerKind::HarnessModel),
             Some("traits") => Some(PickerKind::HarnessModel),
             Some("branch") => Some(PickerKind::Branch),
             Some("checkout") => Some(PickerKind::Checkout),
             _ => None,
         };
+        let mut open = popover::Popup::default();
+        if let Some(kind) = boot_open {
+            open.open(kind);
+        }
         // Sticky last-used picks: loaded synchronously so the very first frame
         // shows the remembered harness/model/reasoning, never a placeholder.
         let data_dir = state.read(cx).data_dir.clone();
@@ -394,7 +398,7 @@ impl Pickers {
             search,
             focus: cx.focus_handle(),
             suppressed: None,
-            boot_focus_pending: open.is_some(),
+            boot_focus_pending: boot_open.is_some(),
             load_task: None,
             refs_task: None,
             switching: None,
@@ -551,17 +555,36 @@ impl Pickers {
 
     // ---- open/close ----
 
+    /// The picker that's open AND interactive — `None` while one animates out.
+    fn open_kind(&self) -> Option<PickerKind> {
+        self.open.as_open().copied()
+    }
+
+    /// The picker to render: open or mid-exit.
+    fn mounted_kind(&self) -> Option<PickerKind> {
+        self.open.get().copied()
+    }
+
+    /// Begin the exit animation without arming re-open suppression (the
+    /// toggle-close path — the next trigger click should reopen normally).
+    fn animate_close(&mut self, cx: &mut Context<Self>) {
+        if self.open.begin_close() {
+            popover::reap_popup(cx, |pickers: &mut Self| &mut pickers.open);
+        }
+    }
+
     fn close(&mut self, cx: &mut Context<Self>) {
-        if let Some(kind) = self.open.take() {
+        if let Some(kind) = self.open_kind() {
             self.suppressed = Some((kind, Instant::now()));
         }
+        self.animate_close(cx);
         cx.notify();
     }
 
     /// Capture knob (`KOMET_OPEN_DIALOG=model`): open the combined
     /// harness/model menu programmatically.
     pub fn open_model_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.open != Some(PickerKind::HarnessModel) {
+        if self.open_kind() != Some(PickerKind::HarnessModel) {
             self.toggle(PickerKind::HarnessModel, window, cx);
         }
     }
@@ -574,8 +597,8 @@ impl Pickers {
         } else {
             kind
         };
-        if self.open == Some(kind) {
-            self.open = None;
+        if self.open_kind() == Some(kind) {
+            self.animate_close(cx);
             cx.notify();
             return;
         }
@@ -587,7 +610,7 @@ impl Pickers {
             cx.notify();
             return;
         }
-        self.open = Some(kind);
+        self.open.open(kind);
         self.search.update(cx, |input, cx| {
             input.set_placeholder("Search…", cx);
             input.set_text("", cx);
@@ -796,7 +819,7 @@ impl Pickers {
                 };
                 // Rows landed under an open, un-searched popover: re-home the
                 // nav highlight to the selected row.
-                if pickers.open == Some(PickerKind::Branch)
+                if pickers.open_kind() == Some(PickerKind::Branch)
                     && pickers.search.read(cx).text().is_empty()
                 {
                     pickers.active = pickers.selected_ref_index(cx);
@@ -831,7 +854,7 @@ impl Pickers {
             self.switch_draft_ref(row, cx);
             return;
         }
-        self.open = None;
+        self.animate_close(cx);
         cx.notify();
     }
 
@@ -877,7 +900,7 @@ impl Pickers {
                 match result {
                     Ok(_) => {
                         pickers.config.branch = Some(ref_name);
-                        pickers.open = None;
+                        pickers.animate_close(cx);
                         pickers.ensure_refs(true, cx);
                     }
                     Err(err) => pickers.switch_error = Some(err.to_string()),
@@ -915,7 +938,7 @@ impl Pickers {
         };
         if row.worktree_path.as_deref() == Some(cwd.as_str()) {
             // Already this session's worktree — nothing to do.
-            self.open = None;
+            self.animate_close(cx);
             cx.notify();
             return;
         }
@@ -967,7 +990,7 @@ impl Pickers {
                 pickers.switching = None;
                 match result {
                     Ok(_) => {
-                        pickers.open = None;
+                        pickers.animate_close(cx);
                         // Checkout state changed — refresh tags/current.
                         pickers.ensure_refs(true, cx);
                     }
@@ -992,7 +1015,7 @@ impl Pickers {
             self.config.branch = None;
         }
         self.config.checkout = kind;
-        self.open = None;
+        self.animate_close(cx);
         cx.notify();
     }
 
@@ -1016,7 +1039,7 @@ impl Pickers {
     }
 
     fn pick_model(&mut self, model_id: String, cx: &mut Context<Self>) {
-        self.open = None;
+        self.animate_close(cx);
         if self.state.read(cx).selected_chat.is_some() {
             // Existing chat: persist to the chat row (Mutate setChatConfig) —
             // survives restarts and syncs; next runs in this chat use it.
@@ -1387,12 +1410,12 @@ impl Pickers {
     }
 
     fn on_search_submit(&mut self, cx: &mut Context<Self>) {
-        if self.open == Some(PickerKind::Branch)
+        if self.open_kind() == Some(PickerKind::Branch)
             && let Some(row) = self.filtered_ref_rows(cx).into_iter().nth(self.active)
         {
             self.pick_ref(row, cx);
         }
-        if self.open == Some(PickerKind::Space)
+        if self.open_kind() == Some(PickerKind::Space)
             && let Some(space) = self.filtered_space_rows(cx).into_iter().nth(self.active)
         {
             self.pick_space(space.id, cx);
@@ -1400,6 +1423,11 @@ impl Pickers {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &Window, cx: &mut Context<Self>) {
+        // The frame stays mounted (and possibly focused) through the exit
+        // animation — keys must not drive a dying popover.
+        if !self.open.is_open() {
+            return;
+        }
         let key = popover::classify_key(
             event.keystroke.key.as_str(),
             event.keystroke.modifiers.platform,
@@ -1408,12 +1436,12 @@ impl Pickers {
         let search_focused = self.search.read(cx).focus_handle(cx).is_focused(window);
         match key {
             MenuKey::Escape => {
-                self.open = None;
+                self.animate_close(cx);
                 cx.notify();
             }
             MenuKey::Up | MenuKey::Down => {
                 let delta = if key == MenuKey::Up { -1 } else { 1 };
-                let count = match self.open {
+                let count = match self.open_kind() {
                     Some(PickerKind::Branch) => self.filtered_ref_rows(cx).len().min(MAX_REF_ROWS),
                     Some(PickerKind::Checkout) => 2,
                     // Keyboard nav walks the MODEL list only; the traits
@@ -1429,7 +1457,7 @@ impl Pickers {
                 // scroll container's direct children, so indices map 1:1);
                 // the traits chips below live in the pinned tray and never
                 // need scrolling into view.
-                if self.open == Some(PickerKind::HarnessModel)
+                if self.open_kind() == Some(PickerKind::HarnessModel)
                     && self.active < self.model_rows_len(cx)
                 {
                     self.model_scroll.scroll_to_item(self.active);
@@ -1437,9 +1465,9 @@ impl Pickers {
                 cx.notify();
             }
             MenuKey::Enter if !search_focused => {
-                if self.open == Some(PickerKind::HarnessModel) {
+                if self.open_kind() == Some(PickerKind::HarnessModel) {
                     self.activate_model_row(cx);
-                } else if self.open == Some(PickerKind::Checkout) {
+                } else if self.open_kind() == Some(PickerKind::Checkout) {
                     let kind = if self.active == 0 {
                         CheckoutKind::Local
                     } else {
@@ -1473,8 +1501,8 @@ impl Pickers {
             PickerKind::Traits => "picker-traits",
             PickerKind::Space => "picker-space",
         };
-        let open = self.open == Some(kind)
-            || (kind == PickerKind::Traits && self.open == Some(PickerKind::HarnessModel));
+        let open = self.open_kind() == Some(kind)
+            || (kind == PickerKind::Traits && self.open_kind() == Some(PickerKind::HarnessModel));
         // Ghost pill (komet composer/styles.tsx `pill`): `h-8 rounded-lg px-2.5
         // gap-1.5 text-[12px] font-medium text-muted-foreground`, icons size-4,
         // hover/open wash — no border, no caret; the actions row stays quiet.
@@ -1541,7 +1569,7 @@ impl Pickers {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let open = self.open == Some(kind);
+        let open = self.open_kind() == Some(kind);
         div()
             .id(id)
             .h(px(20.0))
@@ -1653,7 +1681,8 @@ impl Pickers {
                 .unwrap_or_else(|| SharedString::from("Select ref")),
             None => self.ref_label(),
         };
-        let mut overlay: Option<(PickerKind, AnyElement)> = match self.open {
+        let closing = self.open.closing_since();
+        let mut overlay: Option<(PickerKind, AnyElement)> = match self.mounted_kind() {
             Some(PickerKind::Branch) => {
                 let content = self.render_branch_popover(cx);
                 Some((PickerKind::Branch, self.popover_frame(320.0, content, cx)))
@@ -1672,8 +1701,13 @@ impl Pickers {
             &theme,
             cx,
         );
-        let ref_side =
-            attach_overlay_end(ref_chip, &mut overlay, PickerKind::Branch, "branch-popover");
+        let ref_side = attach_overlay_end(
+            ref_chip,
+            &mut overlay,
+            PickerKind::Branch,
+            "branch-popover",
+            closing,
+        );
 
         if let Some(chat) = &session {
             // The checkout KIND is fixed at creation (harness resume is
@@ -1706,6 +1740,7 @@ impl Pickers {
                 &mut overlay,
                 PickerKind::Checkout,
                 "checkout-popover",
+                closing,
             ))
             .child(ref_side)
             .into_any_element(),
@@ -2485,11 +2520,12 @@ fn attach_overlay(
     overlay: &mut Option<(PickerKind, AnyElement)>,
     kind: PickerKind,
     id: &'static str,
+    closing: Option<std::time::Instant>,
 ) -> gpui::Stateful<gpui::Div> {
     if overlay.as_ref().is_some_and(|(k, _)| *k == kind)
         && let Some((_, element)) = overlay.take()
     {
-        return chip.child(popover::anchored_menu_above(id, element));
+        return chip.child(popover::anchored_menu_above(id, element, closing));
     }
     chip
 }
@@ -2501,13 +2537,14 @@ fn attach_overlay_end(
     overlay: &mut Option<(PickerKind, AnyElement)>,
     kind: PickerKind,
     id: &'static str,
+    closing: Option<std::time::Instant>,
 ) -> gpui::Stateful<gpui::Div> {
     if overlay.as_ref().is_some_and(|(k, _)| *k == kind)
         && let Some((_, element)) = overlay.take()
     {
         return chip
             .relative()
-            .child(popover::anchored_menu_above_end(id, element));
+            .child(popover::anchored_menu_above_end(id, element, closing));
     }
     chip
 }
@@ -2519,7 +2556,7 @@ impl Render for Pickers {
         // its keyboard focus here (re-claim until it sticks — the shell's
         // first-paint fallback focuses the composer after our first render).
         if self.boot_focus_pending {
-            match self.open {
+            match self.open_kind() {
                 Some(PickerKind::Branch) => {
                     self.search.update(cx, |input, cx| {
                         input.set_placeholder("Search refs…", cx);
@@ -2551,7 +2588,7 @@ impl Render for Pickers {
         // A popover opened data-side (KOMET_OPEN_PICKER) never went through
         // `toggle`, so kick its loads here (all ensure_* are idempotent).
         if matches!(
-            self.open,
+            self.open_kind(),
             Some(PickerKind::Branch) | Some(PickerKind::Checkout)
         ) && matches!(self.refs, Loadable::Idle)
         {
@@ -2601,7 +2638,8 @@ impl Render for Pickers {
         // Render the open popover's body first (mutable borrow), then the
         // chips. Branch/Checkout render in the composer FOOTER row (see
         // `render_footer`), not here.
-        let mut overlay: Option<(PickerKind, AnyElement)> = match self.open {
+        let closing = self.open.closing_since();
+        let mut overlay: Option<(PickerKind, AnyElement)> = match self.mounted_kind() {
             Some(PickerKind::Branch) | Some(PickerKind::Checkout) => None,
             Some(PickerKind::HarnessModel) => {
                 let content = self.render_harness_model_popover(cx);
@@ -2655,6 +2693,7 @@ impl Render for Pickers {
                 &mut overlay,
                 PickerKind::Space,
                 "space-popover",
+                closing,
             ));
         }
         // ONE combined model+effort chip (user request): brand icon + model
@@ -2683,6 +2722,7 @@ impl Render for Pickers {
                 &mut overlay,
                 PickerKind::HarnessModel,
                 "model-popover",
+                closing,
             ));
         div()
             .w_full()

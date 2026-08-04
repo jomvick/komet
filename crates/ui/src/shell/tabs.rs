@@ -499,7 +499,7 @@ impl Shell {
                             MouseButton::Right,
                             cx.listener(move |this, event: &MouseDownEvent, _, cx| {
                                 cx.stop_propagation();
-                                this.tab_menu = Some((menu_id.clone(), event.position));
+                                this.tab_menu.open((menu_id.clone(), event.position));
                                 cx.notify();
                             }),
                         )
@@ -717,13 +717,27 @@ impl Shell {
             .into_any_element()
     }
 
+    fn close_tab_menu(&mut self, cx: &mut Context<Self>) {
+        if self.tab_menu.begin_close() {
+            popover::reap_popup(cx, |shell: &mut Self| &mut shell.tab_menu);
+            cx.notify();
+        }
+    }
+
     /// Tab context menu (right-click): close, plus the bulk closes that apply
     /// at this tab's position — rows that would close nothing are omitted.
     pub(super) fn render_tab_menu(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let (chat_id, position) = self.tab_menu.clone()?;
+        let (chat_id, position) = self.tab_menu.get().cloned()?;
+        let closing = self.tab_menu.closing_since();
         let theme = Theme::of(cx).clone();
         let order = self.open_tab_ids(cx);
-        let ix = order.iter().position(|id| id == &chat_id)?;
+        let ix = match order.iter().position(|id| id == &chat_id) {
+            Some(ix) => ix,
+            // The tab itself vanished mid-exit ("Close tab") — keep the card
+            // mounted so the fade still plays.
+            None if closing.is_some() => 0,
+            None => return None,
+        };
         let has_others = order.len() > 1;
         let has_right = ix + 1 < order.len();
         let has_left = ix > 0;
@@ -737,7 +751,7 @@ impl Shell {
             popover::menu_row(&theme, false, format!("{id}-{target}"))
                 .id(id)
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    this.tab_menu = None;
+                    this.close_tab_menu(cx);
                     if keep_left && keep_right {
                         this.close_session_tab(target.clone(), cx);
                     } else {
@@ -750,8 +764,7 @@ impl Shell {
         let mut menu = popover::popover_card(&theme)
             .w(px(170.0))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                this.tab_menu = None;
-                cx.notify();
+                this.close_tab_menu(cx);
             }))
             .flex()
             .flex_col()
@@ -770,6 +783,7 @@ impl Shell {
             "tab-context-menu",
             position,
             menu.into_any_element(),
+            closing,
         ))
     }
 }
