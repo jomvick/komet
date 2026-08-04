@@ -79,6 +79,14 @@ const WASM_POISON_ABORT_AFTER = 3;
  * Freeing on idle returns blocks to the wasm allocator for reuse;
  * rematerialization is a 10-50ms cold replay. */
 const DOC_IDLE_RELEASE_MS = 60_000;
+/** Force-trim threshold: a room with NO trim-eligible checkpoint but a
+ * full-history snapshot this large trims at its CURRENT frontier instead of
+ * waiting days to age into RETAIN_DAYS eligibility. Behind/concurrent peers
+ * take the §3.1 stale-peer full resync (designed-for). Without this, the
+ * 2026-08-04 whale rooms (954KB / 1.8MB import chats, checkpoints first
+ * recorded today) would have kept re-materializing their full history into
+ * the pressed wasm heap for three more days of thrash. */
+const TRIM_FORCE_BYTES = 512 * 1024;
 
 interface SocketState {
   userId: string;
@@ -862,18 +870,25 @@ export class SessionRoom implements DurableObject {
   private async trimHistoryIfDue(doc: LoroDoc, now: number): Promise<boolean> {
     const checkpoints = JSON.parse(this.getMeta("checkpoints") ?? "[]") as FrontierCheckpoint[];
     const cutoff = checkpoints.filter((c) => now - c.at >= RETAIN_MS).pop();
-    if (!cutoff || (doc.isShallow() && this.getMeta("lastTrimAt") === String(cutoff.at))) {
+    let frontiers: { peer: `${number}`; counter: number }[];
+    if (cutoff && !(doc.isShallow() && this.getMeta("lastTrimAt") === String(cutoff.at))) {
+      frontiers = cutoff.frontiers.map((f) => ({ peer: f.peer as `${number}`, counter: f.counter }));
+    } else if (!doc.isShallow() && (this.blobs.get("snapshot")?.length ?? 0) > TRIM_FORCE_BYTES) {
+      // No aged checkpoint but the full history is already a heap hazard:
+      // trim at the current frontier (see TRIM_FORCE_BYTES).
+      frontiers = doc.frontiers().map((f) => ({ peer: String(f.peer) as `${number}`, counter: f.counter }));
+    } else {
       return false;
     }
     try {
       const shallow = doc.export({
         mode: "shallow-snapshot",
-        frontiers: cutoff.frontiers.map((f) => ({ peer: f.peer as `${number}`, counter: f.counter }))
+        frontiers
       });
       this.blobs.put("snapshot", shallow);
       this.ctx.storage.sql.exec("DELETE FROM updates");
       this.setMeta("updateBytes", "0");
-      this.setMeta("lastTrimAt", String(cutoff.at));
+      this.setMeta("lastTrimAt", String(cutoff?.at ?? now));
       // Make the trim durable NOW: a later kill in the same event (a join's
       // backfill export on a pressed isolate — observed live 2026-08-04)
       // rolls back uncommitted storage writes, silently resurrecting the
