@@ -71,6 +71,14 @@ let wasmPoisonStrikes = 0;
  * thrash. Aborting early turns a silent hours-long wedge into a seconds-long
  * blip (sockets close, clients redial into a fresh isolate). */
 const WASM_POISON_ABORT_AFTER = 3;
+/** Free a quiet room's materialized doc after this long. Wasm linear memory
+ * NEVER shrinks and outlives DO instances (one wasm module per isolate), so
+ * docs held resident until instance eviction leak permanently — every
+ * reconnect herd rematerialized every co-located room and the heap climbed
+ * monotonically to the isolate limit in minutes (2026-08-04 thrash loop).
+ * Freeing on idle returns blocks to the wasm allocator for reuse;
+ * rematerialization is a 10-50ms cold replay. */
+const DOC_IDLE_RELEASE_MS = 60_000;
 
 interface SocketState {
   userId: string;
@@ -109,6 +117,9 @@ export class SessionRoom implements DurableObject {
   /** In-memory fragment reassembly. Lost on hibernation → the sender gets a
    * FragmentTimeout ack for the unknown batch and resends — self-healing. */
   private readonly fragments = new Map<WebSocket, Map<string, FragmentBatch>>();
+  /** Idle-doc release bookkeeping (see DOC_IDLE_RELEASE_MS / touchDoc). */
+  private docIdleTimer: ReturnType<typeof setTimeout> | undefined;
+  private lastDocUse = 0;
 
   constructor(ctx: DurableObjectState, env: Env) {
     this.ctx = ctx;
@@ -404,6 +415,14 @@ export class SessionRoom implements DurableObject {
     wasmPoisonStrikes++;
     if (wasmPoisonStrikes < WASM_POISON_ABORT_AFTER) return;
     console.error(`wasm heap poisoned (${wasmPoisonStrikes} strikes); aborting isolate for a fresh heap`);
+    // Best effort: if abort recycles only the DO instance (not the whole
+    // isolate), at least this room's doc goes back to the wasm allocator.
+    try {
+      this.doc?.free();
+    } catch {
+      /* already poisoned beyond freeing */
+    }
+    this.doc = undefined;
     this.ctx.abort("loro-wasm heap exhausted; recycling isolate");
   }
 
@@ -636,6 +655,7 @@ export class SessionRoom implements DurableObject {
   // ── doc/ephemeral materialization ────────────────────────────────────────
 
   private async ensureDoc(): Promise<LoroDoc> {
+    this.touchDoc();
     if (this.doc) return this.doc;
     // AUTOMATED WEDGE BREAK: a cold replay that exceeds the DO CPU limit kills
     // the invocation before `replayAttempts` is cleared below — and every
@@ -722,6 +742,32 @@ export class SessionRoom implements DurableObject {
       console.log(`history trimmed on cold start room=${this.getMeta("chatId") ?? "?"}`);
     }
     return this.doc;
+  }
+
+  /** Idle-doc release (see DOC_IDLE_RELEASE_MS): a debounced timer frees the
+   * materialized doc after a quiet minute. Timer only exists while traffic
+   * keeps the DO awake — same hibernation discipline as the flush debounce.
+   * Buffered `pending` updates survive a release: cold replay re-imports
+   * them (see ensureDoc). */
+  private touchDoc(): void {
+    this.lastDocUse = Date.now();
+    if (this.docIdleTimer) return;
+    this.docIdleTimer = setTimeout(() => this.releaseIdleDoc(), DOC_IDLE_RELEASE_MS + 500);
+  }
+
+  private releaseIdleDoc(): void {
+    this.docIdleTimer = undefined;
+    if (!this.doc) return;
+    const idle = Date.now() - this.lastDocUse;
+    if (idle < DOC_IDLE_RELEASE_MS) {
+      this.docIdleTimer = setTimeout(
+        () => this.releaseIdleDoc(),
+        Math.max(DOC_IDLE_RELEASE_MS - idle, 1_000) + 500
+      );
+      return;
+    }
+    this.doc.free();
+    this.doc = undefined;
   }
 
   /** Drop the persisted update log + snapshot (the /reset-log storage clear):
