@@ -817,6 +817,42 @@ async fn probe_hint_rejoins_a_quiet_room_immediately() {
     client.shutdown().await.unwrap();
 }
 
+#[tokio::test(start_paused = true)]
+async fn own_write_acks_do_not_suppress_the_probe() {
+    // The 2026-08-04 deaf-socket shape: the room accepts and acks our writes
+    // but its broadcast fan-out skips us. A writer that commits more often
+    // than the probe interval used to reset the probe clock with every ack
+    // and was NEVER probed — the wedge could only end with an app restart.
+    let edge = FakeEdge::new();
+    let doc = LoroDoc::new();
+    let client = RoomClient::connect_with(edge.connector(), "room-1", doc.clone())
+        .await
+        .expect("connect");
+    doc.get_text("t").insert(0, "seed").unwrap();
+    doc.commit();
+    wait_until(|| doc_text(&edge.doc) == "seed").await;
+
+    let joins_before = edge.join_requests.load(Ordering::SeqCst);
+    // Keep writing (and getting acked) every 60s for a full probe interval
+    // plus slack. As the only client, nothing is ever broadcast BACK to us —
+    // exactly the deaf-receiver's inbound picture (acks only).
+    for i in 0..16 {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        doc.get_text("t").insert(0, &format!("w{i}")).unwrap();
+        doc.commit();
+    }
+    assert!(
+        edge.join_requests.load(Ordering::SeqCst) > joins_before,
+        "a steadily-acked but broadcast-quiet session must still be probed"
+    );
+    assert_eq!(
+        edge.dials.load(Ordering::SeqCst),
+        1,
+        "probing must ride the live socket"
+    );
+    client.shutdown().await.unwrap();
+}
+
 #[tokio::test]
 async fn corrupt_broadcasts_keep_healing_via_full_resync() {
     let edge = FakeEdge::new();

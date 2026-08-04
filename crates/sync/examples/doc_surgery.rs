@@ -1,5 +1,6 @@
 //! One-off recovery tool (untracked): inspect and repair chat/workspace docs
 //! in a docs.sqlite3 store. Modes:
+//!   dump-workspace    <data_dir>
 //!   inspect-workspace <data_dir> <chat_id>
 //!   inspect-chat      <data_dir> <chat_id>
 //!   cut-chat          <data_dir> <chat_id> <from_index>
@@ -24,6 +25,11 @@ fn main() {
     let store = DocsStore::open(data_dir).expect("open store");
 
     match mode {
+        "dump-workspace" => {
+            let doc = load_doc(&store, "workspace2");
+            let value = doc.get_deep_value().to_json_value();
+            println!("{}", serde_json::to_string_pretty(&value).unwrap());
+        }
         "inspect-workspace" => {
             let chat_id = args.get(3).expect("chat id");
             let doc = load_doc(&store, "workspace2");

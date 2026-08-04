@@ -510,6 +510,9 @@ pub struct Shell {
     /// Keys that just appeared in a live list (fade in, no glide).
     sidebar_new_keys: std::collections::HashSet<String>,
     resort_epoch: usize,
+    /// Last observed `window.is_window_active()` — rising edge fires a
+    /// ProbeSync so a broadcast-deaf room heals as the user looks at the app.
+    was_window_active: bool,
     /// Dev/testing knobs (`KOMET_OPEN_DIALOG`, `KOMET_FORCE_GATE`) — see
     /// [`Shell::new`].
     debug_dialog: Option<String>,
@@ -678,6 +681,7 @@ impl Shell {
             sidebar_resort: std::collections::HashMap::new(),
             sidebar_new_keys: std::collections::HashSet::new(),
             resort_epoch: 0,
+            was_window_active: false,
             debug_dialog,
             debug_gate,
             sidebar_tween: None,
@@ -3726,11 +3730,22 @@ impl Render for Shell {
 
         let root = match &gate {
             GatePhase::Ready => {
+                // Focus is a sync signal: on the rising edge of window
+                // activation, nudge every open room to verify liveness — a
+                // broadcast-deaf socket (accepted writes, runtime pongs,
+                // nothing delivered; 2026-08-04 incident) then heals within
+                // seconds of the user looking at the app rather than waiting
+                // out the background probe cadence.
+                let window_active = window.is_window_active();
+                if window_active && !self.was_window_active {
+                    self.state.update(cx, |s, cx| s.probe_sync(cx));
+                }
+                self.was_window_active = window_active;
                 // A run finishing while you're LOOKING at the session must not
                 // badge "completed" until you leave and return — mark it seen
                 // live while the window is active (idempotent guard inside;
                 // one extra frame settles it).
-                if window.is_window_active() {
+                if window_active {
                     let unseen_selected = {
                         let s = self.state.read(cx);
                         s.selected_chat_row()

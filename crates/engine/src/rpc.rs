@@ -974,6 +974,11 @@ impl RpcService for EngineRpc {
                     handle.watch_messages(),
                 )))
             }
+            methods::PROBE_SYNC => {
+                self.workspace.probe();
+                self.doc_host.probe_open_chats();
+                RpcReply::value(&serde_json::json!({}))
+            }
             methods::WATCH_CHATS => {
                 Ok(RpcReply::Stream(watch_stream(self.workspace.watch_chats())))
             }

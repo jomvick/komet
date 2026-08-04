@@ -305,6 +305,17 @@ impl WorkspaceHost {
         lock(&self.inner.room).is_some()
     }
 
+    /// Probe the workspace room's liveness NOW (window-focus sweep). The
+    /// room ignores the hint unless it has been broadcast-quiet ≥30s — and
+    /// own-write acks deliberately don't count as broadcast traffic, so a
+    /// deaf-receiving socket (2026-08-04 incident) is caught here within
+    /// seconds of the user looking at the app instead of minutes later.
+    pub fn probe(&self) {
+        if let Some(room) = lock(&self.inner.room).as_ref() {
+            room.probe();
+        }
+    }
+
     // ── watches (WatchChats / WatchDevices / merged WatchSessions) ──────────
 
     pub fn watch_chats(&self) -> watch::Receiver<Vec<Chat>> {

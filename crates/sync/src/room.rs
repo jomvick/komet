@@ -635,6 +635,7 @@ impl RoomActor {
             join_sent_at: None,
             join_is_probe: false,
             last_lor_rx: tokio::time::Instant::now(),
+            last_pushed_rx: tokio::time::Instant::now(),
         };
 
         let version = sess.local_version_bytes();
@@ -660,7 +661,7 @@ impl RoomActor {
             // case (zero frames ever) is unchanged.
             let (liveness_at, join_outstanding) = match sess.join_sent_at {
                 Some(sent) => (sent.max(sess.last_lor_rx) + JOIN_RESPONSE_DEADLINE, true),
-                None => (sess.last_lor_rx + probe_interval, false),
+                None => (sess.last_pushed_rx + probe_interval, false),
             };
             tokio::select! {
                 // Biased so a buffered answer frame always beats an expired
@@ -696,16 +697,17 @@ impl RoomActor {
                 frame = pipe.rx.recv() => match frame {
                     None => break SessionEnd::Lost(SyncError::WebSocket("connection closed".into())),
                     Some(bytes) => {
-                        let lor_before = sess.last_lor_rx;
+                        let pushed_before = sess.last_pushed_rx;
                         match sess.handle_frame(&bytes, ready).await {
                             Ok(None) => {}
                             Ok(Some(end)) => break end,
                             Err(err) => break SessionEnd::Lost(err),
                         }
-                        // Organic %LOR traffic resets the probe cadence;
-                        // frames in a probe's own wake do not (see
-                        // PROBE_REPLY_GRACE), and %EPH frames never do.
-                        if sess.last_lor_rx > lor_before
+                        // Organic PUSHED %LOR traffic resets the probe
+                        // cadence; frames in a probe's own wake do not (see
+                        // PROBE_REPLY_GRACE), %EPH frames never do, and acks
+                        // never do (see `last_pushed_rx`).
+                        if sess.last_pushed_rx > pushed_before
                             && last_probe_at.is_none_or(|at| at.elapsed() > PROBE_REPLY_GRACE)
                         {
                             probe_interval = ROOM_PROBE_AFTER;
@@ -736,13 +738,14 @@ impl RoomActor {
                 },
                 Some(_) = self.probe_rx.recv() => {
                     // On-demand probe (RoomClient::probe — a transcript watch
-                    // just attached): verify a quiet room NOW instead of
-                    // waiting out the background cadence. Skipped while a
-                    // join is in flight or when the room spoke %LOR recently
-                    // — a healthy, chatty room never sees these joins.
+                    // just attached, the app window focused): verify a quiet
+                    // room NOW instead of waiting out the background cadence.
+                    // Skipped while a join is in flight or when the room
+                    // PUSHED %LOR recently — a healthy, chatty room never
+                    // sees these joins, but own-write acks don't count.
                     if sess.joined_lor
                         && sess.join_sent_at.is_none()
-                        && sess.last_lor_rx.elapsed() >= PROBE_ON_DEMAND_MIN_QUIET
+                        && sess.last_pushed_rx.elapsed() >= PROBE_ON_DEMAND_MIN_QUIET
                     {
                         tracing::debug!(room = %self.room_id, "on-demand liveness probe");
                         let version = sess.local_version_bytes();
@@ -825,14 +828,25 @@ struct Session {
     /// Connected re-broadcast).
     join_is_probe: bool,
     /// Instant of the last inbound `%LOR` frame — the room-liveness clock
-    /// feeding both the join deadline and the probe timer. %EPH frames are
-    /// deliberately EXCLUDED: the edge's presence path never touches the doc
-    /// machinery, so eph acks/broadcasts keep arriving every ~15s from a
-    /// doc-wedged DO, and counting them silenced the probe and pinned the
-    /// join deadline open on exactly the room that wedged on 2026-07-30
-    /// (adversarial-review finding, round 2). Auto-pongs never reach this
-    /// layer at all (pump forwards only binary frames).
+    /// feeding the JOIN deadline. %EPH frames are deliberately EXCLUDED: the
+    /// edge's presence path never touches the doc machinery, so eph
+    /// acks/broadcasts keep arriving every ~15s from a doc-wedged DO, and
+    /// counting them silenced the probe and pinned the join deadline open on
+    /// exactly the room that wedged on 2026-07-30 (adversarial-review
+    /// finding, round 2). Auto-pongs never reach this layer at all (pump
+    /// forwards only binary frames).
     last_lor_rx: tokio::time::Instant,
+    /// Instant of the last SERVER-PUSHED `%LOR` frame (broadcasts, backfill,
+    /// join answers) — the PROBE clock. Acks are excluded here even though
+    /// they count for `last_lor_rx`: an ack only proves the request path,
+    /// and a DO that accepts our writes while its broadcast fan-out skips us
+    /// (2026-08-04 incident: work-laptop wrote rows every few seconds and
+    /// received nothing for the whole session) would otherwise reset the
+    /// probe with every own-write ack and never be probed at all. Acks DO
+    /// belong in the join deadline: a rejoin queued behind a slow-uplink
+    /// push backlog keeps eliciting acks, and killing that session mid-push
+    /// redialed healthy rooms (the original adversarial-review finding).
+    last_pushed_rx: tokio::time::Instant,
 }
 
 impl Session {
@@ -892,6 +906,13 @@ impl Session {
         };
         if crdt == CrdtType::Loro {
             self.last_lor_rx = tokio::time::Instant::now();
+            // The probe clock advances only on frames the SERVER chose to
+            // push (broadcasts, backfill, join answers) — never on acks,
+            // which a broadcast-skipping room keeps producing for our own
+            // writes (see `last_pushed_rx`).
+            if !matches!(message, ProtocolMessage::Ack { .. }) {
+                self.last_pushed_rx = self.last_lor_rx;
+            }
         }
         match message {
             ProtocolMessage::JoinResponseOk {
@@ -1035,6 +1056,14 @@ impl Session {
                     // (re-uploading full presence) and re-broadcast Connected
                     // (consumers treat it as "resync underway") on a timer.
                     return Ok(());
+                }
+                if ready.is_none() {
+                    // Mid-session rejoin (reconnect, stale-peer resync, full
+                    // resync). The 2026-08-04 incident recovered through this
+                    // exact path with ZERO log lines — the disconnect warned,
+                    // the recovery was silent, and the timeline was
+                    // unreconstructable. Rejoins are rare; log them.
+                    tracing::info!(room = %self.room_id, "room rejoined; backfill under way");
                 }
                 // Join presence once the doc room is up.
                 self.send(&ProtocolMessage::JoinRequest {

@@ -810,8 +810,19 @@ export class SessionRoom implements DurableObject {
       if (!state?.rooms.includes(crdt)) continue;
       try {
         ws.send(bytes);
-      } catch {
-        /* stale socket */
+      } catch (e) {
+        // A member socket we cannot send to is a DEAF PEER, not a skippable
+        // one: swallowing the failure left it looking alive (runtime
+        // auto-pongs, accepted writes) while it silently missed every
+        // broadcast until an app restart (2026-08-04 incident). Close it so
+        // the client's session ends and its redial + VV backfill heal the
+        // gap within seconds.
+        console.warn("broadcast send failed; closing socket", this.getMeta("chatId") ?? "?", String(e));
+        try {
+          ws.close(1011, "broadcast delivery failed");
+        } catch {
+          /* already gone */
+        }
       }
     }
   }

@@ -525,6 +525,18 @@ impl DocHost {
         }
     }
 
+    /// Probe every open chat's room (window-focus liveness sweep). Each
+    /// room ignores the hint unless it has been broadcast-quiet ≥30s.
+    pub fn probe_open_chats(&self) {
+        let handles: Vec<Arc<ChatDocHandle>> =
+            lock(&self.inner.handles).values().cloned().collect();
+        for handle in handles {
+            if let Some(room) = lock(&handle.room).as_ref() {
+                room.probe();
+            }
+        }
+    }
+
     /// Drop a chat's doc unconditionally and delete its local snapshot — the
     /// chat is gone (DeleteChat / DeleteSpace cascade). Watchers see the
     /// stream end; a racing writer keeps its orphaned doc until the run ends.
