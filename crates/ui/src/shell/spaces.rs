@@ -484,7 +484,8 @@ impl Shell {
                                     .child(tag),
                             )
                         })
-                        .when(is_selected, |el| el.child(popover::menu_check(theme)))
+                        // No check glyph — the selected row's wash (menu_row's
+                        // active styling) is the selection signal.
                     }),
             );
 
