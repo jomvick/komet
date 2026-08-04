@@ -275,8 +275,12 @@ async fn sync_cli(ipc_port: u16) -> anyhow::Result<()> {
             return "no room (dialing or edge-less)".into();
         };
         let get = |k: &str| room.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
+        // REJECTED is loud and only shown when nonzero: rejected writes with
+        // a fresh-looking room is exactly the latched-session wedge
+        // (2026-08-04) this readout previously masked.
+        let rejected = get("rejected");
         format!(
-            "{} pushed {} · acked {} · rejoins {} probes {} resyncs {} drops {}",
+            "{} pushed {} · acked {} · rejoins {} probes {} resyncs {} drops {}{}",
             if room.get("connected").and_then(|v| v.as_bool()) == Some(true) {
                 "connected ·"
             } else {
@@ -288,6 +292,11 @@ async fn sync_cli(ipc_port: u16) -> anyhow::Result<()> {
             get("probes"),
             get("fullResyncs"),
             get("disconnects"),
+            if rejected > 0 {
+                format!(" REJECTED {rejected}")
+            } else {
+                String::new()
+            },
         )
     };
     println!(

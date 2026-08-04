@@ -218,6 +218,9 @@ pub struct RoomStatsSnapshot {
     pub full_resyncs: u64,
     /// Sessions lost (transport drops, deadlines, requested redials).
     pub disconnects: u64,
+    /// Our writes the server REJECTED (InvalidUpdate/PermissionDenied acks).
+    /// Nonzero while `last_ack_ms` goes stale is the latched-session tell.
+    pub rejected: u64,
 }
 
 #[derive(Default)]
@@ -229,6 +232,7 @@ struct RoomStatsShared {
     probes: std::sync::atomic::AtomicU64,
     full_resyncs: std::sync::atomic::AtomicU64,
     disconnects: std::sync::atomic::AtomicU64,
+    rejected: std::sync::atomic::AtomicU64,
 }
 
 impl RoomStatsShared {
@@ -242,6 +246,7 @@ impl RoomStatsShared {
             probes: self.probes.load(Relaxed),
             full_resyncs: self.full_resyncs.load(Relaxed),
             disconnects: self.disconnects.load(Relaxed),
+            rejected: self.rejected.load(Relaxed),
         }
     }
 }
@@ -1026,11 +1031,23 @@ impl Session {
             // push (broadcasts, backfill, join answers) — never on acks,
             // which a broadcast-skipping room keeps producing for our own
             // writes (see `last_pushed_rx`).
-            if matches!(message, ProtocolMessage::Ack { .. }) {
-                self.stats.last_ack_ms.store(epoch_ms(), Relaxed);
-            } else {
-                self.last_pushed_rx = self.last_lor_rx;
-                self.stats.last_pushed_ms.store(epoch_ms(), Relaxed);
+            match &message {
+                ProtocolMessage::Ack { status, .. } => {
+                    // Only an Ok ack means the write LANDED. Counting every
+                    // ack made `komet sync` read "acked 0s ago" while the
+                    // server rejected every single update for hours
+                    // (2026-08-04 latched-session incident) — the one
+                    // counter built to expose that wedge was hiding it.
+                    if *status == UpdateStatusCode::Ok {
+                        self.stats.last_ack_ms.store(epoch_ms(), Relaxed);
+                    } else {
+                        self.stats.rejected.fetch_add(1, Relaxed);
+                    }
+                }
+                _ => {
+                    self.last_pushed_rx = self.last_lor_rx;
+                    self.stats.last_pushed_ms.store(epoch_ms(), Relaxed);
+                }
             }
         }
         match message {
@@ -1329,11 +1346,26 @@ impl Session {
                 self.pending.remove(&ref_id);
                 if crdt == CrdtType::Loro {
                     if self.invalid_rejoins >= MAX_INVALID_REJOINS {
+                        // NEVER latch a live session. "Giving up resubmission"
+                        // used to keep the socket alive while every write was
+                        // rejected forever — on 2026-08-04 home-laptop's chat
+                        // room burned its cap against a mid-incident reset
+                        // server doc, then sat latched for HOURS: transcripts
+                        // wrote locally, acks looked fresh (rejections count
+                        // as acks on the wire), every peer backfilled a doc
+                        // the server no longer had. One redial re-uploads our
+                        // full VV diff and converges; a genuinely stale peer
+                        // past a shallow start gets a bounded, VISIBLE retry
+                        // loop (disconnect warns each cycle) instead of a
+                        // silent freeze — the app-layer idempotent
+                        // resubmission still applies either way.
                         tracing::error!(
                             room = %self.room_id,
-                            "updates repeatedly rejected (stale peer past shallow start); giving up resubmission"
+                            "updates repeatedly rejected (stale peer or reset server doc); redialing fresh"
                         );
-                        return Ok(());
+                        return Err(SyncError::WebSocket(
+                            "resync cap exhausted: server keeps rejecting our updates; redialing".into(),
+                        ));
                     }
                     self.invalid_rejoins += 1;
                     // §3.1 stale peer: resync fresh (rejoin with our VV pulls

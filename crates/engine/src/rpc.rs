@@ -989,6 +989,7 @@ impl RpcService for EngineRpc {
                         "probes": s.probes,
                         "fullResyncs": s.full_resyncs,
                         "disconnects": s.disconnects,
+                        "rejected": s.rejected,
                     })
                 }
                 let workspace = self.workspace.sync_status();
