@@ -775,6 +775,87 @@ async fn quiet_healthy_room_is_probed_not_killed() {
     client.shutdown().await.unwrap();
 }
 
+#[tokio::test(start_paused = true)]
+async fn probe_hint_rejoins_a_quiet_room_immediately() {
+    let edge = FakeEdge::new();
+    let doc = LoroDoc::new();
+    let client = RoomClient::connect_with(edge.connector(), "room-1", doc.clone())
+        .await
+        .expect("connect");
+    doc.get_text("t").insert(0, "seed").unwrap();
+    doc.commit();
+    wait_until(|| doc_text(&edge.doc) == "seed").await;
+
+    // A hint right after %LOR traffic is a no-op: attach-happy UIs (tab
+    // flipping) must never turn into a join storm on a healthy room.
+    let joins_before = edge.join_requests.load(Ordering::SeqCst);
+    client.probe();
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(
+        edge.join_requests.load(Ordering::SeqCst),
+        joins_before,
+        "probe hints inside the quiet threshold must be ignored"
+    );
+
+    // Past the quiet threshold — but far inside the 15-min background
+    // cadence — the hint becomes an immediate liveness rejoin on the same
+    // socket, and stays a pure read.
+    tokio::time::sleep(Duration::from_secs(60)).await;
+    let updates_before = edge.loro_doc_updates.load(Ordering::SeqCst);
+    client.probe();
+    wait_until(|| edge.join_requests.load(Ordering::SeqCst) > joins_before).await;
+    assert_eq!(
+        edge.dials.load(Ordering::SeqCst),
+        1,
+        "on-demand probe must ride the live socket, not redial"
+    );
+    assert_eq!(
+        edge.loro_doc_updates.load(Ordering::SeqCst),
+        updates_before,
+        "on-demand probe must not upload DocUpdates"
+    );
+    client.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn corrupt_broadcasts_keep_healing_via_full_resync() {
+    let edge = FakeEdge::new();
+    let doc = LoroDoc::new();
+    let client = RoomClient::connect_with(edge.connector(), "room-1", doc.clone())
+        .await
+        .expect("connect");
+    let tx = edge.conns.lock().unwrap()[0].tx.clone();
+    let garbage = encode(&ProtocolMessage::DocUpdate {
+        crdt: CrdtType::Loro,
+        room_id: "room-1".into(),
+        updates: vec![vec![0xde, 0xad, 0xbe, 0xef]],
+        batch_id: new_batch_id(),
+    })
+    .expect("encode");
+
+    // First unimportable broadcast: the client requests a full snapshot
+    // backfill and converges on the state the broadcast was carrying.
+    edge.doc.get_text("t").insert(0, "one").unwrap();
+    edge.doc.commit();
+    tx.send(garbage.clone()).await.expect("send");
+    wait_until(|| doc_text(&doc) == "one").await;
+
+    // Second gap on the SAME session. The resync request used to be a
+    // one-shot latch, so this froze the doc silently (warn per update,
+    // socket healthy, nothing applying) until reconnect or app restart.
+    edge.doc.get_text("t").insert(0, "two").unwrap();
+    edge.doc.commit();
+    tx.send(garbage).await.expect("send");
+    wait_until(|| doc_text(&doc) == "twoone").await;
+
+    assert_eq!(
+        edge.dials.load(Ordering::SeqCst),
+        1,
+        "gap healing must not need a reconnect"
+    );
+    client.shutdown().await.unwrap();
+}
+
 /// The most important regression guard: the normal join/backfill/reconnect
 /// cycle still works with the incident fixes in place.
 #[tokio::test]

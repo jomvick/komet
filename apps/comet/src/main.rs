@@ -92,22 +92,52 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    // Everything logs to stdout: long-running modes at info, one-shot CLI
-    // commands at warn (RUST_LOG overrides either).
+    // Long-running modes log at info, one-shot CLI commands at warn (RUST_LOG
+    // overrides either).
     // loro's internal block-encode diagnostics log at info and flood
     // journald on every snapshot export — enough to fill a disk on a
     // long-running headless host. Quiet them by default (RUST_LOG still
     // overrides the whole filter).
-    let default_filter = match &cli.command {
-        None | Some(Command::Headless) => "info,loro_internal=warn,loro=warn",
-        Some(_) => "warn",
+    let long_running = matches!(&cli.command, None | Some(Command::Headless));
+    let default_filter = if long_running {
+        "info,loro_internal=warn,loro=warn"
+    } else {
+        "warn"
     };
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| default_filter.into()),
-        )
-        .init();
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| default_filter.into());
+    // Long-running modes mirror stdout logging to {data_dir}/logs — a headed
+    // app launched from Finder has no visible stdout, which left every sync
+    // wedge report ("stale until restart") with zero diagnostics even though
+    // the engine logs the exact failure line. One file per launch, previous
+    // launch kept as `.old`.
+    let log_file = if long_running {
+        let mode = if cli.command.is_some() {
+            "headless"
+        } else {
+            "headed"
+        };
+        open_log_file(mode)
+    } else {
+        None
+    };
+    {
+        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::util::SubscriberInitExt;
+        let registry = tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer());
+        match log_file {
+            Some(file) => registry
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_ansi(false)
+                        .with_writer(std::sync::Arc::new(file)),
+                )
+                .init(),
+            None => registry.init(),
+        }
+    }
 
     match cli.command {
         Some(Command::Headless) => {
@@ -204,4 +234,18 @@ fn harness_from_env() -> komet_engine::HarnessId {
 fn dirs_data_dir() -> std::path::PathBuf {
     let home = std::env::var_os("HOME").expect("HOME not set");
     std::path::PathBuf::from(home).join(".komet-native")
+}
+
+/// `{data_dir}/logs/komet-{mode}.log`, previous launch preserved as `.old`.
+/// Headed and headless are separate files so an embedded-engine app and a
+/// daemon on the same machine never interleave writes.
+fn open_log_file(mode: &str) -> Option<std::fs::File> {
+    let dir = std::env::var_os("KOMET_DATA_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(dirs_data_dir)
+        .join("logs");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join(format!("komet-{mode}.log"));
+    let _ = std::fs::rename(&path, dir.join(format!("komet-{mode}.log.old")));
+    std::fs::File::create(&path).ok()
 }

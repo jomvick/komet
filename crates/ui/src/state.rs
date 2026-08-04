@@ -901,8 +901,15 @@ fn spawn_transcript_watch(
     chat_id: String,
 ) -> Task<()> {
     cx.spawn(async move |this, cx| {
-        // Outer loop: a delta desync (missed frame, schema skew) resubscribes;
-        // the fresh stream opens with a full reset that heals the copy.
+        // Outer loop: a delta desync (missed frame) resubscribes immediately
+        // and the fresh stream's opening reset heals the copy; a subscribe
+        // failure, malformed frame, or stream end retries on a delay. Every
+        // path re-enters the loop — a return here freezes the transcript
+        // with no banner and no heal short of an app restart (this watch and
+        // its engine-side room are the ONLY transcript delivery path). The
+        // task itself is dropped by select_chat/apply_chats when the chat is
+        // deselected or deleted, so retrying can't outlive relevance.
+        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
         'resubscribe: loop {
             let params = serde_json::json!({ "chatId": chat_id });
             let mut rx = match handle
@@ -912,16 +919,25 @@ fn spawn_transcript_watch(
             {
                 Ok(rx) => rx,
                 Err(err) => {
-                    tracing::warn!(%chat_id, error = %err, "transcript watch failed");
-                    return;
+                    tracing::warn!(%chat_id, error = %err, "transcript watch failed; retrying");
+                    if this.update(cx, |_, _| {}).is_err() {
+                        return;
+                    }
+                    cx.background_executor().timer(RETRY_DELAY).await;
+                    continue 'resubscribe;
                 }
             };
             while let Some(value) = rx.recv().await {
                 let frame: TranscriptFrame = match serde_json::from_value(value) {
                     Ok(frame) => frame,
                     Err(err) => {
-                        tracing::warn!(error = %err, "dropping malformed transcript frame");
-                        continue;
+                        // Schema skew (a newer peer's entry shape arriving
+                        // through sync): a skipped frame is a silently stale
+                        // copy, so resubscribe for a fresh reset — delayed,
+                        // in case the reset itself is what can't parse.
+                        tracing::warn!(error = %err, "malformed transcript frame; resubscribing");
+                        cx.background_executor().timer(RETRY_DELAY).await;
+                        continue 'resubscribe;
                     }
                 };
                 let mut desync = false;
@@ -942,7 +958,13 @@ fn spawn_transcript_watch(
                     continue 'resubscribe;
                 }
             }
-            return; // stream ended: chat deleted or engine gone
+            // Stream ended: engine restart, RPC drop, or chat purge. Retry;
+            // the purge case is cleaned up by apply_chats dropping this task.
+            tracing::debug!(%chat_id, "transcript stream ended; resubscribing");
+            if this.update(cx, |_, _| {}).is_err() {
+                return;
+            }
+            cx.background_executor().timer(RETRY_DELAY).await;
         }
     })
 }

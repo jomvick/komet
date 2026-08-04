@@ -53,6 +53,12 @@ const RESIDENT_BYTES_PER_SNAPSHOT_BYTE: usize = 6;
 /// Floor per open doc (room socket buffers, tasks) regardless of content size.
 const DOC_RESIDENT_FLOOR_BYTES: usize = 512 * 1024;
 
+/// Docs touched this recently are never evicted. Closes the open→attach race:
+/// `open()` returns a handle, and until the caller's `watch_messages` lands
+/// the doc is unwatched and unpinned — a concurrent eviction would orphan the
+/// watcher on a roomless doc that renders once and never updates again.
+const EVICT_MIN_IDLE_MS: i64 = 30_000;
+
 /// Edge connection config. The bearer is a **provider**, never a snapshot:
 /// every room (re)connect and HTTP request re-reads it, so WorkOS access-token
 /// refreshes (~1h expiry) take effect without an engine restart. Dev bearers
@@ -188,6 +194,13 @@ impl ChatDocHandle {
     /// commit it sat through in the background.
     pub fn watch_messages(&self) -> watch::Receiver<Vec<SessionMessageEntry>> {
         self.touch();
+        // Attach is a user signal: verify a quiet room is actually alive
+        // (a doc-wedged DO keeps answering pings while delivering nothing,
+        // and the background probe cadence can be hours out). Coalescing
+        // no-op on a healthy or recently-active room.
+        if let Some(room) = lock(&self.room).as_ref() {
+            room.probe();
+        }
         // Subscribe BEFORE the dirty check: a commit racing this attach then
         // sees a live receiver and publishes, instead of re-marking dirty
         // after our refresh and leaving the new watcher a cleared mirror.
@@ -380,22 +393,53 @@ impl DocHost {
             handles.insert(chat_id.to_string(), handle.clone());
         }
 
-        // Edge room join — offline-tolerant: a failed join logs and stays local-first.
+        // Edge room join — offline-tolerant AND supervised. `RoomClient` only
+        // self-reconnects AFTER a first successful join; a one-shot attempt
+        // here (the pre-LRU design) left the doc silently local-only until
+        // app restart whenever the dial hit a transient gap — a post-wake
+        // network, `Auth::token()` momentarily `None` around a refresh, an
+        // edge deploy. The LRU made that dice-roll constant (every reopen),
+        // and a watched doc is pinned against eviction, so nothing ever
+        // retried: the exact "transcript frozen until restart" report.
+        // Retry on the workspace host's capped, jittered backoff; a system
+        // wake redials immediately; eviction/purge ends the loop via `weak`.
         if let Some(edge) = &self.inner.config.edge {
             let url = edge.room_url(format!("/session/{chat_id}/ws"));
             let room_doc = doc.doc().clone();
             let chat = chat_id.to_string();
             let weak = Arc::downgrade(&handle);
             tokio::spawn(async move {
-                match RoomClient::connect_via(url, &chat, room_doc).await {
-                    Ok(client) => {
-                        if let Some(handle) = weak.upgrade() {
+                let mut wake = komet_sync::wake::subscribe();
+                let mut backoff = crate::workspace_host::JOIN_RETRY_BASE;
+                loop {
+                    if weak.upgrade().is_none() {
+                        return; // evicted or purged while dialing
+                    }
+                    match RoomClient::connect_via(url.clone(), &chat, room_doc.clone()).await {
+                        Ok(client) => {
+                            let Some(handle) = weak.upgrade() else {
+                                return; // evicted mid-dial: drop leaves the room
+                            };
                             *lock(&handle.room) = Some(client);
                             tracing::info!(chat = %chat, "session room joined");
+                            return;
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                chat = %chat,
+                                error = %err,
+                                backoff_ms = backoff.as_millis() as u64,
+                                "session room join failed; retrying"
+                            );
                         }
                     }
-                    Err(err) => {
-                        tracing::warn!(chat = %chat, error = %err, "session room join failed; staying offline");
+                    tokio::select! {
+                        _ = tokio::time::sleep(backoff + crate::workspace_host::join_retry_jitter()) => {
+                            backoff = (backoff * 2).min(crate::workspace_host::JOIN_RETRY_CAP);
+                        }
+                        _ = wake.recv() => {
+                            backoff = crate::workspace_host::JOIN_RETRY_BASE;
+                        }
                     }
                 }
             });
@@ -425,7 +469,11 @@ impl DocHost {
                 .collect()
         };
         by_age.sort_unstable();
-        for (_, chat_id) in by_age {
+        for (last_access, chat_id) in by_age {
+            if now_ms() - last_access < EVICT_MIN_IDLE_MS {
+                // Sorted oldest-first: everything after this is younger.
+                return;
+            }
             let (count, estimate) = {
                 let handles = lock(&self.inner.handles);
                 (

@@ -127,12 +127,23 @@ const ROOM_PROBE_MAX: Duration = Duration::from_secs(4 * 3600);
 /// (JoinResponseOk + backfill envelope), not organic traffic — they must not
 /// reset the probe backoff or every probe would reset its own decay.
 const PROBE_REPLY_GRACE: Duration = Duration::from_secs(30);
+/// On-demand probes ([`RoomClient::probe`] — e.g. a transcript watch
+/// attaching) are ignored unless the room has been %LOR-quiet at least this
+/// long: tab-flipping must never turn into a join storm on a healthy room.
+const PROBE_ON_DEMAND_MIN_QUIET: Duration = Duration::from_secs(30);
 const BACKOFF_BASE: Duration = Duration::from_millis(250);
 const BACKOFF_CAP: Duration = Duration::from_secs(30);
 /// Stop resubmitting after this many InvalidUpdate-triggered rejoins in one
 /// session — our history predates the room's shallow start and can never
 /// import; recovery is an app-layer concern (§3.1).
 const MAX_INVALID_REJOINS: u32 = 3;
+/// Cap on full-snapshot resync requests per session. This was once a
+/// one-shot latch: after a single failed import + heal, the NEXT gap on the
+/// same wedged-but-alive socket froze the doc silently forever (one warn
+/// line per update, pongs flowing, nothing applying — user-visible as
+/// "stale until app restart"). A few serialized heals per session keeps the
+/// original loop protection without the permanent freeze.
+const MAX_FULL_RESYNCS: u32 = 3;
 
 /// Errors surfaced by [`RoomClient`].
 #[derive(Debug, Clone, thiserror::Error)]
@@ -184,6 +195,27 @@ pub enum RoomEvent {
     EphemeralUpdate,
     /// The server evicted us; the client will NOT reconnect.
     Evicted,
+}
+
+/// Per-room tuning knobs. Defaults match the per-chat fleet economics
+/// documented on [`ROOM_PROBE_MAX`]; single-instance rooms whose steady state
+/// is %LOR-silent by design (the workspace doc — presence rides `%EPH`, which
+/// deliberately never resets the probe) should cap the decay lower, because
+/// for them the probe is the ONLY thing that can notice a mute room.
+#[derive(Clone, Copy, Debug)]
+pub struct RoomTuning {
+    /// Cap for the quiet-room rejoin-probe backoff (`ROOM_PROBE_AFTER`
+    /// doubling up to this). Lower = faster detection of a wedged room, more
+    /// hibernation wakes on the DO.
+    pub probe_max: Duration,
+}
+
+impl Default for RoomTuning {
+    fn default() -> Self {
+        Self {
+            probe_max: ROOM_PROBE_MAX,
+        }
+    }
 }
 
 /// A byte-frame duplex to the room: `tx` outbound, `rx` inbound. Closing
@@ -297,6 +329,7 @@ pub struct RoomClient {
     eph: EphemeralStore,
     events: broadcast::Sender<RoomEvent>,
     shutdown: watch::Sender<bool>,
+    probe: mpsc::Sender<()>,
     task: Option<tokio::task::JoinHandle<()>>,
     /// Doc + ephemeral local-update subscriptions (drop = unsubscribe).
     _subs: Vec<loro::Subscription>,
@@ -327,14 +360,35 @@ impl RoomClient {
         room_id: &str,
         doc: LoroDoc,
     ) -> Result<Self, SyncError> {
-        let connector = Arc::new(WsConnector { url: provider });
-        Self::connect_with(connector, room_id, doc).await
+        Self::connect_via_tuned(provider, room_id, doc, RoomTuning::default()).await
     }
 
+    /// [`Self::connect_via`] with explicit [`RoomTuning`].
+    pub async fn connect_via_tuned(
+        provider: Arc<dyn UrlProvider>,
+        room_id: &str,
+        doc: LoroDoc,
+        tuning: RoomTuning,
+    ) -> Result<Self, SyncError> {
+        let connector = Arc::new(WsConnector { url: provider });
+        Self::connect_with_tuned(connector, room_id, doc, tuning).await
+    }
+
+    /// Test seam: production always dials through [`Self::connect_via_tuned`].
+    #[cfg(test)]
     pub(crate) async fn connect_with(
         connector: Arc<dyn Connector>,
         room_id: &str,
         doc: LoroDoc,
+    ) -> Result<Self, SyncError> {
+        Self::connect_with_tuned(connector, room_id, doc, RoomTuning::default()).await
+    }
+
+    pub(crate) async fn connect_with_tuned(
+        connector: Arc<dyn Connector>,
+        room_id: &str,
+        doc: LoroDoc,
+        tuning: RoomTuning,
     ) -> Result<Self, SyncError> {
         let eph = EphemeralStore::new(EPHEMERAL_TIMEOUT_MS);
 
@@ -352,6 +406,7 @@ impl RoomClient {
         let (events, _) = broadcast::channel(256);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (ready_tx, ready_rx) = oneshot::channel();
+        let (probe_tx, probe_rx) = mpsc::channel(1);
 
         let actor = RoomActor {
             doc: doc.clone(),
@@ -360,6 +415,8 @@ impl RoomClient {
             connector,
             local_rx,
             eph_rx,
+            probe_rx,
+            tuning,
             events: events.clone(),
             shutdown: shutdown_rx,
         };
@@ -371,6 +428,7 @@ impl RoomClient {
                 eph,
                 events,
                 shutdown: shutdown_tx,
+                probe: probe_tx,
                 task: Some(task),
                 _subs: vec![sub_doc, sub_eph],
             }),
@@ -399,6 +457,17 @@ impl RoomClient {
     /// Subscribe to connection/sync lifecycle events.
     pub fn events(&self) -> broadcast::Receiver<RoomEvent> {
         self.events.subscribe()
+    }
+
+    /// Hint that someone just started relying on this room (a transcript
+    /// watch attached, a viewport focused): if the room has been %LOR-quiet
+    /// past [`PROBE_ON_DEMAND_MIN_QUIET`], the actor rejoins as an immediate
+    /// liveness probe instead of waiting out the background probe cadence
+    /// (15min doubling to hours). A missed/skipped broadcast otherwise
+    /// freezes exactly the doc the user is looking at, with the heal that
+    /// far away. Coalescing and cheap — safe to call on every attach.
+    pub fn probe(&self) {
+        let _ = self.probe.try_send(());
     }
 
     /// Leave the room (protocol `Leave` frames + close handshake) and stop the
@@ -436,6 +505,8 @@ struct RoomActor {
     connector: Arc<dyn Connector>,
     local_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     eph_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    probe_rx: mpsc::Receiver<()>,
+    tuning: RoomTuning,
     events: broadcast::Sender<RoomEvent>,
     shutdown: watch::Receiver<bool>,
 }
@@ -522,6 +593,9 @@ impl RoomActor {
                     _ = self.shutdown.changed() => return,
                     Some(_) = self.local_rx.recv() => {}
                     Some(_) = self.eph_rx.recv() => {}
+                    // Probe hints while disconnected: the redial itself is
+                    // the probe, nothing to remember.
+                    Some(_) = self.probe_rx.recv() => {}
                 }
             };
             if woke {
@@ -557,7 +631,7 @@ impl RoomActor {
             joined_lor: false,
             joined_eph: false,
             invalid_rejoins: 0,
-            full_resync_requested: false,
+            full_resyncs: 0,
             join_sent_at: None,
             join_is_probe: false,
             last_lor_rx: tokio::time::Instant::now(),
@@ -660,6 +734,28 @@ impl RoomActor {
                         }
                     }
                 },
+                Some(_) = self.probe_rx.recv() => {
+                    // On-demand probe (RoomClient::probe — a transcript watch
+                    // just attached): verify a quiet room NOW instead of
+                    // waiting out the background cadence. Skipped while a
+                    // join is in flight or when the room spoke %LOR recently
+                    // — a healthy, chatty room never sees these joins.
+                    if sess.joined_lor
+                        && sess.join_sent_at.is_none()
+                        && sess.last_lor_rx.elapsed() >= PROBE_ON_DEMAND_MIN_QUIET
+                    {
+                        tracing::debug!(room = %self.room_id, "on-demand liveness probe");
+                        let version = sess.local_version_bytes();
+                        if let Err(err) = sess.send_join_loro(version).await {
+                            break SessionEnd::Lost(err);
+                        }
+                        sess.join_is_probe = true;
+                        last_probe_at = Some(tokio::time::Instant::now());
+                        // Someone is actively relying on the room again —
+                        // restart the background cadence from its base.
+                        probe_interval = ROOM_PROBE_AFTER;
+                    }
+                }
                 _ = tokio::time::sleep_until(liveness_at) => {
                     if join_outstanding {
                         // The 2026-07-30 hang: a room that accepted the socket
@@ -686,7 +782,7 @@ impl RoomActor {
                     }
                     sess.join_is_probe = true;
                     last_probe_at = Some(tokio::time::Instant::now());
-                    probe_interval = (probe_interval * 2).min(ROOM_PROBE_MAX);
+                    probe_interval = (probe_interval * 2).min(self.tuning.probe_max);
                 }
             }
         };
@@ -717,7 +813,9 @@ struct Session {
     joined_lor: bool,
     joined_eph: bool,
     invalid_rejoins: u32,
-    full_resync_requested: bool,
+    /// Full-snapshot resyncs requested this session (capped at
+    /// [`MAX_FULL_RESYNCS`], serialized behind the outstanding-join check).
+    full_resyncs: u32,
     /// Instant of the last `%LOR` JoinRequest still awaiting `JoinResponseOk`
     /// (initial join, stale-peer rejoin, or liveness probe); `None` once
     /// answered. `run_session` enforces `JOIN_RESPONSE_DEADLINE` on it.
@@ -979,10 +1077,14 @@ impl Session {
                         Ok(_) => imported = true,
                         Err(err) => {
                             tracing::warn!(room = %self.room_id, error = %err, "remote update import failed");
-                            if !self.full_resync_requested {
-                                // Ask for a full snapshot backfill once; import
-                                // of a snapshot merges, so this heals gaps.
-                                self.full_resync_requested = true;
+                            // Ask for a full snapshot backfill; a snapshot
+                            // import merges, so this heals gaps. Serialized
+                            // behind the outstanding-join check and capped
+                            // per session — but never a one-shot latch,
+                            // which froze the doc silently on the second
+                            // gap of a long-lived session.
+                            if self.join_sent_at.is_none() && self.full_resyncs < MAX_FULL_RESYNCS {
+                                self.full_resyncs += 1;
                                 self.send_join_loro(Vec::new()).await?;
                             }
                         }

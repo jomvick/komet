@@ -60,12 +60,20 @@ const SNAPSHOT_DEBOUNCE_MS: u64 = 1_000;
 /// fails must not strand the device offline until an app restart — retry until
 /// it lands. Jittered so N devices restarting together don't resynchronize
 /// their retries into a thundering herd on the cold DO.
-const JOIN_RETRY_BASE: std::time::Duration = std::time::Duration::from_millis(500);
-const JOIN_RETRY_CAP: std::time::Duration = std::time::Duration::from_secs(30);
+pub(crate) const JOIN_RETRY_BASE: std::time::Duration = std::time::Duration::from_millis(500);
+pub(crate) const JOIN_RETRY_CAP: std::time::Duration = std::time::Duration::from_secs(30);
+/// Probe-cadence cap for the workspace room: fixed at the 15-minute base, no
+/// decay. This room's steady state is zero %LOR by design (heartbeats ride
+/// %EPH, which deliberately never resets the probe), so the default decay
+/// always bottomed out at 4h — leaving a doc-wedged-but-pinging workspace DO
+/// undetected for hours on exactly the room that drives the sidebar
+/// ("Working" indicators, finished sessions). One room per engine, so the
+/// fixed cadence costs ~100 DO wakes/day total, not per chat.
+const WORKSPACE_PROBE_MAX: std::time::Duration = std::time::Duration::from_secs(900);
 
 /// Cheap decorrelation jitter (0–500ms) without pulling in a rng — derived from
 /// the sub-nanosecond wall clock. Mirrors the device relay's `jitter()`.
-fn join_retry_jitter() -> std::time::Duration {
+pub(crate) fn join_retry_jitter() -> std::time::Duration {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
@@ -228,7 +236,12 @@ impl WorkspaceHost {
                 if weak.upgrade().is_none() {
                     return; // host dropped
                 }
-                match RoomClient::connect_via(url.clone(), &room_id, room_doc.clone()).await {
+                let tuning = komet_sync::RoomTuning {
+                    probe_max: WORKSPACE_PROBE_MAX,
+                };
+                match RoomClient::connect_via_tuned(url.clone(), &room_id, room_doc.clone(), tuning)
+                    .await
+                {
                     Ok(client) => {
                         client.ephemeral().set(&presence_key(&device_id), now_ms());
                         let mut events = client.events();
