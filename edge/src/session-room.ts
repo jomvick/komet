@@ -700,12 +700,25 @@ export class SessionRoom implements DurableObject {
       `room=${this.getMeta("chatId") ?? "?"}`
     );
     this.doc = doc;
+    // Record a frontier checkpoint on cold start too: the alarm only records
+    // while WRITES keep it armed, so an idle room never aged into trim
+    // eligibility — it could never shrink, ever. One checkpoint a day max.
+    const checkpoints = JSON.parse(this.getMeta("checkpoints") ?? "[]") as FrontierCheckpoint[];
+    const newest = checkpoints[checkpoints.length - 1];
+    if (!newest || Date.now() - newest.at >= DAY_MS) {
+      checkpoints.push({
+        at: Date.now(),
+        frontiers: doc.frontiers().map((f) => ({ peer: String(f.peer), counter: f.counter }))
+      });
+      while (checkpoints.length > MAX_CHECKPOINTS) checkpoints.shift();
+      this.setMeta("checkpoints", JSON.stringify(checkpoints));
+    }
     // Trim on cold materialization too: fold and alarm both ride WRITES, so
     // an idle-but-watched room NEVER trimmed — yet every isolate restart
     // re-materializes its full history into the shared wasm heap (the
     // 2026-08-04 exhaustion recurred post-fix on exactly those rooms). The
     // one-off export cost here permanently shrinks the room.
-    if (this.trimHistoryIfDue(doc, Date.now())) {
+    if (await this.trimHistoryIfDue(doc, Date.now())) {
       console.log(`history trimmed on cold start room=${this.getMeta("chatId") ?? "?"}`);
     }
     return this.doc;
@@ -787,7 +800,7 @@ export class SessionRoom implements DurableObject {
    * lossless full snapshot when no trim is due (or the trim export fails). */
   private async foldLog(): Promise<void> {
     const doc = await this.ensureDoc();
-    if (this.trimHistoryIfDue(doc, Date.now())) return;
+    if (await this.trimHistoryIfDue(doc, Date.now())) return;
     this.blobs.put("snapshot", doc.export({ mode: "snapshot" }));
     this.ctx.storage.sql.exec("DELETE FROM updates");
     this.setMeta("updateBytes", "0");
@@ -800,7 +813,7 @@ export class SessionRoom implements DurableObject {
    * is CONSUMED: its wasm memory is freed, callers must switch to
    * `this.doc`). Best-effort: any export failure leaves the room to the
    * caller's lossless fold. */
-  private trimHistoryIfDue(doc: LoroDoc, now: number): boolean {
+  private async trimHistoryIfDue(doc: LoroDoc, now: number): Promise<boolean> {
     const checkpoints = JSON.parse(this.getMeta("checkpoints") ?? "[]") as FrontierCheckpoint[];
     const cutoff = checkpoints.filter((c) => now - c.at >= RETAIN_MS).pop();
     if (!cutoff || (doc.isShallow() && this.getMeta("lastTrimAt") === String(cutoff.at))) {
@@ -815,6 +828,11 @@ export class SessionRoom implements DurableObject {
       this.ctx.storage.sql.exec("DELETE FROM updates");
       this.setMeta("updateBytes", "0");
       this.setMeta("lastTrimAt", String(cutoff.at));
+      // Make the trim durable NOW: a later kill in the same event (a join's
+      // backfill export on a pressed isolate — observed live 2026-08-04)
+      // rolls back uncommitted storage writes, silently resurrecting the
+      // full-history snapshot the trim just replaced.
+      await this.ctx.storage.sync();
       const fresh = new LoroDoc();
       fresh.import(shallow);
       this.doc = fresh;
@@ -847,7 +865,7 @@ export class SessionRoom implements DurableObject {
     //    (Also fires from foldLog, which is what usually gets there first on
     //    a high-churn room.)
     this.setMeta("checkpoints", JSON.stringify(checkpoints));
-    this.trimHistoryIfDue(doc, now);
+    await this.trimHistoryIfDue(doc, now);
 
     // 3. Nightly R2 backup (§3.3) — full current snapshot, disaster hatch.
     // Two guards (round-2 review): postReset pauses the put between a
