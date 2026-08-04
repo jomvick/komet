@@ -203,6 +203,12 @@ export default {
       if (parts[2] === "stats" && request.method === "GET") {
         return forward(env.SESSION_ROOMS, room, request, auth.userId, "/stats", "", "workspace");
       }
+      // Raw doc snapshot: the repair/reseed read (2026-08-04: a device stranded
+      // behind the shallow-locked rebuild converges by replacing its local
+      // workspace doc with this — see the incident repair recipe).
+      if (parts[2] === "snapshot" && request.method === "GET") {
+        return forward(env.SESSION_ROOMS, room, request, auth.userId, "/snapshot", "", "workspace");
+      }
       // Operator wedge-break: clear a workspace room whose update log grew big
       // enough to CPU-reset the DO on every cold start (org-membership already
       // checked; state re-uploads from each device's local doc on rejoin).
