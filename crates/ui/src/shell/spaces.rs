@@ -309,7 +309,9 @@ impl Shell {
                     .flex_none()
                     .text_color(theme.text_muted),
             )
-            .child(div().min_w_0().truncate().child(label))
+            // flex_1 pushes the caret to the trigger's right edge and gives
+            // long space names a bound to truncate against.
+            .child(div().flex_1().min_w_0().truncate().child(label))
             .child(
                 icon(icons::ALT_ARROW_DOWN)
                     .size(px(14.0))
