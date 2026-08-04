@@ -1312,24 +1312,25 @@ impl Pickers {
     fn filtered_space_rows(&self, cx: &App) -> Vec<Space> {
         let query = self.search.read(cx).text().to_string();
         let state = self.state.read(cx);
-        let names: Vec<String> = state
-            .spaces
+        let spaces = state.spaces_sorted();
+        let names: Vec<String> = spaces
             .iter()
             .map(|s| s.display_name().to_string())
             .collect();
         popover::filter_indices(&query, &names)
             .into_iter()
-            .map(|ix| state.spaces[ix].clone())
+            .map(|ix| spaces[ix].clone())
             .collect()
     }
 
-    /// Row index of the currently selected space (un-searched open).
+    /// Row index of the currently selected space (un-searched open) — within
+    /// the sorted order [`filtered_space_rows`] lists on an empty query.
     fn selected_space_index(&self, cx: &App) -> usize {
         let state = self.state.read(cx);
         state
             .selected_space
             .as_deref()
-            .and_then(|id| state.spaces.iter().position(|s| s.id == id))
+            .and_then(|id| state.spaces_sorted().iter().position(|s| s.id == id))
             .unwrap_or(0)
     }
 

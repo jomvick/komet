@@ -555,6 +555,15 @@ impl AppState {
         self.spaces.iter().find(|s| s.id == space_id)
     }
 
+    /// Spaces in display order — case-insensitive alphabetical, the order
+    /// both space selectors (sidebar filter, composer picker) list rows in.
+    /// Ties break on id so the order is stable across renders.
+    pub fn spaces_sorted(&self) -> Vec<&Space> {
+        let mut spaces: Vec<&Space> = self.spaces.iter().collect();
+        spaces.sort_by_key(|s| (s.display_name().to_lowercase(), s.id.clone()));
+        spaces
+    }
+
     pub fn space_for_chat(&self, chat: &Chat) -> Option<&Space> {
         self.space_row(chat.space_id.as_deref()?)
     }
