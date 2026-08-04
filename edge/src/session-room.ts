@@ -291,6 +291,7 @@ export class SessionRoom implements DurableObject {
         | number
         | undefined;
       this.dropLog();
+      this.doc?.free(); // release the wasm memory, don't wait on GC finalizers
       this.doc = undefined; // force a fresh (empty) materialization next join
       // Boot any currently-attached %LOR/%EPH sockets so their hung/half-cold
       // sessions bail and reconnect into the now-empty doc.
@@ -438,20 +439,34 @@ export class SessionRoom implements DurableObject {
       const doc = await this.ensureDoc();
       if (!state.rooms.includes(message.crdt)) state.rooms.push(message.crdt);
       ws.serializeAttachment(state);
-      this.send(ws, {
-        type: MessageType.JoinResponseOk,
-        crdt: message.crdt,
-        roomId: message.roomId,
-        permission: "write",
-        version: doc.version().encode()
-      });
+      // Wasm-bindgen objects (VersionVector here and below) free their wasm
+      // memory only via GC finalizers — and V8 has no reason to collect when
+      // the pressure is in WASM linear memory, not the JS heap. Under join
+      // storms these leaked per-answer until the isolate hit its memory
+      // limit (2026-08-04 exhaustion). Free explicitly.
+      const vv = doc.version();
+      try {
+        this.send(ws, {
+          type: MessageType.JoinResponseOk,
+          crdt: message.crdt,
+          roomId: message.roomId,
+          permission: "write",
+          version: vv.encode()
+        });
+      } finally {
+        vv.free();
+      }
       let backfill: Uint8Array;
       if (message.version.length > 0) {
+        let from: VersionVector | undefined;
         try {
-          backfill = doc.export({ mode: "update", from: VersionVector.decode(message.version) });
+          from = VersionVector.decode(message.version);
+          backfill = doc.export({ mode: "update", from });
         } catch {
           // Unknown/garbled client version — fall back to a full snapshot.
           backfill = doc.export({ mode: "snapshot" });
+        } finally {
+          from?.free();
         }
       } else {
         backfill = doc.export({ mode: "snapshot" });
@@ -781,8 +796,10 @@ export class SessionRoom implements DurableObject {
   /** HISTORY TRIM (§3.1): shallow snapshot at the newest recorded frontier
    * checkpoint older than RETAIN_DAYS — history before it is discarded
    * permanently, state fully preserved. Returns whether a trim landed (the
-   * snapshot + log + materialized doc were all replaced). Best-effort: any
-   * export failure leaves the room to the caller's lossless fold. */
+   * snapshot + log + materialized doc were all replaced — the passed `doc`
+   * is CONSUMED: its wasm memory is freed, callers must switch to
+   * `this.doc`). Best-effort: any export failure leaves the room to the
+   * caller's lossless fold. */
   private trimHistoryIfDue(doc: LoroDoc, now: number): boolean {
     const checkpoints = JSON.parse(this.getMeta("checkpoints") ?? "[]") as FrontierCheckpoint[];
     const cutoff = checkpoints.filter((c) => now - c.at >= RETAIN_MS).pop();
@@ -801,6 +818,10 @@ export class SessionRoom implements DurableObject {
       const fresh = new LoroDoc();
       fresh.import(shallow);
       this.doc = fresh;
+      // Free the replaced full-history doc NOW — waiting on GC finalizers
+      // leaks it into the shared wasm heap exactly when trimming was
+      // supposed to relieve it (see handleJoin).
+      if (doc !== fresh) doc.free();
       return true;
     } catch {
       return false;
@@ -843,18 +864,31 @@ export class SessionRoom implements DurableObject {
       const prevVV = this.getMeta("backupVV");
       let advances = true;
       if (prevVV) {
+        let prev: VersionVector | undefined;
+        let cur: VersionVector | undefined;
         try {
-          const prev = VersionVector.decode(Uint8Array.from(atob(prevVV), (c) => c.charCodeAt(0)));
-          const cmp = current.version().compare(prev);
+          prev = VersionVector.decode(Uint8Array.from(atob(prevVV), (c) => c.charCodeAt(0)));
+          cur = current.version();
+          const cmp = cur.compare(prev);
           advances = cmp !== undefined && cmp >= 0;
         } catch {
           /* unreadable meta: allow the put and rewrite it below */
+        } finally {
+          // Explicit frees: see handleJoin — GC finalizers don't run under
+          // wasm-side memory pressure.
+          prev?.free();
+          cur?.free();
         }
       }
       if (advances) {
         const snapshot = current.export({ mode: "snapshot" });
         await this.env.BLOBS.put(`backup/${chatId}/latest.loro`, snapshot);
-        this.setMeta("backupVV", btoa(String.fromCharCode(...current.version().encode())));
+        const vv = current.version();
+        try {
+          this.setMeta("backupVV", btoa(String.fromCharCode(...vv.encode())));
+        } finally {
+          vv.free();
+        }
         this.setMeta("backupDirty", "0");
       }
     }
