@@ -91,6 +91,12 @@ const TRIM_FORCE_BYTES = 512 * 1024;
  * before a device's pushes are short-circuited, and for how long. */
 const IMPORT_PENALTY_STRIKES = 3;
 const IMPORT_PENALTY_MS = 10 * 60 * 1000;
+/** While penalized, payloads at or under this size still get one import
+ * attempt: a healed (re-flattened) device's first small status/title write
+ * clears its box immediately instead of serving out IMPORT_PENALTY_MS in
+ * silence — the box exists to stop ~1MB doomed reassemblies, and a bounded
+ * small import costs ~nothing even when it fails. */
+const PENALTY_PROBE_MAX_BYTES = 4096;
 /** A wasm-bindgen wrapper whose `free()` already ran has `__wbg_ptr === 0`;
  * any method call on it throws `Error("null pointer passed to rust")`. Several
  * flows (trim, fold, alarm, idle release) free-and-replace the cached doc
@@ -156,6 +162,13 @@ export class SessionRoom implements DurableObject {
    * IMPORT_PENALTY_MS — zero wasm cost, bounded retry, and the room stays up
    * for everyone else. In-memory: an instance recycle grants a fresh 3 tries. */
   private readonly importPenalty = new Map<string, { strikes: number; until: number }>();
+  /** Per-device %LOR push outcomes (in-memory, like `importPenalty`). Workers
+   * Logs cannot see hibernatable webSocketMessage handlers, so /stats is the
+   * only live per-device attribution surface an operator has mid-incident. */
+  private readonly pushOutcomes = new Map<
+    string,
+    { ok: number; rejected: number; lastOkAt: number; lastRejectAt: number }
+  >();
   /** Idle-doc release bookkeeping (see DOC_IDLE_RELEASE_MS / touchDoc). */
   private docIdleTimer: ReturnType<typeof setTimeout> | undefined;
   private lastDocUse = 0;
@@ -259,7 +272,10 @@ export class SessionRoom implements DurableObject {
         backupDirty: this.getMeta("backupDirty") === "1",
         // Non-zero while a cold replay is in flight or has been dying — the
         // wedge signature ensureDoc's automated reset watches for.
-        replayAttempts: Number(this.getMeta("replayAttempts") ?? "0")
+        replayAttempts: Number(this.getMeta("replayAttempts") ?? "0"),
+        // Per-device %LOR attribution (in-memory: since this instance woke).
+        importPenalty: [...this.importPenalty].map(([device, e]) => ({ device, ...e })),
+        pushOutcomes: [...this.pushOutcomes].map(([device, e]) => ({ device, ...e }))
       });
     }
     if (url.pathname === "/tail" && request.method === "GET") {
@@ -267,7 +283,16 @@ export class SessionRoom implements DurableObject {
         if (!owner) return json({ error: "not_found" }, 404);
         if (owner !== userId) return json({ error: "forbidden" }, 403);
       }
-      return json(await this.currentTail());
+      try {
+        return json(await this.currentTail());
+      } catch (e) {
+        // Surface the real error to the operator: a bare 1101 here cost the
+        // 2026-08-05 incident an hour of blind guessing (Workers Logs can't
+        // be queried without an observability-scoped token).
+        console.error("tail materialization failed", `room=${this.getMeta("chatId") ?? "?"}`, String(e));
+        this.escalateWasmPoisoning(e);
+        return json({ error: "tail_failed", message: String(e) }, 500);
+      }
     }
     if (url.pathname === "/diff" && request.method === "GET") {
       if (!workspace) {
@@ -292,12 +317,19 @@ export class SessionRoom implements DurableObject {
         if (!owner) return json({ error: "not_found" }, 404);
         if (owner !== userId) return json({ error: "forbidden" }, 403);
       }
-      await this.flush();
-      const doc = await this.ensureDoc();
-      const bytes = doc.export({ mode: "snapshot" });
-      return new Response(bytes as unknown as BodyInit, {
-        headers: { "content-type": "application/octet-stream" }
-      });
+      try {
+        await this.flush();
+        const doc = await this.ensureDoc();
+        const bytes = doc.export({ mode: "snapshot" });
+        return new Response(bytes as unknown as BodyInit, {
+          headers: { "content-type": "application/octet-stream" }
+        });
+      } catch (e) {
+        // The repair-read must never fail as a bare 1101 — see /tail above.
+        console.error("snapshot export failed", `room=${this.getMeta("chatId") ?? "?"}`, String(e));
+        this.escalateWasmPoisoning(e);
+        return json({ error: "snapshot_failed", message: String(e) }, 500);
+      }
     }
     if (url.pathname === "/append" && request.method === "POST") {
       // MERGE-safe repair write: import a Loro update (never replaces the
@@ -599,6 +631,21 @@ export class SessionRoom implements DurableObject {
     return !!entry && entry.strikes >= IMPORT_PENALTY_STRIKES && entry.until > now;
   }
 
+  /** Per-device push-outcome bookkeeping for /stats (see `pushOutcomes`). */
+  private notePush(deviceId: string | undefined, ok: boolean, now: number): void {
+    if (!deviceId) return;
+    const entry =
+      this.pushOutcomes.get(deviceId) ?? { ok: 0, rejected: 0, lastOkAt: 0, lastRejectAt: 0 };
+    if (ok) {
+      entry.ok++;
+      entry.lastOkAt = now;
+    } else {
+      entry.rejected++;
+      entry.lastRejectAt = now;
+    }
+    this.pushOutcomes.set(deviceId, entry);
+  }
+
   private async applyUpdates(
     ws: WebSocket,
     state: SocketState,
@@ -609,18 +656,50 @@ export class SessionRoom implements DurableObject {
   ): Promise<void> {
     if (crdt === CrdtType.Loro) {
       const now = Date.now();
-      if (this.importPenalized(state.deviceId, now)) {
+      const totalBytes = updates.reduce((n, u) => n + u.length, 0);
+      if (this.importPenalized(state.deviceId, now) && totalBytes > PENALTY_PROBE_MAX_BYTES) {
+        this.notePush(state.deviceId, false, now);
         this.ack(ws, { crdt, roomId }, UpdateStatusCode.InvalidUpdate, batchId);
         return;
       }
       const doc = await this.ensureDoc();
+      const imported: Uint8Array[] = [];
+      let failed = false;
       try {
-        for (const update of updates) if (update.length > 0) doc.import(update);
-      } catch {
+        for (const update of updates)
+          if (update.length > 0) {
+            doc.import(update);
+            imported.push(update);
+          }
+      } catch (e) {
+        // Wasm-heap poison is terminal for this instance — no salvage
+        // retries against a dying heap; the outer handler's tripwire counts
+        // it and recycles the isolate.
+        if (e instanceof RangeError || e instanceof WebAssembly.RuntimeError || isWasmUseAfterFree(e)) {
+          throw e;
+        }
         // Includes imports concurrent to a shallow-snapshot start (§3.1 stale
         // peer) — the client resyncs fresh and re-submits at the app layer.
-        // Strike the device: past IMPORT_PENALTY_STRIKES its pushes are
-        // rejected without import for IMPORT_PENALTY_MS (see importPenalty).
+        // Salvage the rest of the batch individually first: one unimportable
+        // update (a stale peer's bundled old history) must not void the
+        // batch's good writes — session status/title are exactly the small
+        // updates that ride along. Re-importing an already-applied update is
+        // idempotent, so restarting the loop from the top is safe.
+        failed = true;
+        imported.length = 0;
+        for (const update of updates) {
+          if (update.length === 0) continue;
+          try {
+            doc.import(update);
+            imported.push(update);
+          } catch {
+            /* this update is the poison; strike below */
+          }
+        }
+      }
+      if (failed) {
+        // Strike the device: past IMPORT_PENALTY_STRIKES its (large) pushes
+        // are rejected without import for IMPORT_PENALTY_MS (importPenalty).
         if (state.deviceId) {
           const entry = this.importPenalty.get(state.deviceId) ?? { strikes: 0, until: 0 };
           entry.strikes++;
@@ -634,10 +713,16 @@ export class SessionRoom implements DurableObject {
             );
           }
         }
+        this.notePush(state.deviceId, false, now);
+        if (imported.length > 0) {
+          this.recordLoroUpdates(imported);
+          this.relay(ws, crdt, roomId, imported);
+        }
         this.ack(ws, { crdt, roomId }, UpdateStatusCode.InvalidUpdate, batchId);
         return;
       }
       if (state.deviceId) this.importPenalty.delete(state.deviceId);
+      this.notePush(state.deviceId, true, now);
       this.recordLoroUpdates(updates);
       this.ack(ws, { crdt, roomId }, UpdateStatusCode.Ok, batchId);
       this.relay(ws, crdt, roomId, updates);
@@ -693,8 +778,14 @@ export class SessionRoom implements DurableObject {
     }
     // Penalized devices get rejected at the HEADER — before any reassembly
     // buffers exist. Their doomed multi-megabyte re-uploads are what pressed
-    // the wasm heap into the 2026-08-04 abort loop.
-    if (message.crdt === CrdtType.Loro && this.importPenalized(state.deviceId, Date.now())) {
+    // the wasm heap into the 2026-08-04 abort loop. Small totals fall through
+    // to the applyUpdates probe (PENALTY_PROBE_MAX_BYTES).
+    if (
+      message.crdt === CrdtType.Loro &&
+      message.totalSizeBytes > PENALTY_PROBE_MAX_BYTES &&
+      this.importPenalized(state.deviceId, Date.now())
+    ) {
+      this.notePush(state.deviceId, false, Date.now());
       this.ack(ws, message, UpdateStatusCode.InvalidUpdate, message.batchId);
       return;
     }
