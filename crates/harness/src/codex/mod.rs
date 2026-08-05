@@ -11,9 +11,10 @@
 //! - Notifications map to [`AgentEvent`]s: agentMessage/reasoning deltas (both
 //!   `delta`/`textDelta` spellings), item lifecycles → typed ToolCall/ToolResult,
 //!   `thread/tokenUsage/updated` → Usage, turn/completed|failed|aborted → Done.
-//! - Approvals: the wire policy is always `"never"` — parity with the Claude
-//!   adapter's auto-approve-everything (unattended runs; the sandbox is the
-//!   guardrail). Stray `item/commandExecution/requestApproval` +
+//! - Approvals + sandbox: yolo mode. The wire policy is always `"never"` and
+//!   the sandbox is forced to `danger-full-access` — parity with the Claude
+//!   adapter's auto-approve-everything (unattended runs). Stray
+//!   `item/commandExecution/requestApproval` +
 //!   `item/fileChange/requestApproval` still round-trip through
 //!   [`RunControls::request_input`] as a synthesized yes/no question.
 //! - Steering: `turn/steer { expectedTurnId }` into the live turn; a rejected
@@ -94,34 +95,6 @@ fn resolve_codex_executable() -> Option<PathBuf> {
             .map(|d| d.join(exe)),
     );
     candidates.into_iter().find(|p| p.exists())
-}
-
-/// True when `cwd` is a LINKED git worktree whose checked-out branch name
-/// contains '/' — the exact shape that trips codex's sandbox worktree-mount
-/// derivation (see the escalation in [`CodexHarness::run`]). Pure filesystem
-/// reads: the worktree's `.git` pointer FILE names the admin dir, whose HEAD
-/// symref carries the branch.
-fn worktree_on_slashed_branch(cwd: &str) -> bool {
-    if cwd.is_empty() {
-        return false;
-    }
-    let dot_git = std::path::Path::new(cwd).join(".git");
-    let is_pointer_file = std::fs::metadata(&dot_git).is_ok_and(|m| m.is_file());
-    if !is_pointer_file {
-        return false; // main checkout (`.git` dir) — codex handles it fine
-    }
-    let Ok(pointer) = std::fs::read_to_string(&dot_git) else {
-        return false;
-    };
-    let Some(gitdir) = pointer.strip_prefix("gitdir:").map(str::trim) else {
-        return false;
-    };
-    let Ok(head) = std::fs::read_to_string(std::path::Path::new(gitdir).join("HEAD")) else {
-        return false;
-    };
-    head.trim()
-        .strip_prefix("ref: refs/heads/")
-        .is_some_and(|branch| branch.contains('/'))
 }
 
 /// The Codex harness. Construct with [`CodexHarness::new`]; tests point it at a
@@ -216,24 +189,14 @@ impl Harness for CodexHarness {
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let exe = self.resolve_executable()?;
-        // Codex ≤0.144.x: the workspace-write sandbox derives a MALFORMED
-        // worktree mount when the checked-out branch name contains '/'
-        // (verified against the real CLI: `wing/x` in a linked worktree kills
-        // every command before it starts; `wing-x` is fine; explicit
-        // writableRoots don't suppress the broken derivation; full access
-        // works). Escalate that exact shape instead of shipping a session
-        // where nothing can run — parity note: the Claude adapter effectively
-        // grants full access anyway (auto-approved can_use_tool).
-        if request.sandbox == komet_proto::SandboxLevel::WorkspaceWrite
-            && worktree_on_slashed_branch(&request.cwd)
-        {
-            tracing::warn!(
-                cwd = %request.cwd,
-                "codex sandbox escalated to danger-full-access: linked worktree on a \
-                 slash-named branch trips codex's worktree-mount derivation"
-            );
-            request.sandbox = komet_proto::SandboxLevel::DangerFullAccess;
-        }
+        // Yolo mode: danger-full-access + approvalPolicy "never" (set below) —
+        // codex's --dangerously-bypass-approvals-and-sandbox equivalent.
+        // Parity with the Claude adapter, which auto-approves every
+        // can_use_tool and so effectively grants full access. This also
+        // sidesteps codex ≤0.144.x's workspace-write bug where a linked
+        // worktree on a slash-named branch derives a malformed mount that
+        // kills every command.
+        request.sandbox = komet_proto::SandboxLevel::DangerFullAccess;
         let mut cmd = Command::new(&exe);
         cmd.arg("app-server");
         crate::compose_child_path(&mut cmd, &exe);
@@ -407,8 +370,9 @@ async fn run_session(session: Session) {
 
     // ---- wire params ------------------------------------------------------
     // Parity with the Claude adapter, which auto-approves every `can_use_tool`
-    // regardless of `auto_approve` (komet sessions run unattended; the sandbox
-    // is the guardrail): never surface wire approvals. "on-request" turned
+    // regardless of `auto_approve` (komet sessions run unattended; combined
+    // with the danger-full-access override above this is codex's yolo mode):
+    // never surface wire approvals. "on-request" turned
     // every command into a yes/no question (user report: "asking me for
     // approval at every step"). The approval-as-input plumbing below stays for
     // stray requests and a future explicit permission-mode setting.
@@ -1145,39 +1109,6 @@ fn send_signal(_pid: u32, _signal: Signal) {
 mod tests {
     use super::*;
     use serde_json::json;
-
-    #[test]
-    fn slashed_branch_worktrees_are_detected_for_sandbox_escalation() {
-        let tmp = tempfile::tempdir().unwrap();
-        let make = |name: &str, branch: &str| {
-            let wt = tmp.path().join(name);
-            let admin = tmp.path().join(format!("{name}-admin"));
-            std::fs::create_dir_all(&wt).unwrap();
-            std::fs::create_dir_all(&admin).unwrap();
-            std::fs::write(wt.join(".git"), format!("gitdir: {}\n", admin.display())).unwrap();
-            std::fs::write(admin.join("HEAD"), format!("ref: refs/heads/{branch}\n")).unwrap();
-            wt.display().to_string()
-        };
-        assert!(worktree_on_slashed_branch(&make(
-            "slashed",
-            "wing/prd-5645"
-        )));
-        assert!(!worktree_on_slashed_branch(&make("plain", "brave-ember")));
-        // A main checkout (`.git` DIRECTORY) never escalates.
-        let main = tmp.path().join("main");
-        std::fs::create_dir_all(main.join(".git")).unwrap();
-        assert!(!worktree_on_slashed_branch(&main.display().to_string()));
-        // Detached HEAD (raw sha) never escalates.
-        let detached = make("detached", "x");
-        std::fs::write(
-            tmp.path().join("detached-admin").join("HEAD"),
-            "0ba950848abc\n",
-        )
-        .unwrap();
-        assert!(!worktree_on_slashed_branch(&detached));
-        assert!(!worktree_on_slashed_branch(""));
-        assert!(!worktree_on_slashed_branch("/nonexistent/path"));
-    }
 
     #[test]
     fn approval_questions_are_yes_no() {
