@@ -116,24 +116,17 @@ fn assemble(dir: &std::path::Path, device_id: &str) -> EngineCore {
     EngineCore::assemble(dir, registry(), HarnessId::Mock, None).expect("engine core assembles")
 }
 
-/// The in-memory room: cross-import workspace-doc updates between two engines on a
-/// timer (what RoomClient + the DO relay do over the wire).
-fn bridge(a: &EngineCore, b: &EngineCore) -> tokio::task::JoinHandle<()> {
-    let da = a.workspace.doc_arc();
-    let db = b.workspace.doc_arc();
-    tokio::spawn(async move {
-        let mut tick = tokio::time::interval(Duration::from_millis(20));
-        loop {
-            tick.tick().await;
-            for (from, to) in [(da.doc(), db.doc()), (db.doc(), da.doc())] {
-                if let Ok(update) = from.export(loro::ExportMode::updates(&to.oplog_vv()))
-                    && !update.is_empty()
-                {
-                    let _ = to.import(&update);
-                }
-            }
-        }
-    })
+/// The in-process room: an in-memory registry server speaking the DO's JSON
+/// WS protocol (what the RegistryRoom DO does over the wire), with both
+/// engines' hosts wired to it via the test seam.
+async fn bridge(
+    a: &EngineCore,
+    b: &EngineCore,
+) -> komet_sync::registry::mock_server::MockRegistryServer {
+    let server = komet_sync::registry::mock_server::MockRegistryServer::start().await;
+    a.workspace.connect_registry_url(&server.url());
+    b.workspace.connect_registry_url(&server.url());
+    server
 }
 
 async fn wait_for<F>(mut predicate: F, what: &str)
@@ -192,7 +185,7 @@ async fn two_engines_share_a_workspace() {
     let dir_b = tempfile::tempdir().unwrap();
     let a = assemble(dir_a.path(), "dev-a");
     let b = assemble(dir_b.path(), "dev-b");
-    let link = bridge(&a, &b);
+    let link = bridge(&a, &b).await;
 
     // Device rows from BOTH engines appear on both sides.
     for core in [&a, &b] {
@@ -200,7 +193,6 @@ async fn two_engines_share_a_workspace() {
             || {
                 let ids: Vec<String> = core
                     .workspace
-                    .doc()
                     .read_devices()
                     .unwrap_or_default()
                     .into_iter()
@@ -248,7 +240,7 @@ async fn two_engines_share_a_workspace() {
     )
     .await;
     wait_for(
-        || b.workspace.doc().chat("chat-1").ok().flatten().is_some(),
+        || b.workspace.chat("chat-1").ok().flatten().is_some(),
         "chat row on B",
     )
     .await;
@@ -256,9 +248,9 @@ async fn two_engines_share_a_workspace() {
     // Run on A: B's workspace view shows the session Working, then Idle.
     queue_run(&a, "chat-1", "cmd-run-1", "m-1");
     let b_status = |wanted: SessionStatus| {
-        let doc = b.workspace.doc_arc();
+        let ws = b.workspace.clone();
         move || {
-            doc.read_sessions()
+            ws.read_sessions()
                 .unwrap_or_default()
                 .iter()
                 .any(|s| s.chat_id == "chat-1" && s.device_id == "dev-a" && s.status == wanted)
@@ -272,7 +264,6 @@ async fn two_engines_share_a_workspace() {
     wait_for(
         || {
             b.workspace
-                .doc()
                 .chat("chat-1")
                 .ok()
                 .flatten()
@@ -302,7 +293,6 @@ async fn two_engines_share_a_workspace() {
     wait_for(
         || {
             a.workspace
-                .doc()
                 .chat("chat-1")
                 .ok()
                 .flatten()
@@ -323,7 +313,6 @@ async fn two_engines_share_a_workspace() {
     wait_for(
         || {
             a.workspace
-                .doc()
                 .read_devices()
                 .unwrap_or_default()
                 .iter()
@@ -333,7 +322,7 @@ async fn two_engines_share_a_workspace() {
     )
     .await;
 
-    link.abort();
+    drop(link);
     a.shutdown().await;
     b.shutdown().await;
 }
@@ -344,14 +333,13 @@ async fn claim_on_first_command_creates_the_chat_row() {
     let dir_b = tempfile::tempdir().unwrap();
     let a = assemble(dir_a.path(), "dev-a");
     let b = assemble(dir_b.path(), "dev-b");
-    let link = bridge(&a, &b);
+    let link = bridge(&a, &b).await;
 
     // No CreateChat: the first run command claims the chat under A's device id.
     queue_run(&a, "chat-claimed", "cmd-claim-1", "m-1");
     wait_for(
         || {
             b.workspace
-                .doc()
                 .chat("chat-claimed")
                 .ok()
                 .flatten()
@@ -361,7 +349,7 @@ async fn claim_on_first_command_creates_the_chat_row() {
     )
     .await;
 
-    link.abort();
+    drop(link);
     a.shutdown().await;
     b.shutdown().await;
 }
@@ -482,7 +470,6 @@ async fn two_engines_converge_through_a_real_workspace_room() {
             || {
                 let ids: Vec<String> = core
                     .workspace
-                    .doc()
                     .read_devices()
                     .unwrap_or_default()
                     .into_iter()
@@ -502,7 +489,6 @@ async fn two_engines_converge_through_a_real_workspace_room() {
     wait_for(
         || {
             a.workspace
-                .doc()
                 .read_devices()
                 .unwrap_or_default()
                 .iter()
@@ -514,4 +500,142 @@ async fn two_engines_converge_through_a_real_workspace_room() {
 
     a.shutdown().await;
     b.shutdown().await;
+}
+
+#[tokio::test]
+async fn legacy_workspace_doc_migrates_instantly_on_first_boot() {
+    use komet_proto::{Chat, Device, Session, Space};
+
+    let dir_a = tempfile::tempdir().unwrap();
+    // Seed the identity-scoped store with a LEGACY Loro workspace snapshot —
+    // what an updated engine finds on its first boot after the registry change.
+    let org_dir = dir_a.path().join("orgs").join("dev-org").join("dev-user");
+    {
+        let store = komet_sync::DocsStore::open(&org_dir).expect("open store");
+        let legacy = komet_doc::WorkspaceDoc::new();
+        let now = chrono::Utc::now();
+        legacy
+            .upsert_device(&Device {
+                id: "dev-a".into(),
+                name: "old laptop".into(),
+                platform: "linux".into(),
+                last_seen_at: Some(now),
+                created_at: Some(now),
+                version: Some("0.1.17".into()),
+            })
+            .unwrap();
+        legacy
+            .upsert_space(&Space {
+                id: "space-legacy".into(),
+                device_id: "dev-a".into(),
+                path: "/tmp/legacy".into(),
+                name: Some("Legacy Space".into()),
+                git_detected: true,
+                git_checked_at: Some(now),
+                checkout_id: Some("co-1".into()),
+                created_at: now,
+            })
+            .unwrap();
+        legacy
+            .upsert_chat(&Chat {
+                id: "chat-legacy".into(),
+                device_id: "dev-a".into(),
+                title: Some("Migrated chat".into()),
+                archived: false,
+                cwd: Some("/tmp/legacy".into()),
+                branch: Some("main".into()),
+                checkout_id: None,
+                config: None,
+                last_message_preview: Some("old preview".into()),
+                last_message_at: Some(now),
+                created_at: now,
+                harness_session_id: Some("hs-9".into()),
+                harness_session_cwd: Some("/tmp/legacy".into()),
+                space_id: Some("space-legacy".into()),
+                last_seen_at: Some(now),
+            })
+            .unwrap();
+        legacy
+            .upsert_session(&Session {
+                chat_id: "chat-legacy".into(),
+                device_id: "dev-a".into(),
+                status: SessionStatus::Idle,
+                started_at: Some(now),
+                updated_at: now,
+            })
+            .unwrap();
+        store
+            .save_snapshot("workspace2", &legacy.export_snapshot().unwrap())
+            .expect("save legacy snapshot");
+    }
+
+    // Boot: migration is instant — the full sidebar state is readable before
+    // any server contact.
+    let a = assemble(dir_a.path(), "dev-a");
+    let chats = a.workspace.read_chats().expect("chats");
+    assert_eq!(chats.len(), 1);
+    assert_eq!(chats[0].title.as_deref(), Some("Migrated chat"));
+    assert_eq!(chats[0].harness_session_id.as_deref(), Some("hs-9"));
+    assert_eq!(chats[0].space_id.as_deref(), Some("space-legacy"));
+    let spaces = a.workspace.read_spaces().expect("spaces");
+    assert_eq!(spaces.len(), 1);
+    assert!(spaces[0].git_detected);
+    // The boot-time device upsert kept the LEGACY user-set name (LWW row
+    // exists), not the hostname.
+    let devices = a.workspace.read_devices().expect("devices");
+    assert_eq!(devices.len(), 1);
+    assert_eq!(devices[0].name, "old laptop");
+
+    // A second (fresh) device converges through the room from the migrated seed.
+    let dir_b = tempfile::tempdir().unwrap();
+    let b = assemble(dir_b.path(), "dev-b");
+    let link = bridge(&a, &b).await;
+    wait_for(
+        || {
+            b.workspace
+                .chat("chat-legacy")
+                .ok()
+                .flatten()
+                .is_some_and(|c| c.title.as_deref() == Some("Migrated chat"))
+        },
+        "migrated chat on B",
+    )
+    .await;
+
+    // A live rename beats the migrated (historical-HLC) title everywhere.
+    b.workspace
+        .rename_chat("chat-legacy", "renamed live")
+        .expect("rename");
+    wait_for(
+        || {
+            a.workspace
+                .chat("chat-legacy")
+                .ok()
+                .flatten()
+                .is_some_and(|c| c.title.as_deref() == Some("renamed live"))
+        },
+        "live rename beats migration on A",
+    )
+    .await;
+
+    drop(link);
+    a.shutdown().await;
+    b.shutdown().await;
+
+    // The registry snapshot now exists; the legacy snapshot is kept for rollback.
+    let store = komet_sync::DocsStore::open(&org_dir).expect("reopen store");
+    assert!(
+        store
+            .load_snapshot(komet_doc::REGISTRY_DOC_ID)
+            .expect("load registry snapshot")
+            .is_some(),
+        "registry snapshot persisted"
+    );
+    assert!(
+        store
+            .load_snapshot("workspace2")
+            .expect("load legacy snapshot")
+            .is_some(),
+        "legacy snapshot retained for rollback"
+    );
 }

@@ -792,6 +792,22 @@ impl AppState {
     /// Synced seen marker: only fires when the chat is currently unseen
     /// (idempotence — no mutate spam), stamps the local row optimistically so
     /// the LWW round-trip is invisible, and fire-and-forgets the mutate.
+    /// Window-focus liveness sweep: ask the engine to probe every open room
+    /// (workspace + chat docs). Fire-and-forget; each room ignores the hint
+    /// unless it has been broadcast-quiet ≥30s, so spamming is harmless.
+    pub fn probe_sync(&mut self, cx: &mut Context<Self>) {
+        let Some(handle) = self.engine.clone() else {
+            return;
+        };
+        cx.spawn(async move |_, _| {
+            let params = serde_json::json!({});
+            if let Err(err) = handle.client().call(methods::PROBE_SYNC, params).await {
+                tracing::debug!(error = %err, "probe sync failed");
+            }
+        })
+        .detach();
+    }
+
     pub fn mark_chat_seen(&mut self, chat_id: &str, cx: &mut Context<Self>) {
         let Some(chat) = self.chats.iter_mut().find(|c| c.id == chat_id) else {
             return;

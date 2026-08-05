@@ -34,13 +34,23 @@ enum DocDisk {
         try? data.write(to: url(for: id), options: .atomic)
     }
 
-    /// LRU-prune session snapshots (the workspace doc is always kept).
+    /// The workspace registry's persisted blob ({rows, cursor, gcFloor,
+    /// clock, pending} JSON — RegistryDoc.toData). Replaces the old `ws3_`
+    /// Loro workspace snapshot; session docs stay Loro snapshots unchanged.
+    static func registryURL(orgId: String, userId: String) -> URL {
+        directory.appendingPathComponent("registry1_\(orgId)_\(userId).json")
+    }
+
+    /// LRU-prune session snapshots (the workspace registry blob is always
+    /// kept; a leftover `ws3_` Loro snapshot is retained for rollback).
     static func prune(keep: Int) {
         let fm = FileManager.default
         guard let files = try? fm.contentsOfDirectory(at: directory,
                                                       includingPropertiesForKeys: [.contentModificationDateKey])
         else { return }
-        let sessions = files.filter { !$0.lastPathComponent.hasPrefix("ws3_") }
+        let sessions = files.filter {
+            !$0.lastPathComponent.hasPrefix("ws3_") && !$0.lastPathComponent.hasPrefix("registry1_")
+        }
         guard sessions.count > keep else { return }
         let sorted = sessions.sorted {
             let a = (try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
@@ -88,5 +98,39 @@ final class DocSaver {
         guard dirty else { return }
         dirty = false
         DocDisk.save(doc: doc, id: docId)
+    }
+}
+
+/// DocSaver's registry twin: debounced persistence for the registry blob.
+/// Poke on every mutation; the blob writes ~1.5s after the last poke, and
+/// `flush` forces it (backgrounding, store teardown).
+@MainActor
+final class RegistrySaver {
+    private let url: URL
+    private let data: () -> Data?
+    private var generation = 0
+    private var dirty = false
+
+    init(url: URL, data: @escaping () -> Data?) {
+        self.url = url
+        self.data = data
+    }
+
+    func poke() {
+        dirty = true
+        generation += 1
+        let expected = generation
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            guard let self, self.generation == expected else { return }
+            self.flush()
+        }
+    }
+
+    func flush() {
+        guard dirty else { return }
+        dirty = false
+        guard let data = data() else { return }
+        try? data.write(to: url, options: .atomic)
     }
 }

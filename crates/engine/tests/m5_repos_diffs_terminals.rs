@@ -450,7 +450,6 @@ async fn delete_space_cascades_chats_and_sessions() {
         .expect("chat row");
     let chat = core
         .workspace
-        .doc()
         .chat("chat-1")
         .expect("read")
         .expect("exists");
@@ -461,7 +460,7 @@ async fn delete_space_cascades_chats_and_sessions() {
     let deleted = core.workspace.delete_space("space-1").expect("cascade");
     assert!(deleted.existed);
     assert_eq!(deleted.chat_ids, vec!["chat-1".to_string()]);
-    assert!(core.workspace.doc().chat("chat-1").expect("read").is_none());
+    assert!(core.workspace.chat("chat-1").expect("read").is_none());
     assert!(core.workspace.read_spaces().expect("spaces").is_empty());
     core.shutdown().await;
 }
@@ -515,7 +514,6 @@ async fn diff_sync_publishes_and_updates_chat_branch() {
     // Row upkeep: branch + checkoutId stamped on the workspace chat row.
     let chat = core
         .workspace
-        .doc()
         .chat("chat-diff")
         .expect("read chat")
         .expect("row");

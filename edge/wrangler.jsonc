@@ -31,13 +31,20 @@
   "durable_objects": {
     "bindings": [
       { "name": "SESSION_ROOMS", "class_name": "SessionRoom" },
-      { "name": "DEVICE_ROOMS", "class_name": "DeviceRoom" }
+      { "name": "DEVICE_ROOMS", "class_name": "DeviceRoom" },
+      { "name": "REGISTRY_ROOMS", "class_name": "RegistryRoom" }
     ]
   },
   "migrations": [
     {
       "tag": "v1",
       "new_sqlite_classes": ["SessionRoom", "DeviceRoom"]
+    },
+    {
+      // Workspace registry (docs/registry-sync.md) — the row-table sidebar
+      // sync that replaces the Loro workspace doc rooms.
+      "tag": "v2",
+      "new_sqlite_classes": ["RegistryRoom"]
     }
   ],
   "r2_buckets": [

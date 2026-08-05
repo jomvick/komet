@@ -84,6 +84,13 @@ final class SessionStore {
         saver?.flush()
     }
 
+    /// Foreground hook: revive the room after a suspension (see
+    /// RoomClient.kick).
+    func kickRoom() {
+        guard let room else { return }
+        Task { await room.kick() }
+    }
+
     func stop() {
         subscriptions.removeAll()
         saver?.flush()

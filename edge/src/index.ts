@@ -17,8 +17,12 @@
  *   POST /diff/:chatId                — host publishes the diff sidecar
  *   GET  /snapshot/:chatId            — repair: read current doc snapshot
  *   POST /append/:chatId              — repair: merge-import a Loro update
- *   GET  /workspace/:orgId/ws         — workspace-doc room `ws/{orgId}` (wss)
+ *   GET  /workspace/:orgId/ws         — workspace-doc room `ws/{orgId}` (wss; legacy clients)
  *   GET  /workspace/:orgId/tail       — workspace-doc tail JSON
+ *   GET  /registry/:orgId/ws          — workspace registry room `reg1/{orgId}/{user}` (wss)
+ *   GET  /registry/:orgId/stats       — registry seq/rows/attribution
+ *   GET  /registry/:orgId/rows        — registry full-table repair read
+ *   POST /registry/:orgId/reset       — registry operator wipe (self-healing)
  *   GET  /device/:deviceId/ws?role=   — device-room byte pipe (§8)
  *   GET  /device/:deviceId/sidecar/:name
  *   POST /device/:deviceId/sidecar/:name
@@ -32,9 +36,10 @@ import { handleAuthRoute } from "./auth-routes";
 import { AUTH_USER_HEADER, ROOM_KIND_HEADER, type Env } from "./env";
 import { SessionRoom } from "./session-room";
 import { DeviceRoom } from "./device-room";
+import { RegistryRoom } from "./registry-room";
 import installSh from "./install.sh";
 
-export { SessionRoom, DeviceRoom };
+export { SessionRoom, DeviceRoom, RegistryRoom };
 
 const ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 const SHA256_RE = /^[a-f0-9]{64}$/;
@@ -70,6 +75,15 @@ const requestInit = (request: Request): RequestInit => ({
   method: request.method,
   body: request.body
 });
+
+/** Carry the dialing engine's `&device=` through to the DO (socket
+ * attribution in logs — the 2026-08-04 deaf socket was only identifiable by
+ * reverse-engineering rotating IPv6 privacy addresses). Validated so a
+ * hand-crafted value can't inject into log lines or the DO's query. */
+const deviceParam = (url: URL): string => {
+  const device = url.searchParams.get("device") ?? "";
+  return ID_RE.test(device) ? `&device=${device}` : "";
+};
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -138,7 +152,7 @@ export default {
         request,
         auth.userId,
         "/ws",
-        `?chatId=${parts[1]}`
+        `?chatId=${parts[1]}${deviceParam(url)}`
       );
     }
     if (parts[0] === "tail" && parts[1] && ID_RE.test(parts[1]) && request.method === "GET") {
@@ -165,11 +179,14 @@ export default {
     if (parts[0] === "workspace" && parts[1] && ID_RE.test(parts[1])) {
       const orgId = parts[1];
       if (auth.orgId !== orgId) return json({ error: "forbidden" }, 403);
-      // `ws3` = the per-user privacy destructive break (`ws2` was the spaces
-      // overhaul): a fresh DO instance with an empty doc; legacy org-wide
-      // rooms are orphaned (hibernated, ~zero cost). URL path stays
-      // `/workspace/:orgId/*`.
-      const room = `ws3/${orgId}/${auth.userId}`;
+      // `ws4` = the 2026-08-04 incident break: the ws3 instance's storage was
+      // left with causally-broken update rows by the abort-thrash loop (acks
+      // outran the debounced flush) and could not be trusted again even after
+      // /reset-log; a name bump allocates a virgin DO. (`ws3` was the per-user
+      // privacy break, `ws2` the spaces overhaul.) Legacy rooms are orphaned
+      // (hibernated, ~zero cost). URL path stays `/workspace/:orgId/*`; the
+      // name is worker-internal — clients echo their own roomId strings.
+      const room = `ws4/${orgId}/${auth.userId}`;
       if (parts[2] === "ws") {
         if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
           return json({ error: "expected websocket" }, 426);
@@ -180,7 +197,7 @@ export default {
           request,
           auth.userId,
           "/ws",
-          `?chatId=${encodeURIComponent(room)}`,
+          `?chatId=${encodeURIComponent(room)}${deviceParam(url)}`,
           "workspace"
         );
       }
@@ -194,11 +211,61 @@ export default {
       if (parts[2] === "stats" && request.method === "GET") {
         return forward(env.SESSION_ROOMS, room, request, auth.userId, "/stats", "", "workspace");
       }
+      // Raw doc snapshot: the repair/reseed read (2026-08-04: a device stranded
+      // behind the shallow-locked rebuild converges by replacing its local
+      // workspace doc with this — see the incident repair recipe).
+      if (parts[2] === "snapshot" && request.method === "GET") {
+        return forward(env.SESSION_ROOMS, room, request, auth.userId, "/snapshot", "", "workspace");
+      }
       // Operator wedge-break: clear a workspace room whose update log grew big
       // enough to CPU-reset the DO on every cold start (org-membership already
       // checked; state re-uploads from each device's local doc on rejoin).
       if (parts[2] === "reset-log" && request.method === "POST") {
         return forward(env.SESSION_ROOMS, room, request, auth.userId, "/reset-log", "", "workspace");
+      }
+      // Merge-safe repair write (the chat rooms' /append, for the workspace
+      // doc): lets an operator seed a reset room with ONE compact
+      // locally-exported history blob instead of waiting for every device to
+      // re-upload its whole doc — the N-way redundant re-seed is what kept
+      // ballooning the update log after the 2026-08-05 wedge breaks.
+      if (parts[2] === "append" && request.method === "POST") {
+        return forward(env.SESSION_ROOMS, room, request, auth.userId, "/append", "", "workspace");
+      }
+    }
+
+    // ── registry rooms (docs/registry-sync.md): the row-table replacement for
+    //    the Loro workspace doc. Same trust shape as /workspace: org claim
+    //    must match the URL, room derived from the caller's OWN user id, DO
+    //    trusts the stamped header. `reg1` = first registry generation. ─────
+    if (parts[0] === "registry" && parts[1] && ID_RE.test(parts[1])) {
+      const orgId = parts[1];
+      if (auth.orgId !== orgId) return json({ error: "forbidden" }, 403);
+      const room = `reg1/${orgId}/${auth.userId}`;
+      if (parts[2] === "ws") {
+        if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
+          return json({ error: "expected websocket" }, 426);
+        }
+        return forward(
+          env.REGISTRY_ROOMS,
+          room,
+          request,
+          auth.userId,
+          "/ws",
+          `?${deviceParam(url).replace(/^&/, "")}`
+        );
+      }
+      if (parts[2] === "stats" && request.method === "GET") {
+        return forward(env.REGISTRY_ROOMS, room, request, auth.userId, "/stats", "");
+      }
+      // Repair/inspection read: the full current row table.
+      if (parts[2] === "rows" && request.method === "GET") {
+        return forward(env.REGISTRY_ROOMS, room, request, auth.userId, "/rows", "");
+      }
+      // Operator wipe. Unlike the CRDT rooms this needs no recipe: clients
+      // detect the seq regression on their next hello and re-seed the table
+      // from local rows with original clocks, automatically.
+      if (parts[2] === "reset" && request.method === "POST") {
+        return forward(env.REGISTRY_ROOMS, room, request, auth.userId, "/reset", "");
       }
     }
 

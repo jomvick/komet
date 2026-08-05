@@ -25,6 +25,9 @@ enum Command {
     Logout,
     /// Show auth + engine status (exits nonzero when a sign-in is needed).
     Status,
+    /// Live sync introspection from the running engine: per-room connection
+    /// state, last pushed-frame/ack ages, rejoin/probe/resync counters.
+    Sync,
     /// Manage `komet headless` as a background service (launchd / systemd --user).
     Daemon {
         #[command(subcommand)]
@@ -159,6 +162,10 @@ fn main() -> anyhow::Result<()> {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(auth_cli::status(engine_config_from_env()))
         }
+        Some(Command::Sync) => {
+            let runtime = tokio::runtime::Runtime::new()?;
+            runtime.block_on(sync_cli(engine_config_from_env().ipc_port))
+        }
         Some(Command::Update { check }) => {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(update_cli::update(&edge_url_from_env(), check))
@@ -236,16 +243,212 @@ fn dirs_data_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(home).join(".komet-native")
 }
 
+/// `komet sync`: dial the running engine's IPC and print per-room sync state.
+/// The introspection surface every 2026-08 incident was missing — "is this
+/// device's workspace room actually receiving?" as a one-liner.
+async fn sync_cli(ipc_port: u16) -> anyhow::Result<()> {
+    let client = komet_rpc::connect_ws(&format!("ws://127.0.0.1:{ipc_port}"))
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!("no engine listening on 127.0.0.1:{ipc_port} ({e}) — is komet running?")
+        })?;
+    let status = client
+        .call(komet_rpc::methods::SYNC_STATUS, serde_json::json!({}))
+        .await
+        .map_err(|e| anyhow::anyhow!("SyncStatus failed: {e}"))?;
+    let now = status.get("nowMs").and_then(|v| v.as_i64()).unwrap_or(0);
+    let age = |ms: i64| -> String {
+        if ms <= 0 {
+            return "never".into();
+        }
+        let s = (now - ms).max(0) / 1000;
+        if s >= 3600 {
+            format!("{}h{}m ago", s / 3600, (s % 3600) / 60)
+        } else if s >= 60 {
+            format!("{}m{}s ago", s / 60, s % 60)
+        } else {
+            format!("{s}s ago")
+        }
+    };
+    let room_line = |room: Option<&serde_json::Value>| -> String {
+        let Some(room) = room else {
+            return "no room (dialing or edge-less)".into();
+        };
+        let get = |k: &str| room.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
+        // REJECTED is loud and only shown when nonzero: rejected writes with
+        // a fresh-looking room is exactly the latched-session wedge
+        // (2026-08-04) this readout previously masked.
+        let rejected = get("rejected");
+        format!(
+            "{} pushed {} · acked {} · rejoins {} probes {} resyncs {} drops {}{}",
+            if room.get("connected").and_then(|v| v.as_bool()) == Some(true) {
+                "connected ·"
+            } else {
+                "DISCONNECTED ·"
+            },
+            age(get("lastPushedMs")),
+            age(get("lastAckMs")),
+            get("rejoins"),
+            get("probes"),
+            get("fullResyncs"),
+            get("disconnects"),
+            if rejected > 0 {
+                format!(" REJECTED {rejected}")
+            } else {
+                String::new()
+            },
+        )
+    };
+    println!(
+        "Device:    {}",
+        status
+            .get("deviceId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?")
+    );
+    println!(
+        "Workspace: {}",
+        room_line(status.get("workspace").filter(|v| !v.is_null()))
+    );
+    let chats = status
+        .get("chats")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    if chats.is_empty() {
+        println!("Chats:     none open");
+    }
+    for chat in &chats {
+        println!(
+            "Chat {}: {}",
+            chat.get("chatId")
+                .and_then(|v| v.as_str())
+                .map(|s| &s[..s.len().min(8)])
+                .unwrap_or("?"),
+            room_line(chat.get("room").filter(|v| !v.is_null()))
+        );
+    }
+    Ok(())
+}
+
 /// `{data_dir}/logs/komet-{mode}.log`, previous launch preserved as `.old`.
 /// Headed and headless are separate files so an embedded-engine app and a
 /// daemon on the same machine never interleave writes.
+///
+/// The returned file holds an exclusive `flock` for the process lifetime:
+/// rotate-on-launch is only safe when nothing is still WRITING the current
+/// file. On 2026-08-04 a dev build launched twice next to the running
+/// installed app — the first rename put the daemon's live log at `.old`, the
+/// second unlinked it entirely, and the daemon spent the rest of the incident
+/// logging to an orphaned inode (an entire day of sync diagnostics gone at
+/// the exact moment they were needed). A launch that finds the canonical file
+/// locked logs to `komet-{mode}.{pid}.log` instead; the next lock-holding
+/// launch sweeps pid-suffixed files older than a week.
 fn open_log_file(mode: &str) -> Option<std::fs::File> {
     let dir = std::env::var_os("KOMET_DATA_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(dirs_data_dir)
         .join("logs");
-    std::fs::create_dir_all(&dir).ok()?;
+    open_log_file_in(&dir, mode)
+}
+
+/// Dir-parameterized body of [`open_log_file`] (unit-testable without env).
+fn open_log_file_in(dir: &std::path::Path, mode: &str) -> Option<std::fs::File> {
+    std::fs::create_dir_all(dir).ok()?;
     let path = dir.join(format!("komet-{mode}.log"));
-    let _ = std::fs::rename(&path, dir.join(format!("komet-{mode}.log.old")));
-    std::fs::File::create(&path).ok()
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        // Probe the CURRENT inode for a live writer before touching it.
+        let preexisting = path.exists();
+        let existing = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .ok()?;
+        let rc = unsafe { libc::flock(existing.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            // A live process owns the canonical log — leave it alone.
+            return std::fs::File::create(dir.join(format!("komet-{mode}.{}.log", std::process::id())))
+                .ok();
+        }
+        // No live writer: rotate, create fresh, and lock it as ours. (The
+        // probe's flock dies with `existing`; a first-ever launch has nothing
+        // to rotate — the probe itself created the empty file.)
+        drop(existing);
+        if preexisting {
+            let _ = std::fs::rename(&path, dir.join(format!("komet-{mode}.log.old")));
+        }
+        let file = std::fs::File::create(&path).ok()?;
+        unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        sweep_stale_pid_logs(dir, mode);
+        Some(file)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = std::fs::rename(&path, dir.join(format!("komet-{mode}.log.old")));
+        std::fs::File::create(&path).ok()
+    }
+}
+
+#[cfg(all(test, unix))]
+mod log_file_tests {
+    use super::open_log_file_in;
+
+    #[test]
+    fn second_launch_never_rotates_a_live_processes_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir = dir.path();
+        // First launch owns the canonical file and keeps writing.
+        let first = open_log_file_in(dir, "headed").expect("first log");
+        assert!(dir.join("komet-headed.log").is_file());
+        // Second launch while the first is alive: canonical file untouched,
+        // pid-suffixed overflow file instead (the 2026-08-04 clobber).
+        let second = open_log_file_in(dir, "headed").expect("second log");
+        let pid_path = dir.join(format!("komet-headed.{}.log", std::process::id()));
+        assert!(pid_path.is_file(), "expected pid-suffixed overflow log");
+        assert!(
+            !dir.join("komet-headed.log.old").exists(),
+            "live canonical log must not be rotated away"
+        );
+        drop(second);
+        // After the owner exits, a fresh launch rotates normally.
+        drop(first);
+        let third = open_log_file_in(dir, "headed").expect("third log");
+        assert!(dir.join("komet-headed.log.old").is_file(), "rotation resumes");
+        drop(third);
+    }
+}
+
+/// Delete `komet-{mode}.{pid}.log` overflow files older than a week — they
+/// only exist when a second instance raced a live one for the canonical log.
+#[cfg(unix)]
+fn sweep_stale_pid_logs(dir: &std::path::Path, mode: &str) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let prefix = format!("komet-{mode}.");
+    let week = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(middle) = name
+            .strip_prefix(&prefix)
+            .and_then(|rest| rest.strip_suffix(".log"))
+        else {
+            continue;
+        };
+        if !middle.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age > week);
+        if stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }

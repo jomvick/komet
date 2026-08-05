@@ -79,6 +79,16 @@ final class AppConfig: @unchecked Sendable {
         return url
     }
 
+    /// The workspace registry room (docs/registry-sync.md) — the row-table
+    /// replacement for the old ws Loro workspace doc.
+    func registrySocketURL() async -> URL? {
+        guard let token = await currentToken() else { return nil }
+        var url = wsBase.appending(path: "registry/\(orgId)/ws")
+        url.append(queryItems: [URLQueryItem(name: "token", value: token),
+                                URLQueryItem(name: "device", value: deviceId)])
+        return url
+    }
+
     func sessionSocketURL(chatId: String) async -> URL? {
         guard let token = await currentToken() else { return nil }
         var url = wsBase.appending(path: "session/\(chatId)/ws")

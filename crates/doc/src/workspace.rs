@@ -558,7 +558,7 @@ fn dt(ms: i64) -> DateTime<Utc> {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct RawDevice {
+pub(crate) struct RawDevice {
     id: String,
     name: String,
     platform: String,
@@ -585,7 +585,7 @@ impl From<RawDevice> for Device {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct RawSpace {
+pub(crate) struct RawSpace {
     id: String,
     device_id: String,
     path: String,
@@ -618,7 +618,7 @@ impl From<RawSpace> for Space {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct RawChat {
+pub(crate) struct RawChat {
     id: String,
     device_id: String,
     #[serde(default)]
@@ -673,7 +673,7 @@ impl From<RawChat> for Chat {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct RawSession {
+pub(crate) struct RawSession {
     chat_id: String,
     device_id: String,
     status: SessionStatus,

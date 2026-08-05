@@ -1147,14 +1147,18 @@ checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
 name = "komet"
-version = "0.1.17"
+version = "0.1.20"
 dependencies = [
  "anyhow",
  "clap",
  "komet-engine",
+ "komet-rpc",
  "komet-ui",
  "komet-update",
+ "libc",
  "mimalloc",
+ "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1162,7 +1166,7 @@ dependencies = [
 
 [[package]]
 name = "komet-doc"
-version = "0.1.17"
+version = "0.1.20"
 dependencies = [
  "chrono",
  "komet-proto",
@@ -1175,7 +1179,7 @@ dependencies = [
 
 [[package]]
 name = "komet-engine"
-version = "0.1.17"
+version = "0.1.20"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1208,7 +1212,7 @@ dependencies = [
 
 [[package]]
 name = "komet-harness"
-version = "0.1.17"
+version = "0.1.20"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1228,7 +1232,7 @@ dependencies = [
 
 [[package]]
 name = "komet-proto"
-version = "0.1.17"
+version = "0.1.20"
 dependencies = [
  "chrono",
  "serde",
@@ -1238,7 +1242,7 @@ dependencies = [
 
 [[package]]
 name = "komet-rpc"
-version = "0.1.17"
+version = "0.1.20"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1256,13 +1260,16 @@ dependencies = [
 
 [[package]]
 name = "komet-sync"
-version = "0.1.17"
+version = "0.1.20"
 dependencies = [
+ "chrono",
  "komet-doc",
+ "komet-proto",
  "futures",
  "loro",
  "loro-protocol",
  "rusqlite",
+ "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.19",
@@ -1274,7 +1281,7 @@ dependencies = [
 
 [[package]]
 name = "komet-ui"
-version = "0.1.17"
+version = "0.1.20"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -1303,7 +1310,7 @@ dependencies = [
 
 [[package]]
 name = "komet-update"
-version = "0.1.17"
+version = "0.1.20"
 dependencies = [
  "anyhow",
  "futures",

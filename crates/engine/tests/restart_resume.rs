@@ -180,7 +180,6 @@ fn complete_assistant_count(core: &EngineCore) -> usize {
 fn stored_harness_session(core: &EngineCore) -> Option<(String, Option<String>)> {
     let chat = core
         .workspace
-        .doc()
         .chat(CHAT)
         .expect("read chat row")
         .expect("chat row exists");
@@ -255,7 +254,7 @@ async fn restart_roundtrip_restores_chats_transcript_and_resume() {
 
     // Sidebar state survived: the chat row is back with its cwd, preview, and
     // the stored harness session (cwd-scoped).
-    let chats = core.workspace.doc().read_chats().expect("read chats");
+    let chats = core.workspace.read_chats().expect("read chats");
     assert_eq!(chats.len(), 1, "chat row survives restart: {chats:#?}");
     assert_eq!(chats[0].id, CHAT);
     assert_eq!(chats[0].cwd.as_deref(), Some("/tmp"));

@@ -59,6 +59,60 @@ const REPLAY_CRASH_LIMIT = 3;
 const FRAGMENT_BYTES = 200_000;
 /** Keep a rolling ~5 weeks of daily frontier checkpoints. */
 const MAX_CHECKPOINTS = 36;
+/** Isolate-wide poisoned-wasm strike counter — MODULE state on purpose: every
+ * SessionRoom co-located in this isolate shares ONE loro-wasm linear memory,
+ * so heap exhaustion poisons them all at once (2026-08-04: every
+ * byte-exporting wasm call threw RangeError("Invalid array buffer length")
+ * while imports/relays kept working, silently wedging all joins fleet-wide). */
+let wasmPoisonStrikes = 0;
+/** Wasm-boundary failures before `ctx.abort()` recycles the isolate. Wasm
+ * memory only ever grows, so the poisoned state is permanent until the isolate
+ * dies — and Cloudflare's own memory-limit reset arrives only after minutes of
+ * thrash. Aborting early turns a silent hours-long wedge into a seconds-long
+ * blip (sockets close, clients redial into a fresh isolate). */
+const WASM_POISON_ABORT_AFTER = 3;
+/** Free a quiet room's materialized doc after this long. Wasm linear memory
+ * NEVER shrinks and outlives DO instances (one wasm module per isolate), so
+ * docs held resident until instance eviction leak permanently — every
+ * reconnect herd rematerialized every co-located room and the heap climbed
+ * monotonically to the isolate limit in minutes (2026-08-04 thrash loop).
+ * Freeing on idle returns blocks to the wasm allocator for reuse;
+ * rematerialization is a 10-50ms cold replay. */
+const DOC_IDLE_RELEASE_MS = 60_000;
+/** Force-trim threshold: a room with NO trim-eligible checkpoint but a
+ * full-history snapshot this large trims at its CURRENT frontier instead of
+ * waiting days to age into RETAIN_DAYS eligibility. Behind/concurrent peers
+ * take the §3.1 stale-peer full resync (designed-for). Without this, the
+ * 2026-08-04 whale rooms (954KB / 1.8MB import chats, checkpoints first
+ * recorded today) would have kept re-materializing their full history into
+ * the pressed wasm heap for three more days of thrash. */
+const TRIM_FORCE_BYTES = 512 * 1024;
+/** Import penalty box (see `importPenalty`): consecutive failed %LOR imports
+ * before a device's pushes are short-circuited, and for how long. */
+const IMPORT_PENALTY_STRIKES = 3;
+const IMPORT_PENALTY_MS = 10 * 60 * 1000;
+/** While penalized, payloads at or under this size still get one import
+ * attempt: a healed (re-flattened) device's first small status/title write
+ * clears its box immediately instead of serving out IMPORT_PENALTY_MS in
+ * silence — the box exists to stop ~1MB doomed reassemblies, and a bounded
+ * small import costs ~nothing even when it fails. */
+const PENALTY_PROBE_MAX_BYTES = 4096;
+/** A wasm-bindgen wrapper whose `free()` already ran has `__wbg_ptr === 0`;
+ * any method call on it throws `Error("null pointer passed to rust")`. Several
+ * flows (trim, fold, alarm, idle release) free-and-replace the cached doc
+ * around `await`s, so a stale wrapper can outlive its wasm memory. 2026-08-04
+ * evening: one such interleaving left `this.doc` dangling in a live instance —
+ * every join/update/tail on the ws3 workspace room threw for 2.5h fleet-wide,
+ * and nothing recycled the instance because the error is neither a RangeError
+ * nor a RuntimeError (the wasm-poison tripwire ignored it). Check liveness
+ * before every reuse; rematerialization is a ~tens-of-ms cold replay. */
+const isLive = (obj: unknown): boolean =>
+  (obj as { __wbg_ptr?: number } | undefined)?.__wbg_ptr !== 0;
+/** The use-after-free / detached-buffer signatures of a dangling wasm wrapper
+ * — same terminal shape as heap poisoning (nothing in-instance recovers it),
+ * so the tripwire must count these too. */
+const isWasmUseAfterFree = (e: unknown): boolean =>
+  e instanceof Error && /null pointer passed to rust|detached ArrayBuffer/i.test(e.message);
 
 interface SocketState {
   userId: string;
@@ -67,6 +121,9 @@ interface SocketState {
   /** True for sockets on a workspace-doc room — org membership was enforced
    * by the Worker, so the per-chat ownership discipline does not apply. */
   workspace?: boolean;
+  /** Dialing engine's device id (from `&device=`, Worker-validated) — pure
+   * log attribution; never used for authz. */
+  deviceId?: string;
 }
 
 interface FragmentBatch {
@@ -94,6 +151,27 @@ export class SessionRoom implements DurableObject {
   /** In-memory fragment reassembly. Lost on hibernation → the sender gets a
    * FragmentTimeout ack for the unknown batch and resends — self-healing. */
   private readonly fragments = new Map<WebSocket, Map<string, FragmentBatch>>();
+  /** Per-device import penalty box. A peer whose %LOR pushes repeatedly fail
+   * to import (a stale peer behind a shallow trim, a device on a diverged
+   * timeline) redials and re-pushes its ENTIRE unacceptable diff forever —
+   * 2026-08-04 ~23:44Z: home-laptop's ~1MB doomed re-uploads, reassembled and
+   * import-attempted every retry cycle, pressed the shared wasm heap into
+   * RangeErrors and the poison tripwire recycled the isolate over and over,
+   * dropping every device's sockets. After IMPORT_PENALTY_STRIKES consecutive
+   * failures a device's pushes are rejected WITHOUT reassembly or import for
+   * IMPORT_PENALTY_MS — zero wasm cost, bounded retry, and the room stays up
+   * for everyone else. In-memory: an instance recycle grants a fresh 3 tries. */
+  private readonly importPenalty = new Map<string, { strikes: number; until: number }>();
+  /** Per-device %LOR push outcomes (in-memory, like `importPenalty`). Workers
+   * Logs cannot see hibernatable webSocketMessage handlers, so /stats is the
+   * only live per-device attribution surface an operator has mid-incident. */
+  private readonly pushOutcomes = new Map<
+    string,
+    { ok: number; rejected: number; lastOkAt: number; lastRejectAt: number }
+  >();
+  /** Idle-doc release bookkeeping (see DOC_IDLE_RELEASE_MS / touchDoc). */
+  private docIdleTimer: ReturnType<typeof setTimeout> | undefined;
+  private lastDocUse = 0;
 
   constructor(ctx: DurableObjectState, env: Env) {
     this.ctx = ctx;
@@ -143,10 +221,22 @@ export class SessionRoom implements DurableObject {
     if (url.pathname === "/ws") {
       const chatId = url.searchParams.get("chatId") ?? "";
       if (chatId && !this.getMeta("chatId")) this.setMeta("chatId", chatId);
+      const deviceId = url.searchParams.get("device") ?? undefined;
       const pair = new WebSocketPair();
       this.ctx.acceptWebSocket(pair[1]);
-      const state: SocketState = { userId, rooms: [], ...(workspace ? { workspace } : {}) };
+      const state: SocketState = {
+        userId,
+        rooms: [],
+        ...(workspace ? { workspace } : {}),
+        ...(deviceId ? { deviceId } : {})
+      };
       pair[1].serializeAttachment(state);
+      console.log(
+        "socket accepted",
+        `room=${this.getMeta("chatId") ?? "?"}`,
+        `device=${deviceId ?? "unattributed"}`,
+        `sockets=${this.ctx.getWebSockets().length}`
+      );
       return new Response(null, { status: 101, webSocket: pair[0] });
     }
 
@@ -182,7 +272,10 @@ export class SessionRoom implements DurableObject {
         backupDirty: this.getMeta("backupDirty") === "1",
         // Non-zero while a cold replay is in flight or has been dying — the
         // wedge signature ensureDoc's automated reset watches for.
-        replayAttempts: Number(this.getMeta("replayAttempts") ?? "0")
+        replayAttempts: Number(this.getMeta("replayAttempts") ?? "0"),
+        // Per-device %LOR attribution (in-memory: since this instance woke).
+        importPenalty: [...this.importPenalty].map(([device, e]) => ({ device, ...e })),
+        pushOutcomes: [...this.pushOutcomes].map(([device, e]) => ({ device, ...e }))
       });
     }
     if (url.pathname === "/tail" && request.method === "GET") {
@@ -190,7 +283,16 @@ export class SessionRoom implements DurableObject {
         if (!owner) return json({ error: "not_found" }, 404);
         if (owner !== userId) return json({ error: "forbidden" }, 403);
       }
-      return json(await this.currentTail());
+      try {
+        return json(await this.currentTail());
+      } catch (e) {
+        // Surface the real error to the operator: a bare 1101 here cost the
+        // 2026-08-05 incident an hour of blind guessing (Workers Logs can't
+        // be queried without an observability-scoped token).
+        console.error("tail materialization failed", `room=${this.getMeta("chatId") ?? "?"}`, String(e));
+        this.escalateWasmPoisoning(e);
+        return json({ error: "tail_failed", message: String(e) }, 500);
+      }
     }
     if (url.pathname === "/diff" && request.method === "GET") {
       if (!workspace) {
@@ -215,12 +317,19 @@ export class SessionRoom implements DurableObject {
         if (!owner) return json({ error: "not_found" }, 404);
         if (owner !== userId) return json({ error: "forbidden" }, 403);
       }
-      await this.flush();
-      const doc = await this.ensureDoc();
-      const bytes = doc.export({ mode: "snapshot" });
-      return new Response(bytes as unknown as BodyInit, {
-        headers: { "content-type": "application/octet-stream" }
-      });
+      try {
+        await this.flush();
+        const doc = await this.ensureDoc();
+        const bytes = doc.export({ mode: "snapshot" });
+        return new Response(bytes as unknown as BodyInit, {
+          headers: { "content-type": "application/octet-stream" }
+        });
+      } catch (e) {
+        // The repair-read must never fail as a bare 1101 — see /tail above.
+        console.error("snapshot export failed", `room=${this.getMeta("chatId") ?? "?"}`, String(e));
+        this.escalateWasmPoisoning(e);
+        return json({ error: "snapshot_failed", message: String(e) }, 500);
+      }
     }
     if (url.pathname === "/append" && request.method === "POST") {
       // MERGE-safe repair write: import a Loro update (never replaces the
@@ -264,6 +373,7 @@ export class SessionRoom implements DurableObject {
         | number
         | undefined;
       this.dropLog();
+      this.doc?.free(); // release the wasm memory, don't wait on GC finalizers
       this.doc = undefined; // force a fresh (empty) materialization next join
       // Boot any currently-attached %LOR/%EPH sockets so their hung/half-cold
       // sessions bail and reconnect into the now-empty doc.
@@ -291,39 +401,112 @@ export class SessionRoom implements DurableObject {
       return;
     }
     const state = ws.deserializeAttachment() as SocketState;
-    switch (decoded.type) {
-      case MessageType.JoinRequest:
-        await this.handleJoin(ws, state, decoded);
-        break;
-      case MessageType.DocUpdate:
-        await this.handleDocUpdate(ws, state, decoded);
-        break;
-      case MessageType.DocUpdateFragmentHeader:
-        this.handleFragmentHeader(ws, state, decoded);
-        break;
-      case MessageType.DocUpdateFragment:
-        await this.handleFragment(ws, state, decoded);
-        break;
-      case MessageType.Leave:
-        state.rooms = state.rooms.filter((r) => r !== decoded.crdt);
-        ws.serializeAttachment(state);
-        break;
-      case MessageType.Ack:
-      case MessageType.RoomError:
-        break;
-      default:
-        ws.close(1002, "Unsupported message");
+    try {
+      switch (decoded.type) {
+        case MessageType.JoinRequest:
+          await this.handleJoin(ws, state, decoded);
+          break;
+        case MessageType.DocUpdate:
+          await this.handleDocUpdate(ws, state, decoded);
+          break;
+        case MessageType.DocUpdateFragmentHeader:
+          this.handleFragmentHeader(ws, state, decoded);
+          break;
+        case MessageType.DocUpdateFragment:
+          await this.handleFragment(ws, state, decoded);
+          break;
+        case MessageType.Leave:
+          state.rooms = state.rooms.filter((r) => r !== decoded.crdt);
+          ws.serializeAttachment(state);
+          break;
+        case MessageType.Ack:
+        case MessageType.RoomError:
+          break;
+        default:
+          ws.close(1002, "Unsupported message");
+      }
+    } catch (e) {
+      // A handler that dies pre-answer used to fail in SILENCE: the client
+      // waits out its 15s join deadline, redials, and dies the same way —
+      // the 2026-08-04 fleet-wide join wedge. Log attributed, answer an
+      // outstanding join so clients fail fast and VISIBLY (JoinError →
+      // long-backoff rejoin instead of a hot 15s dial loop), then escalate
+      // suspected wasm-heap poisoning to an isolate recycle.
+      console.error(
+        "ws message handler failed",
+        `room=${this.getMeta("chatId") ?? "?"}`,
+        `device=${state?.deviceId ?? "unattributed"}`,
+        `type=${decoded.type}`,
+        String(e)
+      );
+      if (decoded.type === MessageType.JoinRequest) {
+        this.send(ws, {
+          type: MessageType.JoinError,
+          crdt: decoded.crdt,
+          roomId: decoded.roomId,
+          code: JoinErrorCode.AppError,
+          message: "internal error"
+        });
+      }
+      this.escalateWasmPoisoning(e);
     }
   }
 
   async webSocketClose(ws: WebSocket): Promise<void> {
+    this.logSocketEnd(ws, "closed");
     this.fragments.delete(ws);
-    await this.flush();
+    try {
+      await this.flush();
+    } catch (e) {
+      // Flush can fold the log (a wasm snapshot export); an uncaught throw
+      // here is invisible in a close handler. Same discipline as above.
+      console.error("flush on socket close failed", `room=${this.getMeta("chatId") ?? "?"}`, String(e));
+      this.escalateWasmPoisoning(e);
+    }
   }
 
   async webSocketError(ws: WebSocket): Promise<void> {
+    this.logSocketEnd(ws, "errored");
     this.fragments.delete(ws);
-    await this.flush();
+    try {
+      await this.flush();
+    } catch (e) {
+      console.error("flush on socket error failed", `room=${this.getMeta("chatId") ?? "?"}`, String(e));
+      this.escalateWasmPoisoning(e);
+    }
+  }
+
+  /** RangeError("Invalid array buffer length") / wasm RuntimeError are the
+   * signature of an exhausted loro-wasm heap (see `wasmPoisonStrikes`).
+   * Strike out and `ctx.abort()` so clients redial into a fresh isolate
+   * within seconds instead of hot-looping against a deaf room until
+   * Cloudflare's memory-limit reset finally fires. */
+  private escalateWasmPoisoning(e: unknown): void {
+    if (!(e instanceof RangeError || e instanceof WebAssembly.RuntimeError || isWasmUseAfterFree(e))) {
+      return;
+    }
+    wasmPoisonStrikes++;
+    if (wasmPoisonStrikes < WASM_POISON_ABORT_AFTER) return;
+    console.error(`wasm heap poisoned (${wasmPoisonStrikes} strikes); aborting isolate for a fresh heap`);
+    // Best effort: if abort recycles only the DO instance (not the whole
+    // isolate), at least this room's doc goes back to the wasm allocator.
+    try {
+      this.doc?.free();
+    } catch {
+      /* already poisoned beyond freeing */
+    }
+    this.doc = undefined;
+    this.ctx.abort("loro-wasm heap exhausted; recycling isolate");
+  }
+
+  private logSocketEnd(ws: WebSocket, how: string): void {
+    const state = ws.deserializeAttachment() as SocketState | null;
+    console.log(
+      `socket ${how}`,
+      `room=${this.getMeta("chatId") ?? "?"}`,
+      `device=${state?.deviceId ?? "unattributed"}`,
+      `sockets=${Math.max(0, this.ctx.getWebSockets().length - 1)}`
+    );
   }
 
   private async handleJoin(ws: WebSocket, state: SocketState, message: JoinRequest): Promise<void> {
@@ -348,20 +531,34 @@ export class SessionRoom implements DurableObject {
       const doc = await this.ensureDoc();
       if (!state.rooms.includes(message.crdt)) state.rooms.push(message.crdt);
       ws.serializeAttachment(state);
-      this.send(ws, {
-        type: MessageType.JoinResponseOk,
-        crdt: message.crdt,
-        roomId: message.roomId,
-        permission: "write",
-        version: doc.version().encode()
-      });
+      // Wasm-bindgen objects (VersionVector here and below) free their wasm
+      // memory only via GC finalizers — and V8 has no reason to collect when
+      // the pressure is in WASM linear memory, not the JS heap. Under join
+      // storms these leaked per-answer until the isolate hit its memory
+      // limit (2026-08-04 exhaustion). Free explicitly.
+      const vv = doc.version();
+      try {
+        this.send(ws, {
+          type: MessageType.JoinResponseOk,
+          crdt: message.crdt,
+          roomId: message.roomId,
+          permission: "write",
+          version: vv.encode()
+        });
+      } finally {
+        vv.free();
+      }
       let backfill: Uint8Array;
       if (message.version.length > 0) {
+        let from: VersionVector | undefined;
         try {
-          backfill = doc.export({ mode: "update", from: VersionVector.decode(message.version) });
+          from = VersionVector.decode(message.version);
+          backfill = doc.export({ mode: "update", from });
         } catch {
           // Unknown/garbled client version — fall back to a full snapshot.
           backfill = doc.export({ mode: "snapshot" });
+        } finally {
+          from?.free();
         }
       } else {
         backfill = doc.export({ mode: "snapshot" });
@@ -369,6 +566,13 @@ export class SessionRoom implements DurableObject {
       if (backfill.length > 0) {
         this.sendUpdates(ws, message.crdt, message.roomId, [backfill]);
       }
+      // A full join answer just exported cleanly — the wasm heap is healthy.
+      // Without this reset, occasional transient RangeErrors accumulated
+      // over an isolate's lifetime and the tripwire aborted HEALTHY
+      // isolates, each abort causing a reconnect herd that produced more
+      // transient errors (observed 2026-08-04: ~1 abort/min with all rooms
+      // already trimmed small). Poisoning is CONSECUTIVE failures.
+      wasmPoisonStrikes = 0;
       return;
     }
 
@@ -403,6 +607,15 @@ export class SessionRoom implements DurableObject {
       return;
     }
     if (!state.rooms.includes(message.crdt)) {
+      // A write from a socket that never (re)joined: PermissionDenied makes
+      // the client rejoin, but the condition itself is the `rooms: []`
+      // broadcast-exclusion state — log who hit it.
+      console.warn(
+        "update from non-member socket",
+        `room=${this.getMeta("chatId") ?? "?"}`,
+        `device=${state.deviceId ?? "unattributed"}`,
+        `crdt=${message.crdt}`
+      );
       this.ack(ws, message, UpdateStatusCode.PermissionDenied);
       return;
     }
@@ -410,27 +623,109 @@ export class SessionRoom implements DurableObject {
   }
 
   /** Shared apply path for whole and reassembled updates. */
+  /** True (and refreshed) when the device is in the import penalty box —
+   * callers must reject its %LOR payloads without reassembly or import. */
+  private importPenalized(deviceId: string | undefined, now: number): boolean {
+    if (!deviceId) return false;
+    const entry = this.importPenalty.get(deviceId);
+    return !!entry && entry.strikes >= IMPORT_PENALTY_STRIKES && entry.until > now;
+  }
+
+  /** Per-device push-outcome bookkeeping for /stats (see `pushOutcomes`). */
+  private notePush(deviceId: string | undefined, ok: boolean, now: number): void {
+    if (!deviceId) return;
+    const entry =
+      this.pushOutcomes.get(deviceId) ?? { ok: 0, rejected: 0, lastOkAt: 0, lastRejectAt: 0 };
+    if (ok) {
+      entry.ok++;
+      entry.lastOkAt = now;
+    } else {
+      entry.rejected++;
+      entry.lastRejectAt = now;
+    }
+    this.pushOutcomes.set(deviceId, entry);
+  }
+
   private async applyUpdates(
     ws: WebSocket,
-    _state: SocketState,
+    state: SocketState,
     crdt: CrdtType,
     roomId: string,
     batchId: `0x${string}`,
     updates: Uint8Array[]
   ): Promise<void> {
     if (crdt === CrdtType.Loro) {
-      const doc = await this.ensureDoc();
-      try {
-        for (const update of updates) if (update.length > 0) doc.import(update);
-      } catch {
-        // Includes imports concurrent to a shallow-snapshot start (§3.1 stale
-        // peer) — the client resyncs fresh and re-submits at the app layer.
+      const now = Date.now();
+      const totalBytes = updates.reduce((n, u) => n + u.length, 0);
+      if (this.importPenalized(state.deviceId, now) && totalBytes > PENALTY_PROBE_MAX_BYTES) {
+        this.notePush(state.deviceId, false, now);
         this.ack(ws, { crdt, roomId }, UpdateStatusCode.InvalidUpdate, batchId);
         return;
       }
+      const doc = await this.ensureDoc();
+      const imported: Uint8Array[] = [];
+      let failed = false;
+      try {
+        for (const update of updates)
+          if (update.length > 0) {
+            doc.import(update);
+            imported.push(update);
+          }
+      } catch (e) {
+        // Wasm-heap poison is terminal for this instance — no salvage
+        // retries against a dying heap; the outer handler's tripwire counts
+        // it and recycles the isolate.
+        if (e instanceof RangeError || e instanceof WebAssembly.RuntimeError || isWasmUseAfterFree(e)) {
+          throw e;
+        }
+        // Includes imports concurrent to a shallow-snapshot start (§3.1 stale
+        // peer) — the client resyncs fresh and re-submits at the app layer.
+        // Salvage the rest of the batch individually first: one unimportable
+        // update (a stale peer's bundled old history) must not void the
+        // batch's good writes — session status/title are exactly the small
+        // updates that ride along. Re-importing an already-applied update is
+        // idempotent, so restarting the loop from the top is safe.
+        failed = true;
+        imported.length = 0;
+        for (const update of updates) {
+          if (update.length === 0) continue;
+          try {
+            doc.import(update);
+            imported.push(update);
+          } catch {
+            /* this update is the poison; strike below */
+          }
+        }
+      }
+      if (failed) {
+        // Strike the device: past IMPORT_PENALTY_STRIKES its (large) pushes
+        // are rejected without import for IMPORT_PENALTY_MS (importPenalty).
+        if (state.deviceId) {
+          const entry = this.importPenalty.get(state.deviceId) ?? { strikes: 0, until: 0 };
+          entry.strikes++;
+          entry.until = now + IMPORT_PENALTY_MS;
+          this.importPenalty.set(state.deviceId, entry);
+          if (entry.strikes === IMPORT_PENALTY_STRIKES) {
+            console.warn(
+              "device entered import penalty box",
+              `room=${this.getMeta("chatId") ?? "?"}`,
+              `device=${state.deviceId}`
+            );
+          }
+        }
+        this.notePush(state.deviceId, false, now);
+        if (imported.length > 0) {
+          this.recordLoroUpdates(imported);
+          this.relay(ws, crdt, roomId, imported);
+        }
+        this.ack(ws, { crdt, roomId }, UpdateStatusCode.InvalidUpdate, batchId);
+        return;
+      }
+      if (state.deviceId) this.importPenalty.delete(state.deviceId);
+      this.notePush(state.deviceId, true, now);
       this.recordLoroUpdates(updates);
       this.ack(ws, { crdt, roomId }, UpdateStatusCode.Ok, batchId);
-      this.broadcast(ws, crdt, { type: MessageType.DocUpdate, crdt, roomId, updates, batchId });
+      this.relay(ws, crdt, roomId, updates);
       return;
     }
     if (crdt === CrdtType.LoroEphemeralStore) {
@@ -442,7 +737,7 @@ export class SessionRoom implements DurableObject {
         return;
       }
       this.ack(ws, { crdt, roomId }, UpdateStatusCode.Ok, batchId);
-      this.broadcast(ws, crdt, { type: MessageType.DocUpdate, crdt, roomId, updates, batchId });
+      this.relay(ws, crdt, roomId, updates);
       return;
     }
     this.ack(ws, { crdt, roomId }, UpdateStatusCode.Unknown, batchId);
@@ -481,6 +776,19 @@ export class SessionRoom implements DurableObject {
       this.ack(ws, message, UpdateStatusCode.PermissionDenied, message.batchId);
       return;
     }
+    // Penalized devices get rejected at the HEADER — before any reassembly
+    // buffers exist. Their doomed multi-megabyte re-uploads are what pressed
+    // the wasm heap into the 2026-08-04 abort loop. Small totals fall through
+    // to the applyUpdates probe (PENALTY_PROBE_MAX_BYTES).
+    if (
+      message.crdt === CrdtType.Loro &&
+      message.totalSizeBytes > PENALTY_PROBE_MAX_BYTES &&
+      this.importPenalized(state.deviceId, Date.now())
+    ) {
+      this.notePush(state.deviceId, false, Date.now());
+      this.ack(ws, message, UpdateStatusCode.InvalidUpdate, message.batchId);
+      return;
+    }
     let batches = this.fragments.get(ws);
     if (!batches) {
       batches = new Map();
@@ -501,6 +809,12 @@ export class SessionRoom implements DurableObject {
   ): Promise<void> {
     const batch = this.fragments.get(ws)?.get(message.batchId);
     if (!batch) {
+      if (message.crdt === CrdtType.Loro && this.importPenalized(state.deviceId, Date.now())) {
+        // Fragments of a batch whose header we rejected (penalty box): drop
+        // silently — a FragmentTimeout here would just solicit a resend of
+        // the same doomed megabytes.
+        return;
+      }
       // Unknown batch (e.g. header lost to hibernation) — tell the sender to
       // retry the whole batch.
       this.ack(ws, message, UpdateStatusCode.FragmentTimeout, message.batchId);
@@ -522,7 +836,18 @@ export class SessionRoom implements DurableObject {
   // ── doc/ephemeral materialization ────────────────────────────────────────
 
   private async ensureDoc(): Promise<LoroDoc> {
-    if (this.doc) return this.doc;
+    this.touchDoc();
+    if (this.doc) {
+      if (isLive(this.doc)) return this.doc;
+      // Dangling wrapper (freed by a concurrent trim/release while another
+      // flow still held the instance): drop it and rematerialize instead of
+      // handing every caller a guaranteed throw (the 2026-08-04 ws3 wedge).
+      console.error(
+        "cached doc was freed (dangling wrapper); rematerializing",
+        `room=${this.getMeta("chatId") ?? "?"}`
+      );
+      this.doc = undefined;
+    }
     // AUTOMATED WEDGE BREAK: a cold replay that exceeds the DO CPU limit kills
     // the invocation before `replayAttempts` is cleared below — and every
     // reconnecting client cold-starts the room into the same death, forever
@@ -531,7 +856,24 @@ export class SessionRoom implements DurableObject {
     // Recovery is by design lossless-enough: every engine holds the full doc
     // locally and re-uploads whatever the server lacks on its next join.
     const attempts = Number(this.getMeta("replayAttempts") ?? "0");
-    if (attempts >= REPLAY_CRASH_LIMIT) this.dropLog();
+    if (attempts >= REPLAY_CRASH_LIMIT) {
+      this.dropLog();
+      // Boot every attached socket, exactly like POST /reset-log. The
+      // automated wedge break used to swap the doc out from UNDER live
+      // sessions: their next writes carried deps the emptied doc lacks,
+      // imports failed, clients burned their capped invalid-rejoin resyncs
+      // and then sat LATCHED — rows frozen on a healthy-looking socket
+      // (2026-08-04: work-metal's workspace status never updated again
+      // after the 20:16Z wedge-break while its chat rooms streamed fine).
+      // A close → redial → empty-VV join re-uploads full state instead.
+      for (const sock of this.ctx.getWebSockets()) {
+        try {
+          sock.close(4410, "room reset");
+        } catch {
+          /* already gone */
+        }
+      }
+    }
     this.setMeta("replayAttempts", String(attempts + 1));
     // INCIDENT (2026-07-30): a CPU-limit kill ROLLS BACK the event's
     // uncommitted storage writes — so the increment above died with every
@@ -582,10 +924,58 @@ export class SessionRoom implements DurableObject {
     this.setMeta("lastReplayMs", String(replayMs));
     this.setMeta("lastReplayRows", String(rows));
     console.log(
-      `cold replay: ${replayMs}ms, ${rows} rows, snapshot ${snapshot?.length ?? 0}B, attempt ${attempts + 1}`
+      `cold replay: ${replayMs}ms, ${rows} rows, snapshot ${snapshot?.length ?? 0}B, attempt ${attempts + 1}`,
+      `room=${this.getMeta("chatId") ?? "?"}`
     );
     this.doc = doc;
-    return doc;
+    // Record a frontier checkpoint on cold start too: the alarm only records
+    // while WRITES keep it armed, so an idle room never aged into trim
+    // eligibility — it could never shrink, ever. One checkpoint a day max.
+    const checkpoints = JSON.parse(this.getMeta("checkpoints") ?? "[]") as FrontierCheckpoint[];
+    const newest = checkpoints[checkpoints.length - 1];
+    if (!newest || Date.now() - newest.at >= DAY_MS) {
+      checkpoints.push({
+        at: Date.now(),
+        frontiers: doc.frontiers().map((f) => ({ peer: String(f.peer), counter: f.counter }))
+      });
+      while (checkpoints.length > MAX_CHECKPOINTS) checkpoints.shift();
+      this.setMeta("checkpoints", JSON.stringify(checkpoints));
+    }
+    // Trim on cold materialization too: fold and alarm both ride WRITES, so
+    // an idle-but-watched room NEVER trimmed — yet every isolate restart
+    // re-materializes its full history into the shared wasm heap (the
+    // 2026-08-04 exhaustion recurred post-fix on exactly those rooms). The
+    // one-off export cost here permanently shrinks the room.
+    if (await this.trimHistoryIfDue(doc, Date.now())) {
+      console.log(`history trimmed on cold start room=${this.getMeta("chatId") ?? "?"}`);
+    }
+    return this.doc;
+  }
+
+  /** Idle-doc release (see DOC_IDLE_RELEASE_MS): a debounced timer frees the
+   * materialized doc after a quiet minute. Timer only exists while traffic
+   * keeps the DO awake — same hibernation discipline as the flush debounce.
+   * Buffered `pending` updates survive a release: cold replay re-imports
+   * them (see ensureDoc). */
+  private touchDoc(): void {
+    this.lastDocUse = Date.now();
+    if (this.docIdleTimer) return;
+    this.docIdleTimer = setTimeout(() => this.releaseIdleDoc(), DOC_IDLE_RELEASE_MS + 500);
+  }
+
+  private releaseIdleDoc(): void {
+    this.docIdleTimer = undefined;
+    if (!this.doc) return;
+    const idle = Date.now() - this.lastDocUse;
+    if (idle < DOC_IDLE_RELEASE_MS) {
+      this.docIdleTimer = setTimeout(
+        () => this.releaseIdleDoc(),
+        Math.max(DOC_IDLE_RELEASE_MS - idle, 1_000) + 500
+      );
+      return;
+    }
+    this.doc.free();
+    this.doc = undefined;
   }
 
   /** Drop the persisted update log + snapshot (the /reset-log storage clear):
@@ -656,12 +1046,111 @@ export class SessionRoom implements DurableObject {
     if ((rows ?? 0) > COMPACT_LOG_ROWS) await this.foldLog();
   }
 
-  /** LOG FOLD: full snapshot re-export + clear the update log. Lossless. */
+  /** LOG FOLD: snapshot re-export + clear the update log. Prefers a shallow
+   * trim when one is due — waiting for the DAILY alarm meant a heap-pressed
+   * colo (2026-08-04 wasm exhaustion) kept thrash-cycling for up to a day
+   * after the retention fix deployed; a high-churn room folds every ~400
+   * rows, so trimming here converges in minutes instead. Falls back to the
+   * lossless full snapshot when no trim is due (or the trim export fails). */
   private async foldLog(): Promise<void> {
     const doc = await this.ensureDoc();
-    this.blobs.put("snapshot", doc.export({ mode: "snapshot" }));
+    if (await this.trimHistoryIfDue(doc, Date.now())) return;
+    // Re-resolve after the await above: a concurrent trim may have replaced
+    // and FREED the wrapper captured in `doc` (guarded ensureDoc returns the
+    // live cached doc, or cheaply rematerializes).
+    const live = await this.ensureDoc();
+    this.blobs.put("snapshot", live.export({ mode: "snapshot" }));
     this.ctx.storage.sql.exec("DELETE FROM updates");
     this.setMeta("updateBytes", "0");
+  }
+
+  /** HISTORY TRIM (§3.1): shallow snapshot at the newest recorded frontier
+   * checkpoint older than RETAIN_DAYS — history before it is discarded
+   * permanently, state fully preserved. Returns whether a trim landed (the
+   * snapshot + log + materialized doc were all replaced — the passed `doc`
+   * is CONSUMED: its wasm memory is freed, callers must switch to
+   * `this.doc`). Best-effort: any export failure leaves the room to the
+   * caller's lossless fold. */
+  private async trimHistoryIfDue(doc: LoroDoc, now: number): Promise<boolean> {
+    const checkpoints = JSON.parse(this.getMeta("checkpoints") ?? "[]") as FrontierCheckpoint[];
+    const cutoff = checkpoints.filter((c) => now - c.at >= RETAIN_MS).pop();
+    let frontiers: { peer: `${number}`; counter: number }[];
+    // lastTrimAt alone gates the cutoff trim: the trim is durable (sync()
+    // below), and requiring doc.isShallow() re-fired it on EVERY cold start
+    // once a log fold re-exported the once-shallow doc as a regular
+    // snapshot (isShallow reads false after rematerializing from it) —
+    // observed as the same rooms "trimming" every few minutes all evening.
+    if (cutoff && this.getMeta("lastTrimAt") !== String(cutoff.at)) {
+      frontiers = cutoff.frontiers.map((f) => ({ peer: f.peer as `${number}`, counter: f.counter }));
+    } else if (
+      (this.blobs.get("snapshot")?.length ?? 0) + Number(this.getMeta("updateBytes") ?? "0") >
+      TRIM_FORCE_BYTES
+    ) {
+      // Snapshot AND log bytes: after a wedge-break reset the re-uploaded
+      // full histories live as LOG ROWS against an empty snapshot (observed
+      // live: 0B snapshot + 119 rows replaying for 7 SECONDS), so a
+      // snapshot-only gate never fired while every cold start ballooned the
+      // heap with the same megabytes.
+      // No aged checkpoint but the full history is already a heap hazard:
+      // trim at the current frontier (see TRIM_FORCE_BYTES).
+      // Any workspace-room generation (ws3/, ws4/, …) — matching the literal
+      // "ws3/" silently dropped this protection when fb6492c bumped the room
+      // name to ws4: the ws4 room force-trimmed at the LIVE frontier on
+      // 2026-08-05 02:37Z (and likely 00:55Z), stranding in-flight peers —
+      // the exact incident b019439 added this guard for. Chat rooms are bare
+      // UUIDs (hex — never a "ws" prefix), so the pattern cannot collide.
+      if (/^ws\d+\//.test(this.getMeta("chatId") ?? "")) {
+        // WORKSPACE rooms: never force-trim at the LIVE frontier. Every
+        // device writes this doc concurrently, so a live-frontier shallow
+        // start orphans any peer whose next ops depend on history just
+        // discarded — their pushes InvalidUpdate forever and, worse, a
+        // post-wedge-break trim can shallow-lock the room before all
+        // engines finish re-uploading (2026-08-04: the 20:34Z force-trim
+        // froze on a partial rebuild; the whole fleet needed manual doc
+        // surgery to converge). Trim only at a checkpoint ≥1 day old —
+        // every recently-active device has passed it, and dropLog clears
+        // checkpoints, so a freshly reset room gets a full day of grace to
+        // re-form before any trim. Chat rooms (single-owner, the 2026-08-04
+        // whale imports) keep the immediate live-frontier trim.
+        const aged = checkpoints.filter((c) => now - c.at >= DAY_MS).pop();
+        if (!aged) return false;
+        frontiers = aged.frontiers.map((f) => ({ peer: f.peer as `${number}`, counter: f.counter }));
+      } else {
+        frontiers = doc.frontiers().map((f) => ({ peer: String(f.peer) as `${number}`, counter: f.counter }));
+      }
+    } else {
+      return false;
+    }
+    try {
+      const shallow = doc.export({
+        mode: "shallow-snapshot",
+        frontiers
+      });
+      this.blobs.put("snapshot", shallow);
+      this.ctx.storage.sql.exec("DELETE FROM updates");
+      this.setMeta("updateBytes", "0");
+      this.setMeta("lastTrimAt", String(cutoff?.at ?? now));
+      // Make the trim durable NOW: a later kill in the same event (a join's
+      // backfill export on a pressed isolate — observed live 2026-08-04)
+      // rolls back uncommitted storage writes, silently resurrecting the
+      // full-history snapshot the trim just replaced.
+      await this.ctx.storage.sync();
+      const fresh = new LoroDoc();
+      fresh.import(shallow);
+      const old = this.doc;
+      this.doc = fresh;
+      // Free the replaced cached doc AND the caller's (possibly distinct,
+      // stale) doc exactly once each — waiting on GC finalizers leaks them
+      // into the shared wasm heap exactly when trimming was supposed to
+      // relieve it (see handleJoin). The isLive guards keep a concurrent
+      // interleaved trim from double-freeing what a sibling already returned
+      // to the allocator.
+      if (old && old !== fresh && isLive(old)) old.free();
+      if (doc !== fresh && doc !== old && isLive(doc)) doc.free();
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   /** Daily alarm: frontier checkpoint, history trim, R2 backup. */
@@ -679,27 +1168,11 @@ export class SessionRoom implements DurableObject {
     });
     while (checkpoints.length > MAX_CHECKPOINTS) checkpoints.shift();
 
-    // 2. HISTORY TRIM: shallow snapshot at the newest checkpoint older than
-    //    RETAIN_DAYS (history before it is discarded permanently — §3.1).
-    const cutoff = checkpoints.filter((c) => now - c.at >= RETAIN_MS).pop();
-    if (cutoff && !(doc.isShallow() && this.getMeta("lastTrimAt") === String(cutoff.at))) {
-      try {
-        const shallow = doc.export({
-          mode: "shallow-snapshot",
-          frontiers: cutoff.frontiers.map((f) => ({ peer: f.peer as `${number}`, counter: f.counter }))
-        });
-        this.blobs.put("snapshot", shallow);
-        this.ctx.storage.sql.exec("DELETE FROM updates");
-        this.setMeta("updateBytes", "0");
-        this.setMeta("lastTrimAt", String(cutoff.at));
-        const fresh = new LoroDoc();
-        fresh.import(shallow);
-        this.doc = fresh;
-      } catch {
-        /* trim is best-effort; the log fold keeps the room bounded */
-      }
-    }
+    // 2. HISTORY TRIM — must see today's checkpoint list, so persist first.
+    //    (Also fires from foldLog, which is what usually gets there first on
+    //    a high-churn room.)
     this.setMeta("checkpoints", JSON.stringify(checkpoints));
+    await this.trimHistoryIfDue(doc, now);
 
     // 3. Nightly R2 backup (§3.3) — full current snapshot, disaster hatch.
     // Two guards (round-2 review): postReset pauses the put between a
@@ -712,22 +1185,41 @@ export class SessionRoom implements DurableObject {
     // stays set and the alarm chain keeps trying.
     const chatId = this.getMeta("chatId");
     if (chatId && this.getMeta("postReset") !== "1") {
-      const current = this.doc ?? doc;
+      // Guarded re-resolve, not `this.doc ?? doc`: the trim above may have
+      // freed either reference, and `doc` was captured before several awaits.
+      const current = await this.ensureDoc();
       const prevVV = this.getMeta("backupVV");
       let advances = true;
       if (prevVV) {
+        let prev: VersionVector | undefined;
+        let cur: VersionVector | undefined;
         try {
-          const prev = VersionVector.decode(Uint8Array.from(atob(prevVV), (c) => c.charCodeAt(0)));
-          const cmp = current.version().compare(prev);
+          prev = VersionVector.decode(Uint8Array.from(atob(prevVV), (c) => c.charCodeAt(0)));
+          cur = current.version();
+          const cmp = cur.compare(prev);
           advances = cmp !== undefined && cmp >= 0;
         } catch {
           /* unreadable meta: allow the put and rewrite it below */
+        } finally {
+          // Explicit frees: see handleJoin — GC finalizers don't run under
+          // wasm-side memory pressure.
+          prev?.free();
+          cur?.free();
         }
       }
       if (advances) {
+        // Read everything off the doc BEFORE the R2 await — a concurrent
+        // trim/release during the put can free `current` under us.
         const snapshot = current.export({ mode: "snapshot" });
+        const vv = current.version();
+        let vvB64: string;
+        try {
+          vvB64 = btoa(String.fromCharCode(...vv.encode()));
+        } finally {
+          vv.free();
+        }
         await this.env.BLOBS.put(`backup/${chatId}/latest.loro`, snapshot);
-        this.setMeta("backupVV", btoa(String.fromCharCode(...current.version().encode())));
+        this.setMeta("backupVV", vvB64);
         this.setMeta("backupDirty", "0");
       }
     }
@@ -757,61 +1249,107 @@ export class SessionRoom implements DurableObject {
 
   // ── wire helpers ─────────────────────────────────────────────────────────
 
-  private send(ws: WebSocket, message: ProtocolMessage): void {
+  /** Returns false when the frame could not be delivered (socket gone /
+   * runtime refused the send). Encode failures throw out instead — they are
+   * OUR bug, never the peer's, and must not be mistaken for a deaf socket. */
+  private send(ws: WebSocket, message: ProtocolMessage): boolean {
+    const bytes = encode(message);
     try {
-      ws.send(encode(message));
+      ws.send(bytes);
+      return true;
     } catch {
       /* socket already gone; hibernation API cleans it up */
+      return false;
     }
   }
 
-  /** Send updates, fragmenting any single update above the protocol cap. */
-  private sendUpdates(ws: WebSocket, crdt: CrdtType, roomId: string, updates: Uint8Array[]): void {
-    const small = updates.filter((u) => u.length <= MAX_MESSAGE_SIZE);
-    if (small.length > 0) {
-      this.send(ws, {
-        type: MessageType.DocUpdate,
-        crdt,
-        roomId,
-        updates: small,
-        batchId: this.newBatchId()
-      });
+  /** Send updates, fragmenting any single update above FRAGMENT_BYTES and
+   * chunking small ones so no encoded frame approaches the loro-protocol
+   * 256KB message cap (envelope overhead included). Returns false if any
+   * frame failed to deliver. */
+  private sendUpdates(ws: WebSocket, crdt: CrdtType, roomId: string, updates: Uint8Array[]): boolean {
+    let ok = true;
+    let batch: Uint8Array[] = [];
+    let batchBytes = 0;
+    const flushBatch = () => {
+      if (batch.length === 0) return;
+      ok =
+        this.send(ws, {
+          type: MessageType.DocUpdate,
+          crdt,
+          roomId,
+          updates: batch,
+          batchId: this.newBatchId()
+        }) && ok;
+      batch = [];
+      batchBytes = 0;
+    };
+    for (const u of updates) {
+      if (u.length > FRAGMENT_BYTES) continue;
+      if (batchBytes + u.length > FRAGMENT_BYTES) flushBatch();
+      batch.push(u);
+      batchBytes += u.length;
     }
+    flushBatch();
     for (const update of updates) {
-      if (update.length <= MAX_MESSAGE_SIZE) continue;
+      if (update.length <= FRAGMENT_BYTES) continue;
       const batchId = this.newBatchId();
       const fragmentCount = Math.ceil(update.length / FRAGMENT_BYTES);
-      this.send(ws, {
-        type: MessageType.DocUpdateFragmentHeader,
-        crdt,
-        roomId,
-        batchId,
-        fragmentCount,
-        totalSizeBytes: update.length
-      });
-      for (let i = 0; i < fragmentCount; i++) {
+      ok =
         this.send(ws, {
-          type: MessageType.DocUpdateFragment,
+          type: MessageType.DocUpdateFragmentHeader,
           crdt,
           roomId,
           batchId,
-          index: i,
-          fragment: update.subarray(i * FRAGMENT_BYTES, Math.min((i + 1) * FRAGMENT_BYTES, update.length))
-        });
+          fragmentCount,
+          totalSizeBytes: update.length
+        }) && ok;
+      for (let i = 0; i < fragmentCount; i++) {
+        ok =
+          this.send(ws, {
+            type: MessageType.DocUpdateFragment,
+            crdt,
+            roomId,
+            batchId,
+            index: i,
+            fragment: update.subarray(
+              i * FRAGMENT_BYTES,
+              Math.min((i + 1) * FRAGMENT_BYTES, update.length)
+            )
+          }) && ok;
       }
     }
+    return ok;
   }
 
-  private broadcast(from: WebSocket, crdt: CrdtType, message: ProtocolMessage): void {
-    const bytes = encode(message);
+  /** Relay accepted updates to every other member socket via sendUpdates —
+   * NOT a single pre-encoded frame. broadcast() used to encode the batch
+   * once, so a reassembled >256KB client push (a device re-uploading its
+   * full workspace history after a server reset) blew the loro-protocol
+   * message cap and NEVER reached peers live; they only converged via a
+   * later rejoin backfill (2026-08-04, the last silent-staleness path). */
+  private relay(from: WebSocket, crdt: CrdtType, roomId: string, updates: Uint8Array[]): void {
     for (const ws of this.ctx.getWebSockets()) {
       if (ws === from) continue;
       const state = ws.deserializeAttachment() as SocketState | null;
       if (!state?.rooms.includes(crdt)) continue;
-      try {
-        ws.send(bytes);
-      } catch {
-        /* stale socket */
+      if (!this.sendUpdates(ws, crdt, roomId, updates)) {
+        // A member socket we cannot send to is a DEAF PEER, not a skippable
+        // one: swallowing the failure left it looking alive (runtime
+        // auto-pongs, accepted writes) while it silently missed every
+        // broadcast until an app restart (2026-08-04 incident). Close it so
+        // the client's session ends and its redial + VV backfill heal the
+        // gap within seconds.
+        console.warn(
+          "relay send failed; closing socket",
+          `room=${this.getMeta("chatId") ?? "?"}`,
+          `device=${state.deviceId ?? "unattributed"}`
+        );
+        try {
+          ws.close(1011, "broadcast delivery failed");
+        } catch {
+          /* already gone */
+        }
       }
     }
   }

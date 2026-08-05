@@ -438,7 +438,6 @@ impl EngineRpc {
                 }
                 let chat = self
                     .workspace
-                    .doc()
                     .chat(chat_id)
                     .map_err(|e| RpcError::Failed(e.to_string()))?
                     .ok_or_else(|| RpcError::Failed("chat not found".into()))?;
@@ -454,7 +453,6 @@ impl EngineRpc {
                     .ok_or_else(|| RpcError::Failed("chat has no workspace space".into()))?;
                 let space = self
                     .workspace
-                    .doc()
                     .space(&space_id)
                     .map_err(|e| RpcError::Failed(e.to_string()))?
                     .ok_or_else(|| RpcError::Failed("chat workspace space not found".into()))?;
@@ -478,7 +476,6 @@ impl EngineRpc {
             (None, Some(space_id)) => {
                 let space = self
                     .workspace
-                    .doc()
                     .space(space_id)
                     .map_err(|e| RpcError::Failed(e.to_string()))?
                     .ok_or_else(|| RpcError::Failed("space not found".into()))?;
@@ -532,7 +529,7 @@ impl EngineRpc {
             }
         }
 
-        if let Ok(Some(chat)) = self.workspace.doc().chat(chat_id) {
+        if let Ok(Some(chat)) = self.workspace.chat(chat_id) {
             let diffs = self.diff_sync.watch_diffs().borrow().clone();
             let diff = chat
                 .checkout_id
@@ -974,6 +971,43 @@ impl RpcService for EngineRpc {
                     handle.watch_messages(),
                 )))
             }
+            methods::PROBE_SYNC => {
+                self.workspace.probe();
+                self.doc_host.probe_open_chats();
+                RpcReply::value(&serde_json::json!({}))
+            }
+            methods::SYNC_STATUS => {
+                fn room_json(s: &komet_sync::RoomStatsSnapshot) -> serde_json::Value {
+                    serde_json::json!({
+                        "connected": s.connected,
+                        "lastPushedMs": s.last_pushed_ms,
+                        "lastAckMs": s.last_ack_ms,
+                        "rejoins": s.rejoins,
+                        "probes": s.probes,
+                        "fullResyncs": s.full_resyncs,
+                        "disconnects": s.disconnects,
+                        "rejected": s.rejected,
+                    })
+                }
+                let workspace = self.workspace.sync_status();
+                let chats: Vec<serde_json::Value> = self
+                    .doc_host
+                    .sync_statuses()
+                    .iter()
+                    .map(|(chat_id, room)| {
+                        serde_json::json!({
+                            "chatId": chat_id,
+                            "room": room.as_ref().map(room_json),
+                        })
+                    })
+                    .collect();
+                RpcReply::value(&serde_json::json!({
+                    "deviceId": self.doc_host.device_id(),
+                    "nowMs": crate::now_ms(),
+                    "workspace": workspace.as_ref().map(room_json),
+                    "chats": chats,
+                }))
+            }
             methods::WATCH_CHATS => {
                 Ok(RpcReply::Stream(watch_stream(self.workspace.watch_chats())))
             }
@@ -1136,7 +1170,6 @@ impl RpcService for EngineRpc {
                 // no row yet) gets the home directory.
                 let cwd = self
                     .workspace
-                    .doc()
                     .chat(&p.chat_id)
                     .ok()
                     .flatten()
@@ -1261,7 +1294,6 @@ impl RpcService for EngineRpc {
                 // Path jail: the uploads dir plus every workspace-known chat cwd.
                 let roots: Vec<std::path::PathBuf> = self
                     .workspace
-                    .doc()
                     .read_chats()
                     .unwrap_or_default()
                     .into_iter()
