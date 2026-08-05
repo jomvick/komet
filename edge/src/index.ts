@@ -174,11 +174,14 @@ export default {
     if (parts[0] === "workspace" && parts[1] && ID_RE.test(parts[1])) {
       const orgId = parts[1];
       if (auth.orgId !== orgId) return json({ error: "forbidden" }, 403);
-      // `ws3` = the per-user privacy destructive break (`ws2` was the spaces
-      // overhaul): a fresh DO instance with an empty doc; legacy org-wide
-      // rooms are orphaned (hibernated, ~zero cost). URL path stays
-      // `/workspace/:orgId/*`.
-      const room = `ws3/${orgId}/${auth.userId}`;
+      // `ws4` = the 2026-08-04 incident break: the ws3 instance's storage was
+      // left with causally-broken update rows by the abort-thrash loop (acks
+      // outran the debounced flush) and could not be trusted again even after
+      // /reset-log; a name bump allocates a virgin DO. (`ws3` was the per-user
+      // privacy break, `ws2` the spaces overhaul.) Legacy rooms are orphaned
+      // (hibernated, ~zero cost). URL path stays `/workspace/:orgId/*`; the
+      // name is worker-internal — clients echo their own roomId strings.
+      const room = `ws4/${orgId}/${auth.userId}`;
       if (parts[2] === "ws") {
         if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
           return json({ error: "expected websocket" }, 426);
