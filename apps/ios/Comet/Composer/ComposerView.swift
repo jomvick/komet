@@ -6,6 +6,7 @@
 // The compact→expanded flip is deterministic (newline or >26 chars), NOT
 // content-size measured — measurement oscillates at the boundary.
 
+import PhotosUI
 import SwiftUI
 
 /// Shared glass shell + input + action row. `chips` (leading accessory views)
@@ -19,12 +20,19 @@ struct ComposerShell<Chips: View>: View {
     var busy = false
     var onSend: () -> Void
     var onStop: () -> Void = {}
+    /// Staged image attachments (attachment-ui.tsx AttachmentStrip inside the
+    /// pill). Non-empty forces the expanded layout, like chips.
+    var attachments: [StagedAttachment] = []
+    /// Present the photo picker; nil hides the attach button.
+    var onAttach: (() -> Void)? = nil
+    var onRemoveAttachment: (String) -> Void = { _ in }
     @ViewBuilder var chips: Chips
 
     @FocusState private var focused: Bool
 
     private var expanded: Bool {
-        Chips.self != EmptyView.self || draft.contains("\n") || draft.count > 26
+        Chips.self != EmptyView.self || !attachments.isEmpty
+            || draft.contains("\n") || draft.count > 26
     }
 
     // Switching between VStack/HStack via AnyLayout (rather than an if/else
@@ -39,13 +47,25 @@ struct ComposerShell<Chips: View>: View {
 
     var body: some View {
         shellLayout {
+            if expanded, !attachments.isEmpty {
+                AttachmentStripView(attachments: attachments, remove: onRemoveAttachment)
+                    .padding(.horizontal, 16)
+                    .padding(.top, 12)
+            }
+            if !expanded, onAttach != nil {
+                attachButton
+                    .padding(.leading, 7)
+            }
             input
                 .padding(.horizontal, expanded ? 20 : 0)
-                .padding(.leading, expanded ? 0 : 20)
+                .padding(.leading, expanded ? 0 : (onAttach == nil ? 20 : 4))
                 .padding(.top, expanded ? 15 : 0)
                 .padding(.vertical, expanded ? 0 : 15)
             if expanded {
                 HStack(spacing: 10) {
+                    if onAttach != nil {
+                        attachButton
+                    }
                     // Chips scroll; the send button stays pinned.
                     ScrollView(.horizontal, showsIndicators: false) {
                         HStack(spacing: 8) {
@@ -81,9 +101,29 @@ struct ComposerShell<Chips: View>: View {
             .focused($focused)
     }
 
+    private var attachButton: some View {
+        Button {
+            onAttach?()
+        } label: {
+            Image(systemName: "plus")
+                .font(.system(size: 15, weight: .medium))
+                .foregroundStyle(Theme.textMuted)
+                .frame(width: 36, height: 36)
+                .background(whiteAlpha(0.06), in: Circle())
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .disabled(busy)
+    }
+
+    /// Attachments count as content: an image-only send is a send, never a stop.
+    private var hasContent: Bool {
+        !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty
+    }
+
     private var actionButton: some View {
         Button {
-            if showStop, draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            if showStop, !hasContent {
                 UIImpactFeedbackGenerator(style: .medium).impactOccurred()
                 onStop()
             } else {
@@ -96,7 +136,7 @@ struct ComposerShell<Chips: View>: View {
                     ProgressView()
                         .controlSize(.small)
                         .tint(Theme.bg)
-                } else if showStop, draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                } else if showStop, !hasContent {
                     RoundedRectangle(cornerRadius: 3.5)
                         .fill(Theme.bg)
                         .frame(width: 12, height: 12)
@@ -117,40 +157,126 @@ struct ComposerShell<Chips: View>: View {
     }
 
     private var buttonActive: Bool {
-        if showStop, draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return true }
-        return sendEnabled && !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !busy
+        if showStop, !hasContent { return true }
+        return sendEnabled && hasContent && !busy
     }
 }
 
 /// The live-chat composer: config is locked once the chat exists, so no chips —
-/// just the input and the morphing action button.
+/// input, the photo attach button, and the morphing action button.
 struct ComposerView: View {
     let store: SessionStore
     let chat: Chat
     let runLive: Bool
 
     @State private var text = ""
+    @State private var attachments: [StagedAttachment] = []
+    @State private var pickerItems: [PhotosPickerItem] = []
+    @State private var showPicker = false
+    @State private var uploading = false
+    @State private var uploadError: String?
 
     var body: some View {
-        ComposerShell(
-            draft: $text,
-            sendEnabled: true,
-            showStop: runLive,
-            onSend: send,
-            onStop: { store.sendInterrupt() }
-        ) {
-            EmptyView()
+        VStack(spacing: 6) {
+            if let uploadError {
+                Text(uploadError)
+                    .font(Theme.sans(12))
+                    .foregroundStyle(Theme.danger)
+                    .lineLimit(2)
+                    .padding(.horizontal, 24)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            ComposerShell(
+                draft: $text,
+                sendEnabled: true,
+                showStop: runLive,
+                busy: uploading,
+                onSend: send,
+                onStop: { store.sendInterrupt() },
+                attachments: attachments,
+                onAttach: { showPicker = true },
+                onRemoveAttachment: { id in attachments.removeAll { $0.id == id } }
+            ) {
+                EmptyView()
+            }
+        }
+        .photosPicker(isPresented: $showPicker, selection: $pickerItems,
+                      maxSelectionCount: 8, matching: .images)
+        .onChange(of: pickerItems) { _, items in
+            guard !items.isEmpty else { return }
+            stage(items)
+        }
+    }
+
+    /// Load picked photos into staged attachments (HEIC transcodes to JPEG;
+    /// unsupported/oversized picks surface as an error line).
+    private func stage(_ items: [PhotosPickerItem]) {
+        Task { @MainActor in
+            var failed = 0
+            for item in items {
+                guard let data = try? await item.loadTransferable(type: Data.self),
+                      let staged = StagedAttachment.stage(data: data) else {
+                    failed += 1
+                    continue
+                }
+                attachments.append(staged)
+            }
+            pickerItems = []
+            if failed > 0 {
+                uploadError = failed == 1
+                    ? "One image couldn't be attached (unsupported or over 24 MB)."
+                    : "\(failed) images couldn't be attached (unsupported or over 24 MB)."
+            } else {
+                uploadError = nil
+            }
         }
     }
 
     private func send() {
         let prompt = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !prompt.isEmpty else { return }
-        if runLive {
-            store.sendSteer(prompt: prompt)
-        } else {
-            store.sendRun(prompt: prompt, chat: chat)
+        let staged = attachments
+        guard !prompt.isEmpty || !staged.isEmpty else { return }
+
+        if staged.isEmpty {
+            deliver(content: prompt, paths: [])
+            clearDraft()
+            return
         }
+        // Upload first, send after: the refs trailer needs the committed
+        // paths, and the doc entry must never point at files that don't
+        // exist. The shell shows the spinner (`busy`) while chunks stream.
+        uploading = true
+        uploadError = nil
+        Task { @MainActor in
+            defer { uploading = false }
+            do {
+                var paths: [String] = []
+                for att in staged {
+                    let path = try await store.uploadAttachment(name: att.name, data: att.data)
+                    // Seed the cache so our own bubble renders from local
+                    // bytes instead of a round-trip.
+                    AttachmentImageCache.shared.seed(deviceId: chat.deviceId, path: path,
+                                                     name: att.name, data: att.data)
+                    paths.append(path)
+                }
+                deliver(content: withAttachments(text: prompt, paths: paths), paths: paths)
+                attachments = []
+                clearDraft()
+            } catch {
+                uploadError = "Attachment upload failed — \(error.localizedDescription)"
+            }
+        }
+    }
+
+    private func deliver(content: String, paths: [String]) {
+        if runLive {
+            store.sendSteer(prompt: content)
+        } else {
+            store.sendRun(prompt: content, chat: chat, attachments: paths)
+        }
+    }
+
+    private func clearDraft() {
         text = ""
         // The clear above is unconditional, so a prompt left sitting in the
         // composer after a successful send is not this path failing to run —

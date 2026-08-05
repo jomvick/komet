@@ -19,6 +19,7 @@ struct SessionView: View {
     /// toolbar item (its container proposes an unbounded width).
     @State private var viewWidth: CGFloat = 0
 
+
     private var chat: Chat? { model.chat(id: chatId) }
 
     private var chatSpace: Space? {
@@ -184,28 +185,53 @@ struct SessionView: View {
 
     private func content(chat: Chat, store: SessionStore) -> some View {
         let status = liveStatus(chat: chat)
-        return VStack(spacing: 0) {
-            // The status strip floats over the transcript's faded bottom edge
-            // instead of stacking below it — the loader sits on the
-            // transparent zone and content is never pushed around.
-            TranscriptView(store: store, chatId: chat.id)
-                .overlay(alignment: .bottom) {
+        // The composer is a bottom SAFE-AREA INSET on the transcript, not a
+        // VStack sibling: the scroll view then spans the full height down to
+        // the keyboard, which is what lets UIKit's interactive
+        // keyboard-dismiss (scrollDismissesKeyboard(.interactively) in
+        // TranscriptView) track a downward drag — with a sibling composer the
+        // scroll view ends above the keyboard and the pan never engages it.
+        return TranscriptView(store: store, chatId: chat.id)
+            .safeAreaInset(edge: .bottom, spacing: 0) {
+                VStack(spacing: 0) {
+                    // The strip reserves its 24pt whether or not a run is
+                    // live, so the composer never shifts. It sits on the
+                    // solid floor right where the transcript's fade completes.
                     statusStrip(chat: chat, status: status)
                         .allowsHitTesting(false)
-                }
-
-            if let request = store.openInputRequest {
-                QuestionPanel(requestId: request.requestId, questions: request.questions) { requestId, answers in
-                    store.respondInput(requestId: requestId, answers: answers)
-                }
-                .padding(.bottom, 8)
-            } else {
-                ComposerView(store: store, chat: chat, runLive: status == .working)
+                    Group {
+                        if let request = store.openInputRequest {
+                            QuestionPanel(requestId: request.requestId, questions: request.questions) { requestId, answers in
+                                store.respondInput(requestId: requestId, answers: answers)
+                            }
+                        } else {
+                            ComposerView(store: store, chat: chat, runLive: status == .working)
+                        }
+                    }
                     .padding(.bottom, 8)
+                }
+                // One continuous dissolve: starts 44pt above the strip and
+                // reaches full bg only at the PHYSICAL bottom edge, so rows
+                // stay faintly visible sliding beneath the glass shell
+                // instead of vanishing at the composer's top. `.container`
+                // keeps it off the keyboard's safe-area region.
+                .background {
+                    LinearGradient(
+                        stops: [
+                            .init(color: Theme.bg.opacity(0), location: 0),
+                            .init(color: Theme.bg.opacity(0.45), location: 0.25),
+                            .init(color: Theme.bg.opacity(0.72), location: 0.6),
+                            .init(color: Theme.bg, location: 1),
+                        ],
+                        startPoint: .top, endPoint: .bottom
+                    )
+                    .padding(.top, -44)  // ramp begins above the strip
+                    .ignoresSafeArea(.container, edges: .bottom)
+                    .allowsHitTesting(false)
+                }
             }
-        }
-        .background(Theme.bg.ignoresSafeArea())
-        .motionAnimation(Motion.fadeQuick, value: store.openInputRequest?.requestId)
+            .background(Theme.bg.ignoresSafeArea())
+            .motionAnimation(Motion.fadeQuick, value: store.openInputRequest?.requestId)
     }
 
     private func liveStatus(chat: Chat) -> SessionStatus? {

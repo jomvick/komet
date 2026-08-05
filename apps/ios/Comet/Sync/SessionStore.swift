@@ -26,6 +26,10 @@ final class SessionStore {
     /// already-visible transcript until the settle loop finished. The store is
     /// cached per chat, so it outlives that churn.
     @ObservationIgnored var hasRevealed = false
+    /// Transcript parse/row cache — store-owned so parses survive view
+    /// churn, and prewarmed off-main whenever a projection lands so opening
+    /// the chat never parses markdown inside the first body pass.
+    @ObservationIgnored let transcriptCache = TranscriptBuilderCache()
     private(set) var connected = false
     /// Client-minted ids of sends the host hasn't materialized yet.
     private(set) var pendingSends: [(messageId: String, text: String, at: Int64)] = []
@@ -44,12 +48,32 @@ final class SessionStore {
         self.chatId = chatId
         self.config = config
         self.offline = offline
+        AttachmentImageCache.shared.configure(config: config)
+    }
+
+    // MARK: Attachments (uploads target the chat's host device)
+
+    @ObservationIgnored private var hostRelay: (deviceId: String, client: DeviceRelayClient)?
+
+    /// Chunked upload of one staged image to the host device; returns the
+    /// durable absolute path on that device (what the refs trailer carries).
+    func uploadAttachment(name: String, data: Data) async throws -> String {
+        guard let hostDeviceId else { throw RelayError.hostOffline }
+        let relay: DeviceRelayClient
+        if let hostRelay, hostRelay.deviceId == hostDeviceId {
+            relay = hostRelay.client
+        } else {
+            relay = DeviceRelayClient(deviceId: hostDeviceId, config: config)
+            hostRelay = (hostDeviceId, relay)
+        }
+        return try await uploadAttachmentChunked(relay: relay, name: name, data: data)
     }
 
     /// Demo-mode injection point (also used by previews).
     func setEntries(_ new: [MessageEntry]) {
         entries = new
         revision &+= 1
+        transcriptCache.prewarm(entries: entries)
     }
 
     @ObservationIgnored private var saver: DocSaver?
@@ -163,6 +187,9 @@ final class SessionStore {
         let ids = Set(entries.map(\.id))
         pendingSends.removeAll { ids.contains($0.messageId) }
         revision &+= 1
+        // If no transcript view is open, settle the parses now (off-main) so
+        // the eventual open is memo hits all the way down.
+        transcriptCache.prewarm(entries: entries)
     }
 
     /// Whole-doc decode. `nil` means the doc has no map root yet — leave the
@@ -267,7 +294,7 @@ final class SessionStore {
 
     // MARK: Command plane (ledger rule 1: append-only, own entries only)
 
-    func sendRun(prompt: String, chat: Chat) {
+    func sendRun(prompt: String, chat: Chat, attachments: [String] = []) {
         if offline {
             demoResponder?(prompt)
             return
@@ -277,7 +304,8 @@ final class SessionStore {
                                  model: chat.config?.model,
                                  reasoning: chat.config?.reasoning,
                                  cwd: chat.cwd ?? "",
-                                 sandbox: chat.config?.sandbox ?? "workspace-write")
+                                 sandbox: chat.config?.sandbox ?? "workspace-write",
+                                 attachments: attachments)
         queueCommand(kind: "run", payload: [
             "kind": "run",
             "request": encodableJSON(request),
