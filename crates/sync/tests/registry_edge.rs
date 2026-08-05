@@ -137,8 +137,20 @@ async fn two_rust_clients_converge_through_a_real_registry_do() {
     })
     .await;
     wait_until(|| {
-        let a = doc_a.lock().unwrap().chat("chat-live").unwrap().unwrap().title;
-        let b = doc_b.lock().unwrap().chat("chat-live").unwrap().unwrap().title;
+        let a = doc_a
+            .lock()
+            .unwrap()
+            .chat("chat-live")
+            .unwrap()
+            .unwrap()
+            .title;
+        let b = doc_b
+            .lock()
+            .unwrap()
+            .chat("chat-live")
+            .unwrap()
+            .unwrap()
+            .title;
         a == b
     })
     .await;

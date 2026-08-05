@@ -23,7 +23,11 @@ fn upsert(set: &[(&str, Value)], at: i64) -> RowOp {
         kind: "chats".into(),
         id: "chat-1".into(),
         op: OpKind::Upsert,
-        set: Some(set.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()),
+        set: Some(
+            set.iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect(),
+        ),
         hlc: hlc(at),
         clocks: None,
     }
@@ -34,7 +38,11 @@ fn update(set: &[(&str, Value)], hlc: String) -> RowOp {
         kind: "chats".into(),
         id: "chat-1".into(),
         op: OpKind::Update,
-        set: Some(set.iter().map(|(k, v)| (k.to_string(), v.clone())).collect()),
+        set: Some(
+            set.iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect(),
+        ),
         hlc,
         clocks: None,
     }
@@ -90,14 +98,20 @@ fn upsert_creates_update_never_does() {
 fn field_lww_newer_wins_older_and_ties_lose() {
     let row = applied(
         None,
-        &upsert(&[("title", json!("hello")), ("archived", json!(false))], 1000),
+        &upsert(
+            &[("title", json!("hello")), ("archived", json!(false))],
+            1000,
+        ),
     );
     let (_, changed) = apply_op(Some(&row), &update(&[("title", json!("stale"))], hlc(500)));
     assert!(!changed);
     // Exact replay: strict-> compare makes re-pushes idempotent.
     let (_, changed) = apply_op(
         Some(&row),
-        &upsert(&[("title", json!("hello")), ("archived", json!(false))], 1000),
+        &upsert(
+            &[("title", json!("hello")), ("archived", json!(false))],
+            1000,
+        ),
     );
     assert!(!changed);
     let renamed = applied(
@@ -113,8 +127,12 @@ fn same_ms_conflicts_settle_by_device_deterministically() {
     let base = applied(None, &upsert(&[("title", json!("hello"))], 1000));
     let from_a = update(&[("title", json!("A"))], hlc_by(5000, "dev-a"));
     let from_b = update(&[("title", json!("B"))], hlc_by(5000, "dev-b"));
-    let ab = apply_op(apply_op(Some(&base), &from_a).0.as_ref(), &from_b).0.unwrap();
-    let ba = apply_op(apply_op(Some(&base), &from_b).0.as_ref(), &from_a).0.unwrap();
+    let ab = apply_op(apply_op(Some(&base), &from_a).0.as_ref(), &from_b)
+        .0
+        .unwrap();
+    let ba = apply_op(apply_op(Some(&base), &from_b).0.as_ref(), &from_a)
+        .0
+        .unwrap();
     assert_eq!(ab.fields["title"], json!("B"));
     assert_eq!(ba.fields["title"], json!("B"));
 }
@@ -141,7 +159,10 @@ fn delete_only_wins_when_causally_newer() {
     assert!(gone.deleted);
     assert!(gone.fields.is_empty());
     // Updates never touch tombstones.
-    let (_, changed) = apply_op(Some(&gone), &update(&[("title", json!("ghost"))], hlc(3000)));
+    let (_, changed) = apply_op(
+        Some(&gone),
+        &update(&[("title", json!("ghost"))], hlc(3000)),
+    );
     assert!(!changed);
     // Older upsert can't revive; newer revives from ONLY its own fields.
     let (_, changed) = apply_op(Some(&gone), &upsert(&[("title", json!("old"))], 1500));
@@ -166,7 +187,10 @@ fn seed_ops_preserve_original_causality() {
         None,
         &upsert(&[("title", json!("old")), ("status", json!("idle"))], 1000),
     );
-    let row = applied(Some(&row), &update(&[("status", json!("working"))], hlc(9000)));
+    let row = applied(
+        Some(&row),
+        &update(&[("status", json!("working"))], hlc(9000)),
+    );
     let seeded = applied(None, &row_to_seed_op(&row));
     assert_eq!(seeded.fields, row.fields);
     assert_eq!(seeded.clocks, row.clocks);
@@ -275,7 +299,11 @@ fn session(chat_id: &str, device_id: &str, status: SessionStatus) -> Session {
 
 /// Stand-in for the server: applies every pushable batch from `docs` to a row
 /// table with the SAME merge fn, acks, and broadcasts merged rows to all.
-fn server_round(server: &mut HashMap<(String, String), RegistryRow>, seq: &mut u64, docs: &mut [&mut RegistryDoc]) {
+fn server_round(
+    server: &mut HashMap<(String, String), RegistryRow>,
+    seq: &mut u64,
+    docs: &mut [&mut RegistryDoc],
+) {
     // Collect each doc's pushable batches first (server applies in order).
     let mut acks: Vec<(usize, String)> = Vec::new();
     let mut touched_all: Vec<RegistryRow> = Vec::new();
@@ -346,7 +374,10 @@ fn field_mutators_round_trip() {
 
     assert!(ws.rename_chat("chat-1", "Renamed").unwrap());
     assert!(ws.set_chat_archived("chat-1", true).unwrap());
-    assert!(ws.set_chat_last_message("chat-1", "preview text", ts(5_000)).unwrap());
+    assert!(
+        ws.set_chat_last_message("chat-1", "preview text", ts(5_000))
+            .unwrap()
+    );
     assert!(ws.rename_device("dev-a", "workstation").unwrap());
     assert!(ws.set_device_last_seen("dev-a", ts(6_000)).unwrap());
     assert!(!ws.rename_chat("nope", "x").unwrap());
@@ -378,17 +409,24 @@ fn delete_chat_tombstones_row_and_session() {
 #[test]
 fn spaces_round_trip_and_mutate() {
     let mut ws = RegistryDoc::new("dev-a");
-    ws.upsert_space(&space("sp-1", "dev-a", "/home/u/project")).unwrap();
+    ws.upsert_space(&space("sp-1", "dev-a", "/home/u/project"))
+        .unwrap();
     let row = ws.space("sp-1").unwrap().expect("row exists");
     assert_eq!(row.display_name(), "project");
     assert!(!row.git_detected);
 
     assert!(ws.rename_space("sp-1", Some("My Project")).unwrap());
-    assert_eq!(ws.space("sp-1").unwrap().unwrap().display_name(), "My Project");
+    assert_eq!(
+        ws.space("sp-1").unwrap().unwrap().display_name(),
+        "My Project"
+    );
     assert!(ws.rename_space("sp-1", None).unwrap());
     assert_eq!(ws.space("sp-1").unwrap().unwrap().display_name(), "project");
 
-    assert!(ws.set_space_git("sp-1", true, Some("checkout-abc"), ts(4_000)).unwrap());
+    assert!(
+        ws.set_space_git("sp-1", true, Some("checkout-abc"), ts(4_000))
+            .unwrap()
+    );
     let row = ws.space("sp-1").unwrap().unwrap();
     assert!(row.git_detected);
     assert_eq!(row.checkout_id.as_deref(), Some("checkout-abc"));
@@ -403,12 +441,18 @@ fn chat_seen_is_monotonic() {
     let mut ws = RegistryDoc::new("dev-a");
     ws.upsert_chat(&chat("chat-1", "dev-a")).unwrap();
     assert!(ws.set_chat_seen("chat-1", ts(5_000)).unwrap());
-    assert_eq!(ws.chat("chat-1").unwrap().unwrap().last_seen_at, Some(ts(5_000)));
+    assert_eq!(
+        ws.chat("chat-1").unwrap().unwrap().last_seen_at,
+        Some(ts(5_000))
+    );
     // Older stamps are ignored without a write.
     let before = ws.pending_len();
     assert!(ws.set_chat_seen("chat-1", ts(4_000)).unwrap());
     assert_eq!(ws.pending_len(), before);
-    assert_eq!(ws.chat("chat-1").unwrap().unwrap().last_seen_at, Some(ts(5_000)));
+    assert_eq!(
+        ws.chat("chat-1").unwrap().unwrap().last_seen_at,
+        Some(ts(5_000))
+    );
     assert!(!ws.set_chat_seen("nope", ts(1)).unwrap());
 }
 
@@ -449,7 +493,10 @@ fn two_docs_converge_through_a_server() {
     let title_a = a.chat("chat-a").unwrap().unwrap().title;
     let title_b = b.chat("chat-a").unwrap().unwrap().title;
     assert_eq!(title_a, title_b);
-    assert!(matches!(title_a.as_deref(), Some("from a") | Some("from b")));
+    assert!(matches!(
+        title_a.as_deref(),
+        Some("from a") | Some("from b")
+    ));
 }
 
 #[test]
@@ -480,8 +527,22 @@ fn delete_space_cascades_and_converges() {
 
     for ws in [&a, &b] {
         let state = ws.read_all().unwrap();
-        assert_eq!(state.spaces.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(), vec!["sp-2"]);
-        assert_eq!(state.chats.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), vec!["chat-2"]);
+        assert_eq!(
+            state
+                .spaces
+                .iter()
+                .map(|s| s.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["sp-2"]
+        );
+        assert_eq!(
+            state
+                .chats
+                .iter()
+                .map(|c| c.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["chat-2"]
+        );
         assert!(state.sessions.is_empty());
     }
     let again = b.delete_space("sp-1").unwrap();
@@ -527,7 +588,14 @@ fn state_frames_delta_replace_and_reseed() {
             kind: "chats".into(),
             id: "chat-9".into(),
             op: OpKind::Upsert,
-            set: Some([("id".to_string(), json!("chat-9")), ("deviceId".to_string(), json!("dev-b")), ("createdAt".to_string(), json!(1))].into()),
+            set: Some(
+                [
+                    ("id".to_string(), json!("chat-9")),
+                    ("deviceId".to_string(), json!("dev-b")),
+                    ("createdAt".to_string(), json!(1)),
+                ]
+                .into(),
+            ),
             hlc: hlc_by(50, "dev-b"),
             clocks: None,
         },
@@ -543,7 +611,10 @@ fn state_frames_delta_replace_and_reseed() {
     let outcome = doc.apply_state(seq + 2, true, 0, vec![remote]);
     assert_eq!(outcome, StateOutcome::Reseeded);
     assert!(doc.pending_len() > 0);
-    let seeded = doc.chat("chat-1").unwrap().expect("kept via reseed overlay");
+    let seeded = doc
+        .chat("chat-1")
+        .unwrap()
+        .expect("kept via reseed overlay");
     assert_eq!(seeded.device_id, "dev-a");
 
     // Server behind us (wiped): local rows kept, reseed enqueued.
@@ -599,16 +670,22 @@ fn migration_seeds_pending_upserts_that_lose_to_live_writes() {
     // Build a legacy loro workspace doc, materialize, seed.
     let legacy = crate::workspace::WorkspaceDoc::new();
     legacy.upsert_device(&device("dev-a", "laptop")).unwrap();
-    legacy.upsert_space(&space("sp-1", "dev-a", "/tmp/one")).unwrap();
+    legacy
+        .upsert_space(&space("sp-1", "dev-a", "/tmp/one"))
+        .unwrap();
     let mut legacy_chat = chat("chat-1", "dev-a");
     legacy_chat.space_id = Some("sp-1".into());
     legacy_chat.title = Some("migrated title".into());
     legacy_chat.last_message_at = Some(ts(400_000));
     legacy.upsert_chat(&legacy_chat).unwrap();
-    legacy.upsert_session(&session("chat-1", "dev-a", SessionStatus::Idle)).unwrap();
+    legacy
+        .upsert_session(&session("chat-1", "dev-a", SessionStatus::Idle))
+        .unwrap();
 
     let mut doc = RegistryDoc::new("dev-a");
-    let seeded = doc.seed_from_workspace(&legacy.read_all().unwrap()).unwrap();
+    let seeded = doc
+        .seed_from_workspace(&legacy.read_all().unwrap())
+        .unwrap();
     assert_eq!(seeded, 4);
     // Instant: the overlay serves the full state before any server contact.
     let state = doc.read_all().unwrap();
@@ -616,7 +693,9 @@ fn migration_seeds_pending_upserts_that_lose_to_live_writes() {
 
     // Two devices seeding the same converged doc = identical result.
     let mut other = RegistryDoc::new("dev-b");
-    other.seed_from_workspace(&legacy.read_all().unwrap()).unwrap();
+    other
+        .seed_from_workspace(&legacy.read_all().unwrap())
+        .unwrap();
     let mut server = HashMap::new();
     let mut seq = 0u64;
     server_round(&mut server, &mut seq, &mut [&mut doc, &mut other]);
@@ -626,5 +705,8 @@ fn migration_seeds_pending_upserts_that_lose_to_live_writes() {
     // A live rename (now-clock) beats the migrated title everywhere.
     other.rename_chat("chat-1", "live rename").unwrap();
     server_round(&mut server, &mut seq, &mut [&mut doc, &mut other]);
-    assert_eq!(doc.chat("chat-1").unwrap().unwrap().title.as_deref(), Some("live rename"));
+    assert_eq!(
+        doc.chat("chat-1").unwrap().unwrap().title.as_deref(),
+        Some("live rename")
+    );
 }

@@ -34,7 +34,6 @@ struct Shared {
 pub struct MockRegistryServer {
     addr: std::net::SocketAddr,
     state: Arc<Mutex<Shared>>,
-    broadcast: broadcast::Sender<String>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -61,12 +60,7 @@ impl MockRegistryServer {
                 });
             }
         });
-        Self {
-            addr,
-            state,
-            broadcast: tx,
-            task,
-        }
+        Self { addr, state, task }
     }
 
     pub fn url(&self) -> String {
@@ -168,7 +162,7 @@ async fn serve(
                             })
                             .to_string()
                         };
-                        if sink.send(WsMessage::Text(reply.into())).await.is_err() {
+                        if sink.send(WsMessage::Text(reply)).await.is_err() {
                             return;
                         }
                     }
@@ -184,8 +178,7 @@ async fn serve(
                             let _ = sink
                                 .send(WsMessage::Text(
                                     json!({"t":"error","code":"invalid_op","message":"bad ops"})
-                                        .to_string()
-                                        .into(),
+                                        .to_string(),
                                 ))
                                 .await;
                             continue;
@@ -235,12 +228,12 @@ async fn serve(
                             // Drain our own broadcast copy first so ordering
                             // matches (rows before ack) on this socket too.
                             while let Ok(text) = rx.try_recv() {
-                                if sink.send(WsMessage::Text(text.into())).await.is_err() {
+                                if sink.send(WsMessage::Text(text)).await.is_err() {
                                     return;
                                 }
                             }
                         }
-                        if sink.send(WsMessage::Text(ack.into())).await.is_err() {
+                        if sink.send(WsMessage::Text(ack)).await.is_err() {
                             return;
                         }
                     }
@@ -255,7 +248,7 @@ async fn serve(
                         let seq = lock(&state).seq;
                         if sink
                             .send(WsMessage::Text(
-                                json!({"t":"probe-ok","seq":seq}).to_string().into(),
+                                json!({"t":"probe-ok","seq":seq}).to_string(),
                             ))
                             .await
                             .is_err()
@@ -267,8 +260,7 @@ async fn serve(
                         let _ = sink
                             .send(WsMessage::Text(
                                 json!({"t":"error","code":"bad_frame","message":"unknown"})
-                                    .to_string()
-                                    .into(),
+                                    .to_string(),
                             ))
                             .await;
                     }
@@ -277,7 +269,7 @@ async fn serve(
             text = rx.recv() => {
                 match text {
                     Ok(text) => {
-                        if ready && sink.send(WsMessage::Text(text.into())).await.is_err() {
+                        if ready && sink.send(WsMessage::Text(text)).await.is_err() {
                             return;
                         }
                     }

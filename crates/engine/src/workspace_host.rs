@@ -729,7 +729,8 @@ impl WorkspaceHost {
     ) -> Result<bool, EngineError> {
         match self.read(|doc| doc.space(space_id))? {
             Some(space) if space.device_id == self.inner.config.device_id => {
-                Ok(self.mutate(|doc| doc.set_space_git(space_id, detected, checkout_id, Utc::now()))?)
+                Ok(self
+                    .mutate(|doc| doc.set_space_git(space_id, detected, checkout_id, Utc::now()))?)
             }
             Some(space) => {
                 tracing::warn!(

@@ -925,7 +925,11 @@ impl RegistryDoc {
         Ok(true)
     }
 
-    pub fn set_chat_checkout(&mut self, chat_id: &str, checkout_id: &str) -> Result<bool, DocError> {
+    pub fn set_chat_checkout(
+        &mut self,
+        chat_id: &str,
+        checkout_id: &str,
+    ) -> Result<bool, DocError> {
         if !self.row_exists(KIND_CHATS, chat_id) {
             return Ok(false);
         }
@@ -938,7 +942,11 @@ impl RegistryDoc {
         Ok(true)
     }
 
-    pub fn set_chat_config(&mut self, chat_id: &str, config: &ChatConfig) -> Result<bool, DocError> {
+    pub fn set_chat_config(
+        &mut self,
+        chat_id: &str,
+        config: &ChatConfig,
+    ) -> Result<bool, DocError> {
         if !self.row_exists(KIND_CHATS, chat_id) {
             return Ok(false);
         }

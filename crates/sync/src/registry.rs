@@ -185,7 +185,7 @@ async fn pump(
         tokio::select! {
             frame = out_rx.recv() => match frame {
                 Some(text) => {
-                    if sink.send(WsMessage::Text(text.into())).await.is_err() {
+                    if sink.send(WsMessage::Text(text)).await.is_err() {
                         break;
                     }
                 }
@@ -504,9 +504,8 @@ impl Actor {
                     if ready.is_some() {
                         // Handshake failed on the very first session.
                         if let Some(ready) = ready.take() {
-                            let _ = ready.send(Err(SyncError::Protocol(
-                                "registry handshake failed".into(),
-                            )));
+                            let _ = ready
+                                .send(Err(SyncError::Protocol("registry handshake failed".into())));
                         }
                         return;
                     }
@@ -617,9 +616,8 @@ impl Actor {
         let mut probe_deadline: Option<tokio::time::Instant> = None;
         loop {
             let quiet_probe_at = last_frame + self.tuning.probe_quiet;
-            let deadline_at = probe_deadline.unwrap_or_else(|| {
-                tokio::time::Instant::now() + Duration::from_secs(86_400)
-            });
+            let deadline_at = probe_deadline
+                .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(86_400));
             tokio::select! {
                 frame = pipe.rx.recv() => {
                     let Some(text) = frame else {
@@ -734,7 +732,13 @@ impl Actor {
             ServerFrame::ProbeOk { .. } => {
                 self.stats.last_pushed_ms.store(epoch_ms(), Relaxed);
             }
-            ServerFrame::State { seq, full, gc_floor, rows, presence } => {
+            ServerFrame::State {
+                seq,
+                full,
+                gc_floor,
+                rows,
+                presence,
+            } => {
                 // Servers only send state as a hello answer, but applying a
                 // late duplicate is harmless and simpler than special-casing.
                 let mut doc = lock(&self.doc);

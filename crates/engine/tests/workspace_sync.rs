@@ -119,7 +119,10 @@ fn assemble(dir: &std::path::Path, device_id: &str) -> EngineCore {
 /// The in-process room: an in-memory registry server speaking the DO's JSON
 /// WS protocol (what the RegistryRoom DO does over the wire), with both
 /// engines' hosts wired to it via the test seam.
-async fn bridge(a: &EngineCore, b: &EngineCore) -> komet_sync::registry::mock_server::MockRegistryServer {
+async fn bridge(
+    a: &EngineCore,
+    b: &EngineCore,
+) -> komet_sync::registry::mock_server::MockRegistryServer {
     let server = komet_sync::registry::mock_server::MockRegistryServer::start().await;
     a.workspace.connect_registry_url(&server.url());
     b.workspace.connect_registry_url(&server.url());

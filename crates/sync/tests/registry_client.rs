@@ -374,7 +374,10 @@ async fn persisted_doc_survives_restart_with_docs_store() {
     client.shutdown().await;
 
     // Session 2: restore, reconnect — the offline rename pushes.
-    let bytes = store.load_snapshot(REGISTRY_DOC_ID).unwrap().expect("saved");
+    let bytes = store
+        .load_snapshot(REGISTRY_DOC_ID)
+        .unwrap()
+        .expect("saved");
     let restored = Arc::new(Mutex::new(
         RegistryDoc::from_bytes(&bytes, "dev-a").unwrap(),
     ));
@@ -412,20 +415,21 @@ async fn churn_stays_bounded_no_history_growth() {
     client.nudge();
     wait_until(|| doc.lock().unwrap().pending_len() == 0).await;
     for i in 0..2_000i64 {
-        let mut d = doc.lock().unwrap();
-        d.upsert_session(&Session {
-            chat_id: "chat-1".into(),
-            device_id: "dev-a".into(),
-            status: if i % 2 == 0 {
-                SessionStatus::Working
-            } else {
-                SessionStatus::Idle
-            },
-            started_at: Some(ts(i)),
-            updated_at: ts(i + 1),
-        })
-        .unwrap();
-        drop(d);
+        {
+            let mut d = doc.lock().unwrap();
+            d.upsert_session(&Session {
+                chat_id: "chat-1".into(),
+                device_id: "dev-a".into(),
+                status: if i % 2 == 0 {
+                    SessionStatus::Working
+                } else {
+                    SessionStatus::Idle
+                },
+                started_at: Some(ts(i)),
+                updated_at: ts(i + 1),
+            })
+            .unwrap();
+        }
         if i % 100 == 0 {
             client.nudge();
             // Let the queue drain periodically so the test bounds memory too.
