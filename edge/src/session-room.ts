@@ -1103,7 +1103,13 @@ export class SessionRoom implements DurableObject {
       // heap with the same megabytes.
       // No aged checkpoint but the full history is already a heap hazard:
       // trim at the current frontier (see TRIM_FORCE_BYTES).
-      if ((this.getMeta("chatId") ?? "").startsWith("ws3/")) {
+      // Any workspace-room generation (ws3/, ws4/, …) — matching the literal
+      // "ws3/" silently dropped this protection when fb6492c bumped the room
+      // name to ws4: the ws4 room force-trimmed at the LIVE frontier on
+      // 2026-08-05 02:37Z (and likely 00:55Z), stranding in-flight peers —
+      // the exact incident b019439 added this guard for. Chat rooms are bare
+      // UUIDs (hex — never a "ws" prefix), so the pattern cannot collide.
+      if (/^ws\d+\//.test(this.getMeta("chatId") ?? "")) {
         // WORKSPACE rooms: never force-trim at the LIVE frontier. Every
         // device writes this doc concurrently, so a live-frontier shallow
         // start orphans any peer whose next ops depend on history just
