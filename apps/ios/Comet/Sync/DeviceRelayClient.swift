@@ -112,12 +112,16 @@ actor DeviceRelayClient {
 
     // MARK: RPC
 
-    /// One unary ControlRpc call to the host engine, 10s deadline (the engine
-    /// itself caps folder listing at 6s).
-    func call<Response: Decodable>(method: String, params: [String: Any]) async throws -> Response {
+    /// One unary ControlRpc call to the host engine. The default 10s deadline
+    /// suits interactive calls (the engine itself caps folder listing at 6s);
+    /// attachment uploads pass longer ones (first chunk 90s for a cold dial,
+    /// commit 150s to outlast the cross-device assemble — desktop state.ts).
+    func call<Response: Decodable>(method: String, params: [String: Any],
+                                   timeoutSeconds: UInt64 = 10) async throws -> Response {
         for attempt in 0..<3 {
             do {
-                return try await callOnce(method: method, params: params)
+                return try await callOnce(method: method, params: params,
+                                          timeoutSeconds: timeoutSeconds)
             } catch let error as RelayError {
                 guard attempt < 2 else { throw error }
                 switch error {
@@ -134,7 +138,8 @@ actor DeviceRelayClient {
 
     private func callOnce<Response: Decodable>(
         method: String,
-        params: [String: Any]
+        params: [String: Any],
+        timeoutSeconds: UInt64 = 10
     ) async throws -> Response {
         try await connect()
         let id = nextId
@@ -154,7 +159,7 @@ actor DeviceRelayClient {
                 await self.send(data, for: id)
             }
             Task {
-                try? await Task.sleep(nanoseconds: 10_000_000_000)
+                try? await Task.sleep(nanoseconds: timeoutSeconds * 1_000_000_000)
                 self.timeoutCall(id: id)
             }
         }

@@ -4,7 +4,7 @@
  * named blobs are stored as ordered chunk rows.
  */
 
-const CHUNK_BYTES = 1_500_000;
+export const CHUNK_BYTES = 1_500_000;
 
 export interface BlobStore {
   put(name: string, bytes: Uint8Array): void;

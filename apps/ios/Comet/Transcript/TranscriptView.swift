@@ -29,25 +29,28 @@ struct TranscriptView: View {
     static let stickThreshold: CGFloat = 70
     static let jumpThreshold: CGFloat = 320
 
-    @State private var builder = TranscriptBuilderCache()
     @State private var veils = VeilStore()
     @State private var folds: [String: Bool] = [:]
-    @State private var pinned = true
     /// One-shot guard for the first non-empty projection.
     @State private var hydrated = false
     /// Gates the reveal: false until the transcript has landed at the bottom.
     @State private var settled = false
-    /// Live content height — the settle loop's "layout stopped moving" signal.
-    @State private var contentHeight: CGFloat = 0
-    @State private var distanceFromBottom: CGFloat = 0
-    @State private var userScrolling = false
+    /// Per-frame scroll tracking. A reference type, NOT view @State: writing
+    /// @State on every scroll frame re-evaluated this whole body (a ForEach
+    /// over every row) per frame — the further up the user had scrolled, the
+    /// more realized rows each pass had to diff, which is exactly the
+    /// "scrolling gets laggier the deeper I go" jank.
+    @State private var scroll = ScrollState()
     @State private var scrollPosition = ScrollPosition(edge: .bottom)
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
-        let rows = builder.rows(revision: store.revision,
-                                entries: store.entries,
-                                pendingSends: store.pendingSends)
+        // The parse cache lives on the store (one per session, prewarmed
+        // off-main), so opening a chat assembles rows from settled parses
+        // instead of re-parsing the whole transcript on the main thread.
+        let rows = store.transcriptCache.rows(revision: store.revision,
+                                              entries: store.entries,
+                                              pendingSends: store.pendingSends)
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 0) {
                 ForEach(rows) { row in
@@ -60,6 +63,9 @@ struct TranscriptView: View {
         }
         .scrollPosition($scrollPosition)
         .defaultScrollAnchor(.bottom)
+        // Drag past the composer and the keyboard follows the finger down —
+        // the Messages-style interactive dismissal.
+        .scrollDismissesKeyboard(.interactively)
         // Held invisible until it has settled at the bottom, then faded in.
         // The settling itself is unavoidable (see settleToBottom) — what is
         // avoidable is WATCHING it: painting mid-settle is what read as the
@@ -82,28 +88,32 @@ struct TranscriptView: View {
             settled = false
             Task { await settleToBottom() }
         }
-        .onScrollGeometryChange(for: CGFloat.self) { $0.contentSize.height } action: { _, new in
-            contentHeight = new
+        .onScrollGeometryChange(for: CGFloat.self) { $0.contentSize.height } action: { [scroll] _, new in
+            scroll.contentHeight = new
         }
-        .onScrollPhaseChange { _, newPhase in
+        .onScrollPhaseChange { [scroll] _, newPhase in
             // Desktop rule: the pin breaks only on USER input (wheel-up/drag),
             // never on streaming growth. Phases track the gesture.
-            userScrolling = newPhase == .interacting || newPhase == .decelerating
+            scroll.userScrolling = newPhase == .interacting || newPhase == .decelerating
         }
         .onScrollGeometryChange(for: CGFloat.self) { geo in
             max(0, geo.contentSize.height + geo.contentInsets.bottom - geo.containerSize.height - geo.contentOffset.y)
-        } action: { old, new in
-            distanceFromBottom = new
-            if userScrolling, new > old + 1, new > 2 {
-                pinned = false
-            } else if !pinned, new <= Self.stickThreshold, new < old {
+        } action: { [scroll] old, new in
+            scroll.distanceFromBottom = new
+            if scroll.userScrolling, new > old + 1, new > 2 {
+                scroll.pinned = false
+            } else if !scroll.pinned, new <= Self.stickThreshold, new < old {
                 // Re-stick only when moving TOWARD the bottom inside the 70pt
                 // band, else the pin would be unbreakable.
-                pinned = true
+                scroll.pinned = true
             }
+            // The only observable write, and only at the threshold crossing —
+            // it re-renders the tiny jump button, never this body.
+            let show = new > Self.jumpThreshold
+            if scroll.showJump != show { scroll.showJump = show }
         }
         .onChange(of: contentSignature(rows)) {
-            guard pinned else { return }
+            guard scroll.pinned else { return }
             if reduceMotion {
                 scrollPosition.scrollTo(edge: .bottom)
             } else {
@@ -127,43 +137,26 @@ struct TranscriptView: View {
             .ignoresSafeArea(edges: .top)
             .allowsHitTesting(false)
         }
-        .overlay(alignment: .bottom) {
-            // Short ramp that reaches FULL bg at the bottom edge — content
-            // dissolves completely beneath the floating status strip, but the
-            // fade starts low enough that message bottoms stay legible.
-            LinearGradient(
-                stops: [
-                    .init(color: Theme.bg.opacity(0), location: 0),
-                    .init(color: Theme.bg.opacity(0.55), location: 0.45),
-                    .init(color: Theme.bg, location: 0.9),
-                    .init(color: Theme.bg, location: 1),
-                ],
-                startPoint: .top, endPoint: .bottom
-            )
-            .frame(height: 44)
-            .allowsHitTesting(false)
-        }
+        // The bottom dissolve lives on SessionView's composer inset (one
+        // continuous gradient from above the status strip to the physical
+        // bottom edge) — a second ramp here would double-darken the rows
+        // right where they slide under the glass.
         .overlay(alignment: .bottomTrailing) {
-            // Jump-to-bottom floats ABOVE the fades.
-            if distanceFromBottom > Self.jumpThreshold {
-                Button {
-                    pinned = true
-                    withAnimation(.spring(duration: 0.35)) {
-                        scrollPosition.scrollTo(edge: .bottom)
-                    }
-                } label: {
-                    Image(systemName: "arrow.down")
-                        .font(.system(size: 14, weight: .medium))
-                        .foregroundStyle(Theme.text)
-                        .frame(width: 36, height: 36)
+            // Jump-to-bottom floats ABOVE the fades. A child view so only IT
+            // observes the show flag — the transcript body stays out of the
+            // per-frame scroll path.
+            JumpToBottomButton(scroll: scroll) {
+                scroll.pinned = true
+                withAnimation(.spring(duration: 0.35)) {
+                    scrollPosition.scrollTo(edge: .bottom)
                 }
-                .glassEffect(.regular.interactive(), in: Circle())
-                .padding(.trailing, 16)
-                .padding(.bottom, 12)
-                .transition(.opacity.combined(with: .move(edge: .bottom)))
             }
+            .padding(.trailing, 16)
+            // 12pt above the COMPOSER, not the safe-area edge: the edge
+            // now sits atop the 24pt status-strip band (SessionView's
+            // inset), so dip into it — the strip never hit-tests.
+            .padding(.bottom, -12)
         }
-        .motionAnimation(Motion.fadeQuick, value: distanceFromBottom > Self.jumpThreshold)
     }
 
     /// Hold the bottom until layout stops moving, then reveal.
@@ -183,10 +176,10 @@ struct TranscriptView: View {
     private func settleToBottom() async {
         var lastHeight: CGFloat = -1
         for _ in 0..<16 {
-            guard pinned, !userScrolling else { break }
+            guard scroll.pinned, !scroll.userScrolling else { break }
             scrollPosition.scrollTo(edge: .bottom)
-            if contentHeight == lastHeight { break }
-            lastHeight = contentHeight
+            if scroll.contentHeight == lastHeight { break }
+            lastHeight = scroll.contentHeight
             try? await Task.sleep(nanoseconds: 30_000_000)
         }
         settled = true
@@ -207,7 +200,8 @@ struct TranscriptView: View {
         Group {
             switch row.kind {
             case .user(let text):
-                UserBubble(text: text, pending: row.timestamp == nil)
+                UserBubble(text: text, pending: row.timestamp == nil,
+                           deviceId: store.hostDeviceId ?? "")
 
             case .markdown(let block, let streaming):
                 MarkdownRowView(row: row, block: block, streaming: streaming, veils: veils)
@@ -233,18 +227,54 @@ struct TranscriptView: View {
     }
 }
 
+/// Per-frame scroll tracking for the transcript. Only `showJump` is
+/// observable — everything else is written every scroll frame and read only
+/// inside closures/the settle loop, so observation (and with it, whole-body
+/// re-evaluation per frame) must not see those writes.
+@Observable
+final class ScrollState {
+    /// Flips at the jump threshold; observed by JumpToBottomButton alone.
+    var showJump = false
+    @ObservationIgnored var distanceFromBottom: CGFloat = 0
+    @ObservationIgnored var contentHeight: CGFloat = 0
+    @ObservationIgnored var pinned = true
+    @ObservationIgnored var userScrolling = false
+}
+
+private struct JumpToBottomButton: View {
+    let scroll: ScrollState
+    let action: () -> Void
+
+    var body: some View {
+        ZStack(alignment: .bottomTrailing) {
+            if scroll.showJump {
+                Button(action: action) {
+                    Image(systemName: "arrow.down")
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundStyle(Theme.text)
+                        .frame(width: 36, height: 36)
+                }
+                .glassEffect(.regular.interactive(), in: Circle())
+                .transition(.opacity.combined(with: .move(edge: .bottom)))
+            }
+        }
+        .motionAnimation(Motion.fadeQuick, value: scroll.showJump)
+    }
+}
+
 /// Row-build cache: one incremental parser per streaming part plus a memo of
-/// settled parses, reused across body evaluations (a reference type, so
-/// building rows never mutates state mid-render).
+/// settled parses. Owned by the SessionStore (NOT view @State) so the parses
+/// survive across view instances — re-opening a chat re-parses nothing.
+@MainActor
 final class TranscriptBuilderCache {
     private var parsers: [String: IncrementalMarkdownParser] = [:]
     private var completed: [String: CompletedParse] = [:]
     private var cachedRevision: UInt64?
     private var cachedRows: [TranscriptRow] = []
+    private var prewarming = false
 
-    /// Rows for the store's current `revision`. The body re-runs on every
-    /// scroll frame (it reads `distanceFromBottom`), and rows only change when
-    /// the doc does — so gate on the revision and hand back the same array.
+    /// Rows for the store's current `revision`. Rows only change when the doc
+    /// does — gate on the revision and hand back the same array.
     func rows(revision: UInt64,
               entries: [MessageEntry],
               pendingSends: [(messageId: String, text: String, at: Int64)]) -> [TranscriptRow] {
@@ -253,6 +283,39 @@ final class TranscriptBuilderCache {
                                                parsers: &parsers, completed: &completed)
         cachedRevision = revision
         return cachedRows
+    }
+
+    /// Parse every settled part OFF the main thread and merge into the memo,
+    /// so the first `rows()` of a freshly hydrated long session assembles from
+    /// memo hits instead of parsing the whole transcript inside body — that
+    /// synchronous parse was the "empty transcript for a while" on open.
+    func prewarm(entries: [MessageEntry]) {
+        guard !prewarming else { return }
+        var jobs: [(key: String, text: String)] = []
+        for entry in entries where entry.role != .user {
+            let streaming = entry.status == .streaming
+            let lastIx = entry.parts.indices.last
+            for (ix, part) in entry.parts.enumerated() {
+                guard case .text(let partId, let text) = part, !text.isEmpty else { continue }
+                if streaming && ix == lastIx { continue }  // live tail: incremental parser's job
+                let key = "\(entry.id)#\(partId)"
+                if completed[key]?.source != text {
+                    jobs.append((key, text))
+                }
+            }
+        }
+        guard !jobs.isEmpty else { return }
+        prewarming = true
+        Task { @MainActor [weak self] in
+            let parsed = await Task.detached(priority: .userInitiated) {
+                jobs.map { (key: $0.key, text: $0.text, blocks: MarkdownParser.parse($0.text)) }
+            }.value
+            guard let self else { return }
+            self.prewarming = false
+            for job in parsed where self.completed[job.key]?.source != job.text {
+                self.completed[job.key] = CompletedParse(source: job.text, blocks: job.blocks)
+            }
+        }
     }
 }
 
@@ -278,27 +341,37 @@ final class VeilStore {
 struct UserBubble: View {
     let text: String
     var pending = false
+    /// The chat's host device — where attachment files live (read-back key).
+    var deviceId = ""
 
     var body: some View {
-        HStack {
-            Spacer(minLength: 0)
-            Text(text)
-                .font(Theme.sans(MD.textSize))
-                .lineSpacing(MD.lineHeight - MD.textSize - 4)
-                .foregroundStyle(Theme.text)
-                .padding(.horizontal, 16)
-                .padding(.vertical, 10)
-                .background(Theme.surfaceRaised, in: RoundedRectangle(cornerRadius: Theme.bubbleRadius))
-                .frame(maxWidth: TranscriptView.maxContentWidth * 0.8, alignment: .trailing)
-                .opacity(pending ? 0.65 : 1)
-                .contextMenu {
-                    Button {
-                        UIPasteboard.general.string = text
-                    } label: {
-                        Label("Copy", systemImage: "doc.on.doc")
+        // Attachment refs ride the message text (message-attachments.ts
+        // transport); split them out and render thumbnails above the bubble,
+        // exactly like the desktop's user rows.
+        let parsed = parseUserMessageImages(text)
+        VStack(alignment: .trailing, spacing: 8) {
+            if !parsed.attachments.isEmpty, !deviceId.isEmpty {
+                UserAttachmentsStrip(deviceId: deviceId, attachments: parsed.attachments)
+            }
+            if !parsed.text.isEmpty {
+                Text(parsed.text)
+                    .font(Theme.sans(MD.textSize))
+                    .lineSpacing(MD.lineHeight - MD.textSize - 4)
+                    .foregroundStyle(Theme.text)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 10)
+                    .background(Theme.surfaceRaised, in: RoundedRectangle(cornerRadius: Theme.bubbleRadius))
+                    .frame(maxWidth: TranscriptView.maxContentWidth * 0.8, alignment: .trailing)
+                    .contextMenu {
+                        Button {
+                            UIPasteboard.general.string = parsed.text
+                        } label: {
+                            Label("Copy", systemImage: "doc.on.doc")
+                        }
                     }
-                }
+            }
         }
+        .opacity(pending ? 0.65 : 1)
         .frame(maxWidth: .infinity, alignment: .trailing)
     }
 }
