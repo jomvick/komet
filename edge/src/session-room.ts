@@ -65,10 +65,6 @@ const MAX_CHECKPOINTS = 36;
  * byte-exporting wasm call threw RangeError("Invalid array buffer length")
  * while imports/relays kept working, silently wedging all joins fleet-wide). */
 let wasmPoisonStrikes = 0;
-/** Last fold-export-failure abort (module state, same isolate scope as the
- * strike counter): bounds foldLog's direct recycle to once per cooldown. */
-let lastFoldAbortAt = 0;
-const FOLD_ABORT_COOLDOWN_MS = 5 * 60 * 1000;
 /** Wasm-boundary failures before `ctx.abort()` recycles the isolate. Wasm
  * memory only ever grows, so the poisoned state is permanent until the isolate
  * dies — and Cloudflare's own memory-limit reset arrives only after minutes of
@@ -1044,16 +1040,6 @@ export class SessionRoom implements DurableObject {
       await this.foldLog();
       return;
     }
-    // Redundancy budget: a re-seeded room (wedge break → every device re-pushes
-    // its whole doc) sits far under COMPACT_LOG_BYTES yet replays seconds of
-    // near-identical full-doc bundles on every cold start (2026-08-05: 1.1MB
-    // log, ZERO snapshot, 5.1s replays, heap-pressure aborts, reconnect herds).
-    // Fold whenever the log dwarfs the folded state it would collapse into.
-    const snapshotBytes = this.blobs.get("snapshot")?.length ?? 0;
-    if (logBytes > 4 * Math.max(snapshotBytes, 32 * 1024)) {
-      await this.foldLog();
-      return;
-    }
     const rows = [...this.ctx.storage.sql.exec("SELECT COUNT(*) AS n FROM updates")][0]?.n as
       | number
       | undefined;
@@ -1073,36 +1059,7 @@ export class SessionRoom implements DurableObject {
     // and FREED the wrapper captured in `doc` (guarded ensureDoc returns the
     // live cached doc, or cheaply rematerializes).
     const live = await this.ensureDoc();
-    try {
-      this.blobs.put("snapshot", live.export({ mode: "snapshot" }));
-    } catch (e) {
-      // A fold that cannot export is a room that can never shrink its log:
-      // every cold start replays the whole log again and presses the heap
-      // further. The strike tripwire does NOT catch this state — small join
-      // backfill exports keep succeeding and resetting the counter, so the
-      // isolate limps pressed forever (2026-08-05 02:46Z: fold RangeErrors
-      // in a loop while /stats 1101'd through flush). One direct abort hands
-      // the next flush a virgin heap, where the same fold demonstrably
-      // succeeds (02:15Z full export worked right after a recycle). The
-      // cooldown keeps a genuinely oversized log from becoming an abort
-      // storm — past it, the room just keeps its log (the old status quo).
-      console.error("log fold export failed", `room=${this.getMeta("chatId") ?? "?"}`, String(e));
-      const now = Date.now();
-      if (
-        (e instanceof RangeError || e instanceof WebAssembly.RuntimeError || isWasmUseAfterFree(e)) &&
-        now - lastFoldAbortAt > FOLD_ABORT_COOLDOWN_MS
-      ) {
-        lastFoldAbortAt = now;
-        try {
-          this.doc?.free();
-        } catch {
-          /* already poisoned beyond freeing */
-        }
-        this.doc = undefined;
-        this.ctx.abort("log fold export failed on a pressed wasm heap; recycling isolate");
-      }
-      return;
-    }
+    this.blobs.put("snapshot", live.export({ mode: "snapshot" }));
     this.ctx.storage.sql.exec("DELETE FROM updates");
     this.setMeta("updateBytes", "0");
   }
