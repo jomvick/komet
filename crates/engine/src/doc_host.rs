@@ -627,7 +627,7 @@ impl DocHost {
         let Some(workspace) = self.workspace() else {
             return;
         };
-        let host_device = match workspace.doc().chat(chat_id) {
+        let host_device = match workspace.chat(chat_id) {
             Ok(Some(chat)) => chat.device_id,
             // Unclaimed chat: whoever drains first claims it — nobody to nudge.
             _ => return,
@@ -929,7 +929,7 @@ impl DocHost {
         prompt: &str,
     ) -> Option<komet_proto::RunRequest> {
         let workspace = self.workspace()?;
-        let chat = match workspace.doc().chat(chat_id) {
+        let chat = match workspace.chat(chat_id) {
             Ok(chat) => chat?,
             Err(err) => {
                 tracing::warn!(chat = %chat_id, error = %err, "workspace chat read failed");

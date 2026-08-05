@@ -81,7 +81,6 @@ impl TitleGenerator {
         let chat = self
             .inner
             .workspace
-            .doc()
             .chat(chat_id)?
             .ok_or_else(|| EngineError::Other("chat has no workspace row".into()))?;
         if chat.title.as_deref().is_some_and(|t| !t.trim().is_empty()) {
@@ -105,7 +104,7 @@ impl TitleGenerator {
 
         // Re-read after the model call: a user may have named the chat or checked
         // out another branch while the throwaway generation was live.
-        let latest = self.inner.workspace.doc().chat(chat_id)?.unwrap_or(chat);
+        let latest = self.inner.workspace.chat(chat_id)?.unwrap_or(chat);
         if latest
             .title
             .as_deref()

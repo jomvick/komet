@@ -1,6 +1,9 @@
 export interface Env {
   SESSION_ROOMS: DurableObjectNamespace;
   DEVICE_ROOMS: DurableObjectNamespace;
+  /** Per-user workspace registries (`reg1/{orgId}/{userId}`) — the row-table
+   * replacement for the Loro workspace doc (docs/registry-sync.md). */
+  REGISTRY_ROOMS: DurableObjectNamespace;
   BLOBS: R2Bucket;
   /** Release artifacts (headless tarballs, dmgs, latest.txt) served at
    * /releases/* for the curl-install flow. */

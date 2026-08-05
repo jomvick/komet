@@ -571,7 +571,6 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
     // The mock's scripted reply doubles as the titling model's output.
     let chat = wait_for("chat title", || {
         core.workspace
-            .doc()
             .chat(chat_id)
             .ok()
             .flatten()
@@ -614,7 +613,6 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
     tokio::time::sleep(Duration::from_millis(400)).await;
     let chat = core
         .workspace
-        .doc()
         .chat(chat_id)
         .expect("chat")
         .expect("row");

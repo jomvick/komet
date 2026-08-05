@@ -9,10 +9,12 @@
 //! - [`DocsStore`]: snapshot persistence (the doc IS the outbox — commands + user entries
 //!   flush immediately) and the processed-command ledger with mark-BEFORE-execute semantics.
 
+pub mod registry;
 mod room;
 mod store;
 pub mod wake;
 
+pub use registry::{RegistryClient, RegistryEvent, RegistryTuning};
 pub use room::{
     RoomClient, RoomEvent, RoomStatsSnapshot, RoomTuning, StaticUrl, SyncError, UrlProvider,
 };
