@@ -62,6 +62,10 @@ final class AppModel {
         override("-setmode") { authModeRaw = $0 }
         override("-setuser") { storedUserId = $0 }
         override("-setorg") { storedOrgId = $0 }
+        // Simulator rig: seed WorkOS tokens straight into the keychain (the
+        // ASWebAuthenticationSession flow can't be driven headlessly).
+        override("-setaccess") { Keychain.save($0, key: "accessToken") }
+        override("-setrefresh") { Keychain.save($0, key: "refreshToken") }
         if args.contains("-bench") {
             Task { await BenchRunner.run() }
             return

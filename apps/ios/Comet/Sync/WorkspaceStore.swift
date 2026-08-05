@@ -1,12 +1,17 @@
-// Workspace doc mirror — the iOS analogue of the desktop's komet-doc mirror
-// over the workspace doc (crates/doc/src/workspace.rs). Joins the per-user
-// `ws3/{orgId}/{userId}` room, projects the doc into typed rows, and performs
-// the writes the writer discipline allows a viewer device: chat creates,
-// archives and seen marks. iOS is a viewport, not an engine device, so it
-// deliberately owns neither a device row nor a presence heartbeat.
+// Workspace registry mirror — the iOS analogue of the desktop's RegistryDoc
+// host (crates/doc/src/registry.rs + crates/engine WorkspaceHost). Joins the
+// per-user `/registry/{orgId}/ws` room, projects the row table into typed
+// rows, and performs the writes the writer discipline allows a viewer device:
+// chat creates, archives, renames and seen marks. iOS is a viewport, not an
+// engine device, so it owns no device row; it does publish a presence beat
+// (registry presence replaced the old ws room's ephemeral store).
+//
+// Reads are OVERLAY reads: the server's authoritative rows plus the pending
+// op-batch queue replayed on top (optimistic local writes, retired on ack).
+// Field names are identical to the old Loro rows (camelCase, epoch-ms
+// timestamps) so the projection — and every view above it — is unchanged.
 
 import Foundation
-import Loro
 import Observation
 
 @MainActor
@@ -16,48 +21,51 @@ final class WorkspaceStore {
     private(set) var spaces: [Space] = []
     private(set) var chats: [Chat] = []
     private(set) var sessions: [String: SessionRow] = [:]
-    private(set) var presence: [String: Int64] = [:]  // deviceId → last heartbeat ms
+    private(set) var presence: [String: Int64] = [:]  // deviceId → last beat ms
     private(set) var connected = false
 
-    let doc = LoroDoc()
-    private var room: RoomClient?
-    private var subscriptions: [Subscription] = []
+    /// Presence entries older than this are expired (mirrors the Rust
+    /// client's 30s TTL, measured from RECEIPT — beats carry the sender's
+    /// wall clock, which we never trust for freshness).
+    static let presenceTtlMs: Int64 = 30_000
+
+    @ObservationIgnored private var doc: RegistryDoc
+    @ObservationIgnored private var client: RegistryClient?
+    @ObservationIgnored private var saver: RegistrySaver?
+    @ObservationIgnored private var presenceReceivedAt: [String: Int64] = [:]
     private let config: AppConfig
 
     init(config: AppConfig) {
         self.config = config
+        self.doc = RegistryDoc(deviceId: config.deviceId)
     }
 
-    @ObservationIgnored private var saver: DocSaver?
-
     func start() {
-        guard room == nil else { return }
-        let roomId = "ws3/\(config.orgId)/\(config.userId)"
-        // Local-first: hydrate from the on-device snapshot before joining —
-        // the sidebar renders immediately and the join backfills incrementally.
-        if DocDisk.load(into: doc, id: roomId) {
-            project()
+        guard client == nil else { return }
+        // Local-first: hydrate from the on-device blob before joining — the
+        // sidebar renders immediately and the hello backfills from our
+        // cursor. First run after the update: no blob → cursor null → the
+        // server's full state (the engines already seeded everything).
+        let blobURL = DocDisk.registryURL(orgId: config.orgId, userId: config.userId)
+        if let data = try? Data(contentsOf: blobURL),
+           let loaded = try? RegistryDoc.from(data: data, deviceId: config.deviceId) {
+            doc = loaded
         }
-        saver = DocSaver(docId: roomId, doc: doc)
-        let client = RoomClient(roomId: roomId, doc: doc) { [config] in
-            await config.workspaceSocketURL()
-        } events: { [weak self] event in
-            Task { @MainActor [weak self] in self?.handle(event) }
-        }
-        room = client
-
-        // Local commits → room. The subscription fires synchronously inside
-        // commit; hop to the actor to send.
-        let localSub = doc.subscribeLocalUpdate { [weak client, weak self] update in
-            guard let client else { return }
-            let bytes = [UInt8](update)
-            Task { await client.sendLocalUpdate(bytes) }
-            Task { @MainActor [weak self] in self?.saver?.poke() }
-        }
-        subscriptions.append(localSub)
-
-        Task { await client.start() }
         project()
+        saver = RegistrySaver(url: blobURL) { [weak self] in
+            try? self?.doc.toData()
+        }
+
+        let delegate = RegistryClient.Delegate(
+            helloCursor: { [weak self] in self?.doc.helloCursor ?? nil },
+            takePushable: { [weak self] in self?.doc.takePushable() ?? [] },
+            event: { [weak self] event in self?.handle(event) }
+        )
+        let client = RegistryClient(device: config.deviceId,
+                                    urlProvider: { [config] in await config.registrySocketURL() },
+                                    delegate: delegate)
+        self.client = client
+        Task { await client.start() }
     }
 
     /// Backgrounding hook: persist immediately.
@@ -66,141 +74,139 @@ final class WorkspaceStore {
     }
 
     /// Foreground hook: revive the room after a suspension (see
-    /// RoomClient.kick).
+    /// RegistryClient.kick).
     func kickRoom() {
-        guard let room else { return }
-        Task { await room.kick() }
+        guard let client else { return }
+        Task { await client.kick() }
     }
 
     func stop() {
-        subscriptions.removeAll()
         saver?.flush()
-        if let room {
-            Task { await room.stop() }
+        if let client {
+            Task { await client.stop() }
         }
-        room = nil
+        client = nil
         connected = false
     }
 
-    private func handle(_ event: RoomEvent) {
+    // MARK: Server events (delivered in frame order — rows before ack)
+
+    private func handle(_ event: RegistryEvent) {
         switch event {
-        case .connected:
-            connected = true
-            purgeLegacyMobileDevices()
-            project()
-        case .disconnected:
-            connected = false
-        case .remoteUpdate:
-            purgeLegacyMobileDevices()
+        case .state(let seq, let full, let gcFloor, let rows, let beats):
+            // On a state frame with full=true and seq < our cursor (server
+            // wiped), applyState keeps local rows and re-seeds them as
+            // upserts carrying their ORIGINAL per-field clocks; the client
+            // pushes those pending batches right after this returns.
+            let outcome = doc.applyState(seq: seq, full: full, gcFloor: gcFloor, rows: rows)
+            if outcome == .reseeded {
+                roomLog.info("registry: server behind local state; re-seeding")
+            }
+            let now = nowMs()
+            for (device, at) in beats {
+                presence[device] = at
+                presenceReceivedAt[device] = now
+            }
             project()
             saver?.poke()
-        case .ephemeralUpdate:
-            projectPresence()
+        case .connected:
+            connected = true
+        case .rows(let seq, let rows):
+            doc.applyRows(seq: seq, rows: rows)
+            project()
+            saver?.poke()
+        case .ack(let batch, let seq, _):
+            // Rows for this batch already arrived (server orders rows before
+            // ack), so retiring the optimistic overlay can't flicker — and if
+            // our op lost LWW, the merged row is now the truth on display.
+            doc.ackBatch(batch, seq: seq)
+            project()
+            saver?.poke()
+        case .presence(let device, let at):
+            presence[device] = at
+            presenceReceivedAt[device] = nowMs()
+        case .disconnected:
+            connected = false
+            doc.markDisconnected()
         }
     }
 
-    /// Older iOS builds registered themselves as engine devices. Mobile is a
-    /// controller only: remove those synced rows so desktop device pickers do
-    /// not retain simulator/phone model names forever.
-    private func purgeLegacyMobileDevices() {
-        guard let root = doc.getDeepValue().mapValue,
-              let deviceRows = root["devices"]?.mapValue else { return }
-        let staleIds = deviceRows.compactMap { id, value -> String? in
-            value.mapValue?["platform"]?.stringValue == "ios" ? id : nil
-        }
-        guard !staleIds.isEmpty else { return }
-        let map = doc.getMap(id: "devices")
-        do {
-            for id in staleIds {
-                try map.delete(key: id)
-            }
-            doc.commit()
-        } catch {
-            // Cleanup is a migration; projection/sync remain usable if it fails.
+    /// Every local write: re-project the overlay, schedule the snapshot, and
+    /// wake the client to push the fresh batch.
+    private func afterLocalWrite() {
+        project()
+        saver?.poke()
+        if let client {
+            Task { await client.nudge() }
         }
     }
 
     // MARK: Presence
 
-    private func projectPresence() {
-        guard let room else { return }
-        Task { @MainActor in
-            let states = await room.eph.getAllStates()
-            var fresh: [String: Int64] = [:]
-            for (key, value) in states where key.hasPrefix("presence/") {
-                if let ms = value.i64Value {
-                    fresh[String(key.dropFirst("presence/".count))] = ms
-                }
-            }
-            presence = fresh
-        }
-    }
-
     func deviceOnline(_ deviceId: String) -> Bool {
-        guard let ms = presence[deviceId] else { return false }
-        return nowMs() - ms < presenceFreshMs
+        guard let received = presenceReceivedAt[deviceId] else { return false }
+        return nowMs() - received < Self.presenceTtlMs
     }
 
-    // MARK: Projection (doc → rows)
+    // MARK: Projection (rows → typed entities)
 
     private func project() {
-        let value = doc.getDeepValue()
-        guard let root = value.mapValue else { return }
-
-        devices = (root["devices"]?.mapValue ?? [:]).compactMap { _, v in
-            guard let m = v.mapValue, let id = m["id"]?.stringValue else { return nil }
+        devices = doc.overlayRows(kind: "devices").map { row in
+            let f = row.fields
+            let id = f["id"]?.stringValue ?? row.id
             return DeviceRow(id: id,
-                            name: m["name"]?.stringValue ?? id,
-                            platform: m["platform"]?.stringValue ?? "",
-                            lastSeenAt: m["lastSeenAt"]?.i64Value,
-                            createdAt: m["createdAt"]?.i64Value)
+                             name: f["name"]?.stringValue ?? id,
+                             platform: f["platform"]?.stringValue ?? "",
+                             lastSeenAt: f["lastSeenAt"]?.int64Value,
+                             createdAt: f["createdAt"]?.int64Value)
         }.sorted { $0.name < $1.name }
 
-        spaces = (root["spaces"]?.mapValue ?? [:]).compactMap { _, v in
-            guard let m = v.mapValue, let id = m["id"]?.stringValue,
-                  let deviceId = m["deviceId"]?.stringValue,
-                  let path = m["path"]?.stringValue else { return nil }
-            return Space(id: id, deviceId: deviceId, path: path,
-                         name: m["name"]?.stringValue,
-                         gitDetected: m["gitDetected"]?.boolValue ?? false,
-                         gitCheckedAt: m["gitCheckedAt"]?.i64Value,
-                         checkoutId: m["checkoutId"]?.stringValue,
-                         createdAt: m["createdAt"]?.i64Value ?? 0)
+        spaces = doc.overlayRows(kind: "spaces").compactMap { row in
+            let f = row.fields
+            guard let deviceId = f["deviceId"]?.stringValue,
+                  let path = f["path"]?.stringValue else { return nil }
+            return Space(id: f["id"]?.stringValue ?? row.id, deviceId: deviceId, path: path,
+                         name: f["name"]?.stringValue,
+                         gitDetected: f["gitDetected"]?.boolValue ?? false,
+                         gitCheckedAt: f["gitCheckedAt"]?.int64Value,
+                         checkoutId: f["checkoutId"]?.stringValue,
+                         createdAt: f["createdAt"]?.int64Value ?? 0)
         }.sorted { ($0.createdAt, $0.id) < ($1.createdAt, $1.id) }  // creation order, id tiebreak
 
-        chats = (root["chats"]?.mapValue ?? [:]).compactMap { _, v in
-            guard let m = v.mapValue, let id = m["id"]?.stringValue,
-                  let deviceId = m["deviceId"]?.stringValue else { return nil }
+        chats = doc.overlayRows(kind: "chats").compactMap { row in
+            let f = row.fields
+            guard let deviceId = f["deviceId"]?.stringValue else { return nil }
             var chatConfig: ChatConfig?
-            if let c = m["config"]?.mapValue {
+            if let c = f["config"]?.objectValue {
                 chatConfig = ChatConfig(harness: c["harness"]?.stringValue ?? "claude-code",
                                         model: c["model"]?.stringValue,
                                         reasoning: c["reasoning"]?.stringValue,
                                         sandbox: c["sandbox"]?.stringValue)
             }
-            return Chat(id: id, deviceId: deviceId,
-                        title: m["title"]?.stringValue,
-                        archived: m["archived"]?.boolValue ?? false,
-                        cwd: m["cwd"]?.stringValue,
-                        branch: m["branch"]?.stringValue,
-                        checkoutId: m["checkoutId"]?.stringValue,
+            return Chat(id: f["id"]?.stringValue ?? row.id, deviceId: deviceId,
+                        title: f["title"]?.stringValue,
+                        archived: f["archived"]?.boolValue ?? false,
+                        cwd: f["cwd"]?.stringValue,
+                        branch: f["branch"]?.stringValue,
+                        checkoutId: f["checkoutId"]?.stringValue,
                         config: chatConfig,
-                        lastMessagePreview: m["lastMessagePreview"]?.stringValue,
-                        lastMessageAt: m["lastMessageAt"]?.i64Value,
-                        createdAt: m["createdAt"]?.i64Value ?? 0,
-                        spaceId: m["spaceId"]?.stringValue,
-                        lastSeenAt: m["lastSeenAt"]?.i64Value)
+                        lastMessagePreview: f["lastMessagePreview"]?.stringValue,
+                        lastMessageAt: f["lastMessageAt"]?.int64Value,
+                        createdAt: f["createdAt"]?.int64Value ?? 0,
+                        spaceId: f["spaceId"]?.stringValue,
+                        lastSeenAt: f["lastSeenAt"]?.int64Value)
         }
 
         var rows: [String: SessionRow] = [:]
-        for (_, v) in root["sessions"]?.mapValue ?? [:] {
-            guard let m = v.mapValue, let chatId = m["chatId"]?.stringValue,
-                  let deviceId = m["deviceId"]?.stringValue,
-                  let statusStr = m["status"]?.stringValue,
+        for row in doc.overlayRows(kind: "sessions") {
+            let f = row.fields
+            guard let chatId = f["chatId"]?.stringValue,
+                  let deviceId = f["deviceId"]?.stringValue,
+                  let statusStr = f["status"]?.stringValue,
                   let status = SessionStatus(rawValue: statusStr) else { continue }
             rows[chatId] = SessionRow(chatId: chatId, deviceId: deviceId, status: status,
-                                      startedAt: m["startedAt"]?.i64Value,
-                                      updatedAt: m["updatedAt"]?.i64Value ?? 0)
+                                      startedAt: f["startedAt"]?.int64Value,
+                                      updatedAt: f["updatedAt"]?.int64Value ?? 0)
         }
         sessions = rows
     }
@@ -314,47 +320,43 @@ final class WorkspaceStore {
     }
 
     /// Retarget a session onto another checkout (the desktop's
-    /// setChatCwd/setChatBranch mutates — LWW row writes here).
+    /// setChatCwd/setChatBranch mutates — LWW field writes here).
     func setChatCheckout(chatId: String, cwd: String, branch: String) {
-        updateChat(chatId) { row in
-            try row.insert(key: "cwd", v: cwd)
-            try row.insert(key: "branch", v: branch)
-        }
+        updateChat(chatId, set: ["cwd": .string(cwd), "branch": .string(branch)])
     }
 
-    // MARK: Writes (viewer-device discipline)
+    // MARK: Writes (viewer-device discipline → op batches)
 
-    /// Mint a new chat onto a space (workspace_host.rs create_chat shape).
-    /// The host = the space's owning device picks it up via the doc.
+    /// Mint a new chat onto a space (workspace_host.rs create_chat shape):
+    /// a full-row upsert. The host = the space's owning device picks it up
+    /// via the registry.
     @discardableResult
     func createChat(space: Space, config chatConfig: ChatConfig,
                     branch: String? = nil, cwd: String? = nil) -> String {
         let chatId = UUID().uuidString.lowercased()
-        let map = doc.getMap(id: "chats")
-        do {
-            let row = try map.getOrCreateContainer(key: chatId, child: LoroMap())
-            try row.insert(key: "id", v: chatId)
-            try row.insert(key: "deviceId", v: space.deviceId)
-            try row.insert(key: "archived", v: false)
-            try row.insert(key: "cwd", v: cwd ?? space.path)
-            try row.insert(key: "spaceId", v: space.id)
-            try row.insert(key: "createdAt", v: nowMs())
-            if let branch {
-                try row.insert(key: "branch", v: branch)
-            }
-            if let cfg = LoroValue.fromEncodable(chatConfig) {
-                try row.insert(key: "config", v: cfg)
-            }
-            doc.commit()
-            project()
-        } catch {}
+        var set: [String: JSONValue] = [
+            "id": .string(chatId),
+            "deviceId": .string(space.deviceId),
+            "archived": .bool(false),
+            "cwd": .string(cwd ?? space.path),
+            "spaceId": .string(space.id),
+            "createdAt": .int(nowMs()),
+        ]
+        if let branch {
+            set["branch"] = .string(branch)
+        }
+        if let cfg = JSONValue(encodable: chatConfig) {
+            set["config"] = cfg
+        }
+        doc.write(kind: "chats", id: chatId, op: .upsert, set: set)
+        afterLocalWrite()
         return chatId
     }
 
     /// Create a space. Preferred path: `Mutate {op:createSpace}` straight to
-    /// the owning host over its relay (it applies the row to its own workspace
+    /// the owning host over its relay (it applies the row to its own registry
     /// doc, functionally identical to the desktop's local mutate + sync).
-    /// Fallback when the host is unreachable: LWW row write into our mirror —
+    /// Fallback when the host is unreachable: a full-row upsert from here —
     /// creates are legal from any device; the owner stamps git on arrival.
     @discardableResult
     func createSpace(deviceId: String, path: String, gitDetected: Bool = false) async -> String {
@@ -373,56 +375,69 @@ final class WorkspaceStore {
         ]
         let viaHost: OkReply? = try? await relay(for: deviceId).call(method: "Mutate", params: params)
         if viaHost == nil {
-            let map = doc.getMap(id: "spaces")
-            do {
-                let row = try map.getOrCreateContainer(key: spaceId, child: LoroMap())
-                try row.insert(key: "id", v: spaceId)
-                try row.insert(key: "deviceId", v: deviceId)
-                try row.insert(key: "path", v: path)
-                try row.insert(key: "gitDetected", v: gitDetected)
-                try row.insert(key: "createdAt", v: nowMs())
-                doc.commit()
-            } catch {}
+            doc.write(kind: "spaces", id: spaceId, op: .upsert, set: [
+                "id": .string(spaceId),
+                "deviceId": .string(deviceId),
+                "path": .string(path),
+                "gitDetected": .bool(gitDetected),
+                "createdAt": .int(nowMs()),
+            ])
         }
-        project()
+        afterLocalWrite()
         return spaceId
     }
 
     func setArchived(chatId: String, archived: Bool) {
-        updateChat(chatId) { row in
-            try row.insert(key: "archived", v: archived)
-        }
+        updateChat(chatId, set: ["archived": .bool(archived)])
     }
 
+    /// Synced seen marker (LWW) with a monotonic guard: no write when the
+    /// stored stamp is already current.
     func markSeen(chatId: String) {
-        updateChat(chatId) { row in
-            try row.insert(key: "lastSeenAt", v: nowMs())
-        }
+        guard let row = doc.overlayRow(kind: "chats", id: chatId) else { return }
+        let at = nowMs()
+        if let current = row.fields["lastSeenAt"]?.int64Value, current >= at { return }
+        doc.write(kind: "chats", id: chatId, op: .update, set: ["lastSeenAt": .int(at)])
+        afterLocalWrite()
     }
 
     func rename(chatId: String, title: String) {
-        updateChat(chatId) { row in
-            try row.insert(key: "title", v: title)
-        }
+        updateChat(chatId, set: ["title": .string(title)])
     }
 
-    /// Chat config is an LWW map set on the chat row; the host reads it when
+    /// Chat config is an LWW field on the chat row; the host reads it when
     /// dispatching the next run.
     func setChatConfig(chatId: String, config chatConfig: ChatConfig) {
-        updateChat(chatId) { row in
-            if let value = LoroValue.fromEncodable(chatConfig) {
-                try row.insert(key: "config", v: value)
-            }
-        }
+        guard let value = JSONValue(encodable: chatConfig) else { return }
+        updateChat(chatId, set: ["config": value])
     }
 
-    private func updateChat(_ chatId: String, _ mutate: (LoroMap) throws -> Void) {
-        let map = doc.getMap(id: "chats")
-        guard let row = map.get(key: chatId)?.asLoroMap() else { return }
-        do {
-            try mutate(row)
-            doc.commit()
-            project()
-        } catch {}
+    /// Tombstone a chat (and its session-status row) in one batch. The
+    /// per-chat session doc remains — this removes the index entry only.
+    func deleteChat(chatId: String) {
+        doc.deleteRows([("chats", chatId), ("sessions", chatId)])
+        afterLocalWrite()
+    }
+
+    /// Hard-delete a space and cascade to its chats: ONE batch tombstones the
+    /// space row and every chat/session row whose spaceId matches — the
+    /// server applies the batch atomically.
+    func deleteSpace(spaceId: String) {
+        var keys: [(kind: String, id: String)] = []
+        for chat in chats where chat.spaceId == spaceId {
+            keys.append(("chats", chat.id))
+            keys.append(("sessions", chat.id))
+        }
+        keys.append(("spaces", spaceId))
+        doc.deleteRows(keys)
+        afterLocalWrite()
+    }
+
+    /// Field sets are `update` ops — they NEVER create or revive rows (the
+    /// old "never invent rows" discipline), so check the overlay row first.
+    private func updateChat(_ chatId: String, set: [String: JSONValue]) {
+        guard doc.rowExists(kind: "chats", id: chatId) else { return }
+        doc.write(kind: "chats", id: chatId, op: .update, set: set)
+        afterLocalWrite()
     }
 }
