@@ -739,28 +739,41 @@ impl Shell {
         // heard a phantom Working→Idle and rang "done" on send (user report
         // 2026-07-31). The dot never showed that ghost; the chime must judge
         // by the identical clock.
+        //
+        // SEND-PENDING-GATED too (`AppState::send_pending`): a send whose
+        // queued command the host hasn't executed yet can still surface a
+        // phantom Working→Idle (a stale Working row crossing the 45s gate on
+        // the send's own re-render, or a late old Idle row) — the done-chime
+        // stays quiet for that chat until the host acks, while the baseline
+        // keeps tracking silently so the ghost edge never fires later. The
+        // question chime is NOT gated: an instant AwaitingInput ack should
+        // still ring.
         {
             let now = Utc::now();
-            let sessions: Vec<(String, komet_proto::SessionStatus)> = state
-                .read(cx)
-                .sessions
-                .iter()
-                .map(|s| {
-                    use komet_proto::view::Indicator;
-                    let status = match komet_proto::view::effective_indicator(Some(s), now) {
-                        Indicator::Working => komet_proto::SessionStatus::Working,
-                        Indicator::AwaitingInput => komet_proto::SessionStatus::AwaitingInput,
-                        Indicator::Errored => komet_proto::SessionStatus::Errored,
-                        Indicator::None => komet_proto::SessionStatus::Idle,
-                    };
-                    (s.chat_id.clone(), status)
-                })
-                .collect();
-            for (chat_id, status) in sessions {
+            let sessions: Vec<(String, komet_proto::SessionStatus, bool)> = {
+                let state = state.read(cx);
+                state
+                    .sessions
+                    .iter()
+                    .map(|s| {
+                        use komet_proto::view::Indicator;
+                        let status = match komet_proto::view::effective_indicator(Some(s), now) {
+                            Indicator::Working => komet_proto::SessionStatus::Working,
+                            Indicator::AwaitingInput => komet_proto::SessionStatus::AwaitingInput,
+                            Indicator::Errored => komet_proto::SessionStatus::Errored,
+                            Indicator::None => komet_proto::SessionStatus::Idle,
+                        };
+                        let send_pending = state.send_pending(&s.chat_id, now);
+                        (s.chat_id.clone(), status, send_pending)
+                    })
+                    .collect()
+            };
+            for (chat_id, status, send_pending) in sessions {
                 let prev = self.sound_prev.insert(chat_id, status);
                 if let Some(prev) = prev
                     && self.settings.sound_enabled
                     && let Some(sound) = crate::sound::sound_for_transition(prev, status)
+                    && !(send_pending && sound == crate::sound::Sound::Done)
                 {
                     crate::sound::play(sound);
                 }
