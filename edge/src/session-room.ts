@@ -1040,6 +1040,16 @@ export class SessionRoom implements DurableObject {
       await this.foldLog();
       return;
     }
+    // Redundancy budget: a re-seeded room (wedge break → every device re-pushes
+    // its whole doc) sits far under COMPACT_LOG_BYTES yet replays seconds of
+    // near-identical full-doc bundles on every cold start (2026-08-05: 1.1MB
+    // log, ZERO snapshot, 5.1s replays, heap-pressure aborts, reconnect herds).
+    // Fold whenever the log dwarfs the folded state it would collapse into.
+    const snapshotBytes = this.blobs.get("snapshot")?.length ?? 0;
+    if (logBytes > 4 * Math.max(snapshotBytes, 32 * 1024)) {
+      await this.foldLog();
+      return;
+    }
     const rows = [...this.ctx.storage.sql.exec("SELECT COUNT(*) AS n FROM updates")][0]?.n as
       | number
       | undefined;
