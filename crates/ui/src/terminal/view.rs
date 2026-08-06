@@ -20,7 +20,7 @@ use gpui::{
 
 use crate::theme::{Appearance, Theme, current_appearance, rgb_to_hsl};
 
-use super::emulator::{CellColor, CellSnapshot};
+use super::emulator::{CellColor, CellSnapshot, Side};
 use super::panel::TerminalPanel;
 
 /// Terminal font metrics (mono).
@@ -58,6 +58,29 @@ pub fn terminal_bg_for(appearance: Appearance) -> Hsla {
 /// context-free form, same shape as [`crate::theme::ink`].
 pub fn terminal_bg() -> Hsla {
     terminal_bg_for(current_appearance())
+}
+
+/// Selection wash over the grid.
+///
+/// Deliberately *achromatic*, which is where this differs from
+/// [`Theme::selection`] — the composer's blue. A saturated wash sits on top of
+/// sixteen ANSI hues and drags every one of them toward itself: red text under
+/// blue reads purple, green reads teal. A neutral veil changes lightness only,
+/// so selected output keeps the colors the program asked for — the whole point
+/// of tuning those palettes per appearance in the first place.
+///
+/// White on dark, black on light, the same direction [`crate::theme::ink`]
+/// takes. The alpha is heavier than a hover wash because this has to read as a
+/// deliberate highlight at a glance, and lighter than a plate because the
+/// glyphs underneath still have to be legible through it.
+pub fn terminal_selection_for(appearance: Appearance) -> Hsla {
+    match appearance {
+        Appearance::Dark => gpui::hsla(0.0, 0.0, 1.0, 0.22),
+        // Slightly heavier: an equal alpha of black on near-white reads fainter
+        // than white on near-black, because the surround is brighter to begin
+        // with.
+        Appearance::Light => gpui::hsla(0.0, 0.0, 0.0, 0.16),
+    }
 }
 
 /// The 16 ANSI colors tuned for the near-black background (indexes 0-7 normal,
@@ -172,6 +195,84 @@ pub fn resolve_color(color: CellColor, theme: &Theme) -> Hsla {
         }
         CellColor::Rgb(r, g, b) => rgb8(r, g, b),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Pointer → cell
+// ---------------------------------------------------------------------------
+
+/// Minimum pointer travel before a press turns into a selection.
+///
+/// Without it, the click that focuses the panel starts a one-cell selection if
+/// the hand moves a pixel — and once anything copies on selection change, that
+/// silently clobbers the clipboard. Matches the threshold zed uses for the same
+/// reason (`SELECTION_DRAG_THRESHOLD`), which is gpui's own `div` drag
+/// threshold.
+pub const SELECTION_DRAG_THRESHOLD: f32 = 2.0;
+
+/// Which cell a pointer landed on, and which edge of it a selection anchors to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CellHit {
+    pub row: usize,
+    pub col: usize,
+    /// Selections anchor to a cell *edge*, not a cell: pressing on the left
+    /// half of a glyph includes it, the right half excludes it.
+    pub side: Side,
+}
+
+/// Map a position *relative to the grid's top-left glyph* onto a cell.
+///
+/// Positions outside the grid clamp to the nearest cell rather than returning
+/// `None`, because that is what a drag needs: the pointer routinely leaves the
+/// panel mid-gesture, and the selection should extend to the edge it left
+/// through instead of freezing at the last sample taken inside.
+///
+/// Overshoot also *forces the side*, which clamping alone does not give you.
+/// Dragging past the bottom should take the last line whole, even when the
+/// pointer drifted left of where it started — deriving the side from x there
+/// would stop the selection mid-row. Same rule going up, mirrored. This is the
+/// behaviour alacritty and zed's `grid_point_and_side` both implement.
+pub fn cell_at(x: f32, y: f32, cell_w: f32, line_h: f32, cols: usize, rows: usize) -> CellHit {
+    // Degenerate metrics (a zero-size grid, or a font probe that returned NaN)
+    // would otherwise divide into garbage cell indices.
+    let usable = |v: f32| v.is_finite() && v > 0.0;
+    if cols == 0 || rows == 0 || !usable(cell_w) || !usable(line_h) {
+        return CellHit {
+            row: 0,
+            col: 0,
+            side: Side::Left,
+        };
+    }
+    let x = if x.is_finite() { x } else { 0.0 };
+    let y = if y.is_finite() { y } else { 0.0 };
+    let last_col = cols - 1;
+    let last_row = rows - 1;
+
+    let raw_col = (x / cell_w).floor();
+    let mut side = if x.max(0.0) % cell_w > cell_w / 2.0 {
+        Side::Right
+    } else {
+        Side::Left
+    };
+    let col = if raw_col > last_col as f32 {
+        side = Side::Right;
+        last_col
+    } else {
+        raw_col.max(0.0) as usize
+    };
+
+    let raw_row = (y / line_h).floor();
+    let row = if raw_row > last_row as f32 {
+        side = Side::Right;
+        last_row
+    } else if raw_row < 0.0 {
+        side = Side::Left;
+        0
+    } else {
+        raw_row as usize
+    };
+
+    CellHit { row, col, side }
 }
 
 // ---------------------------------------------------------------------------
@@ -354,6 +455,10 @@ impl TerminalElement {
 
 pub struct TerminalPrepaint {
     bg_quads: Vec<PaintQuad>,
+    /// Selection wash. Painted after [`Self::bg_quads`] and before the glyphs:
+    /// it has to tint a cell's own background rather than replace it, and it
+    /// must not wash out the text it is highlighting.
+    sel_quads: Vec<PaintQuad>,
     lines: Vec<ShapedLine>,
     cursor: Option<PaintQuad>,
 }
@@ -418,27 +523,58 @@ impl gpui::Element for TerminalElement {
 
         // Report the measured grid, then snapshot for painting. Safe: the
         // panel entity is not borrowed during element prepaint.
+        let origin = point(
+            bounds.left() + px(TERM_PADDING),
+            bounds.top() + px(TERM_PADDING),
+        );
         let snapshot = self.panel.update(cx, |panel, cx| {
-            panel.on_grid_metrics(cols, rows, cx);
+            panel.on_grid_metrics(
+                super::panel::GridGeometry {
+                    origin,
+                    cell_w: f32::from(cell_w),
+                    line_h: f32::from(line_h),
+                    cols,
+                    rows,
+                },
+                cx,
+            );
             panel.active_grid_snapshot(cx)
         });
         let Some(snapshot) = snapshot else {
             return TerminalPrepaint {
                 bg_quads: Vec::new(),
+                sel_quads: Vec::new(),
                 lines: Vec::new(),
                 cursor: None,
             };
         };
 
-        let origin = point(
-            bounds.left() + px(TERM_PADDING),
-            bounds.top() + px(TERM_PADDING),
-        );
         let mut bg_quads = Vec::new();
+        let mut sel_quads = Vec::new();
         let mut lines = Vec::with_capacity(snapshot.lines.len());
 
         for (row_ix, row) in snapshot.lines.iter().enumerate() {
             let y = origin.y + line_h * row_ix as f32;
+            // Selected runs, merged the same way background runs are: one quad
+            // per contiguous span instead of one per cell.
+            let mut sel_start: Option<usize> = None;
+            for col in 0..=row.len() {
+                let selected = row.get(col).is_some_and(|cell| cell.selected);
+                match (sel_start, selected) {
+                    (None, true) => sel_start = Some(col),
+                    (Some(start), false) => {
+                        sel_quads.push(fill(
+                            Bounds::new(
+                                point(origin.x + cell_w * start as f32, y),
+                                size(cell_w * (col - start) as f32, line_h),
+                            ),
+                            terminal_selection_for(theme.appearance),
+                        ));
+                        sel_start = None;
+                    }
+                    _ => {}
+                }
+            }
             // Merge consecutive non-default background cells into quads.
             let mut run_start: Option<(usize, Hsla)> = None;
             for (col, color) in row
@@ -487,6 +623,7 @@ impl gpui::Element for TerminalElement {
 
         TerminalPrepaint {
             bg_quads,
+            sel_quads,
             lines,
             cursor,
         }
@@ -509,6 +646,9 @@ impl gpui::Element for TerminalElement {
         );
         window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
             for quad in prepaint.bg_quads.drain(..) {
+                window.paint_quad(quad);
+            }
+            for quad in prepaint.sel_quads.drain(..) {
                 window.paint_quad(quad);
             }
             for (ix, line) in prepaint.lines.iter().enumerate() {
@@ -901,5 +1041,123 @@ mod tests {
     fn timing_constants_match_spec() {
         assert_eq!(COALESCE_MS, 12);
         assert_eq!(RESIZE_DEBOUNCE_MS, 80);
+    }
+
+    // ---- pointer → cell ----
+
+    /// 10x20 cells, an 8x4 grid: cols 0..7, rows 0..3.
+    fn hit(x: f32, y: f32) -> CellHit {
+        cell_at(x, y, 10.0, 20.0, 8, 4)
+    }
+
+    #[test]
+    fn pointer_maps_to_the_cell_it_is_over() {
+        assert_eq!(
+            hit(0.0, 0.0),
+            CellHit {
+                row: 0,
+                col: 0,
+                side: Side::Left
+            }
+        );
+        assert_eq!(
+            hit(25.0, 45.0),
+            CellHit {
+                row: 2,
+                col: 2,
+                side: Side::Left
+            }
+        );
+        // Last cell, exactly.
+        assert_eq!(
+            hit(70.0, 60.0),
+            CellHit {
+                row: 3,
+                col: 7,
+                side: Side::Left
+            }
+        );
+    }
+
+    #[test]
+    fn side_splits_the_cell_at_its_midpoint() {
+        // Cell 2 spans x 20..30, so the midpoint is 25.
+        assert_eq!(hit(21.0, 0.0).side, Side::Left);
+        assert_eq!(
+            hit(25.0, 0.0).side,
+            Side::Left,
+            "the midpoint itself is left"
+        );
+        assert_eq!(hit(26.0, 0.0).side, Side::Right);
+        // The cell is unaffected by which half.
+        assert_eq!(hit(21.0, 0.0).col, 2);
+        assert_eq!(hit(29.0, 0.0).col, 2);
+    }
+
+    /// Dragging out of the panel must extend to the edge it left through, not
+    /// freeze at the last sample inside.
+    #[test]
+    fn overshoot_clamps_into_the_grid() {
+        assert_eq!(hit(9_999.0, 0.0).col, 7);
+        assert_eq!(hit(0.0, 9_999.0).row, 3);
+        assert_eq!(hit(-50.0, 0.0).col, 0);
+        assert_eq!(hit(0.0, -50.0).row, 0);
+    }
+
+    /// The part clamping alone does not give you: past the right or bottom
+    /// edge the side is forced Right so the last cell is *included*, and above
+    /// the top it is forced Left. Dragging below-and-left must still take the
+    /// bottom row whole.
+    #[test]
+    fn overshoot_forces_the_side_to_the_edge() {
+        assert_eq!(hit(9_999.0, 10.0).side, Side::Right);
+        // x sits in cell 0's left half, but the row overshot — Right wins.
+        assert_eq!(hit(1.0, 9_999.0).side, Side::Right);
+        assert_eq!(hit(1.0, 9_999.0).col, 0);
+        // Above the top, mirrored.
+        assert_eq!(hit(75.0, -50.0).side, Side::Left);
+    }
+
+    #[test]
+    fn degenerate_metrics_do_not_panic() {
+        assert_eq!(
+            cell_at(5.0, 5.0, 0.0, 20.0, 8, 4),
+            CellHit {
+                row: 0,
+                col: 0,
+                side: Side::Left
+            }
+        );
+        assert_eq!(
+            cell_at(5.0, 5.0, 10.0, 20.0, 0, 0),
+            CellHit {
+                row: 0,
+                col: 0,
+                side: Side::Left
+            }
+        );
+        assert_eq!(cell_at(f32::NAN, f32::INFINITY, 10.0, 20.0, 8, 4).col, 0);
+    }
+
+    #[test]
+    fn drag_threshold_matches_the_gpui_default() {
+        assert_eq!(SELECTION_DRAG_THRESHOLD, 2.0);
+    }
+
+    /// The selection veil must stay achromatic, or it tints the ANSI text it
+    /// covers instead of just lifting it.
+    #[test]
+    fn selection_wash_is_neutral_and_translucent() {
+        for appearance in [Appearance::Dark, Appearance::Light] {
+            let wash = terminal_selection_for(appearance);
+            assert_eq!(wash.s, 0.0, "{appearance:?} selection must have no hue");
+            assert!(
+                wash.a > 0.0 && wash.a < 0.5,
+                "{appearance:?} selection must veil the cell, not replace it"
+            );
+        }
+        // Opposite directions: lighten the dark grid, darken the light one.
+        assert_eq!(terminal_selection_for(Appearance::Dark).l, 1.0);
+        assert_eq!(terminal_selection_for(Appearance::Light).l, 0.0);
     }
 }

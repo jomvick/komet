@@ -7,6 +7,10 @@
 //! That split makes the whole escape-sequence surface unit-testable with
 //! scripted byte strings.
 //!
+//! Selection lives here too ([`Emulator::start_selection`] and friends) rather
+//! than in the panel, because `Term` is what knows how to keep anchors on their
+//! text as output scrolls the grid underneath them.
+//!
 //! API notes for the pinned `alacritty_terminal 0.26` / `vte 0.15`:
 //! - `Processor::advance` consumes a byte slice; `Term` implements the
 //!   `vte::ansi::Handler` trait directly, so no event-loop machinery is needed.
@@ -21,11 +25,19 @@ use std::rc::Rc;
 use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line, Point};
+use alacritty_terminal::selection::{Selection, SelectionRange};
 use alacritty_terminal::term::cell::Flags;
 use alacritty_terminal::term::{Config, Term, TermMode};
 use alacritty_terminal::vte::ansi::{
     Color as AnsiColor, CursorShape, NamedColor, Processor, Rgb as AnsiRgb,
 };
+
+/// Grid coordinates and selection granularity, re-exported so the panel and
+/// view speak the emulator's vocabulary without depending on
+/// `alacritty_terminal` directly — the same seam [`CellColor`] draws for
+/// colors.
+pub use alacritty_terminal::index::{Point as GridPoint, Side};
+pub use alacritty_terminal::selection::SelectionType;
 
 /// Scrollback history kept client-side (lines). The engine's replay window is
 /// bounded separately (1 MiB); this only caps what stays scrollable in the UI.
@@ -118,6 +130,8 @@ pub struct CellSnapshot {
     pub wide: bool,
     /// The spacer half of a wide char — never shaped, only background-painted.
     pub wide_spacer: bool,
+    /// Inside the active selection: the view paints a wash over this cell.
+    pub selected: bool,
 }
 
 impl CellSnapshot {
@@ -246,8 +260,77 @@ impl Emulator {
         self.term.scroll_display(Scroll::Bottom);
     }
 
+    // ---- selection ----
+    //
+    // `Term` owns the selection outright, which is what makes this cheap: it
+    // rotates the anchors when output scrolls the grid and drops them on clear
+    // and resize, so a selection tracks live output without any bookkeeping
+    // here. The panel supplies pointer positions; everything below is a thin
+    // translation into grid coordinates.
+
+    /// The grid point under a viewport cell (row 0 = top of the visible area).
+    ///
+    /// Viewport rows are what the pointer hits; grid lines are what a selection
+    /// anchors to, and the two differ by the scrollback offset. Anchoring in
+    /// grid space is what lets a selection stay on its text while the view
+    /// scrolls out from under it.
+    pub fn grid_point(&self, viewport_row: usize, col: usize) -> Point {
+        Point::new(
+            Line(viewport_row as i32 - self.display_offset() as i32),
+            Column(col.min(self.cols().saturating_sub(1))),
+        )
+    }
+
+    /// Begin a selection. `ty` picks the granularity: [`SelectionType::Simple`]
+    /// for a drag, `Semantic` for a double-click word, `Lines` for a triple-
+    /// click row.
+    pub fn start_selection(&mut self, ty: SelectionType, point: Point, side: Side) {
+        self.term.selection = Some(Selection::new(ty, point, side));
+    }
+
+    /// Extend the in-progress selection to `point`. No-op without one.
+    pub fn update_selection(&mut self, point: Point, side: Side) {
+        if let Some(selection) = self.term.selection.as_mut() {
+            selection.update(point, side);
+        }
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.term.selection = None;
+    }
+
+    /// The selected text, or `None` when there is no selection or it covers
+    /// nothing (a click without a drag leaves an empty one behind).
+    pub fn selection_text(&self) -> Option<String> {
+        self.term.selection_to_string().filter(|s| !s.is_empty())
+    }
+
+    /// Whether a non-empty selection is active — drives the copy action and
+    /// the "clear it" branch on the next click.
+    pub fn has_selection(&self) -> bool {
+        self.selection_range().is_some()
+    }
+
+    fn selection_range(&self) -> Option<SelectionRange> {
+        self.term
+            .selection
+            .as_ref()
+            .and_then(|selection| selection.to_range(&self.term))
+    }
+
     /// Snapshot one viewport row (0 = top) honoring the scrollback offset.
     pub fn line(&self, viewport_row: usize) -> Vec<CellSnapshot> {
+        self.line_inner(viewport_row, self.selection_range())
+    }
+
+    /// The shared body of [`Self::line`], taking the selection range as an
+    /// argument so [`Self::lines`] resolves it once per frame rather than once
+    /// per row — `to_range` re-walks the grid for semantic and line selections.
+    fn line_inner(
+        &self,
+        viewport_row: usize,
+        selection: Option<SelectionRange>,
+    ) -> Vec<CellSnapshot> {
         let offset = self.display_offset() as i32;
         let line = Line(viewport_row as i32 - offset);
         let grid = self.term.grid();
@@ -269,6 +352,8 @@ impl Emulator {
                     wide_spacer: cell
                         .flags
                         .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER),
+                    selected: selection
+                        .is_some_and(|range| range.contains(Point::new(line, Column(col)))),
                 }
             })
             .collect()
@@ -276,7 +361,10 @@ impl Emulator {
 
     /// All viewport rows, top to bottom.
     pub fn lines(&self) -> Vec<Vec<CellSnapshot>> {
-        (0..self.rows()).map(|r| self.line(r)).collect()
+        let selection = self.selection_range();
+        (0..self.rows())
+            .map(|r| self.line_inner(r, selection))
+            .collect()
     }
 
     /// Cursor in viewport coordinates; `None` when hidden or scrolled out.
@@ -531,6 +619,102 @@ mod tests {
         assert_eq!(line[2].ch, 'w');
         assert_eq!(e.row_text(0), "宽w");
         assert_eq!(e.cursor(), Some(CursorSnapshot { row: 0, col: 3 }));
+    }
+
+    /// Viewport row → grid line, which is the translation every selection
+    /// anchor goes through. Unscrolled they coincide; scrolled back, the same
+    /// viewport row names a line further up history.
+    #[test]
+    fn grid_point_offsets_by_the_scrollback_position() {
+        let mut e = emu(10, 3);
+        for i in 1..=8 {
+            e.feed(format!("line{i}\r\n").as_bytes());
+        }
+        assert_eq!(e.grid_point(0, 2), Point::new(Line(0), Column(2)));
+        e.scroll(4);
+        assert_eq!(e.grid_point(0, 2), Point::new(Line(-4), Column(2)));
+        // Columns clamp into the grid so an over-wide pointer cannot anchor
+        // outside it.
+        assert_eq!(e.grid_point(0, 99).column, Column(9));
+    }
+
+    #[test]
+    fn simple_selection_yields_its_text_and_marks_its_cells() {
+        let mut e = emu(20, 3);
+        e.feed(b"hello world");
+        assert!(!e.has_selection());
+        assert_eq!(e.selection_text(), None);
+
+        // Drag across "hello".
+        e.start_selection(SelectionType::Simple, e.grid_point(0, 0), Side::Left);
+        e.update_selection(e.grid_point(0, 4), Side::Right);
+        assert!(e.has_selection());
+        assert_eq!(e.selection_text().as_deref(), Some("hello"));
+
+        let line = e.line(0);
+        assert!(line[..5].iter().all(|c| c.selected));
+        assert!(!line[5].selected, "the space past the drag is not selected");
+
+        e.clear_selection();
+        assert!(!e.has_selection());
+        assert!(e.line(0).iter().all(|c| !c.selected));
+    }
+
+    /// Double-click granularity: the anchor expands to the whole word without
+    /// the caller computing any boundaries.
+    #[test]
+    fn semantic_selection_expands_to_the_word() {
+        let mut e = emu(30, 2);
+        e.feed(b"alpha beta gamma");
+        e.start_selection(SelectionType::Semantic, e.grid_point(0, 7), Side::Left);
+        assert_eq!(e.selection_text().as_deref(), Some("beta"));
+    }
+
+    /// Triple-click granularity. The trailing newline is part of the copy —
+    /// pasting a line-selection should reproduce the line break, the way it
+    /// does in every other terminal.
+    #[test]
+    fn line_selection_takes_the_whole_row() {
+        let mut e = emu(30, 3);
+        e.feed(b"first row\r\nsecond row");
+        e.start_selection(SelectionType::Lines, e.grid_point(1, 3), Side::Left);
+        assert_eq!(e.selection_text().as_deref(), Some("second row\n"));
+    }
+
+    /// A selection made across a line break keeps the newline, so pasting the
+    /// copy reproduces the rows.
+    #[test]
+    fn selection_spans_rows_with_a_newline() {
+        let mut e = emu(10, 3);
+        e.feed(b"ab\r\ncd");
+        e.start_selection(SelectionType::Simple, e.grid_point(0, 0), Side::Left);
+        e.update_selection(e.grid_point(1, 1), Side::Right);
+        assert_eq!(e.selection_text().as_deref(), Some("ab\ncd"));
+    }
+
+    /// The reason anchors live in grid space: output that scrolls the grid must
+    /// carry the selection with its text, not leave it pinned to a screen row.
+    #[test]
+    fn selection_follows_its_text_when_output_scrolls() {
+        let mut e = emu(10, 3);
+        e.feed(b"target\r\n");
+        e.start_selection(SelectionType::Simple, e.grid_point(0, 0), Side::Left);
+        e.update_selection(e.grid_point(0, 5), Side::Right);
+        assert_eq!(e.selection_text().as_deref(), Some("target"));
+        // Push it up the screen; the text is unchanged, so the copy is too.
+        e.feed(b"a\r\nb\r\nc\r\n");
+        assert_eq!(e.selection_text().as_deref(), Some("target"));
+    }
+
+    /// A click with no drag selects nothing, and must not report a selection —
+    /// otherwise the copy action fires on every bare click.
+    #[test]
+    fn a_click_without_a_drag_selects_nothing() {
+        let mut e = emu(20, 2);
+        e.feed(b"hello");
+        e.start_selection(SelectionType::Simple, e.grid_point(0, 2), Side::Left);
+        assert_eq!(e.selection_text(), None);
+        assert!(!e.has_selection());
     }
 
     #[test]
