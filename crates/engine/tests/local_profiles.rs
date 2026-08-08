@@ -1,7 +1,7 @@
 //! Integrated regressions for local-first profile privacy and lifecycle boundaries.
 
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Barrier, Mutex};
 
 use komet_engine::{
     AuthState, Engine, EngineConfig, EngineCore, EngineProfile, HarnessId, WorkspaceScope,
@@ -35,6 +35,51 @@ fn assemble(profile: EngineProfile) -> EngineCore {
 async fn shutdown(core: EngineCore) {
     core.shutdown().await;
     drop(core);
+}
+
+#[tokio::test]
+async fn concurrent_engine_info_and_runtime_share_one_device_identity() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = Arc::new(config(
+        dir.path(),
+        "http://127.0.0.1:1".into(),
+        Some("client_test"),
+        None,
+    ));
+    let workers = 32;
+    let barrier = Arc::new(Barrier::new(workers));
+    let calls = (0..workers)
+        .map(|_| {
+            let config = config.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                Engine::engine_info(&config, WorkspaceScope::Local)
+                    .expect("resolve concurrent engine info")
+                    .device_id
+            })
+        })
+        .collect::<Vec<_>>();
+    let announced = calls
+        .into_iter()
+        .map(|call| call.join().expect("engine-info worker"))
+        .collect::<std::collections::HashSet<_>>();
+
+    assert_eq!(announced.len(), 1, "every viewport announces one identity");
+    let announced = announced.into_iter().next().expect("announced id");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("device-id"))
+            .expect("persisted device id")
+            .trim(),
+        announced
+    );
+
+    let core = assemble(EngineProfile::local(dir.path()).expect("local profile"));
+    assert_eq!(
+        core.device_id, announced,
+        "the assembled runtime must use the identity already announced"
+    );
+    shutdown(core).await;
 }
 
 #[tokio::test]

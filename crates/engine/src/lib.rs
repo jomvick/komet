@@ -5,6 +5,7 @@
 //! sessions + docs + commands + minimal IPC. Terminals, repos/diffs, uploads, auth,
 //! agent accounts, and the device-room host land in later milestones.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -804,13 +805,58 @@ fn env_or(key: &str, default: &str) -> String {
 
 /// Stable per-installation device id, persisted at `{data_dir}/device-id`.
 fn load_or_create_device_id(data_dir: &Path) -> Result<String, EngineError> {
+    std::fs::create_dir_all(data_dir)?;
     let path = data_dir.join("device-id");
     match std::fs::read_to_string(&path) {
-        Ok(id) if !id.trim().is_empty() => Ok(id.trim().to_string()),
-        Ok(_) | Err(_) => {
-            let id = new_id();
-            std::fs::write(&path, &id)?;
-            Ok(id)
+        Ok(id) if !id.trim().is_empty() => return Ok(id.trim().to_string()),
+        Ok(_) => {
+            return Err(EngineError::Other(format!(
+                "invalid device identity {}: file is empty",
+                path.display()
+            )));
         }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
+    }
+
+    let id = new_id();
+    let temp_path = data_dir.join(format!(
+        ".device-id.tmp-{}-{}",
+        std::process::id(),
+        new_id()
+    ));
+    let write_result = (|| -> Result<(), EngineError> {
+        let mut temp = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)?;
+        temp.write_all(id.as_bytes())?;
+        temp.sync_all()?;
+        Ok(())
+    })();
+    if let Err(err) = write_result {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(err);
+    }
+
+    // Publish only fully-written bytes and never replace another process's
+    // winner. A hard link is the portable create-if-absent primitive already
+    // used for local-profile identity; losers can immediately read the winner.
+    let publish_result = std::fs::hard_link(&temp_path, &path);
+    let _ = std::fs::remove_file(&temp_path);
+    match publish_result {
+        Ok(()) => Ok(id),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            let winner = std::fs::read_to_string(&path)?;
+            if winner.trim().is_empty() {
+                Err(EngineError::Other(format!(
+                    "invalid device identity {}: file is empty",
+                    path.display()
+                )))
+            } else {
+                Ok(winner.trim().to_string())
+            }
+        }
+        Err(err) => Err(err.into()),
     }
 }
