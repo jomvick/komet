@@ -67,12 +67,17 @@ pub struct Uploads {
 }
 
 impl Uploads {
+    /// Use the historical device-global uploads directory.
     pub fn new(data_dir: &Path, edge: Option<EdgeConfig>) -> Self {
-        let dir = data_dir.join("uploads");
+        Self::from_root(&data_dir.join("uploads"), edge)
+    }
+
+    /// Use an already-resolved profile uploads directory.
+    pub fn from_root(dir: &Path, edge: Option<EdgeConfig>) -> Self {
         Self {
             inner: Arc::new(UploadsInner {
                 tmp: dir.join("tmp"),
-                dir,
+                dir: dir.to_path_buf(),
                 edge,
                 http: reqwest::Client::builder()
                     .timeout(Duration::from_secs(30))
