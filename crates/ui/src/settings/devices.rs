@@ -9,6 +9,7 @@ use gpui::{
 };
 use std::time::Duration;
 
+use komet_proto::WorkspaceScope;
 use komet_rpc::methods;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
@@ -40,6 +41,16 @@ pub fn format_last_seen(last_seen: Option<DateTime<Utc>>, now: DateTime<Utc>) ->
         format!("{}h ago", secs / 3600)
     } else {
         format!("{}d ago", secs / 86_400)
+    }
+}
+
+/// Scope-aware copy: a local registry describes only the active local
+/// workspace and must not imply that account device metadata is already live.
+pub fn devices_subtitle(scope: Option<WorkspaceScope>) -> &'static str {
+    match scope {
+        Some(WorkspaceScope::Local) => "Manage device details stored in this local workspace.",
+        Some(WorkspaceScope::Synced) => "Manage device names and inspect synced device metadata.",
+        Some(WorkspaceScope::Development) | None => "Manage device names for this workspace.",
     }
 }
 
@@ -204,9 +215,13 @@ impl Render for DevicesPage {
         use crate::settings::widgets;
         let theme = Theme::of(cx).clone();
         let now = Utc::now();
-        let (devices, local_id) = {
+        let (devices, local_id, workspace_scope) = {
             let state = self.state.read(cx);
-            (state.devices.clone(), state.local_device_id.clone())
+            (
+                state.devices.clone(),
+                state.local_device_id.clone(),
+                state.workspace_scope,
+            )
         };
         let copied = self.copied.clone();
         let dialog = self.render_rename_dialog(window.viewport_size(), cx);
@@ -382,7 +397,7 @@ impl Render for DevicesPage {
                     ))
                     .child(widgets::page_subtitle(
                         &theme,
-                        "Manage device names and inspect synced device metadata.",
+                        devices_subtitle(workspace_scope),
                     ))
                     .when_some(self.error.clone(), |el, message| {
                         el.child(
@@ -437,5 +452,12 @@ mod tests {
             format_last_seen(Some(now - TimeDelta::days(2)), now),
             "2d ago"
         );
+    }
+
+    #[test]
+    fn local_subtitle_does_not_claim_synced_metadata() {
+        let copy = devices_subtitle(Some(WorkspaceScope::Local));
+        assert!(copy.contains("local workspace"));
+        assert!(!copy.contains("synced"));
     }
 }

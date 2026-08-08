@@ -431,6 +431,9 @@ pub const PENDING_SEND_TTL_MS: i64 = 30_000;
 /// glue ([`Self::bootstrap`], [`Self::select_chat`]) layers subscriptions on top.
 pub struct AppState {
     pub connection: ConnectionStatus,
+    /// Fixed data boundary of the attached engine. Authentication may change
+    /// in place, but changing this scope requires assembling a new runtime.
+    pub workspace_scope: Option<WorkspaceScope>,
     /// Auth stream value; `None` until the engine reports one (M4).
     pub auth: Option<AuthState>,
     pub devices: Vec<Device>,
@@ -476,6 +479,7 @@ impl AppState {
     pub fn new() -> Self {
         Self {
             connection: ConnectionStatus::Connecting,
+            workspace_scope: None,
             auth: None,
             devices: Vec::new(),
             spaces: Vec::new(),
@@ -774,7 +778,7 @@ impl AppState {
     }
 
     pub fn gate(&self) -> GatePhase {
-        gate_phase(&self.connection, self.auth.as_ref())
+        gate_phase(&self.connection, self.workspace_scope, self.auth.as_ref())
     }
 
     pub fn engine(&self) -> Option<&EngineHandle> {
@@ -789,6 +793,8 @@ impl AppState {
         let data_dir = config.data_dir.clone();
         state.update(cx, |s, cx| {
             s.connection = ConnectionStatus::Connecting;
+            s.workspace_scope = None;
+            s.auth = None;
             s.data_dir = Some(data_dir);
             cx.notify();
         });
@@ -818,7 +824,9 @@ impl AppState {
     /// Methods the engine doesn't serve yet (chats/devices/auth land with the
     /// workspace doc in M4) fail their subscribe and are skipped gracefully.
     fn attach_engine(&mut self, handle: EngineHandle, cx: &mut Context<Self>) {
-        self.connection = ConnectionStatus::Ready;
+        let engine_info = handle.engine_info();
+        self.workspace_scope = Some(engine_info.workspace_scope);
+        self.local_device_id = Some(engine_info.device_id.clone());
         self.engine = Some(handle.clone());
         self.watch_tasks = vec![
             spawn_watch(
@@ -855,6 +863,9 @@ impl AppState {
             ),
             spawn_local_device_probe(cx, handle.clone()),
         ];
+        // EngineInfo is part of the attachment boundary: views must know which
+        // data profile they reached before they are allowed to render Ready.
+        self.connection = ConnectionStatus::Ready;
         // Re-subscribe the transcript if a chat was already selected (reconnect path).
         if let Some(chat_id) = self.selected_chat.clone() {
             self.transcript_task = Some(spawn_transcript_watch(cx, handle, chat_id));
@@ -1175,6 +1186,14 @@ mod tests {
 
         assert_eq!(info.device_id, "legacy-device");
         assert_eq!(info.workspace_scope, WorkspaceScope::Synced);
+        assert_eq!(
+            gate_phase(
+                &ConnectionStatus::Ready,
+                Some(info.workspace_scope),
+                Some(&AuthState::SignedOut),
+            ),
+            GatePhase::SignIn
+        );
     }
 
     #[tokio::test]
@@ -1832,22 +1851,33 @@ mod tests {
             name: None,
         };
         assert_eq!(
-            gate_phase(&ConnectionStatus::Connecting, None),
+            gate_phase(&ConnectionStatus::Connecting, None, None),
             GatePhase::Loading
         );
         assert_eq!(
-            gate_phase(&ConnectionStatus::Failed("boom".into()), None),
+            gate_phase(&ConnectionStatus::Failed("boom".into()), None, None),
             GatePhase::Failed("boom".into())
         );
-        // Unknown auth (pre-M4) gates nothing.
-        assert_eq!(gate_phase(&ConnectionStatus::Ready, None), GatePhase::Ready);
         assert_eq!(
-            gate_phase(&ConnectionStatus::Ready, Some(&AuthState::SignedOut)),
+            gate_phase(
+                &ConnectionStatus::Ready,
+                Some(WorkspaceScope::Local),
+                Some(&AuthState::SignedOut),
+            ),
+            GatePhase::Ready
+        );
+        assert_eq!(
+            gate_phase(
+                &ConnectionStatus::Ready,
+                Some(WorkspaceScope::Synced),
+                Some(&AuthState::SignedOut),
+            ),
             GatePhase::SignIn
         );
         assert_eq!(
             gate_phase(
                 &ConnectionStatus::Ready,
+                Some(WorkspaceScope::Synced),
                 Some(&AuthState::SignedIn {
                     user: user.clone(),
                     org_id: None
@@ -1859,10 +1889,39 @@ mod tests {
         assert_eq!(
             gate_phase(
                 &ConnectionStatus::Ready,
+                Some(WorkspaceScope::Synced),
                 Some(&AuthState::NeedsOrganization { user })
             ),
             GatePhase::OrgGate
         );
+    }
+
+    #[test]
+    fn auth_changes_do_not_change_a_local_runtime_scope_or_watches() {
+        let mut state = AppState::new();
+        state.workspace_scope = Some(WorkspaceScope::Local);
+        state.watch_tasks.push(Task::ready(()));
+
+        state.apply_auth(AuthState::NeedsOrganization {
+            user: UserProfile {
+                id: "u".into(),
+                email: "w@example.com".into(),
+                name: None,
+            },
+        });
+        assert_eq!(state.workspace_scope, Some(WorkspaceScope::Local));
+        assert_eq!(state.watch_tasks.len(), 1);
+
+        state.apply_auth(AuthState::SignedIn {
+            user: UserProfile {
+                id: "u".into(),
+                email: "w@example.com".into(),
+                name: None,
+            },
+            org_id: Some("org-1".into()),
+        });
+        assert_eq!(state.workspace_scope, Some(WorkspaceScope::Local));
+        assert_eq!(state.watch_tasks.len(), 1);
     }
 
     #[test]
