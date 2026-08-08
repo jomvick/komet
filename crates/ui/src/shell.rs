@@ -490,6 +490,7 @@ fn sync_flow_after_auth(
             // AuthStatus belongs to the runtime, not to the Shell that opened
             // the browser. Every attached viewport must advertise the pending
             // profile switch once any of them completes sign-in.
+            (SyncFlow::RestartPending { .. }, Some(AuthState::SignedOut)) => SyncFlow::Idle,
             (SyncFlow::Canceling, Some(AuthState::SignedIn { .. })) => flow,
             (SyncFlow::RestartPending { .. }, Some(AuthState::SignedIn { .. })) => flow,
             (_, Some(AuthState::SignedIn { .. })) => SyncFlow::RestartPending { notice_open: true },
@@ -4810,6 +4811,17 @@ mod tests {
             ),
             Some(AccountMenuAction::RestartPending)
         );
+        for notice_open in [true, false] {
+            assert_eq!(
+                sync_flow_after_auth(
+                    SyncFlow::RestartPending { notice_open },
+                    Some(WorkspaceScope::Local),
+                    Some(&AuthState::SignedOut),
+                ),
+                SyncFlow::Idle,
+                "revoked credentials cancel the pending synced restart"
+            );
+        }
     }
 
     #[test]
