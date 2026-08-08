@@ -25,7 +25,10 @@ use gpui::{
 use unicode_segmentation::UnicodeSegmentation;
 
 use komet_doc::{MessagePart, MessageRole, SessionCommandPayload, SessionMessageEntry};
-use komet_proto::{FileSearchMatch, RunRequest, SandboxLevel, UserInputAnswer, UserInputQuestion};
+use komet_proto::{
+    FileSearchMatch, HarnessId, RunRequest, SandboxLevel, SlashCommand, UserInputAnswer,
+    UserInputQuestion,
+};
 use komet_rpc::{RpcError, methods};
 
 use crate::attachments::{self, StagedAttachment};
@@ -1433,6 +1436,36 @@ impl ComposerInput {
             path
         } else {
             format!("{path} ")
+        };
+        self.record_edit(&range, &inserted);
+        self.content =
+            self.content[..range.start].to_owned() + &inserted + &self.content[range.end..];
+        self.refresh_projection();
+        let cursor =
+            range.start + inserted.len() + existing_separator.map(char::len_utf8).unwrap_or(0);
+        self.selected_range = cursor..cursor;
+        self.selection_reversed = false;
+        self.follow_cursor = true;
+        self.reset_blink();
+        cx.emit(ComposerInputEvent::Edited);
+        cx.notify();
+    }
+
+    /// Replace a completed plain-text token (slash commands) as one
+    /// non-coalescing undo step. Unlike [`Self::replace_mention`], the
+    /// replacement is ordinary text — no link, no chip projection.
+    pub fn replace_plain_token(
+        &mut self,
+        range: Range<usize>,
+        replacement: &str,
+        cx: &mut Context<Self>,
+    ) {
+        let next = self.content[range.end..].chars().next();
+        let existing_separator = next.filter(|ch| ch.is_whitespace() && *ch != '\n' && *ch != '\r');
+        let inserted = if existing_separator.is_some() {
+            replacement.to_owned()
+        } else {
+            format!("{replacement} ")
         };
         self.record_edit(&range, &inserted);
         self.content =
@@ -3096,6 +3129,48 @@ fn mention_token(text: &str, cursor: usize) -> Option<MentionToken> {
     })
 }
 
+/// The `/` must open the input: slash commands are whole-prompt prefixes
+/// (`/compact`, `/goal ship it`), so only the first token triggers, and a
+/// query containing another `/` (a typed path) never does.
+fn slash_token(text: &str, cursor: usize) -> Option<MentionToken> {
+    if cursor > text.len() || !text.is_char_boundary(cursor) || !text.starts_with('/') {
+        return None;
+    }
+    let end = text
+        .char_indices()
+        .find_map(|(at, ch)| ch.is_whitespace().then_some(at))
+        .unwrap_or(text.len());
+    // Cursor outside the command token (typing the argument): popup closed.
+    if cursor == 0 || cursor > end {
+        return None;
+    }
+    let query = &text[1..cursor];
+    if query.contains('/') {
+        return None;
+    }
+    Some(MentionToken {
+        range: 0..end,
+        query: query.to_string(),
+    })
+}
+
+/// Slash-command completion state: like [`FileMentionState`] but the
+/// candidate list is fetched once per harness (`ListCommands`) and filtered
+/// locally per keystroke — no RPC, debounce, or skeleton churn while typing.
+#[derive(Debug, Clone, Default)]
+struct SlashState {
+    token: Option<MentionToken>,
+    /// Indices into the cached command list, filter-ranked for the query.
+    filtered: Vec<usize>,
+    active: Option<usize>,
+    /// Harness the popup is showing commands for (cache key).
+    harness: Option<HarnessId>,
+    request: u64,
+    loading: bool,
+    error: Option<SharedString>,
+    dismissed: Option<(Range<usize>, String)>,
+}
+
 #[derive(Debug, Clone, Default)]
 struct FileMentionState {
     token: Option<MentionToken>,
@@ -3131,6 +3206,19 @@ fn mention_error_message(err: &RpcError) -> SharedString {
     }
 }
 
+/// A failed command discovery, translated for the popup.
+fn slash_error_message(err: &RpcError) -> SharedString {
+    match err {
+        RpcError::UnknownMethod(_) => {
+            "The session's device runs an older komet — update it to list commands".into()
+        }
+        RpcError::Transport(_) | RpcError::Closed => "The session's device is unreachable".into(),
+        RpcError::BadParams(_) | RpcError::Failed(_) => {
+            "Couldn't load this agent's commands".into()
+        }
+    }
+}
+
 pub struct Composer {
     state: Entity<AppState>,
     input: Entity<ComposerInput>,
@@ -3147,6 +3235,11 @@ pub struct Composer {
     picker_task: Option<Task<()>>,
     mention_task: Option<Task<()>>,
     mention: FileMentionState,
+    slash_task: Option<Task<()>>,
+    slash: SlashState,
+    /// Advertised commands per harness (one `ListCommands` per harness per
+    /// composer lifetime; the engine caches discovery on its side too).
+    slash_cache: HashMap<HarnessId, Vec<SlashCommand>>,
     current_key: String,
     sending: bool,
     failure: Option<SharedString>,
@@ -3212,9 +3305,30 @@ impl Composer {
                 this.on_input_edited(cx)
             }
             ComposerInputEvent::ViewportChanged => cx.notify(),
-            ComposerInputEvent::MentionNavigate(delta) => this.move_mention(*delta, cx),
-            ComposerInputEvent::MentionAccept => this.accept_mention(cx),
-            ComposerInputEvent::MentionDismiss => this.dismiss_mention(cx),
+            // The slash popup and the mention popup share the input's
+            // completion key routing; they are mutually exclusive by token
+            // shape (`/` at offset 0 vs `@` at a token boundary).
+            ComposerInputEvent::MentionNavigate(delta) => {
+                if this.slash.token.is_some() {
+                    this.move_slash(*delta, cx)
+                } else {
+                    this.move_mention(*delta, cx)
+                }
+            }
+            ComposerInputEvent::MentionAccept => {
+                if this.slash.token.is_some() {
+                    this.accept_slash(cx)
+                } else {
+                    this.accept_mention(cx)
+                }
+            }
+            ComposerInputEvent::MentionDismiss => {
+                if this.slash.token.is_some() {
+                    this.dismiss_slash(cx)
+                } else {
+                    this.dismiss_mention(cx)
+                }
+            }
             ComposerInputEvent::PastedImages(images) => {
                 let staged = images
                     .iter()
@@ -3235,6 +3349,9 @@ impl Composer {
             picker_task: None,
             mention_task: None,
             mention: FileMentionState::default(),
+            slash_task: None,
+            slash: SlashState::default(),
+            slash_cache: HashMap::new(),
             current_key,
             sending: false,
             failure: None,
@@ -3455,8 +3572,12 @@ impl Composer {
     }
 
     fn sync_mention_controls(&mut self, cx: &mut Context<Self>) {
-        let open = self.mention.token.is_some();
-        let has_selection = self.mention.active.is_some();
+        let open = self.mention.token.is_some() || self.slash.token.is_some();
+        let has_selection = if self.slash.token.is_some() {
+            self.slash.active.is_some()
+        } else {
+            self.mention.active.is_some()
+        };
         self.input.update(cx, |input, cx| {
             input.set_mention_controls(open, has_selection, cx)
         });
@@ -3481,12 +3602,16 @@ impl Composer {
             if self.mention.token.is_some() || self.mention_task.is_some() {
                 self.reset_mention(None, cx);
             }
+            if self.slash.token.is_some() || self.slash_task.is_some() {
+                self.reset_slash(None, cx);
+            }
             return;
         }
         let (text, cursor) = {
             let input = self.input.read(cx);
             (input.text().to_string(), input.cursor_offset())
         };
+        self.update_slash(&text, cursor, cx);
         let token = mention_token(&text, cursor);
         let still_dismissed = token.as_ref().is_some_and(|token| {
             self.mention
@@ -3755,6 +3880,288 @@ impl Composer {
             .relative()
             .child(self.input.clone())
             .children(self.render_file_mention_popup(theme, cx))
+            .children(self.render_slash_popup(theme, cx))
+    }
+
+    // ---- slash commands ---------------------------------------------------
+
+    /// Track the `/` token on every edit: open/refresh the popup, fetch the
+    /// harness's command list on first open, filter locally per keystroke.
+    fn update_slash(&mut self, text: &str, cursor: usize, cx: &mut Context<Self>) {
+        let token = slash_token(text, cursor);
+        let still_dismissed = token.as_ref().is_some_and(|token| {
+            self.slash.dismissed.as_ref().is_some_and(|(range, value)| {
+                token.range == *range && text.get(range.clone()) == Some(value.as_str())
+            })
+        });
+        if still_dismissed {
+            self.slash.token = None;
+            self.sync_mention_controls(cx);
+            return;
+        }
+        self.slash.dismissed = None;
+        let harness = self.pickers.read(cx).resolved(cx).harness;
+        let harness_changed = self.slash.harness != harness;
+        if token == self.slash.token && !harness_changed {
+            self.refilter_slash(cx);
+            return;
+        }
+        self.slash.token = token.clone();
+        self.slash.harness = harness;
+        self.slash.error = None;
+        if token.is_none() {
+            self.slash.active = None;
+            self.sync_mention_controls(cx);
+            return;
+        }
+        // No resolved harness (catalog still loading): empty popup, no fetch.
+        let Some(harness) = harness else {
+            self.slash.loading = false;
+            self.refilter_slash(cx);
+            return;
+        };
+        if self.slash_cache.contains_key(&harness) {
+            self.slash.loading = false;
+            self.refilter_slash(cx);
+            return;
+        }
+        // First open for this harness: one ListCommands, targeted like file
+        // search (the chat/space host device owns the agent binary).
+        self.slash.request = self.slash.request.wrapping_add(1);
+        self.slash.loading = true;
+        self.refilter_slash(cx);
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.slash.loading = false;
+            return;
+        };
+        let target = {
+            let state = self.state.read(cx);
+            state
+                .selected_chat_row()
+                .map(|chat| chat.device_id.clone())
+                .or_else(|| state.selected_space_row().map(|s| s.device_id.clone()))
+        };
+        let request = self.slash.request;
+        self.slash_task = Some(cx.spawn(async move |this, cx| {
+            let mut params = serde_json::json!({ "harness": harness });
+            if let (Some(target), Some(object)) = (&target, params.as_object_mut()) {
+                object.insert("targetDeviceId".into(), target.clone().into());
+            }
+            let result = engine.client().call(methods::LIST_COMMANDS, params).await;
+            this.update(cx, |composer, cx| {
+                if composer.slash.request != request {
+                    return;
+                }
+                composer.slash.loading = false;
+                match result {
+                    Ok(value) => match serde_json::from_value::<Vec<SlashCommand>>(value) {
+                        Ok(commands) => {
+                            composer.slash_cache.insert(harness, commands);
+                        }
+                        Err(err) => tracing::warn!(%err, "slash command decode failed"),
+                    },
+                    Err(err) => {
+                        tracing::debug!(%err, "slash command discovery failed");
+                        composer.slash.error = Some(slash_error_message(&err));
+                    }
+                }
+                composer.refilter_slash(cx);
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    /// Re-rank the cached list for the current query (pure local filter).
+    fn refilter_slash(&mut self, cx: &mut Context<Self>) {
+        let query = self
+            .slash
+            .token
+            .as_ref()
+            .map(|t| t.query.clone())
+            .unwrap_or_default();
+        let commands = self
+            .slash
+            .harness
+            .and_then(|h| self.slash_cache.get(&h))
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let names: Vec<&str> = commands.iter().map(|c| c.name.as_str()).collect();
+        self.slash.filtered = crate::popover::filter_indices(&query, &names);
+        self.slash.active = (!self.slash.filtered.is_empty()).then_some(0);
+        self.sync_mention_controls(cx);
+        cx.notify();
+    }
+
+    fn move_slash(&mut self, delta: isize, cx: &mut Context<Self>) {
+        self.slash.active =
+            crate::popover::menu_step(self.slash.active, self.slash.filtered.len(), delta);
+        self.sync_mention_controls(cx);
+        cx.notify();
+    }
+
+    fn dismiss_slash(&mut self, cx: &mut Context<Self>) {
+        let dismissed = self.slash.token.as_ref().and_then(|token| {
+            self.input
+                .read(cx)
+                .text()
+                .get(token.range.clone())
+                .map(|text| (token.range.clone(), text.to_string()))
+        });
+        self.reset_slash(dismissed, cx);
+        cx.notify();
+    }
+
+    fn accept_slash(&mut self, cx: &mut Context<Self>) {
+        let Some(token) = self.slash.token.clone() else {
+            return;
+        };
+        let Some(command) = self
+            .slash
+            .active
+            .and_then(|active| self.slash.filtered.get(active))
+            .and_then(|&ix| {
+                self.slash
+                    .harness
+                    .and_then(|h| self.slash_cache.get(&h))
+                    .and_then(|c| c.get(ix))
+            })
+            .cloned()
+        else {
+            return;
+        };
+        self.input.update(cx, |input, cx| {
+            input.replace_plain_token(token.range, &format!("/{}", command.name), cx)
+        });
+        self.reset_slash(None, cx);
+        cx.notify();
+    }
+
+    /// Tear down the slash completion (mirrors [`Self::reset_mention`]).
+    fn reset_slash(&mut self, dismissed: Option<(Range<usize>, String)>, cx: &mut Context<Self>) {
+        let request = self.slash.request.wrapping_add(1);
+        self.slash_task = None;
+        self.slash = SlashState {
+            request,
+            dismissed,
+            harness: self.slash.harness,
+            ..SlashState::default()
+        };
+        self.sync_mention_controls(cx);
+    }
+
+    fn render_slash_popup(
+        &self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let token = self.slash.token.as_ref()?;
+        let commands = self
+            .slash
+            .harness
+            .and_then(|h| self.slash_cache.get(&h))
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let mut card = crate::popover::popover_card(theme)
+            .w(px(380.0))
+            .max_h(px(280.0))
+            .overflow_hidden()
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.dismiss_slash(cx)));
+        if self.slash.loading && commands.is_empty() {
+            card = card.child(crate::popover::skeleton_rows(
+                "slash-loading",
+                theme,
+                3,
+                cx.entity_id(),
+                cx,
+            ));
+        } else if let Some(error) = self.slash.error.clone() {
+            card = card.child(
+                div()
+                    .px(px(12.0))
+                    .py(px(10.0))
+                    .text_size(px(12.0))
+                    .text_color(theme.danger_muted)
+                    .child(error),
+            );
+        } else if self.slash.filtered.is_empty() {
+            card = card.child(
+                div()
+                    .px(px(12.0))
+                    .py(px(10.0))
+                    .text_size(px(12.0))
+                    .text_color(theme.text_muted)
+                    .child(if commands.is_empty() {
+                        "This agent has no slash commands"
+                    } else {
+                        "No matching commands"
+                    }),
+            );
+        } else {
+            for (row_ix, &cmd_ix) in self.slash.filtered.iter().enumerate() {
+                let Some(command) = commands.get(cmd_ix) else {
+                    continue;
+                };
+                let selected = self.slash.active == Some(row_ix);
+                let name: SharedString = format!("/{}", command.name).into();
+                let mut description = command.description.clone();
+                if let Some(hint) = &command.input_hint {
+                    if description.is_empty() {
+                        description = format!("<{hint}>");
+                    } else {
+                        description = format!("{description} · <{hint}>");
+                    }
+                }
+                let description: SharedString = description.into();
+                card = card.child(
+                    crate::popover::menu_row(theme, selected, format!("slash-result-{row_ix}"))
+                        .id(("slash-result", row_ix))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.slash.active = Some(row_ix);
+                            this.accept_slash(cx);
+                        }))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(8.0))
+                                .child(
+                                    crate::icons::icon(crate::icons::COMMAND)
+                                        .size(px(14.0))
+                                        .text_color(theme.text_muted),
+                                )
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .text_size(px(12.5))
+                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                        .text_color(theme.text)
+                                        .child(name),
+                                )
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .overflow_hidden()
+                                        .truncate()
+                                        .text_size(px(12.0))
+                                        .text_color(theme.text_muted)
+                                        .child(description),
+                                ),
+                        ),
+                );
+            }
+        }
+        let anchor = self
+            .input
+            .read(cx)
+            .visible_point_for_index(token.range.start)?;
+        Some(crate::popover::anchored_menu_above_at(
+            "slash-popup",
+            anchor,
+            card.into_any_element(),
+        ))
     }
 
     fn on_state_changed(&mut self, cx: &mut Context<Self>) {
@@ -4653,6 +5060,11 @@ impl Render for Composer {
         {
             self.reset_mention(None, cx);
         }
+        if self.slash.token.is_some()
+            && (wizard_active || !self.input.focus_handle(cx).is_focused(window))
+        {
+            self.reset_slash(None, cx);
+        }
         let mode = self.button_mode(cx);
         let (text_width, has_newline, content_height, last_width, epoch) = {
             let input = self.input.read(cx);
@@ -5149,6 +5561,34 @@ mod tests {
             mention_token("See (@lib", 9).map(|token| token.range),
             Some(5..9)
         );
+    }
+
+    #[test]
+    fn slash_token_only_opens_the_prompt() {
+        assert_eq!(
+            slash_token("/comp", 5),
+            Some(MentionToken {
+                range: 0..5,
+                query: "comp".into(),
+            })
+        );
+        // Token range spans the whole command word even mid-cursor.
+        assert_eq!(
+            slash_token("/compact now", 3),
+            Some(MentionToken {
+                range: 0..8,
+                query: "co".into(),
+            })
+        );
+        // Not at offset 0 → prose, not a command.
+        assert!(slash_token("run /compact", 12).is_none());
+        // Cursor past the command word (typing the argument) → closed.
+        assert!(slash_token("/goal ship it", 10).is_none());
+        // A typed absolute path is not a command.
+        assert!(slash_token("/usr/bin", 8).is_none());
+        // Bare "/" with cursor at 0 → closed; cursor after it → open-all.
+        assert!(slash_token("/", 0).is_none());
+        assert_eq!(slash_token("/", 1).map(|t| t.query), Some(String::new()));
     }
 
     #[test]

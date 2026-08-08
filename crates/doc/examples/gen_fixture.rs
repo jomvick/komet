@@ -52,6 +52,8 @@ fn main() {
         &AgentEvent::ToolResult {
             id: "tool-1".into(),
             is_error: false,
+            output: None,
+            diff: None,
         },
     );
     fold_event_into_parts(

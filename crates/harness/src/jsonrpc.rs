@@ -1,5 +1,7 @@
-//! Minimal JSON-RPC 2.0 client over the app server's stdio (newline-delimited
-//! frames, id-multiplexed), ported from codex.ts's `startAppServer`.
+//! Minimal JSON-RPC 2.0 client over a child agent's stdio (newline-delimited
+//! frames, id-multiplexed), ported from codex.ts's `startAppServer`. Shared by
+//! the Codex app-server harness and the ACP harness — both protocols are
+//! newline-framed JSON-RPC 2.0 over stdio.
 //!
 //! - Responses are matched to callers by numeric id (a shared pending map the
 //!   reader task resolves directly, so requests can be awaited from anywhere —
@@ -124,7 +126,7 @@ async fn write_loop(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<Strin
             stdin.flush().await
         };
         if let Err(e) = write.await {
-            tracing::debug!(target: "komet_harness::codex", "stdin write failed (tolerated): {e}");
+            tracing::debug!(target: "komet_harness::rpc", "stdin write failed (tolerated): {e}");
             return;
         }
     }
@@ -143,7 +145,7 @@ async fn read_loop(stdout: ChildStdout, pending: Pending, tx: mpsc::Sender<Incom
             continue;
         }
         let Ok(msg) = serde_json::from_str::<Value>(line) else {
-            tracing::debug!(target: "komet_harness::codex", "non-JSON stdout line (skipped)");
+            tracing::debug!(target: "komet_harness::rpc", "non-JSON stdout line (skipped)");
             continue;
         };
         let method = msg.get("method").and_then(Value::as_str);

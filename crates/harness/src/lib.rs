@@ -14,8 +14,8 @@ use tokio::sync::{mpsc, oneshot};
 pub use tokio_util::sync::CancellationToken;
 
 use komet_proto::{
-    AgentEvent, HarnessId, Model, ReasoningLevel, RunRequest, SteeringMode, UserInputAnswer,
-    UserInputQuestion,
+    AgentEvent, HarnessId, Model, ReasoningLevel, RunRequest, SlashCommand, SteeringMode,
+    UserInputAnswer, UserInputQuestion,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -56,6 +56,11 @@ pub trait Harness: Send + Sync {
     fn steering_mode(&self) -> SteeringMode;
     fn reasoning_levels(&self) -> &[ReasoningLevel];
     async fn models(&self) -> Result<Vec<Model>, HarnessError>;
+    /// Slash commands the agent advertises (ACP `availableCommands`); empty
+    /// for harnesses without them. May spawn a short-lived discovery process.
+    async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
+        Ok(Vec::new())
+    }
     /// Run one (persistent) session; the stream ends with `AgentEvent::Done`.
     async fn run(
         &self,
@@ -64,8 +69,10 @@ pub trait Harness: Send + Sync {
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError>;
 }
 
+pub mod acp;
 pub mod claude;
 pub mod codex;
+pub(crate) mod jsonrpc;
 pub mod mock;
 pub mod shell_env;
 
@@ -206,5 +213,52 @@ pub(crate) fn crash_message(
     }
 }
 
+pub use acp::AcpHarness;
 pub use claude::ClaudeHarness;
 pub use codex::CodexHarness;
+
+// ---------------------------------------------------------------------------
+// Child lifecycle (shared by the codex and ACP harnesses)
+// ---------------------------------------------------------------------------
+
+/// Reap the child: graceful SIGTERM first, SIGKILL after `kill_grace`.
+/// (`kill_on_drop` remains the last-resort backstop.)
+pub(crate) async fn shutdown_child(
+    child: &mut tokio::process::Child,
+    kill_grace: std::time::Duration,
+) {
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return;
+    }
+    if let Some(pid) = child.id() {
+        send_signal(pid, Signal::Term);
+        if tokio::time::timeout(kill_grace, child.wait()).await.is_ok() {
+            return;
+        }
+    }
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum Signal {
+    Term,
+    Kill,
+}
+
+#[cfg(unix)]
+pub(crate) fn send_signal(pid: u32, signal: Signal) {
+    let sig = match signal {
+        Signal::Term => libc::SIGTERM,
+        Signal::Kill => libc::SIGKILL,
+    };
+    // SAFETY: plain kill(2) on a pid we spawned and have not yet reaped.
+    unsafe {
+        libc::kill(pid as libc::pid_t, sig);
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn send_signal(_pid: u32, _signal: Signal) {
+    // No SIGTERM off unix; `start_kill`/`kill_on_drop` handle termination.
+}

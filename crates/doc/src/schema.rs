@@ -71,6 +71,12 @@ struct DocPartJson {
     resolved: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     message: Option<String>,
+    /// Capped tool output (additive — absent on old rows and old writers).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    output: Option<String>,
+    /// Capped inline tool diff (additive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    diff: Option<serde_json::Value>,
 }
 
 /// App parts → doc part json (mirror of `toDocParts`).
@@ -87,6 +93,8 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             call,
             is_error,
             resolved,
+            output,
+            diff,
         } => DocPartJson {
             id: id.clone(),
             kind: "tool".into(),
@@ -94,6 +102,8 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             // TS shape parity: `isError` is written only once the tool result arrived;
             // its presence IS the resolution marker.
             is_error: if *resolved { Some(*is_error) } else { None },
+            output: output.clone(),
+            diff: diff.as_ref().map(serde_json::to_value).transpose()?,
             ..Default::default()
         },
         MessagePart::Input {
@@ -126,6 +136,8 @@ fn from_doc_part(p: DocPartJson) -> MessagePart {
                 call,
                 is_error: p.is_error.unwrap_or(false),
                 resolved: p.is_error.is_some(),
+                output: p.output,
+                diff: p.diff.and_then(|d| serde_json::from_value(d).ok()),
             },
             None => MessagePart::Text {
                 id: p.id,
@@ -506,6 +518,12 @@ fn push_part(parts: &LoroList, part: &MessagePart) -> Result<(), DocError> {
     if let Some(message) = &doc_part.message {
         map.insert("message", message.as_str())?;
     }
+    if let Some(output) = &doc_part.output {
+        map.insert("output", output.as_str())?;
+    }
+    if let Some(diff) = &doc_part.diff {
+        map.insert("diff", loro_value_from_json(diff))?;
+    }
     Ok(())
 }
 
@@ -725,6 +743,12 @@ fn update_part_fields(map: &LoroMap, part: &MessagePart) -> Result<(), DocError>
     if let Some(message) = &doc_part.message {
         map.insert("message", message.as_str())?;
     }
+    if let Some(output) = &doc_part.output {
+        map.insert("output", output.as_str())?;
+    }
+    if let Some(diff) = &doc_part.diff {
+        map.insert("diff", loro_value_from_json(diff))?;
+    }
     if let Some(text) = &doc_part.text {
         // Defensive path only — the fold never rewrites earlier text.
         if let Some(loro::ValueOrContainer::Container(loro::Container::Text(t))) = map.get("text") {
@@ -907,6 +931,8 @@ mod tests {
             &AgentEvent::ToolResult {
                 id: "tool-1".into(),
                 is_error: false,
+                output: None,
+                diff: None,
             },
         );
         writer.sync(&folded).unwrap();
@@ -926,6 +952,54 @@ mod tests {
             } => {
                 assert!(*resolved);
                 assert!(!*is_error);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// The ToolResult resolution path goes through `update_part_fields` —
+    /// output and diff must survive the doc round trip (regression: they were
+    /// silently dropped there while `to_doc_part` carried them).
+    #[test]
+    fn segment_writer_round_trips_tool_output_and_diff() {
+        let doc = SessionDoc::init("chat-2").unwrap();
+        let mut writer = SegmentWriter::begin(&doc, "a1", "dev-a", 5).unwrap();
+
+        let mut folded = Vec::new();
+        fold_event_into_parts(
+            &mut folded,
+            &AgentEvent::ToolCall {
+                id: "t1".into(),
+                call: ToolCall::Exec {
+                    command: "ls".into(),
+                },
+            },
+        );
+        writer.sync(&folded).unwrap();
+        fold_event_into_parts(
+            &mut folded,
+            &AgentEvent::ToolResult {
+                id: "t1".into(),
+                is_error: false,
+                output: Some("total 0".into()),
+                diff: Some(komet_proto::ToolDiff {
+                    path: "/w/a.rs".into(),
+                    old_text: Some("old".into()),
+                    new_text: "new".into(),
+                }),
+            },
+        );
+        writer.sync(&folded).unwrap();
+        writer.finish(&folded, MessageStatus::Complete).unwrap();
+
+        let entries = doc.read_entries().unwrap();
+        match &entries[0].parts[0] {
+            MessagePart::Tool { output, diff, .. } => {
+                assert_eq!(output.as_deref(), Some("total 0"));
+                let diff = diff.as_ref().expect("diff survives");
+                assert_eq!(diff.path, "/w/a.rs");
+                assert_eq!(diff.old_text.as_deref(), Some("old"));
+                assert_eq!(diff.new_text, "new");
             }
             other => panic!("unexpected {other:?}"),
         }

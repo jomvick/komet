@@ -8,6 +8,8 @@ pub enum HarnessId {
     ClaudeCode,
     Codex,
     Cursor,
+    /// xAI's Grok Build agent, driven over ACP (`grok agent stdio`).
+    Grok,
     /// Test harness; never shown in production pickers.
     Mock,
 }
@@ -168,6 +170,30 @@ pub struct TodoItem {
     pub done: bool,
 }
 
+/// A slash command advertised by the agent (ACP `availableCommands`): typed as
+/// `/name` at the start of the composer, sent to the agent as prompt text.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SlashCommand {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    /// Placeholder hint for the command's argument, when it takes one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_hint: Option<String>,
+}
+
+/// A file modification carried inline on a tool result (ACP
+/// `ToolCallContent::Diff`). `old_text: None` means a new file.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolDiff {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_text: Option<String>,
+    pub new_text: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UserInputQuestion {
@@ -230,12 +256,27 @@ pub enum AgentEvent {
     ToolResult {
         id: String,
         is_error: bool,
+        /// Tool output text, capped by the emitting harness (ACP tool-call
+        /// content; claude/codex adapters never populate it). The doc-side
+        /// fold applies its own byte cap before anything persists.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
+        /// Inline file diff for edit-shaped tools (ACP `Diff` content).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        diff: Option<ToolDiff>,
     },
     /// Kept as a harness passthrough (rate-limit probes); never persisted to docs.
     #[serde(rename_all = "camelCase")]
     Usage {
         input_tokens: u64,
         output_tokens: u64,
+    },
+    /// The agent advertised (or changed) its slash-command set — ACP
+    /// `available_commands_update`. The engine caches the latest list per
+    /// harness for the composer's `/` popup; never persisted to docs.
+    #[serde(rename_all = "camelCase")]
+    AvailableCommands {
+        commands: Vec<SlashCommand>,
     },
     Error {
         message: String,

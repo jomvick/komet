@@ -5,9 +5,31 @@
 
 use serde::{Deserialize, Serialize};
 
-use komet_proto::{AgentEvent, ToolCall, UserInputQuestion};
+use komet_proto::{AgentEvent, ToolCall, ToolDiff, UserInputQuestion};
 
 use crate::constants::MSG_INLINE_MAX;
+
+/// Byte cap for tool output persisted into the doc. Deliberately tighter than
+/// the harness-side cap: docs sync to every device and reload with the
+/// session, so this bounds what long tool-heavy sessions cost at load time.
+pub const TOOL_OUTPUT_DOC_CAP: usize = 4 * 1024;
+
+/// Byte cap for each side of an inline diff persisted into the doc.
+pub const TOOL_DIFF_DOC_CAP: usize = 16 * 1024;
+
+/// Truncate on a char boundary, marking the cut so the UI can say so.
+fn cap_doc_text(text: &str, cap: usize) -> String {
+    if text.len() <= cap {
+        return text.to_owned();
+    }
+    let mut end = cap;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = text[..end].to_owned();
+    out.push_str("\n… [truncated]");
+    out
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -34,6 +56,14 @@ pub enum MessagePart {
         /// True once a ToolResult arrived.
         #[serde(default)]
         resolved: bool,
+        /// Tool output text, capped at [`TOOL_OUTPUT_DOC_CAP`] by the fold.
+        /// Additive: absent on old entries and on harnesses that don't
+        /// surface output (claude/codex today).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
+        /// Inline file diff for edit-shaped tools, capped by the fold.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        diff: Option<ToolDiff>,
     },
     #[serde(rename_all = "camelCase")]
     Input {
@@ -62,7 +92,15 @@ impl MessagePart {
     pub fn byte_len(&self) -> usize {
         match self {
             MessagePart::Text { text, .. } => text.len(),
-            MessagePart::Tool { call, .. } => serde_json::to_vec(call).map_or(0, |v| v.len()),
+            MessagePart::Tool {
+                call, output, diff, ..
+            } => {
+                serde_json::to_vec(call).map_or(0, |v| v.len())
+                    + output.as_ref().map_or(0, String::len)
+                    + diff
+                        .as_ref()
+                        .map_or(0, |d| serde_json::to_vec(d).map_or(0, |v| v.len()))
+            }
             MessagePart::Input { questions, .. } => {
                 serde_json::to_vec(questions).map_or(0, |v| v.len())
             }
@@ -117,21 +155,41 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                     call: call.clone(),
                     is_error: false,
                     resolved: false,
+                    output: None,
+                    diff: None,
                 });
             }
         }
-        AgentEvent::ToolResult { id, is_error } => {
+        AgentEvent::ToolResult {
+            id,
+            is_error,
+            output,
+            diff,
+        } => {
             for p in out.iter_mut() {
                 if let MessagePart::Tool {
                     id: pid,
                     is_error: e,
                     resolved,
+                    output: out_slot,
+                    diff: diff_slot,
                     ..
                 } = p
                     && pid == id
                 {
                     *e = *is_error;
                     *resolved = true;
+                    *out_slot = output
+                        .as_ref()
+                        .map(|o| cap_doc_text(o, TOOL_OUTPUT_DOC_CAP));
+                    *diff_slot = diff.as_ref().map(|d| ToolDiff {
+                        path: d.path.clone(),
+                        old_text: d
+                            .old_text
+                            .as_ref()
+                            .map(|t| cap_doc_text(t, TOOL_DIFF_DOC_CAP)),
+                        new_text: cap_doc_text(&d.new_text, TOOL_DIFF_DOC_CAP),
+                    });
                 }
             }
         }
@@ -178,7 +236,11 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                 });
             }
         }
-        AgentEvent::AssistantMessageCompleted { .. } | AgentEvent::Usage { .. } => {}
+        // AvailableCommands feeds the engine's per-harness command cache, not
+        // the transcript.
+        AgentEvent::AssistantMessageCompleted { .. }
+        | AgentEvent::Usage { .. }
+        | AgentEvent::AvailableCommands { .. } => {}
     }
 }
 
@@ -359,6 +421,8 @@ mod tests {
             &AgentEvent::ToolResult {
                 id: "t".into(),
                 is_error: true,
+                output: None,
+                diff: None,
             },
         );
         match &parts[0] {
@@ -404,6 +468,8 @@ mod tests {
                 },
                 is_error: false,
                 resolved: true,
+                output: None,
+                diff: None,
             },
         ];
         let chunks = split_parts(&parts);

@@ -14,7 +14,7 @@
  * discarded at the event layer (harness ToolResult carries only `isError`),
  * and ApplyPatch already stores path-only summaries.
  */
-import type { MessagePart, ToolCall } from "./control-types";
+import type { MessagePart, ToolCall, ToolPartDiff } from "./control-types";
 
 /** A tool call reduced to its render surface. Structurally a subset of
  * {@link ToolCall}; every variant here is assignable-from its wire twin after
@@ -51,6 +51,11 @@ export type SessionMessagePart =
       readonly id: string;
       readonly call: RenderToolCall;
       readonly isError?: boolean;
+      /** Capped tool output — kept by the policy (the caps are the size
+       * discipline; unlike raw inputs, output is the rendered record). */
+      readonly output?: string;
+      /** Capped inline diff — kept for the same reason. */
+      readonly diff?: ToolPartDiff;
     };
 
 /** Reduce a wire tool call to its render surface. Idempotent — feeding an
@@ -126,7 +131,9 @@ export const toRenderParts = (
           kind: "tool",
           id: p.id,
           call: sanitizeToolCall(p.call),
-          ...(typeof p.isError === "boolean" ? { isError: p.isError } : {})
+          ...(typeof p.isError === "boolean" ? { isError: p.isError } : {}),
+          ...(typeof p.output === "string" ? { output: p.output } : {}),
+          ...(p.diff !== undefined ? { diff: p.diff } : {})
         }
       : p
   );

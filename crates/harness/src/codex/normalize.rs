@@ -85,7 +85,12 @@ fn tool_lifecycle(phase: Phase, id: String, call: ToolCall, is_error: bool) -> V
                 id: id.clone(),
                 call,
             },
-            AgentEvent::ToolResult { id, is_error },
+            AgentEvent::ToolResult {
+                id,
+                is_error,
+                output: None,
+                diff: None,
+            },
         ],
     }
 }
@@ -136,6 +141,8 @@ pub(crate) fn map_item(phase: Phase, item: &Value) -> Vec<AgentEvent> {
                 vec![AgentEvent::ToolResult {
                     id,
                     is_error: status == "failed" || exit_code != 0,
+                    output: None,
+                    diff: None,
                 }]
             }
         },
@@ -178,6 +185,8 @@ pub(crate) fn map_item(phase: Phase, item: &Value) -> Vec<AgentEvent> {
             Phase::Completed => vec![AgentEvent::ToolResult {
                 id,
                 is_error: status == "failed",
+                output: None,
+                diff: None,
             }],
         },
         "webSearch" | "web_search" => tool_lifecycle(
@@ -247,6 +256,8 @@ mod tests {
             vec![AgentEvent::ToolResult {
                 id: "c1".into(),
                 is_error: true,
+                output: None,
+                diff: None,
             }]
         );
     }
@@ -285,7 +296,9 @@ mod tests {
                 },
                 AgentEvent::ToolResult {
                     id: "f2".into(),
-                    is_error: true
+                    is_error: true,
+                    output: None,
+                    diff: None,
                 },
             ]
         );

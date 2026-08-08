@@ -27,7 +27,6 @@
 
 mod catalog;
 mod normalize;
-mod rpc;
 
 use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
@@ -48,12 +47,12 @@ use komet_proto::{
     UserInputAnswer, UserInputQuestion,
 };
 
+use crate::jsonrpc::{Incoming, RpcClient};
 use crate::{Harness, HarnessError, RunControls};
 use catalog::{REASONING_LEVELS, sandbox_mode, sandbox_policy_value, static_models, to_effort};
 use normalize::{
     Phase, delta_text, item_id, item_type, map_item, turn_error_message, turn_id, usage_event,
 };
-use rpc::{Incoming, RpcClient};
 
 /// Locate the device's installed Codex CLI: `CODEX_EXECUTABLE`, then our own
 /// PATH, then the login-shell PATH snapshot (the user's shell init shapes
@@ -1062,48 +1061,7 @@ fn approval_question(method: &str, params: &Value) -> UserInputQuestion {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Child lifecycle
-// ---------------------------------------------------------------------------
-
-/// Reap the child: graceful SIGTERM first, SIGKILL after `kill_grace`.
-/// (`kill_on_drop` remains the last-resort backstop.)
-async fn shutdown_child(child: &mut Child, kill_grace: Duration) {
-    if matches!(child.try_wait(), Ok(Some(_))) {
-        return;
-    }
-    if let Some(pid) = child.id() {
-        send_signal(pid, Signal::Term);
-        if tokio::time::timeout(kill_grace, child.wait()).await.is_ok() {
-            return;
-        }
-    }
-    let _ = child.start_kill();
-    let _ = child.wait().await;
-}
-
-#[derive(Clone, Copy)]
-enum Signal {
-    Term,
-    Kill,
-}
-
-#[cfg(unix)]
-fn send_signal(pid: u32, signal: Signal) {
-    let sig = match signal {
-        Signal::Term => libc::SIGTERM,
-        Signal::Kill => libc::SIGKILL,
-    };
-    // SAFETY: plain kill(2) on a pid we spawned and have not yet reaped.
-    unsafe {
-        libc::kill(pid as libc::pid_t, sig);
-    }
-}
-
-#[cfg(not(unix))]
-fn send_signal(_pid: u32, _signal: Signal) {
-    // No SIGTERM off unix; `start_kill`/`kill_on_drop` handle termination.
-}
+use crate::{Signal, send_signal, shutdown_child};
 
 #[cfg(test)]
 mod tests {

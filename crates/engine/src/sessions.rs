@@ -811,11 +811,18 @@ fn render_parts(parts: &[MessagePart]) -> Vec<MessagePart> {
                 call,
                 is_error,
                 resolved,
+                output,
+                diff,
             } => MessagePart::Tool {
                 id: id.clone(),
                 call: sanitize_tool_call(call),
                 is_error: *is_error,
                 resolved: *resolved,
+                // Output and diffs are deliberately kept (capped at fold
+                // time): unlike raw tool inputs they are the transcript's
+                // record of what happened, and the caps bound doc growth.
+                output: output.clone(),
+                diff: diff.clone(),
             },
             other => other.clone(),
         })

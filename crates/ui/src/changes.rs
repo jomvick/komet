@@ -985,7 +985,9 @@ fn diff_token_color(class: crate::markdown::highlight::TokenClass, theme: &Theme
 /// The expanded body of one file section: notices, hunk headers, +/-/context
 /// lines with a coloured accent bar, dual line-number gutters, a marker
 /// column, and paint-only syntax runs (komet checkout-diff-sidebar).
-fn render_file_body(
+/// Shared with the transcript's tool-diff detail blocks — the same component
+/// renders a checkout diff section and an inline ACP tool diff.
+pub(crate) fn render_file_body(
     file: &FileDiff,
     highlight: Option<Arc<Vec<Vec<Token>>>>,
     theme: &Theme,
