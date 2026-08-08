@@ -692,9 +692,11 @@ impl Auth {
         let res = match res {
             Ok(res) => res,
             Err(err) => {
-                // Network failure is transient: keep the session, caller retries later.
-                tracing::warn!(error = %err, "auth: refresh could not reach the edge");
-                return Ok(None);
+                // Network failure is transient: keep the session, but surface the
+                // error so the background loop applies its retry delay.
+                return Err(EngineError::Other(format!(
+                    "could not reach the edge during refresh: {err}"
+                )));
             }
         };
         let status = res.status().as_u16();

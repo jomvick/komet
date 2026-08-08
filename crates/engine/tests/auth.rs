@@ -57,6 +57,7 @@ struct StubState {
     exchange_started: tokio::sync::Notify,
     release_exchange: tokio::sync::Notify,
     refreshes: AtomicUsize,
+    drop_refresh: AtomicBool,
     /// Refresh tokens seen by /auth/refresh, in order.
     refresh_tokens: Mutex<Vec<String>>,
     /// TTL (seconds) for minted access tokens.
@@ -194,6 +195,10 @@ async fn handle(mut stream: tokio::net::TcpStream, state: Arc<StubState>) {
                 .lock()
                 .expect("lock")
                 .push(refresh_token.to_string());
+            if state.drop_refresh.load(Ordering::SeqCst) {
+                state.refreshes.fetch_add(1, Ordering::SeqCst);
+                return;
+            }
             if refresh_token == "dead" {
                 respond(&mut stream, "401 Unauthorized", r#"{"error":"revoked"}"#).await;
                 return;
@@ -423,6 +428,32 @@ async fn revoked_refresh_token_signs_out() {
         "revocation must not rewrite the captured startup fact"
     );
     assert!(!dir.path().join("session.json").exists());
+}
+
+#[tokio::test]
+async fn offline_refresh_loop_backs_off_without_revoking_session() {
+    let edge = StubEdge::start().await;
+    edge.state.drop_refresh.store(true, Ordering::SeqCst);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let session_file = dir.path().join("session.json");
+    std::fs::write(
+        &session_file,
+        r#"{"refreshToken":"offline","user":{"id":"user_1","email":"w@example.com"},"orgId":"org_1"}"#,
+    )
+    .expect("seed session");
+    let auth = Auth::new(workos_config(&edge.url(), dir.path()));
+
+    let refresh_loop = auth.spawn_refresh_loop();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    assert_eq!(
+        edge.state.refreshes.load(Ordering::SeqCst),
+        1,
+        "a transport failure must enter the background retry delay"
+    );
+    assert!(auth.state().is_signed_in());
+    assert!(session_file.exists(), "offline must not revoke the session");
+    refresh_loop.abort();
 }
 
 #[tokio::test]
