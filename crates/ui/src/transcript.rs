@@ -1476,7 +1476,21 @@ impl Transcript {
                 for row in &self.rows[old_range.clone()] {
                     self.render_cache.borrow_mut().invalidate_row(&row.id);
                 }
-                self.list.splice(old_range, count);
+                if old_range.len() == count {
+                    // In-place content change, same row count — notably the
+                    // live→complete flip, where EVERY row of the streamed
+                    // message changes version (streaming bit, tool auto_open,
+                    // timestamp bit) with identical ids. `splice` would reset
+                    // those items to hint-less Unmeasured (heights read 0
+                    // until the next paint) and, when the viewport-top item is
+                    // inside the range, clobber the scroll anchor to the range
+                    // start — the end-of-turn up/down jump the spring then has
+                    // to walk back. `remeasure_items` keeps old sizes as hints
+                    // and holds the anchor across the remeasure.
+                    self.list.remeasure_items(old_range);
+                } else {
+                    self.list.splice(old_range, count);
+                }
             }
         }
         self.rows = new_rows;
