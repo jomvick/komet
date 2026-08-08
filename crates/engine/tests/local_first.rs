@@ -139,6 +139,33 @@ async fn revoked_captured_session_stays_on_its_synced_cache() {
 }
 
 #[tokio::test]
+async fn development_without_an_explicit_bearer_stays_offline() {
+    let dir = tempfile::tempdir().unwrap();
+    let (edge_url, requests, edge_task) = rejecting_edge().await;
+    let config = config(dir.path(), edge_url, None, None);
+    let auth = Engine::build_auth(&config).await;
+    let scope = Engine::initial_workspace_scope(&auth);
+    let profile = Engine::resolve_profile(&config, &auth, scope)
+        .unwrap()
+        .expect("development profile is ready");
+
+    assert_eq!(scope, WorkspaceScope::Development);
+    assert_eq!(auth.access_token().await.as_deref(), Some("dev-user"));
+    let runtime = Engine::assemble_runtime(&config, auth, profile)
+        .await
+        .unwrap();
+
+    assert_eq!(runtime.workspace_scope(), WorkspaceScope::Development);
+    assert!(
+        runtime.core().links().is_none(),
+        "the synthetic dev identity must not enable Edge"
+    );
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
+    runtime.shutdown().await;
+    edge_task.abort();
+}
+
+#[tokio::test]
 async fn explicit_dev_bearer_keeps_online_routing_enabled() {
     let dir = tempfile::tempdir().unwrap();
     let config = config(

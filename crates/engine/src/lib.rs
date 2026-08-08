@@ -79,7 +79,8 @@ pub struct EngineConfig {
     pub data_dir: PathBuf,
     /// Edge base URL.
     pub edge_url: String,
-    /// Bearer for edge room joins; `None` runs fully offline (sync disabled).
+    /// Explicit development bearer for edge room joins. Synced WorkOS runtimes
+    /// obtain their bearer from [`Auth`]; development stays offline when this is absent.
     pub edge_token: Option<String>,
     /// Localhost IPC port for the UI.
     pub ipc_port: u16,
@@ -480,7 +481,7 @@ impl Engine {
     }
 
     /// Open one already-resolved profile and enable online transports only for
-    /// synced and explicit development runtimes.
+    /// synced runtimes with live auth or development with an explicit bearer.
     pub async fn assemble_runtime(
         config: &EngineConfig,
         auth: Auth,
@@ -488,9 +489,15 @@ impl Engine {
     ) -> anyhow::Result<EngineRuntime> {
         let online = match profile.scope() {
             WorkspaceScope::Local => false,
-            WorkspaceScope::Synced | WorkspaceScope::Development => {
-                auth.access_token().await.is_some()
-            }
+            WorkspaceScope::Synced => auth.access_token().await.is_some(),
+            // Dev Auth always exposes `dev_user_id` as its synthetic access
+            // token, including when WorkOS was merely disabled with
+            // KOMET_WORKOS_CLIENT_ID="". Only an explicitly configured,
+            // non-empty bearer opts this runtime into Edge rooms and relays.
+            WorkspaceScope::Development => config
+                .edge_token
+                .as_deref()
+                .is_some_and(|token| !token.trim().is_empty()),
         };
         let device_id = load_or_create_device_id(profile.device_root())?;
         let edge = online.then(|| {

@@ -53,7 +53,8 @@ The engine never re-resolves an open store because `AuthState` changed. This pre
 | --- | --- | --- |
 | WorkOS enabled, no parseable saved `session.json` | `Local` | Disabled |
 | Parseable saved WorkOS session | `Synced` | Enabled when a bearer is available; organization onboarding completes before opening the store when needed |
-| Explicit dev bearer / WorkOS disabled | `Development` | Enabled |
+| WorkOS disabled without a dev bearer | `Development` | Disabled |
+| Explicit non-empty dev bearer | `Development` | Enabled |
 
 `komet login` and `komet logout` operate on `session.json` while the engine is stopped. Login selects `Synced` for the next start; logout selects `Local` for the next start. The UI may update live authentication status, but the active `WorkspaceScope` still changes only after restart.
 
