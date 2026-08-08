@@ -37,18 +37,12 @@ async fn shutdown(core: EngineCore) {
     drop(core);
 }
 
-#[tokio::test]
-async fn concurrent_engine_info_and_runtime_share_one_device_identity() {
-    let dir = tempfile::tempdir().expect("tempdir");
-    let config = Arc::new(config(
-        dir.path(),
-        "http://127.0.0.1:1".into(),
-        Some("client_test"),
-        None,
-    ));
-    let workers = 32;
+fn concurrent_engine_info(
+    config: Arc<EngineConfig>,
+    workers: usize,
+) -> std::collections::HashSet<String> {
     let barrier = Arc::new(Barrier::new(workers));
-    let calls = (0..workers)
+    (0..workers)
         .map(|_| {
             let config = config.clone();
             let barrier = barrier.clone();
@@ -59,11 +53,22 @@ async fn concurrent_engine_info_and_runtime_share_one_device_identity() {
                     .device_id
             })
         })
-        .collect::<Vec<_>>();
-    let announced = calls
+        .collect::<Vec<_>>()
         .into_iter()
         .map(|call| call.join().expect("engine-info worker"))
-        .collect::<std::collections::HashSet<_>>();
+        .collect()
+}
+
+#[tokio::test]
+async fn concurrent_engine_info_and_runtime_share_one_device_identity() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let config = Arc::new(config(
+        dir.path(),
+        "http://127.0.0.1:1".into(),
+        Some("client_test"),
+        None,
+    ));
+    let announced = concurrent_engine_info(config, 32);
 
     assert_eq!(announced.len(), 1, "every viewport announces one identity");
     let announced = announced.into_iter().next().expect("announced id");
@@ -79,6 +84,37 @@ async fn concurrent_engine_info_and_runtime_share_one_device_identity() {
         core.device_id, announced,
         "the assembled runtime must use the identity already announced"
     );
+    shutdown(core).await;
+}
+
+#[tokio::test]
+async fn empty_legacy_device_identity_is_repaired_once_for_all_boots() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::write(dir.path().join("device-id"), b"").expect("seed truncated identity");
+    let config = Arc::new(config(
+        dir.path(),
+        "http://127.0.0.1:1".into(),
+        Some("client_test"),
+        None,
+    ));
+
+    let announced = concurrent_engine_info(config, 32);
+    assert_eq!(
+        announced.len(),
+        1,
+        "legacy repair must publish one identity"
+    );
+    let announced = announced.into_iter().next().expect("repaired id");
+    assert!(!announced.trim().is_empty());
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("device-id"))
+            .expect("repaired device id")
+            .trim(),
+        announced
+    );
+
+    let core = assemble(EngineProfile::local(dir.path()).expect("local profile"));
+    assert_eq!(core.device_id, announced);
     shutdown(core).await;
 }
 

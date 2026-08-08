@@ -846,18 +846,20 @@ fn env_or(key: &str, default: &str) -> String {
 /// Stable per-installation device id, persisted at `{data_dir}/device-id`.
 fn load_or_create_device_id(data_dir: &Path) -> Result<String, EngineError> {
     std::fs::create_dir_all(data_dir)?;
+    // EngineInfo is resolved before the lifetime InstanceLock is acquired, so
+    // identity creation and legacy repair need their own short critical section.
+    // The OS releases this lock after a crash; unlike a create_new lockfile it
+    // cannot strand an installation permanently.
+    let _identity_lock = DeviceIdentityLock::acquire(data_dir)?;
     let path = data_dir.join("device-id");
-    match std::fs::read_to_string(&path) {
+    let recovering_empty = match std::fs::read_to_string(&path) {
         Ok(id) if !id.trim().is_empty() => return Ok(id.trim().to_string()),
-        Ok(_) => {
-            return Err(EngineError::Other(format!(
-                "invalid device identity {}: file is empty",
-                path.display()
-            )));
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        // Older releases used truncate+write. A crash between those operations
+        // left a zero-byte file that is safe to replace with a fresh identity.
+        Ok(_) => true,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
         Err(err) => return Err(err.into()),
-    }
+    };
 
     let id = new_id();
     let temp_path = data_dir.join(format!(
@@ -879,10 +881,24 @@ fn load_or_create_device_id(data_dir: &Path) -> Result<String, EngineError> {
         return Err(err);
     }
 
-    // Publish only fully-written bytes and never replace another process's
-    // winner. A hard link is the portable create-if-absent primitive already
-    // used for local-profile identity; losers can immediately read the winner.
-    let publish_result = std::fs::hard_link(&temp_path, &path);
+    // Fresh installs use create-if-absent. Legacy empty files need an atomic
+    // same-directory replacement on Unix; the Windows fallback runs under the
+    // identity lock and remains recoverable if interrupted.
+    let publish_result = if recovering_empty {
+        match std::fs::read_to_string(&path) {
+            Ok(id) if !id.trim().is_empty() => {
+                let _ = std::fs::remove_file(&temp_path);
+                return Ok(id.trim().to_string());
+            }
+            Ok(_) => replace_empty_device_id(&temp_path, &path),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::hard_link(&temp_path, &path)
+            }
+            Err(err) => Err(err),
+        }
+    } else {
+        std::fs::hard_link(&temp_path, &path)
+    };
     let _ = std::fs::remove_file(&temp_path);
     match publish_result {
         Ok(()) => Ok(id),
@@ -898,5 +914,73 @@ fn load_or_create_device_id(data_dir: &Path) -> Result<String, EngineError> {
             }
         }
         Err(err) => Err(err.into()),
+    }
+}
+
+struct DeviceIdentityLock {
+    _file: std::fs::File,
+}
+
+impl DeviceIdentityLock {
+    fn acquire(data_dir: &Path) -> Result<Self, EngineError> {
+        let path = data_dir.join("device-id.lock");
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            options.share_mode(0);
+            let mut retries = 200;
+            let file = loop {
+                match options.open(&path) {
+                    Ok(file) => break file,
+                    Err(err)
+                        if err.kind() == std::io::ErrorKind::PermissionDenied && retries > 0 =>
+                    {
+                        retries -= 1;
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(err) => return Err(err.into()),
+                }
+            };
+            return Ok(Self { _file: file });
+        }
+
+        #[cfg(not(windows))]
+        let file = options.open(&path)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            loop {
+                if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                    break;
+                }
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() != Some(libc::EINTR) {
+                    return Err(err.into());
+                }
+            }
+        }
+
+        #[cfg(not(windows))]
+        Ok(Self { _file: file })
+    }
+}
+
+fn replace_empty_device_id(temp_path: &Path, path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::rename(temp_path, path)
+    }
+    #[cfg(not(unix))]
+    {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+        std::fs::hard_link(temp_path, path)
     }
 }
