@@ -453,9 +453,12 @@ fn sync_flow_after_auth(
 ) -> SyncFlow {
     match scope {
         Some(WorkspaceScope::Local) => match (flow, auth) {
-            (SyncFlow::Enabling, Some(AuthState::SignedIn { .. })) => {
-                SyncFlow::RestartPending { notice_open: true }
-            }
+            // AuthStatus belongs to the runtime, not to the Shell that opened
+            // the browser. Every attached viewport must advertise the pending
+            // profile switch once any of them completes sign-in.
+            (SyncFlow::Canceling, Some(AuthState::SignedIn { .. })) => flow,
+            (SyncFlow::RestartPending { .. }, Some(AuthState::SignedIn { .. })) => flow,
+            (_, Some(AuthState::SignedIn { .. })) => SyncFlow::RestartPending { notice_open: true },
             _ => flow,
         },
         Some(WorkspaceScope::Synced) => match auth {
@@ -4589,6 +4592,24 @@ mod tests {
                 Some(&signed_in),
             ),
             SyncFlow::RestartPending { notice_open: true }
+        );
+        assert_eq!(
+            sync_flow_after_auth(
+                SyncFlow::Idle,
+                Some(WorkspaceScope::Local),
+                Some(&signed_in),
+            ),
+            SyncFlow::RestartPending { notice_open: true },
+            "another viewport derives the pending restart from AuthStatus"
+        );
+        assert_eq!(
+            sync_flow_after_auth(
+                SyncFlow::RestartPending { notice_open: false },
+                Some(WorkspaceScope::Local),
+                Some(&signed_in),
+            ),
+            SyncFlow::RestartPending { notice_open: false },
+            "shared auth updates do not reopen a postponed notice"
         );
         assert_eq!(
             account_menu_action(
