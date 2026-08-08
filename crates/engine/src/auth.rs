@@ -215,13 +215,20 @@ struct AuthInner {
     state_tx: watch::Sender<AuthState>,
     stored: Mutex<Option<StoredSession>>,
     access: Mutex<Option<AccessEntry>>,
-    /// Pending sign-in `state` values (CSRF), stamped so abandoned attempts expire.
-    pending: Mutex<HashMap<String, Instant>>,
+    /// Pending OAuth states plus the cancellation generation that fences code
+    /// exchanges already in flight when sign-out occurs.
+    sign_in: Mutex<SignInLifecycle>,
     /// Single-flight refresh: WorkOS refresh tokens are single-use (rotated per
     /// exchange); two concurrent refreshes would race and could revoke the session.
     refresh_gate: tokio::sync::Mutex<()>,
     /// Loopback callback listener port, bound lazily on the first headed sign-in.
     loopback: tokio::sync::Mutex<Option<u16>>,
+}
+
+#[derive(Default)]
+struct SignInLifecycle {
+    generation: u64,
+    pending: HashMap<String, Instant>,
 }
 
 /// The auth service — cheap to clone by `Arc`.
@@ -272,7 +279,7 @@ impl Auth {
                 state_tx,
                 stored: Mutex::new(stored),
                 access: Mutex::new(None),
-                pending: Mutex::new(HashMap::new()),
+                sign_in: Mutex::new(SignInLifecycle::default()),
                 refresh_gate: tokio::sync::Mutex::new(()),
                 loopback: tokio::sync::Mutex::new(None),
             }),
@@ -442,18 +449,26 @@ impl Auth {
         }
         let trimmed = pasted.trim();
         let (state, code) = trimmed.split_once('.').unwrap_or(("", ""));
-        if state.is_empty() || code.is_empty() || !self.take_pending(state) {
+        if state.is_empty() || code.is_empty() {
             return Err(EngineError::Other(
                 "invalid or expired sign-in code — start sign-in again and paste the full code"
                     .into(),
             ));
         }
+        let Some(generation) = self.take_pending(state) else {
+            return Err(EngineError::Other(
+                "invalid or expired sign-in code — start sign-in again and paste the full code"
+                    .into(),
+            ));
+        };
         let result = self.exchange_code(code).await?;
-        self.finish_sign_in(result);
-        Ok(())
+        self.finish_sign_in(result, generation)
     }
 
     pub fn sign_out(&self) {
+        let mut sign_in = lock(&self.inner.sign_in);
+        sign_in.generation = sign_in.generation.wrapping_add(1);
+        sign_in.pending.clear();
         *lock(&self.inner.stored) = None;
         *lock(&self.inner.access) = None;
         self.persist::<&StoredSession>(None);
@@ -522,10 +537,12 @@ impl Auth {
     fn begin_sign_in(&self, redirect_uri: &str) -> String {
         let state = uuid::Uuid::new_v4().to_string();
         {
-            let mut pending = lock(&self.inner.pending);
+            let mut sign_in = lock(&self.inner.sign_in);
             let cutoff = Instant::now();
-            pending.retain(|_, at| cutoff.duration_since(*at) < SIGN_IN_TTL);
-            pending.insert(state.clone(), cutoff);
+            sign_in
+                .pending
+                .retain(|_, at| cutoff.duration_since(*at) < SIGN_IN_TTL);
+            sign_in.pending.insert(state.clone(), cutoff);
         }
         let client_id = self.inner.workos.clone().unwrap_or_default();
         format!(
@@ -537,12 +554,16 @@ impl Auth {
         )
     }
 
-    /// Consume a pending sign-in state; false when unknown/expired (CSRF check).
-    fn take_pending(&self, state: &str) -> bool {
-        let mut pending = lock(&self.inner.pending);
+    /// Consume a pending sign-in state and capture its cancellation generation.
+    /// `None` means unknown/expired (CSRF check).
+    fn take_pending(&self, state: &str) -> Option<u64> {
+        let mut sign_in = lock(&self.inner.sign_in);
         let now = Instant::now();
-        pending.retain(|_, at| now.duration_since(*at) < SIGN_IN_TTL);
-        pending.remove(state).is_some()
+        sign_in
+            .pending
+            .retain(|_, at| now.duration_since(*at) < SIGN_IN_TTL);
+        sign_in.pending.remove(state)?;
+        Some(sign_in.generation)
     }
 
     async fn exchange_code(&self, code: &str) -> Result<SignInResult, EngineError> {
@@ -602,7 +623,16 @@ impl Auth {
         })
     }
 
-    fn finish_sign_in(&self, result: SignInResult) {
+    fn finish_sign_in(&self, result: SignInResult, generation: u64) -> Result<(), EngineError> {
+        // Serialize the final commit with sign-out. A callback can consume its
+        // OAuth state and spend time exchanging the code; if cancellation wins
+        // during that await, its old generation must never restore credentials.
+        let sign_in = lock(&self.inner.sign_in);
+        if sign_in.generation != generation {
+            return Err(EngineError::Other(
+                "sign-in was canceled — start again from Komet".into(),
+            ));
+        }
         let org_id = jwt_claims(&result.access_token).and_then(|c| c.org_id);
         *lock(&self.inner.access) = Some(AccessEntry::fresh(result.access_token));
         let session = StoredSession {
@@ -617,6 +647,7 @@ impl Auth {
         self.inner
             .state_tx
             .send_replace(state_for(result.user, org_id));
+        Ok(())
     }
 
     /// Refresh the session (single-flight). `organization_id` migrates the WorkOS
@@ -878,15 +909,23 @@ async fn handle_loopback_conn(
         let code = params.get("code");
         let state = params.get("state");
         match (code, state) {
-            (Some(code), Some(state)) if auth.take_pending(state) => {
+            (Some(code), Some(state)) if let Some(generation) = auth.take_pending(state) => {
                 match auth.exchange_code(code).await {
-                    Ok(result) => {
-                        auth.finish_sign_in(result);
-                        (
+                    Ok(result) => match auth.finish_sign_in(result, generation) {
+                        Ok(()) => (
                             "200 OK",
                             page("Signed in. You can close this tab and return to Komet."),
-                        )
-                    }
+                        ),
+                        Err(err) => {
+                            tracing::info!(error = %err, "auth: discarded canceled callback exchange");
+                            (
+                                "409 Conflict",
+                                page(
+                                    "This sign-in was canceled. Start again from Komet if you still want to enable sync.",
+                                ),
+                            )
+                        }
+                    },
                     Err(err) => {
                         tracing::warn!(error = %err, "auth: loopback code exchange failed");
                         (

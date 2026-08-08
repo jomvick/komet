@@ -2,7 +2,7 @@
 //! loopback callback, refresh rotation + revocation, org onboarding) against a stub
 //! edge HTTP server on a plain tokio TcpListener.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -53,6 +53,9 @@ fn fake_jwt(ttl_secs: i64, org_id: Option<&str>) -> String {
 #[derive(Default)]
 struct StubState {
     exchanges: AtomicUsize,
+    block_exchange: AtomicBool,
+    exchange_started: tokio::sync::Notify,
+    release_exchange: tokio::sync::Notify,
     refreshes: AtomicUsize,
     /// Refresh tokens seen by /auth/refresh, in order.
     refresh_tokens: Mutex<Vec<String>>,
@@ -166,6 +169,10 @@ async fn handle(mut stream: tokio::net::TcpStream, state: Arc<StubState>) {
                 return;
             }
             let n = state.exchanges.fetch_add(1, Ordering::SeqCst) + 1;
+            if state.block_exchange.load(Ordering::SeqCst) {
+                state.exchange_started.notify_one();
+                state.release_exchange.notified().await;
+            }
             let org = state.exchange_org.lock().expect("lock").clone();
             let token = fake_jwt(ttl, (!org.is_empty()).then_some(org.as_str()));
             let response = serde_json::json!({
@@ -453,6 +460,52 @@ async fn loopback_callback_completes_headed_sign_in() {
     assert!(
         matches!(auth.state(), AuthState::SignedIn { org_id: Some(org), user } if org == "org_1" && user.name.as_deref() == Some("Wing Test"))
     );
+}
+
+#[tokio::test]
+async fn sign_out_invalidates_pending_and_in_flight_oauth_callbacks() {
+    let edge = StubEdge::start().await;
+    *edge.state.exchange_org.lock().expect("lock") = "org_1".into();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let auth = Auth::new(workos_config(&edge.url(), dir.path()));
+
+    let first_url = auth.start_sign_in().await.expect("authorize url");
+    let callback = query_param(&first_url, "redirect_uri")
+        .expect("redirect")
+        .replace("%3A", ":")
+        .replace("%2F", "/");
+    let first_state = query_param(&first_url, "state").expect("state");
+    auth.sign_out();
+    let canceled_pending = reqwest::get(format!("{callback}?code=old&state={first_state}"))
+        .await
+        .expect("pending callback response");
+    assert_eq!(canceled_pending.status().as_u16(), 400);
+    assert_eq!(edge.state.exchanges.load(Ordering::SeqCst), 0);
+
+    edge.state.block_exchange.store(true, Ordering::SeqCst);
+    let second_url = auth.start_sign_in().await.expect("second authorize url");
+    let second_state = query_param(&second_url, "state").expect("second state");
+    let callback_request = tokio::spawn(reqwest::get(format!(
+        "{callback}?code=in-flight&state={second_state}"
+    )));
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        edge.state.exchange_started.notified(),
+    )
+    .await
+    .expect("exchange did not start");
+
+    auth.sign_out();
+    edge.state.release_exchange.notify_one();
+    let canceled_exchange = callback_request
+        .await
+        .expect("callback task")
+        .expect("in-flight callback response");
+
+    assert_eq!(canceled_exchange.status().as_u16(), 409);
+    assert_eq!(auth.state(), AuthState::SignedOut);
+    assert!(!dir.path().join("session.json").exists());
+    assert_eq!(edge.state.exchanges.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
