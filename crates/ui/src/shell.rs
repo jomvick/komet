@@ -21,6 +21,7 @@ use gpui::{
     Task, Window, WindowControlArea, actions, div, prelude::*, px,
 };
 
+use komet_engine::InstanceLock;
 use komet_proto::{AuthState, WorkspaceScope};
 use komet_rpc::methods;
 use gpui_tokio::Tokio;
@@ -426,6 +427,39 @@ enum AccountMenuAction {
     SyncInProgress,
     RestartPending,
     SignOut,
+}
+
+const RUNTIME_CHANGE_TIMEOUT: Duration = Duration::from_secs(10);
+const RUNTIME_CHANGE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Wait until a stopped daemon can no longer win the next bootstrap probe and
+/// has released the data directory for the replacement runtime.
+async fn wait_for_remote_engine_shutdown(
+    ipc_port: u16,
+    data_dir: &std::path::Path,
+    timeout: Duration,
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let port_closed = !matches!(
+            tokio::time::timeout(
+                Duration::from_millis(200),
+                tokio::net::TcpStream::connect(("127.0.0.1", ipc_port)),
+            )
+            .await,
+            Ok(Ok(_))
+        );
+        if port_closed && InstanceLock::holder(data_dir).is_none() {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "the daemon did not finish stopping within {} seconds",
+                timeout.as_secs()
+            ));
+        }
+        tokio::time::sleep(RUNTIME_CHANGE_POLL_INTERVAL).await;
+    }
 }
 
 fn account_menu_action(scope: Option<WorkspaceScope>, flow: SyncFlow) -> Option<AccountMenuAction> {
@@ -1487,11 +1521,21 @@ impl Shell {
         }
 
         self.runtime_change_error = None;
-        self.runtime_change_task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
+        let ipc_port = self.boot.ipc_port;
+        let data_dir = self.data_dir.clone();
+        let shutdown = Tokio::spawn(cx, async move {
+            engine
                 .client()
                 .call(methods::STOP_ENGINE, serde_json::json!({}))
-                .await;
+                .await
+                .map_err(|err| err.to_string())?;
+            wait_for_remote_engine_shutdown(ipc_port, &data_dir, RUNTIME_CHANGE_TIMEOUT).await
+        });
+        self.runtime_change_task = Some(cx.spawn(async move |this, cx| {
+            let result = match shutdown.await {
+                Ok(result) => result,
+                Err(err) => Err(err.to_string()),
+            };
             this.update(cx, |shell, cx| {
                 shell.runtime_change_task = None;
                 match result {
@@ -4652,6 +4696,59 @@ impl Render for Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn remote_shutdown_waits_for_ipc_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            drop(listener);
+        });
+
+        wait_for_remote_engine_shutdown(port, dir.path(), Duration::from_secs(2))
+            .await
+            .unwrap();
+        release.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remote_shutdown_waits_for_engine_lock_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = InstanceLock::acquire(dir.path()).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let lock_released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let released_by_task = lock_released.clone();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            drop(lock);
+            released_by_task.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        wait_for_remote_engine_shutdown(port, dir.path(), Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert!(lock_released.load(std::sync::atomic::Ordering::SeqCst));
+        release.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_shutdown_times_out_while_ipc_remains_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let error = wait_for_remote_engine_shutdown(port, dir.path(), Duration::from_millis(100))
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("did not finish stopping"));
+        drop(listener);
+    }
 
     #[test]
     fn account_actions_follow_the_attached_workspace_scope() {
