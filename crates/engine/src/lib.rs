@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-pub use komet_proto::{HarnessId, WorkspaceScope};
+pub use komet_proto::{EngineInfo, HarnessId, WorkspaceScope};
 
 use komet_sync::DocsStore;
 
@@ -330,6 +330,7 @@ impl EngineCore {
             self.diff_sync.clone(),
             self.uploads.clone(),
             self.agent_accounts.clone(),
+            self.workspace_scope,
         )
         .with_auth(self.auth());
         if let Some(links) = self.links() {
@@ -385,8 +386,8 @@ impl Engine {
     }
 
     /// Resolve the shared dev/WorkOS auth configuration for headed and headless
-    /// modes. Production callers pass the baked WorkOS client id; explicit dev
-    /// bearers still opt into the local dev identity.
+    /// modes. A clean WorkOS boot deliberately avoids probing Edge: signed-out
+    /// installations must be able to start locally without network access.
     pub async fn build_auth(config: &EngineConfig) -> Auth {
         let mut auth_config = AuthConfig::new(config.edge_url.clone(), config.data_dir.clone());
         auth_config.workos_client_id = config.workos_client_id.clone();
@@ -404,46 +405,103 @@ impl Engine {
         if let Some(token) = &config.edge_token {
             auth_config.dev_user_id = token.clone();
         }
-        Auth::detect(auth_config).await
+        Auth::new(auth_config)
     }
 
-    /// Open the identity-scoped stores and online transports for an auth session
-    /// that is already ready. The headed UI waits behind its sign-in gate before
-    /// calling this; headless mode waits on the terminal flow.
+    /// Capture the workspace boundary once, before refresh or sign-in can mutate auth.
+    pub fn initial_workspace_scope(auth: &Auth) -> WorkspaceScope {
+        if !auth.workos_enabled() {
+            WorkspaceScope::Development
+        } else if auth.loaded_workos_session() {
+            WorkspaceScope::Synced
+        } else {
+            WorkspaceScope::Local
+        }
+    }
+
+    /// Resolve a profile for the captured scope. A synced session without an
+    /// organization returns `None` until onboarding selects one; it never falls
+    /// through to the local or development profile.
+    pub fn resolve_profile(
+        config: &EngineConfig,
+        auth: &Auth,
+        scope: WorkspaceScope,
+    ) -> Result<Option<EngineProfile>, EngineError> {
+        match scope {
+            WorkspaceScope::Local => EngineProfile::local(&config.data_dir).map(Some),
+            WorkspaceScope::Development => {
+                let dev_token_org = config
+                    .edge_token
+                    .as_deref()
+                    .and_then(|token| token.split_once('@'))
+                    .map(|(_, org)| org.to_string())
+                    .filter(|org| !org.is_empty());
+                let org_id = dev_token_org
+                    .or(config.org_id.clone())
+                    .unwrap_or_else(|| env_or("KOMET_ORG_ID", DEFAULT_ORG_ID));
+                let user_id = auth
+                    .user_id()
+                    .unwrap_or_else(|| env_or("KOMET_USER_ID", DEFAULT_USER_ID));
+                Ok(Some(EngineProfile::development(
+                    &config.data_dir,
+                    &org_id,
+                    &user_id,
+                )))
+            }
+            WorkspaceScope::Synced => {
+                let state = auth.state();
+                let Some(user) = state.user() else {
+                    return Err(EngineError::Other(
+                        "captured synced session no longer exposes its user identity".into(),
+                    ));
+                };
+                let Some(org_id) = state.org_id() else {
+                    return Ok(None);
+                };
+                Ok(Some(EngineProfile::synced(
+                    &config.data_dir,
+                    org_id,
+                    &user.id,
+                )))
+            }
+        }
+    }
+
+    /// Resolve the one-shot identity served before profile stores are available.
+    pub fn engine_info(
+        config: &EngineConfig,
+        workspace_scope: WorkspaceScope,
+    ) -> Result<EngineInfo, EngineError> {
+        std::fs::create_dir_all(&config.data_dir)?;
+        Ok(EngineInfo {
+            device_id: load_or_create_device_id(&config.data_dir)?,
+            workspace_scope,
+        })
+    }
+
+    /// Open one already-resolved profile and enable online transports only for
+    /// synced and explicit development runtimes.
     pub async fn assemble_runtime(
         config: &EngineConfig,
         auth: Auth,
+        profile: EngineProfile,
     ) -> anyhow::Result<EngineRuntime> {
-        let online = (auth.workos_enabled() || config.edge_token.is_some())
-            && auth.access_token().await.is_some();
-        let device_id = load_or_create_device_id(&config.data_dir)?;
+        let online = match profile.scope() {
+            WorkspaceScope::Local => false,
+            WorkspaceScope::Synced | WorkspaceScope::Development => {
+                auth.access_token().await.is_some()
+            }
+        };
+        let device_id = load_or_create_device_id(profile.device_root())?;
         let edge = online.then(|| {
             EdgeConfig::new(config.edge_url.clone(), Arc::new(auth.clone())).with_device(device_id)
         });
 
-        let dev_token_org = config
-            .edge_token
-            .as_deref()
-            .and_then(|t| t.split_once('@'))
-            .map(|(_, org)| org.to_string())
-            .filter(|s| !s.is_empty());
-        let org_id = auth
-            .state()
-            .org_id()
-            .map(str::to_string)
-            .or(dev_token_org)
-            .or(config.org_id.clone())
-            .unwrap_or_else(|| env_or("KOMET_ORG_ID", DEFAULT_ORG_ID));
-        let user_id = auth
-            .user_id()
-            .unwrap_or_else(|| env_or("KOMET_USER_ID", DEFAULT_USER_ID));
-        let core = EngineCore::assemble_with_identity(
-            &config.data_dir,
+        let core = EngineCore::assemble_with_profile(
+            profile,
             Arc::new(default_registry()),
             config.default_harness,
             edge.clone(),
-            &org_id,
-            &user_id,
         )?;
         core.set_auth(auth.clone());
         // Release checker: polls {edge}/releases on a 6h cadence; headless
@@ -489,16 +547,21 @@ impl Engine {
 
         std::fs::create_dir_all(&config.data_dir)?;
         let auth = Self::build_auth(&config).await;
+        let workspace_scope = Self::initial_workspace_scope(&auth);
+        let mut profile = Self::resolve_profile(&config, &auth, workspace_scope)?;
         let _refresh_loop = auth.spawn_refresh_loop();
 
-        // WorkOS mode: gate edge features on a signed-in, org-scoped session. A TTY
-        // gets the interactive paste-code flow; a service manager (systemd/launchd)
-        // fails fast with a "run `komet login`" error instead of hanging on a prompt.
-        if auth.workos_enabled() {
+        // A captured cloud session without an organization must finish onboarding
+        // before its profile can open. A clean signed-out install is local and never
+        // enters the terminal sign-in flow.
+        if workspace_scope == WorkspaceScope::Synced && profile.is_none() {
             terminal_sign_in(&auth).await?;
+            profile = Self::resolve_profile(&config, &auth, workspace_scope)?;
         }
+        let profile = profile
+            .ok_or_else(|| EngineError::Other("synced workspace profile is not ready".into()))?;
 
-        let runtime = Self::assemble_runtime(&config, auth).await?;
+        let runtime = Self::assemble_runtime(&config, auth, profile).await?;
 
         // A daemon exists to serve this port, so a bind failure is fatal here —
         // unlike the headed app, which can still work over its in-process

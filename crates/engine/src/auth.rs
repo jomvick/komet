@@ -208,6 +208,9 @@ struct AuthInner {
     config: AuthConfig,
     /// `Some(client_id)` = WorkOS mode; `None` = dev mode.
     workos: Option<String>,
+    /// Whether construction loaded a parseable WorkOS session. This is an
+    /// immutable startup fact: refresh or sign-out must not rewrite it.
+    loaded_workos_session: bool,
     http: reqwest::Client,
     state_tx: watch::Sender<AuthState>,
     stored: Mutex<Option<StoredSession>>,
@@ -254,6 +257,7 @@ impl Auth {
             (Some(_), Some(session)) => state_for(session.user.clone(), session.org_id.clone()),
             (Some(_), None) => AuthState::SignedOut,
         };
+        let loaded_workos_session = workos.is_some() && stored.is_some();
         let (state_tx, _) = watch::channel(initial);
         let http = reqwest::Client::builder()
             .timeout(HTTP_TIMEOUT)
@@ -263,6 +267,7 @@ impl Auth {
             inner: Arc::new(AuthInner {
                 config,
                 workos,
+                loaded_workos_session,
                 http,
                 state_tx,
                 stored: Mutex::new(stored),
@@ -307,6 +312,12 @@ impl Auth {
 
     pub fn workos_enabled(&self) -> bool {
         self.inner.workos.is_some()
+    }
+
+    /// True when construction loaded a parseable persisted WorkOS session.
+    /// The value stays true even if a later refresh revokes that session.
+    pub fn loaded_workos_session(&self) -> bool {
+        self.inner.loaded_workos_session
     }
 
     /// Live auth status (current value + changes).

@@ -29,7 +29,9 @@ use serde::de::DeserializeOwned;
 
 use komet_doc::{SessionMessageEntry, TranscriptDesync, TranscriptFrame};
 use komet_engine::{Engine, EngineConfig, EngineRuntime, rpc::AuthRpc};
-use komet_proto::{AuthState, Chat, ChatIndicator, Device, HarnessId, Session, Space};
+use komet_proto::{
+    AuthState, Chat, ChatIndicator, Device, EngineInfo, HarnessId, Session, Space, WorkspaceScope,
+};
 use komet_rpc::{RpcClient, RpcError, RpcReply, RpcService, connect_ws, memory_client, methods};
 
 // ---------------------------------------------------------------------------
@@ -115,17 +117,21 @@ enum DeferredEngineState {
     Failed(String),
 }
 
-/// Serves AuthRpc immediately, then holds all data RPC calls until the signed-in
-/// user's identity-scoped engine is assembled. Existing UI subscriptions remain
-/// pending and attach to the real service without reconnecting.
+/// Serves engine identity and AuthRpc immediately, then holds data calls only
+/// while a captured synced profile still needs organization onboarding.
+/// Existing subscriptions attach to the assembled service without reconnecting.
 struct DeferredEngineRpc {
     auth: AuthRpc,
+    engine_info: EngineInfo,
     state: tokio::sync::watch::Receiver<DeferredEngineState>,
 }
 
 #[async_trait]
 impl RpcService for DeferredEngineRpc {
     async fn handle(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError> {
+        if method == methods::ENGINE_INFO {
+            return RpcReply::value(&self.engine_info);
+        }
         if AuthRpc::handles(method) {
             return self.auth.handle(method, params).await;
         }
@@ -170,6 +176,7 @@ impl EngineBackend for RemoteEngine {
 #[derive(Clone)]
 pub struct EngineHandle {
     inner: Arc<dyn EngineBackend>,
+    engine_info: EngineInfo,
 }
 
 impl EngineHandle {
@@ -186,11 +193,19 @@ impl EngineHandle {
         if matches!(probe, Ok(Ok(_))) {
             tracing::info!(%url, "engine daemon detected; connecting");
             match connect_ws(&url).await {
-                Ok(client) => {
-                    return Ok(EngineHandle {
-                        inner: Arc::new(RemoteEngine { client, url }),
-                    });
-                }
+                Ok(client) => match query_engine_info(&client).await {
+                    Ok(engine_info) => {
+                        return Ok(EngineHandle {
+                            inner: Arc::new(RemoteEngine { client, url }),
+                            engine_info,
+                        });
+                    }
+                    Err(err) => tracing::warn!(
+                        %url,
+                        error = %err,
+                        "listener did not provide engine identity; embedding instead"
+                    ),
+                },
                 // Something is on the port but it is not an engine (or it is
                 // wedged). Fall through and embed: a stranger holding 27654
                 // should cost other viewports, not this window.
@@ -209,10 +224,14 @@ impl EngineHandle {
             workos_client_id: config.workos_client_id,
         };
         let auth = Engine::build_auth(&engine_config).await;
+        let workspace_scope = Engine::initial_workspace_scope(&auth);
+        let initial_profile = Engine::resolve_profile(&engine_config, &auth, workspace_scope)?;
+        let engine_info = Engine::engine_info(&engine_config, workspace_scope)?;
         let refresh_task = auth.spawn_refresh_loop();
         let (state_tx, state_rx) = tokio::sync::watch::channel(DeferredEngineState::Waiting);
         let service: Arc<dyn RpcService> = Arc::new(DeferredEngineRpc {
             auth: AuthRpc::new(auth.clone()),
+            engine_info: engine_info.clone(),
             state: state_rx,
         });
         let client = memory_client(service.clone());
@@ -220,8 +239,8 @@ impl EngineHandle {
         // Serve the same service on the IPC port so a terminal viewport can
         // attach to this window's engine with no setup. Deliberately the
         // *deferred* service, not the assembled one: a viewport that connects
-        // before sign-in gets AuthRpc (so it can show its own gate) and its
-        // data subscriptions wait exactly as this window's do.
+        // during cloud onboarding gets EngineInfo and AuthRpc immediately, and
+        // its data subscriptions wait exactly as this window's do.
         //
         // Best-effort — losing the bind race with another engine costs other
         // viewports, not this one.
@@ -239,17 +258,35 @@ impl EngineHandle {
         let runtime = Arc::new(tokio::sync::Mutex::new(None));
         let runtime_for_boot = runtime.clone();
         let boot_task = tokio::spawn(async move {
-            let mut auth_state = auth.watch_state();
-            while !auth_state.borrow().is_signed_in() {
-                if auth_state.changed().await.is_err() {
-                    state_tx.send_replace(DeferredEngineState::Failed(
-                        "authentication state closed before sign-in".into(),
-                    ));
-                    return;
+            let profile = match initial_profile {
+                Some(profile) => profile,
+                None => {
+                    let mut auth_state = auth.watch_state();
+                    while !auth_state.borrow().is_signed_in() {
+                        if auth_state.changed().await.is_err() {
+                            state_tx.send_replace(DeferredEngineState::Failed(
+                                "authentication state closed before workspace onboarding".into(),
+                            ));
+                            return;
+                        }
+                    }
+                    match Engine::resolve_profile(&engine_config, &auth, workspace_scope) {
+                        Ok(Some(profile)) => profile,
+                        Ok(None) => {
+                            state_tx.send_replace(DeferredEngineState::Failed(
+                                "workspace onboarding completed without an organization".into(),
+                            ));
+                            return;
+                        }
+                        Err(err) => {
+                            state_tx.send_replace(DeferredEngineState::Failed(err.to_string()));
+                            return;
+                        }
+                    }
                 }
-            }
+            };
 
-            match Engine::assemble_runtime(&engine_config, auth).await {
+            match Engine::assemble_runtime(&engine_config, auth, profile).await {
                 Ok(engine_runtime) => {
                     let service: Arc<dyn RpcService> = engine_runtime.core().rpc_service();
                     *runtime_for_boot.lock().await = Some(engine_runtime);
@@ -269,6 +306,7 @@ impl EngineHandle {
                 ipc_task,
                 client,
             }),
+            engine_info,
         })
     }
 
@@ -280,8 +318,40 @@ impl EngineHandle {
         self.inner.mode()
     }
 
+    pub fn engine_info(&self) -> &EngineInfo {
+        &self.engine_info
+    }
+
     pub async fn shutdown(&self) {
         self.inner.shutdown().await;
+    }
+}
+
+/// Query the current protocol first, with a conservative fallback for daemons
+/// from before `EngineInfo` existed. Old daemons are always treated as synced.
+async fn query_engine_info(client: &RpcClient) -> Result<EngineInfo, RpcError> {
+    match client
+        .call_as(methods::ENGINE_INFO, serde_json::json!({}))
+        .await
+    {
+        Ok(info) => Ok(info),
+        Err(RpcError::Failed(message))
+            if message == format!("unknown method: {}", methods::ENGINE_INFO) =>
+        {
+            #[derive(serde::Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct LocalDevice {
+                device_id: String,
+            }
+            let legacy: LocalDevice = client
+                .call_as(methods::LOCAL_DEVICE, serde_json::json!({}))
+                .await?;
+            Ok(EngineInfo {
+                device_id: legacy.device_id,
+                workspace_scope: WorkspaceScope::Synced,
+            })
+        }
+        Err(err) => Err(err),
     }
 }
 
@@ -1079,6 +1149,34 @@ mod tests {
         listener.local_addr().unwrap().port()
     }
 
+    struct LegacyIdentityRpc;
+
+    #[async_trait]
+    impl RpcService for LegacyIdentityRpc {
+        async fn handle(
+            &self,
+            method: &str,
+            _params: serde_json::Value,
+        ) -> Result<RpcReply, RpcError> {
+            match method {
+                methods::LOCAL_DEVICE => {
+                    RpcReply::value(&serde_json::json!({ "deviceId": "legacy-device" }))
+                }
+                other => Err(RpcError::UnknownMethod(other.into())),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_daemon_identity_falls_back_to_synced_scope() {
+        let client = memory_client(Arc::new(LegacyIdentityRpc));
+
+        let info = query_engine_info(&client).await.unwrap();
+
+        assert_eq!(info.device_id, "legacy-device");
+        assert_eq!(info.workspace_scope, WorkspaceScope::Synced);
+    }
+
     #[tokio::test]
     async fn bootstrap_embeds_engine_when_port_is_free() {
         let dir = tempfile::tempdir().unwrap();
@@ -1181,7 +1279,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn production_bootstrap_requires_sign_in_before_opening_engine_data() {
+    async fn production_bootstrap_opens_local_data_without_sign_in() {
         let dir = tempfile::tempdir().unwrap();
         let handle = EngineHandle::bootstrap(EngineBootConfig {
             data_dir: dir.path().to_path_buf(),
@@ -1195,6 +1293,14 @@ mod tests {
         .await
         .unwrap();
 
+        assert_eq!(handle.engine_info().workspace_scope, WorkspaceScope::Local);
+        let info: EngineInfo = handle
+            .client()
+            .call_as(methods::ENGINE_INFO, serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(info, *handle.engine_info());
+
         let mut auth = handle
             .client()
             .subscribe(methods::AUTH_STATUS, serde_json::json!({}))
@@ -1204,6 +1310,46 @@ mod tests {
             parse_auth_state(&auth.recv().await.unwrap()),
             Some(AuthState::SignedOut)
         );
+        let harnesses = handle
+            .client()
+            .call(methods::LIST_HARNESSES, serde_json::json!({}))
+            .await
+            .expect("local data RPC is immediately available");
+        assert!(harnesses.as_array().is_some_and(|items| !items.is_empty()));
+        assert!(
+            !dir.path().join("orgs/dev-org/dev-user").exists(),
+            "production boot must not create dev-user data"
+        );
+        assert!(dir.path().join("profiles/local").is_dir());
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn engine_info_is_available_while_cloud_onboarding_is_deferred() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("session.json"),
+            r#"{"refreshToken":"saved","user":{"id":"user_1","email":"u@example.com"}}"#,
+        )
+        .unwrap();
+        let handle = EngineHandle::bootstrap(EngineBootConfig {
+            data_dir: dir.path().to_path_buf(),
+            ipc_port: free_port().await,
+            edge_url: "http://127.0.0.1:1".into(),
+            edge_token: None,
+            org_id: None,
+            workos_client_id: Some("client_test".into()),
+            default_harness: HarnessId::Mock,
+        })
+        .await
+        .unwrap();
+
+        let info: EngineInfo = handle
+            .client()
+            .call_as(methods::ENGINE_INFO, serde_json::json!({}))
+            .await
+            .expect("EngineInfo bypasses deferred cloud stores");
+        assert_eq!(info.workspace_scope, WorkspaceScope::Synced);
         assert!(
             tokio::time::timeout(
                 std::time::Duration::from_millis(100),
@@ -1213,12 +1359,9 @@ mod tests {
             )
             .await
             .is_err(),
-            "data RPC must wait behind the production sign-in gate"
+            "cloud data waits for organization onboarding"
         );
-        assert!(
-            !dir.path().join("orgs/dev-org/dev-user").exists(),
-            "production boot must not create dev-user data"
-        );
+        assert!(!dir.path().join("orgs").exists());
         handle.shutdown().await;
     }
 
@@ -1254,6 +1397,10 @@ mod tests {
             EngineMode::Remote {
                 url: format!("ws://127.0.0.1:{port}")
             }
+        );
+        assert_eq!(
+            handle.engine_info().workspace_scope,
+            WorkspaceScope::Development
         );
         let harnesses = handle
             .client()

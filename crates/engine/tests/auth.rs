@@ -261,6 +261,7 @@ async fn dev_mode_is_signed_in_with_configured_bearer() {
     config.dev_user_id = "wing-dev".into();
     let auth = Auth::new(config);
     assert!(!auth.workos_enabled());
+    assert!(!auth.loaded_workos_session());
     assert!(matches!(auth.state(), AuthState::SignedIn { user, .. } if user.id == "wing-dev"));
     assert_eq!(auth.access_token().await.as_deref(), Some("wing-dev"));
     // Dev sign-in mirrors the TS service: a no-op URL, CompleteSignIn accepted.
@@ -276,6 +277,7 @@ async fn headless_flow_exchanges_pasted_code_and_gates_on_org() {
     let dir = tempfile::tempdir().expect("tempdir");
     let auth = Auth::new(workos_config(&edge.url(), dir.path()));
     assert!(auth.workos_enabled());
+    assert!(!auth.loaded_workos_session());
     assert_eq!(auth.state(), AuthState::SignedOut);
     assert_eq!(auth.access_token().await, None, "signed out: no token");
 
@@ -300,6 +302,10 @@ async fn headless_flow_exchanges_pasted_code_and_gates_on_org() {
     auth.complete_sign_in(&format!("{state}.code123"))
         .await
         .expect("paste-code sign-in");
+    assert!(
+        !auth.loaded_workos_session(),
+        "sign-in does not rewrite the startup fact"
+    );
     assert_eq!(edge.state.exchanges.load(Ordering::SeqCst), 1);
     assert!(
         matches!(auth.state(), AuthState::NeedsOrganization { user } if user.email == "w@example.com")
@@ -400,10 +406,15 @@ async fn revoked_refresh_token_signs_out() {
         auth.state().is_signed_in(),
         "boots from the persisted session"
     );
+    assert!(auth.loaded_workos_session());
 
     // The refresh is doomed → the session degrades to SignedOut and the file is gone.
     assert_eq!(auth.access_token().await, None);
     assert_eq!(auth.state(), AuthState::SignedOut);
+    assert!(
+        auth.loaded_workos_session(),
+        "revocation must not rewrite the captured startup fact"
+    );
     assert!(!dir.path().join("session.json").exists());
 }
 

@@ -14,6 +14,14 @@ pub enum WorkspaceScope {
     Development,
 }
 
+/// Stable information about the engine runtime reached by a client.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EngineInfo {
+    pub device_id: String,
+    pub workspace_scope: WorkspaceScope,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -31,5 +39,20 @@ mod tests {
                 scope
             );
         }
+    }
+
+    #[test]
+    fn engine_info_uses_camel_case_fields() {
+        let info = EngineInfo {
+            device_id: "device-1".into(),
+            workspace_scope: WorkspaceScope::Local,
+        };
+        assert_eq!(
+            serde_json::to_value(&info).unwrap(),
+            serde_json::json!({
+                "deviceId": "device-1",
+                "workspaceScope": "local",
+            })
+        );
     }
 }

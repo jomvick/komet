@@ -1,0 +1,164 @@
+//! Local-first startup boundaries and captured synced-session behavior.
+
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use komet_engine::{AuthState, Engine, EngineConfig, EngineInfo, HarnessId, WorkspaceScope};
+use komet_rpc::{memory_client, methods};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+fn config(
+    data_dir: &std::path::Path,
+    edge_url: String,
+    workos_client_id: Option<&str>,
+    edge_token: Option<&str>,
+) -> EngineConfig {
+    EngineConfig {
+        data_dir: data_dir.to_path_buf(),
+        edge_url,
+        edge_token: edge_token.map(str::to_string),
+        ipc_port: 0,
+        default_harness: HarnessId::Mock,
+        org_id: None,
+        workos_client_id: workos_client_id.map(str::to_string),
+    }
+}
+
+async fn rejecting_edge() -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let seen = requests.clone();
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let seen = seen.clone();
+            tokio::spawn(async move {
+                let mut request = [0u8; 4096];
+                let _ = stream.read(&mut request).await;
+                seen.fetch_add(1, Ordering::SeqCst);
+                let body = r#"{"error":"revoked"}"#;
+                let response = format!(
+                    "HTTP/1.1 401 Unauthorized\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    (format!("http://127.0.0.1:{port}"), requests, task)
+}
+
+#[tokio::test]
+async fn signed_out_workos_boot_serves_local_data_without_dev_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config(
+        dir.path(),
+        "http://127.0.0.1:1".into(),
+        Some("client_test"),
+        None,
+    );
+    let auth = Engine::build_auth(&config).await;
+    let scope = Engine::initial_workspace_scope(&auth);
+    let profile = Engine::resolve_profile(&config, &auth, scope)
+        .unwrap()
+        .expect("local profile is ready without auth");
+
+    assert_eq!(scope, WorkspaceScope::Local);
+    let runtime = Engine::assemble_runtime(&config, auth, profile)
+        .await
+        .unwrap();
+    let client = memory_client(runtime.core().rpc_service());
+    let info: EngineInfo = client
+        .call_as(methods::ENGINE_INFO, serde_json::json!({}))
+        .await
+        .unwrap();
+    assert_eq!(info.workspace_scope, WorkspaceScope::Local);
+    assert!(
+        client
+            .call(methods::LIST_HARNESSES, serde_json::json!({}))
+            .await
+            .unwrap()
+            .as_array()
+            .is_some_and(|items| !items.is_empty())
+    );
+    assert!(dir.path().join("profiles/local").is_dir());
+    assert!(!dir.path().join("orgs/dev-org/dev-user").exists());
+    assert!(runtime.core().links().is_none());
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn clean_local_auth_construction_does_not_probe_edge_health() {
+    let dir = tempfile::tempdir().unwrap();
+    let (edge_url, requests, edge_task) = rejecting_edge().await;
+    let config = config(dir.path(), edge_url, Some("client_test"), None);
+
+    let auth = Engine::build_auth(&config).await;
+
+    assert_eq!(
+        Engine::initial_workspace_scope(&auth),
+        WorkspaceScope::Local
+    );
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
+    edge_task.abort();
+}
+
+#[tokio::test]
+async fn revoked_captured_session_stays_on_its_synced_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("session.json"),
+        r#"{"refreshToken":"dead","user":{"id":"user_1","email":"u@example.com"},"orgId":"org_1"}"#,
+    )
+    .unwrap();
+    let (edge_url, requests, edge_task) = rejecting_edge().await;
+    let config = config(dir.path(), edge_url, Some("client_test"), None);
+    let auth = Engine::build_auth(&config).await;
+    let scope = Engine::initial_workspace_scope(&auth);
+    let profile = Engine::resolve_profile(&config, &auth, scope)
+        .unwrap()
+        .expect("persisted org resolves before refresh");
+
+    assert!(auth.loaded_workos_session());
+    assert_eq!(scope, WorkspaceScope::Synced);
+    let runtime = Engine::assemble_runtime(&config, auth.clone(), profile)
+        .await
+        .unwrap();
+
+    assert_eq!(auth.state(), AuthState::SignedOut);
+    assert!(auth.loaded_workos_session());
+    assert_eq!(runtime.workspace_scope(), WorkspaceScope::Synced);
+    assert!(dir.path().join("orgs/org_1/user_1").is_dir());
+    assert!(!dir.path().join("profiles/local").exists());
+    assert!(requests.load(Ordering::SeqCst) >= 1);
+    runtime.shutdown().await;
+    edge_task.abort();
+}
+
+#[tokio::test]
+async fn explicit_dev_bearer_keeps_online_routing_enabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = config(
+        dir.path(),
+        "http://127.0.0.1:1".into(),
+        None,
+        Some("dev-user@dev-org"),
+    );
+    let auth = Engine::build_auth(&config).await;
+    let scope = Engine::initial_workspace_scope(&auth);
+    let profile = Engine::resolve_profile(&config, &auth, scope)
+        .unwrap()
+        .expect("development profile is ready");
+
+    let runtime = Engine::assemble_runtime(&config, auth, profile)
+        .await
+        .unwrap();
+
+    assert_eq!(runtime.workspace_scope(), WorkspaceScope::Development);
+    assert!(runtime.core().links().is_some());
+    assert!(dir.path().join("orgs/dev-org/dev-user").is_dir());
+    runtime.shutdown().await;
+}
