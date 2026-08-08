@@ -1427,6 +1427,14 @@ mod tests {
             .await
             .unwrap();
         assert!(harnesses.as_array().is_some_and(|h| !h.is_empty()));
+        assert!(matches!(
+            handle
+                .client()
+                .call(methods::STOP_ENGINE, serde_json::json!({}))
+                .await,
+            Err(RpcError::Failed(message))
+                if message == format!("unknown method: {}", methods::STOP_ENGINE)
+        ));
     }
 
     fn chat(id: &str, created_min: i64, last_msg_min: Option<i64>) -> Chat {

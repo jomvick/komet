@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use komet_engine::{AuthState, Engine, EngineConfig, EngineInfo, HarnessId, WorkspaceScope};
-use komet_rpc::{memory_client, methods};
+use komet_rpc::{connect_ws, memory_client, methods};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn config(
@@ -188,4 +188,49 @@ async fn explicit_dev_bearer_keeps_online_routing_enabled() {
     assert!(runtime.core().links().is_some());
     assert!(dir.path().join("orgs/dev-org/dev-user").is_dir());
     runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn headless_stop_rpc_drains_the_daemon_and_releases_ipc() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap().port()
+    };
+    let mut engine_config = config(
+        dir.path(),
+        "http://127.0.0.1:1".into(),
+        Some("client_test"),
+        None,
+    );
+    engine_config.ipc_port = port;
+    let daemon = tokio::spawn(Engine::new(engine_config).run());
+
+    let client = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Ok(client) = connect_ws(&format!("ws://127.0.0.1:{port}")).await {
+                break client;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("headless IPC did not start");
+
+    assert_eq!(
+        client
+            .call(methods::STOP_ENGINE, serde_json::json!({}))
+            .await
+            .unwrap(),
+        serde_json::json!({ "ok": true })
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), daemon)
+        .await
+        .expect("headless engine did not stop")
+        .expect("headless task panicked")
+        .expect("headless shutdown failed");
+
+    tokio::net::TcpListener::bind(("127.0.0.1", port))
+        .await
+        .expect("headless IPC port remained occupied after shutdown");
 }

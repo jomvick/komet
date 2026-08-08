@@ -9,7 +9,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use async_trait::async_trait;
 pub use komet_proto::{EngineInfo, HarnessId, WorkspaceScope};
+use komet_rpc::{RpcError, RpcReply, RpcService, methods};
 
 use komet_sync::DocsStore;
 
@@ -368,6 +370,32 @@ pub struct EngineRuntime {
     _host_relay: Option<komet_rpc::HostRelay>,
 }
 
+/// IPC-only lifecycle control owned by `komet headless`. The regular
+/// [`EngineRpc`] deliberately does not expose this method, so a viewport
+/// attached to another headed process cannot shut down that process's engine.
+struct HeadlessRpc {
+    inner: Arc<dyn RpcService>,
+    stop_tx: tokio::sync::mpsc::UnboundedSender<()>,
+}
+
+#[async_trait]
+impl RpcService for HeadlessRpc {
+    async fn handle(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError> {
+        if method != methods::STOP_ENGINE {
+            return self.inner.handle(method, params).await;
+        }
+
+        let stop_tx = self.stop_tx.clone();
+        // Let the unary success frame reach the client before `Engine::run`
+        // aborts the IPC server and drains the runtime.
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let _ = stop_tx.send(());
+        });
+        RpcReply::value(&serde_json::json!({ "ok": true }))
+    }
+}
+
 impl EngineRuntime {
     pub fn core(&self) -> &EngineCore {
         &self.core
@@ -574,9 +602,21 @@ impl Engine {
         // A daemon exists to serve this port, so a bind failure is fatal here —
         // unlike the headed app, which can still work over its in-process
         // transport (see `serve_ipc`).
-        let server = serve_ipc(config.ipc_port, runtime.core().rpc_service()).await?;
+        let (stop_tx, mut stop_rx) = tokio::sync::mpsc::unbounded_channel();
+        let service: Arc<dyn RpcService> = Arc::new(HeadlessRpc {
+            inner: runtime.core().rpc_service(),
+            stop_tx,
+        });
+        let server = serve_ipc(config.ipc_port, service).await?;
 
-        shutdown_signal().await?;
+        tokio::select! {
+            result = shutdown_signal() => result?,
+            requested = stop_rx.recv() => {
+                if requested.is_some() {
+                    tracing::info!("headless shutdown requested over IPC");
+                }
+            }
+        }
         tracing::info!("shutting down");
         server.abort();
         runtime.shutdown().await;

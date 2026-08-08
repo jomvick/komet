@@ -42,8 +42,8 @@ use crate::settings::{
     SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, TERMINAL_DEFAULT_HEIGHT, UiSettings, platform_combo,
 };
 use crate::state::{
-    AppState, ConnectionStatus, EngineBootConfig, GatePhase, Indicator, OrgRow, format_time_ago,
-    org_name_valid, parse_orgs, sort_memberships,
+    AppState, ConnectionStatus, EngineBootConfig, EngineMode, GatePhase, Indicator, OrgRow,
+    format_time_ago, org_name_valid, parse_orgs, sort_memberships,
 };
 use crate::terminal::panel::{TerminalPanel, ToggleTerminal, clamp_terminal_height};
 use crate::theme::Theme;
@@ -566,6 +566,8 @@ pub struct Shell {
     sync_flow: SyncFlow,
     mutate_task: Option<Task<()>>,
     auth_task: Option<Task<()>>,
+    runtime_change_task: Option<Task<()>>,
+    runtime_change_error: Option<SharedString>,
     /// Kept for the failed-gate "Retry" action.
     boot: EngineBootConfig,
     data_dir: PathBuf,
@@ -747,6 +749,8 @@ impl Shell {
             sync_flow: SyncFlow::Idle,
             mutate_task: None,
             auth_task: None,
+            runtime_change_task: None,
+            runtime_change_error: None,
             boot,
             data_dir,
             settings,
@@ -1469,7 +1473,40 @@ impl Shell {
     }
 
     fn quit_for_runtime_change(&mut self, cx: &mut Context<Self>) {
-        cx.quit();
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.runtime_change_error = Some("Engine not connected".into());
+            cx.notify();
+            return;
+        };
+        if engine.mode() == EngineMode::InProcess {
+            cx.quit();
+            return;
+        }
+        if self.runtime_change_task.is_some() {
+            return;
+        }
+
+        self.runtime_change_error = None;
+        self.runtime_change_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(methods::STOP_ENGINE, serde_json::json!({}))
+                .await;
+            this.update(cx, |shell, cx| {
+                shell.runtime_change_task = None;
+                match result {
+                    Ok(_) => cx.quit(),
+                    Err(err) => {
+                        shell.runtime_change_error = Some(format!(
+                            "Could not stop the remote engine: {err}. Run `komet daemon stop`, then quit and reopen Komet."
+                        ).into());
+                        cx.notify();
+                    }
+                }
+            })
+            .ok();
+        }));
+        cx.notify();
     }
 
     fn start_sign_in(&mut self, cx: &mut Context<Self>) {
@@ -2744,6 +2781,18 @@ impl Shell {
             self.state.read(cx).auth.as_ref(),
             Some(AuthState::NeedsOrganization { .. })
         );
+        let remote_engine = self
+            .state
+            .read(cx)
+            .engine()
+            .is_some_and(|engine| matches!(engine.mode(), EngineMode::Remote { .. }));
+        let runtime_change_label = if self.runtime_change_task.is_some() {
+            "Stopping engine…"
+        } else if remote_engine {
+            "Stop daemon and quit"
+        } else {
+            "Quit Komet"
+        };
 
         if self.sync_flow == SyncFlow::Enabling && needs_org {
             return Some(self.render_org_gate(cx));
@@ -2798,9 +2847,23 @@ impl Shell {
                 .child(
                     div().mt(px(6.0)).child(popover::dialog_body(
                         &theme,
-                        "Quit and reopen Komet to start the synced workspace. Existing local sessions stay on this device and will not be uploaded.",
+                        if remote_engine {
+                            "Komet is using a background daemon. Stop it and quit Komet, then reopen to start the synced workspace. Existing local sessions stay on this device and will not be uploaded."
+                        } else {
+                            "Quit and reopen Komet to start the synced workspace. Existing local sessions stay on this device and will not be uploaded."
+                        },
                     )),
                 )
+                .when_some(self.runtime_change_error.clone(), |card, error| {
+                    card.child(
+                        div()
+                            .mt(px(10.0))
+                            .text_size(px(12.0))
+                            .line_height(px(17.0))
+                            .text_color(theme.danger)
+                            .child(error),
+                    )
+                })
                 .child(
                     div()
                         .mt(px(16.0))
@@ -2816,8 +2879,11 @@ impl Shell {
                                 })),
                         )
                         .child(
-                            popover::btn_primary(&theme, "Quit Komet")
+                            popover::btn_primary(&theme, runtime_change_label)
                                 .id("sync-restart-quit")
+                                .when(self.runtime_change_task.is_some(), |button| {
+                                    button.opacity(0.6)
+                                })
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.quit_for_runtime_change(cx)
                                 })),
@@ -3555,6 +3621,18 @@ impl Shell {
 
     fn render_signed_out_restart(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
+        let remote_engine = self
+            .state
+            .read(cx)
+            .engine()
+            .is_some_and(|engine| matches!(engine.mode(), EngineMode::Remote { .. }));
+        let runtime_change_label = if self.runtime_change_task.is_some() {
+            "Stopping engine…"
+        } else if remote_engine {
+            "Stop daemon and quit"
+        } else {
+            "Quit Komet"
+        };
         let card = div()
             .w(px(380.0))
             .px(px(32.0))
@@ -3590,12 +3668,29 @@ impl Shell {
                     .line_height(px(19.0))
                     .text_color(theme.text_muted)
                     .child(SharedString::from(
-                        "Quit and reopen Komet before continuing. This prevents the previous synced workspace from running without its credentials.",
+                        if remote_engine {
+                            "Komet is using a background daemon. Stop it and quit Komet before reopening so the previous synced workspace cannot keep running without its credentials."
+                        } else {
+                            "Quit and reopen Komet before continuing. This prevents the previous synced workspace from running without its credentials."
+                        },
                     )),
             )
+            .when_some(self.runtime_change_error.clone(), |card, error| {
+                card.child(
+                    div()
+                        .mb(px(16.0))
+                        .text_size(px(12.0))
+                        .line_height(px(17.0))
+                        .text_color(theme.danger)
+                        .child(error),
+                )
+            })
             .child(
-                popover::btn_primary(&theme, "Quit Komet")
+                popover::btn_primary(&theme, runtime_change_label)
                     .id("signed-out-quit")
+                    .when(self.runtime_change_task.is_some(), |button| {
+                        button.opacity(0.6)
+                    })
                     .on_click(cx.listener(|this, _, _, cx| this.quit_for_runtime_change(cx))),
             );
 
