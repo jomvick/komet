@@ -5240,6 +5240,26 @@ impl Render for Composer {
                 )
             });
 
+        // Turn-boundary steering notice: for agents without mid-turn
+        // injection (Grok over ACP today), a "steer" is queued and applies
+        // when the current turn finishes. Without this hint the queue read
+        // as a dropped steer (user report: "my steer didn't apply until
+        // grok already finished").
+        let steer_queues = mode == SendButtonMode::Steer
+            && self.pickers.read(cx).resolved_steering_mode(cx)
+                == Some(komet_proto::SteeringMode::TurnBoundary);
+        let container = container.when(steer_queues, |el| {
+            el.child(
+                div()
+                    .mt(px(6.0))
+                    .px(px(12.0))
+                    .text_size(px(11.0))
+                    .line_height(px(15.0))
+                    .text_color(theme.text_muted.opacity(0.8))
+                    .child("This agent can't be steered mid-turn — your message will be queued and sent when the current turn finishes."),
+            )
+        });
+
         if wizard_active {
             let wizard = self.render_wizard(cx);
             return container.child(motion::fade_quick("composer-wizard", div().child(wizard)));

@@ -80,6 +80,18 @@ case "$promptline" in
   fi
   ;;
 
+*scenario:many*)
+  # A wide read pass: 14 expandable chips — regression surface for the
+  # analytic group-height accounting (auto-height cards clipped the tail).
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Reading the workspace."}}'
+  i=1
+  while [ $i -le 14 ]; do
+    update "{\"sessionUpdate\":\"tool_call\",\"toolCallId\":\"r$i\",\"title\":\"read file $i\",\"kind\":\"read\",\"status\":\"completed\",\"rawInput\":{\"path\":\"/w/src/file_$i.rs\"},\"content\":[{\"type\":\"content\",\"content\":{\"type\":\"text\",\"text\":\"contents of file $i\"}}]}"
+    i=$((i+1))
+  done
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  ;;
+
 *scenario:happy*)
   update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Hello"}}'
   update '{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"thinking"}}'

@@ -1066,9 +1066,11 @@ pub struct Transcript {
     live_parsers: HashMap<String, IncrementalParser>,
     tree_cache: HashMap<String, (usize, Arc<BlockTree>)>,
     folds: HashMap<SharedString, FoldState>,
-    /// Open detail blocks (output/diff) per chip, keyed `"{row_id}#d{ix}"`.
-    /// Render-local like `folds` — never part of the row fingerprint.
-    tool_details: HashMap<SharedString, bool>,
+    /// Detail folds (output/diff) per chip, keyed `"{row_id}#d{ix}"` — full
+    /// [`FoldState`]s so detail bodies tween open/closed exactly like the
+    /// group fold. Render-local like `folds` — never part of the row
+    /// fingerprint.
+    tool_details: HashMap<SharedString, FoldState>,
     /// Streaming fade veils, one per live markdown row (dropped on completion).
     veils: HashMap<SharedString, Rc<RefCell<RowVeil>>>,
     /// Live rows present in the transcript's REPLAY after (re)attaching to a
@@ -2072,18 +2074,25 @@ impl Transcript {
     ) -> AnyElement {
         let fold = self.folds.get(row_id).copied().unwrap_or_default();
         let open = fold.open.unwrap_or(auto_open);
-        // Which chips have their detail block open (render-local, analytic).
-        let detail_opens: Vec<bool> = tools
+        // Which chips have their detail block open (render-local, analytic —
+        // the FINAL state; a mid-tween detail already counts as its target).
+        let detail_folds: Vec<FoldState> = tools
             .iter()
             .enumerate()
             .map(|(ix, tool)| {
-                tool.detail.is_some()
-                    && self
-                        .tool_details
-                        .get(&SharedString::from(format!("{row_id}#d{ix}")))
-                        .copied()
-                        .unwrap_or(false)
+                if tool.detail.is_none() {
+                    return FoldState::default();
+                }
+                self.tool_details
+                    .get(&SharedString::from(format!("{row_id}#d{ix}")))
+                    .copied()
+                    .unwrap_or_default()
             })
+            .collect();
+        let detail_opens: Vec<bool> = tools
+            .iter()
+            .zip(&detail_folds)
+            .map(|(tool, fold)| tool.detail.is_some() && fold.open.unwrap_or(false))
             .collect();
         let open_height = chips_height(tools.len())
             + tools
@@ -2149,11 +2158,27 @@ impl Transcript {
                     return tool_chip(tool, theme);
                 };
                 let open = detail_opens[ix];
+                let dfold = detail_folds[ix];
                 let key = SharedString::from(format!("{row_id}#d{ix}"));
                 // Expandable chip: ONE card whose header row is the chip and
                 // whose body is the detail — not a floating card below it.
                 // The guide rail stretches with the row, so an open detail
                 // never breaks the rail.
+                //
+                // The card's height is EXPLICIT (border-box), not intrinsic:
+                // an auto-height card adds its 2px of borders on top of the
+                // 30px header, and with N chips that overflowed the group's
+                // analytic height by 2N px — the last chips rendered clipped
+                // (user report: "tool calls cut off at the bottom"). The
+                // explicit height is also what the open/close tween animates.
+                let closed_h = CHIP_CARD_HEIGHT;
+                let open_h = CHIP_CARD_HEIGHT + detail_height(&detail);
+                let card_target = if open { open_h } else { closed_h };
+                let animating = dfold.epoch > 0
+                    && dfold
+                        .toggled_at
+                        .is_some_and(|at| at.elapsed() < FOLD_TWEEN_WINDOW);
+                let toggle_key = key.clone();
                 let mut card = div()
                     .my(px((CHIP_HEIGHT - CHIP_CARD_HEIGHT) / 2.0))
                     .ml(px(12.0))
@@ -2171,13 +2196,19 @@ impl Transcript {
                             .id(key.clone())
                             .cursor_pointer()
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                let open = this.tool_details.entry(key.clone()).or_insert(false);
-                                *open = !*open;
+                                let entry =
+                                    this.tool_details.entry(toggle_key.clone()).or_default();
+                                let currently_open = entry.open.unwrap_or(false);
+                                entry.from = if currently_open { open_h } else { closed_h };
+                                entry.open = Some(!currently_open);
+                                entry.epoch += 1;
+                                entry.toggled_at = Some(Instant::now());
                                 cx.notify();
                             }))
                             .child(chip_header(tool, open, theme)),
                     );
-                if open {
+                // The body stays mounted while the close tween shrinks over it.
+                if open || animating {
                     card = card
                         .child(
                             div()
@@ -2187,6 +2218,18 @@ impl Transcript {
                         )
                         .child(detail_body(&detail, theme));
                 }
+                let card: AnyElement = if animating {
+                    let from = dfold.from;
+                    card.with_animation(
+                        SharedString::from(format!("{key}-tween{}", dfold.epoch)),
+                        RESIZE.animation(),
+                        move |el, t| el.h(px(motion::lerp(from, card_target, t))),
+                    )
+                    .into_any_element()
+                } else {
+                    card.h(px(card_target)).into_any_element()
+                };
+                let card = div().min_w_0().flex_1().child(card);
                 div()
                     .w_full()
                     .flex_none()

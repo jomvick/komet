@@ -532,6 +532,17 @@ impl Pickers {
     /// The fully-resolved config the composer threads into the Run request and
     /// `Mutate createChat`: concrete model + reasoning whenever the catalog is
     /// loaded (no "engine picks a default" passthrough).
+    /// The resolved harness's steering mode, from the loaded descriptor list.
+    /// `None` while the catalog is loading (callers should assume the common
+    /// StepBoundary case and show nothing).
+    pub fn resolved_steering_mode(&self, cx: &App) -> Option<komet_proto::SteeringMode> {
+        let harness = self.effective_harness(cx)?;
+        self.harnesses
+            .ready()
+            .and_then(|list| list.iter().find(|d| d.id == harness))
+            .map(|d| d.steering_mode)
+    }
+
     pub fn resolved(&self, cx: &App) -> ResolvedRunConfig {
         ResolvedRunConfig {
             harness: self.effective_harness(cx),
