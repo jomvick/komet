@@ -1,6 +1,6 @@
-//! komet — headed by default; `komet headless` runs the engine alone. Auth is
-//! decoupled from the daemon: `komet login` persists the session and exits, so a
-//! service-managed `komet headless` only ever loads saved credentials.
+//! komet — headed by default; `komet headless` runs the engine alone. Both start
+//! local-only without credentials. `komet login` and `komet logout` select the
+//! profile used by the next engine start without mutating a live runtime.
 
 mod auth_cli;
 mod daemon;
@@ -17,13 +17,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run the engine without a UI (VPS / remote device mode).
+    /// Run the engine without a UI (local-only unless a saved session enables sync).
     Headless,
-    /// Sign in (paste-code flow), persist the session, and exit.
+    /// Sign in and enable sync on the next engine start.
     Login,
-    /// Remove the saved session.
+    /// Remove the saved session and return to local-only on the next start.
     Logout,
-    /// Show auth + engine status (exits nonzero when a sign-in is needed).
+    /// Show workspace mode, optional auth, and engine status.
     Status,
     /// Live sync introspection from the running engine: per-room connection
     /// state, last pushed-frame/ack ages, rejoin/probe/resync counters.
@@ -76,8 +76,8 @@ fn edge_url_from_env() -> String {
 
 /// WorkOS client id resolution: explicit env wins (empty string = dev mode);
 /// otherwise a `KOMET_EDGE_TOKEN` dev bearer keeps dev mode (smoke tests,
-/// local wrangler); otherwise the baked production client id — so a bare
-/// `komet headless` signs in against production with zero configuration.
+/// local wrangler); otherwise the baked production client id makes optional
+/// sync available while a bare start remains local-only.
 fn workos_client_id_from_env(edge_token: &Option<String>) -> Option<String> {
     match std::env::var("KOMET_WORKOS_CLIENT_ID") {
         Ok(v) if v.trim().is_empty() => None,
@@ -371,8 +371,10 @@ fn open_log_file_in(dir: &std::path::Path, mode: &str) -> Option<std::fs::File> 
         let rc = unsafe { libc::flock(existing.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc != 0 {
             // A live process owns the canonical log — leave it alone.
-            return std::fs::File::create(dir.join(format!("komet-{mode}.{}.log", std::process::id())))
-                .ok();
+            return std::fs::File::create(
+                dir.join(format!("komet-{mode}.{}.log", std::process::id())),
+            )
+            .ok();
         }
         // No live writer: rotate, create fresh, and lock it as ours. (The
         // probe's flock dies with `existing`; a first-ever launch has nothing
@@ -417,7 +419,10 @@ mod log_file_tests {
         // After the owner exits, a fresh launch rotates normally.
         drop(first);
         let third = open_log_file_in(dir, "headed").expect("third log");
-        assert!(dir.join("komet-headed.log.old").is_file(), "rotation resumes");
+        assert!(
+            dir.join("komet-headed.log.old").is_file(),
+            "rotation resumes"
+        );
         drop(third);
     }
 }
@@ -426,7 +431,9 @@ mod log_file_tests {
 /// only exist when a second instance raced a live one for the canonical log.
 #[cfg(unix)]
 fn sweep_stale_pid_logs(dir: &std::path::Path, mode: &str) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     let prefix = format!("komet-{mode}.");
     let week = std::time::Duration::from_secs(7 * 24 * 60 * 60);
     for entry in entries.flatten() {

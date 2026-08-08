@@ -4,8 +4,9 @@
 #   curl -fsSL https://komet.komet.sh/install.sh | sh
 #
 # Installs the self-contained native binary (no runtime deps) to
-# ~/.komet-native/app, puts `komet` on PATH, and — once you've signed in —
-# runs it as a systemd user service that survives reboots. Re-running
+# ~/.komet-native/app, puts `komet` on PATH, and runs it as a local-only
+# systemd user service that survives reboots. Signing in is optional and
+# enables sync after a restart. Re-running
 # upgrades in place; ~/.komet-native state is preserved.
 #
 # The binary ships with production endpoints baked in: no KOMET_EDGE_URL or
@@ -62,11 +63,8 @@ mkdir -p "$HOME/.local/bin"
 ln -sf "$app_root/current/komet" "$HOME/.local/bin/komet"
 
 # --- service -----------------------------------------------------------------
-# Auth is decoupled from the daemon: `komet login` persists the session and a
-# service-managed `komet headless` loads it (exiting with "run komet login
-# first" otherwise) — so the service starts only after first sign-in.
-signed_in=no
-[ -f "$data_root/session.json" ] && signed_in=yes
+# The daemon is useful before auth: without a saved session it serves the local
+# profile. Login only changes which profile the next daemon start selects.
 
 service=manual
 if command -v systemctl >/dev/null 2>&1 && [ -n "${XDG_RUNTIME_DIR:-}" ]; then
@@ -75,8 +73,6 @@ if command -v systemctl >/dev/null 2>&1 && [ -n "${XDG_RUNTIME_DIR:-}" ]; then
 [Unit]
 Description=Komet native headless engine
 After=network-online.target
-StartLimitIntervalSec=60
-StartLimitBurst=5
 
 [Service]
 ExecStart=%h/.komet-native/app/current/komet headless
@@ -88,13 +84,9 @@ EnvironmentFile=-%h/.komet-native/env
 WantedBy=default.target
 UNIT
   systemctl --user daemon-reload
-  systemctl --user enable komet-native >/dev/null 2>&1 || true
-  if [ "$signed_in" = yes ]; then
-    systemctl --user restart komet-native
-    service=running
-  else
-    service=ready
-  fi
+  systemctl --user enable komet-native
+  systemctl --user restart komet-native
+  service=running
   # Keep the user manager (and the engine) running without an active login.
   loginctl enable-linger "$USER" 2>/dev/null \
     || sudo -n loginctl enable-linger "$USER" 2>/dev/null \
@@ -117,15 +109,16 @@ echo "✓ komet $ver installed$path_hint"
 echo ""
 case "$service" in
   running)
-    echo "the engine restarted with the new version."
+    echo "the engine is running with the new version (local-only unless sync is enabled)."
     echo "  systemctl --user status komet-native    check the service"
-    ;;
-  ready)
-    echo "next steps:"
-    echo "  komet login                              sign in (paste-code) and exit"
-    echo "  systemctl --user start komet-native      then start the engine"
+    echo ""
+    echo "optional sync (local sessions stay local):"
+    echo "  systemctl --user stop komet-native"
+    echo "  komet login"
+    echo "  systemctl --user restart komet-native"
     ;;
   manual)
-    echo "next: \`komet login\` to sign in, then run the engine with \`komet headless\`."
+    echo "next: run the local-only engine with \`komet headless\`."
+    echo "optional sync: run \`komet login\` before starting the engine."
     ;;
 esac
