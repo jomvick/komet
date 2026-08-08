@@ -340,6 +340,22 @@ pub fn sort_memberships(mut orgs: Vec<OrgRow>) -> Vec<OrgRow> {
 // AppState entity
 // ---------------------------------------------------------------------------
 
+/// A composer send whose doc command is queued but not yet executed by the
+/// chat's host device — cleared when the host writes the user message back
+/// into the transcript (same client-minted id as the [`AppState::echoes`]
+/// dedup), or after [`PENDING_SEND_TTL_MS`].
+#[derive(Debug, Clone)]
+struct PendingSend {
+    message_id: String,
+    started: DateTime<Utc>,
+}
+
+/// How long the send-in-flight overlay may hold before the synced status
+/// shows through again. Covers the queue → nudge → drain → sync round-trip
+/// to a remote host; when the host is offline the dot falls back to the
+/// truth after this.
+pub const PENDING_SEND_TTL_MS: i64 = 30_000;
+
 /// Root application state. Reducer methods (`apply_*`, [`Self::session_for`], …)
 /// are plain `&mut self` functions so tests construct the struct directly; gpui
 /// glue ([`Self::bootstrap`], [`Self::select_chat`]) layers subscriptions on top.
@@ -364,6 +380,9 @@ pub struct AppState {
     /// Optimistic user echoes per chat id, shown until the doc frame carrying
     /// the same message id arrives (client-minted ids make dedup exact).
     echoes: HashMap<String, Vec<SessionMessageEntry>>,
+    /// Send-in-flight overlay per chat id: a queued doc command the host
+    /// hasn't executed yet (see [`Self::begin_pending_send`]).
+    pending_sends: HashMap<String, PendingSend>,
     /// This engine's device id (best-effort `LocalDevice` probe; `None` until
     /// the engine serves it — views degrade gracefully).
     pub local_device_id: Option<String>,
@@ -396,6 +415,7 @@ impl AppState {
             selected_chat: None,
             transcript: Vec::new(),
             echoes: HashMap::new(),
+            pending_sends: HashMap::new(),
             local_device_id: None,
             update: None,
             data_dir: None,
@@ -488,6 +508,7 @@ impl AppState {
             echoes.retain(|echo| !entries.iter().any(|e| e.id == echo.id));
         }
         self.transcript = entries;
+        self.ack_pending_send_from_transcript();
     }
 
     /// Apply a `WatchDocMessages` delta frame in place. `Err` = this copy has
@@ -503,6 +524,7 @@ impl AppState {
             let transcript = &self.transcript;
             echoes.retain(|echo| !transcript.iter().any(|e| e.id == echo.id));
         }
+        self.ack_pending_send_from_transcript();
         Ok(())
     }
 
@@ -518,6 +540,54 @@ impl AppState {
     pub fn remove_echo(&mut self, chat_id: &str, message_id: &str) {
         if let Some(echoes) = self.echoes.get_mut(chat_id) {
             echoes.retain(|e| e.id != message_id);
+        }
+    }
+
+    /// Composer send fired: overlay the chat as Working until the host writes
+    /// the user message back into the transcript (or the TTL lapses). A remote
+    /// send has no live session row until the host drains the queued command —
+    /// that gap read as "no live run" and flashed the Completed dot, and any
+    /// phantom Working→Idle edge in it rang the done-chime on send (user
+    /// report 2026-08-05).
+    pub fn begin_pending_send(&mut self, chat_id: &str, message_id: &str, now: DateTime<Utc>) {
+        self.pending_sends.insert(
+            chat_id.to_string(),
+            PendingSend {
+                message_id: message_id.to_string(),
+                started: now,
+            },
+        );
+    }
+
+    /// Send failed — drop the overlay so the dot tells the truth again. Only
+    /// removes the overlay this message started: a quick resend must not lose
+    /// its own overlay to the first send's failure cleanup.
+    pub fn end_pending_send(&mut self, chat_id: &str, message_id: &str) {
+        if self
+            .pending_sends
+            .get(chat_id)
+            .is_some_and(|p| p.message_id == message_id)
+        {
+            self.pending_sends.remove(chat_id);
+        }
+    }
+
+    /// Is a send still in flight for this chat (unacked, inside the TTL)?
+    pub fn send_pending(&self, chat_id: &str, now: DateTime<Utc>) -> bool {
+        self.pending_sends.get(chat_id).is_some_and(|p| {
+            now.signed_duration_since(p.started).num_milliseconds() <= PENDING_SEND_TTL_MS
+        })
+    }
+
+    /// The host executed the queued command iff the sent message's id showed
+    /// up in the transcript (it writes the message before — causally with —
+    /// the Working status; sessions.rs dispatch paths).
+    fn ack_pending_send_from_transcript(&mut self) {
+        if let Some(chat_id) = self.selected_chat.as_deref()
+            && let Some(pending) = self.pending_sends.get(chat_id)
+            && self.transcript.iter().any(|e| e.id == pending.message_id)
+        {
+            self.pending_sends.remove(chat_id);
         }
     }
 
@@ -588,8 +658,13 @@ impl AppState {
         self.selected_space_row().is_some_and(|s| s.git_detected)
     }
 
-    /// Full display status for a chat (tab dots, Active list).
+    /// Full display status for a chat (tab dots, Active list). A send in
+    /// flight ([`Self::begin_pending_send`]) reads as Working — the queued
+    /// command is as good as running.
     pub fn display_status_for(&self, chat: &Chat, now: DateTime<Utc>) -> ChatIndicator {
+        if self.send_pending(&chat.id, now) {
+            return ChatIndicator::Working;
+        }
         display_status(chat, self.session_for(&chat.id), now)
     }
 
@@ -604,7 +679,7 @@ impl AppState {
                     .as_deref()
                     .is_some_and(|id| self.space_row(id).is_some())
             })
-            .map(|c| (display_status(c, self.session_for(&c.id), now), c))
+            .map(|c| (self.display_status_for(c, now), c))
             .collect();
         sort_active(&mut rows);
         rows
@@ -614,8 +689,12 @@ impl AppState {
         self.sessions.iter().find(|s| s.chat_id == chat_id)
     }
 
-    /// Staleness-checked status dot for a chat row.
+    /// Staleness-checked status dot for a chat row. A send in flight reads as
+    /// Working (see [`Self::display_status_for`]).
     pub fn indicator_for(&self, chat_id: &str, now: DateTime<Utc>) -> Indicator {
+        if self.send_pending(chat_id, now) {
+            return Indicator::Working;
+        }
         effective_indicator(self.session_for(chat_id), now)
     }
 
@@ -1236,6 +1315,63 @@ mod tests {
             started_at: None,
             updated_at: now - TimeDelta::seconds(updated_secs_ago),
         }
+    }
+
+    fn user_entry(id: &str) -> SessionMessageEntry {
+        SessionMessageEntry {
+            id: id.into(),
+            role: komet_doc::MessageRole::User,
+            parts: Vec::new(),
+            created_at: 0,
+            device_id: "dev".into(),
+            status: None,
+            continuation_of: None,
+        }
+    }
+
+    #[test]
+    fn send_pending_overlays_working_until_ttl() {
+        let now = Utc::now();
+        let s_chat = chat("c", 0, Some(10)); // unseen, no session row
+        let mut s = AppState::new();
+        assert_eq!(s.display_status_for(&s_chat, now), ChatIndicator::Completed);
+        assert_eq!(s.indicator_for("c", now), Indicator::None);
+        s.begin_pending_send("c", "m1", now);
+        assert_eq!(s.display_status_for(&s_chat, now), ChatIndicator::Working);
+        assert_eq!(s.indicator_for("c", now), Indicator::Working);
+        // Time-bounded: an offline host must not leave an eternal spinner.
+        let later = now + TimeDelta::milliseconds(PENDING_SEND_TTL_MS + 1);
+        assert_eq!(
+            s.display_status_for(&s_chat, later),
+            ChatIndicator::Completed
+        );
+        assert_eq!(s.indicator_for("c", later), Indicator::None);
+    }
+
+    #[test]
+    fn send_pending_acked_when_the_host_writes_the_message_back() {
+        let now = Utc::now();
+        let mut s = AppState::new();
+        s.selected_chat = Some("c".into());
+        s.begin_pending_send("c", "m1", now);
+        // A frame without the message keeps the overlay.
+        s.apply_transcript(vec![user_entry("other")]);
+        assert!(s.send_pending("c", now));
+        // The host executed the command: our id comes back in the doc.
+        s.apply_transcript(vec![user_entry("other"), user_entry("m1")]);
+        assert!(!s.send_pending("c", now));
+    }
+
+    #[test]
+    fn send_failure_cleanup_only_ends_its_own_overlay() {
+        let now = Utc::now();
+        let mut s = AppState::new();
+        s.begin_pending_send("c", "m1", now);
+        s.begin_pending_send("c", "m2", now); // quick resend superseded m1
+        s.end_pending_send("c", "m1"); // m1's failure cleanup arrives late
+        assert!(s.send_pending("c", now), "m2's overlay must survive");
+        s.end_pending_send("c", "m2");
+        assert!(!s.send_pending("c", now));
     }
 
     #[test]

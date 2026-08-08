@@ -4389,6 +4389,10 @@ impl Composer {
                 s.select_chat(Some(chat_id.clone()), cx);
             }
             s.push_echo(&chat_id, echo);
+            // Working overlay until the host executes the queued command —
+            // without it a remote send flashed Completed (and could ring the
+            // done-chime) in the queue→drain→sync gap.
+            s.begin_pending_send(&chat_id, &message_id, chrono::Utc::now());
             cx.notify();
         });
 
@@ -4602,6 +4606,7 @@ impl Composer {
                     composer.failure = Some(message.into());
                     composer.state.update(cx, |s, cx| {
                         s.remove_echo(&err_chat_id, &err_message_id);
+                        s.end_pending_send(&err_chat_id, &err_message_id);
                         cx.notify();
                     });
                     composer.input.update(cx, |input, cx| input.set_text(restore_text, cx));
