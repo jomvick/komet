@@ -499,6 +499,39 @@ fn two_docs_converge_through_a_server() {
     ));
 }
 
+/// The command plane outruns the registry channel: the host's
+/// claim-on-first-command lands with NEWER clocks than the viewer's earlier
+/// `createChat`. The claim writes only the fields it knows, so the viewer's
+/// `config`/`title` must still land on merge (a full-row claim's `Null`
+/// writes deleted them — the missing-harness-icon clobber).
+#[test]
+fn late_create_chat_config_survives_a_prior_claim() {
+    let mut viewer = RegistryDoc::new("dev-viewer");
+    let mut host = RegistryDoc::new("dev-a");
+
+    // Viewer writes the real row first (older clocks)…
+    viewer.upsert_chat(&chat("chat-race", "dev-a")).unwrap();
+    // …then the host claims the same chat before that row reaches it. (Real
+    // claims trail by whole seconds; the sleep keeps the HLCs out of the
+    // same-millisecond device-id tiebreak.)
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    host.claim_chat("chat-race", Some("/tmp/repo"), Some("space-1"), ts(9_000));
+
+    let mut server = HashMap::new();
+    let mut seq = 0u64;
+    server_round(&mut server, &mut seq, &mut [&mut viewer, &mut host]);
+
+    for doc in [&viewer, &host] {
+        let merged = doc.chat("chat-race").unwrap().expect("merged row");
+        // Claimed fields (newer clocks) stand…
+        assert_eq!(merged.device_id, "dev-a");
+        assert_eq!(merged.space_id.as_deref(), Some("space-1"));
+        // …and the fields the claim never wrote come from the createChat.
+        assert_eq!(merged.config, chat("chat-race", "dev-a").config);
+        assert_eq!(merged.title.as_deref(), Some("First chat"));
+    }
+}
+
 #[test]
 fn delete_space_cascades_and_converges() {
     let mut a = RegistryDoc::new("dev-a");

@@ -304,6 +304,7 @@ mod tests {
     fn run_request() -> RunRequest {
         RunRequest {
             prompt: "hello".into(),
+            harness: None,
             model: None,
             reasoning: None,
             model_options: Default::default(),

@@ -242,6 +242,10 @@ let commandDefaultTtlMs: Int64 = 86_400_000
 /// kebab-case ("claude-code").
 struct RunRequest: Codable {
     var prompt: String
+    /// Harness id ("claude-code") picked at send time; rides the command so
+    /// the host's claim-on-first-command records it even when the chat row is
+    /// still syncing.
+    var harness: String?
     var model: String?
     var reasoning: String?
     var modelOptions: [String: String] = [:]

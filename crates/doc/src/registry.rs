@@ -834,6 +834,32 @@ impl RegistryDoc {
         Ok(())
     }
 
+    /// Claim-on-first-command row: ONLY the fields the claim actually knows
+    /// (identity, cwd, space). Absent fields carry no clocked write, so the
+    /// real `createChat` upsert — racing behind on the registry channel with
+    /// older clocks — still lands its `config`/`title` under per-field LWW
+    /// instead of losing them to `Null` deletes.
+    pub fn claim_chat(
+        &mut self,
+        chat_id: &str,
+        cwd: Option<&str>,
+        space_id: Option<&str>,
+        created_at: DateTime<Utc>,
+    ) {
+        let mut set = fields([
+            ("id", json!(chat_id)),
+            ("deviceId", json!(self.device_id())),
+            ("createdAt", json!(created_at.timestamp_millis())),
+        ]);
+        if let Some(cwd) = cwd {
+            set.insert("cwd".into(), json!(cwd));
+        }
+        if let Some(space_id) = space_id {
+            set.insert("spaceId".into(), json!(space_id));
+        }
+        self.write(KIND_CHATS, chat_id, OpKind::Upsert, set);
+    }
+
     /// Synced seen marker (LWW) with a monotonic guard: no write when the
     /// stored stamp is already >= `at`.
     pub fn set_chat_seen(&mut self, chat_id: &str, at: DateTime<Utc>) -> Result<bool, DocError> {

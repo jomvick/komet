@@ -688,6 +688,17 @@ impl DocHost {
             .unwrap_or(self.inner.config.default_harness)
     }
 
+    /// The harness a request dispatches on: the request's own pick when it
+    /// carries one (rides the command plane, immune to registry-row races),
+    /// else [`Self::harness_for`].
+    pub(crate) fn harness_for_request(
+        &self,
+        chat_id: &str,
+        request: &komet_proto::RunRequest,
+    ) -> HarnessId {
+        request.harness.unwrap_or_else(|| self.harness_for(chat_id))
+    }
+
     /// Drain pending commands (host-only): evaluate → mark processed BEFORE execute →
     /// execute → write the outcome as the sole outcome writer.
     pub async fn drain_commands(&self, handle: &Arc<ChatDocHandle>) {
@@ -797,7 +808,26 @@ impl DocHost {
                 if let Some(ws) = self.workspace() {
                     ws.claim_chat(chat_id, Some(&request.cwd))?;
                 }
-                let harness = self.harness_for(chat_id);
+                let harness = self.harness_for_request(chat_id, request);
+                // A row with no config renders no harness glyph (and every
+                // later dispatch falls back to the engine default), so stamp
+                // what this run actually executes with. Claimed rows and
+                // catalog-not-loaded createChats both land here; the racing
+                // real createChat carries the same picked values.
+                if let Some(ws) = self.workspace()
+                    && ws.chat_config(chat_id).is_none()
+                {
+                    let config = komet_proto::ChatConfig {
+                        harness,
+                        model: request.model.clone(),
+                        reasoning: request.reasoning,
+                        model_options: request.model_options.clone(),
+                        sandbox: request.sandbox,
+                    };
+                    if let Err(err) = ws.set_chat_config(chat_id, &config) {
+                        tracing::warn!(chat = %chat_id, error = %err, "run-config backfill failed");
+                    }
+                }
                 sessions
                     .dispatch(chat_id, harness, request.clone(), Some(message_id.clone()))
                     .await?;
@@ -829,13 +859,9 @@ impl DocHost {
                         // turn's images; this steer's own refs (if any) already
                         // ride the prompt text.
                         request.attachments = Vec::new();
+                        let harness = self.harness_for_request(chat_id, &request);
                         sessions
-                            .dispatch(
-                                chat_id,
-                                self.harness_for(chat_id),
-                                request,
-                                message_id.clone(),
-                            )
+                            .dispatch(chat_id, harness, request, message_id.clone())
                             .await?;
                         Ok((
                             SessionCommandStatus::Applied,
@@ -907,9 +933,8 @@ impl DocHost {
                     tracing::warn!(chat = %chat_id, request = %request_id, error = %err,
                         "orphaned input resolve failed");
                 }
-                sessions
-                    .dispatch(chat_id, self.harness_for(chat_id), request, None)
-                    .await?;
+                let harness = self.harness_for_request(chat_id, &request);
+                sessions.dispatch(chat_id, harness, request, None).await?;
                 Ok((
                     SessionCommandStatus::Applied,
                     Some("answered as new turn".into()),
@@ -939,6 +964,7 @@ impl DocHost {
         let config = chat.config;
         Some(komet_proto::RunRequest {
             prompt: prompt.to_string(),
+            harness: config.as_ref().map(|c| c.harness),
             model: config.as_ref().and_then(|c| c.model.clone()),
             reasoning: config.as_ref().and_then(|c| c.reasoning),
             model_options: config

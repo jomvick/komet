@@ -163,6 +163,7 @@ impl TitleGenerator {
         for attempt in 0..=RETRY_DELAYS_MS.len() {
             let request = RunRequest {
                 prompt: title_prompt.clone(),
+                harness: Some(harness_id),
                 model: cheap.clone(),
                 reasoning: Some(ReasoningLevel::Minimal),
                 model_options: serde_json::Map::new(),

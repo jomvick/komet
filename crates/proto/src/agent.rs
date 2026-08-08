@@ -82,6 +82,12 @@ pub struct ModelOptionChoice {
 #[serde(rename_all = "camelCase")]
 pub struct RunRequest {
     pub prompt: String,
+    /// The harness picked at send time. Rides the command plane so
+    /// claim-on-first-command (chat row still in flight on the registry
+    /// channel) dispatches — and records — the picked harness instead of the
+    /// engine default. Additive + serde-defaulted for wire compat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub harness: Option<HarnessId>,
     pub model: Option<String>,
     pub reasoning: Option<ReasoningLevel>,
     /// Harness-specific option selections (option id -> choice id), JSON round-tripped.

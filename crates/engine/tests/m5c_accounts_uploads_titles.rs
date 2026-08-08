@@ -554,6 +554,7 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
 
     let request = komet_proto::RunRequest {
         prompt: "please fix the login flow".into(),
+        harness: None,
         model: None,
         reasoning: None,
         model_options: serde_json::Map::new(),
@@ -597,6 +598,7 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
         .expect("rename");
     let request = komet_proto::RunRequest {
         prompt: "another request".into(),
+        harness: None,
         model: None,
         reasoning: None,
         model_options: serde_json::Map::new(),
@@ -611,11 +613,7 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
         .await
         .expect("second dispatch");
     tokio::time::sleep(Duration::from_millis(400)).await;
-    let chat = core
-        .workspace
-        .chat(chat_id)
-        .expect("chat")
-        .expect("row");
+    let chat = core.workspace.chat(chat_id).expect("chat").expect("row");
     assert_eq!(chat.title.as_deref(), Some("My Custom Name"));
     core.shutdown().await;
 }

@@ -146,6 +146,7 @@ where
 fn run_request(prompt: &str) -> RunRequest {
     RunRequest {
         prompt: prompt.into(),
+        harness: None,
         model: None,
         reasoning: None,
         model_options: Default::default(),
@@ -159,6 +160,22 @@ fn run_request(prompt: &str) -> RunRequest {
 
 /// Queue a run command into a chat doc the way a remote viewer would (ledger rule 1).
 fn queue_run(core: &EngineCore, chat_id: &str, command_id: &str, message_id: &str) {
+    queue_run_with(
+        core,
+        chat_id,
+        command_id,
+        message_id,
+        run_request("go do it"),
+    );
+}
+
+fn queue_run_with(
+    core: &EngineCore,
+    chat_id: &str,
+    command_id: &str,
+    message_id: &str,
+    request: RunRequest,
+) {
     let handle = core.doc_host.open(chat_id).expect("open chat");
     let now = chrono::Utc::now().timestamp_millis();
     handle
@@ -166,7 +183,7 @@ fn queue_run(core: &EngineCore, chat_id: &str, command_id: &str, message_id: &st
         .queue_command(&SessionCommandEntry {
             id: command_id.into(),
             payload: SessionCommandPayload::Run {
-                request: run_request("go do it"),
+                request,
                 message_id: message_id.into(),
             },
             issued_by: VIEWER.into(),
@@ -352,6 +369,97 @@ async fn claim_on_first_command_creates_the_chat_row() {
     drop(link);
     a.shutdown().await;
     b.shutdown().await;
+}
+
+/// A first command whose cwd is a linked WORKTREE must attribute the chat to
+/// the parent checkout's space — claiming at the worktree path minted a
+/// phantom sidebar space named after the worktree folder.
+#[tokio::test]
+async fn claim_resolves_a_worktree_cwd_to_the_repo_root_space() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), "dev-a");
+    let client = komet_rpc::memory_client(core.rpc_service());
+
+    // A checkout with a linked worktree — fs layout only; the claim path
+    // reads `.git` without spawning git.
+    let repo = tempfile::tempdir().unwrap();
+    let root = repo.path().join("proj");
+    let wt = repo.path().join("clever-ember");
+    std::fs::create_dir_all(root.join(".git/worktrees/clever-ember")).unwrap();
+    std::fs::create_dir_all(&wt).unwrap();
+    std::fs::write(
+        wt.join(".git"),
+        format!(
+            "gitdir: {}\n",
+            root.join(".git/worktrees/clever-ember").display()
+        ),
+    )
+    .unwrap();
+
+    // The project's space already exists (the normal state — sessions are
+    // created FROM a space).
+    client
+        .call(
+            methods::MUTATE,
+            serde_json::json!({
+                "op": "createSpace", "spaceId": "space-proj", "deviceId": "dev-a",
+                "path": root.to_string_lossy(),
+            }),
+        )
+        .await
+        .expect("create space");
+
+    let request = RunRequest {
+        cwd: wt.to_string_lossy().into_owned(),
+        ..run_request("go do it")
+    };
+    queue_run_with(&core, "chat-wt", "cmd-wt-1", "m-1", request);
+    wait_for(
+        || {
+            core.workspace
+                .chat("chat-wt")
+                .ok()
+                .flatten()
+                .is_some_and(|c| c.space_id.as_deref() == Some("space-proj"))
+        },
+        "worktree chat attributed to the project space",
+    )
+    .await;
+    let spaces = core.workspace.read_spaces().unwrap_or_default();
+    assert_eq!(
+        spaces.len(),
+        1,
+        "no phantom space for the worktree: {spaces:?}"
+    );
+    core.shutdown().await;
+}
+
+/// The claimed row records the harness the run actually dispatched on (the
+/// request carries the picked harness) — without it the sidebar renders no
+/// harness glyph and later dispatches silently fall back to the default.
+#[tokio::test]
+async fn claimed_chat_row_records_the_run_harness() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), "dev-a");
+
+    let request = RunRequest {
+        harness: Some(HarnessId::Cursor),
+        ..run_request("go do it")
+    };
+    queue_run_with(&core, "chat-glyph", "cmd-glyph-1", "m-1", request);
+    wait_for(
+        || {
+            core.workspace
+                .chat("chat-glyph")
+                .ok()
+                .flatten()
+                .and_then(|c| c.config)
+                .is_some_and(|c| c.harness == HarnessId::Cursor)
+        },
+        "claimed row carries the dispatched harness",
+    )
+    .await;
+    core.shutdown().await;
 }
 
 #[tokio::test]

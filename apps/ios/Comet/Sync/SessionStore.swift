@@ -301,6 +301,7 @@ final class SessionStore {
         }
         let messageId = UUID().uuidString.lowercased()
         let request = RunRequest(prompt: prompt,
+                                 harness: chat.config?.harness,
                                  model: chat.config?.model,
                                  reasoning: chat.config?.reasoning,
                                  cwd: chat.cwd ?? "",

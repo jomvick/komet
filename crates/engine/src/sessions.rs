@@ -542,6 +542,7 @@ impl SessionsEngine {
                         let (_, cwd) = sessions.inner.journal_harness_session(&chat_id)?;
                         Some(RunRequest {
                             prompt: String::new(),
+                            harness: None,
                             model: None,
                             reasoning: None,
                             model_options: Default::default(),
@@ -559,7 +560,7 @@ impl SessionsEngine {
                 request.prompt = prompt_text;
                 request.resume = None; // dispatch re-injects the remembered session
                 request.attachments = Vec::new();
-                let harness_id = host.harness_for(&chat_id);
+                let harness_id = host.harness_for_request(&chat_id, &request);
                 match sessions
                     .dispatch(&chat_id, harness_id, request, Some(user_id))
                     .await

@@ -8,6 +8,7 @@ fn run_request_attachments_survive_command_round_trip() {
     let doc = SessionDoc::init("chat-1").unwrap();
     let request = komet_proto::RunRequest {
         prompt: "p".into(),
+        harness: None,
         model: None,
         reasoning: None,
         model_options: Default::default(),

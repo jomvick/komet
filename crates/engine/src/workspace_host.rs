@@ -498,13 +498,17 @@ impl WorkspaceHost {
     /// Claim-on-first-command: create the chat row under OUR device id when a run
     /// command arrives for a chat with no row yet. No-op when the row exists.
     ///
+    /// The claim is a PARTIAL row write (identity/cwd/space only): the command
+    /// plane is nudged and outruns the registry channel, so the client's
+    /// `createChat` for the same chat routinely arrives AFTER the claim with
+    /// older clocks — fields the claim never wrote (`config`, `title`) must
+    /// still land then.
+    ///
     /// Spaces invariant: every chat belongs to a space, so the claim resolves an
     /// own-device space matching `cwd` — or auto-creates one (gitDetected false;
     /// SpacesSync corrects on its next pass). A cwd-less claim (e.g. note_message
     /// racing ahead of the run command) leaves `spaceId` unset; the row is
-    /// invisible to the UI until a spaced claim/create lands. NOTE: a worktree
-    /// cwd claims a space *at the worktree path*, not the repo root — acceptable
-    /// for tooling-only (raw doc command) traffic.
+    /// invisible to the UI until a spaced claim/create lands.
     pub fn claim_chat(&self, chat_id: &str, cwd: Option<&str>) -> Result<(), EngineError> {
         if self.read(|doc| doc.chat(chat_id))?.is_some() {
             return Ok(());
@@ -513,42 +517,37 @@ impl WorkspaceHost {
             Some(cwd) => Some(self.space_for_path(cwd)?),
             None => None,
         };
-        self.mutate(|doc| {
-            doc.upsert_chat(&Chat {
-                id: chat_id.to_string(),
-                device_id: doc.device_id().to_string(),
-                title: None,
-                archived: false,
-                cwd: cwd.map(str::to_string),
-                branch: None,
-                checkout_id: None,
-                config: None,
-                last_message_preview: None,
-                last_message_at: None,
-                created_at: Utc::now(),
-                harness_session_id: None,
-                harness_session_cwd: None,
-                space_id,
-                last_seen_at: None,
-            })
-        })?;
+        self.mutate(|doc| doc.claim_chat(chat_id, cwd, space_id.as_deref(), Utc::now()));
         Ok(())
     }
 
-    /// An own-device space whose path matches, else a freshly created one.
+    /// An own-device space whose path matches, else one at the path's parent
+    /// checkout root, else a freshly created one at that root.
+    ///
+    /// A linked-worktree cwd resolves to the checkout root FIRST: claiming at
+    /// the worktree path itself minted a phantom sidebar space named after the
+    /// worktree folder ("clever-ember") next to the project's real space.
     fn space_for_path(&self, path: &str) -> Result<String, EngineError> {
         let device_id = &self.inner.config.device_id;
-        if let Some(space) = self
-            .read(|doc| doc.read_spaces())?
-            .into_iter()
+        let spaces = self.read(|doc| doc.read_spaces())?;
+        if let Some(space) = spaces
+            .iter()
             .find(|s| s.device_id == *device_id && s.path == path)
         {
-            return Ok(space.id);
+            return Ok(space.id.clone());
+        }
+        let root = linked_worktree_root(std::path::Path::new(path));
+        if let Some(root) = root.as_deref()
+            && let Some(space) = spaces
+                .iter()
+                .find(|s| s.device_id == *device_id && s.path == root)
+        {
+            return Ok(space.id.clone());
         }
         let space = Space {
             id: crate::new_id(),
             device_id: device_id.clone(),
-            path: path.to_string(),
+            path: root.unwrap_or_else(|| path.to_string()),
             name: None,
             git_detected: false,
             git_checked_at: None,
@@ -992,6 +991,35 @@ impl WorkspaceHostInner {
     }
 }
 
+/// The parent checkout root of a linked git worktree: `<path>/.git` is a FILE
+/// containing `gitdir: <root>/.git/worktrees/<name>`. `None` for a primary
+/// checkout (`.git` is a directory), a non-repo folder, or any other layout
+/// (bare-repo worktrees have no `<root>` working copy to attribute to). Pure
+/// fs reads — no git subprocess; this runs on the synchronous claim path.
+fn linked_worktree_root(path: &std::path::Path) -> Option<String> {
+    let gitfile = path.join(".git");
+    if !std::fs::metadata(&gitfile).ok()?.is_file() {
+        return None;
+    }
+    let content = std::fs::read_to_string(&gitfile).ok()?;
+    let target = content
+        .lines()
+        .find_map(|line| line.strip_prefix("gitdir:"))?
+        .trim();
+    let mut target = std::path::PathBuf::from(target);
+    if target.is_relative() {
+        // Rare (`worktree.useRelativePaths`); canonicalize resolves the
+        // `../..` hops against the real filesystem.
+        target = std::fs::canonicalize(path.join(target)).ok()?;
+    }
+    let worktrees = target.parent()?;
+    let dot_git = worktrees.parent()?;
+    if worktrees.file_name()? != "worktrees" || dot_git.file_name()? != ".git" {
+        return None;
+    }
+    Some(dot_git.parent()?.to_string_lossy().into_owned())
+}
+
 /// Local live statuses win for this device's chats; every other device's rows come
 /// from the registry. Sorted by chat id (stable stream output).
 fn merge_sessions(device_id: &str, rows: &[Session], local: &[Session]) -> Vec<Session> {
@@ -1128,5 +1156,49 @@ async fn workspace_task(weak: Weak<WorkspaceHostInner>, mut changed_rx: watch::R
                 inner.publish();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::linked_worktree_root;
+
+    #[test]
+    fn linked_worktree_resolves_to_the_checkout_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("proj");
+        let wt = dir.path().join("clever-ember");
+        std::fs::create_dir_all(root.join(".git").join("worktrees").join("clever-ember")).unwrap();
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::write(
+            wt.join(".git"),
+            format!(
+                "gitdir: {}\n",
+                root.join(".git/worktrees/clever-ember").display()
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            linked_worktree_root(&wt).as_deref(),
+            Some(root.to_str().unwrap())
+        );
+    }
+
+    #[test]
+    fn primary_checkouts_and_plain_folders_resolve_to_none() {
+        let dir = tempfile::tempdir().unwrap();
+        // Primary checkout: `.git` is a directory.
+        let primary = dir.path().join("primary");
+        std::fs::create_dir_all(primary.join(".git")).unwrap();
+        assert_eq!(linked_worktree_root(&primary), None);
+        // Not a repo at all.
+        let plain = dir.path().join("plain");
+        std::fs::create_dir_all(&plain).unwrap();
+        assert_eq!(linked_worktree_root(&plain), None);
+        // A `.git` file pointing somewhere that is not `<root>/.git/worktrees/<name>`.
+        let odd = dir.path().join("odd");
+        std::fs::create_dir_all(&odd).unwrap();
+        std::fs::write(odd.join(".git"), "gitdir: /somewhere/else\n").unwrap();
+        assert_eq!(linked_worktree_root(&odd), None);
     }
 }
