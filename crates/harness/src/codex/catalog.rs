@@ -1,4 +1,4 @@
-//! Model catalog + effort/sandbox mapping for Codex, ported from komet's
+//! Model catalog + effort mapping for Codex, ported from komet's
 //! `packages/harness/src/codex.ts`.
 //!
 //! The TS harness discovers models live via the app server's `model/list`
@@ -7,7 +7,7 @@
 //! short-lived `codex app-server` + `model/list` pagination can later be
 //! spliced in (same call t3code's Codex provider makes).
 
-use komet_proto::{Model, ModelOption, ModelOptionChoice, ReasoningLevel, SandboxLevel};
+use komet_proto::{Model, ModelOption, ModelOptionChoice, ReasoningLevel};
 
 /// The unified reasoning ladder Codex accepts (`minimal` is offered but clamped
 /// on the wire — see [`to_effort`]).
@@ -35,37 +35,6 @@ pub(crate) fn to_effort(reasoning: Option<ReasoningLevel>) -> Option<&'static st
         ReasoningLevel::Max => "max",
         ReasoningLevel::Ultra => "ultra",
     })
-}
-
-/// `thread/start`'s `sandbox` param (kebab-case wire words).
-pub(crate) fn sandbox_mode(sandbox: SandboxLevel) -> &'static str {
-    match sandbox {
-        SandboxLevel::ReadOnly => "read-only",
-        SandboxLevel::WorkspaceWrite => "workspace-write",
-        SandboxLevel::DangerFullAccess => "danger-full-access",
-    }
-}
-
-/// `turn/start`'s `sandboxPolicy.type` (camelCase variant of the same policy).
-pub(crate) fn sandbox_policy_type(sandbox: SandboxLevel) -> &'static str {
-    match sandbox {
-        SandboxLevel::ReadOnly => "readOnly",
-        SandboxLevel::WorkspaceWrite => "workspaceWrite",
-        SandboxLevel::DangerFullAccess => "dangerFullAccess",
-    }
-}
-
-/// `turn/start`'s full `sandboxPolicy` object. Workspace-write keeps network
-/// access: komet agents fetch deps and hit APIs unattended, and with the
-/// approval policy pinned to "never" a network-less sandbox would fail those
-/// commands with no escalation path.
-pub(crate) fn sandbox_policy_value(sandbox: SandboxLevel) -> serde_json::Value {
-    let mut policy = serde_json::Map::new();
-    policy.insert("type".into(), sandbox_policy_type(sandbox).into());
-    if matches!(sandbox, SandboxLevel::WorkspaceWrite) {
-        policy.insert("networkAccess".into(), true.into());
-    }
-    serde_json::Value::Object(policy)
 }
 
 const ULTRA_LADDER: &[ReasoningLevel] = &[
@@ -185,20 +154,6 @@ mod tests {
         assert_eq!(to_effort(Some(ReasoningLevel::Ultrathink)), Some("xhigh"));
         assert_eq!(to_effort(Some(ReasoningLevel::Max)), Some("max"));
         assert_eq!(to_effort(Some(ReasoningLevel::Ultra)), Some("ultra"));
-    }
-
-    #[test]
-    fn sandbox_maps_both_spellings() {
-        assert_eq!(sandbox_mode(SandboxLevel::ReadOnly), "read-only");
-        assert_eq!(sandbox_policy_type(SandboxLevel::ReadOnly), "readOnly");
-        assert_eq!(
-            sandbox_policy_type(SandboxLevel::WorkspaceWrite),
-            "workspaceWrite"
-        );
-        assert_eq!(
-            sandbox_mode(SandboxLevel::DangerFullAccess),
-            "danger-full-access"
-        );
     }
 
     #[test]

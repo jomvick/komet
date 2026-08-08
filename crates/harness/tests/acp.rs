@@ -229,6 +229,87 @@ async fn config_options_apply_requested_model_and_effort() {
 }
 
 #[tokio::test]
+async fn question_shaped_requests_bridge_to_the_input_panel() {
+    // The controls' bridge answers every question with its FIRST option
+    // label — build controls that answer "Use tokio" specifically.
+    let (steer_tx, steer_rx) = mpsc::channel(8);
+    let token = CancellationToken::new();
+    let controls = RunControls {
+        request_input: Box::new(move |questions| {
+            let (tx, rx) = oneshot::channel();
+            let answers: Vec<UserInputAnswer> = questions
+                .iter()
+                .map(|q| UserInputAnswer {
+                    question_id: q.id.clone(),
+                    labels: vec!["Use tokio".into()],
+                })
+                .collect();
+            let _ = tx.send(answers);
+            rx
+        }),
+        steering: steer_rx,
+        interrupt: token.clone(),
+    };
+    let _keep = (steer_tx, token);
+    let events = run_to_end(&harness(), request("scenario:question"), controls).await;
+    // The fixture answers refusal unless the harness relayed the choice
+    // (optionId opt-tokio) instead of auto-accepting.
+    assert!(
+        events.contains(&AgentEvent::TextDelta {
+            text: "answered".into()
+        }),
+        "{events:?}"
+    );
+    assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
+}
+
+#[tokio::test]
+async fn claude_and_codex_specs_drive_the_same_wire() {
+    // The whole point of the conversion: the claude/codex specs run against
+    // the same fake ACP agent with no per-agent protocol code. Model ids in
+    // the fixture are grok-flavored, so config sets simply skip.
+    for (name, h) in [
+        (
+            "claude",
+            AcpHarness::claude().with_executable(fixture_path()),
+        ),
+        ("codex", AcpHarness::codex().with_executable(fixture_path())),
+    ] {
+        let (controls, _steer, _token) = controls();
+        let events = run_to_end(&h, request("scenario:happy"), controls).await;
+        assert!(
+            events.contains(&AgentEvent::TextDelta {
+                text: "Hello".into()
+            }),
+            "{name}: {events:?}"
+        );
+        assert_eq!(
+            dones(&events),
+            vec![(DoneStatus::Completed, None)],
+            "{name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn ultrathink_prefixes_the_prompt_for_claude() {
+    let (controls, _steer, _token) = controls();
+    let h = AcpHarness::claude().with_executable(fixture_path());
+    let mut req = request("scenario:echo-prompt");
+    req.reasoning = Some(komet_proto::ReasoningLevel::Ultrathink);
+    let events = run_to_end(&h, req, controls).await;
+    // The fixture echoes the prompt text back; the Ultrathink prefix must be
+    // on the wire.
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::TextDelta { text } if text.starts_with("Ultrathink:")
+        )),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
 async fn permission_requests_auto_accept_the_preferred_allow_option() {
     let (controls, _steer, _token) = controls();
     let events = run_to_end(&harness(), request("scenario:permission"), controls).await;
@@ -458,6 +539,54 @@ async fn missing_binary_surfaces_not_installed_with_install_hint() {
         err,
         HarnessError::NotInstalled(_) | HarnessError::Io(_)
     ));
+}
+
+/// Real-adapter smoke: spawns the actual `claude-agent-acp` (via npx when not
+/// installed) against the installed, authenticated claude CLI and burns one
+/// tiny haiku prompt. Run explicitly:
+/// `cargo test -p komet-harness --test acp -- --ignored real_claude`
+#[tokio::test]
+#[ignore = "needs the claude CLI authenticated + network; costs one tiny prompt"]
+async fn real_claude_adapter_end_to_end() {
+    let (controls, steer_tx, _token) = controls();
+    let harness = AcpHarness::claude();
+    let mut req = request("Reply with exactly the word ACP-OK and nothing else.");
+    req.model = Some("claude-haiku-4-5".into());
+    req.reasoning = None;
+    req.cwd = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let stream = harness.run(req, controls).await.expect("run starts");
+    // The session parks after Done while the steering mailbox lives (the
+    // engine reaps by dropping it) — release the sender at Done or the
+    // stream never ends.
+    let events = tokio::time::timeout(Duration::from_secs(180), async move {
+        let mut stream = stream;
+        let mut steer = Some(steer_tx);
+        let mut events = Vec::new();
+        while let Some(ev) = stream.next().await {
+            let ev = ev.expect("stream event");
+            if matches!(ev, AgentEvent::Done { .. }) {
+                steer = None;
+            }
+            events.push(ev);
+        }
+        drop(steer);
+        events
+    })
+    .await
+    .expect("real run finished in time");
+    let text: String = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::TextDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        text.contains("ACP-OK"),
+        "unexpected reply: {text:?}\n{events:?}"
+    );
+    assert_eq!(dones(&events).len(), 1, "{events:?}");
+    assert_eq!(dones(&events)[0].0, DoneStatus::Completed, "{events:?}");
 }
 
 #[test]

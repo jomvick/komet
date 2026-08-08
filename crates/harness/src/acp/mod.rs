@@ -40,7 +40,7 @@ use tokio::sync::mpsc;
 
 use komet_proto::{
     AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SlashCommand,
-    SteeringMode,
+    SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
 use crate::jsonrpc::{Incoming, RpcClient};
@@ -57,6 +57,9 @@ struct AcpAgentSpec {
     env_override: &'static str,
     /// Arguments that put the binary in ACP-serving mode.
     args: &'static [&'static str],
+    /// `npx -y <package>` fallback when the binary isn't installed — pinned
+    /// so a cold launch is reproducible (npx caches after the first run).
+    npx_package: Option<&'static str>,
     /// Extra install locations to probe after PATH.
     extra_paths: fn() -> Vec<PathBuf>,
     /// Search summary + install hint for the NotInstalled error.
@@ -66,6 +69,146 @@ struct AcpAgentSpec {
     /// Effort ladder surfaced in the picker; applied per session via the
     /// `thought_level` config option (must mirror the registry descriptor).
     reasoning_levels: &'static [ReasoningLevel],
+    /// Transform applied to the initial prompt and every steer — Claude's
+    /// Ultrathink is a prompt-prefix convention, not an effort flag.
+    prompt_transform: fn(Option<ReasoningLevel>, &str) -> String,
+    /// Preference-ordered `thought_level` value ids for the run's reasoning
+    /// (per-agent clamping, e.g. Claude xhigh→max off the xhigh family). The
+    /// first value the agent actually advertises wins.
+    effort_values: fn(Option<ReasoningLevel>, Option<&str>) -> Vec<&'static str>,
+}
+
+fn identity_transform(_reasoning: Option<ReasoningLevel>, text: &str) -> String {
+    text.to_owned()
+}
+
+/// PATH + login-shell + extra dirs + node-version-manager scan for a binary.
+fn find_on_paths(exe: &str, extra: Vec<PathBuf>) -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|path| {
+            std::env::split_paths(&path)
+                .filter(|d| !d.as_os_str().is_empty())
+                .map(|d| d.join(exe))
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(shell_path) = crate::shell_env::login_shell_path() {
+        candidates.extend(
+            std::env::split_paths(shell_path)
+                .filter(|d| !d.as_os_str().is_empty())
+                .map(|d| d.join(exe)),
+        );
+    }
+    candidates.extend(extra);
+    candidates.extend(
+        crate::node_version_manager_bins()
+            .into_iter()
+            .map(|d| d.join(exe)),
+    );
+    candidates.into_iter().find(|p| p.exists())
+}
+
+/// Generic effort ladder for agents without their own clamping rules.
+fn default_effort_values(
+    reasoning: Option<ReasoningLevel>,
+    _model: Option<&str>,
+) -> Vec<&'static str> {
+    let Some(level) = reasoning else {
+        return Vec::new();
+    };
+    match level {
+        ReasoningLevel::Minimal => vec!["minimal", "low"],
+        ReasoningLevel::Low => vec!["low", "minimal"],
+        ReasoningLevel::Medium => vec!["medium"],
+        ReasoningLevel::High => vec!["high"],
+        ReasoningLevel::XHigh => vec!["xhigh", "x-high", "high"],
+        ReasoningLevel::Max => vec!["max", "xhigh", "high"],
+        ReasoningLevel::Ultra | ReasoningLevel::Ultracode | ReasoningLevel::Ultrathink => {
+            vec!["ultra", "max", "high"]
+        }
+    }
+}
+
+fn claude_spec() -> AcpAgentSpec {
+    AcpAgentSpec {
+        id: HarnessId::ClaudeCode,
+        display_name: "Claude Code",
+        executable: "claude-agent-acp",
+        env_override: "CLAUDE_ACP_EXECUTABLE",
+        args: &[],
+        npx_package: Some("@agentclientprotocol/claude-agent-acp@0.66.0"),
+        extra_paths: npm_global_paths("claude-agent-acp"),
+        install_hint: "claude-agent-acp (searched PATH, the login shell's PATH, npm \
+             global bins, and fnm/nvm/volta/pnpm/bun install dirs; falls back to \
+             `npx -y @agentclientprotocol/claude-agent-acp` when npx is available; \
+             install with `npm install -g @agentclientprotocol/claude-agent-acp`; \
+             set CLAUDE_ACP_EXECUTABLE to override)",
+        models: crate::claude::catalog::static_models,
+        // `_session/steering` advertised by the adapter: priority-`now`
+        // injection, pre-empting the current generation.
+        steering_mode: SteeringMode::StepBoundary,
+        reasoning_levels: &[
+            ReasoningLevel::Low,
+            ReasoningLevel::Medium,
+            ReasoningLevel::High,
+            ReasoningLevel::XHigh,
+            ReasoningLevel::Max,
+        ],
+        prompt_transform: crate::claude::catalog::apply_ultrathink,
+        effort_values: |reasoning, model| {
+            crate::claude::catalog::to_effort(reasoning, model)
+                .into_iter()
+                .collect()
+        },
+    }
+}
+
+fn codex_spec() -> AcpAgentSpec {
+    AcpAgentSpec {
+        id: HarnessId::Codex,
+        display_name: "Codex",
+        executable: "codex-acp",
+        env_override: "CODEX_ACP_EXECUTABLE",
+        args: &[],
+        npx_package: Some("@agentclientprotocol/codex-acp@1.1.14"),
+        extra_paths: npm_global_paths("codex-acp"),
+        install_hint: "codex-acp (searched PATH, the login shell's PATH, npm global \
+             bins, and fnm/nvm/volta/pnpm/bun install dirs; falls back to \
+             `npx -y @agentclientprotocol/codex-acp` when npx is available; install \
+             with `npm install -g @agentclientprotocol/codex-acp`; set \
+             CODEX_ACP_EXECUTABLE to override)",
+        models: crate::codex::catalog::static_models,
+        steering_mode: SteeringMode::StepBoundary,
+        reasoning_levels: crate::codex::catalog::REASONING_LEVELS,
+        prompt_transform: identity_transform,
+        effort_values: |reasoning, _model| {
+            crate::codex::catalog::to_effort(reasoning)
+                .into_iter()
+                .collect()
+        },
+    }
+}
+
+/// npm-global bin dirs for an adapter binary (`npm i -g` installs).
+fn npm_global_paths(exe: &'static str) -> fn() -> Vec<PathBuf> {
+    // fn pointers can't capture; probe the fixed npm-global locations and
+    // append the exe at call time via a small per-exe shim table.
+    match exe {
+        "claude-agent-acp" => || npm_global_bins("claude-agent-acp"),
+        "codex-acp" => || npm_global_bins("codex-acp"),
+        _ => || Vec::new(),
+    }
+}
+
+fn npm_global_bins(exe: &str) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        dirs.push(home.join(".local").join("bin").join(exe));
+        dirs.push(home.join(".npm-global").join("bin").join(exe));
+    }
+    dirs.push(PathBuf::from("/opt/homebrew/bin").join(exe));
+    dirs.push(PathBuf::from("/usr/local/bin").join(exe));
+    dirs
 }
 
 fn grok_spec() -> AcpAgentSpec {
@@ -75,6 +218,7 @@ fn grok_spec() -> AcpAgentSpec {
         executable: "grok",
         env_override: "GROK_EXECUTABLE",
         args: &["agent", "stdio"],
+        npx_package: Some("@xai-official/grok@1.0.0"),
         extra_paths: || {
             let mut dirs = Vec::new();
             if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
@@ -113,6 +257,8 @@ fn grok_spec() -> AcpAgentSpec {
             ReasoningLevel::Medium,
             ReasoningLevel::High,
         ],
+        prompt_transform: identity_transform,
+        effort_values: default_effort_values,
     }
 }
 
@@ -130,15 +276,31 @@ pub struct AcpHarness {
 }
 
 impl AcpHarness {
-    /// Grok Build (`grok agent stdio`) — xAI's native ACP agent.
-    pub fn grok() -> Self {
+    fn with_spec(spec: AcpAgentSpec) -> Self {
         Self {
-            spec: grok_spec(),
+            spec,
             executable: None,
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
             commands: tokio::sync::OnceCell::new(),
         }
+    }
+
+    /// Claude Code over ACP — the org-maintained `claude-agent-acp` adapter
+    /// on the Claude Agent SDK.
+    pub fn claude() -> Self {
+        Self::with_spec(claude_spec())
+    }
+
+    /// Codex over ACP — the org-maintained `codex-acp` adapter wrapping the
+    /// codex app-server.
+    pub fn codex() -> Self {
+        Self::with_spec(codex_spec())
+    }
+
+    /// Grok Build (`grok agent stdio`) — xAI's native ACP agent.
+    pub fn grok() -> Self {
+        Self::with_spec(grok_spec())
     }
 
     /// Use a fixed agent binary instead of PATH/known-location resolution.
@@ -154,47 +316,43 @@ impl AcpHarness {
         self
     }
 
-    fn resolve_executable(&self) -> Result<PathBuf, HarnessError> {
+    /// Test seam: the program `run` would spawn (the adapter binary, or npx
+    /// for the pinned-package fallback).
+    #[doc(hidden)]
+    pub fn launch_program(&self) -> Result<PathBuf, HarnessError> {
+        self.resolve_launch().map(|(program, _)| program)
+    }
+
+    /// Resolve what to spawn: the adapter binary itself, or `npx -y <pinned>`
+    /// when the binary isn't installed but npx is. Returns the program plus
+    /// the full argument list (npx package prefix + the spec's ACP args).
+    fn resolve_launch(&self) -> Result<(PathBuf, Vec<String>), HarnessError> {
+        let spec_args: Vec<String> = self.spec.args.iter().map(|a| a.to_string()).collect();
         if let Some(p) = &self.executable {
-            return Ok(p.clone());
+            return Ok((p.clone(), spec_args));
         }
         if let Some(p) = std::env::var_os(self.spec.env_override)
             && !p.is_empty()
         {
-            return Ok(PathBuf::from(p));
+            return Ok((PathBuf::from(p), spec_args));
         }
-        let exe = self.spec.executable;
-        let mut candidates: Vec<PathBuf> = std::env::var_os("PATH")
-            .map(|path| {
-                std::env::split_paths(&path)
-                    .filter(|d| !d.as_os_str().is_empty())
-                    .map(|d| d.join(exe))
-                    .collect()
-            })
-            .unwrap_or_default();
-        if let Some(shell_path) = crate::shell_env::login_shell_path() {
-            candidates.extend(
-                std::env::split_paths(shell_path)
-                    .filter(|d| !d.as_os_str().is_empty())
-                    .map(|d| d.join(exe)),
-            );
+        if let Some(found) = find_on_paths(self.spec.executable, (self.spec.extra_paths)()) {
+            return Ok((found, spec_args));
         }
-        candidates.extend((self.spec.extra_paths)());
-        candidates.extend(
-            crate::node_version_manager_bins()
-                .into_iter()
-                .map(|d| d.join(exe)),
-        );
-        candidates
-            .into_iter()
-            .find(|p| p.exists())
-            .ok_or_else(|| HarnessError::NotInstalled(self.spec.install_hint.into()))
+        if let Some(pkg) = self.spec.npx_package
+            && let Some(npx) = find_on_paths("npx", Vec::new())
+        {
+            let mut args = vec!["-y".to_string(), pkg.to_string()];
+            args.extend(spec_args);
+            return Ok((npx, args));
+        }
+        Err(HarnessError::NotInstalled(self.spec.install_hint.into()))
     }
 
     fn spawn_agent(&self, cwd: Option<&str>) -> Result<(Child, crate::StderrTail), HarnessError> {
-        let exe = self.resolve_executable()?;
+        let (exe, args) = self.resolve_launch()?;
         let mut cmd = Command::new(&exe);
-        cmd.args(self.spec.args);
+        cmd.args(args);
         crate::compose_child_path(&mut cmd, &exe);
         if let Some(cwd) = cwd.filter(|c| !c.is_empty()) {
             cmd.current_dir(cwd);
@@ -308,7 +466,7 @@ impl Harness for AcpHarness {
     /// Static catalog; an absent binary surfaces as NotInstalled here, like
     /// the codex harness.
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
-        self.resolve_executable()?;
+        self.resolve_launch()?;
         Ok((self.spec.models)())
     }
 
@@ -344,6 +502,8 @@ impl Harness for AcpHarness {
             request,
             harness: self.spec.id,
             agent_name: self.spec.display_name,
+            prompt_transform: self.spec.prompt_transform,
+            effort_values: self.spec.effort_values,
             interrupt_grace: self.interrupt_grace,
             kill_grace: self.kill_grace,
             stderr_tail,
@@ -369,6 +529,8 @@ struct Session {
     request: RunRequest,
     harness: HarnessId,
     agent_name: &'static str,
+    prompt_transform: fn(Option<ReasoningLevel>, &str) -> String,
+    effort_values: fn(Option<ReasoningLevel>, Option<&str>) -> Vec<&'static str>,
     interrupt_grace: Duration,
     kill_grace: Duration,
     stderr_tail: crate::StderrTail,
@@ -433,34 +595,80 @@ async fn send(tx: &mpsc::Sender<Result<AgentEvent, HarnessError>>, ev: AgentEven
     tx.send(Ok(ev)).await.is_ok()
 }
 
+/// Normalize an option/model-option id for matching across naming styles
+/// (`fastMode` == `fast_mode` == `fast-mode`).
+fn norm_id(id: &str) -> String {
+    id.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
+/// Pick the advertised model value for a requested model id. Agents differ in
+/// what they advertise: full ids (`claude-opus-5`), SDK aliases
+/// (`opus`, `sonnet`, `haiku` — the claude adapter), and `[1m]`-suffixed
+/// long-context variants. Exact match first (with the `[1m]` compose when the
+/// run selects the 1M window), then a family-token fallback that prefers a
+/// variant matching the requested context window.
+fn pick_model_value(requested: &str, available: &[&str], context_1m: bool) -> Option<String> {
+    let with_1m = format!("{requested}[1m]");
+    if context_1m && available.contains(&with_1m.as_str()) {
+        return Some(with_1m);
+    }
+    if available.contains(&requested) {
+        return Some(requested.to_owned());
+    }
+    // Family fallback: "claude-opus-5" → "opus" matches "opus[1m]".
+    let family = ["fable", "opus", "sonnet", "haiku", "gpt"]
+        .into_iter()
+        .find(|f| norm_id(requested).contains(f))?;
+    let candidates: Vec<&&str> = available
+        .iter()
+        .filter(|v| norm_id(v).contains(family))
+        .collect();
+    candidates
+        .iter()
+        .find(|v| v.contains("[1m]") == context_1m)
+        .or_else(|| candidates.first())
+        .map(|v| (**v).to_owned())
+}
+
 /// The `session/set_config_option` calls a session response's `configOptions`
-/// warrant for this run: the requested model (category `model`) and effort
-/// (category `thought_level`), matched against the option's advertised value
-/// ids and skipped when already current. Pure so it's testable; unknown
-/// categories and boolean options are left alone.
+/// warrant for this run:
+/// - the requested model (category `model`; a `contextWindow: "1m"` model
+///   option composes the `<model>[1m]` id first, the CLI's own convention),
+/// - the effort (category `thought_level`, first advertised value from the
+///   spec's preference list),
+/// - any remaining `model_options` matched by normalized id — selects take
+///   the choice id, booleans take `on`/`true` truthiness (fastMode, thinking).
+///
+/// Matched against advertised values and skipped when already current. Pure
+/// so it's testable; the returned value is the request's flattened `value`
+/// payload (select: `{"value": id}`, boolean: `{"type":"boolean","value": b}`).
 fn config_option_sets(
     session_response: &Value,
     model: Option<&str>,
-    reasoning: Option<ReasoningLevel>,
-) -> Vec<(String, String)> {
+    efforts: &[&'static str],
+    model_options: &serde_json::Map<String, Value>,
+) -> Vec<(String, Value)> {
     let Some(options) = session_response
         .get("configOptions")
         .and_then(Value::as_array)
     else {
         return Vec::new();
     };
+    let context_1m = model_options
+        .get("contextWindow")
+        .and_then(Value::as_str)
+        .is_some_and(|w| w.eq_ignore_ascii_case("1m"));
     let mut sets = Vec::new();
     for option in options {
-        if option.get("type").and_then(Value::as_str) != Some("select") {
-            continue;
-        }
-        let (Some(config_id), Some(category)) = (
-            option.get("id").and_then(Value::as_str),
-            option.get("category").and_then(Value::as_str),
-        ) else {
+        let Some(config_id) = option.get("id").and_then(Value::as_str) else {
             continue;
         };
-        let current = option.get("currentValue").and_then(Value::as_str);
+        let kind = option.get("type").and_then(Value::as_str).unwrap_or("");
+        let category = option.get("category").and_then(Value::as_str);
+        let current = option.get("currentValue");
         let available: Vec<&str> = option
             .get("options")
             .and_then(Value::as_array)
@@ -469,30 +677,52 @@ fn config_option_sets(
             .iter()
             .filter_map(|o| o.get("value").and_then(Value::as_str))
             .collect();
-        let wanted: Option<&str> = match category {
-            "model" => model.filter(|m| available.contains(m)),
-            "thought_level" => reasoning.and_then(|level| {
-                // Preference ladder per komet level; the first value the
-                // agent actually advertises wins (Grok: low/medium/high).
-                let candidates: &[&str] = match level {
-                    ReasoningLevel::Minimal => &["minimal", "low"],
-                    ReasoningLevel::Low => &["low", "minimal"],
-                    ReasoningLevel::Medium => &["medium"],
-                    ReasoningLevel::High => &["high"],
-                    ReasoningLevel::XHigh => &["xhigh", "x-high", "high"],
-                    ReasoningLevel::Max => &["max", "xhigh", "high"],
-                    ReasoningLevel::Ultra
-                    | ReasoningLevel::Ultracode
-                    | ReasoningLevel::Ultrathink => &["ultra", "max", "high"],
-                };
-                candidates.iter().find(|c| available.contains(*c)).copied()
+
+        let wanted: Option<Value> = match (kind, category) {
+            ("select", Some("model")) => model
+                .and_then(|m| pick_model_value(m, &available, context_1m))
+                .map(Value::String),
+            // Unattended parity with the retired custom adapters (claude
+            // bypassPermissions / codex approvalPolicy never): pick the
+            // no-prompts mode when the agent offers one.
+            ("select", Some("mode")) => ["bypassPermissions", "bypass_permissions", "yolo"]
+                .into_iter()
+                .find(|v| available.contains(v))
+                .map(|v| Value::String(v.to_owned())),
+            ("select", Some("thought_level")) => efforts
+                .iter()
+                .find(|c| available.contains(*c))
+                .map(|c| Value::String((*c).to_owned())),
+            // Everything else: best-effort match against the run's
+            // model-option selections by normalized id.
+            _ => model_options.iter().find_map(|(opt_id, choice)| {
+                if norm_id(opt_id) != norm_id(config_id) || opt_id == "contextWindow" {
+                    return None;
+                }
+                match kind {
+                    "select" => choice
+                        .as_str()
+                        .filter(|c| available.contains(c))
+                        .map(|c| Value::String(c.to_owned())),
+                    "boolean" => {
+                        let on = choice == &Value::Bool(true)
+                            || choice
+                                .as_str()
+                                .is_some_and(|c| c.eq_ignore_ascii_case("on"));
+                        Some(Value::Bool(on))
+                    }
+                    _ => None,
+                }
             }),
-            _ => None,
         };
         if let Some(value) = wanted
-            && current != Some(value)
+            && current != Some(&value)
         {
-            sets.push((config_id.to_owned(), value.to_owned()));
+            let payload = match value {
+                Value::Bool(b) => serde_json::json!({ "type": "boolean", "value": b }),
+                other => serde_json::json!({ "value": other }),
+            };
+            sets.push((config_id.to_owned(), payload));
         }
     }
     sets
@@ -504,6 +734,23 @@ fn session_update_events(params: &Value, session_id: &str) -> Vec<AgentEvent> {
         return Vec::new();
     }
     map_update(params.get("update").unwrap_or(&Value::Null))
+}
+
+/// Per-turn token usage from a settled `session/prompt` response, when the
+/// adapter attaches it (tolerant of both field spellings; absent → nothing).
+fn usage_from_response(res: &Result<Value, HarnessError>) -> Option<AgentEvent> {
+    let usage = res.as_ref().ok()?.get("usage")?;
+    let count = |keys: &[&str]| {
+        keys.iter()
+            .find_map(|k| usage.get(*k))
+            .and_then(Value::as_u64)
+    };
+    let input = count(&["inputTokens", "input_tokens"]);
+    let output = count(&["outputTokens", "output_tokens"]);
+    (input.is_some() || output.is_some()).then(|| AgentEvent::Usage {
+        input_tokens: input.unwrap_or(0),
+        output_tokens: output.unwrap_or(0),
+    })
 }
 
 /// Map a finished `session/prompt` result to the run's terminal status.
@@ -574,6 +821,110 @@ fn handle_server_request(client: &RpcClient, id: Value, method: &str, params: &V
     }
 }
 
+type RequestInputFn = Box<
+    dyn Fn(Vec<UserInputQuestion>) -> tokio::sync::oneshot::Receiver<Vec<UserInputAnswer>>
+        + Send
+        + Sync,
+>;
+
+/// A permission request is a QUESTION (not a tool permission) when its
+/// options don't look like an allow/reject set: any option without an
+/// allow/reject kind, or two options sharing one kind, means the agent is
+/// relaying user-facing choices (Claude's AskUserQuestion arrives this way
+/// through the adapter). Tool permissions auto-accept (unattended parity);
+/// questions round-trip through the input bridge.
+fn is_user_question(options: &[Value]) -> bool {
+    let mut seen: Vec<&str> = Vec::new();
+    for option in options {
+        let Some(kind) = option.get("kind").and_then(Value::as_str) else {
+            return true;
+        };
+        if !matches!(
+            kind,
+            "allow_once" | "allow_always" | "reject_once" | "reject_always"
+        ) {
+            return true;
+        }
+        if seen.contains(&kind) {
+            return true;
+        }
+        seen.push(kind);
+    }
+    false
+}
+
+/// The live-run request handler: tool permissions auto-accept like
+/// [`handle_server_request`], but question-shaped requests block on the
+/// engine's input bridge (in a subtask so the message loop keeps flowing)
+/// and answer with the option whose name matches the chosen label. A dropped
+/// resolver degrades to `cancelled` — never a silent allow.
+fn handle_server_request_live(
+    client: &RpcClient,
+    id: Value,
+    method: &str,
+    params: &Value,
+    request_input: &std::sync::Arc<RequestInputFn>,
+) {
+    if method != "session/request_permission" {
+        handle_server_request(client, id, method, params);
+        return;
+    }
+    let options: Vec<Value> = params
+        .get("options")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if !is_user_question(&options) {
+        handle_server_request(client, id, method, params);
+        return;
+    }
+    let names: Vec<String> = options
+        .iter()
+        .map(|o| {
+            o.get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        })
+        .collect();
+    let question = UserInputQuestion {
+        id: new_message_id(),
+        header: "Agent question".into(),
+        question: params
+            .get("toolCall")
+            .and_then(|t| t.get("title"))
+            .and_then(Value::as_str)
+            .unwrap_or("The agent needs your input.")
+            .to_owned(),
+        options: names.clone(),
+        multi_select: false,
+    };
+    let client = client.clone();
+    let request_input = std::sync::Arc::clone(request_input);
+    tokio::spawn(async move {
+        let answers = (request_input)(vec![question.clone()])
+            .await
+            .unwrap_or_default();
+        let picked = answers
+            .iter()
+            .find(|a| a.question_id == question.id)
+            .and_then(|a| a.labels.first())
+            .and_then(|label| {
+                options
+                    .iter()
+                    .find(|o| o.get("name").and_then(Value::as_str) == Some(label.as_str()))
+            })
+            .and_then(|o| o.get("optionId").and_then(Value::as_str));
+        match picked {
+            Some(option_id) => client.respond(
+                &id,
+                json!({ "outcome": { "outcome": "selected", "optionId": option_id } }),
+            ),
+            None => client.respond(&id, json!({ "outcome": { "outcome": "cancelled" } })),
+        }
+    });
+}
+
 /// Await a setup request while draining incoming messages, so a `session/load`
 /// whose replay outruns the incoming channel's capacity can't deadlock the
 /// reader. Replayed `session/update`s are dropped (the doc already holds the
@@ -632,15 +983,18 @@ async fn run_session(session: Session) {
         request,
         harness,
         agent_name,
+        prompt_transform,
+        effort_values,
         interrupt_grace,
         kill_grace,
         stderr_tail,
     } = session;
     let RunControls {
-        request_input: _request_input,
+        request_input,
         mut steering,
         interrupt,
     } = controls;
+    let request_input = std::sync::Arc::new(request_input);
 
     // ---- handshake + session (interruptible) ------------------------------
     let setup = async {
@@ -692,25 +1046,36 @@ async fn run_session(session: Session) {
                 "session/new returned no sessionId".into(),
             ));
         }
-        // Apply the run's model + effort through the session's advertised
-        // config options (ACP has no per-prompt model field). Best-effort:
-        // a rejected set is logged, never fatal — the agent's default runs.
-        for (config_id, value) in config_option_sets(
+        // Apply the run's model + effort + model options through the
+        // session's advertised config options (ACP has no per-prompt model
+        // field). Best-effort: a rejected set is logged, never fatal — the
+        // agent's default runs.
+        let efforts = effort_values(request.reasoning, request.model.as_deref());
+        for (config_id, payload) in config_option_sets(
             &session_response,
             request.model.as_deref(),
-            request.reasoning,
+            &efforts,
+            &request.model_options,
         ) {
-            let params = json!({
-                "sessionId": session_id,
-                "configId": config_id,
-                "value": value,
-            });
-            if let Err(e) =
-                request_draining(&client, &mut incoming, "session/set_config_option", params).await
+            let mut params = serde_json::Map::new();
+            params.insert("sessionId".into(), session_id.clone().into());
+            params.insert("configId".into(), config_id.clone().into());
+            if let Some(payload) = payload.as_object() {
+                for (k, v) in payload {
+                    params.insert(k.clone(), v.clone());
+                }
+            }
+            if let Err(e) = request_draining(
+                &client,
+                &mut incoming,
+                "session/set_config_option",
+                Value::Object(params),
+            )
+            .await
             {
                 tracing::debug!(
                     target: "komet_harness::acp",
-                    "session/set_config_option {config_id}={value} rejected (agent default runs): {e}"
+                    "session/set_config_option {config_id}={payload} rejected (agent default runs): {e}"
                 );
             }
         }
@@ -784,7 +1149,7 @@ async fn run_session(session: Session) {
     let mut turn: Option<BoxFuture<'static, Result<Value, HarnessError>>> = Some(prompt_turn(
         client.clone(),
         session_id.clone(),
-        request.prompt.clone(),
+        prompt_transform(request.reasoning, &request.prompt),
     ));
     // Steers waiting for the turn boundary (agents without the extension, or
     // extension steers that lost the turn-end race).
@@ -817,7 +1182,13 @@ async fn run_session(session: Session) {
                             }
                         }
                         Incoming::Request { id, method, params } => {
-                            handle_server_request(&client, id, &method, &params);
+                            handle_server_request_live(
+                                &client,
+                                id,
+                                &method,
+                                &params,
+                                &request_input,
+                            );
                         }
                         _ => {}
                     }
@@ -834,6 +1205,13 @@ async fn run_session(session: Session) {
                     AgentEvent::AssistantMessageCompleted { assistant_message_id: prev },
                 )
                 .await
+                {
+                    break 'main;
+                }
+                // Per-turn token usage, when the adapter settles the prompt
+                // with it (claude-agent-acp and codex-acp both do).
+                if let Some(usage) = usage_from_response(&res)
+                    && !send(&event_tx, usage).await
                 {
                     break 'main;
                 }
@@ -894,7 +1272,7 @@ async fn run_session(session: Session) {
                     // tolerated by design.
                 }
                 Some(Incoming::Request { id, method, params }) => {
-                    handle_server_request(&client, id, &method, &params);
+                    handle_server_request_live(&client, id, &method, &params, &request_input);
                 }
                 Some(Incoming::Eof) | None => {
                     // The turn ends via a request RESPONSE, which races EOF
@@ -915,6 +1293,9 @@ async fn run_session(session: Session) {
                             AgentEvent::AssistantMessageCompleted { assistant_message_id: prev },
                         )
                         .await;
+                        if let Some(usage) = usage_from_response(&res) {
+                            let _ = send(&event_tx, usage).await;
+                        }
                         let (status, error) = stop_outcome(&res, interrupted);
                         done_current = true;
                         if interrupted {
@@ -937,7 +1318,9 @@ async fn run_session(session: Session) {
 
             steer = steering.recv(), if steering_open && !interrupted => match steer {
                 Some(msg) => {
-                    let text = msg.prompt;
+                    // Same transform as the initial prompt: Claude's
+                    // Ultrathink prefix rides every steer too.
+                    let text = prompt_transform(request.reasoning, &msg.prompt);
                     if turn.is_none() {
                         // Idle between turns: a steer is simply the next turn.
                         let (prev, next) = rotate(&mut assistant_message_id);
@@ -1085,7 +1468,7 @@ mod tests {
     }
 
     #[test]
-    fn config_option_sets_map_model_and_effort() {
+    fn config_option_sets_map_model_effort_and_model_options() {
         let response = json!({
             "sessionId": "s-1",
             "configOptions": [
@@ -1094,10 +1477,11 @@ mod tests {
                     "name": "Model",
                     "category": "model",
                     "type": "select",
-                    "currentValue": "grok-4-fast",
+                    "currentValue": "claude-sonnet-5",
                     "options": [
-                        { "value": "grok-4-fast", "name": "Grok 4 Fast" },
-                        { "value": "grok-4.5", "name": "Grok 4.5" },
+                        { "value": "claude-sonnet-5", "name": "Sonnet 5" },
+                        { "value": "claude-opus-5", "name": "Opus 5" },
+                        { "value": "claude-opus-5[1m]", "name": "Opus 5 (1M)" },
                     ],
                 },
                 {
@@ -1110,47 +1494,61 @@ mod tests {
                         { "value": "low", "name": "Low" },
                         { "value": "medium", "name": "Medium" },
                         { "value": "high", "name": "High" },
+                        { "value": "max", "name": "Max" },
                     ],
                 },
                 {
-                    "id": "voice",
-                    "name": "Voice mode",
-                    "category": "other_thing",
+                    "id": "fast_mode",
+                    "name": "Fast mode",
+                    "category": "model_config",
                     "type": "boolean",
                     "currentValue": false,
                 },
             ],
         });
-        // Model needs switching; medium effort differs from current high.
+        let no_opts = serde_json::Map::new();
+        // Model switch + effort preference list; fastMode untouched without a
+        // model-option selection.
         assert_eq!(
-            config_option_sets(&response, Some("grok-4.5"), Some(ReasoningLevel::Medium)),
+            config_option_sets(&response, Some("claude-opus-5"), &["medium"], &no_opts),
             vec![
-                ("model".to_owned(), "grok-4.5".to_owned()),
-                ("effort".to_owned(), "medium".to_owned()),
+                ("model".to_owned(), json!({ "value": "claude-opus-5" })),
+                ("effort".to_owned(), json!({ "value": "medium" })),
+            ]
+        );
+        // Effort preference order: first ADVERTISED candidate wins.
+        assert_eq!(
+            config_option_sets(&response, None, &["xhigh", "max"], &no_opts),
+            vec![("effort".to_owned(), json!({ "value": "max" }))]
+        );
+        // contextWindow=1m composes the [1m] model id; fastMode=on matches the
+        // boolean option across naming styles (fastMode vs fast_mode).
+        let mut opts = serde_json::Map::new();
+        opts.insert("contextWindow".into(), json!("1m"));
+        opts.insert("fastMode".into(), json!("on"));
+        assert_eq!(
+            config_option_sets(&response, Some("claude-opus-5"), &["high"], &opts),
+            vec![
+                ("model".to_owned(), json!({ "value": "claude-opus-5[1m]" })),
+                (
+                    "fast_mode".to_owned(),
+                    json!({ "type": "boolean", "value": true })
+                ),
             ]
         );
         // Already-current values and unadvertised models set nothing.
         assert_eq!(
-            config_option_sets(&response, Some("grok-4-fast"), Some(ReasoningLevel::High)),
-            Vec::<(String, String)>::new()
+            config_option_sets(&response, Some("claude-sonnet-5"), &["high"], &no_opts),
+            Vec::new()
         );
         assert_eq!(
-            config_option_sets(&response, Some("gpt-5.6-sol"), None),
-            Vec::<(String, String)>::new()
-        );
-        // Unknown komet levels degrade down the preference ladder.
-        assert_eq!(
-            config_option_sets(&response, None, Some(ReasoningLevel::Ultra)),
-            Vec::<(String, String)>::new(), // ultra → high == current
-        );
-        assert_eq!(
-            config_option_sets(&response, None, Some(ReasoningLevel::Minimal)),
-            vec![("effort".to_owned(), "low".to_owned())]
+            config_option_sets(&response, Some("gpt-5.6-sol"), &[], &no_opts),
+            Vec::new()
         );
         // No configOptions advertised → nothing to set.
         assert_eq!(
-            config_option_sets(&json!({"sessionId": "s"}), Some("grok-4.5"), None),
-            Vec::<(String, String)>::new()
+            config_option_sets(&json!({"sessionId": "s"}), Some("x"), &["high"], &no_opts),
+            Vec::new()
         );
     }
 

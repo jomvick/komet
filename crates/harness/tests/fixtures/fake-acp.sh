@@ -115,6 +115,26 @@ case "$promptline" in
   emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
   ;;
 
+*scenario:echo-prompt*)
+  # Echo the prompt's first text block back as a delta (prompt-transform
+  # verification: Ultrathink prefix must be on the wire).
+  text=$(printf '%s' "$promptline" | sed 's/.*"text":"\([^"]*\)".*/\1/')
+  update "{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"$text\"}}"
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  ;;
+
+*scenario:question*)
+  # AskUserQuestion-shaped request: options WITHOUT allow/reject kinds are
+  # user-facing choices — must round-trip through the input bridge, never
+  # auto-accept. The test's bridge answers "Use tokio".
+  emit "{\"id\":88,\"method\":\"session/request_permission\",\"params\":{\"sessionId\":\"$SID\",\"toolCall\":{\"toolCallId\":\"q1\",\"title\":\"Which async runtime should I use?\"},\"options\":[{\"optionId\":\"opt-tokio\",\"name\":\"Use tokio\"},{\"optionId\":\"opt-smol\",\"name\":\"Use smol\"}]}}"
+  read -r ans || exit 1
+  { has "$ans" '"id":88' && has "$ans" '"outcome":"selected"' && has "$ans" '"optionId":"opt-tokio"'; } ||
+    { emit "{\"id\":$pid,\"result\":{\"stopReason\":\"refusal\"}}"; exit 0; }
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"answered"}}'
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  ;;
+
 *scenario:permission*)
   emit "{\"id\":77,\"method\":\"session/request_permission\",\"params\":{\"sessionId\":\"$SID\",\"toolCall\":{\"toolCallId\":\"t1\"},\"options\":[{\"optionId\":\"once\",\"name\":\"Allow once\",\"kind\":\"allow_once\"},{\"optionId\":\"always\",\"name\":\"Always allow\",\"kind\":\"allow_always\"},{\"optionId\":\"no\",\"name\":\"Reject\",\"kind\":\"reject_once\"}]}}"
   read -r ans || exit 1

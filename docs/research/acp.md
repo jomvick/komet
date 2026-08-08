@@ -13,13 +13,22 @@
   agent (npm `@xai-official/grok`, ACP registry id `grok-build`). Auth: browser
   OAuth or `XAI_API_KEY`; komet passes env through. `GROK_EXECUTABLE` overrides
   resolution (tests point it at `tests/fixtures/fake-acp.sh`).
-- **claude/codex keep their custom adapters.** ACP parity would cost the
-  `--settings` passthrough (fastMode/ultracode), pin adapter-bundled agent
-  versions over the user's installed CLIs, and change Claude steering semantics
-  (the adapter's `_session/steering` pre-empts with priority `now` vs our
-  step-boundary stdin line). Revisit when ACP v2 stabilizes (prompt lifecycle,
-  first-class permissions, resume-with-replay) and per-turn usage leaves the
-  unstable flag.
+- **claude/codex converted to ACP too** (2026-08-08, wing's call: "keep things
+  clean"): `AcpHarness::claude()` via `@agentclientprotocol/claude-agent-acp`
+  (pinned 0.66.0) and `AcpHarness::codex()` via `@agentclientprotocol/codex-acp`
+  (pinned 1.1.14), resolved from PATH or launched through `npx -y <pinned>`.
+  The bespoke stream-json/app-server adapters (~4,300 lines) are deleted; the
+  catalogs (models, effort clamping, Ultrathink prefix) survive as spec inputs.
+  Accepted deltas: Claude steering is now priority-`now` pre-emption (adapter
+  semantics) instead of step-boundary stdin; sandbox policy control is
+  adapter-owned; komet-specific settings ride config options where advertised
+  (mode → bypassPermissions, model via family-alias matching — the claude
+  adapter advertises SDK aliases like `opus[1m]`/`sonnet`/`haiku` —
+  fastMode/thinking as booleans) and are silently skipped elsewhere
+  (ultracode has no adapter surface today). AskUserQuestion arrives as a
+  question-shaped `session/request_permission` (options without allow/reject
+  kinds) and bridges to the input panel; allow/reject-shaped requests
+  auto-accept. Per-turn usage comes from the settled prompt response.
 
 ## Protocol surface used (v1)
 - `initialize` (protocolVersion 1; fs/terminal client capabilities declined) →

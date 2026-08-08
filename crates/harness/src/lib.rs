@@ -1,12 +1,12 @@
-//! komet-harness — one interface over Claude Code / Codex (and a mock for tests).
+//! komet-harness — one interface over coding agents, all driven through the
+//! Agent Client Protocol (and a mock for tests).
 //!
-//! Integration decisions (docs/research/harness.md):
-//! - Claude Code: spawn the installed `claude` CLI with
-//!   `--input-format stream-json --output-format stream-json --verbose
-//!    --include-partial-messages`, implement the control channel (can_use_tool →
-//!   requestInput, interrupt, set_model), steer by writing user lines mid-run.
-//! - Codex: spawn `codex app-server`, JSON-RPC 2.0 over stdio (thread/start, turn/start,
-//!   turn/steer{expectedTurnId}, turn/interrupt, item/* + delta notifications).
+//! Every production harness is the shared [`AcpHarness`] with a per-agent
+//! spec: Claude Code via the org-maintained `claude-agent-acp` adapter, Codex
+//! via `codex-acp`, Grok Build natively. Decision record:
+//! docs/research/acp.md (the bespoke stream-json/app-server adapters this
+//! crate used to hold are documented historically in
+//! docs/research/harness.md).
 
 use async_trait::async_trait;
 use futures::stream::BoxStream;
@@ -214,8 +214,6 @@ pub(crate) fn crash_message(
 }
 
 pub use acp::AcpHarness;
-pub use claude::ClaudeHarness;
-pub use codex::CodexHarness;
 
 // ---------------------------------------------------------------------------
 // Child lifecycle (shared by the codex and ACP harnesses)
