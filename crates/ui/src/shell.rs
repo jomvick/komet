@@ -458,11 +458,18 @@ fn sync_flow_after_auth(
             }
             _ => flow,
         },
-        Some(WorkspaceScope::Synced) => match flow {
-            SyncFlow::SignOutConfirm
-            | SyncFlow::SigningOut
-            | SyncFlow::SignedOutRestartRequired => flow,
-            _ => SyncFlow::Idle,
+        Some(WorkspaceScope::Synced) => match auth {
+            // AuthStatus is shared by every viewport attached to the runtime.
+            // Once a synced store loses its credentials, every Shell must stop:
+            // letting another viewport sign in would authenticate a new account
+            // while the engine still serves the previous account's fixed store.
+            Some(AuthState::SignedOut) => SyncFlow::SignedOutRestartRequired,
+            _ => match flow {
+                SyncFlow::SignOutConfirm
+                | SyncFlow::SigningOut
+                | SyncFlow::SignedOutRestartRequired => flow,
+                _ => SyncFlow::Idle,
+            },
         },
         Some(WorkspaceScope::Development) => SyncFlow::Idle,
         None => flow,
@@ -4589,6 +4596,46 @@ mod tests {
                 SyncFlow::RestartPending { notice_open: false },
             ),
             Some(AccountMenuAction::RestartPending)
+        );
+    }
+
+    #[test]
+    fn synced_sign_out_blocks_every_viewport_and_cannot_switch_accounts() {
+        let signed_in_as_another_user = AuthState::SignedIn {
+            user: komet_proto::UserProfile {
+                id: "user-2".into(),
+                email: "other@example.com".into(),
+                name: None,
+            },
+            org_id: Some("org-2".into()),
+        };
+
+        assert_eq!(
+            sync_flow_after_auth(
+                SyncFlow::SigningOut,
+                Some(WorkspaceScope::Synced),
+                Some(&AuthState::SignedOut),
+            ),
+            SyncFlow::SignedOutRestartRequired,
+            "the viewport that requested sign-out is blocked by AuthStatus"
+        );
+        assert_eq!(
+            sync_flow_after_auth(
+                SyncFlow::Idle,
+                Some(WorkspaceScope::Synced),
+                Some(&AuthState::SignedOut),
+            ),
+            SyncFlow::SignedOutRestartRequired,
+            "another viewport observing the same runtime is also blocked"
+        );
+        assert_eq!(
+            sync_flow_after_auth(
+                SyncFlow::SignedOutRestartRequired,
+                Some(WorkspaceScope::Synced),
+                Some(&signed_in_as_another_user),
+            ),
+            SyncFlow::SignedOutRestartRequired,
+            "new credentials cannot reopen the previous account's store"
         );
     }
 
