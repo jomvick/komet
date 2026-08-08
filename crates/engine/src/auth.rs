@@ -908,9 +908,15 @@ async fn handle_loopback_conn(
             .collect();
         let code = params.get("code");
         let state = params.get("state");
+        let invalid_callback = || {
+            (
+                "400 Bad Request",
+                page("Invalid or expired sign-in link. Start again from Komet."),
+            )
+        };
         match (code, state) {
-            (Some(code), Some(state)) if let Some(generation) = auth.take_pending(state) => {
-                match auth.exchange_code(code).await {
+            (Some(code), Some(state)) => match auth.take_pending(state) {
+                Some(generation) => match auth.exchange_code(code).await {
                     Ok(result) => match auth.finish_sign_in(result, generation) {
                         Ok(()) => (
                             "200 OK",
@@ -933,12 +939,10 @@ async fn handle_loopback_conn(
                             page("Sign-in failed during token exchange — check the Komet logs."),
                         )
                     }
-                }
-            }
-            _ => (
-                "400 Bad Request",
-                page("Invalid or expired sign-in link. Start again from Komet."),
-            ),
+                },
+                None => invalid_callback(),
+            },
+            _ => invalid_callback(),
         }
     };
     let response = format!(
