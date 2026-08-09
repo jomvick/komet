@@ -2260,6 +2260,10 @@ impl Pickers {
                 div()
                     .flex()
                     .flex_col()
+                    // 2px row gap — the menu-column rhythm everywhere else
+                    // (model list, device switcher); without it adjacent
+                    // hover/selected washes fuse into one blob (user report).
+                    .gap(px(2.0))
                     .child(popover::menu_heading(&theme, "Reasoning"))
                     .children(levels.into_iter().enumerate().map(|(ix, level)| {
                         let is_active = current == Some(level);
@@ -2297,6 +2301,7 @@ impl Pickers {
                 div()
                     .flex()
                     .flex_col()
+                    .gap(px(2.0)) // same rhythm as the Reasoning section above
                     .child(popover::menu_heading(&theme, &option.label))
                     .children(
                         option
