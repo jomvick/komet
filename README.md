@@ -1,6 +1,7 @@
 # Komet
 
-Control your coding agents (Claude Code, Codex) from any of your devices.
+Control your coding agents (Claude Code, Codex, Grok, Hermes, Pi) from any of
+your devices.
 
 ![Komet running a Claude Code session](docs/screenshot.png)
 

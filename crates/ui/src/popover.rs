@@ -427,14 +427,6 @@ pub fn menu_separator() -> gpui::Div {
     div().h(px(1.0)).mx(px(-4.0)).my(px(4.0)).bg(hairline(0.07))
 }
 
-/// The trailing check on the selected row (komet `MenuCheck`): 14px,
-/// `text-foreground/70`, pushed to the row end by the caller's flex.
-pub fn menu_check(theme: &Theme) -> impl IntoElement {
-    crate::icons::icon(crate::icons::CHECK)
-        .size(px(14.0))
-        .text_color(theme.text.opacity(0.7))
-}
-
 /// The recessed band tone for a palette/picker header or footer strip — a
 /// translucent black so the glass still reads through (the add-space palette
 /// converged on this; measured subtler tones vanish against the dim scrim).

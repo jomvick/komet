@@ -30,6 +30,37 @@
   kinds) and bridges to the input panel; allow/reject-shaped requests
   auto-accept. Per-turn usage comes from the settled prompt response.
 
+- **Hermes + Pi registered** (2026-08-08): `AcpHarness::hermes()` runs Nous
+  Research's native ACP server (`hermes acp`; Python install via
+  `curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash` plus the
+  `.[acp]` extra — no npm fallback, so resolution is PATH/`~/.local/bin`/
+  `~/.hermes/bin` only, `HERMES_EXECUTABLE` overrides). No
+  `_session/steering` extension and no effort config advertised (Hermes 4's
+  hybrid reasoning is model-internal) → turn-boundary steering, empty ladder;
+  the model list is discovered over ACP (below), with the Nous flagships as
+  the static fallback. `AcpHarness::pi()` runs the pi coding
+  agent (pi.dev) through the community `pi-acp` adapter (pinned 0.0.33,
+  `npx -y` fallback; requires the pi CLI itself,
+  `@earendil-works/pi-coding-agent`; `PI_ACP_EXECUTABLE` overrides). Models
+  ride pi's own provider config (catalog advertises a `default` pass-through
+  entry); thinking ladder minimal→max maps onto komet's levels via the
+  generic `thought_level` preference ladder ("off" has no komet tier).
+- **ACP is the source of truth for model lists** (2026-08-08, follow-up on
+  the same branch): `models()` runs a short-lived probe (initialize →
+  `session/new`, the `discover_commands` pattern) and reads the response's
+  first-class `models` (SessionModelState: `availableModels` +
+  `currentModelId`), falling back to the `model` config option's choices —
+  paseo's preference order. The spec's static catalog only enriches matched
+  ids (label/description/options/curated ladders, e.g. codex service tiers)
+  and answers outright when the agent advertises nothing or the probe fails;
+  successful discovery is cached per harness instance, failures retry.
+  Per-model effort ladders do NOT exist on the wire (the model list carries
+  no effort metadata; `thought_level` reflects only the currently selected
+  model — Zed refreshes reactively via `config_option_update`, paseo's Kimi
+  adapter walks models on one probe session): discovered models inherit the
+  probe session's ladder unless a static entry supplies one. Revisit a
+  Kimi-style walk if an agent genuinely varies per model.
+
 ## Protocol surface used (v1)
 - `initialize` (protocolVersion 1; fs/terminal client capabilities declined) →
   `session/new` / `session/load` (fresh-session fallback; replay drained, the

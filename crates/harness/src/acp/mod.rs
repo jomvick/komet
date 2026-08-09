@@ -1,7 +1,9 @@
 //! ACP harness: spawns an Agent Client Protocol agent (JSON-RPC 2.0 over
 //! stdio, protocol v1) and maps its session updates onto [`AgentEvent`]s. One
 //! implementation covers every ACP agent; [`AcpHarness::grok`] configures it
-//! for xAI's Grok Build (`grok agent stdio`), the first registered agent.
+//! for xAI's Grok Build (`grok agent stdio`), the first registered agent —
+//! [`AcpHarness::hermes`] (Nous Research, `hermes acp`) and [`AcpHarness::pi`]
+//! (pi.dev via `pi-acp`) followed.
 //!
 //! - `initialize` (protocolVersion 1, fs/terminal capabilities declined) →
 //!   `session/new`, or `session/load` with a fresh-session fallback when
@@ -196,6 +198,7 @@ fn npm_global_paths(exe: &'static str) -> fn() -> Vec<PathBuf> {
     match exe {
         "claude-agent-acp" => || npm_global_bins("claude-agent-acp"),
         "codex-acp" => || npm_global_bins("codex-acp"),
+        "pi-acp" => || npm_global_bins("pi-acp"),
         _ => || Vec::new(),
     }
 }
@@ -262,6 +265,113 @@ fn grok_spec() -> AcpAgentSpec {
     }
 }
 
+fn hermes_spec() -> AcpAgentSpec {
+    AcpAgentSpec {
+        id: HarnessId::Hermes,
+        display_name: "Hermes",
+        executable: "hermes",
+        env_override: "HERMES_EXECUTABLE",
+        args: &["acp"],
+        // Python/uv install — no npm fallback exists.
+        npx_package: None,
+        extra_paths: || {
+            let mut dirs = Vec::new();
+            if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+                dirs.push(home.join(".local").join("bin").join("hermes"));
+                dirs.push(home.join(".hermes").join("bin").join("hermes"));
+            }
+            dirs.push(PathBuf::from("/opt/homebrew/bin/hermes"));
+            dirs.push(PathBuf::from("/usr/local/bin/hermes"));
+            dirs
+        },
+        install_hint: "hermes (searched PATH, the login shell's PATH, ~/.local/bin, \
+             ~/.hermes/bin, /opt/homebrew/bin, /usr/local/bin, and fnm/nvm/volta/pnpm/bun \
+             install dirs; install with \
+             `curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash`, then \
+             `cd ~/.hermes/hermes-agent && uv pip install -e '.[acp]'` for the ACP \
+             server; set HERMES_EXECUTABLE to override)",
+        // Hermes derives its model list from the providers the user has
+        // authenticated (`hermes model`); these are the Nous flagships every
+        // portal account gets. Ids the agent doesn't advertise are skipped by
+        // the config-option set, falling back to the agent's own default.
+        models: || {
+            vec![
+                Model {
+                    id: "hermes-4-405b".into(),
+                    label: "Hermes 4 405B".into(),
+                    description: Some("Nous Research's hybrid-reasoning flagship".into()),
+                    reasoning_levels: Vec::new(),
+                    options: Vec::new(),
+                },
+                Model {
+                    id: "hermes-4-70b".into(),
+                    label: "Hermes 4 70B".into(),
+                    description: Some("Faster Hermes 4 — same post-training, 70B".into()),
+                    reasoning_levels: Vec::new(),
+                    options: Vec::new(),
+                },
+            ]
+        },
+        // No `_session/steering` extension: steers deliver at turn boundaries.
+        steering_mode: SteeringMode::TurnBoundary,
+        // Hermes exposes no effort config over ACP today (hybrid reasoning is
+        // model-internal); revisit when the adapter advertises a ladder.
+        reasoning_levels: &[],
+        prompt_transform: identity_transform,
+        effort_values: default_effort_values,
+    }
+}
+
+fn pi_spec() -> AcpAgentSpec {
+    AcpAgentSpec {
+        id: HarnessId::Pi,
+        display_name: "Pi",
+        executable: "pi-acp",
+        env_override: "PI_ACP_EXECUTABLE",
+        args: &[],
+        npx_package: Some("pi-acp@0.0.33"),
+        extra_paths: npm_global_paths("pi-acp"),
+        install_hint: "pi-acp (searched PATH, the login shell's PATH, npm global bins, \
+             and fnm/nvm/volta/pnpm/bun install dirs; falls back to `npx -y pi-acp` \
+             when npx is available; install with `npm install -g pi-acp` — requires the \
+             pi CLI itself, `npm install -g --ignore-scripts \
+             @earendil-works/pi-coding-agent`; set PI_ACP_EXECUTABLE to override)",
+        // pi routes models through its own provider config (~/.pi); the picker
+        // advertises the pass-through entry and pi keeps whatever the user set
+        // up. Unknown ids are skipped by the config-option set.
+        models: || {
+            vec![Model {
+                id: "default".into(),
+                label: "pi default".into(),
+                description: Some("Runs the model configured in pi (`pi` settings)".into()),
+                reasoning_levels: vec![
+                    ReasoningLevel::Minimal,
+                    ReasoningLevel::Low,
+                    ReasoningLevel::Medium,
+                    ReasoningLevel::High,
+                    ReasoningLevel::XHigh,
+                    ReasoningLevel::Max,
+                ],
+                options: Vec::new(),
+            }]
+        },
+        // The adapter has no `_session/steering` extension: turn boundaries.
+        steering_mode: SteeringMode::TurnBoundary,
+        // pi's thinking ladder (minimal→max; its extra "off" tier has no komet
+        // equivalent and is left to the agent default).
+        reasoning_levels: &[
+            ReasoningLevel::Minimal,
+            ReasoningLevel::Low,
+            ReasoningLevel::Medium,
+            ReasoningLevel::High,
+            ReasoningLevel::XHigh,
+            ReasoningLevel::Max,
+        ],
+        prompt_transform: identity_transform,
+        effort_values: default_effort_values,
+    }
+}
+
 /// The ACP harness. Construct with [`AcpHarness::grok`]; tests point it at a
 /// fake agent with [`AcpHarness::with_executable`].
 pub struct AcpHarness {
@@ -273,6 +383,9 @@ pub struct AcpHarness {
     kill_grace: Duration,
     /// Discovery result cache: the advertised commands survive across calls.
     commands: tokio::sync::OnceCell<Vec<SlashCommand>>,
+    /// Model discovery cache: only a successful, non-empty probe is cached,
+    /// so a mis-authed agent retries on the next picker open.
+    models_cache: tokio::sync::OnceCell<Vec<Model>>,
 }
 
 impl AcpHarness {
@@ -283,6 +396,7 @@ impl AcpHarness {
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
             commands: tokio::sync::OnceCell::new(),
+            models_cache: tokio::sync::OnceCell::new(),
         }
     }
 
@@ -301,6 +415,17 @@ impl AcpHarness {
     /// Grok Build (`grok agent stdio`) — xAI's native ACP agent.
     pub fn grok() -> Self {
         Self::with_spec(grok_spec())
+    }
+
+    /// Hermes Agent (`hermes acp`) — Nous Research's native ACP server.
+    pub fn hermes() -> Self {
+        Self::with_spec(hermes_spec())
+    }
+
+    /// The pi coding agent over ACP — the community `pi-acp` adapter wrapping
+    /// pi's RPC mode.
+    pub fn pi() -> Self {
+        Self::with_spec(pi_spec())
     }
 
     /// Use a fixed agent binary instead of PATH/known-location resolution.
@@ -443,6 +568,138 @@ impl AcpHarness {
             Err(_) => Err(HarnessError::Protocol("command discovery timed out".into())),
         }
     }
+
+    /// One short-lived probe for the agent's real model list: initialize →
+    /// `session/new`, then read the response's first-class `models`
+    /// (SessionModelState) with the `model` config option as fallback. The
+    /// wire is the source of truth — the spec's static catalog only enriches
+    /// matching entries and names the pick when the agent advertises nothing.
+    async fn discover_models(&self) -> Result<Vec<Model>, HarnessError> {
+        let (mut child, _stderr) = self.spawn_agent(None)?;
+        let (client, _incoming) = match (child.stdin.take(), child.stdout.take()) {
+            (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
+            _ => {
+                shutdown_child(&mut child, self.kill_grace).await;
+                return Err(HarnessError::Protocol("agent child has no stdio".into()));
+            }
+        };
+        let discovery = async {
+            client.request("initialize", initialize_params()).await?;
+            let cwd = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+            let session = client
+                .request("session/new", json!({ "cwd": cwd, "mcpServers": [] }))
+                .await?;
+            Ok::<Vec<Model>, HarnessError>(models_from_session(&session, &(self.spec.models)()))
+        };
+        let result = tokio::time::timeout(Duration::from_secs(10), discovery).await;
+        shutdown_child(&mut child, self.kill_grace).await;
+        match result {
+            Ok(inner) => inner,
+            Err(_) => Err(HarnessError::Protocol("model discovery timed out".into())),
+        }
+    }
+}
+
+/// Map an advertised `thought_level` value id onto komet's ladder.
+fn reasoning_from_value(value: &str) -> Option<ReasoningLevel> {
+    match norm_id(value).as_str() {
+        "minimal" => Some(ReasoningLevel::Minimal),
+        "low" => Some(ReasoningLevel::Low),
+        "medium" => Some(ReasoningLevel::Medium),
+        "high" => Some(ReasoningLevel::High),
+        "xhigh" => Some(ReasoningLevel::XHigh),
+        "max" => Some(ReasoningLevel::Max),
+        "ultra" => Some(ReasoningLevel::Ultra),
+        "ultracode" => Some(ReasoningLevel::Ultracode),
+        "ultrathink" => Some(ReasoningLevel::Ultrathink),
+        _ => None,
+    }
+}
+
+/// Derive the model list a `session/new` response advertises. Preference
+/// order mirrors paseo's ACP client: the first-class `models` state, then the
+/// `model` config option's choices; empty when the agent advertises neither.
+/// ACP carries no per-model effort metadata — every discovered model gets the
+/// probe session's `thought_level` ladder unless a static catalog entry with
+/// the same id supplies its own (the catalog also contributes label/
+/// description/options for matched ids, e.g. codex service tiers).
+fn models_from_session(session_response: &Value, catalog: &[Model]) -> Vec<Model> {
+    let ladder: Vec<ReasoningLevel> = session_response
+        .get("configOptions")
+        .and_then(Value::as_array)
+        .map(|a| a.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .find(|o| o.get("category").and_then(Value::as_str) == Some("thought_level"))
+        .and_then(|o| o.get("options").and_then(Value::as_array))
+        .map(|opts| {
+            opts.iter()
+                .filter_map(|o| o.get("value").and_then(Value::as_str))
+                .filter_map(reasoning_from_value)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let entry = |id: &str, name: Option<&str>, description: Option<&str>| -> Model {
+        let known = catalog.iter().find(|m| norm_id(&m.id) == norm_id(id));
+        Model {
+            id: id.to_owned(),
+            label: name
+                .map(str::to_owned)
+                .or_else(|| known.map(|m| m.label.clone()))
+                .unwrap_or_else(|| id.to_owned()),
+            description: description
+                .map(str::to_owned)
+                .or_else(|| known.and_then(|m| m.description.clone())),
+            reasoning_levels: match known.filter(|m| !m.reasoning_levels.is_empty()) {
+                Some(m) => m.reasoning_levels.clone(),
+                None => ladder.clone(),
+            },
+            options: known.map(|m| m.options.clone()).unwrap_or_default(),
+        }
+    };
+
+    let advertised = session_response
+        .get("models")
+        .and_then(|m| m.get("availableModels"))
+        .and_then(Value::as_array)
+        .map(|a| a.as_slice())
+        .unwrap_or_default();
+    if !advertised.is_empty() {
+        return advertised
+            .iter()
+            .filter_map(|m| {
+                let id = m.get("modelId").and_then(Value::as_str)?;
+                Some(entry(
+                    id,
+                    m.get("name").and_then(Value::as_str),
+                    m.get("description").and_then(Value::as_str),
+                ))
+            })
+            .collect();
+    }
+
+    session_response
+        .get("configOptions")
+        .and_then(Value::as_array)
+        .map(|a| a.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .find(|o| o.get("category").and_then(Value::as_str) == Some("model"))
+        .and_then(|o| o.get("options").and_then(Value::as_array))
+        .map(|opts| {
+            opts.iter()
+                .filter_map(|o| {
+                    let id = o.get("value").and_then(Value::as_str)?;
+                    Some(entry(
+                        id,
+                        o.get("name").and_then(Value::as_str),
+                        o.get("description").and_then(Value::as_str),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[async_trait]
@@ -463,11 +720,22 @@ impl Harness for AcpHarness {
         self.spec.reasoning_levels
     }
 
-    /// Static catalog; an absent binary surfaces as NotInstalled here, like
-    /// the codex harness.
+    /// ACP is the source of truth: a short-lived probe reads the agent's
+    /// advertised model list (cached on success). The spec's static catalog
+    /// answers when the agent advertises nothing or the probe fails — and an
+    /// absent binary still surfaces as NotInstalled, like before.
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         self.resolve_launch()?;
-        Ok((self.spec.models)())
+        if let Some(models) = self.models_cache.get() {
+            return Ok(models.clone());
+        }
+        match self.discover_models().await {
+            Ok(models) if !models.is_empty() => {
+                let _ = self.models_cache.set(models.clone());
+                Ok(self.models_cache.get().cloned().unwrap_or(models))
+            }
+            Ok(_) | Err(_) => Ok((self.spec.models)()),
+        }
     }
 
     async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
