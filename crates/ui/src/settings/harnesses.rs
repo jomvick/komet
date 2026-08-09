@@ -159,6 +159,10 @@ impl HarnessesPage {
                         if let Ok(list) = serde_json::from_value::<Vec<HarnessDescriptor>>(value) {
                             page.harnesses = Loadable::Ready(list);
                         }
+                        // The composer caches its catalog per space — poke
+                        // every Pickers to re-fetch, or the rail keeps the
+                        // old set until restart.
+                        crate::pickers::bump_harness_catalog(cx);
                     }
                     Err(err) => page.error = Some(err.to_string()),
                 }

@@ -39,6 +39,26 @@ use crate::state::{AppState, EngineHandle};
 use crate::theme::Theme;
 
 // ---------------------------------------------------------------------------
+// Catalog invalidation (Settings → Agents toggles)
+// ---------------------------------------------------------------------------
+
+/// Marker global: [`bump_harness_catalog`] pokes it whenever a Settings →
+/// Agents toggle changes some device's enabled set, and every [`Pickers`]
+/// observes it to force-refresh its cached harness catalog — without this the
+/// composer served the boot-time list until restart (user report).
+#[derive(Default)]
+pub struct HarnessCatalogChanged;
+
+impl gpui::Global for HarnessCatalogChanged {}
+
+/// Notify all composers that some device's harness catalog changed. The
+/// global carries no data — `default_global` pushes the observer effect, and
+/// the observers re-fetch from the engine (the source of truth).
+pub fn bump_harness_catalog(cx: &mut App) {
+    cx.default_global::<HarnessCatalogChanged>();
+}
+
+// ---------------------------------------------------------------------------
 // Draft config (what the pickers accumulate)
 // ---------------------------------------------------------------------------
 
@@ -305,6 +325,7 @@ pub struct Pickers {
     mutate_task: Option<Task<()>>,
     _search_events: Subscription,
     _state_observe: Subscription,
+    _catalog_observe: Subscription,
 }
 
 impl Pickers {
@@ -312,7 +333,15 @@ impl Pickers {
         let search = cx.new(|cx| ComposerInput::new("Search…", cx));
         let search_events = cx.subscribe(&search, |this: &mut Self, _, event, cx| match event {
             ComposerInputEvent::Edited => {
-                this.active = 0;
+                // Typing in the filter resets the highlight — but only the
+                // Branch picker HAS a filter. `set_text` emits Edited on
+                // programmatic clears too, and this subscription runs AFTER
+                // `toggle` returns, so an unscoped reset clobbers the
+                // just-anchored selected-model row back to 0 (regression:
+                // the top row wore a second highlight again).
+                if this.open == Some(PickerKind::Branch) {
+                    this.active = 0;
+                }
                 cx.notify();
             }
             ComposerInputEvent::Submitted => this.on_search_submit(cx),
@@ -354,6 +383,14 @@ impl Pickers {
             }
             cx.notify();
         });
+        // A Settings → Agents toggle changed some device's enabled set:
+        // force-refresh the cached catalog so the rail/chips follow without a
+        // restart (stale rows stay visible while the reload runs).
+        let catalog_observe =
+            cx.observe_global::<HarnessCatalogChanged>(|this: &mut Self, cx| {
+                this.ensure_harnesses(true, cx);
+                cx.notify();
+            });
         // Dev/testing knob: `KOMET_OPEN_PICKER=model|traits|repo|branch` boots
         // with that popover open — synthetic input can't reach the app on
         // headless compositors, so captures need a data-side path.
@@ -399,6 +436,7 @@ impl Pickers {
             mutate_task: None,
             _search_events: search_events,
             _state_observe: state_observe,
+            _catalog_observe: catalog_observe,
         }
     }
 
@@ -591,7 +629,12 @@ impl Pickers {
         self.open = Some(kind);
         self.search.update(cx, |input, cx| {
             input.set_placeholder("Search…", cx);
-            input.set_text("", cx);
+            // Skip the no-op clear: `set_text` emits Edited unconditionally,
+            // and the Branch arm of the subscription above would reset the
+            // highlight this function is about to anchor.
+            if !input.text().is_empty() {
+                input.set_text("", cx);
+            }
         });
         // The keyboard-nav highlight starts ON the selected row — row 0
         // otherwise reads as a second active row (user report).
@@ -627,7 +670,10 @@ impl Pickers {
             // revalidates, keeping stale rows visible until fresh ones land.
             PickerKind::Branch | PickerKind::Checkout => self.ensure_refs(true, cx),
             PickerKind::HarnessModel | PickerKind::Traits => {
-                self.ensure_harnesses(cx);
+                // Force: the enabled set moves under us (Settings → Agents,
+                // possibly from another viewer) — every open revalidates,
+                // keeping current rows visible until the fresh catalog lands.
+                self.ensure_harnesses(true, cx);
                 self.prefetch_models(cx);
             }
         }
@@ -636,18 +682,30 @@ impl Pickers {
 
     // ---- loads ----
 
-    fn ensure_harnesses(&mut self, cx: &mut Context<Self>) {
-        // Only load from Idle: `render` re-runs this every frame, so an Error
-        // that could re-trigger a load would flip back to Loading before the
-        // retry row ever painted (and spam the engine). Retry resets to Idle.
-        if !matches!(self.harnesses, Loadable::Idle) {
+    fn ensure_harnesses(&mut self, force: bool, cx: &mut Context<Self>) {
+        // Non-forced (the render loop's eager kick) only loads from Idle: an
+        // Error that could re-trigger a load would flip back to Loading
+        // before the retry row ever painted (and spam the engine); Retry
+        // resets to Idle. FORCED refreshes (a Settings → Agents toggle, a
+        // picker open) reload through Ready/Error too — the enabled set just
+        // changed under the cache, which otherwise served the boot-time
+        // catalog until restart (user report). Stale-while-revalidate: loaded
+        // rows stay on screen while the fresh catalog lands.
+        let reload = match self.harnesses {
+            Loadable::Idle => true,
+            Loadable::Loading => false,
+            Loadable::Ready(_) | Loadable::Error(_) => force,
+        };
+        if !reload {
             return;
         }
         let Some(engine) = self.engine(cx) else {
             return;
         };
         let target = self.space_target(cx);
-        self.harnesses = Loadable::Loading;
+        if !matches!(self.harnesses, Loadable::Ready(_)) {
+            self.harnesses = Loadable::Loading;
+        }
         self.load_task = Some(cx.spawn(async move |this, cx| {
             let mut params = serde_json::Map::new();
             if let Some(target) = &target {
@@ -1707,7 +1765,7 @@ impl Pickers {
                         PickerKind::HarnessModel | PickerKind::Traits => {
                             this.harnesses = Loadable::Idle;
                             this.models.clear();
-                            this.ensure_harnesses(cx);
+                            this.ensure_harnesses(false, cx);
                         }
                     }))
                     .child(SharedString::from("Retry")),
@@ -2435,7 +2493,7 @@ impl Render for Pickers {
         // Eager-load the harness catalog + every offered harness's models so
         // the chip reads "Fable 5" (a concrete pick) before any popover
         // opens, and rail switches inside the picker are instant.
-        self.ensure_harnesses(cx);
+        self.ensure_harnesses(false, cx);
         self.prefetch_models(cx);
         // A popover opened data-side (KOMET_OPEN_PICKER) never went through
         // `toggle`, so kick its loads here (all ensure_* are idempotent).
