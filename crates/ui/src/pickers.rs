@@ -449,23 +449,24 @@ impl Pickers {
             return Some(config.harness);
         }
         // New-chat canvas: the remembered last-used harness (sticky defaults),
-        // when the loaded catalog still offers it.
+        // when the loaded catalog still offers it (the device may have
+        // disabled it in Settings → Agents since).
         if let Some(harness) = self.defaults.harness {
             let offered = match self.harnesses.ready() {
-                Some(list) => visible_harnesses(list).iter().any(|d| d.id == harness),
+                Some(list) => offered_harnesses(list).iter().any(|d| d.id == harness),
                 None => true, // catalog not loaded yet — trust the memory
             };
             if offered {
                 return Some(harness);
             }
         }
-        // Fall back to the first VISIBLE harness: the registry lists the mock
+        // Fall back to the first OFFERED harness: the registry lists the mock
         // harness first, and resolving chips against it would boot the
         // new-chat canvas onto "Mock" instead of Claude Code + its default
         // model (it stays available under `KOMET_HARNESS=mock`).
         self.harnesses
             .ready()
-            .and_then(|list| visible_harnesses(list).first().map(|d| d.id))
+            .and_then(|list| offered_harnesses(list).first().map(|d| d.id))
     }
 
     /// Effective model id: the draft pick, the selected chat's config, or (on
@@ -600,10 +601,11 @@ impl Pickers {
                 CheckoutKind::NewWorktree => 1,
             },
             PickerKind::Branch => self.selected_ref_index(cx),
-            _ => 0,
+            PickerKind::HarnessModel | PickerKind::Traits => self.selected_model_index(cx),
         };
         if kind == PickerKind::HarnessModel {
             self.model_scroll.set_offset(gpui::Point::default());
+            self.model_scroll.scroll_to_item(self.active);
         }
         // Searchable pickers focus the filter input (it sits inside the frame,
         // so the frame's key handler still sees arrows/Enter); the rest focus
@@ -626,9 +628,7 @@ impl Pickers {
             PickerKind::Branch | PickerKind::Checkout => self.ensure_refs(true, cx),
             PickerKind::HarnessModel | PickerKind::Traits => {
                 self.ensure_harnesses(cx);
-                if let Some(harness) = self.effective_harness(cx) {
-                    self.ensure_models(harness, cx);
-                }
+                self.prefetch_models(cx);
             }
         }
         cx.notify();
@@ -668,13 +668,33 @@ impl Pickers {
                     },
                     Err(err) => Loadable::Error(err.to_string()),
                 };
-                if let Some(harness) = pickers.effective_harness(cx) {
-                    pickers.ensure_models(harness, cx);
-                }
+                pickers.prefetch_models(cx);
                 cx.notify();
             })
             .ok();
         }));
+    }
+
+    /// Kick a model load for the effective harness AND every offered one, in
+    /// parallel — by the time the user opens the picker (or switches rail
+    /// tabs) the lists are already there, instead of a per-selection
+    /// "Loading models…" round-trip. Each `ensure_models` call is guarded by
+    /// its slot state, so re-running this every catalog load/render is free.
+    fn prefetch_models(&mut self, cx: &mut Context<Self>) {
+        let mut targets: Vec<HarnessId> = match self.harnesses.ready() {
+            Some(list) => offered_harnesses(list).iter().map(|d| d.id).collect(),
+            None => Vec::new(),
+        };
+        // The committed chat's harness may be outside the offered set (e.g.
+        // disabled after the chat was created) — its models still matter.
+        if let Some(effective) = self.effective_harness(cx)
+            && !targets.contains(&effective)
+        {
+            targets.push(effective);
+        }
+        for harness in targets {
+            self.ensure_models(harness, cx);
+        }
     }
 
     fn ensure_models(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
@@ -718,6 +738,14 @@ impl Pickers {
                     }
                 }
                 pickers.models.insert(harness, loaded);
+                // A list that landed while its popover is open re-anchors the
+                // keyboard highlight onto the selected row (it sat at 0 while
+                // loading).
+                if pickers.open == Some(PickerKind::HarnessModel)
+                    && pickers.effective_harness(cx) == Some(harness)
+                {
+                    pickers.active = pickers.selected_model_index(cx);
+                }
                 cx.notify();
             })
             .ok();
@@ -1002,6 +1030,8 @@ impl Pickers {
         self.save_defaults();
         self.model_scroll.set_offset(gpui::Point::default());
         self.ensure_models(harness, cx);
+        // Re-anchor the keyboard highlight onto the new harness's selected row.
+        self.active = self.selected_model_index(cx);
         cx.notify();
     }
 
@@ -1151,6 +1181,22 @@ impl Pickers {
                     .map(|d| d.reasoning_levels.clone())
             })
             .unwrap_or_default()
+    }
+
+    /// The row the keyboard-nav highlight starts on: the resolved selected
+    /// model's index (mirrors the row check in the popover — the harness
+    /// default row when nothing is picked), 0 while the list is loading.
+    fn selected_model_index(&self, cx: &App) -> usize {
+        let Some(models) = self
+            .effective_harness(cx)
+            .and_then(|h| self.models.get(&h))
+            .and_then(|l| l.ready())
+        else {
+            return 0;
+        };
+        self.selected_model(cx)
+            .and_then(|selected| models.iter().position(|m| m.id == selected.id))
+            .unwrap_or(0)
     }
 
     /// The viewed harness's model list, when loaded (keyboard nav rows).
@@ -1898,7 +1944,7 @@ impl Pickers {
                 )
             }
             Loadable::Ready(list) => {
-                let mut descriptors: Vec<HarnessDescriptor> = visible_harnesses(list);
+                let mut descriptors: Vec<HarnessDescriptor> = offered_harnesses(list);
                 // The committed harness always gets its rail tab, even when
                 // it's the (normally hidden) mock harness of a dev session.
                 if let Some(effective) = effective
@@ -2270,37 +2316,6 @@ pub(crate) fn harness_brand_icon(harness: HarnessId) -> (&'static str, Option<gp
     }
 }
 
-/// Display-only toggle switch (komet branch-picker.tsx `Toggle`): an 18×32
-/// pill whose knob slides right and track flips white when on. State is owned
-/// by the parent row.
-#[allow(dead_code)]
-fn toggle_switch(theme: &Theme, on: bool) -> gpui::Div {
-    div()
-        .flex_none()
-        .w(px(32.0))
-        .h(px(18.0))
-        .rounded_full()
-        .bg(if on {
-            theme.text
-        } else {
-            crate::theme::ink(0.15)
-        })
-        .relative()
-        .child(
-            div()
-                .absolute()
-                .top(px(2.0))
-                .left(px(if on { 16.0 } else { 2.0 }))
-                .size(px(14.0))
-                .rounded_full()
-                .bg(if on {
-                    theme.on_solid
-                } else {
-                    crate::theme::ink(0.7)
-                }),
-        )
-}
-
 /// `KOMET_HARNESS=mock` (the e2e/dev rig) opts the mock harness into the UI;
 /// production launches never set it, so the mock never surfaces there.
 fn mock_harness_enabled() -> bool {
@@ -2330,6 +2345,28 @@ fn visible_harnesses_impl(list: &[HarnessDescriptor], allow_mock: bool) -> Vec<H
         .cloned()
         .collect();
     if real.is_empty() { list.to_vec() } else { real }
+}
+
+/// What the composer actually offers: [`visible_harnesses`] narrowed to the
+/// catalog device's enabled set (Settings → Agents — per-device state, so a
+/// space on another device follows THAT device's toggles). The dev-rig mock
+/// opt-in survives the filter, and a catalog where nothing is enabled (or
+/// that predates the flag entirely and defaults empty) falls back to
+/// everything visible rather than an empty rail.
+pub fn offered_harnesses(list: &[HarnessDescriptor]) -> Vec<HarnessDescriptor> {
+    offered_harnesses_impl(list, mock_harness_enabled())
+}
+
+fn offered_harnesses_impl(list: &[HarnessDescriptor], allow_mock: bool) -> Vec<HarnessDescriptor> {
+    let visible = visible_harnesses_impl(list, allow_mock);
+    let offered: Vec<HarnessDescriptor> = visible
+        .iter()
+        .filter(|d| {
+            komet_engine::registry::descriptor_enabled(d) || (allow_mock && d.id == HarnessId::Mock)
+        })
+        .cloned()
+        .collect();
+    if offered.is_empty() { visible } else { offered }
 }
 
 /// Attach the (single) open popover overlay to its trigger chip.
@@ -2395,12 +2432,11 @@ impl Render for Pickers {
             }
         }
 
-        // Eager-load the harness catalog + effective harness's models so the
-        // chip reads "Fable 5" (a concrete pick) before any popover opens.
+        // Eager-load the harness catalog + every offered harness's models so
+        // the chip reads "Fable 5" (a concrete pick) before any popover
+        // opens, and rail switches inside the picker are instant.
         self.ensure_harnesses(cx);
-        if let Some(harness) = self.effective_harness(cx) {
-            self.ensure_models(harness, cx);
-        }
+        self.prefetch_models(cx);
         // A popover opened data-side (KOMET_OPEN_PICKER) never went through
         // `toggle`, so kick its loads here (all ensure_* are idempotent).
         if matches!(
@@ -2734,6 +2770,8 @@ mod tests {
             supports_steering: true,
             steering_mode: komet_proto::SteeringMode::StepBoundary,
             reasoning_levels: vec![],
+            installed: true,
+            enabled: None,
         };
         let mixed = vec![
             descriptor(HarnessId::Mock, "Mock"),
@@ -2748,5 +2786,50 @@ mod tests {
         // …and opted back in by KOMET_HARNESS=mock (the e2e rig).
         assert_eq!(visible_harnesses_impl(&mixed, true).len(), 2);
         assert_eq!(visible_harnesses_impl(&mixed, true)[0].id, HarnessId::Mock);
+    }
+
+    #[test]
+    fn offered_harnesses_follow_the_catalog_enabled_flags() {
+        let descriptor = |id: HarnessId, name: &str, enabled: Option<bool>| HarnessDescriptor {
+            id,
+            name: name.into(),
+            supports_steering: true,
+            steering_mode: komet_proto::SteeringMode::StepBoundary,
+            reasoning_levels: vec![],
+            installed: true,
+            enabled,
+        };
+        let catalog = |claude: Option<bool>, codex: Option<bool>, grok: Option<bool>| {
+            vec![
+                descriptor(HarnessId::Mock, "Mock", Some(false)),
+                descriptor(HarnessId::ClaudeCode, "Claude Code", claude),
+                descriptor(HarnessId::Codex, "Codex", codex),
+                descriptor(HarnessId::Grok, "Grok", grok),
+            ]
+        };
+        // A catalog from an engine predating the flag (all None) falls back
+        // to default-set membership: Claude Code + Codex only.
+        let offered = offered_harnesses_impl(&catalog(None, None, None), false);
+        assert_eq!(
+            offered.iter().map(|d| d.id).collect::<Vec<_>>(),
+            vec![HarnessId::ClaudeCode, HarnessId::Codex]
+        );
+        // The device's flags win: Grok on, Codex off; catalog order holds.
+        let offered =
+            offered_harnesses_impl(&catalog(Some(true), Some(false), Some(true)), false);
+        assert_eq!(
+            offered.iter().map(|d| d.id).collect::<Vec<_>>(),
+            vec![HarnessId::ClaudeCode, HarnessId::Grok]
+        );
+        // The dev-rig mock opt-in survives the enabled filter.
+        let offered = offered_harnesses_impl(&catalog(Some(true), Some(false), None), true);
+        assert_eq!(
+            offered.iter().map(|d| d.id).collect::<Vec<_>>(),
+            vec![HarnessId::Mock, HarnessId::ClaudeCode]
+        );
+        // Nothing enabled falls back to the visible list, not an empty rail.
+        let offered =
+            offered_harnesses_impl(&catalog(Some(false), Some(false), Some(false)), false);
+        assert_eq!(offered.len(), 3);
     }
 }

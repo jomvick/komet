@@ -86,6 +86,13 @@ struct ListModelsParams {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct SetHarnessEnabledParams {
+    harness: HarnessId,
+    enabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct QueueCommandParams {
     chat_id: String,
     command: SessionCommandPayload,
@@ -717,6 +724,7 @@ fn forwardable(method: &str) -> bool {
     matches!(
         method,
         methods::LIST_HARNESSES
+            | methods::SET_HARNESS_ENABLED
             | methods::LIST_MODELS
             | methods::LIST_COMMANDS
             | methods::QUEUE_COMMAND
@@ -942,6 +950,15 @@ impl RpcService for EngineRpc {
         }
         match method {
             methods::LIST_HARNESSES => RpcReply::value(&self.registry.descriptors()),
+            methods::SET_HARNESS_ENABLED => {
+                let p: SetHarnessEnabledParams = parse_params(params)?;
+                self.registry
+                    .set_enabled(p.harness, p.enabled)
+                    .map_err(RpcError::Failed)?;
+                // Fresh catalog in the reply: the page repaints from it in one
+                // round trip, and a refused/raced toggle self-corrects.
+                RpcReply::value(&self.registry.descriptors())
+            }
             methods::LIST_MODELS => {
                 let p: ListModelsParams = parse_params(params)?;
                 let harness = self

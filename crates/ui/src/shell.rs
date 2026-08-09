@@ -33,6 +33,7 @@ use crate::popover::{self, Loadable};
 use crate::rail;
 use crate::settings::accounts::AccountsPage;
 use crate::settings::appearance::AppearancePage;
+use crate::settings::harnesses::HarnessesPage;
 use crate::settings::archived::ArchivedPage;
 use crate::settings::devices::DevicesPage;
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
@@ -142,6 +143,9 @@ pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsSection {
     Devices,
+    /// Which harnesses the composer offers (enable/disable toggles).
+    Harnesses,
+    /// Per-provider CLI accounts (login, usage) — labeled "Accounts".
     Agents,
     Appearance,
     Shortcuts,
@@ -149,8 +153,9 @@ pub enum SettingsSection {
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 5] = [
+    pub const ALL: [SettingsSection; 6] = [
         SettingsSection::Devices,
+        SettingsSection::Harnesses,
         SettingsSection::Agents,
         SettingsSection::Appearance,
         SettingsSection::Shortcuts,
@@ -162,6 +167,7 @@ impl SettingsSection {
     pub fn label(self) -> &'static str {
         match self {
             SettingsSection::Devices => "Devices",
+            SettingsSection::Harnesses => "Agents",
             SettingsSection::Agents => "Accounts",
             SettingsSection::Appearance => "Appearance",
             SettingsSection::Shortcuts => "Shortcuts",
@@ -436,6 +442,7 @@ pub struct Shell {
     appearance_page: Option<Entity<AppearancePage>>,
     shortcuts_page: Option<Entity<ShortcutsPage>>,
     accounts_page: Option<Entity<AccountsPage>>,
+    harnesses_page: Option<Entity<HarnessesPage>>,
     shortcuts_sub: Option<Subscription>,
     /// Session-row context menu: (chat id, window position).
     chat_menu: Option<(String, Point<Pixels>)>,
@@ -603,6 +610,7 @@ impl Shell {
                 Route::Settings(SettingsSection::Devices)
             }
             Some("settings/agents") => Route::Settings(SettingsSection::Agents),
+            Some("settings/harnesses") => Route::Settings(SettingsSection::Harnesses),
             Some("settings/appearance") => Route::Settings(SettingsSection::Appearance),
             Some("settings/shortcuts") => Route::Settings(SettingsSection::Shortcuts),
             Some("settings/archived") => Route::Settings(SettingsSection::Archived),
@@ -645,6 +653,7 @@ impl Shell {
             appearance_page: None,
             shortcuts_page: None,
             accounts_page: None,
+            harnesses_page: None,
             shortcuts_sub: None,
             chat_menu: None,
             rename_dialog: None,
@@ -1089,6 +1098,11 @@ impl Shell {
     // ---- routes / settings ----
 
     fn open_settings(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
+        // Recreate per visit: the page's ListHarnesses load re-probes which
+        // CLIs are installed, so installing one shows up on the next open.
+        if section == SettingsSection::Harnesses {
+            self.harnesses_page = None;
+        }
         self.route = Route::Settings(section);
         self.nav.push(NavEntry::Settings(section));
         self.user_menu_open = false;
@@ -1146,6 +1160,16 @@ impl Shell {
                     self.devices_page = Some(cx.new(|cx| DevicesPage::new(state, cx)));
                 }
                 match &self.devices_page {
+                    Some(page) => page.clone().into_any_element(),
+                    None => Empty.into_any_element(),
+                }
+            }
+            SettingsSection::Harnesses => {
+                if self.harnesses_page.is_none() {
+                    let state = self.state.clone();
+                    self.harnesses_page = Some(cx.new(|cx| HarnessesPage::new(state, cx)));
+                }
+                match &self.harnesses_page {
                     Some(page) => page.clone().into_any_element(),
                     None => Empty.into_any_element(),
                 }
@@ -1721,6 +1745,7 @@ impl Shell {
     ) -> AnyElement {
         let section_icon = |item: SettingsSection| match item {
             SettingsSection::Devices => icons::MONITOR,
+            SettingsSection::Harnesses => icons::WIDGET,
             SettingsSection::Agents => icons::KEY_MINIMALISTIC,
             SettingsSection::Appearance => icons::TUNING,
             SettingsSection::Shortcuts => icons::KEYBOARD,

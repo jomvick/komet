@@ -64,6 +64,14 @@ struct AcpAgentSpec {
     npx_package: Option<&'static str>,
     /// Extra install locations to probe after PATH.
     extra_paths: fn() -> Vec<PathBuf>,
+    /// The agent's own CLI binary (`claude`, `codex`, …) — what "installed"
+    /// means to the user. Distinct from `executable` where the spawned adapter
+    /// wraps the CLI (`claude-agent-acp`, `codex-acp`, `pi-acp`), and the npx
+    /// fallback deliberately doesn't count: npx can fetch an adapter on
+    /// demand, but an absent CLI still means no logins/config to drive.
+    cli_executable: &'static str,
+    /// Extra install locations probed for [`Self::cli_executable`].
+    cli_extra_paths: fn() -> Vec<PathBuf>,
     /// Search summary + install hint for the NotInstalled error.
     install_hint: &'static str,
     models: fn() -> Vec<Model>,
@@ -140,6 +148,15 @@ fn claude_spec() -> AcpAgentSpec {
         args: &[],
         npx_package: Some("@agentclientprotocol/claude-agent-acp@0.66.0"),
         extra_paths: npm_global_paths("claude-agent-acp"),
+        cli_executable: "claude",
+        cli_extra_paths: || {
+            let mut dirs = npm_global_bins("claude");
+            if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+                // The native installer's launcher location.
+                dirs.push(home.join(".claude").join("local").join("claude"));
+            }
+            dirs
+        },
         install_hint: "claude-agent-acp (searched PATH, the login shell's PATH, npm \
              global bins, and fnm/nvm/volta/pnpm/bun install dirs; falls back to \
              `npx -y @agentclientprotocol/claude-agent-acp` when npx is available; \
@@ -174,6 +191,8 @@ fn codex_spec() -> AcpAgentSpec {
         args: &[],
         npx_package: Some("@agentclientprotocol/codex-acp@1.1.14"),
         extra_paths: npm_global_paths("codex-acp"),
+        cli_executable: "codex",
+        cli_extra_paths: || npm_global_bins("codex"),
         install_hint: "codex-acp (searched PATH, the login shell's PATH, npm global \
              bins, and fnm/nvm/volta/pnpm/bun install dirs; falls back to \
              `npx -y @agentclientprotocol/codex-acp` when npx is available; install \
@@ -214,6 +233,18 @@ fn npm_global_bins(exe: &str) -> Vec<PathBuf> {
     dirs
 }
 
+fn grok_install_paths() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        dirs.push(home.join(".local").join("bin").join("grok"));
+        dirs.push(home.join(".grok").join("bin").join("grok"));
+        dirs.push(home.join(".npm-global").join("bin").join("grok"));
+    }
+    dirs.push(PathBuf::from("/opt/homebrew/bin/grok"));
+    dirs.push(PathBuf::from("/usr/local/bin/grok"));
+    dirs
+}
+
 fn grok_spec() -> AcpAgentSpec {
     AcpAgentSpec {
         id: HarnessId::Grok,
@@ -222,17 +253,9 @@ fn grok_spec() -> AcpAgentSpec {
         env_override: "GROK_EXECUTABLE",
         args: &["agent", "stdio"],
         npx_package: Some("@xai-official/grok@1.0.0"),
-        extra_paths: || {
-            let mut dirs = Vec::new();
-            if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-                dirs.push(home.join(".local").join("bin").join("grok"));
-                dirs.push(home.join(".grok").join("bin").join("grok"));
-                dirs.push(home.join(".npm-global").join("bin").join("grok"));
-            }
-            dirs.push(PathBuf::from("/opt/homebrew/bin/grok"));
-            dirs.push(PathBuf::from("/usr/local/bin/grok"));
-            dirs
-        },
+        extra_paths: grok_install_paths,
+        cli_executable: "grok",
+        cli_extra_paths: grok_install_paths,
         install_hint: "grok (searched PATH, the login shell's PATH, ~/.local/bin, \
              ~/.grok/bin, ~/.npm-global/bin, /opt/homebrew/bin, /usr/local/bin, and \
              fnm/nvm/volta/pnpm/bun install dirs; install with \
@@ -265,6 +288,17 @@ fn grok_spec() -> AcpAgentSpec {
     }
 }
 
+fn hermes_install_paths() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        dirs.push(home.join(".local").join("bin").join("hermes"));
+        dirs.push(home.join(".hermes").join("bin").join("hermes"));
+    }
+    dirs.push(PathBuf::from("/opt/homebrew/bin/hermes"));
+    dirs.push(PathBuf::from("/usr/local/bin/hermes"));
+    dirs
+}
+
 fn hermes_spec() -> AcpAgentSpec {
     AcpAgentSpec {
         id: HarnessId::Hermes,
@@ -274,16 +308,9 @@ fn hermes_spec() -> AcpAgentSpec {
         args: &["acp"],
         // Python/uv install — no npm fallback exists.
         npx_package: None,
-        extra_paths: || {
-            let mut dirs = Vec::new();
-            if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-                dirs.push(home.join(".local").join("bin").join("hermes"));
-                dirs.push(home.join(".hermes").join("bin").join("hermes"));
-            }
-            dirs.push(PathBuf::from("/opt/homebrew/bin/hermes"));
-            dirs.push(PathBuf::from("/usr/local/bin/hermes"));
-            dirs
-        },
+        extra_paths: hermes_install_paths,
+        cli_executable: "hermes",
+        cli_extra_paths: hermes_install_paths,
         install_hint: "hermes (searched PATH, the login shell's PATH, ~/.local/bin, \
              ~/.hermes/bin, /opt/homebrew/bin, /usr/local/bin, and fnm/nvm/volta/pnpm/bun \
              install dirs; install with \
@@ -331,6 +358,8 @@ fn pi_spec() -> AcpAgentSpec {
         args: &[],
         npx_package: Some("pi-acp@0.0.33"),
         extra_paths: npm_global_paths("pi-acp"),
+        cli_executable: "pi",
+        cli_extra_paths: || npm_global_bins("pi"),
         install_hint: "pi-acp (searched PATH, the login shell's PATH, npm global bins, \
              and fnm/nvm/volta/pnpm/bun install dirs; falls back to `npx -y pi-acp` \
              when npx is available; install with `npm install -g pi-acp` — requires the \
@@ -718,6 +747,20 @@ impl Harness for AcpHarness {
     }
     fn reasoning_levels(&self) -> &[ReasoningLevel] {
         self.spec.reasoning_levels
+    }
+
+    /// The agent's own CLI, not the adapter: `claude` counts as installed even
+    /// when `claude-agent-acp` would arrive via npx, and an npx-reachable
+    /// adapter does NOT count when the CLI itself is missing. Explicit
+    /// executables (tests, `*_EXECUTABLE` overrides) always count.
+    fn installed(&self) -> bool {
+        if self.executable.is_some() {
+            return true;
+        }
+        if std::env::var_os(self.spec.env_override).is_some_and(|v| !v.is_empty()) {
+            return true;
+        }
+        find_on_paths(self.spec.cli_executable, (self.spec.cli_extra_paths)()).is_some()
     }
 
     /// ACP is the source of truth: a short-lived probe reads the agent's
