@@ -41,8 +41,8 @@ use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
 use komet_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SlashCommand,
-    SteeringMode, UserInputAnswer, UserInputQuestion,
+    AgentEvent, DoneStatus, HarnessId, Model, ModelOption, ModelOptionChoice, ReasoningLevel,
+    RunRequest, SlashCommand, SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
 use crate::jsonrpc::{Incoming, RpcClient};
@@ -86,6 +86,10 @@ struct AcpAgentSpec {
     /// (per-agent clamping, e.g. Claude xhigh→max off the xhigh family). The
     /// first value the agent actually advertises wins.
     effort_values: fn(Option<ReasoningLevel>, Option<&str>) -> Vec<&'static str>,
+    /// Levels appended to a DISCOVERED model's non-empty ladder: modes the
+    /// wire can't advertise because they aren't `thought_level` values
+    /// (Claude's Ultrathink rides prompts via `prompt_transform`).
+    ladder_extras: &'static [ReasoningLevel],
 }
 
 fn identity_transform(_reasoning: Option<ReasoningLevel>, text: &str) -> String {
@@ -179,6 +183,9 @@ fn claude_spec() -> AcpAgentSpec {
                 .into_iter()
                 .collect()
         },
+        // Ultrathink is a prompt-prefix mode (see `prompt_transform`), so it
+        // never appears among the adapter's `thought_level` values.
+        ladder_extras: &[ReasoningLevel::Ultrathink],
     }
 }
 
@@ -207,6 +214,7 @@ fn codex_spec() -> AcpAgentSpec {
                 .into_iter()
                 .collect()
         },
+        ladder_extras: &[],
     }
 }
 
@@ -285,6 +293,7 @@ fn grok_spec() -> AcpAgentSpec {
         ],
         prompt_transform: identity_transform,
         effort_values: default_effort_values,
+        ladder_extras: &[],
     }
 }
 
@@ -346,6 +355,7 @@ fn hermes_spec() -> AcpAgentSpec {
         reasoning_levels: &[],
         prompt_transform: identity_transform,
         effort_values: default_effort_values,
+        ladder_extras: &[],
     }
 }
 
@@ -398,6 +408,7 @@ fn pi_spec() -> AcpAgentSpec {
         ],
         prompt_transform: identity_transform,
         effort_values: default_effort_values,
+        ladder_extras: &[],
     }
 }
 
@@ -618,7 +629,19 @@ impl AcpHarness {
             let session = client
                 .request("session/new", json!({ "cwd": cwd, "mcpServers": [] }))
                 .await?;
-            Ok::<Vec<Model>, HarnessError>(models_from_session(&session, &(self.spec.models)()))
+            let mut models = models_from_session(&session, &(self.spec.models)());
+            // Prompt-convention modes (Claude Ultrathink) extend any real
+            // ladder — never an effort-less model's empty one.
+            for model in &mut models {
+                if !model.reasoning_levels.is_empty() {
+                    for extra in self.spec.ladder_extras {
+                        if !model.reasoning_levels.contains(extra) {
+                            model.reasoning_levels.push(*extra);
+                        }
+                    }
+                }
+            }
+            Ok::<Vec<Model>, HarnessError>(models)
         };
         let result = tokio::time::timeout(Duration::from_secs(10), discovery).await;
         shutdown_child(&mut child, self.kill_grace).await;
@@ -645,19 +668,25 @@ fn reasoning_from_value(value: &str) -> Option<ReasoningLevel> {
     }
 }
 
-/// Derive the model list a `session/new` response advertises. Preference
-/// order mirrors paseo's ACP client: the first-class `models` state, then the
-/// `model` config option's choices; empty when the agent advertises neither.
-/// ACP carries no per-model effort metadata — every discovered model gets the
-/// probe session's `thought_level` ladder unless a static catalog entry with
-/// the same id supplies its own (the catalog also contributes label/
-/// description/options for matched ids, e.g. codex service tiers).
+/// Derive the model list a `session/new` response advertises. The `model`
+/// config option's choices come FIRST, the legacy first-class `models` state
+/// is only a fallback: the org adapters enumerate one `availableModels` entry
+/// per model × effort combination on that deprecated surface (Zed dropped it
+/// entirely), while their `configOptions` carry base model ids with effort as
+/// a separate `thought_level` option. `[1m]`-suffixed long-context variants
+/// collapse into the base model's Context Window trait, matching the static
+/// catalogs. Traits come off the wire too — every select/boolean config
+/// option outside mode/model/thought_level becomes a `ModelOption` — so
+/// unmatched models keep fast mode etc.; the catalog only enriches matched
+/// ids with label/description/per-model ladders.
 fn models_from_session(session_response: &Value, catalog: &[Model]) -> Vec<Model> {
-    let ladder: Vec<ReasoningLevel> = session_response
+    let config_options = session_response
         .get("configOptions")
         .and_then(Value::as_array)
         .map(|a| a.as_slice())
-        .unwrap_or_default()
+        .unwrap_or_default();
+
+    let ladder: Vec<ReasoningLevel> = config_options
         .iter()
         .find(|o| o.get("category").and_then(Value::as_str) == Some("thought_level"))
         .and_then(|o| o.get("options").and_then(Value::as_array))
@@ -668,9 +697,18 @@ fn models_from_session(session_response: &Value, catalog: &[Model]) -> Vec<Model
                 .collect()
         })
         .unwrap_or_default();
+    let wire_options: Vec<ModelOption> = config_options
+        .iter()
+        .filter_map(trait_from_config_option)
+        .collect();
 
-    let entry = |id: &str, name: Option<&str>, description: Option<&str>| -> Model {
-        let known = catalog.iter().find(|m| norm_id(&m.id) == norm_id(id));
+    let known = |id: &str| catalog.iter().find(|m| norm_id(&m.id) == norm_id(id));
+    let build = |id: &str,
+                 name: Option<&str>,
+                 description: Option<&str>,
+                 options: Vec<ModelOption>|
+     -> Model {
+        let known = known(id);
         Model {
             id: id.to_owned(),
             label: name
@@ -684,51 +722,140 @@ fn models_from_session(session_response: &Value, catalog: &[Model]) -> Vec<Model
                 Some(m) => m.reasoning_levels.clone(),
                 None => ladder.clone(),
             },
-            options: known.map(|m| m.options.clone()).unwrap_or_default(),
+            options,
         }
     };
 
-    let advertised = session_response
-        .get("models")
-        .and_then(|m| m.get("availableModels"))
-        .and_then(Value::as_array)
-        .map(|a| a.as_slice())
+    let model_select: Vec<&Value> = config_options
+        .iter()
+        .find(|o| o.get("category").and_then(Value::as_str) == Some("model"))
+        .and_then(|o| o.get("options").and_then(Value::as_array))
+        .map(|opts| opts.iter().collect())
         .unwrap_or_default();
-    if !advertised.is_empty() {
-        return advertised
+    if !model_select.is_empty() {
+        let raw_ids: Vec<&str> = model_select
             .iter()
-            .filter_map(|m| {
-                let id = m.get("modelId").and_then(Value::as_str)?;
-                Some(entry(
+            .filter_map(|o| o.get("value").and_then(Value::as_str))
+            .collect();
+        return model_select
+            .iter()
+            .filter_map(|o| {
+                let id = o.get("value").and_then(Value::as_str)?;
+                // A 1M variant folds into its base row's Context Window
+                // trait; it only stands alone when its bare base id is not
+                // advertised (the claude adapter lists `opus[1m]` with no
+                // bare `opus` when the CLI pins the 1M window).
+                if let Some(base) = strip_context_hint(id)
+                    && raw_ids.contains(&base)
+                {
+                    return None;
+                }
+                let mut options = wire_options.clone();
+                if raw_ids
+                    .iter()
+                    .any(|raw| strip_context_hint(raw) == Some(id))
+                {
+                    options.push(crate::claude::catalog::context_window());
+                }
+                Some(build(
                     id,
-                    m.get("name").and_then(Value::as_str),
-                    m.get("description").and_then(Value::as_str),
+                    o.get("name").and_then(Value::as_str),
+                    o.get("description").and_then(Value::as_str),
+                    options,
                 ))
             })
             .collect();
     }
 
+    // Legacy fallback for agents predating session config options. The
+    // catalog's own option sets apply here — nothing arrives on the wire.
     session_response
-        .get("configOptions")
+        .get("models")
+        .and_then(|m| m.get("availableModels"))
         .and_then(Value::as_array)
         .map(|a| a.as_slice())
         .unwrap_or_default()
         .iter()
-        .find(|o| o.get("category").and_then(Value::as_str) == Some("model"))
-        .and_then(|o| o.get("options").and_then(Value::as_array))
-        .map(|opts| {
-            opts.iter()
-                .filter_map(|o| {
-                    let id = o.get("value").and_then(Value::as_str)?;
-                    Some(entry(
-                        id,
-                        o.get("name").and_then(Value::as_str),
-                        o.get("description").and_then(Value::as_str),
-                    ))
-                })
-                .collect()
+        .filter_map(|m| {
+            let id = m.get("modelId").and_then(Value::as_str)?;
+            Some(build(
+                id,
+                m.get("name").and_then(Value::as_str),
+                m.get("description").and_then(Value::as_str),
+                known(id).map(|k| k.options.clone()).unwrap_or_default(),
+            ))
         })
-        .unwrap_or_default()
+        .collect()
+}
+
+/// A session config option surfaced as a Traits-dropdown section. Mode is
+/// komet's own (forced to the no-prompts choice), model rides the model rows,
+/// and thought_level is the Reasoning ladder — everything else the agent
+/// advertises (fast mode, collaboration mode, agent persona, …) passes
+/// through. `currentValue` doubles as the default: it is the state the
+/// session opens in. Booleans render as an off/on select, mirroring the
+/// catalogs (komet never declares the boolean config capability, so adapters
+/// send selects, but handle the shape defensively).
+fn trait_from_config_option(option: &Value) -> Option<ModelOption> {
+    if matches!(
+        option.get("category").and_then(Value::as_str),
+        Some("mode" | "model" | "thought_level")
+    ) {
+        return None;
+    }
+    let id = option.get("id").and_then(Value::as_str)?;
+    let label = option.get("name").and_then(Value::as_str).unwrap_or(id);
+    match option.get("type").and_then(Value::as_str)? {
+        "select" => {
+            let choices: Vec<ModelOptionChoice> = option
+                .get("options")
+                .and_then(Value::as_array)?
+                .iter()
+                .filter_map(|c| {
+                    let id = c.get("value").and_then(Value::as_str)?;
+                    Some(ModelOptionChoice {
+                        id: id.to_owned(),
+                        label: c
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or(id)
+                            .to_owned(),
+                    })
+                })
+                .collect();
+            let default_choice = option
+                .get("currentValue")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .or_else(|| choices.first().map(|c| c.id.clone()))?;
+            (choices.len() > 1).then(|| ModelOption {
+                id: id.to_owned(),
+                label: label.to_owned(),
+                choices,
+                default_choice,
+            })
+        }
+        "boolean" => Some(ModelOption {
+            id: id.to_owned(),
+            label: label.to_owned(),
+            choices: vec![
+                ModelOptionChoice {
+                    id: "off".into(),
+                    label: "Off".into(),
+                },
+                ModelOptionChoice {
+                    id: "on".into(),
+                    label: "On".into(),
+                },
+            ],
+            default_choice: if option.get("currentValue") == Some(&Value::Bool(true)) {
+                "on".into()
+            } else {
+                "off".into()
+            },
+        }),
+        _ => None,
+    }
 }
 
 #[async_trait]
@@ -915,16 +1042,31 @@ fn norm_id(id: &str) -> String {
         .to_ascii_lowercase()
 }
 
+/// Whether a model id carries the 1M-context hint, in either spelling: the
+/// display form `opus[1m]` or the SDK-id form `claude-opus-4-6-1m`.
+fn context_hint_1m(id: &str) -> bool {
+    id.contains("[1m]") || id.ends_with("-1m")
+}
+
+/// The id with a trailing long-context hint removed; `None` when it carries
+/// none.
+fn strip_context_hint(id: &str) -> Option<&str> {
+    id.strip_suffix("[1m]").or_else(|| id.strip_suffix("-1m"))
+}
+
 /// Pick the advertised model value for a requested model id. Agents differ in
 /// what they advertise: full ids (`claude-opus-5`), SDK aliases
-/// (`opus`, `sonnet`, `haiku` — the claude adapter), and `[1m]`-suffixed
-/// long-context variants. Exact match first (with the `[1m]` compose when the
-/// run selects the 1M window), then a family-token fallback that prefers a
-/// variant matching the requested context window.
+/// (`opus`, `sonnet`, `haiku` — the claude adapter), and long-context
+/// variants in either hint spelling. Exact match first (with the 1M compose
+/// when the run selects the 1M window), then a family-token fallback that
+/// prefers a variant matching the requested context window.
 fn pick_model_value(requested: &str, available: &[&str], context_1m: bool) -> Option<String> {
-    let with_1m = format!("{requested}[1m]");
-    if context_1m && available.contains(&with_1m.as_str()) {
-        return Some(with_1m);
+    if context_1m {
+        for composed in [format!("{requested}[1m]"), format!("{requested}-1m")] {
+            if available.contains(&composed.as_str()) {
+                return Some(composed);
+            }
+        }
     }
     if available.contains(&requested) {
         return Some(requested.to_owned());
@@ -939,7 +1081,7 @@ fn pick_model_value(requested: &str, available: &[&str], context_1m: bool) -> Op
         .collect();
     candidates
         .iter()
-        .find(|v| v.contains("[1m]") == context_1m)
+        .find(|v| context_hint_1m(v) == context_1m)
         .or_else(|| candidates.first())
         .map(|v| (**v).to_owned())
 }
@@ -995,11 +1137,20 @@ fn config_option_sets(
                 .map(Value::String),
             // Unattended parity with the retired custom adapters (claude
             // bypassPermissions / codex approvalPolicy never): pick the
-            // no-prompts mode when the agent offers one.
-            ("select", Some("mode")) => ["bypassPermissions", "bypass_permissions", "yolo"]
-                .into_iter()
-                .find(|v| available.contains(v))
-                .map(|v| Value::String(v.to_owned())),
+            // no-prompts mode when the agent offers one. claude-agent-acp
+            // calls it `bypassPermissions`, codex-acp `agent-full-access`
+            // (approvalPolicy "never" + danger-full-access sandbox).
+            ("select", Some("mode")) => [
+                "bypassPermissions",
+                "bypass_permissions",
+                "yolo",
+                "agent-full-access",
+                "danger-full-access",
+                "full-access",
+            ]
+            .into_iter()
+            .find(|v| available.contains(v))
+            .map(|v| Value::String(v.to_owned())),
             ("select", Some("thought_level")) => efforts
                 .iter()
                 .find(|c| available.contains(*c))
@@ -1138,30 +1289,20 @@ type RequestInputFn = Box<
         + Sync,
 >;
 
-/// A permission request is a QUESTION (not a tool permission) when its
-/// options don't look like an allow/reject set: any option without an
-/// allow/reject kind, or two options sharing one kind, means the agent is
-/// relaying user-facing choices (Claude's AskUserQuestion arrives this way
-/// through the adapter). Tool permissions auto-accept (unattended parity);
-/// questions round-trip through the input bridge.
+/// A permission request is a QUESTION (not a tool permission) when any of
+/// its options lacks an allow/reject kind — that's how the agent relays
+/// user-facing choices (Claude's AskUserQuestion arrives this way through
+/// the adapter). Every option carrying an allow/reject kind means a real
+/// tool permission, which auto-accepts (unattended parity); kinds may
+/// legitimately repeat — codex sends two `allow_always` options ("Allow for
+/// Session" and a prefix-rule amendment) on every exec approval.
 fn is_user_question(options: &[Value]) -> bool {
-    let mut seen: Vec<&str> = Vec::new();
-    for option in options {
-        let Some(kind) = option.get("kind").and_then(Value::as_str) else {
-            return true;
-        };
-        if !matches!(
-            kind,
-            "allow_once" | "allow_always" | "reject_once" | "reject_always"
-        ) {
-            return true;
-        }
-        if seen.contains(&kind) {
-            return true;
-        }
-        seen.push(kind);
-    }
-    false
+    options.iter().any(|option| {
+        !matches!(
+            option.get("kind").and_then(Value::as_str),
+            Some("allow_once" | "allow_always" | "reject_once" | "reject_always")
+        )
+    })
 }
 
 /// The live-run request handler: tool permissions auto-accept like
@@ -1280,6 +1421,22 @@ fn prompt_like_request(
     params: Value,
 ) -> BoxFuture<'static, Result<Value, HarnessError>> {
     Box::pin(async move { client.request(method, params).await })
+}
+
+/// A mid-turn `_session/steering` call. `idleBehavior: promptRequired`
+/// covers the turn-ended race: the agent hands the text back instead of
+/// firing an untracked turn.
+fn steering_call_future(
+    client: &RpcClient,
+    session_id: &str,
+    text: &str,
+) -> BoxFuture<'static, Result<Value, HarnessError>> {
+    let params = json!({
+        "sessionId": session_id,
+        "prompt": [{ "type": "text", "text": text }],
+        "_meta": { "steering": { "idleBehavior": "promptRequired" } },
+    });
+    prompt_like_request(client.clone(), "_session/steering", params)
 }
 
 /// The per-run event loop: one task multiplexing agent messages, the pending
@@ -1465,6 +1622,15 @@ async fn run_session(session: Session) {
     // Steers waiting for the turn boundary (agents without the extension, or
     // extension steers that lost the turn-end race).
     let mut queued_steers: VecDeque<String> = VecDeque::new();
+    // The in-flight `_session/steering` call (text + response future), plus
+    // followers awaiting their turn. Polled from the main select so the loop
+    // keeps draining `incoming` while the agent responds — awaiting inline
+    // deadlocks against a full incoming channel when the agent floods
+    // updates (the reader blocks on the channel and never parses the
+    // steering response).
+    let mut steering_call: Option<(String, BoxFuture<'static, Result<Value, HarnessError>>)> =
+        None;
+    let mut steer_backlog: VecDeque<String> = VecDeque::new();
     let mut steering_open = true;
     let mut interrupted = false;
     let mut interrupt_sent = false;
@@ -1627,6 +1793,75 @@ async fn run_session(session: Session) {
                 }
             },
 
+            res = async { steering_call.as_mut().expect("guarded by if").1.as_mut().await },
+                if steering_call.is_some() =>
+            {
+                let (text, _) = steering_call.take().expect("guarded by if");
+                let outcome = match &res {
+                    Ok(resp) => resp
+                        .get("outcome")
+                        .and_then(Value::as_str)
+                        .unwrap_or("injected")
+                        .to_owned(),
+                    Err(e) => {
+                        tracing::debug!(
+                            target: "komet_harness::acp",
+                            "_session/steering failed (redelivering): {e}"
+                        );
+                        // Failed calls redeliver like a lost turn-end race.
+                        "promptRequired".to_owned()
+                    }
+                };
+                if interrupted {
+                    // The run is winding down; the steer is abandoned like
+                    // any queued steer at interrupt.
+                } else if outcome != "promptRequired" {
+                    let (prev, next) = rotate(&mut assistant_message_id);
+                    if !send(
+                        &event_tx,
+                        AgentEvent::Steered {
+                            assistant_message_id: Some(prev),
+                            next_assistant_message_id: Some(next),
+                        },
+                    )
+                    .await
+                    {
+                        break 'main;
+                    }
+                } else if turn.is_some() {
+                    // Raced the turn end: redeliver at the boundary the
+                    // loop is about to hit.
+                    queued_steers.push_back(text);
+                } else {
+                    // The turn ended while the call was in flight and its
+                    // boundary already passed — the steer becomes the next
+                    // turn directly.
+                    let (prev, next) = rotate(&mut assistant_message_id);
+                    if !send(
+                        &event_tx,
+                        AgentEvent::Steered {
+                            assistant_message_id: Some(prev),
+                            next_assistant_message_id: Some(next),
+                        },
+                    )
+                    .await
+                    {
+                        break 'main;
+                    }
+                    done_current = false;
+                    turn = Some(prompt_turn(client.clone(), session_id.clone(), text));
+                }
+                while let Some(next_text) = steer_backlog.pop_front() {
+                    if turn.is_some() && !interrupted {
+                        let fut = steering_call_future(&client, &session_id, &next_text);
+                        steering_call = Some((next_text, fut));
+                        break;
+                    }
+                    // No live turn to inject into: boundary delivery.
+                    queued_steers.push_back(next_text);
+                }
+            },
+
             steer = steering.recv(), if steering_open && !interrupted => match steer {
                 Some(msg) => {
                     // Same transform as the initial prompt: Claude's
@@ -1650,46 +1885,14 @@ async fn run_session(session: Session) {
                         turn = Some(prompt_turn(client.clone(), session_id.clone(), text));
                     } else if steer_ext {
                         // Mid-turn injection via the `_session/steering`
-                        // extension. `idleBehavior: promptRequired` covers the
-                        // turn-ended race: the agent hands the text back
-                        // instead of firing an untracked turn.
-                        let params = json!({
-                            "sessionId": session_id,
-                            "prompt": [{ "type": "text", "text": text }],
-                            "_meta": { "steering": { "idleBehavior": "promptRequired" } },
-                        });
-                        match client.request("_session/steering", params).await {
-                            Ok(resp) => {
-                                let outcome = resp
-                                    .get("outcome")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("injected");
-                                if outcome == "promptRequired" {
-                                    // Raced the turn end: redeliver at the
-                                    // boundary the loop is about to hit.
-                                    queued_steers.push_back(text);
-                                } else {
-                                    let (prev, next) = rotate(&mut assistant_message_id);
-                                    if !send(
-                                        &event_tx,
-                                        AgentEvent::Steered {
-                                            assistant_message_id: Some(prev),
-                                            next_assistant_message_id: Some(next),
-                                        },
-                                    )
-                                    .await
-                                    {
-                                        break 'main;
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                tracing::debug!(
-                                    target: "komet_harness::acp",
-                                    "_session/steering failed (queued for turn boundary): {e}"
-                                );
-                                queued_steers.push_back(text);
-                            }
+                        // extension: start the call, resolved by its own
+                        // select branch. One call in flight at a time;
+                        // followers wait in the backlog.
+                        if steering_call.is_some() {
+                            steer_backlog.push_back(text);
+                        } else {
+                            let fut = steering_call_future(&client, &session_id, &text);
+                            steering_call = Some((text, fut));
                         }
                     } else {
                         // No extension (Grok today): turn-boundary delivery.
@@ -1860,6 +2063,218 @@ mod tests {
         assert_eq!(
             config_option_sets(&json!({"sessionId": "s"}), Some("x"), &["high"], &no_opts),
             Vec::new()
+        );
+    }
+
+    #[test]
+    fn models_prefer_the_model_config_option_over_legacy_available_models() {
+        // codex-acp shape: the legacy models state enumerates model × effort,
+        // the config options carry base ids + a separate thought_level select.
+        let response = json!({
+            "sessionId": "s-1",
+            "models": {
+                "currentModelId": "gpt-5.6-sol low",
+                "availableModels": [
+                    { "modelId": "gpt-5.6-sol low", "name": "GPT-5.6-Sol (low)" },
+                    { "modelId": "gpt-5.6-sol medium", "name": "GPT-5.6-Sol (medium)" },
+                    { "modelId": "gpt-5.6-terra low", "name": "GPT-5.6-Terra (low)" },
+                ],
+            },
+            "configOptions": [
+                {
+                    "id": "mode",
+                    "name": "Mode",
+                    "category": "mode",
+                    "type": "select",
+                    "currentValue": "agent",
+                    "options": [
+                        { "value": "read-only", "name": "Read Only" },
+                        { "value": "agent", "name": "Agent" },
+                        { "value": "agent-full-access", "name": "Agent (full access)" },
+                    ],
+                },
+                {
+                    "id": "model",
+                    "name": "Model",
+                    "category": "model",
+                    "type": "select",
+                    "currentValue": "gpt-5.6-sol",
+                    "options": [
+                        { "value": "gpt-5.6-sol", "name": "GPT-5.6-Sol", "description": "Frontier" },
+                        { "value": "gpt-5.6-terra", "name": "GPT-5.6-Terra" },
+                    ],
+                },
+                {
+                    "id": "reasoning_effort",
+                    "name": "Reasoning effort",
+                    "category": "thought_level",
+                    "type": "select",
+                    "currentValue": "medium",
+                    "options": [
+                        { "value": "low", "name": "Low" },
+                        { "value": "medium", "name": "Medium" },
+                        { "value": "high", "name": "High" },
+                    ],
+                },
+                {
+                    "id": "fast-mode",
+                    "name": "Fast mode",
+                    "category": "model_config",
+                    "type": "select",
+                    "currentValue": "off",
+                    "options": [
+                        { "value": "off", "name": "Off" },
+                        { "value": "on", "name": "On" },
+                    ],
+                },
+            ],
+        });
+        let models = models_from_session(&response, &crate::codex::catalog::static_models());
+        // Two base models — never one row per effort variant.
+        assert_eq!(
+            models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["gpt-5.6-sol", "gpt-5.6-terra"]
+        );
+        // Catalog match keeps the curated per-model ladder; wire wins on
+        // label/description.
+        assert_eq!(models[0].label, "GPT-5.6-Sol");
+        assert_eq!(models[0].description.as_deref(), Some("Frontier"));
+        assert!(models[0].reasoning_levels.contains(&ReasoningLevel::Ultra));
+        // Wire config options become traits; mode/model/thought_level do not.
+        assert_eq!(
+            models[0]
+                .options
+                .iter()
+                .map(|o| o.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fast-mode"]
+        );
+        assert_eq!(models[0].options[0].default_choice, "off");
+    }
+
+    #[test]
+    fn model_1m_variants_collapse_into_a_context_window_trait() {
+        let response = json!({
+            "sessionId": "s-1",
+            "configOptions": [
+                {
+                    "id": "model",
+                    "category": "model",
+                    "type": "select",
+                    "currentValue": "claude-sonnet-5",
+                    "options": [
+                        { "value": "claude-sonnet-5", "name": "Sonnet 5" },
+                        { "value": "claude-sonnet-5[1m]", "name": "Sonnet 5 (1M)" },
+                        // SDK-id hint spelling collapses too.
+                        { "value": "claude-opus-4-6", "name": "Opus 4.6" },
+                        { "value": "claude-opus-4-6-1m", "name": "Opus 4.6 (1M)" },
+                        { "value": "claude-haiku-4-5", "name": "Haiku 4.5" },
+                    ],
+                },
+            ],
+        });
+        let models = models_from_session(&response, &[]);
+        assert_eq!(
+            models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["claude-sonnet-5", "claude-opus-4-6", "claude-haiku-4-5"]
+        );
+        assert!(models[0].options.iter().any(|o| o.id == "contextWindow"));
+        assert!(models[1].options.iter().any(|o| o.id == "contextWindow"));
+        assert!(models[2].options.is_empty());
+    }
+
+    #[test]
+    fn orphan_1m_variants_stand_alone() {
+        // The real claude adapter advertises `opus[1m]` with NO bare `opus`
+        // when the CLI pins the 1M window — those rows must survive, not
+        // collapse into a base that was never advertised.
+        let response = json!({
+            "sessionId": "s-1",
+            "configOptions": [{
+                "id": "model",
+                "category": "model",
+                "type": "select",
+                "currentValue": "claude-fable-5[1m]",
+                "options": [
+                    { "value": "default", "name": "Default" },
+                    { "value": "opus[1m]", "name": "Opus" },
+                    { "value": "claude-fable-5[1m]", "name": "Fable 5" },
+                    { "value": "sonnet", "name": "Sonnet" },
+                    { "value": "haiku", "name": "Haiku" },
+                ],
+            }],
+        });
+        let models = models_from_session(&response, &[]);
+        assert_eq!(
+            models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["default", "opus[1m]", "claude-fable-5[1m]", "sonnet", "haiku"]
+        );
+        assert!(models.iter().all(|m| m.options.is_empty()));
+    }
+
+    #[test]
+    fn models_fall_back_to_legacy_state_with_catalog_options() {
+        let response = json!({
+            "sessionId": "s-1",
+            "models": {
+                "availableModels": [
+                    { "modelId": "gpt-5.6-sol", "name": "GPT-5.6-Sol" },
+                    { "modelId": "gpt-x", "name": "GPT-X" },
+                ],
+            },
+        });
+        let models = models_from_session(&response, &crate::codex::catalog::static_models());
+        assert_eq!(models.len(), 2);
+        // Catalog-matched id keeps the curated options on the legacy path…
+        assert!(models[0].options.iter().any(|o| o.id == "serviceTier"));
+        // …unknown ids get none.
+        assert!(models[1].options.is_empty());
+    }
+
+    #[test]
+    fn codex_exec_approval_options_are_not_a_question() {
+        // codex-acp's real exec-approval shape: two allow_always entries (the
+        // session allow + a prefix-rule amendment). Must auto-accept.
+        let options = vec![
+            json!({ "optionId": "allow_once", "name": "Allow Once", "kind": "allow_once" }),
+            json!({ "optionId": "allow_always", "name": "Allow for Session", "kind": "allow_always" }),
+            json!({ "optionId": "allow_prefix", "name": "Allow Commands Starting With `cargo test`", "kind": "allow_always" }),
+            json!({ "optionId": "reject", "name": "Reject", "kind": "reject_once" }),
+        ];
+        assert!(!is_user_question(&options));
+        // AskUserQuestion relays choices without allow/reject kinds.
+        let question = vec![
+            json!({ "optionId": "a", "name": "Blue" }),
+            json!({ "optionId": "b", "name": "Green" }),
+        ];
+        assert!(is_user_question(&question));
+        let mixed = vec![
+            json!({ "optionId": "a", "name": "Proceed", "kind": "allow_once" }),
+            json!({ "optionId": "b", "name": "Другое", "kind": "other" }),
+        ];
+        assert!(is_user_question(&mixed));
+    }
+
+    #[test]
+    fn mode_config_option_prefers_a_no_prompt_mode_per_adapter_naming() {
+        let codex = json!({
+            "sessionId": "s-1",
+            "configOptions": [{
+                "id": "mode",
+                "category": "mode",
+                "type": "select",
+                "currentValue": "agent",
+                "options": [
+                    { "value": "read-only" },
+                    { "value": "agent" },
+                    { "value": "agent-full-access" },
+                ],
+            }],
+        });
+        let no_opts = serde_json::Map::new();
+        assert_eq!(
+            config_option_sets(&codex, None, &[], &no_opts),
+            vec![("mode".to_owned(), json!({ "value": "agent-full-access" }))]
         );
     }
 

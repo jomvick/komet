@@ -1785,3 +1785,143 @@ async fn empty_reasoning_deltas_are_heartbeats_not_journal_noise() {
         "text deltas unaffected"
     );
 }
+
+#[tokio::test]
+async fn parked_session_ignores_trailing_frames_and_stays_idle() {
+    // ACP children keep forwarding session/update frames after a turn's Done
+    // (late tool_call_updates, flushed text). A parked session must treat
+    // them as inert: no Working re-arm (the eternally-running-session bug),
+    // no phantom assistant entry.
+    let mut script = mock_script();
+    script.push(AgentEvent::ToolCall {
+        id: "tool-1".into(),
+        call: ToolCall::Exec {
+            command: "echo late-echo".into(),
+        },
+    });
+    script.push(AgentEvent::TextDelta {
+        text: "trailing flush".into(),
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), Arc::new(MockHarness { script }));
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-run-parked",
+        SessionCommandPayload::Run {
+            request: run_request("go"),
+            message_id: "m-parked".into(),
+        },
+    );
+
+    wait_for(
+        || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Idle),
+        "session to complete",
+    )
+    .await;
+    // The trailing frames land right after the park; hold the assertion open
+    // past the 120ms flush window to catch a phantom segment or a Working
+    // re-arm (both are what the old code did).
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(600);
+    while tokio::time::Instant::now() < deadline {
+        assert_eq!(
+            core.sessions.session_status(CHAT).map(|s| s.status),
+            Some(SessionStatus::Idle),
+            "trailing frames must not re-arm Working"
+        );
+        let all = entries_now(&core);
+        assert!(
+            all.len() <= 2,
+            "trailing frames must not open a phantom entry: {all:#?}"
+        );
+        tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+    let all = entries(&core);
+    assert_eq!(all.len(), 2, "user + one assistant entry");
+    assert_eq!(all[1].status, Some(MessageStatus::Complete));
+}
+
+#[tokio::test]
+async fn stale_tool_echo_after_steer_boundary_does_not_split_text() {
+    // Adapters re-emit shape-bearing tool_call_updates as full ToolCall
+    // events. Once a steer boundary reset the fold, such an echo for a
+    // PRIOR segment's tool must not mint a chip mid-text in the new segment
+    // (the mid-word transcript splits).
+    let script = vec![
+        AgentEvent::SessionStarted {
+            harness: HarnessId::Mock,
+            model: "mock-1".into(),
+            tools: vec![],
+            cwd: "/tmp".into(),
+            session_id: "hs-steer".into(),
+            assistant_message_id: "a-1".into(),
+        },
+        AgentEvent::TextDelta {
+            text: "part one".into(),
+        },
+        AgentEvent::ToolCall {
+            id: "tool-long".into(),
+            call: ToolCall::Exec {
+                command: "sleep 60".into(),
+            },
+        },
+        AgentEvent::Steered {
+            assistant_message_id: Some("a-1".into()),
+            next_assistant_message_id: Some("a-2".into()),
+        },
+        AgentEvent::TextDelta {
+            text: "part ".into(),
+        },
+        // The long-running exec from segment one completes mid-stream of the
+        // next segment: a shape-bearing echo plus its result.
+        AgentEvent::ToolCall {
+            id: "tool-long".into(),
+            call: ToolCall::Exec {
+                command: "sleep 60".into(),
+            },
+        },
+        AgentEvent::ToolResult {
+            id: "tool-long".into(),
+            is_error: false,
+            output: None,
+            diff: None,
+        },
+        AgentEvent::TextDelta {
+            text: "two".into(),
+        },
+        done(DoneStatus::Completed),
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), Arc::new(MockHarness { script }));
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-run-echo",
+        SessionCommandPayload::Run {
+            request: run_request("go"),
+            message_id: "m-echo".into(),
+        },
+    );
+
+    wait_for(
+        || {
+            entries_now(&core).len() == 3
+                && core.sessions.session_status(CHAT).map(|s| s.status)
+                    == Some(SessionStatus::Idle)
+        },
+        "both segments to land",
+    )
+    .await;
+    let all = entries(&core);
+    // Segment one: text + the (unresolved-at-boundary) tool chip.
+    assert_eq!(all[1].parts.len(), 2, "{:#?}", all[1].parts);
+    // Segment two: ONE contiguous text part, no spliced chip.
+    assert_eq!(
+        all[2].parts,
+        vec![MessagePart::Text {
+            id: "t0".into(),
+            text: "part two".into()
+        }],
+        "stale echo must not split the streaming text"
+    );
+}

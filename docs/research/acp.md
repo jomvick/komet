@@ -45,21 +45,29 @@
   ride pi's own provider config (catalog advertises a `default` pass-through
   entry); thinking ladder minimal→max maps onto komet's levels via the
   generic `thought_level` preference ladder ("off" has no komet tier).
-- **ACP is the source of truth for model lists** (2026-08-08, follow-up on
-  the same branch): `models()` runs a short-lived probe (initialize →
-  `session/new`, the `discover_commands` pattern) and reads the response's
-  first-class `models` (SessionModelState: `availableModels` +
-  `currentModelId`), falling back to the `model` config option's choices —
-  paseo's preference order. The spec's static catalog only enriches matched
-  ids (label/description/options/curated ladders, e.g. codex service tiers)
-  and answers outright when the agent advertises nothing or the probe fails;
-  successful discovery is cached per harness instance, failures retry.
-  Per-model effort ladders do NOT exist on the wire (the model list carries
-  no effort metadata; `thought_level` reflects only the currently selected
-  model — Zed refreshes reactively via `config_option_update`, paseo's Kimi
-  adapter walks models on one probe session): discovered models inherit the
-  probe session's ladder unless a static entry supplies one. Revisit a
-  Kimi-style walk if an agent genuinely varies per model.
+- **ACP is the source of truth for model lists** (2026-08-08; preference
+  order inverted 2026-08-09): `models()` runs a short-lived probe
+  (initialize → `session/new`, the `discover_commands` pattern) and reads
+  the `model` config option's choices FIRST, falling back to the legacy
+  first-class `models` state (SessionModelState) only when no model config
+  option is advertised. The original paseo order (legacy state first) put
+  one row per model × effort in the picker: codex-acp enumerates
+  `gpt-5.6-sol[low]`…`[ultra]` on the deprecated surface while its
+  `configOptions` carry base ids with effort as a separate `thought_level`
+  select — the same reason Zed deleted its model-API support outright
+  (zed@c413552859). 1M-context variants (`opus[1m]` display form,
+  `claude-…-1m` SDK form) collapse into the base row's Context Window trait
+  when the bare id is also advertised, and stand alone otherwise. Traits
+  come off the wire too: every select/boolean config option outside
+  mode/model/thought_level becomes a `ModelOption` (codex `fast-mode` — its
+  service tier — and `collaboration_mode`; `currentValue` doubles as the
+  default choice), so the static catalogs' option sets now only apply on
+  the legacy-fallback and probe-failure paths. The catalog still enriches
+  matched ids (label/description/curated per-model ladders); discovered
+  models otherwise inherit the probe session's `thought_level` ladder plus
+  the spec's `ladder_extras` (Claude Ultrathink — a prompt-prefix mode the
+  wire can't advertise). Revisit a Kimi-style per-model walk if an agent
+  genuinely varies ladders per model.
 
 ## Protocol surface used (v1)
 - `initialize` (protocolVersion 1; fs/terminal client capabilities declined) →
@@ -77,7 +85,13 @@
   per-turn tokens — deliberately unmapped.
 - `session/request_permission` → auto-accept the preferred allow option
   (`allow_always` > `allow_once` > first) — parity with claude
-  bypassPermissions / codex approvalPolicy never.
+  bypassPermissions / codex approvalPolicy never. Question-shaped means
+  *some option lacks an allow/reject kind* — kinds legitimately repeat
+  (codex sends TWO `allow_always` options on every exec approval: "Allow
+  for Session" + a prefix-rule amendment; treating duplicates as questions
+  re-prompted the user for every command, 2026-08-09). The forced
+  no-prompts mode matches per-adapter naming: claude `bypassPermissions`,
+  codex `agent-full-access`.
 - **Session config options**: ACP has no per-prompt model field; the run's
   model + reasoning apply through `session/set_config_option` against the
   session response's advertised `configOptions` (category `model` /

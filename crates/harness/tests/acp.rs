@@ -547,6 +547,51 @@ async fn missing_binary_surfaces_not_installed_with_install_hint() {
 }
 
 /// Real-adapter smoke: spawns the actual `claude-agent-acp` (via npx when not
+/// Discovery against the real installed adapters: base model rows only
+/// (never one per reasoning effort), with wire-derived trait options. Free
+/// (initialize + session/new, no prompt), but needs the CLIs installed and
+/// authenticated. Run explicitly:
+/// `cargo test -p komet-harness --test acp -- --ignored real_discovery`
+#[tokio::test]
+#[ignore = "needs the claude + codex CLIs installed and authenticated"]
+async fn real_discovery_yields_base_models_with_traits() {
+    let codex = AcpHarness::codex().models().await.expect("codex discovery");
+    assert!(!codex.is_empty());
+    for m in &codex {
+        assert!(
+            !m.id.contains('[') || m.id.ends_with("[1m]"),
+            "effort-variant leaked as a model row: {}",
+            m.id
+        );
+    }
+    let sol = codex.iter().find(|m| m.id == "gpt-5.6-sol").expect("sol");
+    assert!(
+        sol.options.iter().any(|o| o.id == "fast-mode"),
+        "codex fast-mode trait missing: {:?}",
+        sol.options
+    );
+    assert!(!sol.reasoning_levels.is_empty());
+
+    let claude = AcpHarness::claude()
+        .models()
+        .await
+        .expect("claude discovery");
+    assert!(!claude.is_empty());
+    for m in &claude {
+        assert!(
+            !m.reasoning_levels.is_empty(),
+            "claude ladder missing on {}",
+            m.id
+        );
+        assert!(
+            m.reasoning_levels
+                .contains(&komet_proto::ReasoningLevel::Ultrathink),
+            "ultrathink extra missing on {}",
+            m.id
+        );
+    }
+}
+
 /// installed) against the installed, authenticated claude CLI and burns one
 /// tiny haiku prompt. Run explicitly:
 /// `cargo test -p komet-harness --test acp -- --ignored real_claude`
@@ -613,8 +658,8 @@ fn descriptor_surface_matches_registry_expectations() {
 
 #[tokio::test]
 async fn models_are_discovered_from_the_acp_session() {
-    // ACP is the source of truth: the fixture advertises SessionModelState,
-    // so the picker list comes from the wire, not the static catalog.
+    // ACP is the source of truth: the fixture advertises a model config
+    // option, so the picker list comes from the wire, not the static catalog.
     let harness = AcpHarness::hermes().with_executable(fixture_path());
     let models = harness.models().await.expect("discovery");
     let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();

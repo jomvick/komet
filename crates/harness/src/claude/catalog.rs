@@ -86,7 +86,7 @@ fn toggle(id: &str, label: &str) -> ModelOption {
 /// The 200K/1M context-window select carried by the long-context models. The
 /// 1M window is selected via a model-id suffix (`<model>[1m]`), exactly how the
 /// CLI itself does it.
-fn context_window() -> ModelOption {
+pub(crate) fn context_window() -> ModelOption {
     ModelOption {
         id: "contextWindow".into(),
         label: "Context Window".into(),
