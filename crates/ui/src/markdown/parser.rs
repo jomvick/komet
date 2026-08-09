@@ -378,7 +378,10 @@ fn parse_inline_container(cur: &mut Cursor, style: &InlineStyle) -> Vec<InlineRu
         }
         parse_inline_event(cur, &mut runs, style);
     }
-    merge_runs(runs)
+    // Autolink AFTER merging: pulldown splits Text events at would-be
+    // emphasis chars ("…/Foo_(bar)" arrives as three events), so scanning
+    // per-event would truncate URLs at every underscore.
+    autolink_runs(merge_runs(runs))
 }
 
 fn parse_inline_event(cur: &mut Cursor, runs: &mut Vec<InlineRun>, style: &InlineStyle) {
@@ -422,6 +425,100 @@ fn parse_inline_event(cur: &mut Cursor, runs: &mut Vec<InlineRun>, style: &Inlin
         // `End` is consumed by the container loop; anything else is ignored.
         _ => {}
     }
+}
+
+/// Promote bare `http(s)://` URLs into link runs — GFM's autolink extension,
+/// which pulldown-cmark has no option for (agents paste naked PR/issue URLs
+/// constantly; user report: the link isn't clickable). Runs already inside a
+/// link or code span pass through untouched. Idempotent, so nested containers
+/// re-applying it on their merged output is harmless.
+fn autolink_runs(runs: Vec<InlineRun>) -> Vec<InlineRun> {
+    let mut out = Vec::with_capacity(runs.len());
+    for run in runs {
+        if run.style.link.is_some() || run.style.code {
+            out.push(run);
+        } else {
+            push_text_autolinked(&mut out, &run.text, &run.style);
+        }
+    }
+    out
+}
+
+fn push_text_autolinked(runs: &mut Vec<InlineRun>, text: &str, style: &InlineStyle) {
+    let push = |runs: &mut Vec<InlineRun>, text: &str, style: InlineStyle| {
+        if !text.is_empty() {
+            runs.push(InlineRun {
+                text: text.to_string(),
+                style,
+            });
+        }
+    };
+    let mut rest = text;
+    while let Some(at) = find_url_start(rest) {
+        let from = &rest[at..];
+        let scheme = if from.starts_with("https://") {
+            "https://".len()
+        } else {
+            "http://".len()
+        };
+        let len = bare_url_len(from);
+        if len <= scheme {
+            // A scheme with nothing after it stays text (don't re-find it).
+            push(runs, &rest[..at + scheme], style.clone());
+            rest = &from[scheme..];
+            continue;
+        }
+        push(runs, &rest[..at], style.clone());
+        let mut linked = style.clone();
+        linked.link = Some(from[..len].to_string());
+        push(runs, &from[..len], linked);
+        rest = &from[len..];
+    }
+    push(runs, rest, style.clone());
+}
+
+/// First viable `http(s)://` occurrence: not glued to a preceding
+/// alphanumeric (`foohttps://…` stays text, per GFM's boundary rule).
+fn find_url_start(text: &str) -> Option<usize> {
+    let mut from = 0;
+    while let Some(rel) = text[from..].find("http") {
+        let at = from + rel;
+        let after = &text[at..];
+        let is_scheme = after.starts_with("http://") || after.starts_with("https://");
+        let boundary = text[..at]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric());
+        if is_scheme && boundary {
+            return Some(at);
+        }
+        from = at + "http".len();
+    }
+    None
+}
+
+/// Byte length of the bare URL at the start of `text`: run to whitespace (or
+/// a delimiter that never appears in pasted URLs), then trim the trailing
+/// punctuation GFM excludes — a closing paren only stays when an opener
+/// inside the URL balances it ("…/Foo_(bar))" keeps one, sheds one).
+fn bare_url_len(text: &str) -> usize {
+    let end = text
+        .char_indices()
+        .find(|(_, c)| c.is_whitespace() || matches!(c, '<' | '>' | '"' | '\'' | '`'))
+        .map_or(text.len(), |(i, _)| i);
+    let mut url = &text[..end];
+    while let Some(last) = url.chars().next_back() {
+        let trim = match last {
+            '.' | ',' | ';' | ':' | '!' | '?' | '*' | '_' | '~' => true,
+            ')' => url.matches('(').count() < url.matches(')').count(),
+            _ => false,
+        };
+        if !trim {
+            break;
+        }
+        url = &url[..url.len() - last.len_utf8()];
+    }
+    url.len()
 }
 
 /// Merge adjacent identically-styled runs (keeps run counts small and makes the
@@ -836,6 +933,64 @@ mod tests {
             .expect("link run");
         assert_eq!(link.text, "zed");
         assert_eq!(link.style.link.as_deref(), Some("https://zed.dev"));
+    }
+
+    /// The paragraph's single link run: (text, url).
+    fn only_link(source: &str) -> Option<(String, String)> {
+        let tree = parse_full(source);
+        let Block::Paragraph { runs } = &tree.blocks[0].block else {
+            panic!()
+        };
+        let links: Vec<_> = runs
+            .iter()
+            .filter_map(|r| Some((r.text.clone(), r.style.link.clone()?)))
+            .collect();
+        assert!(links.len() <= 1, "expected at most one link: {links:?}");
+        links.into_iter().next()
+    }
+
+    /// Bare URLs autolink (the GFM extension pulldown-cmark lacks): the URL
+    /// becomes a clickable run, trailing sentence punctuation stays text.
+    #[test]
+    fn bare_urls_autolink() {
+        assert_eq!(
+            only_link("PR is updated: https://github.com/komet/komet/pull/31\n"),
+            Some((
+                "https://github.com/komet/komet/pull/31".into(),
+                "https://github.com/komet/komet/pull/31".into()
+            ))
+        );
+        assert_eq!(
+            only_link("see https://x.dev/a, then rest.\n").map(|l| l.1),
+            Some("https://x.dev/a".into())
+        );
+        // A wrapping paren is shed; one balanced by an opener in the path stays.
+        assert_eq!(
+            only_link("(docs: https://x.dev/Foo_(bar))\n").map(|l| l.1),
+            Some("https://x.dev/Foo_(bar)".into())
+        );
+        // Bold text still autolinks, and the run keeps the emphasis.
+        let tree = parse_full("**see https://x.dev now**\n");
+        let Block::Paragraph { runs } = &tree.blocks[0].block else {
+            panic!()
+        };
+        let link = runs.iter().find(|r| r.style.link.is_some()).unwrap();
+        assert!(link.style.bold);
+        assert_eq!(link.style.link.as_deref(), Some("https://x.dev"));
+    }
+
+    /// Non-links stay text: glued schemes, bare schemes, code spans, and the
+    /// destination text of a real markdown link.
+    #[test]
+    fn autolink_leaves_non_urls_alone() {
+        assert_eq!(only_link("foohttps://x.dev is glued\n"), None);
+        assert_eq!(only_link("the https:// scheme alone\n"), None);
+        assert_eq!(only_link("`https://x.dev` in code\n"), None);
+        // A markdown link whose TEXT is a URL keeps the written destination.
+        assert_eq!(
+            only_link("[https://shown.dev](https://real.dev)\n"),
+            Some(("https://shown.dev".into(), "https://real.dev".into()))
+        );
     }
 
     #[test]

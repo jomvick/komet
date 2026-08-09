@@ -165,6 +165,9 @@ impl EngineCore {
         // port binds; held (and kernel-released on crash) for the engine's life.
         let lock = InstanceLock::acquire(data_dir)?;
         let device_id = load_or_create_device_id(data_dir)?;
+        // This device's harness enablement (Settings → Agents) rides the
+        // engine data dir — per-device, like the CLI installs it gates.
+        registry.load_prefs(data_dir);
         let store = Arc::new(DocsStore::open(profile.store_root())?);
         let journal = Arc::new(RunJournal::open(profile.store_root().join("journals"))?);
         let sessions = SessionsEngine::new(device_id.clone(), journal, registry.clone());

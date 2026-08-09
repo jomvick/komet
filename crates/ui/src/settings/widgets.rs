@@ -269,6 +269,28 @@ pub fn badge_active(theme: &Theme, label: impl Into<SharedString>) -> gpui::Div 
         .child(label.into())
 }
 
+/// Display-only toggle switch (komet branch-picker.tsx `Toggle`): an 18×32
+/// pill whose knob slides right and track flips white when on. State is owned
+/// by the parent row — the caller adds `.id(..)` and `.on_click(..)`.
+pub fn toggle_switch(theme: &Theme, on: bool) -> gpui::Div {
+    div()
+        .flex_none()
+        .w(px(32.0))
+        .h(px(18.0))
+        .rounded_full()
+        .bg(if on { theme.text } else { ink(0.15) })
+        .relative()
+        .child(
+            div()
+                .absolute()
+                .top(px(2.0))
+                .left(px(if on { 16.0 } else { 2.0 }))
+                .size(px(14.0))
+                .rounded_full()
+                .bg(if on { theme.on_solid } else { ink(0.7) }),
+        )
+}
+
 /// A small quiet ghost action (`rounded-lg px-2.5 py-1.5 text-[12px]
 /// text-muted-foreground`). Caller adds id + click + leading icon child AND
 /// its own `.hover(..)` — gpui panics on a second hover, and the pages vary

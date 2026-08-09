@@ -1,6 +1,6 @@
 # Komet
 
-Control your coding agents (Claude Code, Codex) locally by default, with optional multi-device sync.
+Control your coding agents (Claude Code, Codex, Grok, Hermes, Pi) locally by default, with optional multi-device sync.
 
 ![Komet running a Claude Code session](docs/screenshot.png)
 

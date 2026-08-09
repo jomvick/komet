@@ -265,15 +265,20 @@ async fn question_shaped_requests_bridge_to_the_input_panel() {
 
 #[tokio::test]
 async fn claude_and_codex_specs_drive_the_same_wire() {
-    // The whole point of the conversion: the claude/codex specs run against
-    // the same fake ACP agent with no per-agent protocol code. Model ids in
-    // the fixture are grok-flavored, so config sets simply skip.
+    // The whole point of the conversion: every spec runs against the same
+    // fake ACP agent with no per-agent protocol code. Model ids in the
+    // fixture are grok-flavored, so config sets simply skip.
     for (name, h) in [
         (
             "claude",
             AcpHarness::claude().with_executable(fixture_path()),
         ),
         ("codex", AcpHarness::codex().with_executable(fixture_path())),
+        (
+            "hermes",
+            AcpHarness::hermes().with_executable(fixture_path()),
+        ),
+        ("pi", AcpHarness::pi().with_executable(fixture_path())),
     ] {
         let (controls, _steer, _token) = controls();
         let events = run_to_end(&h, request("scenario:happy"), controls).await;
@@ -602,6 +607,82 @@ fn descriptor_surface_matches_registry_expectations() {
             komet_proto::ReasoningLevel::Low,
             komet_proto::ReasoningLevel::Medium,
             komet_proto::ReasoningLevel::High,
+        ]
+    );
+}
+
+#[tokio::test]
+async fn models_are_discovered_from_the_acp_session() {
+    // ACP is the source of truth: the fixture advertises SessionModelState,
+    // so the picker list comes from the wire, not the static catalog.
+    let harness = AcpHarness::hermes().with_executable(fixture_path());
+    let models = harness.models().await.expect("discovery");
+    let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(ids, vec!["grok-4-fast", "grok-4.5"], "{models:?}");
+    // Unmatched ids inherit the probe session's thought_level ladder.
+    assert_eq!(
+        models[0].reasoning_levels,
+        vec![
+            komet_proto::ReasoningLevel::Low,
+            komet_proto::ReasoningLevel::Medium,
+            komet_proto::ReasoningLevel::High,
+        ],
+        "{models:?}"
+    );
+    assert_eq!(models[0].description.as_deref(), Some("Fast tier"));
+    // Cached: a second call returns the same list without respawning.
+    let again = harness.models().await.expect("cached");
+    assert_eq!(again, models);
+}
+
+#[tokio::test]
+async fn models_enrich_from_the_static_catalog_on_id_match() {
+    // grok's static catalog knows "grok-4.5" — the discovered entry keeps the
+    // wire label but inherits the curated description and ladder.
+    let harness = AcpHarness::grok().with_executable(fixture_path());
+    let models = harness.models().await.expect("discovery");
+    let grok45 = models
+        .iter()
+        .find(|m| m.id == "grok-4.5")
+        .expect("grok-4.5");
+    assert_eq!(
+        grok45.description.as_deref(),
+        Some("xAI's coding model — 500k context"),
+        "{grok45:?}"
+    );
+}
+
+#[tokio::test]
+async fn models_fall_back_to_the_static_catalog_when_the_probe_fails() {
+    let harness = AcpHarness::pi().with_executable("/nonexistent/never-a-pi-acp");
+    let models = harness.models().await.expect("static fallback");
+    let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(ids, vec!["default"], "{models:?}");
+}
+
+#[test]
+fn hermes_and_pi_descriptor_surfaces_match_registry_expectations() {
+    let hermes = AcpHarness::hermes();
+    assert_eq!(hermes.id(), HarnessId::Hermes);
+    assert_eq!(hermes.display_name(), "Hermes");
+    assert!(hermes.supports_steering());
+    assert_eq!(hermes.steering_mode(), SteeringMode::TurnBoundary);
+    assert!(hermes.reasoning_levels().is_empty());
+
+    let pi = AcpHarness::pi();
+    assert_eq!(pi.id(), HarnessId::Pi);
+    assert_eq!(pi.display_name(), "Pi");
+    assert!(pi.supports_steering());
+    assert_eq!(pi.steering_mode(), SteeringMode::TurnBoundary);
+    assert_eq!(
+        pi.reasoning_levels(),
+        &[
+            komet_proto::ReasoningLevel::Minimal,
+            komet_proto::ReasoningLevel::Low,
+            komet_proto::ReasoningLevel::Medium,
+            komet_proto::ReasoningLevel::High,
+            komet_proto::ReasoningLevel::XHigh,
+            komet_proto::ReasoningLevel::Max,
         ]
     );
 }

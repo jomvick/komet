@@ -1,8 +1,14 @@
 //! HarnessRegistry — the engine's harness catalog: eager instances (mock) plus lazy
 //! slots resolved on first use (claude-code spawns subprocess discovery; codex/cursor
 //! later). Lazy slots carry a static descriptor so `ListHarnesses` never forces a spawn.
+//!
+//! Also owns the device's harness ENABLEMENT (Settings → Agents): which harnesses
+//! this device's composer offers, persisted in `{data_dir}/harness-prefs.json`.
+//! Per-device because CLI installs are — a viewer retargets the settings page at
+//! another device and edits THAT device's set over the forwarded RPCs.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use serde::{Deserialize, Serialize};
@@ -19,6 +25,34 @@ pub struct HarnessDescriptor {
     pub supports_steering: bool,
     pub steering_mode: SteeringMode,
     pub reasoning_levels: Vec<ReasoningLevel>,
+    /// Whether the agent's CLI is present on the listing device (the settings
+    /// enable-gate). Defaults true so catalogs from engines predating the
+    /// field never read as uninstallable.
+    #[serde(default = "default_installed")]
+    pub installed: bool,
+    /// Whether the listing device offers this harness (Settings → Agents).
+    /// `None` — the catalog came from an engine predating the setting — means
+    /// "unknown": consumers fall back to [`default_enabled`] membership.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+}
+
+fn default_installed() -> bool {
+    true
+}
+
+/// The out-of-the-box enabled set: Claude Code and Codex only; every other
+/// harness is opt-in from Settings → Agents.
+pub fn default_enabled() -> Vec<HarnessId> {
+    vec![HarnessId::ClaudeCode, HarnessId::Codex]
+}
+
+/// A descriptor's effective enabled flag ([`default_enabled`] membership when
+/// the catalog predates the setting).
+pub fn descriptor_enabled(descriptor: &HarnessDescriptor) -> bool {
+    descriptor
+        .enabled
+        .unwrap_or_else(|| default_enabled().contains(&descriptor.id))
 }
 
 fn describe(harness: &dyn Harness) -> HarnessDescriptor {
@@ -28,15 +62,29 @@ fn describe(harness: &dyn Harness) -> HarnessDescriptor {
         supports_steering: harness.supports_steering(),
         steering_mode: harness.steering_mode(),
         reasoning_levels: harness.reasoning_levels().to_vec(),
+        installed: harness.installed(),
+        enabled: None,
     }
 }
 
+/// The persisted shape of `harness-prefs.json`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct HarnessPrefsFile {
+    /// `None` = the user never touched the setting → the default set.
+    enabled: Option<Vec<HarnessId>>,
+}
+
 type Factory = Box<dyn Fn() -> Result<Arc<dyn Harness>, HarnessError> + Send + Sync>;
+type InstalledProbe = Box<dyn Fn() -> bool + Send + Sync>;
 
 enum Slot {
     Ready(Arc<dyn Harness>),
     Lazy {
         descriptor: HarnessDescriptor,
+        /// Re-run on every `descriptors()` call — a CLI installed mid-session
+        /// shows up on the next settings/picker open, no restart needed.
+        installed: InstalledProbe,
         factory: Factory,
     },
 }
@@ -44,6 +92,10 @@ enum Slot {
 pub struct HarnessRegistry {
     slots: Mutex<HashMap<HarnessId, Slot>>,
     order: Mutex<Vec<HarnessId>>,
+    /// This device's enabled set; `None` inner value = the default set.
+    prefs: Mutex<HarnessPrefsFile>,
+    /// Where the prefs persist; `None` (tests, bare registries) skips writes.
+    prefs_path: Mutex<Option<PathBuf>>,
 }
 
 impl Default for HarnessRegistry {
@@ -57,6 +109,8 @@ impl HarnessRegistry {
         Self {
             slots: Mutex::new(HashMap::new()),
             order: Mutex::new(Vec::new()),
+            prefs: Mutex::new(HarnessPrefsFile::default()),
+            prefs_path: Mutex::new(None),
         }
     }
 
@@ -68,6 +122,90 @@ impl HarnessRegistry {
         self.order.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    fn prefs(&self) -> MutexGuard<'_, HarnessPrefsFile> {
+        self.prefs.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Load `harness-prefs.json` from the engine data dir and remember the
+    /// path for writes. Corrupt/missing files fall back to the default set.
+    pub fn load_prefs(&self, data_dir: &Path) {
+        let path = data_dir.join("harness-prefs.json");
+        let loaded = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<HarnessPrefsFile>(&text).ok())
+            .unwrap_or_default();
+        *self.prefs() = loaded;
+        *self
+            .prefs_path
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(path);
+    }
+
+    /// The enabled set in effect (the default set until the user edits it).
+    pub fn enabled_set(&self) -> Vec<HarnessId> {
+        self.prefs().enabled.clone().unwrap_or_else(default_enabled)
+    }
+
+    /// Whether this device's CLI probe passes for `id` (no spawn, no resolve).
+    fn installed_for(&self, id: HarnessId) -> bool {
+        match self.slots().get(&id) {
+            Some(Slot::Ready(harness)) => harness.installed(),
+            Some(Slot::Lazy { installed, .. }) => installed(),
+            None => false,
+        }
+    }
+
+    /// Flip one harness's enablement and persist. Refuses unknown harnesses,
+    /// enabling one whose CLI is missing (the settings gate, enforced where
+    /// the state lives), and disabling the last enabled harness.
+    pub fn set_enabled(&self, id: HarnessId, on: bool) -> Result<(), String> {
+        if !self.slots().contains_key(&id) {
+            return Err(format!("unknown harness {id:?}"));
+        }
+        if on && !self.installed_for(id) {
+            return Err(format!("{id:?} CLI is not installed on this device"));
+        }
+        let mut set = self.enabled_set();
+        match (on, set.contains(&id)) {
+            (true, false) => set.push(id),
+            (false, true) => {
+                if set.len() == 1 {
+                    return Err("cannot disable the last enabled harness".into());
+                }
+                set.retain(|h| *h != id);
+            }
+            _ => return Ok(()),
+        }
+        self.prefs().enabled = Some(set);
+        self.persist_prefs();
+        Ok(())
+    }
+
+    /// Best-effort atomic write (temp + rename, the ui-settings pattern).
+    fn persist_prefs(&self) {
+        let Some(path) = self
+            .prefs_path
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+        else {
+            return;
+        };
+        let json = match serde_json::to_string_pretty(&*self.prefs()) {
+            Ok(json) => json,
+            Err(err) => {
+                tracing::warn!(error = %err, "harness-prefs serialize failed");
+                return;
+            }
+        };
+        let tmp = path.with_extension("json.tmp");
+        if let Err(err) =
+            std::fs::write(&tmp, json).and_then(|()| std::fs::rename(&tmp, &path))
+        {
+            tracing::warn!(error = %err, "harness-prefs save failed");
+        }
+    }
+
     pub fn register(&self, harness: Arc<dyn Harness>) {
         let id = harness.id();
         if self.slots().insert(id, Slot::Ready(harness)).is_none() {
@@ -75,8 +213,15 @@ impl HarnessRegistry {
         }
     }
 
-    /// Register a slot resolved on first `resolve` (the factory result is cached).
-    pub fn register_lazy(&self, descriptor: HarnessDescriptor, factory: Factory) {
+    /// Register a slot resolved on first `resolve` (the factory result is
+    /// cached). `installed` is the CLI-presence probe run per `descriptors()`
+    /// call; it must never spawn.
+    pub fn register_lazy(
+        &self,
+        descriptor: HarnessDescriptor,
+        installed: InstalledProbe,
+        factory: Factory,
+    ) {
         let id = descriptor.id;
         if self
             .slots()
@@ -84,6 +229,7 @@ impl HarnessRegistry {
                 id,
                 Slot::Lazy {
                     descriptor,
+                    installed,
                     factory,
                 },
             )
@@ -108,13 +254,25 @@ impl HarnessRegistry {
 
     /// Catalog for `ListHarnesses` — never forces a lazy resolve.
     pub fn descriptors(&self) -> Vec<HarnessDescriptor> {
+        let enabled = self.enabled_set();
         let slots = self.slots();
         self.order()
             .iter()
-            .filter_map(|id| match slots.get(id) {
-                Some(Slot::Ready(harness)) => Some(describe(harness.as_ref())),
-                Some(Slot::Lazy { descriptor, .. }) => Some(descriptor.clone()),
-                None => None,
+            .filter_map(|id| {
+                let mut descriptor = match slots.get(id) {
+                    Some(Slot::Ready(harness)) => describe(harness.as_ref()),
+                    Some(Slot::Lazy {
+                        descriptor,
+                        installed,
+                        ..
+                    }) => HarnessDescriptor {
+                        installed: installed(),
+                        ..descriptor.clone()
+                    },
+                    None => return None,
+                };
+                descriptor.enabled = Some(enabled.contains(id));
+                Some(descriptor)
             })
             .collect()
     }
@@ -187,7 +345,10 @@ pub fn default_registry() -> HarnessRegistry {
                 ReasoningLevel::XHigh,
                 ReasoningLevel::Max,
             ],
+            installed: true,
+            enabled: None,
         },
+        Box::new(|| komet_harness::AcpHarness::claude().installed()),
         Box::new(|| Ok(Arc::new(komet_harness::AcpHarness::claude()) as Arc<dyn Harness>)),
     );
     // Codex, same lazy pattern: the static descriptor mirrors AcpHarness::codex()
@@ -211,7 +372,10 @@ pub fn default_registry() -> HarnessRegistry {
                 ReasoningLevel::Max,
                 ReasoningLevel::Ultra,
             ],
+            installed: true,
+            enabled: None,
         },
+        Box::new(|| komet_harness::AcpHarness::codex().installed()),
         Box::new(|| Ok(Arc::new(komet_harness::AcpHarness::codex()) as Arc<dyn Harness>)),
     );
     // Grok Build over ACP, same lazy pattern: the static descriptor mirrors
@@ -229,8 +393,51 @@ pub fn default_registry() -> HarnessRegistry {
                 ReasoningLevel::Medium,
                 ReasoningLevel::High,
             ],
+            installed: true,
+            enabled: None,
         },
+        Box::new(|| komet_harness::AcpHarness::grok().installed()),
         Box::new(|| Ok(Arc::new(komet_harness::AcpHarness::grok()) as Arc<dyn Harness>)),
+    );
+    // Hermes Agent over ACP (`hermes acp`), same lazy pattern: the static
+    // descriptor mirrors AcpHarness::hermes() exactly. No steering extension
+    // (turn boundaries) and no effort ladder — Hermes exposes no effort
+    // config over ACP today (hybrid reasoning is model-internal).
+    registry.register_lazy(
+        HarnessDescriptor {
+            id: HarnessId::Hermes,
+            name: "Hermes".into(),
+            supports_steering: true,
+            steering_mode: SteeringMode::TurnBoundary,
+            reasoning_levels: Vec::new(),
+            installed: true,
+            enabled: None,
+        },
+        Box::new(|| komet_harness::AcpHarness::hermes().installed()),
+        Box::new(|| Ok(Arc::new(komet_harness::AcpHarness::hermes()) as Arc<dyn Harness>)),
+    );
+    // pi over ACP (community `pi-acp` adapter), same lazy pattern: the static
+    // descriptor mirrors AcpHarness::pi() exactly — turn-boundary steering,
+    // pi's thinking ladder minus its "off" tier.
+    registry.register_lazy(
+        HarnessDescriptor {
+            id: HarnessId::Pi,
+            name: "Pi".into(),
+            supports_steering: true,
+            steering_mode: SteeringMode::TurnBoundary,
+            reasoning_levels: vec![
+                ReasoningLevel::Minimal,
+                ReasoningLevel::Low,
+                ReasoningLevel::Medium,
+                ReasoningLevel::High,
+                ReasoningLevel::XHigh,
+                ReasoningLevel::Max,
+            ],
+            installed: true,
+            enabled: None,
+        },
+        Box::new(|| komet_harness::AcpHarness::pi().installed()),
+        Box::new(|| Ok(Arc::new(komet_harness::AcpHarness::pi()) as Arc<dyn Harness>)),
     );
     registry
 }
@@ -252,7 +459,10 @@ mod tests {
                 supports_steering: true,
                 steering_mode: SteeringMode::StepBoundary,
                 reasoning_levels: vec![],
+                installed: true,
+                enabled: None,
             },
+            Box::new(|| false),
             Box::new(move || {
                 counted.fetch_add(1, Ordering::SeqCst);
                 Err(HarnessError::NotInstalled("nope".into()))
@@ -261,6 +471,8 @@ mod tests {
         let listed = registry.descriptors();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].name, "Lazy Mock");
+        // The listing runs the probe, not the stored placeholder.
+        assert!(!listed[0].installed);
         assert_eq!(
             calls.load(Ordering::SeqCst),
             0,
@@ -280,7 +492,9 @@ mod tests {
                 HarnessId::Mock,
                 HarnessId::ClaudeCode,
                 HarnessId::Codex,
-                HarnessId::Grok
+                HarnessId::Grok,
+                HarnessId::Hermes,
+                HarnessId::Pi
             ]
         );
         assert!(registry.resolve(HarnessId::Mock).is_ok());
@@ -303,6 +517,116 @@ mod tests {
                 ReasoningLevel::High
             ]
         );
+        // Hermes and Pi mirror their specs the same way.
+        let hermes = registry.resolve(HarnessId::Hermes).unwrap();
+        assert_eq!(hermes.id(), HarnessId::Hermes);
+        assert_eq!(hermes.display_name(), "Hermes");
+        assert_eq!(hermes.steering_mode(), SteeringMode::TurnBoundary);
+        assert!(hermes.reasoning_levels().is_empty());
+        let pi = registry.resolve(HarnessId::Pi).unwrap();
+        assert_eq!(pi.id(), HarnessId::Pi);
+        assert_eq!(pi.display_name(), "Pi");
+        assert_eq!(pi.steering_mode(), SteeringMode::TurnBoundary);
+        assert_eq!(
+            pi.reasoning_levels(),
+            &[
+                ReasoningLevel::Minimal,
+                ReasoningLevel::Low,
+                ReasoningLevel::Medium,
+                ReasoningLevel::High,
+                ReasoningLevel::XHigh,
+                ReasoningLevel::Max
+            ]
+        );
+    }
+
+    /// Catalogs serialized by engines that predate the `installed`/`enabled`
+    /// fields must keep deserializing — installed, and enabled per the
+    /// default-set fallback (Claude Code yes, Grok no).
+    #[test]
+    fn descriptor_without_new_fields_parses_with_fallbacks() {
+        let parse = |id: &str| -> HarnessDescriptor {
+            serde_json::from_str(&format!(
+                r#"{{
+                    "id": "{id}",
+                    "name": "x",
+                    "supportsSteering": true,
+                    "steeringMode": "step-boundary",
+                    "reasoningLevels": []
+                }}"#
+            ))
+            .unwrap()
+        };
+        let claude = parse("claude-code");
+        assert!(claude.installed);
+        assert_eq!(claude.enabled, None);
+        assert!(descriptor_enabled(&claude));
+        assert!(!descriptor_enabled(&parse("grok")));
+    }
+
+    /// A registry slot for the tests below: installed probe fixed, factory
+    /// never expected to run.
+    fn test_slot(registry: &HarnessRegistry, id: HarnessId, installed: bool) {
+        registry.register_lazy(
+            HarnessDescriptor {
+                id,
+                name: format!("{id:?}"),
+                supports_steering: true,
+                steering_mode: SteeringMode::StepBoundary,
+                reasoning_levels: vec![],
+                installed: true,
+                enabled: None,
+            },
+            Box::new(move || installed),
+            Box::new(|| Err(HarnessError::NotInstalled("test slot".into()))),
+        );
+    }
+
+    /// `descriptors()` stamps the per-device enabled flag; `set_enabled`
+    /// guards the gate (no enabling missing CLIs, no disabling the last one)
+    /// and persists across a reload.
+    #[test]
+    fn enablement_stamps_guards_and_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = HarnessRegistry::new();
+        registry.load_prefs(dir.path());
+        test_slot(&registry, HarnessId::ClaudeCode, true);
+        test_slot(&registry, HarnessId::Codex, true);
+        test_slot(&registry, HarnessId::Grok, true);
+        test_slot(&registry, HarnessId::Hermes, false);
+
+        // Default set stamped: Claude Code + Codex on, the rest off.
+        let flags: Vec<(HarnessId, Option<bool>)> = registry
+            .descriptors()
+            .into_iter()
+            .map(|d| (d.id, d.enabled))
+            .collect();
+        assert_eq!(
+            flags,
+            vec![
+                (HarnessId::ClaudeCode, Some(true)),
+                (HarnessId::Codex, Some(true)),
+                (HarnessId::Grok, Some(false)),
+                (HarnessId::Hermes, Some(false)),
+            ]
+        );
+
+        // The gate: a missing CLI can't be enabled; unknown ids refuse.
+        assert!(registry.set_enabled(HarnessId::Hermes, true).is_err());
+        assert!(registry.set_enabled(HarnessId::Pi, true).is_err());
+        // Installed CLIs toggle both ways; no-op flips are fine.
+        registry.set_enabled(HarnessId::Grok, true).unwrap();
+        registry.set_enabled(HarnessId::Grok, true).unwrap();
+        registry.set_enabled(HarnessId::Codex, false).unwrap();
+        registry.set_enabled(HarnessId::ClaudeCode, false).unwrap();
+        // Grok is the last one standing — refusing keeps the composer usable.
+        assert!(registry.set_enabled(HarnessId::Grok, false).is_err());
+        assert_eq!(registry.enabled_set(), vec![HarnessId::Grok]);
+
+        // A fresh registry over the same data dir reads the persisted set.
+        let reloaded = HarnessRegistry::new();
+        reloaded.load_prefs(dir.path());
+        assert_eq!(reloaded.enabled_set(), vec![HarnessId::Grok]);
     }
 
     /// The Codex lazy descriptor must be indistinguishable from `describe()`

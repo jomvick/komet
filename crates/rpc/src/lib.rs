@@ -34,6 +34,9 @@ pub use server::{serve_connection, serve_ws_listener};
 /// Full surface: docs/research/feature-inventory.md §2.
 pub mod methods {
     pub const LIST_HARNESSES: &str = "ListHarnesses";
+    /// Flip a harness's enablement on the target device (Settings → Agents);
+    /// replies with the device's fresh `ListHarnesses` catalog.
+    pub const SET_HARNESS_ENABLED: &str = "SetHarnessEnabled";
     pub const LIST_MODELS: &str = "ListModels";
     pub const LIST_COMMANDS: &str = "ListCommands";
     pub const QUEUE_COMMAND: &str = "QueueCommand";

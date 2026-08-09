@@ -3,7 +3,8 @@
 //!
 //! Every production harness is the shared [`AcpHarness`] with a per-agent
 //! spec: Claude Code via the org-maintained `claude-agent-acp` adapter, Codex
-//! via `codex-acp`, Grok Build natively. Decision record:
+//! via `codex-acp`, Grok Build and Hermes natively, pi via the community
+//! `pi-acp` adapter. Decision record:
 //! docs/research/acp.md (the bespoke stream-json/app-server adapters this
 //! crate used to hold are documented historically in
 //! docs/research/harness.md).
@@ -55,6 +56,12 @@ pub trait Harness: Send + Sync {
     fn supports_steering(&self) -> bool;
     fn steering_mode(&self) -> SteeringMode;
     fn reasoning_levels(&self) -> &[ReasoningLevel];
+    /// Whether the agent's own CLI is present on this device — the settings
+    /// gate for enabling the harness. A filesystem probe, never a spawn.
+    /// Defaults to true for harnesses without a CLI to check (mock).
+    fn installed(&self) -> bool {
+        true
+    }
     async fn models(&self) -> Result<Vec<Model>, HarnessError>;
     /// Slash commands the agent advertises (ACP `availableCommands`); empty
     /// for harnesses without them. May spawn a short-lived discovery process.
