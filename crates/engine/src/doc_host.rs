@@ -195,6 +195,13 @@ pub struct ChatDocHandle {
     /// Last known snapshot blob size — the eviction budget estimate's input.
     snapshot_bytes: AtomicUsize,
     room: Mutex<Option<RoomClient>>,
+    /// The sync generation this handle was BUILT for (1 = legacy s2,
+    /// 2 = chat2). The staleness checks compare this against the registry —
+    /// inferring mode from `chat2_local_sub` misread edge-less chat2
+    /// handles (no subscription is ever installed offline) as stale s2 and
+    /// retired them on every open, dropping the doc out from under live
+    /// runs.
+    room_gen: u32,
     /// A threshold checkpoint POST is in flight (review H1: the quiesce
     /// tick must not stack concurrent full-snapshot uploads).
     checkpointing: Arc<AtomicBool>,
@@ -386,7 +393,63 @@ impl DocHost {
         let chats = workspace.watch_chats();
         if self.inner.workspace.set(workspace).is_ok() {
             self.spawn_cutover_watcher(chats);
+            self.spawn_migration_sweep();
         }
+    }
+
+    /// Host migration sweep: proactively seed this device's own s2 chats
+    /// onto chat2, one per tick. The lazy open()-triggered seed could never
+    /// fire in real usage — idle chats are never opened, a headless host's
+    /// only opens are nudges (which arrive exactly when a run starts), and
+    /// viewing a chat used to pin it. Every safety gate stays (s2 room
+    /// joined, 2s frontier quiet, no live writer, no pending commands,
+    /// frontier seal at the flip) — only the trigger changes: the host owns
+    /// migrating its chats. Aborted seeds retry after a gap; a migrated
+    /// fleet makes the tick a cheap no-op scan.
+    fn spawn_migration_sweep(&self) {
+        const TICK: std::time::Duration = std::time::Duration::from_secs(30);
+        const RETRY_GAP_MS: i64 = 10 * 60 * 1000;
+        let host = self.clone();
+        tokio::spawn(async move {
+            let mut attempted: HashMap<String, i64> = HashMap::new();
+            loop {
+                tokio::time::sleep(TICK).await;
+                let Some(edge) = host.inner.config.edge.clone() else {
+                    return; // edge-less engine: nothing to migrate onto
+                };
+                let Some(ws) = host.workspace() else { continue };
+                let chats: Vec<komet_proto::Chat> = ws.watch_chats().borrow().clone();
+                let device = host.inner.config.device_id.clone();
+                let now = now_ms();
+                let candidate = chats.into_iter().find(|c| {
+                    c.device_id == device
+                        && c.room_gen.unwrap_or(1) < 2
+                        && !attempted
+                            .get(&c.id)
+                            .is_some_and(|t| now - *t <= RETRY_GAP_MS)
+                });
+                let Some(chat) = candidate else { continue };
+                attempted.insert(chat.id.clone(), now);
+                // A cached (warm) handle never re-enters open()'s build path,
+                // so arm the quiet-waiter directly; a cold chat opens, which
+                // arms it on the way up.
+                let cached = lock(&host.inner.handles).get(&chat.id).cloned();
+                match cached {
+                    Some(handle) => {
+                        if handle.room_gen < 2 && !handle.retired.load(Ordering::Relaxed) {
+                            tracing::debug!(chat = %chat.id, "migration sweep: arming seed on warm s2 chat");
+                            host.spawn_chat2_seed_when_quiet(edge, &chat.id, &handle);
+                        }
+                    }
+                    None => {
+                        tracing::debug!(chat = %chat.id, "migration sweep: opening cold s2 chat to seed");
+                        if let Err(err) = host.open(&chat.id) {
+                            tracing::warn!(chat = %chat.id, error = %err, "migration sweep open failed");
+                        }
+                    }
+                }
+            }
+        });
     }
 
     /// Live cutover convergence: when a registry chat row flips to roomGen 2
@@ -419,7 +482,7 @@ impl DocHost {
                     let Some(handle) = handles.get(&chat_id) else {
                         continue;
                     };
-                    if lock(&handle.chat2_local_sub).is_some() {
+                    if handle.room_gen >= 2 {
                         continue; // already chat2-mode
                     }
                     handle.retired.store(true, Ordering::Relaxed);
@@ -459,10 +522,8 @@ impl DocHost {
         {
             let mut handles = lock(&self.inner.handles);
             if let Some(handle) = handles.get(chat_id) {
-                // s2-mode marker: the chat2 local-update subscription is
-                // installed before the chat2 dial, so its absence means this
-                // handle was built for the legacy room.
-                if registry_gen >= 2 && lock(&handle.chat2_local_sub).is_none() {
+                if registry_gen >= 2 && handle.room_gen < 2 {
+                    // Built for the legacy room; the chat has since cut over.
                     handle.retired.store(true, Ordering::Relaxed);
                 }
                 if handle.retired.load(Ordering::Relaxed) && !self.pinned(handle) {
@@ -556,7 +617,25 @@ impl DocHost {
                     }
                     SessionDoc::init(chat_id)?
                 }
-                None => SessionDoc::init(chat_id)?,
+                None => {
+                    // Born on chat2 (or a cold reader's first open): stamp
+                    // the epoch-2 lineage NOW. Plain snapshot saves preserve
+                    // an existing row's epoch but default a NEW row to 0 —
+                    // without this stamp, the next open reads "pre-chat2
+                    // doc" and the M3 adopt DISCARDS everything written
+                    // since (caught by the restart_resume suite: first-turn
+                    // transcripts vanished on reopen).
+                    let doc = SessionDoc::init(chat_id)?;
+                    if let Ok(snapshot) = doc.export_snapshot() {
+                        let _ = self.inner.store.save_snapshot_with_cursor(
+                            chat_id,
+                            &snapshot,
+                            0,
+                            crate::chat2_host::CHAT2_DOC_EPOCH,
+                        );
+                    }
+                    doc
+                }
             }
         } else {
             match stored {
@@ -590,6 +669,7 @@ impl DocHost {
             last_access: AtomicI64::new(now_ms()),
             snapshot_bytes: AtomicUsize::new(snapshot_len),
             room: Mutex::new(None),
+            room_gen,
             retired: AtomicBool::new(false),
             checkpointing: Arc::new(AtomicBool::new(false)),
             chat2: Mutex::new(None),
@@ -646,6 +726,32 @@ impl DocHost {
                 // and never reach the room (the host would never see it).
                 for command in &requeue_commands {
                     let _ = doc.queue_command(command);
+                }
+                // First contact with the room (cursor 0): everything
+                // committed BEFORE the subscription above — SessionDoc::
+                // init's container/meta ops, an adopt's fresh doc — is
+                // invisible to the push path, yet every later commit
+                // causally DEPENDS on it. Rows built on unpushed deps import
+                // into peers' loro pending-buffers and never materialize:
+                // born-chat2 cross-device runs sat invisible on every other
+                // device (host never saw the command, viewers never saw the
+                // transcript). Push the doc's full update log as the join's
+                // first batch; once acked the cursor moves and this never
+                // re-arms.
+                if chat2_cursor == 0 {
+                    match doc
+                        .doc()
+                        .export(loro::ExportMode::updates(&loro::VersionVector::default()))
+                    {
+                        Ok(bytes) if !bytes.is_empty() => {
+                            lock(&handle.chat2_pending_local).push(bytes);
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            tracing::warn!(chat = %chat_id, error = %err,
+                                "chat2 first-contact export failed; peers may stall on missing deps");
+                        }
+                    }
                 }
                 self.spawn_chat2_join(edge.clone(), &handle, chat2_cursor);
             } else {
@@ -1007,7 +1113,7 @@ impl DocHost {
         {
             let handles = lock(&self.inner.handles);
             if let Some(handle) = handles.get(chat_id) {
-                if self.pinned(handle) {
+                if self.seed_blocked(handle) {
                     return Err("chat became active mid-seed; aborted before flip".into());
                 }
                 // Frontier seal (review B1's TOCTOU): ANY doc movement since
@@ -1055,7 +1161,11 @@ impl DocHost {
             let mut handles = lock(&self.inner.handles);
             if let Some(handle) = handles.get(chat_id) {
                 handle.retired.store(true, Ordering::Relaxed);
-                if !self.pinned(handle) {
+                // Drop unless a live WRITER holds the doc. Watchers do not
+                // keep the fat handle alive: their streams end with it and
+                // they resubscribe onto the chat2 adopt path (the same
+                // contract the cutover watcher enforces for remote flips).
+                if Arc::strong_count(&handle.doc) == 1 {
                     handles.remove(chat_id);
                     true
                 } else {
@@ -1245,6 +1355,31 @@ impl DocHost {
                 self.save_snapshot(&handle);
                 tracing::debug!(chat = %handle.chat_id, "doc evicted (LRU)");
             }
+        }
+    }
+
+    /// Seed-specific activity gate: a live WRITER (a run's doc ref) or
+    /// pending host commands block a seed — watchers do NOT. Pure readers
+    /// cannot lose writes, and the flip drops the handle so their streams
+    /// end and resubscribe onto the chat2 adopt path. `pinned()` below keeps
+    /// counting watchers for EVICTION, where a watched doc must stay
+    /// resident. (Watcher-pinned seeds made "open a chat to look at it"
+    /// self-defeating: the act of viewing blocked its own migration.)
+    fn seed_blocked(&self, handle: &Arc<ChatDocHandle>) -> bool {
+        if Arc::strong_count(&handle.doc) > 1 {
+            return true;
+        }
+        if self.is_host(&handle.chat_id) {
+            let is_processed = |id: &str| self.inner.store.is_processed(id).unwrap_or(false);
+            match handle.doc.read_commands() {
+                Ok(commands) => commands
+                    .iter()
+                    .any(|c| c.status == SessionCommandStatus::Pending && !is_processed(&c.id)),
+                // Unreadable ledger: never flip blind.
+                Err(_) => true,
+            }
+        } else {
+            false
         }
     }
 
