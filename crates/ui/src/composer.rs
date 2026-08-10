@@ -4165,6 +4165,7 @@ impl Composer {
             "slash-popup",
             anchor,
             card.into_any_element(),
+            None,
         ))
     }
 

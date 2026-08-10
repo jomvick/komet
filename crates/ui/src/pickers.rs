@@ -343,7 +343,7 @@ impl Pickers {
                 // `toggle` returns, so an unscoped reset clobbers the
                 // just-anchored selected-model row back to 0 (regression:
                 // the top row wore a second highlight again).
-                if this.open == Some(PickerKind::Branch) {
+                if this.open_kind() == Some(PickerKind::Branch) {
                     this.active = 0;
                 }
                 cx.notify();
@@ -836,7 +836,7 @@ impl Pickers {
                 // A list that landed while its popover is open re-anchors the
                 // keyboard highlight onto the selected row (it sat at 0 while
                 // loading).
-                if pickers.open == Some(PickerKind::HarnessModel)
+                if pickers.open_kind() == Some(PickerKind::HarnessModel)
                     && pickers.effective_harness(cx) == Some(harness)
                 {
                     pickers.active = pickers.selected_model_index(cx);
