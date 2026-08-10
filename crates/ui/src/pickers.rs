@@ -267,6 +267,11 @@ pub fn browser_rows(listing: &FolderListing) -> Vec<&komet_proto::FolderEntry> {
 // Entity
 // ---------------------------------------------------------------------------
 
+/// Sentinel for "no keyboard-highlighted row" (`active`): matches no index,
+/// and `usize::MAX as isize == -1` — `menu_step` treats it like `None`, so
+/// the first Down lands on row 0.
+const NO_ACTIVE_ROW: usize = usize::MAX;
+
 /// Which picker popover is open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PickerKind {
@@ -1356,11 +1361,29 @@ impl Pickers {
 
     // ---- the space picker (new-session canvas) ----
 
-    /// Spaces matching the search query, ranked (`popover::filter_indices`).
+    /// The picker's project rows: scoped to the canvas's device — the device
+    /// switcher narrows the list, projects on other devices don't show
+    /// (pick the device first, then its project). Unscoped only while the
+    /// device is still unknown (pre-probe boot).
+    fn scoped_space_rows(&self, cx: &App) -> Vec<Space> {
+        let state = self.state.read(cx);
+        let device = state.effective_device_id();
+        state
+            .spaces_sorted()
+            .into_iter()
+            .filter(|s| match device.as_deref() {
+                Some(d) => s.device_id == d,
+                None => true,
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// [`Self::scoped_space_rows`] matching the search query, ranked
+    /// (`popover::filter_indices`).
     fn filtered_space_rows(&self, cx: &App) -> Vec<Space> {
         let query = self.search.read(cx).text().to_string();
-        let state = self.state.read(cx);
-        let spaces = state.spaces_sorted();
+        let spaces = self.scoped_space_rows(cx);
         let names: Vec<String> = spaces
             .iter()
             .map(|s| s.display_name().to_string())
@@ -1372,14 +1395,15 @@ impl Pickers {
     }
 
     /// Row index of the currently selected space (un-searched open) — within
-    /// the sorted order [`filtered_space_rows`] lists on an empty query.
+    /// the scoped order [`filtered_space_rows`] lists on an empty query.
+    /// [`NO_ACTIVE_ROW`] when nothing is selected (the no-project canvas must
+    /// not open with row 0 wearing a phantom highlight — user report).
     fn selected_space_index(&self, cx: &App) -> usize {
-        let state = self.state.read(cx);
-        state
-            .selected_space
+        let selected = self.state.read(cx).selected_space_row().map(|s| s.id.clone());
+        selected
             .as_deref()
-            .and_then(|id| state.spaces_sorted().iter().position(|s| s.id == id))
-            .unwrap_or(0)
+            .and_then(|id| self.scoped_space_rows(cx).iter().position(|s| s.id == id))
+            .unwrap_or(NO_ACTIVE_ROW)
     }
 
     /// Re-home the canvas onto another project. The state observer does the
@@ -1495,11 +1519,7 @@ impl Pickers {
                 .children(rows.into_iter().zip(online).enumerate().map(
                     |(ix, (device, online))| {
                         let is_local = local.as_deref() == Some(device.id.as_str());
-                        let label: SharedString = if is_local {
-                            format!("{} (this device)", device.name).into()
-                        } else {
-                            device.name.clone().into()
-                        };
+                        let label: SharedString = device.name.clone().into();
                         let is_selected = effective.as_deref() == Some(device.id.as_str());
                         let pick_id = device.id.clone();
                         popover::menu_row_nav(
@@ -1513,13 +1533,24 @@ impl Pickers {
                             this.pick_device(pick_id.clone(), cx);
                         }))
                         .child(div().flex_1().min_w_0().truncate().child(label))
-                        .when(!online, |el| {
+                        // The local device wears a muted right-aligned "You"
+                        // instead of a "(this device)" suffix in the name.
+                        .when(is_local, |el| {
                             el.child(
                                 div()
                                     .flex_none()
                                     .text_size(px(10.0))
-                                    .text_color(theme.warning.opacity(0.8))
-                                    .child(SharedString::from("offline")),
+                                    .text_color(theme.text_muted.opacity(0.45))
+                                    .child(SharedString::from("You")),
+                            )
+                        })
+                        // Disconnected glyph, not the word (user request).
+                        .when(!online, |el| {
+                            el.child(
+                                crate::icons::icon(crate::icons::WIFI_OFF)
+                                    .size(px(12.0))
+                                    .flex_none()
+                                    .text_color(theme.warning.opacity(0.8)),
                             )
                         })
                     },
@@ -1534,29 +1565,34 @@ impl Pickers {
             .into_any_element()
     }
 
-    /// The project popover: search + one row per project (name, muted
-    /// `@ device` tag, check on the current pick), then "New project…" and
-    /// "Don't work in a project" action rows.
+    /// The project popover: search + one row per project on the picked device
+    /// (check on the current pick), then "New project…" and "Don't work in a
+    /// project" action rows. Rows are device-scoped, so no per-row `@ device`
+    /// tag — the device chip next door names the host.
     fn render_space_popover(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let rows = self.filtered_space_rows(cx);
-        let (selected, no_project, device_names): (Option<String>, bool, Vec<Option<String>>) = {
+        let (selected, no_project): (Option<String>, bool) = {
             let state = self.state.read(cx);
             (
                 state.selected_space_row().map(|s| s.id.clone()),
                 state.no_project,
-                rows.iter()
-                    .map(|space| state.device_name(&space.device_id).map(str::to_string))
-                    .collect(),
             )
         };
         let active = self.active;
         let body: AnyElement = if rows.is_empty() {
+            // Distinguish "the filter ate everything" from "this device has
+            // no projects yet" — the scoped list makes the latter common.
+            let empty: &str = if self.search.read(cx).text().is_empty() {
+                "No projects on this device."
+            } else {
+                "No projects match."
+            };
             div()
                 .p(px(Theme::SPACE_SM))
                 .text_size(px(12.0))
                 .text_color(theme.text_faint)
-                .child(SharedString::from("No projects match."))
+                .child(SharedString::from(empty.to_string()))
                 .into_any_element()
         } else {
             div()
@@ -1566,33 +1602,22 @@ impl Pickers {
                 .gap(px(2.0))
                 .max_h(px(224.0))
                 .overflow_y_scroll()
-                .children(rows.into_iter().zip(device_names).enumerate().map(
-                    |(ix, (space, device))| {
-                        let label: SharedString = space.display_name().to_string().into();
-                        let is_selected = selected.as_deref() == Some(space.id.as_str());
-                        let pick_id = space.id.clone();
-                        popover::menu_row_nav(
-                            &theme,
-                            is_selected,
-                            ix == active,
-                            format!("space-row-{ix}"),
-                        )
-                        .id(("space-row", ix))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.pick_space(pick_id.clone(), cx);
-                        }))
-                        .child(div().flex_1().min_w_0().truncate().child(label))
-                        .when_some(device, |el, device| {
-                            el.child(
-                                div()
-                                    .flex_none()
-                                    .text_size(px(10.0))
-                                    .text_color(theme.text_muted.opacity(0.45))
-                                    .child(SharedString::from(format!("@ {device}"))),
-                            )
-                        })
-                    },
-                ))
+                .children(rows.into_iter().enumerate().map(|(ix, space)| {
+                    let label: SharedString = space.display_name().to_string().into();
+                    let is_selected = selected.as_deref() == Some(space.id.as_str());
+                    let pick_id = space.id.clone();
+                    popover::menu_row_nav(
+                        &theme,
+                        is_selected,
+                        ix == active,
+                        format!("space-row-{ix}"),
+                    )
+                    .id(("space-row", ix))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.pick_space(pick_id.clone(), cx);
+                    }))
+                    .child(div().flex_1().min_w_0().truncate().child(label))
+                }))
                 .into_any_element()
         };
         // Action rows under a hairline: mint a project, or opt out of one.
@@ -1615,36 +1640,46 @@ impl Pickers {
                     .truncate()
                     .child(SharedString::from("New project…")),
             );
-        let opt_out = popover::menu_row_nav(&theme, no_project, false, "project-none".to_string())
-            .id("project-none")
-            .on_click(cx.listener(|this, _, _, cx| this.pick_no_project(cx)))
-            .child(
-                crate::icons::icon(crate::icons::CLOSE)
-                    .size(px(12.0))
-                    .flex_none()
-                    .text_color(theme.text_muted.opacity(0.7)),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .child(SharedString::from("Don't work in a project")),
-            );
+        // Hidden while the opt-out is active (the chip already says "No
+        // project") — showing it selected read as a second highlighted row.
+        let opt_out = (!no_project).then(|| {
+            popover::menu_row_nav(&theme, false, false, "project-none".to_string())
+                .id("project-none")
+                .on_click(cx.listener(|this, _, _, cx| this.pick_no_project(cx)))
+                .child(
+                    crate::icons::icon(crate::icons::CLOSE)
+                        .size(px(12.0))
+                        .flex_none()
+                        .text_color(theme.text_muted.opacity(0.7)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .child(SharedString::from("Don't work in a project")),
+                )
+        });
         div()
             .flex()
             .flex_col()
+            // Same 2px rhythm as the list's own row gap — the action rows
+            // sat flush while list rows breathed (user report).
+            .gap(px(2.0))
             .child(self.search_box(&theme))
             .child(body)
             .child(
+                // Full-bleed through the card's 4px inset — a divider
+                // stopping short of the edges read as a mistake.
                 div()
                     .my(px(2.0))
+                    .mx(px(-4.0))
                     .h(px(1.0))
                     .flex_none()
                     .bg(theme.border.opacity(0.6)),
             )
             .child(new_project)
-            .child(opt_out)
+            .children(opt_out)
             .into_any_element()
     }
 
@@ -1697,7 +1732,8 @@ impl Pickers {
                     Some(PickerKind::Device) => self.filtered_device_rows(cx).len(),
                     None => 0,
                 };
-                self.active = popover::menu_step(Some(self.active), count, delta).unwrap_or(0);
+                let current = (self.active != NO_ACTIVE_ROW).then_some(self.active);
+                self.active = popover::menu_step(current, count, delta).unwrap_or(0);
                 // Keep the highlighted MODEL row in view (the rows are the
                 // scroll container's direct children, so indices map 1:1);
                 // the traits chips below live in the pinned tray and never
@@ -1755,6 +1791,9 @@ impl Pickers {
             .id(id)
             .h(px(32.0))
             .max_w(px(208.0))
+            // Shrinkable under row pressure — four footer chips share one
+            // line; without min_w_0 they overflowed and painted overlapped.
+            .min_w_0()
             .flex()
             .flex_row()
             .items_center()
@@ -1859,7 +1898,12 @@ impl Pickers {
     fn footer_label(icon_path: &'static str, label: SharedString, theme: &Theme) -> gpui::Div {
         div()
             .h(px(20.0))
-            .max_w(px(280.0))
+            // Four of these share one row now (device, project, checkout,
+            // ref): cap each early and let them SHRINK (`min_w_0`) — without
+            // it the clusters overflowed into each other and the labels
+            // painted overlapped (user report).
+            .max_w(px(160.0))
+            .min_w_0()
             .flex()
             .flex_row()
             .items_center()
@@ -1876,115 +1920,14 @@ impl Pickers {
             .child(div().min_w_0().truncate().child(label))
     }
 
-    /// The composer footer row. New-session canvas: device + project
-    /// selectors always, checkout-kind + ref joining when the picked project
-    /// has git (checkout left of ref — wing's order). Existing session:
-    /// read-only labels only — where a session runs (device, project,
-    /// checkout, ref) is fixed at creation.
-    pub fn render_footer(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    /// The new-session canvas's target row — device + project selector chips
+    /// under the canvas logo (their popovers anchor BELOW; the composer
+    /// footer carries only checkout + ref now, and sessions show their
+    /// target in the titlebar instead).
+    pub fn render_target_selectors(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
-        // A selected chat whose workspace row hasn't synced yet (the moment
-        // right after send mints it) still renders the DRAFT footer — the
-        // values are identical, so the toolbar never blinks through a
-        // half-empty locked state.
-        let (space, session) = {
-            let state = self.state.read(cx);
-            let space = state.selected_space_row().cloned();
-            let session = state
-                .selected_chat
-                .as_ref()
-                .and_then(|_| state.selected_chat_row().cloned());
-            (space, session)
-        };
-        let row = || {
-            // Symmetric: the container's 8px gap sits above the toolbar;
-            // bleeding 8 of the container's 16px bottom padding (mb -8)
-            // leaves 8 below — equal air on both sides of the row.
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .justify_between()
-                .gap(px(8.0))
-                .px(px(10.0))
-                .mb(px(-8.0))
-        };
-
-        if let Some(chat) = &session {
-            // Sessions never move: everything renders as read-only labels.
-            // Device always; project only when the session has one; checkout
-            // kind + ref only when that project has git.
-            let device_label: SharedString = self
-                .state
-                .read(cx)
-                .device_name(&chat.device_id)
-                .map(str::to_string)
-                .unwrap_or_else(|| "Unknown device".to_string())
-                .into();
-            let mut left = div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .min_w_0()
-                .gap(px(4.0))
-                .child(Self::footer_label(
-                    crate::icons::MONITOR,
-                    device_label,
-                    &theme,
-                ));
-            if let Some(space) = &space {
-                left = left.child(Self::footer_label(
-                    crate::icons::FOLDER,
-                    SharedString::from(space.display_name().to_string()),
-                    &theme,
-                ));
-            }
-            let right = space.as_ref().filter(|s| s.git_detected).map(|space| {
-                let is_worktree = chat.cwd.as_deref().is_some_and(|cwd| cwd != space.path);
-                let (icon_path, label) = if is_worktree {
-                    (crate::icons::FOLDER_WITH_FILES, "Worktree")
-                } else {
-                    (crate::icons::FOLDER, "Local checkout")
-                };
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .flex_none()
-                    .gap(px(4.0))
-                    .child(Self::footer_label(
-                        icon_path,
-                        SharedString::from(label),
-                        &theme,
-                    ))
-                    .child(Self::footer_label(
-                        crate::icons::GIT_BRANCH,
-                        chat.branch
-                            .clone()
-                            .map(SharedString::from)
-                            .unwrap_or_else(|| SharedString::from("No ref")),
-                        &theme,
-                    ))
-            });
-            return Some(row().child(left).children(right).into_any_element());
-        }
-
-        // New-session canvas.
-        let git = space.as_ref().is_some_and(|s| s.git_detected);
-        if git {
-            // Refs feed the draft labels — eager + idempotent.
-            self.ensure_refs(false, cx);
-        }
         let closing = self.open.closing_since();
         let mut overlay: Option<(PickerKind, AnyElement)> = match self.mounted_kind() {
-            Some(PickerKind::Branch) if git => {
-                let content = self.render_branch_popover(cx);
-                Some((PickerKind::Branch, self.popover_frame(320.0, content, cx)))
-            }
-            Some(PickerKind::Checkout) if git => {
-                let content = self.render_checkout_popover(cx);
-                Some((PickerKind::Checkout, self.popover_frame(224.0, content, cx)))
-            }
             Some(PickerKind::Space) => {
                 let content = self.render_space_popover(cx);
                 Some((PickerKind::Space, self.popover_frame(280.0, content, cx)))
@@ -1995,7 +1938,6 @@ impl Pickers {
             }
             _ => None,
         };
-
         let (device_label, project_label, offline) = {
             let state = self.state.read(cx);
             let device_id = state.effective_device_id();
@@ -2008,8 +1950,8 @@ impl Pickers {
             let offline = device_id
                 .as_deref()
                 .is_some_and(|id| !state.device_online(id, chrono::Utc::now()));
-            let project_label: SharedString = space
-                .as_ref()
+            let project_label: SharedString = state
+                .selected_space_row()
                 .map(|s| s.display_name().to_string())
                 .unwrap_or_else(|| "No project".to_string())
                 .into();
@@ -2033,30 +1975,119 @@ impl Pickers {
             &theme,
             cx,
         );
-        let left = div()
+        div()
             .flex()
             .flex_row()
             .items_center()
-            .min_w_0()
             .gap(px(4.0))
-            .child(attach_overlay(
+            .child(attach_overlay_below(
                 device_chip,
                 &mut overlay,
                 PickerKind::Device,
                 "device-popover",
                 closing,
             ))
-            .child(attach_overlay(
+            .child(attach_overlay_below(
                 project_chip,
                 &mut overlay,
                 PickerKind::Space,
                 "project-popover",
                 closing,
-            ));
+            ))
+            .into_any_element()
+    }
 
-        if !git {
-            return Some(row().child(left).into_any_element());
+    /// The composer footer row: checkout-kind + ref, LEFT-aligned, only when
+    /// the picked (or session's) project has git. Device + project moved to
+    /// the new-session canvas ([`Self::render_target_selectors`]); sessions
+    /// name their target in the titlebar.
+    pub fn render_footer(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let theme = Theme::of(cx).clone();
+        // A selected chat whose workspace row hasn't synced yet (the moment
+        // right after send mints it) still renders the DRAFT footer — the
+        // values are identical, so the toolbar never blinks through a
+        // half-empty locked state.
+        let (space, session) = {
+            let state = self.state.read(cx);
+            let space = state.selected_space_row().cloned();
+            let session = state
+                .selected_chat
+                .as_ref()
+                .and_then(|_| state.selected_chat_row().cloned());
+            (space, session)
+        };
+        let row = || {
+            // Symmetric: the container's 8px gap sits above the toolbar;
+            // bleeding 8 of the container's 16px bottom padding (mb -8)
+            // leaves 8 below — equal air on both sides of the row.
+            // `w_full` is load-bearing: without it the canvas layout sizes
+            // the row to CONTENT, and the left cluster's flex_1 (basis 0)
+            // collapsed to zero width — both clusters painted from the same
+            // origin, chips overlapping (user report).
+            div()
+                .w_full()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap(px(8.0))
+                .px(px(10.0))
+                .mb(px(-8.0))
+        };
+
+        if let Some(chat) = &session {
+            // Sessions never move: read-only checkout-kind + ref labels,
+            // LEFT-aligned, only when the session's project has git. The
+            // target (project @ device) lives in the titlebar now.
+            let Some(space) = space.as_ref().filter(|s| s.git_detected) else {
+                return None;
+            };
+            let is_worktree = chat.cwd.as_deref().is_some_and(|cwd| cwd != space.path);
+            let (icon_path, label) = if is_worktree {
+                (crate::icons::FOLDER_WITH_FILES, "Worktree")
+            } else {
+                (crate::icons::FOLDER, "Local checkout")
+            };
+            // Mirrors the draft chips: checkout hugs the left edge, ref the
+            // right.
+            let left = div().flex().flex_row().items_center().min_w_0().child(
+                Self::footer_label(icon_path, SharedString::from(label), &theme),
+            );
+            let right = div().flex().flex_row().items_center().min_w_0().child(
+                Self::footer_label(
+                    crate::icons::GIT_BRANCH,
+                    chat.branch
+                        .clone()
+                        .map(SharedString::from)
+                        .unwrap_or_else(|| SharedString::from("No ref")),
+                    &theme,
+                ),
+            );
+            return Some(row().child(left).child(right).into_any_element());
         }
+
+        // New-session canvas: checkout + ref only, LEFT-aligned (device +
+        // project live under the canvas logo now).
+        let git = space.as_ref().is_some_and(|s| s.git_detected);
+        if !git {
+            return None;
+        }
+        // Refs feed the draft labels — eager + idempotent.
+        self.ensure_refs(false, cx);
+        let closing = self.open.closing_since();
+        let mut overlay: Option<(PickerKind, AnyElement)> = match self.mounted_kind() {
+            Some(PickerKind::Branch) => {
+                let content = self.render_branch_popover(cx);
+                Some((PickerKind::Branch, self.popover_frame(320.0, content, cx)))
+            }
+            Some(PickerKind::Checkout) => {
+                let content = self.render_checkout_popover(cx);
+                Some((PickerKind::Checkout, self.popover_frame(224.0, content, cx)))
+            }
+            // Space/Device popovers mount on the canvas selectors
+            // (`render_target_selectors`), not here.
+            _ => None,
+        };
 
         let ref_label = self.ref_label();
         let ref_chip = self.footer_chip(
@@ -2079,19 +2110,25 @@ impl Pickers {
             &theme,
             cx,
         );
-        let right = div()
+        // Checkout on the left edge, ref on the right — the row's
+        // justify_between splits them (user request).
+        let left = div()
             .flex()
             .flex_row()
             .items_center()
-            .flex_none()
-            .gap(px(4.0))
+            .min_w_0()
             .child(attach_overlay(
                 kind_chip,
                 &mut overlay,
                 PickerKind::Checkout,
                 "checkout-popover",
                 closing,
-            ))
+            ));
+        let right = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .min_w_0()
             .child(attach_overlay_end(
                 ref_chip,
                 &mut overlay,
@@ -2854,6 +2891,23 @@ fn attach_overlay(
         && let Some((_, element)) = overlay.take()
     {
         return chip.child(popover::anchored_menu_above(id, element, closing));
+    }
+    chip
+}
+
+/// [`attach_overlay`] opening DOWNWARD — the canvas target selectors sit
+/// mid-screen, so their menus drop below the chips.
+fn attach_overlay_below(
+    chip: gpui::Stateful<gpui::Div>,
+    overlay: &mut Option<(PickerKind, AnyElement)>,
+    kind: PickerKind,
+    id: &'static str,
+    closing: Option<std::time::Instant>,
+) -> gpui::Stateful<gpui::Div> {
+    if overlay.as_ref().is_some_and(|(k, _)| *k == kind)
+        && let Some((_, element)) = overlay.take()
+    {
+        return chip.child(popover::anchored_menu_below(id, element, closing));
     }
     chip
 }

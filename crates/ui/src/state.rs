@@ -472,16 +472,19 @@ impl AppState {
         // Heal a vanished selection (project deleted elsewhere): fall back to
         // the first project; its chats died with it, so a matching chat
         // selection is healed by the accompanying chats frame (`apply_chats`).
+        // The picker lists projects per-device, so healing prefers one on the
+        // picked device — a global fallback would silently re-aim the canvas
+        // at another machine.
         if let Some(selected) = &self.selected_space
             && !self.spaces.iter().any(|s| &s.id == selected)
         {
-            self.selected_space = self.spaces.first().map(|s| s.id.clone());
+            self.selected_space = self.first_space_on_picked_device();
         }
         // First frame with no selection yet: pick the first project so the
         // canvas never boots project-less by accident — unless the user
         // deliberately opted out.
         if self.selected_space.is_none() && !self.no_project {
-            self.selected_space = self.spaces.first().map(|s| s.id.clone());
+            self.selected_space = self.first_space_on_picked_device();
         }
     }
 
@@ -496,6 +499,21 @@ impl AppState {
 
     pub fn apply_devices(&mut self, devices: Vec<Device>) {
         self.devices = devices;
+    }
+
+    /// First project on the composer's picked device (falling back through
+    /// the local device, then any project at all — better a cross-device
+    /// project than a surprise project-less canvas). Display order.
+    fn first_space_on_picked_device(&self) -> Option<String> {
+        let device = self
+            .selected_device
+            .as_deref()
+            .or(self.local_device_id.as_deref());
+        let sorted = self.spaces_sorted();
+        device
+            .and_then(|d| sorted.iter().find(|s| s.device_id == d).copied())
+            .or_else(|| sorted.first().copied())
+            .map(|s| s.id.clone())
     }
 
     pub fn apply_update(&mut self, status: komet_update::UpdateStatus) {
@@ -731,18 +749,14 @@ impl AppState {
         }
     }
 
-    /// The "@ device" tag for a space (" · offline" appended when the host's
-    /// heartbeat is stale) — shared by the space pickers' rows, the sidebar
-    /// filter trigger, and the composer's space chip. Returns `(tag, offline)`.
+    /// The "@ device" tag for a space — shared by the space pickers' rows,
+    /// the sidebar filter trigger, and the composer's space chip. Returns
+    /// `(tag, offline)`; staleness renders as a disconnected GLYPH at the
+    /// call sites (user request), never words in the tag.
     pub fn space_device_tag(&self, space: &Space, now: DateTime<Utc>) -> (String, bool) {
         let offline = !self.device_online(&space.device_id, now);
         let device = self.device_name(&space.device_id).unwrap_or("Unknown device");
-        let tag = if offline {
-            format!("@ {device} · offline")
-        } else {
-            format!("@ {device}")
-        };
-        (tag, offline)
+        (format!("@ {device}"), offline)
     }
 
     /// Does the selected space's folder have git? Drives the branch picker and

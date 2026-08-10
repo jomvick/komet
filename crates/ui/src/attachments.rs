@@ -500,11 +500,12 @@ impl ImageCache {
             self.pending_free.push(image.image);
         }
         self.loaded_bytes += bytes;
+        let shielded = protected().lock().unwrap().clone();
         while self.loaded_bytes > IMAGE_CACHE_BUDGET_BYTES {
             let oldest = self
                 .map
                 .iter()
-                .filter(|(k, _)| **k != key)
+                .filter(|(k, _)| **k != key && !shielded.contains(*k))
                 .filter_map(|(k, e)| match e {
                     CacheEntry::Loaded { last_used, .. } => Some((*last_used, k.clone())),
                     _ => None,
@@ -522,6 +523,23 @@ impl ImageCache {
 fn cache() -> &'static Mutex<ImageCache> {
     static CACHE: OnceLock<Mutex<ImageCache>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(ImageCache::default()))
+}
+
+/// Keys shielded from LRU eviction — the open transcript's attachments. The
+/// gpui list caches rendered rows across frames, so a VISIBLE thumbnail's
+/// `last_used` tick can go stale and budget pressure evicted images still on
+/// screen (user report: "images unload before they are scrolled out of
+/// view"). The transcript replaces this set on every row sync; other chats'
+/// images stay evictable, so the budget still bounds the cache overall.
+fn protected() -> &'static Mutex<std::collections::HashSet<(String, String)>> {
+    static PROTECTED: OnceLock<Mutex<std::collections::HashSet<(String, String)>>> =
+        OnceLock::new();
+    PROTECTED.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Replace the eviction shield with the given keys (see [`protected`]).
+pub fn protect_attachments(keys: std::collections::HashSet<(String, String)>) {
+    *protected().lock().unwrap() = keys;
 }
 
 fn key(device_id: &str, path: &str) -> (String, String) {

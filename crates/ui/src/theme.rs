@@ -323,7 +323,7 @@ impl Theme {
     /// itself past this band so settled content (message text, the
     /// hover-revealed timestamp) never sits inside the fade when scrolled
     /// to the bottom.
-    pub const TRANSCRIPT_FADE_BAND: f32 = 40.0;
+    pub const TRANSCRIPT_FADE_BAND: f32 = 24.0;
     /// Message bubble corner radius.
     pub const BUBBLE_RADIUS: f32 = 16.0;
     /// Panel / card corner radius.
@@ -402,6 +402,18 @@ impl Theme {
         match self.appearance {
             Appearance::Dark => self.surface_overlay.opacity(0.65),
             Appearance::Light => self.surface_overlay.opacity(0.85),
+        }
+    }
+
+    /// The composer pill / question panel fill. Light's `input_bg` is opaque
+    /// white (the elevation ladder on an opaque page) — over glass it read as
+    /// a solid slab in front of the frosted blur, so it thins to a
+    /// translucent tint there. Dark's 3% white wash is already glass-native.
+    pub fn input_glass_bg(&self) -> Hsla {
+        if self.is_glass() && matches!(self.appearance, Appearance::Light) {
+            self.input_bg.opacity(0.6)
+        } else {
+            self.input_bg
         }
     }
 

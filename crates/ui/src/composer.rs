@@ -3223,6 +3223,8 @@ pub struct Composer {
     state: Entity<AppState>,
     input: Entity<ComposerInput>,
     /// Composer actions row: repo/branch/harness-model/traits (§1.7).
+    /// Shared with the shell's new-session canvas, which renders the
+    /// device/project target selectors ([`Pickers::render_target_selectors`]).
     pickers: Entity<Pickers>,
     /// Draft text per chat key ("" = new-chat canvas), surviving navigation.
     drafts: HashMap<String, String>,
@@ -3287,6 +3289,11 @@ pub struct Composer {
 impl EventEmitter<ComposerEvent> for Composer {}
 
 impl Composer {
+    /// The picker entity, for the shell's canvas target selectors.
+    pub fn pickers(&self) -> &Entity<Pickers> {
+        &self.pickers
+    }
+
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let input = cx.new(|cx| {
             let mut input = ComposerInput::new("Do anything…", cx);
@@ -3521,6 +3528,9 @@ impl Composer {
                             .child(
                                 img(att.image.clone())
                                     .size_full()
+                                    // Own radii — the frame's rounding only
+                                    // clips rectangularly (7 = 8 - border).
+                                    .rounded(px(7.0))
                                     .object_fit(ObjectFit::Cover),
                             ),
                     )
@@ -4913,8 +4923,8 @@ impl Composer {
             .rounded(px(26.0))
             .border_1()
             .border_color(theme.border)
-            .bg(theme.input_bg)
-            .shadow_lg()
+            .bg(theme.input_glass_bg())
+            .when(!theme.is_glass(), |el| el.shadow_lg())
             .flex()
             .flex_col()
             .child(
@@ -5352,13 +5362,16 @@ impl Render for Composer {
         // border-white/[0.08] bg-white/[0.03] shadow-xl` — a floating pill with
         // a hairline over a faint wash, never a solid grey box. Picker chips,
         // attach, and the send circle all live INSIDE the pill.
-        let pill_bg = theme.input_bg;
+        let pill_bg = theme.input_glass_bg();
+        // No drop shadow on glass: it paints BEHIND the translucent fill and
+        // shows through as an inner glow (theme.rs's card_selected_shadows
+        // lesson; user report).
         let pill = div()
             .rounded(px(26.0))
             .bg(pill_bg)
             .border_1()
             .border_color(theme.border)
-            .shadow_lg();
+            .when(!theme.is_glass(), |el| el.shadow_lg());
         // The pill's bottom edge is stationary on screen (the composer sits at
         // the bottom of the shell column; growth moves the TOP edge), so the
         // controls pin to the bottom and only the text glides with the reveal
@@ -5474,7 +5487,13 @@ impl Render for Composer {
         // The file dropzone lives in the shell (the whole conversation column,
         // not just the pill — shell.rs `chat-dropzone`); drops land back here
         // via `add_paths`.
-        let container = container.child(motion::fade_quick("composer-input", body));
+        // Frosted: the pill backdrop-blurs the transcript scrolling under it
+        // (the popover glass treatment; radius matches the pill's rounding).
+        let container = container.child(crate::frost::frosted(
+            26.0,
+            16.0,
+            motion::fade_quick("composer-input", body),
+        ));
         // Branch/worktree toolbar under the pill (t3code BranchToolbar): the
         // checkout-kind selector + ref picker for new sessions, read-only
         // labels once the session exists. Git spaces only.

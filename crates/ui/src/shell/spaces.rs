@@ -84,14 +84,16 @@ pub(super) struct RenameSpaceDialog {
 pub(super) fn status_dot_color(status: ChatIndicator, theme: &Theme) -> gpui::Hsla {
     match status {
         // Pink, not amber — the harsh yellow read as a warning; running is
-        // routine (user request).
+        // routine (user request). Non-done statuses sit well below full
+        // strength: at full alpha the colored words shouted across the
+        // whole sidebar (user request) — only Done keeps its pop.
         ChatIndicator::Working => {
-            theme.busy.opacity(0.85) // pink-400
+            theme.busy.opacity(0.55) // pink-400, muted
         }
         // Blue: "asking you a question" must read differently from "busy
         // working" at a glance.
-        ChatIndicator::AwaitingInput => theme.accent.opacity(0.9),
-        ChatIndicator::Errored => theme.danger,
+        ChatIndicator::AwaitingInput => theme.accent.opacity(0.6),
+        ChatIndicator::Errored => theme.danger.opacity(0.65),
         // Green: finished-but-unseen reads as "ready for you".
         ChatIndicator::Completed => {
             theme.success.opacity(0.9) // emerald-400
@@ -356,13 +358,18 @@ impl Shell {
                                 .flex_none()
                                 .text_size(px(10.0))
                                 .font_weight(gpui::FontWeight::NORMAL)
-                                .text_color(if offline {
-                                    theme.warning.opacity(0.8)
-                                } else {
-                                    theme.text_muted.opacity(0.45)
-                                })
+                                .text_color(theme.text_muted.opacity(0.45))
                                 .child(tag),
                         )
+                        // Disconnected glyph, not the word (user request).
+                        .when(offline, |el| {
+                            el.child(
+                                icon(icons::WIFI_OFF)
+                                    .size(px(12.0))
+                                    .flex_none()
+                                    .text_color(theme.warning.opacity(0.8)),
+                            )
+                        })
                     }),
             )
             .child(
@@ -527,13 +534,18 @@ impl Shell {
                                 div()
                                     .flex_none()
                                     .text_size(px(10.0))
-                                    .text_color(if offline {
-                                        theme.warning.opacity(0.8)
-                                    } else {
-                                        theme.text_muted.opacity(0.45)
-                                    })
+                                    .text_color(theme.text_muted.opacity(0.45))
                                     .child(tag),
                             )
+                            // Disconnected glyph, not the word (user request).
+                            .when(offline, |el| {
+                                el.child(
+                                    icon(icons::WIFI_OFF)
+                                        .size(px(12.0))
+                                        .flex_none()
+                                        .text_color(theme.warning.opacity(0.8)),
+                                )
+                            })
                         })
                         // No check glyph — the selected row's wash (menu_row's
                         // active styling) is the selection signal.
@@ -624,12 +636,256 @@ impl Shell {
                     harness,
                     status,
                     is_selected,
+                    false,
                     theme,
                     cx,
                 );
                 (format!("c:{}", chat.id), height, element)
             })
             .collect()
+    }
+
+    /// The sidebar's archived shelf — a direct port of t3code's settled
+    /// shelf: header is label + hairline + chevron ("Archived (N)" closed,
+    /// "Archived" open), rows are 36px SLIM one-liners (dimmed harness mark,
+    /// title, time-ago right — the time yields to Unarchive on row hover),
+    /// and the tail pages behind an explicit "Show N more" row (initial 10,
+    /// +25 a click). `None` when nothing is archived under the current
+    /// project filter.
+    pub(super) fn render_archived_section(
+        &mut self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        const INITIAL: usize = 10;
+        const PAGE: usize = 25;
+        let now = Utc::now();
+        let filter = self.settings.space_filter.clone();
+        let rows: Vec<komet_proto::Chat> = {
+            let state = self.state.read(cx);
+            state
+                .chats
+                .iter()
+                .filter(|c| c.archived)
+                .filter(|chat| match &filter {
+                    Some(space_id) => chat.space_id.as_deref() == Some(space_id.as_str()),
+                    None => true,
+                })
+                .cloned()
+                .collect()
+        };
+        if rows.is_empty() {
+            return None;
+        }
+        let total = rows.len();
+        let open = self.archived_open;
+        let shown = self.archived_shown.max(INITIAL);
+        // Header (t3code settled-shelf toggle): muted 12px label, a hairline
+        // filling the middle, chevron flipping open/closed. The count only
+        // shows while collapsed — expanded, the rows speak for themselves.
+        let label: SharedString = if open {
+            "Archived".into()
+        } else {
+            format!("Archived ({total})").into()
+        };
+        let header = div()
+            .id("archived-toggle")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .mt(px(12.0))
+            .mb(px(4.0))
+            .px(px(10.0))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.archived_open = !this.archived_open;
+                this.archived_shown = INITIAL;
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(px(12.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text_muted.opacity(0.5))
+                    .child(label),
+            )
+            .child(div().h(px(1.0)).flex_1().bg(theme.border.opacity(0.6)))
+            .child(
+                crate::icons::icon(if open {
+                    crate::icons::ALT_ARROW_DOWN
+                } else {
+                    crate::icons::ALT_ARROW_RIGHT
+                })
+                .size(px(12.0))
+                .flex_none()
+                .text_color(theme.text_muted.opacity(0.5)),
+            );
+        let mut section = div().flex().flex_col().child(header);
+        if open {
+            let selected = self.state.read(cx).selected_chat.clone();
+            let selected_wash = crate::theme::glass_selected_bg();
+            let mut list = div().flex().flex_col().gap(px(2.0));
+            for chat in rows.into_iter().take(shown) {
+                let id = chat.id.clone();
+                let hovered = self.archived_hover.as_deref() == Some(id.as_str());
+                let is_selected = selected.as_deref() == Some(id.as_str());
+                let title: SharedString = transcript::single_line(
+                    &chat.title.clone().unwrap_or_else(|| "New session".into()),
+                )
+                .into();
+                let time_ago: SharedString =
+                    format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now).into();
+                let (mark, tint) = chat
+                    .config
+                    .as_ref()
+                    .map(|c| crate::pickers::harness_brand_icon(c.harness))
+                    .unwrap_or((crate::icons::CHAT_ROUND_LINE, None));
+                // Right slot: time at rest; the Unarchive affordance takes
+                // its place on row hover (t3code: "only the time/jump label
+                // yields to the settle affordance").
+                let right: AnyElement = if hovered {
+                    let restore_id = id.clone();
+                    // Metrics match the active rows' Archive pill exactly
+                    // (18px pill, 11px icon, 10px label, padding bled right)
+                    // — two sizes of the same affordance read as a mistake.
+                    div()
+                        .id(SharedString::from(format!("archived-restore-{id}")))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(4.0))
+                        .h(px(18.0))
+                        .px(px(4.0))
+                        .mr(px(-4.0))
+                        .rounded(px(5.0))
+                        .bg(crate::theme::wash(0.10))
+                        .hover(|s| s.bg(crate::theme::wash(0.18)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.set_chat_archived(restore_id.clone(), false, cx);
+                        }))
+                        .child(
+                            crate::icons::icon(crate::icons::ARCHIVE_UP_MINIMALISTIC)
+                                .size(px(11.0))
+                                .flex_none()
+                                .text_color(theme.text_muted),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(10.0))
+                                .text_color(theme.text_muted)
+                                .child(SharedString::from("Unarchive")),
+                        )
+                        .into_any_element()
+                } else {
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(theme.text_muted.opacity(0.55))
+                        .child(time_ago)
+                        .into_any_element()
+                };
+                let hover_id = id.clone();
+                let open_id = id.clone();
+                let menu_id = id.clone();
+                list = list.child(
+                    div()
+                        .id(SharedString::from(format!("archived-{id}")))
+                        .h(px(36.0))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(10.0))
+                        .px(px(10.0))
+                        .rounded(px(6.0))
+                        .cursor_pointer()
+                        .when(is_selected, |el| el.bg(selected_wash))
+                        .when(!is_selected, |el| {
+                            el.hover(|s| s.bg(theme.glass_hover()))
+                        })
+                        .on_hover(cx.listener(move |this, entered: &bool, _, cx| {
+                            if *entered {
+                                if this.archived_hover.as_deref() != Some(hover_id.as_str()) {
+                                    this.archived_hover = Some(hover_id.clone());
+                                    cx.notify();
+                                }
+                            } else if this.archived_hover.as_deref() == Some(hover_id.as_str()) {
+                                this.archived_hover = None;
+                                cx.notify();
+                            }
+                        }))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.open_chat(open_id.clone(), cx);
+                        }))
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                                this.chat_menu.open((menu_id.clone(), event.position));
+                                cx.notify();
+                            }),
+                        )
+                        // Archived history recedes: dimmed mark at rest,
+                        // restored on hover (t3code's grayscale favicon).
+                        .child(
+                            crate::icons::icon(mark)
+                                .size(px(14.0))
+                                .flex_none()
+                                .text_color(if hovered || is_selected {
+                                    tint.unwrap_or(theme.text_muted)
+                                } else {
+                                    tint.unwrap_or(theme.text_muted).opacity(0.4)
+                                }),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(13.0))
+                                .text_color(if hovered || is_selected {
+                                    theme.text
+                                } else {
+                                    theme.text.opacity(0.55)
+                                })
+                                .child(title),
+                        )
+                        .child(right),
+                );
+            }
+            // Mount fade: the shelf popping in whole read as jank — a quick
+            // fade on the expanded list softens the accordion.
+            section = section.child(motion::fade_quick("archived-list", list));
+            if total > shown {
+                let remaining = (total - shown).min(PAGE);
+                section = section.child(
+                    div()
+                        .id("archived-more")
+                        .h(px(36.0))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(10.0))
+                        .px(px(10.0))
+                        .rounded(px(6.0))
+                        .text_size(px(13.0))
+                        .text_color(theme.text_muted.opacity(0.55))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme.glass_hover()).text_color(theme.text))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.archived_shown = this.archived_shown.max(INITIAL) + PAGE;
+                            cx.notify();
+                        }))
+                        .child(
+                            crate::icons::icon(crate::icons::PLUS)
+                                .size(px(14.0))
+                                .flex_none(),
+                        )
+                        .child(SharedString::from(format!("Show {remaining} more"))),
+                );
+            }
+        }
+        Some(section.pb(px(Theme::SPACE_SM)).into_any_element())
     }
 
     // ---- add-space flow (the ⌘K palette) ----

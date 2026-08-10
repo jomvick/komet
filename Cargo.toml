@@ -46,14 +46,14 @@ loro-protocol = "0.3"
 # KOMET_GPU_STATS=1 diagnostics); b687328 adds ImageSource::evict (frees
 # sprite-atlas tiles — remove_asset alone leaked them, see
 # attachments::flush_evicted); ac135eb adds device memory to the stats line.
-gpui = { git = "https://github.com/wingleeio/zed", rev = "ac135eb227c0784e4bb8f09ae3c3ff6bffd8a827" }
-gpui_platform = { git = "https://github.com/wingleeio/zed", rev = "ac135eb227c0784e4bb8f09ae3c3ff6bffd8a827", features = [
+gpui = { git = "https://github.com/wingleeio/zed", rev = "a5b59b53e50fa7455faa358192d887c7f16130c0" }
+gpui_platform = { git = "https://github.com/wingleeio/zed", rev = "a5b59b53e50fa7455faa358192d887c7f16130c0", features = [
     "wayland",
     "x11",
     "font-kit",
     "runtime_shaders",
 ] }
-gpui_tokio = { git = "https://github.com/wingleeio/zed", rev = "ac135eb227c0784e4bb8f09ae3c3ff6bffd8a827" }
+gpui_tokio = { git = "https://github.com/wingleeio/zed", rev = "a5b59b53e50fa7455faa358192d887c7f16130c0" }
 
 # diffs
 similar = "2"
@@ -107,3 +107,6 @@ opt-level = 0
 
 [profile.dev.package."*"]
 opt-level = 2
+
+
+

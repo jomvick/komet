@@ -64,17 +64,39 @@ impl Shell {
     /// animated left inset, the toggle-changes button on git projects).
     pub(super) fn render_session_title_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
-        let (title, harness, on_canvas): (SharedString, Option<komet_proto::HarnessId>, bool) = {
+        // The canvas titles as NOTHING (user request — a "New session"
+        // header over the empty canvas was noise); the bar keeps its height,
+        // drag region, and buttons. A session appends its target as a muted
+        // "/project @ device" tag right of the title (the composer footer no
+        // longer carries it).
+        let (title, target, harness, on_canvas): (
+            SharedString,
+            Option<SharedString>,
+            Option<komet_proto::HarnessId>,
+            bool,
+        ) = {
             let state = self.state.read(cx);
             match state.selected_chat_row() {
-                Some(chat) => (
-                    SharedString::from(transcript::single_line(
-                        &chat.title.clone().unwrap_or_else(|| "New session".into()),
-                    )),
-                    chat.config.as_ref().map(|c| c.harness),
-                    false,
-                ),
-                None => (SharedString::from("New session"), None, true),
+                Some(chat) => {
+                    let folder = chat
+                        .space_id
+                        .as_deref()
+                        .and_then(|id| state.space_row(id))
+                        .map(|s| s.display_name().to_string())
+                        .unwrap_or_else(|| "~".to_string());
+                    let device = state
+                        .device_name(&chat.device_id)
+                        .unwrap_or("Unknown device");
+                    (
+                        SharedString::from(transcript::single_line(
+                            &chat.title.clone().unwrap_or_else(|| "New session".into()),
+                        )),
+                        Some(SharedString::from(format!("/{folder} @ {device}"))),
+                        chat.config.as_ref().map(|c| c.harness),
+                        false,
+                    )
+                }
+                None => (SharedString::from(""), None, None, true),
             }
         };
         let git = self.space_git_detected(cx);
@@ -132,12 +154,22 @@ impl Shell {
                                 theme.text.opacity(0.85)
                             })
                             .child(title),
-                    ),
+                    )
+                    .when_some(target, |el, target| {
+                        el.child(
+                            div()
+                                .flex_none()
+                                .text_size(px(12.0))
+                                .text_color(theme.text_muted.opacity(0.5))
+                                .child(target),
+                        )
+                    }),
             )
             .child(div().flex_1())
             // Stable location: the toggle shows whether the pane is open or
-            // not (the pane's own header is gone).
-            .when(git, |el| {
+            // not (the pane's own header is gone). Hidden on the new-session
+            // canvas (user request) — there's no session to diff yet.
+            .when(git && !on_canvas, |el| {
                 el.child(header_icon_button(
                     "toggle-changes",
                     icons::SIDEBAR_MINIMALISTIC,
