@@ -383,7 +383,55 @@ impl DocHost {
 
     /// Wire the workspace host (engine assembly) — the source of chat-ownership rows.
     pub fn set_workspace(&self, workspace: WorkspaceHost) {
-        let _ = self.inner.workspace.set(workspace);
+        let chats = workspace.watch_chats();
+        if self.inner.workspace.set(workspace).is_ok() {
+            self.spawn_cutover_watcher(chats);
+        }
+    }
+
+    /// Live cutover convergence: when a registry chat row flips to roomGen 2
+    /// while this device holds an s2-mode handle, retire it NOW — a viewer
+    /// watching the chat at flip time otherwise stays frozen on the dead s2
+    /// room until they happen to reopen (the host writes only to chat2 from
+    /// the flip on). Dropping the handle ends the watch streams cleanly; the
+    /// UI's transcript/standing watches resubscribe and the fresh open takes
+    /// the chat2 adopt path. A handle with a LIVE local writer (a running
+    /// turn's doc ref) is left alone — the host never flips mid-run, and a
+    /// racing writer must never lose its doc out from under it.
+    fn spawn_cutover_watcher(&self, mut chats: watch::Receiver<Vec<komet_proto::Chat>>) {
+        let host = self.clone();
+        tokio::spawn(async move {
+            loop {
+                if chats.changed().await.is_err() {
+                    return; // workspace host gone (shutdown)
+                }
+                let flipped: Vec<String> = chats
+                    .borrow_and_update()
+                    .iter()
+                    .filter(|c| c.room_gen.unwrap_or(1) >= 2)
+                    .map(|c| c.id.clone())
+                    .collect();
+                if flipped.is_empty() {
+                    continue;
+                }
+                let mut handles = lock(&host.inner.handles);
+                for chat_id in flipped {
+                    let Some(handle) = handles.get(&chat_id) else {
+                        continue;
+                    };
+                    if lock(&handle.chat2_local_sub).is_some() {
+                        continue; // already chat2-mode
+                    }
+                    handle.retired.store(true, Ordering::Relaxed);
+                    let live_writer = Arc::strong_count(&handle.doc) > 1;
+                    if !live_writer {
+                        handles.remove(&chat_id);
+                        tracing::info!(chat = %chat_id,
+                            "s2 handle dropped on chat2 cutover; watchers resubscribe onto the new room");
+                    }
+                }
+            }
+        });
     }
 
     /// The workspace host, once wired (tests may assemble a DocHost without one).
