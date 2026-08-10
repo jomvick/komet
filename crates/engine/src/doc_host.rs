@@ -441,8 +441,19 @@ impl DocHost {
                     if weak.upgrade().is_none() {
                         return; // evicted or purged while dialing
                     }
-                    match RoomClient::connect_via(url.clone(), &chat, room_doc.clone()).await {
-                        Ok(client) => {
+                    // Deadline on the WHOLE dial, including the token
+                    // provider: on 2026-08-10 an engine instance sat inside
+                    // a hung first dial for over an hour — no error, no
+                    // retry, no log line — while every transcript it was
+                    // asked to open rendered black. A hang must become a
+                    // logged, retried failure.
+                    let dial = tokio::time::timeout(
+                        std::time::Duration::from_secs(30),
+                        RoomClient::connect_via(url.clone(), &chat, room_doc.clone()),
+                    )
+                    .await;
+                    match dial {
+                        Ok(Ok(client)) => {
                             let Some(handle) = weak.upgrade() else {
                                 return; // evicted mid-dial: drop leaves the room
                             };
@@ -450,12 +461,19 @@ impl DocHost {
                             tracing::info!(chat = %chat, "session room joined");
                             return;
                         }
-                        Err(err) => {
+                        Ok(Err(err)) => {
                             tracing::warn!(
                                 chat = %chat,
                                 error = %err,
                                 backoff_ms = backoff.as_millis() as u64,
                                 "session room join failed; retrying"
+                            );
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                chat = %chat,
+                                backoff_ms = backoff.as_millis() as u64,
+                                "session room join timed out (hung dial); retrying"
                             );
                         }
                     }

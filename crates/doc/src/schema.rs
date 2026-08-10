@@ -256,7 +256,11 @@ impl SessionDoc {
             .filter_map(|v| match entry_from_json(v) {
                 Ok(entry) => Some(entry),
                 Err(err) => {
-                    tracing::warn!(error = %err, "skipping malformed transcript entry");
+                    tracing::warn!(
+                        chat = %self.chat_id().unwrap_or_default(),
+                        error = %err,
+                        "skipping unsalvageable transcript entry"
+                    );
                     None
                 }
             })
@@ -579,16 +583,122 @@ fn entry_from_json(v: serde_json::Value) -> Result<SessionMessageEntry, DocError
         #[serde(default)]
         continuation_of: Option<String>,
     }
-    let raw: RawEntry = serde_json::from_value(v)?;
+    match serde_json::from_value::<RawEntry>(v.clone()) {
+        Ok(raw) => Ok(SessionMessageEntry {
+            id: raw.id,
+            role: raw.role,
+            parts: raw.parts.into_iter().map(from_doc_part).collect(),
+            created_at: raw.created_at,
+            device_id: raw.device_id,
+            status: raw.status,
+            continuation_of: raw.continuation_of,
+        }),
+        // 2026-08-10 incident rule: a missing field must cost AT MOST what
+        // the field carried — never the entry, never the transcript. Rooms
+        // merge writes from every device and app version; one bad writer
+        // (or one mangled export) blanking whole sessions for every reader
+        // is exactly what tonight looked like.
+        Err(strict_err) => salvage_entry(v, strict_err),
+    }
+}
+
+/// Field-level salvage for entries the strict shape rejects. Missing
+/// identity/attribution fields get deterministic stand-ins (content-hashed
+/// id, so repeated reads and continuation joins stay stable); parts are
+/// salvaged individually — a part missing `kind` is inferred from its
+/// content shape, and only truly contentless parts are dropped.
+fn salvage_entry(
+    v: serde_json::Value,
+    strict_err: serde_json::Error,
+) -> Result<SessionMessageEntry, DocError> {
+    let Some(obj) = v.as_object() else {
+        return Err(DocError::Json(strict_err));
+    };
+    let stable_hash = {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        v.to_string().hash(&mut hasher);
+        hasher.finish()
+    };
+    let str_field = |key: &str| obj.get(key).and_then(|x| x.as_str()).map(str::to_owned);
+    let id = str_field("id").unwrap_or_else(|| format!("recovered-{stable_hash:016x}"));
+    let role = obj
+        .get("role")
+        .and_then(|r| serde_json::from_value::<MessageRole>(r.clone()).ok())
+        .unwrap_or(MessageRole::Assistant);
+    let mut parts = Vec::new();
+    let mut dropped_parts = 0usize;
+    if let Some(raw_parts) = obj.get("parts").and_then(|p| p.as_array()) {
+        for (ix, part) in raw_parts.iter().enumerate() {
+            match serde_json::from_value::<DocPartJson>(part.clone()) {
+                Ok(p) => parts.push(from_doc_part(p)),
+                Err(_) => match salvage_part(part, &id, ix) {
+                    Some(p) => parts.push(p),
+                    None => dropped_parts += 1,
+                },
+            }
+        }
+    }
+    tracing::warn!(
+        entry = %id,
+        error = %strict_err,
+        salvaged_parts = parts.len(),
+        dropped_parts,
+        "transcript entry failed strict parse; salvaged"
+    );
     Ok(SessionMessageEntry {
-        id: raw.id,
-        role: raw.role,
-        parts: raw.parts.into_iter().map(from_doc_part).collect(),
-        created_at: raw.created_at,
-        device_id: raw.device_id,
-        status: raw.status,
-        continuation_of: raw.continuation_of,
+        id,
+        role,
+        parts,
+        created_at: obj.get("createdAt").and_then(|x| x.as_i64()).unwrap_or(0),
+        device_id: str_field("deviceId").unwrap_or_default(),
+        status: obj
+            .get("status")
+            .and_then(|s| serde_json::from_value(s.clone()).ok()),
+        continuation_of: str_field("continuationOf"),
     })
+}
+
+/// Salvage one part whose strict `DocPartJson` parse failed: infer the kind
+/// from the content shape (`text` → text part, parseable `call` → tool
+/// part). `None` only when nothing renderable survives.
+fn salvage_part(part: &serde_json::Value, entry_id: &str, ix: usize) -> Option<MessagePart> {
+    let obj = part.as_object()?;
+    let id = obj
+        .get("id")
+        .and_then(|x| x.as_str())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("{entry_id}#recovered-{ix}"));
+    if let Some(text) = obj.get("text").and_then(|x| x.as_str()) {
+        return Some(MessagePart::Text {
+            id,
+            text: text.to_owned(),
+        });
+    }
+    if let Some(call) = obj
+        .get("call")
+        .and_then(|c| serde_json::from_value(c.clone()).ok())
+    {
+        return Some(MessagePart::Tool {
+            id,
+            call,
+            is_error: obj.get("isError").and_then(|x| x.as_bool()).unwrap_or(false),
+            resolved: obj.get("resolved").and_then(|x| x.as_bool()).unwrap_or(true),
+            output: obj.get("output").and_then(|x| x.as_str()).map(str::to_owned),
+            diff: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
+            diff_stats: None,
+        });
+    }
+    if let Some(message) = obj.get("message").and_then(|x| x.as_str()) {
+        return Some(MessagePart::Error {
+            id,
+            message: message.to_owned(),
+        });
+    }
+    None
 }
 
 /// Render-time continuation join at the entry level (`joinContinuations` in TS):
@@ -1170,5 +1280,56 @@ mod tests {
         assert_eq!(tail.messages.len(), 2);
         assert_eq!(tail.messages[1].id, "m4");
         assert_eq!(tail.chat_id, "chat-1");
+    }
+
+    /// 2026-08-10 incident: entries/parts missing strict fields must salvage
+    /// field-by-field — a fresh reader importing a room's merged doc must
+    /// never render a BLANK transcript because some writer (old app version,
+    /// other-platform client, mangled export) omitted metadata.
+    #[test]
+    fn malformed_entries_salvage_instead_of_vanishing() {
+        // Entry missing `id` + `deviceId`; one part missing `kind` but
+        // carrying text; one part contentless (dropped).
+        let v = serde_json::json!({
+            "role": "assistant",
+            "createdAt": 123,
+            "parts": [
+                { "id": "p1", "text": "still readable" },
+                { "opaque": true },
+                { "id": "p3", "kind": "text", "text": "well-formed" }
+            ]
+        });
+        let entry = entry_from_json(v.clone()).expect("salvaged");
+        assert!(entry.id.starts_with("recovered-"), "deterministic stand-in id");
+        let again = entry_from_json(v).expect("salvaged again");
+        assert_eq!(entry.id, again.id, "recovered id is stable across reads");
+        assert_eq!(entry.role, MessageRole::Assistant);
+        assert_eq!(entry.created_at, 123);
+        assert_eq!(entry.parts.len(), 2, "text parts survive, contentless part dropped");
+        match &entry.parts[0] {
+            MessagePart::Text { text, .. } => assert_eq!(text, "still readable"),
+            other => panic!("unexpected {other:?}"),
+        }
+
+        // Tool part missing `kind` but with a parseable call salvages as Tool.
+        let v = serde_json::json!({
+            "role": "assistant",
+            "createdAt": 1,
+            "parts": [ { "id": "t1", "call": { "kind": "exec", "command": "ls" }, "output": "x" } ]
+        });
+        let entry = entry_from_json(v).expect("salvaged");
+        assert!(matches!(&entry.parts[0], MessagePart::Tool { resolved: true, .. }));
+
+        // Only non-objects are truly unsalvageable.
+        assert!(entry_from_json(serde_json::json!("garbage")).is_err());
+        assert!(entry_from_json(serde_json::json!(42)).is_err());
+
+        // Well-formed entries take the strict path unchanged.
+        let v = serde_json::json!({
+            "id": "m1", "role": "user", "createdAt": 5, "deviceId": "d",
+            "parts": [ { "id": "p", "kind": "text", "text": "hi" } ]
+        });
+        let entry = entry_from_json(v).expect("strict");
+        assert_eq!(entry.id, "m1");
     }
 }
