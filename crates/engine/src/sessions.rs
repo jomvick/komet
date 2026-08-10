@@ -821,16 +821,25 @@ fn render_parts(parts: &[MessagePart]) -> Vec<MessagePart> {
                 resolved,
                 output,
                 diff,
+                output_ref,
+                output_bytes,
+                diff_ref,
+                diff_stats,
             } => MessagePart::Tool {
                 id: id.clone(),
                 call: sanitize_tool_call(call),
                 is_error: *is_error,
                 resolved: *resolved,
-                // Output and diffs are deliberately kept (capped at fold
-                // time): unlike raw tool inputs they are the transcript's
-                // record of what happened, and the caps bound doc growth.
+                // Output summaries, diff stats, and sidecar refs are
+                // deliberately kept: unlike raw tool inputs they are the
+                // transcript's record of what happened, and the strip already
+                // bounded them (docs/chat2-sync.md A1).
                 output: output.clone(),
                 diff: diff.clone(),
+                output_ref: output_ref.clone(),
+                output_bytes: *output_bytes,
+                diff_ref: diff_ref.clone(),
+                diff_stats: diff_stats.clone(),
             },
             other => other.clone(),
         })
@@ -1256,6 +1265,16 @@ async fn drive_run(
         let skip_fold = matches!(&event, AgentEvent::SessionStarted { .. }) && !folded.is_empty();
         if !skip_fold {
             fold_event_into_parts(&mut folded, &event);
+            // A1 strip companions: the fold left only a summary in the doc;
+            // the full output/diff ride the R2 sidecar (fire-and-forget — a
+            // lost upload degrades to "full output unavailable", never blocks
+            // the doc), and the parts get their sidecar keys stamped.
+            if let Some(payload) = komet_doc::sidecar_payload(&event) {
+                komet_doc::apply_sidecar_refs(&chat_id, &mut folded);
+                if let Some(doc_host) = inner.doc_host.get() {
+                    doc_host.upload_tool_sidecar(&chat_id, payload);
+                }
+            }
         }
 
         if let AgentEvent::Done { status, .. } = &event {

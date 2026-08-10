@@ -13,3 +13,4 @@ serde_json.workspace = true
 thiserror.workspace = true
 chrono.workspace = true
 tracing.workspace = true
+similar.workspace = true

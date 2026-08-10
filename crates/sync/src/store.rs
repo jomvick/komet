@@ -30,6 +30,13 @@ const MIGRATIONS: &[&str] = &[
         command_id   TEXT PRIMARY KEY,
         processed_at INTEGER NOT NULL
      ) STRICT;",
+    // v2 — chat2 room cursor + doc epoch (docs/chat2-sync.md C2). The cursor
+    // is persisted in the SAME transaction as the snapshot bytes, so content
+    // and cursor cannot diverge (restored backups / copied devices simply
+    // redownload from their honest cursor). `epoch` marks rebuild lineage
+    // (M1/M3): 2 = thin chat2 rebuild; NULL/0 = pre-migration s2 doc.
+    "ALTER TABLE snapshots ADD COLUMN cursor INTEGER;
+     ALTER TABLE snapshots ADD COLUMN epoch INTEGER;",
 ];
 
 /// SQLite-backed store under a data directory (`{data_dir}/docs.sqlite3`).
@@ -77,6 +84,48 @@ impl DocsStore {
             params![doc_id, bytes, now_ms()],
         )?;
         Ok(())
+    }
+
+    /// Save the snapshot together with its chat2 room cursor and doc epoch —
+    /// ONE transaction, so bytes and cursor can never disagree (the C2 rule;
+    /// a divergent pair is exactly the restored-backup redownload bug).
+    pub fn save_snapshot_with_cursor(
+        &self,
+        doc_id: &str,
+        bytes: &[u8],
+        cursor: u64,
+        epoch: u32,
+    ) -> Result<(), StoreError> {
+        self.conn().execute(
+            "INSERT INTO snapshots (doc_id, bytes, saved_at, cursor, epoch) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(doc_id) DO UPDATE SET bytes = excluded.bytes, saved_at = excluded.saved_at,
+                 cursor = excluded.cursor, epoch = excluded.epoch",
+            params![doc_id, bytes, now_ms(), cursor as i64, epoch as i64],
+        )?;
+        Ok(())
+    }
+
+    /// Snapshot + chat2 cursor + epoch. Pre-migration rows (or rows written
+    /// by [`Self::save_snapshot`]) read back as `(bytes, 0, 0)`.
+    pub fn load_snapshot_with_cursor(
+        &self,
+        doc_id: &str,
+    ) -> Result<Option<(Vec<u8>, u64, u32)>, StoreError> {
+        let row = self
+            .conn()
+            .query_row(
+                "SELECT bytes, cursor, epoch FROM snapshots WHERE doc_id = ?1",
+                params![doc_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Option<i64>>(1)?.unwrap_or(0) as u64,
+                        row.get::<_, Option<i64>>(2)?.unwrap_or(0) as u32,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(row)
     }
 
     /// Delete the snapshot row for `doc_id` (destructive schema breaks: the
@@ -179,6 +228,36 @@ mod tests {
             store.load_snapshot("chat-1").unwrap().as_deref(),
             Some(&b"v2-longer-bytes"[..])
         );
+    }
+
+    #[test]
+    fn cursor_rides_the_snapshot_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DocsStore::open(dir.path()).unwrap();
+
+        // Plain saves (pre-chat2 path) read back with cursor/epoch 0.
+        store.save_snapshot("chat-1", b"v1").unwrap();
+        assert_eq!(
+            store.load_snapshot_with_cursor("chat-1").unwrap(),
+            Some((b"v1".to_vec(), 0, 0))
+        );
+        // Cursor and bytes land together; a re-save moves both.
+        store
+            .save_snapshot_with_cursor("chat-1", b"v2", 41, 2)
+            .unwrap();
+        assert_eq!(
+            store.load_snapshot_with_cursor("chat-1").unwrap(),
+            Some((b"v2".to_vec(), 41, 2))
+        );
+        // Plain load still works for cursor-written rows.
+        assert_eq!(
+            store.load_snapshot("chat-1").unwrap().as_deref(),
+            Some(&b"v2"[..])
+        );
+        // A plain save (legacy caller) clears nothing — cursor persists…
+        store.save_snapshot("chat-1", b"v3").unwrap();
+        let (bytes, cursor, epoch) = store.load_snapshot_with_cursor("chat-1").unwrap().unwrap();
+        assert_eq!((bytes.as_slice(), cursor, epoch), (&b"v3"[..], 41, 2));
     }
 
     #[test]

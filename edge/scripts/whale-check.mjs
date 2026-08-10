@@ -82,6 +82,47 @@ const tailRes = await fetch(`${base}/tail/${chatId}?token=${token}`);
 const tailBody = tailRes.status === 200 ? await tailRes.json() : await tailRes.text();
 log(`tail: ${tailRes.status}${tailRes.status !== 200 ? " " + String(tailBody).slice(0, 200) : ` (${tailBody.totalMessages} messages)`}`);
 
+// ── fold backpressure: a >2MB log crosses COMPACT_LOG_BYTES on the same
+//    flush that wrote its chunked rows, so foldLog must have collapsed the
+//    log into the snapshot (force-trimming shallow via TRIM_FORCE_BYTES on a
+//    chat room) and reset the byte accounting — then the room must keep
+//    accepting, persisting, and serving writes on top of the folded doc. ────
+const EXTRA = 40;
+for (let j = 0; j < EXTRA; j++) {
+  const m = messages.insertContainer(messages.length, new LoroMap());
+  m.set("id", `m${i + j}`);
+  m.set("role", j % 2 ? "assistant" : "user");
+  m.set("createdAt", 1754400000000 + i + j);
+  m.set("deviceId", "whale-dev");
+  const parts = m.setContainer("parts", new LoroList());
+  const part = parts.insertContainer(0, new LoroMap());
+  part.set("id", `p${i + j}`);
+  part.set("kind", "text");
+  part.setContainer("text", new LoroText()).insert(0, `post-fold message ${j}`);
+  hostDoc.commit(); // one update per message: exercises the row path, not another whale
+}
+await sleep(1500); // let the wave relay
+const s3 = await stats(); // /stats flushes, so the wave's rows land durably now
+log(`stats after post-fold wave:  ${s3.status} ${JSON.stringify(s3.body)}`);
+
+// A fresh reader joining AFTER the fold+trim reads the shallow-aware §3.1
+// backfill (the bug-#2 path: force-trimmed whale rooms used to serve fresh
+// readers an EMPTY transcript with zero errors).
+const reader2 = new LoroWebsocketClient({ url: `${wsBase}/session/${chatId}/ws?token=${token}` });
+await reader2.waitConnected();
+const reader2Adaptor = new LoroAdaptor();
+await reader2.join({ roomId: chatId, crdtAdaptor: reader2Adaptor });
+const reader2Doc = reader2Adaptor.getDoc();
+const t1 = Date.now();
+while (Date.now() - t1 < 20000) {
+  if (reader2Doc.getList("messages").length >= i + EXTRA) break;
+  await sleep(100);
+}
+log(`post-fold reader backfill: ${reader2Doc.getList("messages").length}/${i + EXTRA} messages`);
+
+const tail2Res = await fetch(`${base}/tail/${chatId}?token=${token}`);
+const tail2Body = tail2Res.status === 200 ? await tail2Res.json() : await tail2Res.text();
+
 // ── verdict ───────────────────────────────────────────────────────────────
 let failures = 0;
 const check = (name, cond, detail = "") => {
@@ -102,5 +143,40 @@ check(
   "/tail materializes",
   tailRes.status === 200 && tailBody.totalMessages === i,
   `status=${tailRes.status}`
+);
+
+// Fold backpressure. The byte-budget assertions only hold when the payload
+// actually crosses COMPACT_LOG_BYTES (2MB) — the default 3MB does.
+if (payloadMB * 1024 * 1024 > 2 * 1024 * 1024) {
+  check(
+    "fold collapsed the chunked log into the snapshot",
+    s2.status === 200 && s2.body.updateRows === 0 && s2.body.snapshotBytes > 0,
+    s2.status === 200 ? `updateRows=${s2.body.updateRows}, snapshotBytes=${s2.body.snapshotBytes}` : ""
+  );
+  check(
+    "fold reset the log byte accounting",
+    s2.status === 200 && s2.body.updateLogBytes === 0,
+    s2.status === 200 ? `updateLogBytes=${s2.body.updateLogBytes}` : ""
+  );
+  check(
+    "force-trim engaged on the whale room",
+    s2.status === 200 && !!s2.body.lastTrimAt,
+    s2.status === 200 ? `lastTrimAt=${s2.body.lastTrimAt}` : ""
+  );
+}
+check(
+  "post-fold writes persist as fresh log rows",
+  s3.status === 200 && s3.body.updateRows > 0,
+  s3.status === 200 ? `updateRows=${s3.body.updateRows}` : `status=${s3.status}`
+);
+check("first reader stayed live across the fold", readerDoc.getList("messages").length === i + EXTRA);
+check(
+  "fresh post-fold reader gets the full transcript (shallow-aware backfill)",
+  reader2Doc.getList("messages").length === i + EXTRA
+);
+check(
+  "/tail reflects the post-fold wave",
+  tail2Res.status === 200 && tail2Body.totalMessages === i + EXTRA,
+  `status=${tail2Res.status}${tail2Res.status === 200 ? `, totalMessages=${tail2Body.totalMessages}` : ""}`
 );
 process.exit(failures === 0 ? 0 : 1);

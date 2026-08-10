@@ -264,6 +264,13 @@ struct ReadAttachmentChunkParams {
     offset: u64,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FetchToolBlobParams {
+    /// Doc-resident sidecar ref (`{chatId}/{partId}` or `…​.diff`).
+    blob_ref: String,
+}
+
 /// The Mutate surface (feature-inventory §2 DataRpc), tagged by `op`.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "camelCase")]
@@ -1338,6 +1345,15 @@ impl RpcService for EngineRpc {
                     .read_chunk(&p.path, p.offset, &roots)
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&chunk)
+            }
+            methods::FETCH_TOOL_BLOB => {
+                let p: FetchToolBlobParams = parse_params(params)?;
+                let text = self
+                    .doc_host
+                    .fetch_tool_blob(&p.blob_ref)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "text": text }))
             }
             other => Err(RpcError::UnknownMethod(other.to_string())),
         }

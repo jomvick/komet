@@ -1173,6 +1173,7 @@ dependencies = [
  "loro",
  "serde",
  "serde_json",
+ "similar",
  "thiserror 2.0.19",
  "tracing",
 ]
@@ -1268,6 +1269,7 @@ dependencies = [
  "futures",
  "loro",
  "loro-protocol",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",

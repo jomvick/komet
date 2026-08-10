@@ -9,26 +9,77 @@ use komet_proto::{AgentEvent, ToolCall, ToolDiff, UserInputQuestion};
 
 use crate::constants::MSG_INLINE_MAX;
 
-/// Byte cap for tool output persisted into the doc. Deliberately tighter than
-/// the harness-side cap: docs sync to every device and reload with the
-/// session, so this bounds what long tool-heavy sessions cost at load time.
-pub const TOOL_OUTPUT_DOC_CAP: usize = 4 * 1024;
+/// Char cap for the tool-output SUMMARY persisted into the doc: first
+/// non-empty line, nothing more. The per-part 4KB cap (c951c3e) bounded each
+/// part but not the session — chat 1b65e93d measured 917KB (85%) of a 1MB doc
+/// in capped outputs across 426 tool parts (docs/chat2-sync.md). Full outputs
+/// live in the R2 sidecar behind `output_ref`; t3code ships an 84-char
+/// summary, so 160 is generous.
+pub const TOOL_OUTPUT_SUMMARY_MAX: usize = 160;
 
-/// Byte cap for each side of an inline diff persisted into the doc.
-pub const TOOL_DIFF_DOC_CAP: usize = 16 * 1024;
+/// One line of the doc-resident summary for a tool output: the first
+/// non-empty line, capped at [`TOOL_OUTPUT_SUMMARY_MAX`] chars. `None` for
+/// blank output. The `…` marker means "there is more in the sidecar".
+pub fn summarize_tool_output(text: &str) -> Option<String> {
+    let line = text.lines().find(|l| !l.trim().is_empty())?;
+    let line = line.trim_end();
+    let mut chars = 0usize;
+    let mut end = line.len();
+    for (i, _) in line.char_indices() {
+        if chars == TOOL_OUTPUT_SUMMARY_MAX {
+            end = i;
+            break;
+        }
+        chars += 1;
+    }
+    // "…" means content beyond this line exists in the sidecar — measure the
+    // REMAINDER after the summarized line, not total length (leading blank
+    // lines used to false-positive the marker).
+    let offset = line.as_ptr() as usize - text.as_ptr() as usize;
+    let rest = &text[offset + line.len()..];
+    let cut = end < line.len() || !rest.trim().is_empty();
+    let mut out = line[..end].to_owned();
+    if cut {
+        out.push('…');
+    }
+    Some(out)
+}
 
-/// Truncate on a char boundary, marking the cut so the UI can say so.
-fn cap_doc_text(text: &str, cap: usize) -> String {
-    if text.len() <= cap {
-        return text.to_owned();
+/// Per-file diff stats persisted in place of inline diff text (t3's shape).
+/// The inline diff was the bigger bomb than outputs — 32KB/edit, unexercised
+/// only because the claude harness emits none. Full diff text lives in the
+/// sidecar behind `diff_ref`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolDiffStat {
+    pub path: String,
+    pub additions: u64,
+    pub deletions: u64,
+}
+
+/// Line-level add/delete counts for one file's diff.
+pub fn diff_stat(diff: &ToolDiff) -> ToolDiffStat {
+    let (additions, deletions) = match &diff.old_text {
+        None => (diff.new_text.lines().count() as u64, 0),
+        Some(old) => {
+            let text_diff = similar::TextDiff::from_lines(old.as_str(), diff.new_text.as_str());
+            let mut additions = 0u64;
+            let mut deletions = 0u64;
+            for change in text_diff.iter_all_changes() {
+                match change.tag() {
+                    similar::ChangeTag::Insert => additions += 1,
+                    similar::ChangeTag::Delete => deletions += 1,
+                    similar::ChangeTag::Equal => {}
+                }
+            }
+            (additions, deletions)
+        }
+    };
+    ToolDiffStat {
+        path: diff.path.clone(),
+        additions,
+        deletions,
     }
-    let mut end = cap;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    let mut out = text[..end].to_owned();
-    out.push_str("\n… [truncated]");
-    out
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,14 +107,29 @@ pub enum MessagePart {
         /// True once a ToolResult arrived.
         #[serde(default)]
         resolved: bool,
-        /// Tool output text, capped at [`TOOL_OUTPUT_DOC_CAP`] by the fold.
-        /// Additive: absent on old entries and on harnesses that don't
-        /// surface output (claude/codex today).
+        /// One-line tool output summary ([`summarize_tool_output`]). Old
+        /// entries (pre-strip) still carry up to 4KB here; old app versions
+        /// render this field either way, so the strip is invisible to them.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output: Option<String>,
-        /// Inline file diff for edit-shaped tools, capped by the fold.
+        /// Inline file diff — written by pre-strip app versions only; new
+        /// folds persist [`Self::Tool::diff_stats`] + `diff_ref` instead.
+        /// Kept so old docs render their diffs.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         diff: Option<ToolDiff>,
+        /// Sidecar key (`{chatId}/{partId}`) of the full output — additive;
+        /// stamped by [`apply_sidecar_refs`] (the fold is chat-agnostic).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_ref: Option<String>,
+        /// Full-output byte length, so the UI can say "Show full output (12 KB)".
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_bytes: Option<u64>,
+        /// Sidecar key (`{chatId}/{partId}.diff`) of the full diff JSON.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        diff_ref: Option<String>,
+        /// Per-file diff stats (additive replacement for inline `diff`).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        diff_stats: Option<Vec<ToolDiffStat>>,
     },
     #[serde(rename_all = "camelCase")]
     Input {
@@ -93,13 +159,20 @@ impl MessagePart {
         match self {
             MessagePart::Text { text, .. } => text.len(),
             MessagePart::Tool {
-                call, output, diff, ..
+                call,
+                output,
+                diff,
+                diff_stats,
+                ..
             } => {
                 serde_json::to_vec(call).map_or(0, |v| v.len())
                     + output.as_ref().map_or(0, String::len)
                     + diff
                         .as_ref()
                         .map_or(0, |d| serde_json::to_vec(d).map_or(0, |v| v.len()))
+                    + diff_stats
+                        .as_ref()
+                        .map_or(0, |s| serde_json::to_vec(s).map_or(0, |v| v.len()))
             }
             MessagePart::Input { questions, .. } => {
                 serde_json::to_vec(questions).map_or(0, |v| v.len())
@@ -157,6 +230,10 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                     resolved: false,
                     output: None,
                     diff: None,
+                    output_ref: None,
+                    output_bytes: None,
+                    diff_ref: None,
+                    diff_stats: None,
                 });
             }
         }
@@ -173,23 +250,26 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                     resolved,
                     output: out_slot,
                     diff: diff_slot,
+                    output_bytes,
+                    diff_stats,
                     ..
                 } = p
                     && pid == id
                 {
                     *e = *is_error;
                     *resolved = true;
-                    *out_slot = output
+                    // The strip (docs/chat2-sync.md A1): the doc gets a
+                    // one-line summary + byte count; the full text rides the
+                    // sidecar (the host uploads it from the same event —
+                    // `sidecar_payload`). Inline diffs die entirely: stats
+                    // only, never text.
+                    *out_slot = output.as_deref().and_then(summarize_tool_output);
+                    *output_bytes = output
                         .as_ref()
-                        .map(|o| cap_doc_text(o, TOOL_OUTPUT_DOC_CAP));
-                    *diff_slot = diff.as_ref().map(|d| ToolDiff {
-                        path: d.path.clone(),
-                        old_text: d
-                            .old_text
-                            .as_ref()
-                            .map(|t| cap_doc_text(t, TOOL_DIFF_DOC_CAP)),
-                        new_text: cap_doc_text(&d.new_text, TOOL_DIFF_DOC_CAP),
-                    });
+                        .filter(|o| !o.trim().is_empty())
+                        .map(|o| o.len() as u64);
+                    *diff_slot = None;
+                    *diff_stats = diff.as_ref().map(|d| vec![diff_stat(d)]);
                 }
             }
         }
@@ -242,6 +322,62 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
         | AgentEvent::Usage { .. }
         | AgentEvent::AvailableCommands { .. } => {}
     }
+}
+
+/// Stamp sidecar keys onto resolved tool parts that have sidecar content.
+///
+/// Separate from the fold because the fold is chat-agnostic and pure; the
+/// caller (who knows the chat id) runs this right after each fold step, before
+/// the parts hit the doc. Idempotent. Key shape `{chatId}/{partId}` (+
+/// `.diff`) matches the edge's `/blob/{chatId}/{partId}` route.
+pub fn apply_sidecar_refs(chat_id: &str, parts: &mut [MessagePart]) {
+    for part in parts.iter_mut() {
+        if let MessagePart::Tool {
+            id,
+            resolved: true,
+            output_ref,
+            output_bytes,
+            diff_ref,
+            diff_stats,
+            ..
+        } = part
+        {
+            if output_ref.is_none() && output_bytes.is_some() {
+                *output_ref = Some(format!("{chat_id}/{id}"));
+            }
+            if diff_ref.is_none() && diff_stats.is_some() {
+                *diff_ref = Some(format!("{chat_id}/{id}.diff"));
+            }
+        }
+    }
+}
+
+/// What a [`AgentEvent::ToolResult`] owes the sidecar: the full output text
+/// and/or the full diff (as JSON), keyed by part id. `None` when the event
+/// carries nothing worth uploading.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SidecarPayload {
+    pub part_id: String,
+    pub output: Option<String>,
+    pub diff: Option<ToolDiff>,
+}
+
+pub fn sidecar_payload(event: &AgentEvent) -> Option<SidecarPayload> {
+    let AgentEvent::ToolResult {
+        id, output, diff, ..
+    } = event
+    else {
+        return None;
+    };
+    let output = output.clone().filter(|o| !o.trim().is_empty());
+    if output.is_none() && diff.is_none() {
+        return None;
+    }
+    Some(SidecarPayload {
+        part_id: id.clone(),
+        output,
+        diff: diff.clone(),
+    })
 }
 
 /// Render-only privacy policy — strip heavy/sensitive tool inputs before a call enters the doc.
@@ -470,6 +606,10 @@ mod tests {
                 resolved: true,
                 output: None,
                 diff: None,
+                output_ref: None,
+                output_bytes: None,
+                diff_ref: None,
+                diff_stats: None,
             },
         ];
         let chunks = split_parts(&parts);
@@ -497,5 +637,176 @@ mod tests {
     #[test]
     fn continuation_ids_are_deterministic() {
         assert_eq!(continuation_id("m1", 1), "m1#c1");
+    }
+
+    // ── A1 strip (docs/chat2-sync.md) ───────────────────────────────────────
+
+    #[test]
+    fn summarize_takes_first_nonempty_line_and_marks_the_cut() {
+        assert_eq!(summarize_tool_output(""), None);
+        assert_eq!(summarize_tool_output("  \n\t\n"), None);
+        assert_eq!(summarize_tool_output("one line"), Some("one line".into()));
+        assert_eq!(
+            summarize_tool_output("\n\nfirst real\nsecond"),
+            Some("first real…".into())
+        );
+        // Leading blank lines alone are NOT "more content" — no false "…".
+        assert_eq!(
+            summarize_tool_output("\n\nonly line"),
+            Some("only line".into())
+        );
+        assert_eq!(
+            summarize_tool_output("only line\n\n  \n"),
+            Some("only line".into())
+        );
+        let long = "x".repeat(TOOL_OUTPUT_SUMMARY_MAX + 40);
+        let summary = summarize_tool_output(&long).unwrap();
+        assert_eq!(summary.chars().count(), TOOL_OUTPUT_SUMMARY_MAX + 1);
+        assert!(summary.ends_with('…'));
+        // Char-boundary safety on multibyte input.
+        let wide = "é".repeat(TOOL_OUTPUT_SUMMARY_MAX + 5);
+        let summary = summarize_tool_output(&wide).unwrap();
+        assert_eq!(summary.chars().count(), TOOL_OUTPUT_SUMMARY_MAX + 1);
+    }
+
+    #[test]
+    fn diff_stat_counts_line_changes() {
+        let stat = diff_stat(&ToolDiff {
+            path: "/w/a.rs".into(),
+            old_text: Some("a\nb\nc\n".into()),
+            new_text: "a\nB\nc\nd\n".into(),
+        });
+        assert_eq!(stat.path, "/w/a.rs");
+        assert_eq!(stat.additions, 2); // B + d
+        assert_eq!(stat.deletions, 1); // b
+        // New file: every line is an addition.
+        let stat = diff_stat(&ToolDiff {
+            path: "/w/new.rs".into(),
+            old_text: None,
+            new_text: "one\ntwo\n".into(),
+        });
+        assert_eq!((stat.additions, stat.deletions), (2, 0));
+    }
+
+    #[test]
+    fn fold_strips_output_to_summary_and_diff_to_stats() {
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ToolCall {
+                id: "t".into(),
+                call: ToolCall::Exec {
+                    command: "cargo test".into(),
+                },
+            },
+        );
+        let full = "running 42 tests\n".repeat(300); // ~5KB, was 4KB inline pre-strip
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ToolResult {
+                id: "t".into(),
+                is_error: false,
+                output: Some(full.clone()),
+                diff: Some(ToolDiff {
+                    path: "/w/a.rs".into(),
+                    old_text: Some("a\n".into()),
+                    new_text: "b\n".into(),
+                }),
+            },
+        );
+        match &parts[0] {
+            MessagePart::Tool {
+                output,
+                output_bytes,
+                diff,
+                diff_stats,
+                ..
+            } => {
+                assert_eq!(output.as_deref(), Some("running 42 tests…"));
+                assert_eq!(*output_bytes, Some(full.len() as u64));
+                assert!(diff.is_none(), "inline diff text must not enter the doc");
+                let stats = diff_stats.as_ref().unwrap();
+                assert_eq!(stats.len(), 1);
+                assert_eq!((stats[0].additions, stats[0].deletions), (1, 1));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sidecar_refs_stamp_once_and_only_where_content_exists() {
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ToolCall {
+                id: "t1".into(),
+                call: ToolCall::Exec {
+                    command: "ls".into(),
+                },
+            },
+        );
+        // Unresolved: no refs yet.
+        apply_sidecar_refs("chat-9", &mut parts);
+        assert!(matches!(
+            &parts[0],
+            MessagePart::Tool {
+                output_ref: None,
+                diff_ref: None,
+                ..
+            }
+        ));
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ToolResult {
+                id: "t1".into(),
+                is_error: false,
+                output: Some("hello".into()),
+                diff: Some(ToolDiff {
+                    path: "/w/a".into(),
+                    old_text: None,
+                    new_text: "x\n".into(),
+                }),
+            },
+        );
+        apply_sidecar_refs("chat-9", &mut parts);
+        apply_sidecar_refs("chat-9", &mut parts); // idempotent
+        match &parts[0] {
+            MessagePart::Tool {
+                output_ref,
+                diff_ref,
+                ..
+            } => {
+                assert_eq!(output_ref.as_deref(), Some("chat-9/t1"));
+                assert_eq!(diff_ref.as_deref(), Some("chat-9/t1.diff"));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sidecar_payload_carries_full_texts() {
+        assert_eq!(
+            sidecar_payload(&AgentEvent::TextDelta { text: "x".into() }),
+            None
+        );
+        assert_eq!(
+            sidecar_payload(&AgentEvent::ToolResult {
+                id: "t".into(),
+                is_error: false,
+                output: Some("   \n".into()),
+                diff: None,
+            }),
+            None,
+            "blank output uploads nothing"
+        );
+        let payload = sidecar_payload(&AgentEvent::ToolResult {
+            id: "t".into(),
+            is_error: true,
+            output: Some("full output".into()),
+            diff: None,
+        })
+        .unwrap();
+        assert_eq!(payload.part_id, "t");
+        assert_eq!(payload.output.as_deref(), Some("full output"));
     }
 }
