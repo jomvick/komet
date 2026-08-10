@@ -4315,20 +4315,16 @@ impl Composer {
             .read(cx)
             .selected_chat_row()
             .and_then(|c| c.cwd.clone());
-        // The SPACE fixes the new chat's device + base folder — this is the
-        // behavioral core of spaces: sessions are minted onto the space's
-        // device, not necessarily this one.
+        // The PROJECT fixes the new chat's device + base folder — sessions are
+        // minted onto the project's device, not necessarily this one. With no
+        // project ("Don't work in a project") the composer's device pick is
+        // the host and the session runs from `~` there.
         let space = self.state.read(cx).selected_space_row().cloned();
-        if is_new && space.is_none() {
-            self.failure = Some("Add a space first".into());
-            cx.notify();
-            return;
-        }
         let local_device_id = self.state.read(cx).local_device_id.clone();
+        let target_device_id = self.state.read(cx).effective_device_id();
         let device_id = if is_new {
-            space
-                .as_ref()
-                .map(|s| s.device_id.clone())
+            target_device_id
+                .clone()
                 .unwrap_or_else(|| "local".to_string())
         } else {
             self.state
@@ -4339,11 +4335,10 @@ impl Composer {
                 .unwrap_or_else(|| "local".to_string())
         };
         // Uploads/read-backs target the chat's HOST device (forwardable RPCs);
-        // for a new chat that's the space's device (None when it's local).
+        // for a new chat that's the target device (None when it's local).
         let host_device_id = if is_new {
-            space
-                .as_ref()
-                .map(|s| s.device_id.clone())
+            target_device_id
+                .clone()
                 .filter(|id| local_device_id.as_deref() != Some(id.as_str()))
         } else {
             self.state
@@ -4424,7 +4419,9 @@ impl Composer {
                 // picked base ref (CreateWorktree on send, targeted at the
                 // space's device; the RPC relay-forwards).
                 let mut cwd = if is_new {
-                    space_path.clone()
+                    // Project-less sessions run from the host's home dir —
+                    // "~" is expanded on the host when the run spawns.
+                    space_path.clone().or_else(|| Some("~".to_string()))
                 } else {
                     existing_cwd
                 }
@@ -4474,15 +4471,31 @@ impl Composer {
                 }
 
                 // Best-effort Mutate createChat with the picked config: the
-                // engine resolves device + cwd from the SPACE row (idempotent;
-                // the doc host would materialize the chat on first command
-                // anyway, so failures are non-fatal).
-                if is_new && let Some(space_id) = &space_id {
+                // engine resolves device + cwd from the PROJECT row when one
+                // is picked; project-less chats name the host device outright
+                // (idempotent; the doc host would materialize the chat on
+                // first command anyway, so failures are non-fatal).
+                if is_new {
                     let mut mutate = serde_json::json!({
                         "op": "createChat",
                         "chatId": chat_id,
-                        "spaceId": space_id,
                     });
+                    if let Some(object) = mutate.as_object_mut() {
+                        match &space_id {
+                            Some(space_id) => {
+                                object.insert(
+                                    "spaceId".into(),
+                                    serde_json::Value::String(space_id.clone()),
+                                );
+                            }
+                            None => {
+                                object.insert(
+                                    "deviceId".into(),
+                                    serde_json::Value::String(device_id.clone()),
+                                );
+                            }
+                        }
+                    }
                     if let Some(object) = mutate.as_object_mut() {
                         if let Some(worktree_cwd) = &worktree_cwd {
                             object.insert(

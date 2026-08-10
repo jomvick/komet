@@ -276,10 +276,13 @@ pub enum PickerKind {
     Checkout,
     HarnessModel,
     Traits,
-    /// New-session canvas only: which space the session mints into. A pick
-    /// re-keys everything space-derived (refs, harness/model catalogs) via
+    /// New-session canvas only: which project the session mints into. A pick
+    /// re-keys everything project-derived (refs, harness/model catalogs) via
     /// the state observer.
     Space,
+    /// New-session canvas only: the device project-less sessions run on (a
+    /// project pick implies its own host and overrides this).
+    Device,
 }
 
 pub struct Pickers {
@@ -416,6 +419,24 @@ impl Pickers {
             .as_deref()
             .map(ComposerDefaults::load)
             .unwrap_or_default();
+        // Restore the last device/project picks (the canvas's "defaults to
+        // last selected" rule). Vanished rows heal in `apply_spaces`; a
+        // remembered opt-out sticks.
+        {
+            let device = defaults.device.clone();
+            let project = defaults.project.clone();
+            let no_project = defaults.no_project;
+            state.update(cx, |s, _| {
+                if s.selected_device.is_none() {
+                    s.selected_device = device;
+                }
+                if no_project {
+                    s.no_project = true;
+                } else if s.selected_space.is_none() {
+                    s.selected_space = project;
+                }
+            });
+        }
         let draft_owner = state.read(cx).selected_chat.clone();
         let space_owner = state.read(cx).selected_space.clone();
         Self {
@@ -673,6 +694,7 @@ impl Pickers {
             PickerKind::Branch => self.selected_ref_index(cx),
             PickerKind::HarnessModel | PickerKind::Traits => self.selected_model_index(cx),
             PickerKind::Space => self.selected_space_index(cx),
+            PickerKind::Device => self.selected_device_index(cx),
         };
         if kind == PickerKind::HarnessModel {
             self.model_scroll.set_offset(gpui::Point::default());
@@ -693,7 +715,7 @@ impl Pickers {
             PickerKind::Space => {
                 let handle = self.search.read(cx).focus_handle(cx);
                 self.search.update(cx, |input, cx| {
-                    input.set_placeholder("Search spaces…", cx);
+                    input.set_placeholder("Search projects…", cx);
                 });
                 window.focus(&handle, cx);
             }
@@ -711,8 +733,8 @@ impl Pickers {
                 self.ensure_harnesses(true, cx);
                 self.prefetch_models(cx);
             }
-            // Spaces are already synced state — nothing to load.
-            PickerKind::Space => {}
+            // Projects and devices are already synced state — nothing to load.
+            PickerKind::Space | PickerKind::Device => {}
         }
         cx.notify();
     }
@@ -923,10 +945,10 @@ impl Pickers {
     // ---- selections ----
 
     fn pick_ref(&mut self, row: RepoRef, cx: &mut Context<Self>) {
-        // Existing session: the pick SWITCHES the session's checkout (the
-        // t3code mid-session `switchRef`) instead of updating the draft.
+        // Refs are fixed at creation: an existing session can never move
+        // (wing's rule — the footer renders read-only labels there, so this
+        // is a belt-and-braces guard).
         if self.state.read(cx).selected_chat_row().is_some() {
-            self.switch_session_ref(row, cx);
             return;
         }
         if row.worktree_path.is_some() {
@@ -991,97 +1013,6 @@ impl Pickers {
                     Ok(_) => {
                         pickers.config.branch = Some(ref_name);
                         pickers.animate_close(cx);
-                        pickers.ensure_refs(true, cx);
-                    }
-                    Err(err) => pickers.switch_error = Some(err.to_string()),
-                }
-                cx.notify();
-            })
-            .ok();
-        }));
-        cx.notify();
-    }
-
-    /// Mid-session ref switch, two shapes (both t3code):
-    ///
-    /// - The picked ref already lives in ANOTHER worktree → RETARGET the
-    ///   session onto that worktree (`reuseExistingWorktree`): a `setChatCwd`
-    ///   + `setChatBranch` mutate, no git. Resume is cwd-scoped, so the next
-    ///   run there starts a fresh harness conversation — the transcript
-    ///   itself carries on.
-    /// - Otherwise → `git checkout` in the SESSION's own cwd (`SwitchRef`,
-    ///   relay-forwarded to the host device). The host's HEAD watcher
-    ///   reconciles `chat.branch` to every device. Errors (dirty tree, ref
-    ///   held by the MAIN checkout) keep the popover open with git's message.
-    fn switch_session_ref(&mut self, row: RepoRef, cx: &mut Context<Self>) {
-        if self.switching.is_some() {
-            return; // one switch at a time
-        }
-        let Some(chat) = self.state.read(cx).selected_chat_row().cloned() else {
-            return;
-        };
-        let Some(cwd) = chat.cwd.clone() else {
-            return;
-        };
-        let Some(engine) = self.engine(cx) else {
-            return;
-        };
-        if row.worktree_path.as_deref() == Some(cwd.as_str()) {
-            // Already this session's worktree — nothing to do.
-            self.animate_close(cx);
-            cx.notify();
-            return;
-        }
-        let local = self.state.read(cx).local_device_id.clone();
-        self.switch_error = None;
-        self.switching = Some(row.name.clone());
-        let ref_name = row.name.clone();
-        let retarget = row.worktree_path.clone();
-        self.switch_task = Some(cx.spawn(async move |this, cx| {
-            let result = match retarget {
-                // Reuse the ref's existing worktree: move the session there.
-                Some(path) => {
-                    let cwd_mutate = serde_json::json!({
-                        "op": "setChatCwd",
-                        "chatId": chat.id,
-                        "cwd": path,
-                    });
-                    let branch_mutate = serde_json::json!({
-                        "op": "setChatBranch",
-                        "chatId": chat.id,
-                        "branch": ref_name,
-                    });
-                    match engine.client().call(methods::MUTATE, cwd_mutate).await {
-                        Ok(_) => engine.client().call(methods::MUTATE, branch_mutate).await,
-                        Err(err) => Err(err),
-                    }
-                }
-                // Plain ref: checkout in place on the chat's HOST device.
-                None => {
-                    let mut params = serde_json::Map::new();
-                    params.insert("repoPath".into(), serde_json::Value::String(cwd));
-                    params.insert(
-                        "refName".into(),
-                        serde_json::Value::String(ref_name.clone()),
-                    );
-                    if local.as_deref() != Some(chat.device_id.as_str()) {
-                        params.insert(
-                            "targetDeviceId".into(),
-                            serde_json::Value::String(chat.device_id.clone()),
-                        );
-                    }
-                    engine
-                        .client()
-                        .call(methods::SWITCH_REF, serde_json::Value::Object(params))
-                        .await
-                }
-            };
-            this.update(cx, |pickers, cx| {
-                pickers.switching = None;
-                match result {
-                    Ok(_) => {
-                        pickers.animate_close(cx);
-                        // Checkout state changed — refresh tags/current.
                         pickers.ensure_refs(true, cx);
                     }
                     Err(err) => pickers.switch_error = Some(err.to_string()),
@@ -1442,24 +1373,152 @@ impl Pickers {
             .unwrap_or(0)
     }
 
-    /// Re-home the canvas onto another space. The state observer does the
+    /// Re-home the canvas onto another project. The state observer does the
     /// heavy lifting: branch draft, ref cache, and the per-device
-    /// harness/model catalogs all invalidate on the space change.
+    /// harness/model catalogs all invalidate on the project change.
     fn pick_space(&mut self, space_id: String, cx: &mut Context<Self>) {
         self.state
             .update(cx, |s, cx| s.select_space(Some(space_id), cx));
+        self.remember_target(cx);
         self.close(cx);
     }
 
-    /// The space popover: search + one row per space (name, muted `@ device`
-    /// tag, check on the current pick).
+    /// "Don't work in a project": the canvas mints project-less sessions
+    /// (cwd `~` on the picked device).
+    fn pick_no_project(&mut self, cx: &mut Context<Self>) {
+        self.state.update(cx, |s, cx| s.select_space(None, cx));
+        self.remember_target(cx);
+        self.close(cx);
+    }
+
+    fn pick_device(&mut self, device_id: String, cx: &mut Context<Self>) {
+        self.state.update(cx, |s, cx| s.select_device(device_id, cx));
+        self.remember_target(cx);
+        self.close(cx);
+    }
+
+    /// Persist the device/project picks — the "last selected" defaults the
+    /// next boot's canvas restores.
+    fn remember_target(&mut self, cx: &App) {
+        {
+            let state = self.state.read(cx);
+            self.defaults.device = state
+                .selected_device
+                .clone()
+                .or_else(|| state.local_device_id.clone());
+            self.defaults.project = state.selected_space.clone();
+            self.defaults.no_project = state.no_project;
+        }
+        if let Some(dir) = &self.data_dir {
+            if let Err(err) = self.defaults.save(dir) {
+                tracing::warn!(error = %err, "composer-defaults save failed");
+            }
+        }
+    }
+
+    /// Devices in picker order: this device first, then by name.
+    fn device_rows(&self, cx: &App) -> Vec<komet_proto::Device> {
+        let state = self.state.read(cx);
+        let local = state.local_device_id.clone();
+        let mut devices: Vec<komet_proto::Device> = state.devices.clone();
+        devices.sort_by_key(|d| {
+            (
+                local.as_deref() != Some(d.id.as_str()),
+                d.name.to_lowercase(),
+                d.id.clone(),
+            )
+        });
+        devices
+    }
+
+    fn selected_device_index(&self, cx: &App) -> usize {
+        let effective = self.state.read(cx).effective_device_id();
+        self.device_rows(cx)
+            .iter()
+            .position(|d| Some(d.id.as_str()) == effective.as_deref())
+            .unwrap_or(0)
+    }
+
+    /// The device popover: one row per device (name, muted "offline" tag,
+    /// check on the canvas's effective device).
+    fn render_device_popover(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::of(cx).clone();
+        let now = chrono::Utc::now();
+        let rows = self.device_rows(cx);
+        let (effective, local, online): (Option<String>, Option<String>, Vec<bool>) = {
+            let state = self.state.read(cx);
+            (
+                state.effective_device_id(),
+                state.local_device_id.clone(),
+                rows.iter()
+                    .map(|d| state.device_online(&d.id, now))
+                    .collect(),
+            )
+        };
+        let active = self.active;
+        let body: AnyElement = if rows.is_empty() {
+            div()
+                .p(px(Theme::SPACE_SM))
+                .text_size(px(12.0))
+                .text_color(theme.text_faint)
+                .child(SharedString::from("No devices yet."))
+                .into_any_element()
+        } else {
+            div()
+                .id("device-list")
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .max_h(px(224.0))
+                .overflow_y_scroll()
+                .children(rows.into_iter().zip(online).enumerate().map(
+                    |(ix, (device, online))| {
+                        let is_local = local.as_deref() == Some(device.id.as_str());
+                        let label: SharedString = if is_local {
+                            format!("{} (this device)", device.name).into()
+                        } else {
+                            device.name.clone().into()
+                        };
+                        let is_selected = effective.as_deref() == Some(device.id.as_str());
+                        let pick_id = device.id.clone();
+                        popover::menu_row_nav(
+                            &theme,
+                            is_selected,
+                            ix == active,
+                            format!("device-row-{ix}"),
+                        )
+                        .id(("device-row", ix))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.pick_device(pick_id.clone(), cx);
+                        }))
+                        .child(div().flex_1().min_w_0().truncate().child(label))
+                        .when(!online, |el| {
+                            el.child(
+                                div()
+                                    .flex_none()
+                                    .text_size(px(10.0))
+                                    .text_color(theme.warning.opacity(0.8))
+                                    .child(SharedString::from("offline")),
+                            )
+                        })
+                    },
+                ))
+                .into_any_element()
+        };
+        div().flex().flex_col().child(body).into_any_element()
+    }
+
+    /// The project popover: search + one row per project (name, muted
+    /// `@ device` tag, check on the current pick), then "New project…" and
+    /// "Don't work in a project" action rows.
     fn render_space_popover(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let rows = self.filtered_space_rows(cx);
-        let (selected, device_names): (Option<String>, Vec<Option<String>>) = {
+        let (selected, no_project, device_names): (Option<String>, bool, Vec<Option<String>>) = {
             let state = self.state.read(cx);
             (
-                state.selected_space.clone(),
+                state.selected_space_row().map(|s| s.id.clone()),
+                state.no_project,
                 rows.iter()
                     .map(|space| state.device_name(&space.device_id).map(str::to_string))
                     .collect(),
@@ -1471,7 +1530,7 @@ impl Pickers {
                 .p(px(Theme::SPACE_SM))
                 .text_size(px(12.0))
                 .text_color(theme.text_faint)
-                .child(SharedString::from("No spaces match."))
+                .child(SharedString::from("No projects match."))
                 .into_any_element()
         } else {
             div()
@@ -1510,11 +1569,50 @@ impl Pickers {
                 ))
                 .into_any_element()
         };
+        // Action rows under a hairline: mint a project, or opt out of one.
+        let new_project = popover::menu_row_nav(&theme, false, false, "project-new".to_string())
+            .id("project-new")
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.close(cx);
+                window.dispatch_action(Box::new(crate::shell::AddSpacePalette), cx);
+            }))
+            .child(
+                crate::icons::icon(crate::icons::PLUS)
+                    .size(px(12.0))
+                    .flex_none()
+                    .text_color(theme.text_muted.opacity(0.7)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .child(SharedString::from("New project…")),
+            );
+        let opt_out = popover::menu_row_nav(&theme, no_project, false, "project-none".to_string())
+            .id("project-none")
+            .on_click(cx.listener(|this, _, _, cx| this.pick_no_project(cx)))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .child(SharedString::from("Don't work in a project")),
+            );
         div()
             .flex()
             .flex_col()
             .child(self.search_box(&theme))
             .child(body)
+            .child(
+                div()
+                    .my(px(2.0))
+                    .h(px(1.0))
+                    .flex_none()
+                    .bg(theme.border.opacity(0.6)),
+            )
+            .child(new_project)
+            .child(opt_out)
             .into_any_element()
     }
 
@@ -1528,6 +1626,11 @@ impl Pickers {
             && let Some(space) = self.filtered_space_rows(cx).into_iter().nth(self.active)
         {
             self.pick_space(space.id, cx);
+        }
+        if self.open_kind() == Some(PickerKind::Device)
+            && let Some(device) = self.device_rows(cx).into_iter().nth(self.active)
+        {
+            self.pick_device(device.id, cx);
         }
     }
 
@@ -1559,6 +1662,7 @@ impl Pickers {
                     Some(PickerKind::HarnessModel) => self.model_rows_len(cx),
                     Some(PickerKind::Traits) => 0, // merged into HarnessModel
                     Some(PickerKind::Space) => self.filtered_space_rows(cx).len(),
+                    Some(PickerKind::Device) => self.device_rows(cx).len(),
                     None => 0,
                 };
                 self.active = popover::menu_step(Some(self.active), count, delta).unwrap_or(0);
@@ -1609,6 +1713,7 @@ impl Pickers {
             PickerKind::HarnessModel => "picker-model",
             PickerKind::Traits => "picker-traits",
             PickerKind::Space => "picker-space",
+            PickerKind::Device => "picker-device",
         };
         let open = self.open_kind() == Some(kind);
         // Ghost pill (komet composer/styles.tsx `pill`): `h-8 rounded-lg px-2.5
@@ -1739,10 +1844,11 @@ impl Pickers {
             .child(div().min_w_0().truncate().child(label))
     }
 
-    /// The composer footer row (t3code BranchToolbar): checkout-kind on the
-    /// left, the ref selector right-aligned. `None` for non-git spaces. On an
-    /// existing session both sides are read-only labels ("Worktree" /
-    /// "Local checkout" + the chat's branch).
+    /// The composer footer row. New-session canvas: device + project
+    /// selectors always, checkout-kind + ref joining when the picked project
+    /// has git (checkout left of ref — wing's order). Existing session:
+    /// read-only labels only — where a session runs (device, project,
+    /// checkout, ref) is fixed at creation.
     pub fn render_footer(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let theme = Theme::of(cx).clone();
         // A selected chat whose workspace row hasn't synced yet (the moment
@@ -1751,57 +1857,142 @@ impl Pickers {
         // half-empty locked state.
         let (space, session) = {
             let state = self.state.read(cx);
-            let space = state.selected_space_row().cloned()?;
+            let space = state.selected_space_row().cloned();
             let session = state
                 .selected_chat
                 .as_ref()
                 .and_then(|_| state.selected_chat_row().cloned());
             (space, session)
         };
-        if !space.git_detected {
-            return None;
-        }
-        let new_chat = session.is_none();
-
-        // Refs feed both modes (draft labels, mid-session switch list) —
-        // eager + idempotent.
-        self.ensure_refs(false, cx);
-
-        // Symmetric: the container's 8px gap sits above the toolbar; bleeding
-        // 8 of the container's 16px bottom padding (mb -8) leaves 8 below —
-        // equal air on both sides of the row.
-        let row = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_between()
-            .gap(px(8.0))
-            .px(px(10.0))
-            .mb(px(-8.0));
-
-        // The ref side is LIVE in both modes: draft pick on a new chat,
-        // checkout switch on an existing session (t3code keeps its branch
-        // selector interactive mid-session too).
-        let ref_label = match &session {
-            Some(chat) => chat
-                .branch
-                .clone()
-                .map(SharedString::from)
-                .unwrap_or_else(|| SharedString::from("Select ref")),
-            None => self.ref_label(),
+        let row = || {
+            // Symmetric: the container's 8px gap sits above the toolbar;
+            // bleeding 8 of the container's 16px bottom padding (mb -8)
+            // leaves 8 below — equal air on both sides of the row.
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap(px(8.0))
+                .px(px(10.0))
+                .mb(px(-8.0))
         };
+
+        if let Some(chat) = &session {
+            // Sessions never move: no footer for project-less / non-git
+            // sessions, read-only labels otherwise.
+            let space = space?;
+            if !space.git_detected {
+                return None;
+            }
+            let is_worktree = chat.cwd.as_deref().is_some_and(|cwd| cwd != space.path);
+            let (icon_path, label) = if is_worktree {
+                (crate::icons::FOLDER_WITH_FILES, "Worktree")
+            } else {
+                (crate::icons::FOLDER, "Local checkout")
+            };
+            let left = Self::footer_label(icon_path, SharedString::from(label), &theme);
+            let ref_side = Self::footer_label(
+                crate::icons::GIT_BRANCH,
+                chat.branch
+                    .clone()
+                    .map(SharedString::from)
+                    .unwrap_or_else(|| SharedString::from("No ref")),
+                &theme,
+            );
+            return Some(row().child(left).child(ref_side).into_any_element());
+        }
+
+        // New-session canvas.
+        let git = space.as_ref().is_some_and(|s| s.git_detected);
+        if git {
+            // Refs feed the draft labels — eager + idempotent.
+            self.ensure_refs(false, cx);
+        }
         let closing = self.open.closing_since();
         let mut overlay: Option<(PickerKind, AnyElement)> = match self.mounted_kind() {
-            Some(PickerKind::Branch) => {
+            Some(PickerKind::Branch) if git => {
                 let content = self.render_branch_popover(cx);
                 Some((PickerKind::Branch, self.popover_frame(320.0, content, cx)))
             }
-            Some(PickerKind::Checkout) if new_chat => {
+            Some(PickerKind::Checkout) if git => {
                 let content = self.render_checkout_popover(cx);
                 Some((PickerKind::Checkout, self.popover_frame(224.0, content, cx)))
             }
+            Some(PickerKind::Space) => {
+                let content = self.render_space_popover(cx);
+                Some((PickerKind::Space, self.popover_frame(280.0, content, cx)))
+            }
+            Some(PickerKind::Device) => {
+                let content = self.render_device_popover(cx);
+                Some((PickerKind::Device, self.popover_frame(224.0, content, cx)))
+            }
             _ => None,
         };
+
+        let (device_label, project_label, offline) = {
+            let state = self.state.read(cx);
+            let device_id = state.effective_device_id();
+            let device_label: SharedString = device_id
+                .as_deref()
+                .and_then(|id| state.device_name(id))
+                .map(str::to_string)
+                .unwrap_or_else(|| "This device".to_string())
+                .into();
+            let offline = device_id
+                .as_deref()
+                .is_some_and(|id| !state.device_online(id, chrono::Utc::now()));
+            let project_label: SharedString = space
+                .as_ref()
+                .map(|s| s.display_name().to_string())
+                .unwrap_or_else(|| "No project".to_string())
+                .into();
+            (device_label, project_label, offline)
+        };
+        let device_chip = self
+            .footer_chip(
+                PickerKind::Device,
+                "picker-device",
+                crate::icons::MONITOR,
+                device_label,
+                &theme,
+                cx,
+            )
+            .when(offline, |el| el.text_color(theme.warning.opacity(0.8)));
+        let project_chip = self.footer_chip(
+            PickerKind::Space,
+            "picker-project",
+            crate::icons::FOLDER,
+            project_label,
+            &theme,
+            cx,
+        );
+        let left = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .min_w_0()
+            .gap(px(4.0))
+            .child(attach_overlay(
+                device_chip,
+                &mut overlay,
+                PickerKind::Device,
+                "device-popover",
+                closing,
+            ))
+            .child(attach_overlay(
+                project_chip,
+                &mut overlay,
+                PickerKind::Space,
+                "project-popover",
+                closing,
+            ));
+
+        if !git {
+            return Some(row().child(left).into_any_element());
+        }
+
+        let ref_label = self.ref_label();
         let ref_chip = self.footer_chip(
             PickerKind::Branch,
             "picker-branch",
@@ -1810,27 +2001,6 @@ impl Pickers {
             &theme,
             cx,
         );
-        let ref_side = attach_overlay_end(
-            ref_chip,
-            &mut overlay,
-            PickerKind::Branch,
-            "branch-popover",
-            closing,
-        );
-
-        if let Some(chat) = &session {
-            // The checkout KIND is fixed at creation (harness resume is
-            // cwd-scoped — the session never moves folders): label only.
-            let is_worktree = chat.cwd.as_deref().is_some_and(|cwd| cwd != space.path);
-            let (icon_path, label) = if is_worktree {
-                (crate::icons::FOLDER_WITH_FILES, "Worktree")
-            } else {
-                (crate::icons::FOLDER, "Local checkout")
-            };
-            let left = Self::footer_label(icon_path, SharedString::from(label), &theme);
-            return Some(row.child(left).child(ref_side).into_any_element());
-        }
-
         let kind_icon = match (self.config.checkout, self.selected_ref_worktree().is_some()) {
             (CheckoutKind::Local, false) => crate::icons::FOLDER,
             _ => crate::icons::FOLDER_WITH_FILES,
@@ -1843,17 +2013,27 @@ impl Pickers {
             &theme,
             cx,
         );
-        Some(
-            row.child(attach_overlay(
+        let right = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .flex_none()
+            .gap(px(4.0))
+            .child(attach_overlay(
                 kind_chip,
                 &mut overlay,
                 PickerKind::Checkout,
                 "checkout-popover",
                 closing,
             ))
-            .child(ref_side)
-            .into_any_element(),
-        )
+            .child(attach_overlay_end(
+                ref_chip,
+                &mut overlay,
+                PickerKind::Branch,
+                "branch-popover",
+                closing,
+            ));
+        Some(row().child(left).child(right).into_any_element())
     }
 
     fn popover_frame(&self, width: f32, content: AnyElement, cx: &mut Context<Self>) -> AnyElement {
@@ -1928,8 +2108,8 @@ impl Pickers {
                             this.models.clear();
                             this.ensure_harnesses(false, cx);
                         }
-                        // Spaces load nothing; no retry surface exists.
-                        PickerKind::Space => {}
+                        // Projects/devices load nothing; no retry surface exists.
+                        PickerKind::Space | PickerKind::Device => {}
                     }))
                     .child(SharedString::from("Retry")),
             )
@@ -2721,7 +2901,11 @@ impl Render for Pickers {
         // `render_footer`), not here.
         let closing = self.open.closing_since();
         let mut overlay: Option<(PickerKind, AnyElement)> = match self.mounted_kind() {
-            Some(PickerKind::Branch) | Some(PickerKind::Checkout) => None,
+            // Footer-row pickers — their popovers mount down there.
+            Some(PickerKind::Branch)
+            | Some(PickerKind::Checkout)
+            | Some(PickerKind::Space)
+            | Some(PickerKind::Device) => None,
             Some(PickerKind::HarnessModel) => {
                 let content = self.render_harness_model_popover(cx);
                 Some((
@@ -2739,60 +2923,20 @@ impl Render for Pickers {
                     self.popover_frame_flush(240.0, content, cx),
                 ))
             }
-            Some(PickerKind::Space) => {
-                let content = self.render_space_popover(cx);
-                Some((PickerKind::Space, self.popover_frame(280.0, content, cx)))
-            }
             None => None,
         };
 
-        // Left cluster: the SPACE chip on the new-session canvas (which space
-        // the session mints into — wing's restructure; existing sessions are
-        // pinned to theirs, so the chip hides). The branch chip lives in the
-        // composer FOOTER row.
+        // Left cluster: empty — the device/project pickers live in the
+        // composer FOOTER row alongside checkout + ref.
         // Right cluster: agent+model and traits — the composer appends
         // attach + send after this element (komet composer-actions.tsx
         // arrangement).
-        let new_chat = self.state.read(cx).selected_chat.is_none();
-        // Name + "@ device" tag (the space pickers' row format), so the chip
-        // says which host the session mints on without opening the picker.
-        let space_label: Option<(SharedString, SharedString, bool)> = new_chat
-            .then(|| {
-                let state = self.state.read(cx);
-                state.selected_space_row().map(|s| {
-                    let (tag, offline) = state.space_device_tag(s, chrono::Utc::now());
-                    (
-                        SharedString::from(s.display_name().to_string()),
-                        SharedString::from(tag),
-                        offline,
-                    )
-                })
-            })
-            .flatten();
-        let mut left = div()
+        let left = div()
             .flex()
             .flex_row()
             .items_center()
             .min_w_0()
             .gap(px(4.0));
-        if let Some((label, tag, offline)) = space_label {
-            let space_chip = self.trigger_chip(
-                PickerKind::Space,
-                label,
-                true,
-                Some((crate::icons::FOLDER, None)),
-                Some((tag, offline.then(|| theme.warning.opacity(0.8)))),
-                &theme,
-                cx,
-            );
-            left = left.child(attach_overlay(
-                space_chip,
-                &mut overlay,
-                PickerKind::Space,
-                "space-popover",
-                closing,
-            ));
-        }
         // Model chip (brand icon + model name) beside a separate Traits chip
         // (t3code TraitsPicker arrangement): the trigger label is the joined
         // non-default summary ("High · 1M · Fast"), falling back to "Traits".
