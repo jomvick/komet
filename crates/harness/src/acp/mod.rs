@@ -1875,6 +1875,42 @@ async fn run_session(session: Session) {
                     // and no Done ever coming — the stranded-Working /
                     // eternal-timer bug. Post-turn: nothing left to do.
                     if turn.is_some() {
+                        // Pre-injection updates can still sit in `incoming`
+                        // (responses bypass that queue): drain them into the
+                        // CURRENT segment first, or text the agent streamed
+                        // before the injection landed folds after the split —
+                        // the transcript attributes it to the reply-to-steer.
+                        let mut consumer_gone = false;
+                        while let Ok(inc) = incoming.try_recv() {
+                            match inc {
+                                Incoming::Notification { method, params }
+                                    if method == "session/update" =>
+                                {
+                                    for ev in session_update_events(&params, &session_id) {
+                                        if !send(&event_tx, ev).await {
+                                            consumer_gone = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                Incoming::Request { id, method, params } => {
+                                    handle_server_request_live(
+                                        &client,
+                                        id,
+                                        &method,
+                                        &params,
+                                        &request_input,
+                                    );
+                                }
+                                _ => {}
+                            }
+                            if consumer_gone {
+                                break;
+                            }
+                        }
+                        if consumer_gone {
+                            break 'main;
+                        }
                         let (prev, next) = rotate(&mut assistant_message_id);
                         if !send(
                             &event_tx,
@@ -2019,10 +2055,13 @@ async fn run_session(session: Session) {
         }
     }
 
-    shutdown_child(&mut child, kill_grace).await;
+    // Escalation dies BEFORE the child is reaped: after `shutdown_child`
+    // waits the pid, a still-armed SIGTERM/SIGKILL timer would fire at a
+    // freed (reusable) pid.
     if let Some(handle) = escalation {
         handle.abort();
     }
+    shutdown_child(&mut child, kill_grace).await;
 }
 
 #[cfg(test)]

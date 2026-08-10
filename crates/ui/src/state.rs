@@ -897,43 +897,59 @@ impl AppState {
 /// on the first frame when nothing is selected yet (manual selection wins).
 fn spawn_chats_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<()> {
     cx.spawn(async move |this, cx| {
-        let mut rx = match handle
-            .client()
-            .subscribe(methods::WATCH_CHATS, serde_json::json!({}))
-            .await
-        {
-            Ok(rx) => rx,
-            Err(err) => {
-                tracing::debug!(error = %err, "chats watch unavailable");
-                return;
-            }
-        };
-        while let Some(value) = rx.recv().await {
-            let parsed: Vec<Chat> = match serde_json::from_value(value) {
-                Ok(parsed) => parsed,
+        // Resubscribe loop (same contract as the transcript watch): a daemon
+        // restart or RPC drop ends the stream, and a bare return here froze
+        // the sidebar until app restart — new chats, renames and archives
+        // from every device silently stopped arriving.
+        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+        loop {
+            let mut rx = match handle
+                .client()
+                .subscribe(methods::WATCH_CHATS, serde_json::json!({}))
+                .await
+            {
+                Ok(rx) => rx,
                 Err(err) => {
-                    tracing::warn!(error = %err, "dropping malformed chats frame");
+                    tracing::debug!(error = %err, "chats watch unavailable; retrying");
+                    if this.update(cx, |_, _| {}).is_err() {
+                        return;
+                    }
+                    cx.background_executor().timer(RETRY_DELAY).await;
                     continue;
                 }
             };
-            let alive = this.update(cx, |state, cx| {
-                state.apply_chats(parsed);
-                if state.selected_chat.is_none() && !state.auto_selected {
-                    let most_recent = state
-                        .chats
-                        .iter()
-                        .find(|c| !c.archived)
-                        .map(|c| c.id.clone());
-                    if let Some(chat_id) = most_recent {
-                        state.auto_selected = true;
-                        state.select_chat(Some(chat_id), cx);
+            while let Some(value) = rx.recv().await {
+                let parsed: Vec<Chat> = match serde_json::from_value(value) {
+                    Ok(parsed) => parsed,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "dropping malformed chats frame");
+                        continue;
                     }
+                };
+                let alive = this.update(cx, |state, cx| {
+                    state.apply_chats(parsed);
+                    if state.selected_chat.is_none() && !state.auto_selected {
+                        let most_recent = state
+                            .chats
+                            .iter()
+                            .find(|c| !c.archived)
+                            .map(|c| c.id.clone());
+                        if let Some(chat_id) = most_recent {
+                            state.auto_selected = true;
+                            state.select_chat(Some(chat_id), cx);
+                        }
+                    }
+                    cx.notify();
+                });
+                if alive.is_err() {
+                    return;
                 }
-                cx.notify();
-            });
-            if alive.is_err() {
-                break;
             }
+            tracing::debug!("chats stream ended; resubscribing");
+            if this.update(cx, |_, _| {}).is_err() {
+                return;
+            }
+            cx.background_executor().timer(RETRY_DELAY).await;
         }
     })
 }
@@ -945,32 +961,49 @@ fn spawn_watch<T: DeserializeOwned + 'static>(
     apply: fn(&mut AppState, T),
 ) -> Task<()> {
     cx.spawn(async move |this, cx| {
-        let mut rx = match handle
-            .client()
-            .subscribe(method, serde_json::json!({}))
-            .await
-        {
-            Ok(rx) => rx,
-            Err(err) => {
-                tracing::debug!(method, error = %err, "watch unavailable");
-                return;
-            }
-        };
-        while let Some(value) = rx.recv().await {
-            let parsed: T = match serde_json::from_value(value) {
-                Ok(parsed) => parsed,
+        // Resubscribe loop: these are the standing Sessions/Devices/Spaces
+        // watches — a daemon restart ended the stream and a bare return froze
+        // them for the rest of the app's life (remote Working dots staled out
+        // to nothing after 45s, and Idle/Completed transitions from other
+        // devices never arrived again — "the session never completes").
+        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+        loop {
+            let mut rx = match handle
+                .client()
+                .subscribe(method, serde_json::json!({}))
+                .await
+            {
+                Ok(rx) => rx,
                 Err(err) => {
-                    tracing::warn!(method, error = %err, "dropping malformed watch frame");
+                    tracing::debug!(method, error = %err, "watch unavailable; retrying");
+                    if this.update(cx, |_, _| {}).is_err() {
+                        return;
+                    }
+                    cx.background_executor().timer(RETRY_DELAY).await;
                     continue;
                 }
             };
-            let alive = this.update(cx, |state, cx| {
-                apply(state, parsed);
-                cx.notify();
-            });
-            if alive.is_err() {
-                break;
+            while let Some(value) = rx.recv().await {
+                let parsed: T = match serde_json::from_value(value) {
+                    Ok(parsed) => parsed,
+                    Err(err) => {
+                        tracing::warn!(method, error = %err, "dropping malformed watch frame");
+                        continue;
+                    }
+                };
+                let alive = this.update(cx, |state, cx| {
+                    apply(state, parsed);
+                    cx.notify();
+                });
+                if alive.is_err() {
+                    return;
+                }
             }
+            tracing::debug!(method, "watch stream ended; resubscribing");
+            if this.update(cx, |_, _| {}).is_err() {
+                return;
+            }
+            cx.background_executor().timer(RETRY_DELAY).await;
         }
     })
 }

@@ -28,15 +28,21 @@ pub const CHAT2_DOC_EPOCH: u32 = 2;
 /// the existing change plumbing — this type only owns import + same-tx
 /// persistence.
 pub struct EngineChatSink {
-    doc: Arc<SessionDoc>,
+    /// WEAK: the sink lives inside the handle's `ChatClient` for the
+    /// client's whole life — a strong ref here kept
+    /// `Arc::strong_count(&handle.doc) > 1` permanently, which reads as
+    /// "live writer" to `pinned()` and made every chat2 handle immune to
+    /// LRU eviction (unbounded warm-doc growth). Callbacks upgrade per
+    /// call; a dead doc (evicted handle) is a no-op.
+    doc: std::sync::Weak<SessionDoc>,
     store: Arc<DocsStore>,
     chat_id: String,
 }
 
 impl EngineChatSink {
-    pub fn new(doc: Arc<SessionDoc>, store: Arc<DocsStore>, chat_id: impl Into<String>) -> Self {
+    pub fn new(doc: &Arc<SessionDoc>, store: Arc<DocsStore>, chat_id: impl Into<String>) -> Self {
         Self {
-            doc,
+            doc: Arc::downgrade(doc),
             store,
             chat_id: chat_id.into(),
         }
@@ -44,7 +50,10 @@ impl EngineChatSink {
 
     /// Export the CURRENT doc and persist it with `cursor` in one tx.
     fn persist_with_cursor(&self, cursor: u64) {
-        match self.doc.export_snapshot() {
+        let Some(doc) = self.doc.upgrade() else {
+            return;
+        };
+        match doc.export_snapshot() {
             Ok(bytes) => {
                 if let Err(err) = self.store.save_snapshot_with_cursor(
                     &self.chat_id,
@@ -66,7 +75,10 @@ impl EngineChatSink {
 
 impl ChatDocSink for EngineChatSink {
     fn apply_row(&self, bytes: &[u8], cursor: u64) {
-        if let Err(err) = self.doc.doc().import(bytes) {
+        let Some(doc) = self.doc.upgrade() else {
+            return;
+        };
+        if let Err(err) = doc.doc().import(bytes) {
             // Malformed remote bytes cost the row, never the doc (the same
             // skip-not-fail rule as transcript reads). The cursor still
             // advances: replaying a poison row forever is the wedge class.
@@ -77,8 +89,8 @@ impl ChatDocSink for EngineChatSink {
     }
 
     fn apply_checkpoint(&self, bytes: &[u8], cursor: u64) -> Result<(), String> {
-        self.doc
-            .doc()
+        let doc = self.doc.upgrade().ok_or("doc evicted")?;
+        doc.doc()
             .import(bytes)
             .map_err(|e| format!("checkpoint import: {e}"))?;
         self.persist_with_cursor(cursor);
@@ -86,6 +98,9 @@ impl ChatDocSink for EngineChatSink {
     }
 
     fn contains_frontier(&self, frontier: &[u8]) -> bool {
+        let Some(doc) = self.doc.upgrade() else {
+            return true; // evicted: claim contained so the client idles, not refetches
+        };
         if frontier.is_empty() {
             return true;
         }
@@ -95,7 +110,7 @@ impl ChatDocSink for EngineChatSink {
             // merge), never silently skips history.
             return false;
         };
-        self.doc.doc().oplog_vv().includes_vv(&vv)
+        doc.doc().oplog_vv().includes_vv(&vv)
     }
 
     fn advance_cursor(&self, cursor: u64) {
@@ -134,6 +149,7 @@ impl CheckpointFetcher for EdgeCheckpointFetcher {
         );
         Box::pin(async move {
             let mut got: Vec<u8> = Vec::new();
+            let mut seen_seq: Option<String> = None;
             // Range-resume loop: each attempt continues at the byte where
             // the last one stopped. Attempt count bounds a flapping link;
             // the ChatClient's own deadline bounds wall clock.
@@ -153,6 +169,26 @@ impl CheckpointFetcher for EdgeCheckpointFetcher {
                         continue;
                     }
                 };
+                // Resume validator: a NEW checkpoint can commit between
+                // attempts, and a Range against it would splice two different
+                // blobs (the import fails and burns a whole redial cycle).
+                // The DO stamps every response with the checkpoint's seq —
+                // on change, restart the download from byte 0.
+                let seq = res
+                    .headers()
+                    .get("x-chat2-checkpoint-seq")
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string);
+                if seq.is_some() && seen_seq.is_some() && seq != seen_seq {
+                    tracing::info!(resumed_at = got.len(),
+                        "chat2 checkpoint replaced mid-download; restarting from 0");
+                    got.clear();
+                    seen_seq = seq;
+                    continue;
+                }
+                if seq.is_some() {
+                    seen_seq = seq;
+                }
                 match res.status().as_u16() {
                     200 => got.clear(),
                     206 => {}

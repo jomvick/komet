@@ -113,6 +113,14 @@ pub struct RunRequest {
     pub attachments: Vec<String>,
 }
 
+/// The session-scoped singleton id for the live plan/todo chip. ACP plan
+/// updates carry no wire id; adapters emit every update under this one id so
+/// the fold refreshes the same chip in place. Consumers that de-duplicate
+/// tool ids across segment boundaries (the engine's stale-echo filter) must
+/// EXEMPT this id — it legitimately reappears in every segment for the whole
+/// life of a run.
+pub const LIVE_PLAN_TOOL_ID: &str = "acp-plan";
+
 /// A decoded tool invocation, reduced to the fields each kind renders.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
