@@ -2748,6 +2748,7 @@ impl Shell {
         let _ = (text, border);
         let has_selection = self.state.read(cx).selected_chat.is_some();
         let has_spaces = !self.state.read(cx).spaces.is_empty();
+        let no_project = self.state.read(cx).no_project;
         let space_name: SharedString = self
             .state
             .read(cx)
@@ -2762,7 +2763,7 @@ impl Shell {
         // (new-chat mode mints the chat id on first send).
         let outlet: AnyElement = if has_selection {
             self.transcript.clone().into_any_element()
-        } else if !has_spaces {
+        } else if !has_spaces && !no_project {
             // Onboarding (first boot / after the destructive wipe): no folders
             // to work in yet — one clear affordance.
             let _ = faint;
@@ -2790,7 +2791,7 @@ impl Shell {
                                 .text_size(px(16.0))
                                 .font_weight(gpui::FontWeight::MEDIUM)
                                 .text_color(theme.text)
-                                .child(SharedString::from("Add a space to get started")),
+                                .child(SharedString::from("Add a project to get started")),
                         )
                         .child(
                             div()
@@ -2798,14 +2799,28 @@ impl Shell {
                                 .text_size(px(13.0))
                                 .text_color(theme.text_muted.opacity(0.7))
                                 .child(SharedString::from(
-                                    "A space is a folder on one of your devices.",
+                                    "A project is a folder on one of your devices.",
                                 )),
                         )
                         .child(
-                            popover::btn_primary(&theme_owned, "Add a space")
+                            popover::btn_primary(&theme_owned, "Add a project")
                                 .id("onboarding-add-space")
                                 .mt(px(20.0))
                                 .on_click(cx.listener(|this, _, _, cx| this.open_add_space(cx))),
+                        )
+                        .child(
+                            div()
+                                .id("onboarding-no-project")
+                                .mt(px(10.0))
+                                .text_size(px(12.0))
+                                .text_color(theme.text_muted.opacity(0.6))
+                                .cursor_pointer()
+                                .hover(|s| s.text_color(theme.text_muted))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.state
+                                        .update(cx, |s, cx| s.select_space(None, cx));
+                                }))
+                                .child(SharedString::from("Or start without a project")),
                         ),
                 ))
                 .into_any_element()

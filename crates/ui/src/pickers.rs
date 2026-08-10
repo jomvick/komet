@@ -2126,7 +2126,7 @@ impl Pickers {
                 .p(px(Theme::SPACE_SM))
                 .text_size(px(12.0))
                 .text_color(theme.text_faint)
-                .child(SharedString::from("No space selected"))
+                .child(SharedString::from("No project selected"))
                 .into_any_element();
         }
         let rows = self.filtered_ref_rows(cx);

@@ -1689,15 +1689,17 @@ mod tests {
             .map(|c| c.id.as_str())
             .collect();
         assert_eq!(ids, ["old", "new"]);
-        // The overview shows every live-space chat (idle included) — chats of
-        // unknown spaces stay hidden. Completed ("old") outranks idle ("new").
+        // The overview shows every live-space chat (idle included) PLUS
+        // project-less chats (first-class since the project selectors);
+        // chats of unknown spaces stay hidden. Completed ("old") outranks
+        // idle ("new"/"dangling").
         let now = Utc::now();
         let overview: Vec<&str> = state
             .overview_chats(now)
             .iter()
             .map(|(_, c)| c.id.as_str())
             .collect();
-        assert_eq!(overview, ["old", "new"]);
+        assert_eq!(overview, ["old", "new", "dangling"]);
     }
 
     #[test]

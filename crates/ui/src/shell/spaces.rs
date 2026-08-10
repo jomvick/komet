@@ -1,4 +1,4 @@
-//! Spaces sidebar: the space-filter dropdown (searchable, with "All spaces"),
+//! Spaces sidebar: the space-filter dropdown (searchable, with "All projects"),
 //! the filtered Sessions list, and the add-space palette (⌘K-style: device
 //! tabs + filtered folder browser).
 //!
@@ -145,8 +145,8 @@ impl Shell {
 
     // ---- sidebar sections ----
 
-    /// The filter's display rows: "All spaces", then spaces matching the
-    /// search (ranked — `popover::filter_indices`), then "Add space…".
+    /// The filter's display rows: "All projects", then spaces matching the
+    /// search (ranked — `popover::filter_indices`), then "New project…".
     /// "All" only shows on an empty query (searching means hunting a space).
     fn spaces_menu_rows(&self, cx: &App) -> Vec<SpacesMenuRow> {
         let query = self
@@ -177,7 +177,7 @@ impl Shell {
         // "PaletteSearch" context: ↑↓/⏎ stay unbound in the input and bubble
         // to the card's key handler.
         let search =
-            cx.new(|cx| ComposerInput::with_context("Search spaces…", "PaletteSearch", cx));
+            cx.new(|cx| ComposerInput::with_context("Search projects…", "PaletteSearch", cx));
         let search_events = cx.subscribe(&search, |this: &mut Shell, _, event, cx| {
             if matches!(event, ComposerInputEvent::Edited) {
                 if let Some(menu) = this.spaces_menu.open_mut() {
@@ -262,7 +262,7 @@ impl Shell {
         }
     }
 
-    /// The sidebar's space-filter row: current filter ("All spaces" or the
+    /// The sidebar's space-filter row: current filter ("All projects" or the
     /// space's name) + chevron, the dropdown floating beneath while open.
     /// Sits OUTSIDE the sidebar's scroll region so the float never clips.
     pub(super) fn render_spaces_filter(
@@ -283,7 +283,7 @@ impl Shell {
                         Some((tag.into(), offline)),
                     )
                 }
-                None => (SharedString::from("All spaces"), None),
+                None => (SharedString::from("All projects"), None),
             }
         };
         let open = self.spaces_menu.is_open();
@@ -431,8 +431,8 @@ impl Shell {
             .into_any_element()
     }
 
-    /// The dropdown card: search on top, "All spaces" + space rows (check on
-    /// the active filter; right-click for rename/remove) + "Add space…".
+    /// The dropdown card: search on top, "All projects" + space rows (check on
+    /// the active filter; right-click for rename/remove) + "New project…".
     fn render_spaces_menu(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let (search, active, focus, list_scroll) = {
             let Some(menu) = self.spaces_menu.get() else {
@@ -455,7 +455,7 @@ impl Shell {
             rows.iter()
                 .map(|row| match row {
                     SpacesMenuRow::All => {
-                        (row.clone(), SharedString::from("All spaces"), None, false)
+                        (row.clone(), SharedString::from("All projects"), None, false)
                     }
                     SpacesMenuRow::Space(id) => match state.space_row(id) {
                         Some(space) => {
@@ -470,7 +470,7 @@ impl Shell {
                         None => (row.clone(), SharedString::from("?"), None, false),
                     },
                     SpacesMenuRow::AddSpace => {
-                        (row.clone(), SharedString::from("Add space…"), None, false)
+                        (row.clone(), SharedString::from("New project…"), None, false)
                     }
                 })
                 .collect()
@@ -1570,7 +1570,7 @@ impl Shell {
             .space_row(&space_id)
             .map(|s| s.display_name().to_string())
             .unwrap_or_default();
-        let input = cx.new(|cx| ComposerInput::new("Space name", cx));
+        let input = cx.new(|cx| ComposerInput::new("Project name", cx));
         input.update(cx, |input, cx| input.set_text(current, cx));
         let events = cx.subscribe(&input, |this: &mut Shell, _, event, cx| {
             if matches!(event, ComposerInputEvent::Submitted) {
@@ -1678,7 +1678,7 @@ impl Shell {
                         cx.notify();
                     }
                 }))
-                .child(popover::dialog_title(&theme, "Rename space"))
+                .child(popover::dialog_title(&theme, "Rename project"))
                 .child(
                     div()
                         .mt(px(12.0))
@@ -1718,7 +1718,7 @@ impl Shell {
                 (
                     space
                         .map(|s| s.display_name().to_string())
-                        .unwrap_or_else(|| "this space".into()),
+                        .unwrap_or_else(|| "this project".into()),
                     space
                         .and_then(|s| state.device_name(&s.device_id))
                         .unwrap_or("its device")
@@ -1736,7 +1736,7 @@ impl Shell {
                 )
             };
             let card = popover::dialog_card(&theme)
-                .child(popover::dialog_title(&theme, "Remove space?"))
+                .child(popover::dialog_title(&theme, "Remove project?"))
                 .child(div().mt(px(6.0)).child(popover::dialog_body(&theme, copy)))
                 .child(
                     div()
