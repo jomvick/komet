@@ -655,7 +655,10 @@ impl WorkspaceHost {
                 last_message_at: None,
                 created_at: Utc::now(),
                 harness_session_id: None,
-                room_gen: None,
+                // Born on chat2: a brand-new chat has an empty doc — nothing
+                // to seed, no migration race to lose. Only pre-existing chats
+                // go through the seed+flip path (the host migration sweep).
+                room_gen: Some(2),
                 harness_session_cwd: None,
                 space_id: Some(space.id.clone()),
                 last_seen_at: None,
