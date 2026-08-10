@@ -1269,6 +1269,7 @@ dependencies = [
  "futures",
  "loro",
  "loro-protocol",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",
