@@ -32,6 +32,12 @@
  *   HEAD /attachments/:sha256
  *   PUT  /blob/:chatId/:partId        — tool-output sidecar (chat2-sync A2)
  *   GET  /blob/:chatId/:partId
+ *   GET  /chat2/:chatId/ws            — chat2 log-relay room (wss, chat2-sync B)
+ *   GET|POST /chat2/:chatId/checkpoint — client-built doc snapshot (Range-resumable GET)
+ *   GET|PUT  /chat2/:chatId/tail      — host-published sidecars, served verbatim
+ *   GET|PUT  /chat2/:chatId/diff
+ *   GET  /chat2/:chatId/stats
+ *   POST /chat2/:chatId/reset
  */
 import { authenticate } from "./auth";
 import { handleAuthRoute } from "./auth-routes";
@@ -39,9 +45,10 @@ import { AUTH_USER_HEADER, ROOM_KIND_HEADER, type Env } from "./env";
 import { SessionRoom } from "./session-room";
 import { DeviceRoom } from "./device-room";
 import { RegistryRoom } from "./registry-room";
+import { ChatRoom } from "./chat-room";
 import installSh from "./install.sh";
 
-export { SessionRoom, DeviceRoom, RegistryRoom };
+export { SessionRoom, DeviceRoom, RegistryRoom, ChatRoom };
 
 const ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 const SHA256_RE = /^[a-f0-9]{64}$/;
@@ -175,6 +182,41 @@ export default {
     }
     if (parts[0] === "append" && parts[1] && ID_RE.test(parts[1]) && request.method === "POST") {
       return forward(env.SESSION_ROOMS, `s2/${parts[1]}`, request, auth.userId, "/append", "");
+    }
+
+    // ── chat2 rooms (docs/chat2-sync.md B): dumb log relays, one per chat.
+    //    Claim-on-first-join ownership enforced in the DO (chat ids are
+    //    client-minted). The DO handles /ws, /checkpoint (GET Range-resumable
+    //    + POST floor-guarded), host-published /tail + /diff sidecars,
+    //    /stats, /reset. ──────────────────────────────────────────────────────
+    if (parts[0] === "chat2" && parts[1] && ID_RE.test(parts[1]) && parts[2]) {
+      const room = `chat2/${parts[1]}`;
+      if (parts[2] === "ws" && parts.length === 3) {
+        if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
+          return json({ error: "expected websocket" }, 426);
+        }
+        return forward(
+          env.CHAT_ROOMS,
+          room,
+          request,
+          auth.userId,
+          "/ws",
+          `?chatId=${parts[1]}${deviceParam(url)}`
+        );
+      }
+      const routes: Record<string, string[]> = {
+        checkpoint: ["GET", "POST"],
+        tail: ["GET", "PUT"],
+        diff: ["GET", "PUT"],
+        stats: ["GET"],
+        reset: ["POST"]
+      };
+      if (parts.length === 3 && routes[parts[2]]?.includes(request.method)) {
+        // Query carries through (`seqCovered` on POST /checkpoint), as do
+        // headers (`x-chat2-frontier`, `range`).
+        return forward(env.CHAT_ROOMS, room, request, auth.userId, `/${parts[2]}`, url.search);
+      }
+      return json({ error: "not found" }, 404);
     }
 
     // ── workspace rooms (ARCHITECTURE §2.2/§6.1): same SessionRoom DO class;

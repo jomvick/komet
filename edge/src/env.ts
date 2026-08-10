@@ -4,6 +4,9 @@ export interface Env {
   /** Per-user workspace registries (`reg1/{orgId}/{userId}`) — the row-table
    * replacement for the Loro workspace doc (docs/registry-sync.md). */
   REGISTRY_ROOMS: DurableObjectNamespace;
+  /** chat2 session rooms (`chat2/{chatId}`) — dumb authenticated log relays
+   * replacing SessionRoom's loro-aware s2 rooms (docs/chat2-sync.md). */
+  CHAT_ROOMS: DurableObjectNamespace;
   BLOBS: R2Bucket;
   /** Release artifacts (headless tarballs, dmgs, latest.txt) served at
    * /releases/* for the curl-install flow. */

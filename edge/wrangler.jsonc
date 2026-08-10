@@ -32,7 +32,8 @@
     "bindings": [
       { "name": "SESSION_ROOMS", "class_name": "SessionRoom" },
       { "name": "DEVICE_ROOMS", "class_name": "DeviceRoom" },
-      { "name": "REGISTRY_ROOMS", "class_name": "RegistryRoom" }
+      { "name": "REGISTRY_ROOMS", "class_name": "RegistryRoom" },
+      { "name": "CHAT_ROOMS", "class_name": "ChatRoom" }
     ]
   },
   "migrations": [
@@ -45,6 +46,12 @@
       // sync that replaces the Loro workspace doc rooms.
       "tag": "v2",
       "new_sqlite_classes": ["RegistryRoom"]
+    },
+    {
+      // chat2 session rooms (docs/chat2-sync.md) — dumb log relays that
+      // replace SessionRoom's loro-aware s2 rooms.
+      "tag": "v3",
+      "new_sqlite_classes": ["ChatRoom"]
     }
   ],
   "r2_buckets": [
