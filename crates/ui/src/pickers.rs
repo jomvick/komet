@@ -721,6 +721,13 @@ impl Pickers {
                 });
                 window.focus(&handle, cx);
             }
+            PickerKind::Device => {
+                let handle = self.search.read(cx).focus_handle(cx);
+                self.search.update(cx, |input, cx| {
+                    input.set_placeholder("Search devices…", cx);
+                });
+                window.focus(&handle, cx);
+            }
             _ => window.focus(&self.focus, cx),
         }
         match kind {
@@ -1433,6 +1440,18 @@ impl Pickers {
         devices
     }
 
+    /// [`Self::device_rows`] filtered by the search box (same ranked
+    /// substring match as the project rows).
+    fn filtered_device_rows(&self, cx: &App) -> Vec<komet_proto::Device> {
+        let query = self.search.read(cx).text().to_string();
+        let rows = self.device_rows(cx);
+        let names: Vec<String> = rows.iter().map(|d| d.name.clone()).collect();
+        popover::filter_indices(&query, &names)
+            .into_iter()
+            .map(|ix| rows[ix].clone())
+            .collect()
+    }
+
     fn selected_device_index(&self, cx: &App) -> usize {
         let effective = self.state.read(cx).effective_device_id();
         self.device_rows(cx)
@@ -1441,12 +1460,12 @@ impl Pickers {
             .unwrap_or(0)
     }
 
-    /// The device popover: one row per device (name, muted "offline" tag,
-    /// check on the canvas's effective device).
+    /// The device popover: search + one row per device (name, muted "offline"
+    /// tag, check on the canvas's effective device).
     fn render_device_popover(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let now = chrono::Utc::now();
-        let rows = self.device_rows(cx);
+        let rows = self.filtered_device_rows(cx);
         let (effective, local, online): (Option<String>, Option<String>, Vec<bool>) = {
             let state = self.state.read(cx);
             (
@@ -1463,7 +1482,7 @@ impl Pickers {
                 .p(px(Theme::SPACE_SM))
                 .text_size(px(12.0))
                 .text_color(theme.text_faint)
-                .child(SharedString::from("No devices yet."))
+                .child(SharedString::from("No devices match."))
                 .into_any_element()
         } else {
             div()
@@ -1507,7 +1526,12 @@ impl Pickers {
                 ))
                 .into_any_element()
         };
-        div().flex().flex_col().child(body).into_any_element()
+        div()
+            .flex()
+            .flex_col()
+            .child(self.search_box(&theme))
+            .child(body)
+            .into_any_element()
     }
 
     /// The project popover: search + one row per project (name, muted
@@ -1595,6 +1619,12 @@ impl Pickers {
             .id("project-none")
             .on_click(cx.listener(|this, _, _, cx| this.pick_no_project(cx)))
             .child(
+                crate::icons::icon(crate::icons::CLOSE)
+                    .size(px(12.0))
+                    .flex_none()
+                    .text_color(theme.text_muted.opacity(0.7)),
+            )
+            .child(
                 div()
                     .flex_1()
                     .min_w_0()
@@ -1630,7 +1660,7 @@ impl Pickers {
             self.pick_space(space.id, cx);
         }
         if self.open_kind() == Some(PickerKind::Device)
-            && let Some(device) = self.device_rows(cx).into_iter().nth(self.active)
+            && let Some(device) = self.filtered_device_rows(cx).into_iter().nth(self.active)
         {
             self.pick_device(device.id, cx);
         }
@@ -1664,7 +1694,7 @@ impl Pickers {
                     Some(PickerKind::HarnessModel) => self.model_rows_len(cx),
                     Some(PickerKind::Traits) => 0, // merged into HarnessModel
                     Some(PickerKind::Space) => self.filtered_space_rows(cx).len(),
-                    Some(PickerKind::Device) => self.device_rows(cx).len(),
+                    Some(PickerKind::Device) => self.filtered_device_rows(cx).len(),
                     None => 0,
                 };
                 self.active = popover::menu_step(Some(self.active), count, delta).unwrap_or(0);
@@ -1881,28 +1911,62 @@ impl Pickers {
         };
 
         if let Some(chat) = &session {
-            // Sessions never move: no footer for project-less / non-git
-            // sessions, read-only labels otherwise.
-            let space = space?;
-            if !space.git_detected {
-                return None;
+            // Sessions never move: everything renders as read-only labels.
+            // Device always; project only when the session has one; checkout
+            // kind + ref only when that project has git.
+            let device_label: SharedString = self
+                .state
+                .read(cx)
+                .device_name(&chat.device_id)
+                .map(str::to_string)
+                .unwrap_or_else(|| "Unknown device".to_string())
+                .into();
+            let mut left = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .min_w_0()
+                .gap(px(4.0))
+                .child(Self::footer_label(
+                    crate::icons::MONITOR,
+                    device_label,
+                    &theme,
+                ));
+            if let Some(space) = &space {
+                left = left.child(Self::footer_label(
+                    crate::icons::FOLDER,
+                    SharedString::from(space.display_name().to_string()),
+                    &theme,
+                ));
             }
-            let is_worktree = chat.cwd.as_deref().is_some_and(|cwd| cwd != space.path);
-            let (icon_path, label) = if is_worktree {
-                (crate::icons::FOLDER_WITH_FILES, "Worktree")
-            } else {
-                (crate::icons::FOLDER, "Local checkout")
-            };
-            let left = Self::footer_label(icon_path, SharedString::from(label), &theme);
-            let ref_side = Self::footer_label(
-                crate::icons::GIT_BRANCH,
-                chat.branch
-                    .clone()
-                    .map(SharedString::from)
-                    .unwrap_or_else(|| SharedString::from("No ref")),
-                &theme,
-            );
-            return Some(row().child(left).child(ref_side).into_any_element());
+            let right = space.as_ref().filter(|s| s.git_detected).map(|space| {
+                let is_worktree = chat.cwd.as_deref().is_some_and(|cwd| cwd != space.path);
+                let (icon_path, label) = if is_worktree {
+                    (crate::icons::FOLDER_WITH_FILES, "Worktree")
+                } else {
+                    (crate::icons::FOLDER, "Local checkout")
+                };
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .flex_none()
+                    .gap(px(4.0))
+                    .child(Self::footer_label(
+                        icon_path,
+                        SharedString::from(label),
+                        &theme,
+                    ))
+                    .child(Self::footer_label(
+                        crate::icons::GIT_BRANCH,
+                        chat.branch
+                            .clone()
+                            .map(SharedString::from)
+                            .unwrap_or_else(|| SharedString::from("No ref")),
+                        &theme,
+                    ))
+            });
+            return Some(row().child(left).children(right).into_any_element());
         }
 
         // New-session canvas.

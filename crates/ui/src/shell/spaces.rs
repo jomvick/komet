@@ -386,8 +386,8 @@ impl Shell {
         // NEW SESSION beside the trigger (adding a project lives in the
         // dropdown's "New project…" row now). While the sidebar is collapsed
         // this same button fades into the titlebar instead
-        // (`render_session_title_bar`).
-        let on_canvas = self.state.read(cx).selected_chat.is_none();
+        // (`render_session_title_bar`). A plain button — the canvas showing
+        // is not an "active" state worth a selected wash (user feedback).
         let add = div()
             .id("sidebar-new-session")
             .size(px(24.0))
@@ -397,18 +397,11 @@ impl Shell {
             .justify_center()
             .rounded(px(6.0))
             .cursor_pointer()
-            .bg(if on_canvas {
-                crate::theme::glass_selected_bg()
-            } else {
-                motion::hover_blend(
-                    "sidebar-new-session",
-                    crate::theme::wash(0.0),
-                    crate::theme::wash(0.14),
-                )
-            })
-            .when(on_canvas, |el| {
-                el.shadow(crate::theme::glass_selected_shadows())
-            })
+            .bg(motion::hover_blend(
+                "sidebar-new-session",
+                crate::theme::wash(0.0),
+                crate::theme::wash(0.14),
+            ))
             .on_hover(motion::hover_listener("sidebar-new-session"))
             .on_click(cx.listener(|this, _, _, cx| this.open_new_session(cx)))
             .child(

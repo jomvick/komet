@@ -463,6 +463,9 @@ pub struct Shell {
     /// trigger's click tell "toggle closed" apart from "just dismissed by
     /// this same click" (same guard as `user_menu_dismissed_at`).
     spaces_menu_dismissed_at: Option<std::time::Instant>,
+    /// Sidebar session row under the pointer — its status corner swaps to
+    /// the archive button (t3code's settle-on-hover).
+    chat_row_hover: Option<String>,
     /// Scroll position of the sidebar lists region (drives its edge fades).
     sidebar_scroll: gpui::ScrollHandle,
     /// `settings.last_space_id` applied once after the first spaces frame.
@@ -655,6 +658,7 @@ impl Shell {
             add_space: None,
             spaces_menu: popover::Popup::default(),
             spaces_menu_dismissed_at: None,
+            chat_row_hover: None,
             sidebar_scroll: gpui::ScrollHandle::new(),
             space_boot_applied: false,
             sound_prev: std::collections::HashMap::new(),
@@ -781,12 +785,23 @@ impl Shell {
         // chat implies its space, which `select_chat` already applied).
         if !self.space_boot_applied && !state.read(cx).spaces.is_empty() {
             self.space_boot_applied = true;
-            if state.read(cx).selected_chat.is_none()
-                && !state.read(cx).no_project
-                && let Some(last) = self.settings.last_space_id.clone()
-                && state.read(cx).space_row(&last).is_some()
-            {
-                state.update(cx, |s, cx| s.select_space(Some(last), cx));
+            if state.read(cx).selected_chat.is_none() {
+                // A set sidebar filter is an explicit standing choice — the
+                // canvas defaults (project AND its device) follow it, even
+                // over a remembered "no project" opt-out. Otherwise the last
+                // selected project stands, unless opted out.
+                let exists = |id: &String| state.read(cx).space_row(id).is_some();
+                let filter = self.settings.space_filter.clone().filter(&exists);
+                let target = match filter {
+                    Some(filter) => Some(filter),
+                    None if !state.read(cx).no_project => {
+                        self.settings.last_space_id.clone().filter(&exists)
+                    }
+                    None => None,
+                };
+                if target.is_some() {
+                    state.update(cx, |s, cx| s.select_space(target, cx));
+                }
             }
         }
         // Persist the selected space (the new-tab fallback under "All").
@@ -1865,9 +1880,12 @@ impl Shell {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        // Activity, not position (t3code Sidebar): status is a colored word in
-        // the row's top-right corner — Working animates the composer-strip
-        // spinner beside it; Idle rows show the relative time instead.
+        // Activity, not position (t3code Sidebar): status is a small colored
+        // word + glyph in the row's top-right corner — Working animates the
+        // composer-strip spinner, Done wears a check; Idle rows show the
+        // relative time instead. Under the pointer the whole corner swaps to
+        // the ARCHIVE button (t3code's settle-on-hover).
+        let row_hovered = self.chat_row_hover.as_deref() == Some(id.as_str());
         let status_color = spaces::status_dot_color(status, theme);
         let status_label: Option<&'static str> = match status {
             komet_proto::ChatIndicator::Working => Some("Working"),
@@ -1876,33 +1894,76 @@ impl Shell {
             komet_proto::ChatIndicator::Completed => Some("Done"),
             komet_proto::ChatIndicator::Idle => None,
         };
-        let corner: AnyElement = match status_label {
-            Some(label) => div()
+        let corner: AnyElement = if row_hovered {
+            let archive_id = id.clone();
+            div()
+                .id(SharedString::from(format!("chat-archive-{id}")))
                 .flex_none()
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap(px(5.0))
-                .when(status == komet_proto::ChatIndicator::Working, |el| {
-                    el.child(loaders::mini_gradient_spinner(
-                        format!("chat-working-{id}"),
-                        2.0,
-                        cx.entity_id(),
-                        cx,
-                    ))
-                })
+                .gap(px(4.0))
+                .h(px(18.0))
+                .px(px(6.0))
+                .rounded(px(5.0))
+                .bg(crate::theme::wash(0.10))
+                .hover(|s| s.bg(crate::theme::wash(0.18)))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.archive_chat(archive_id.clone(), cx);
+                }))
+                .child(
+                    icon(icons::ARCHIVE_MINIMALISTIC)
+                        .size(px(11.0))
+                        .flex_none()
+                        .text_color(theme.text_muted),
+                )
                 .child(
                     div()
-                        .text_size(px(11.0))
-                        .text_color(status_color)
-                        .child(SharedString::from(label)),
+                        .text_size(px(10.0))
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from("Archive")),
                 )
-                .into_any_element(),
-            None => div()
-                .flex_none()
-                .text_size(px(11.0))
-                .child(time_ago.clone())
-                .into_any_element(),
+                .into_any_element()
+        } else {
+            match status_label {
+                Some(label) => div()
+                    .flex_none()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(4.0))
+                    .when(status == komet_proto::ChatIndicator::Working, |el| {
+                        el.child(loaders::mini_gradient_spinner(
+                            format!("chat-working-{id}"),
+                            2.0,
+                            cx.entity_id(),
+                            cx,
+                        ))
+                    })
+                    .when(status == komet_proto::ChatIndicator::Completed, |el| {
+                        el.child(
+                            icon(icons::CHECK)
+                                .size(px(11.0))
+                                .flex_none()
+                                .text_color(status_color),
+                        )
+                    })
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(status_color)
+                            .child(SharedString::from(label)),
+                    )
+                    .into_any_element(),
+                None => div()
+                    .flex_none()
+                    .text_size(px(10.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .child(time_ago.clone())
+                    .into_any_element(),
+            }
         };
         let (hover, text) = (theme.glass_hover(), theme.text);
         let selected_wash = crate::theme::glass_selected_bg();
@@ -1936,10 +1997,25 @@ impl Shell {
             .when(selected, |el| {
                 el.shadow(crate::theme::glass_selected_shadows())
             })
-            .on_hover(motion::hover_listener(fade_key))
+            // ONE on_hover per element (gpui): drive the fade AND the shell's
+            // hover row (the archive-swap corner) from the same listener.
+            .on_hover(cx.listener({
+                let hover_id = id.clone();
+                move |this, hovered: &bool, window, cx| {
+                    motion::set_hover(&fade_key, *hovered, motion::reduced_motion(cx));
+                    window.refresh();
+                    if *hovered {
+                        if this.chat_row_hover.as_deref() != Some(hover_id.as_str()) {
+                            this.chat_row_hover = Some(hover_id.clone());
+                            cx.notify();
+                        }
+                    } else if this.chat_row_hover.as_deref() == Some(hover_id.as_str()) {
+                        this.chat_row_hover = None;
+                        cx.notify();
+                    }
+                }
+            }))
             .cursor_pointer()
-            // A sidebar click opens the session as a tab (appends if absent,
-            // focuses if present) — the reopen path for locally closed tabs.
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.open_chat(select_id.clone(), cx);
             }))
