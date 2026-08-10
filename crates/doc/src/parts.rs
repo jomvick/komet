@@ -17,12 +17,40 @@ use crate::constants::MSG_INLINE_MAX;
 /// summary, so 160 is generous.
 pub const TOOL_OUTPUT_SUMMARY_MAX: usize = 160;
 
-/// One line of the doc-resident summary for a tool output: the first
-/// non-empty line, capped at [`TOOL_OUTPUT_SUMMARY_MAX`] chars. `None` for
-/// blank output. The `…` marker means "there is more in the sidecar".
+/// The doc-resident form of a tool output (docs/chat2-sync.md A1; the R2
+/// sidecar is PARKED as of 2026-08-10, so this IS the whole record in the
+/// doc — the full text survives only in the host's local run journal):
+///
+/// - Markdown code fences are stripped first — ACP harnesses fence every
+///   output, so the fence is transport wrapping, never content (pre-fix,
+///   every summary read "```console…").
+/// - Outputs that fit [`TOOL_OUTPUT_SUMMARY_MAX`] chars ride whole — a
+///   summary of a two-line output is more UI than the output.
+/// - Bigger outputs keep the first non-empty line, capped, with a `…`
+///   marker meaning "there was more".
+///
+/// `None` for blank output.
 pub fn summarize_tool_output(text: &str) -> Option<String> {
-    let line = text.lines().find(|l| !l.trim().is_empty())?;
-    let line = line.trim_end();
+    let kept: Vec<&str> = text
+        .lines()
+        .filter(|l| !l.trim_start().starts_with("```"))
+        .collect();
+    let stripped = kept.join("\n");
+    let stripped = stripped.trim();
+    if stripped.is_empty() {
+        return None;
+    }
+    if stripped.chars().count() <= TOOL_OUTPUT_SUMMARY_MAX {
+        return Some(stripped.to_owned());
+    }
+    // Too big to inline: first non-empty line, capped. There is always more
+    // than the summary here (whole output exceeded the budget), so the
+    // marker is unconditional.
+    let line = stripped
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or(stripped)
+        .trim_end();
     let mut chars = 0usize;
     let mut end = line.len();
     for (i, _) in line.char_indices() {
@@ -32,16 +60,8 @@ pub fn summarize_tool_output(text: &str) -> Option<String> {
         }
         chars += 1;
     }
-    // "…" means content beyond this line exists in the sidecar — measure the
-    // REMAINDER after the summarized line, not total length (leading blank
-    // lines used to false-positive the marker).
-    let offset = line.as_ptr() as usize - text.as_ptr() as usize;
-    let rest = &text[offset + line.len()..];
-    let cut = end < line.len() || !rest.trim().is_empty();
     let mut out = line[..end].to_owned();
-    if cut {
-        out.push('…');
-    }
+    out.push('…');
     Some(out)
 }
 
@@ -258,16 +278,16 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                 {
                     *e = *is_error;
                     *resolved = true;
-                    // The strip (docs/chat2-sync.md A1): the doc gets a
-                    // one-line summary + byte count; the full text rides the
-                    // sidecar (the host uploads it from the same event —
-                    // `sidecar_payload`). Inline diffs die entirely: stats
-                    // only, never text.
-                    *out_slot = output.as_deref().and_then(summarize_tool_output);
-                    *output_bytes = output
-                        .as_ref()
-                        .filter(|o| !o.trim().is_empty())
-                        .map(|o| o.len() as u64);
+                    // Tool OUTPUTS never enter the doc (2026-08-10 product
+                    // call: chips are one-liners — name + call info — like
+                    // pre-output builds; the R2 sidecar is parked with them,
+                    // docs/chat2-sync.md A2). Full text lives only in the
+                    // host's run journal. Inline diffs die the same way:
+                    // stats only, never text. `is_error` still folds so
+                    // failed chips read as failed.
+                    let _ = output; // journal-only
+                    *out_slot = None;
+                    *output_bytes = None;
                     *diff_slot = None;
                     *diff_stats = diff.as_ref().map(|d| vec![diff_stat(d)]);
                 }
@@ -642,23 +662,30 @@ mod tests {
     // ── A1 strip (docs/chat2-sync.md) ───────────────────────────────────────
 
     #[test]
-    fn summarize_takes_first_nonempty_line_and_marks_the_cut() {
+    fn summarize_inlines_small_outputs_and_marks_big_cuts() {
         assert_eq!(summarize_tool_output(""), None);
         assert_eq!(summarize_tool_output("  \n\t\n"), None);
         assert_eq!(summarize_tool_output("one line"), Some("one line".into()));
+        // Small multi-line outputs ride whole — no summary, no "…".
         assert_eq!(
             summarize_tool_output("\n\nfirst real\nsecond"),
-            Some("first real…".into())
-        );
-        // Leading blank lines alone are NOT "more content" — no false "…".
-        assert_eq!(
-            summarize_tool_output("\n\nonly line"),
-            Some("only line".into())
+            Some("first real\nsecond".into())
         );
         assert_eq!(
             summarize_tool_output("only line\n\n  \n"),
             Some("only line".into())
         );
+        // Markdown fences are transport wrapping, never content: stripped
+        // even when they'd otherwise be the first line, and a fence-only
+        // output is blank.
+        assert_eq!(
+            summarize_tool_output("```console\nreal content\n```"),
+            Some("real content".into())
+        );
+        assert_eq!(summarize_tool_output("```\n```"), None);
+        // Big outputs: first non-empty (post-fence) line + unconditional "…".
+        let big = format!("```console\nhead line\n{}\n```", "x".repeat(300));
+        assert_eq!(summarize_tool_output(&big), Some("head line…".into()));
         let long = "x".repeat(TOOL_OUTPUT_SUMMARY_MAX + 40);
         let summary = summarize_tool_output(&long).unwrap();
         assert_eq!(summary.chars().count(), TOOL_OUTPUT_SUMMARY_MAX + 1);
@@ -722,8 +749,10 @@ mod tests {
                 diff_stats,
                 ..
             } => {
-                assert_eq!(output.as_deref(), Some("running 42 tests…"));
-                assert_eq!(*output_bytes, Some(full.len() as u64));
+                // One-liner chips: outputs never enter the doc at all
+                // (journal-only); diff text neither — stats survive.
+                assert_eq!(output.as_deref(), None);
+                assert_eq!(*output_bytes, None);
                 assert!(diff.is_none(), "inline diff text must not enter the doc");
                 let stats = diff_stats.as_ref().unwrap();
                 assert_eq!(stats.len(), 1);
@@ -776,7 +805,10 @@ mod tests {
                 diff_ref,
                 ..
             } => {
-                assert_eq!(output_ref.as_deref(), Some("chat-9/t1"));
+                // One-liner fold: outputs never reach the doc, so there is
+                // no output content to key even after resolution; diff
+                // STATS exist, so the diff ref still stamps.
+                assert_eq!(output_ref.as_deref(), None);
                 assert_eq!(diff_ref.as_deref(), Some("chat-9/t1.diff"));
             }
             other => panic!("unexpected {other:?}"),

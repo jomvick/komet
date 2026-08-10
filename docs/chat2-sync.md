@@ -47,7 +47,14 @@ Stops new whales being born. No protocol changes; additive on the existing s2 ro
 - Old readers: both fields are already serde-additive; old app versions render the
   summary as if it were the output. Acceptable.
 
-**A2. Output sidecar.** Full (still 4 KiB-capped at the harness boundary) outputs and
+**A2. Output sidecar.** *[PARKED 2026-08-10 (v0.1.30): product call — no R2
+uploads for now. The fold keeps small outputs inline (≤160 chars,
+fence-stripped) and summarizes big ones; full text survives only in the
+host's run journal. The machinery below (blob routes, `sidecar_payload`,
+`apply_sidecar_refs`, `upload_tool_sidecar`, UI upgrade path) is built,
+tested, and dormant — reintroduction is re-adding one call site in
+`sessions.rs`. M1's rebuild still returns sidecar payloads; the C3 cutover
+must decide their fate (upload or drop) before flipping `roomGen`.]* Full (still 4 KiB-capped at the harness boundary) outputs and
 diffs go to R2 through a Worker route (no DO involvement — the `BLOBS` bucket already
 exists): `PUT/GET /blob/{chatId}/{partId}` , owner-auth via the existing Worker JWT
 check. Host uploads are debounced/batched per commit tick, fire-and-forget (a lost

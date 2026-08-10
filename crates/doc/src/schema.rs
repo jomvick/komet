@@ -1054,9 +1054,14 @@ mod tests {
                 diff_stats,
                 ..
             } => {
-                assert_eq!(output.as_deref(), Some("total 0…"));
-                assert_eq!(output_ref.as_deref(), Some("chat-2/t1"));
-                assert_eq!(*output_bytes, Some("total 0\nmore lines".len() as u64));
+                // One-liner chips: the fold drops outputs entirely (journal
+                // only), so even a direct apply_sidecar_refs call has no
+                // output to key — diff stats still get their ref (this test
+                // calls apply_sidecar_refs directly; the live fold no longer
+                // does).
+                assert_eq!(output.as_deref(), None);
+                assert_eq!(output_ref.as_deref(), None);
+                assert_eq!(*output_bytes, None);
                 assert!(diff.is_none(), "no inline diff text in the doc");
                 assert_eq!(diff_ref.as_deref(), Some("chat-2/t1.diff"));
                 let stats = diff_stats.as_ref().expect("stats survive");

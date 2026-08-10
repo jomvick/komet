@@ -1265,16 +1265,12 @@ async fn drive_run(
         let skip_fold = matches!(&event, AgentEvent::SessionStarted { .. }) && !folded.is_empty();
         if !skip_fold {
             fold_event_into_parts(&mut folded, &event);
-            // A1 strip companions: the fold left only a summary in the doc;
-            // the full output/diff ride the R2 sidecar (fire-and-forget — a
-            // lost upload degrades to "full output unavailable", never blocks
-            // the doc), and the parts get their sidecar keys stamped.
-            if let Some(payload) = komet_doc::sidecar_payload(&event) {
-                komet_doc::apply_sidecar_refs(&chat_id, &mut folded);
-                if let Some(doc_host) = inner.doc_host.get() {
-                    doc_host.upload_tool_sidecar(&chat_id, payload);
-                }
-            }
+            // R2 sidecar PARKED (2026-08-10, product call): the fold's
+            // summary/stats ARE the doc's whole record — no refs stamped, no
+            // uploads. Full outputs survive only in the host's local run
+            // journal. To reintroduce: `komet_doc::sidecar_payload(&event)`
+            // → `apply_sidecar_refs` → `doc_host.upload_tool_sidecar`, all
+            // still in place and tested.
         }
 
         if let AgentEvent::Done { status, .. } = &event {
