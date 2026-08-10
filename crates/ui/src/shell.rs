@@ -463,9 +463,10 @@ pub struct Shell {
     /// trigger's click tell "toggle closed" apart from "just dismissed by
     /// this same click" (same guard as `user_menu_dismissed_at`).
     spaces_menu_dismissed_at: Option<std::time::Instant>,
-    /// Sidebar session row under the pointer — its status corner swaps to
-    /// the archive button (t3code's settle-on-hover).
-    chat_row_hover: Option<String>,
+    /// Chat id whose STATUS CORNER is under the pointer — just that corner
+    /// swaps to the archive button (t3code's settle-on-hover); hovering the
+    /// row body leaves the status readable.
+    chat_status_hover: Option<String>,
     /// Scroll position of the sidebar lists region (drives its edge fades).
     sidebar_scroll: gpui::ScrollHandle,
     /// `settings.last_space_id` applied once after the first spaces frame.
@@ -658,7 +659,7 @@ impl Shell {
             add_space: None,
             spaces_menu: popover::Popup::default(),
             spaces_menu_dismissed_at: None,
-            chat_row_hover: None,
+            chat_status_hover: None,
             sidebar_scroll: gpui::ScrollHandle::new(),
             space_boot_applied: false,
             sound_prev: std::collections::HashMap::new(),
@@ -1653,6 +1654,13 @@ impl Shell {
         let theme = Theme::of(cx).clone();
         let can_back = self.nav.can_back();
         let can_forward = self.nav.can_forward();
+        // The new-session + joins the cluster while the sidebar is collapsed
+        // (fading on the sidebar width tween) — INSIDE the cluster row so it
+        // shares the buttons' exact size and 2px rhythm; a separate mount in
+        // the title row sat 10px off the cluster and read misaligned (user
+        // report).
+        let plus_alpha = self.titlebar_plus_alpha();
+        let show_plus = matches!(self.route, Route::Chat) && plus_alpha > 0.01;
         div()
             .absolute()
             .top_0()
@@ -1685,7 +1693,27 @@ impl Shell {
                 &theme,
                 cx.listener(|this, _, _, cx| this.navigate_forward(cx)),
             ))
+            .children(show_plus.then(|| {
+                div()
+                    .flex_none()
+                    .opacity(plus_alpha)
+                    .child(window_control_button(
+                        "titlebar-new-session",
+                        icons::PLUS,
+                        &theme,
+                        cx.listener(|this, _, _, cx| this.open_new_session(cx)),
+                    ))
+            }))
             .into_any_element()
+    }
+
+    /// How present the titlebar's new-session + is: 0 with the sidebar open
+    /// (the + lives in the sidebar header), 1 fully collapsed, riding the
+    /// sidebar width tween in between.
+    pub(super) fn titlebar_plus_alpha(&self) -> f32 {
+        let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
+        let open_width = self.settings.sidebar_width.max(1.0);
+        (1.0 - sidebar_now / open_width).clamp(0.0, 1.0)
     }
 
     /// Native Windows caption controls integrated into Komet's unified
@@ -1883,9 +1911,10 @@ impl Shell {
         // Activity, not position (t3code Sidebar): status is a small colored
         // word + glyph in the row's top-right corner — Working animates the
         // composer-strip spinner, Done wears a check; Idle rows show the
-        // relative time instead. Under the pointer the whole corner swaps to
-        // the ARCHIVE button (t3code's settle-on-hover).
-        let row_hovered = self.chat_row_hover.as_deref() == Some(id.as_str());
+        // relative time instead. Hovering THE CORNER ITSELF (not the row —
+        // user feedback) swaps it for the ARCHIVE button, t3code's
+        // settle-on-hover.
+        let corner_hovered = self.chat_status_hover.as_deref() == Some(id.as_str());
         let status_color = spaces::status_dot_color(status, theme);
         let status_label: Option<&'static str> = match status {
             komet_proto::ChatIndicator::Working => Some("Working"),
@@ -1894,11 +1923,8 @@ impl Shell {
             komet_proto::ChatIndicator::Completed => Some("Done"),
             komet_proto::ChatIndicator::Idle => None,
         };
-        let corner: AnyElement = if row_hovered {
-            let archive_id = id.clone();
+        let corner_body: AnyElement = if corner_hovered {
             div()
-                .id(SharedString::from(format!("chat-archive-{id}")))
-                .flex_none()
                 .flex()
                 .flex_row()
                 .items_center()
@@ -1908,10 +1934,6 @@ impl Shell {
                 .rounded(px(5.0))
                 .bg(crate::theme::wash(0.10))
                 .hover(|s| s.bg(crate::theme::wash(0.18)))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.archive_chat(archive_id.clone(), cx);
-                }))
                 .child(
                     icon(icons::ARCHIVE_MINIMALISTIC)
                         .size(px(11.0))
@@ -1928,7 +1950,6 @@ impl Shell {
         } else {
             match status_label {
                 Some(label) => div()
-                    .flex_none()
                     .flex()
                     .flex_row()
                     .items_center()
@@ -1958,12 +1979,41 @@ impl Shell {
                     )
                     .into_any_element(),
                 None => div()
-                    .flex_none()
                     .text_size(px(10.0))
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .child(time_ago.clone())
                     .into_any_element(),
             }
+        };
+        // One stable wrapper across both states (identity keeps the hover
+        // from flickering as the content swaps); archiving only clicks while
+        // the corner is hovered, so the row's own click stays the selector.
+        let corner: AnyElement = {
+            let hover_id = id.clone();
+            let archive_id = id.clone();
+            div()
+                .id(SharedString::from(format!("chat-corner-{id}")))
+                .flex_none()
+                .occlude()
+                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                    if *hovered {
+                        if this.chat_status_hover.as_deref() != Some(hover_id.as_str()) {
+                            this.chat_status_hover = Some(hover_id.clone());
+                            cx.notify();
+                        }
+                    } else if this.chat_status_hover.as_deref() == Some(hover_id.as_str()) {
+                        this.chat_status_hover = None;
+                        cx.notify();
+                    }
+                }))
+                .when(corner_hovered, |el| {
+                    el.cursor_pointer().on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.archive_chat(archive_id.clone(), cx);
+                    }))
+                })
+                .child(corner_body)
+                .into_any_element()
         };
         let (hover, text) = (theme.glass_hover(), theme.text);
         let selected_wash = crate::theme::glass_selected_bg();
@@ -1997,24 +2047,7 @@ impl Shell {
             .when(selected, |el| {
                 el.shadow(crate::theme::glass_selected_shadows())
             })
-            // ONE on_hover per element (gpui): drive the fade AND the shell's
-            // hover row (the archive-swap corner) from the same listener.
-            .on_hover(cx.listener({
-                let hover_id = id.clone();
-                move |this, hovered: &bool, window, cx| {
-                    motion::set_hover(&fade_key, *hovered, motion::reduced_motion(cx));
-                    window.refresh();
-                    if *hovered {
-                        if this.chat_row_hover.as_deref() != Some(hover_id.as_str()) {
-                            this.chat_row_hover = Some(hover_id.clone());
-                            cx.notify();
-                        }
-                    } else if this.chat_row_hover.as_deref() == Some(hover_id.as_str()) {
-                        this.chat_row_hover = None;
-                        cx.notify();
-                    }
-                }
-            }))
+            .on_hover(motion::hover_listener(fade_key))
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.open_chat(select_id.clone(), cx);

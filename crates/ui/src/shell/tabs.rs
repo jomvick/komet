@@ -79,48 +79,18 @@ impl Shell {
         };
         let git = self.space_git_detected(cx);
 
-        // The new-session `+` lives in the sidebar header; when the sidebar
-        // collapses it FADES into the titlebar here, riding the same width
-        // tween the sidebar animates on (1 at collapsed, 0 at open — no
-        // pop-in, and no dead hit-target while invisible).
+        // The new-session `+` renders in the WINDOW-CONTROL CLUSTER while the
+        // sidebar is collapsed (`render_titlebar_cluster`) — this row only
+        // budgets for it: the title's left inset grows by one button slot as
+        // the + fades in, so the text never sits under it.
         let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
-        let open_width = self.settings.sidebar_width.max(1.0);
-        let plus_alpha = (1.0 - sidebar_now / open_width).clamp(0.0, 1.0);
-        let plus: Option<AnyElement> = (plus_alpha > 0.01).then(|| {
-            div()
-                .id("titlebar-new-session")
-                .size(px(24.0))
-                .flex_none()
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(px(6.0))
-                .opacity(plus_alpha)
-                .cursor_pointer()
-                .bg(motion::hover_blend(
-                    "titlebar-new-session",
-                    theme.glass_hover().opacity(0.0),
-                    theme.glass_hover(),
-                ))
-                .on_hover(motion::hover_listener("titlebar-new-session"))
-                .occlude()
-                .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
-                .on_click(cx.listener(|this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.open_new_session(cx);
-                }))
-                .child(
-                    icon(icons::PLUS)
-                        .size(px(16.0))
-                        .text_color(theme.text_muted),
-                )
-                .into_any_element()
-        });
+        let plus_inset = 26.0 * self.titlebar_plus_alpha();
 
         // Same glide as the old strip: content starts at the inset card's
         // left edge while the sidebar is open, and slides toward the control
         // cluster as it collapses.
-        let content_left = (sidebar_now + Theme::SPACE_LG).max(self.title_bar_content_start());
+        let content_left =
+            (sidebar_now + Theme::SPACE_LG).max(self.title_bar_content_start() + plus_inset);
         let inner = div()
             .size_full()
             .flex()
@@ -132,7 +102,6 @@ impl Shell {
                 cfg!(target_os = "windows"),
                 Theme::SPACE_LG,
             )))
-            .children(plus)
             .child(
                 div()
                     .min_w_0()
