@@ -196,7 +196,7 @@ fn pre_title(core: &EngineCore) {
         .create_space("space-restart", &core.device_id, "/tmp", None, false)
         .expect("create space row");
     core.workspace
-        .create_chat(CHAT, "space-restart", None, None)
+        .create_chat(CHAT, Some("space-restart"), None, None, None)
         .expect("create chat row");
     core.workspace
         .rename_chat(CHAT, "Pre-titled")

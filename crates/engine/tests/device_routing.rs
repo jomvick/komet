@@ -364,7 +364,7 @@ async fn terminal_stream_proxies_over_the_relay() {
         .expect("space row on B");
     core_b
         .workspace
-        .create_chat("chat-term", "space-term", None, None)
+        .create_chat("chat-term", Some("space-term"), None, None, None)
         .expect("chat row on B");
     let _host = core_b.start_host_relay(&relay_url);
 

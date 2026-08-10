@@ -1614,7 +1614,7 @@ async fn real_claude_sees_uploaded_image_inline() {
     .expect("engine core assembles");
     // Pre-title the chat so the auto-titler doesn't spend a second model call.
     core.workspace
-        .create_chat(CHAT, &core.device_id, None, Some("/tmp".into()))
+        .create_chat(CHAT, None, Some(&core.device_id), None, Some("/tmp".into()))
         .expect("create chat row");
     core.workspace
         .rename_chat(CHAT, "Pre-titled")

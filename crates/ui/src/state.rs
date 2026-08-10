@@ -369,9 +369,19 @@ pub struct AppState {
     /// Sorted (see [`sort_chats`]); includes archived rows — views filter.
     pub chats: Vec<Chat>,
     pub sessions: Vec<Session>,
-    /// The space whose tabs fill the main area. Healed by [`Self::apply_spaces`]
-    /// when the row vanishes; selecting a chat implies its space.
+    /// The project the new-session canvas mints into. Healed by
+    /// [`Self::apply_spaces`] when the row vanishes; selecting a chat implies
+    /// its project.
     pub selected_space: Option<String>,
+    /// Deliberate "Don't work in a project" pick: while set, the canvas mints
+    /// project-less sessions (cwd `~` on the picked device) and
+    /// [`Self::selected_space_row`] reads as `None` — healing must NOT
+    /// re-select a project underneath it.
+    pub no_project: bool,
+    /// The composer's device pick — where project-less sessions run, and the
+    /// device whose projects the project picker lists. `None` falls back to
+    /// the local device.
+    pub selected_device: Option<String>,
     pub selected_chat: Option<String>,
     /// Boot auto-select happened (or a manual selection superseded it).
     pub auto_selected: bool,
@@ -417,6 +427,8 @@ impl AppState {
             chats: Vec::new(),
             sessions: Vec::new(),
             selected_space: None,
+            no_project: false,
+            selected_device: None,
             selected_chat: None,
             transcript: Vec::new(),
             echoes: HashMap::new(),
@@ -457,17 +469,18 @@ impl AppState {
         sort_spaces(&mut spaces);
         self.spaces = spaces;
         self.spaces_synced = true;
-        // Heal a vanished selection (space deleted elsewhere): fall back to the
-        // first space; its chats died with it, so a matching chat selection is
-        // healed by the accompanying chats frame (`apply_chats`).
+        // Heal a vanished selection (project deleted elsewhere): fall back to
+        // the first project; its chats died with it, so a matching chat
+        // selection is healed by the accompanying chats frame (`apply_chats`).
         if let Some(selected) = &self.selected_space
             && !self.spaces.iter().any(|s| &s.id == selected)
         {
             self.selected_space = self.spaces.first().map(|s| s.id.clone());
         }
-        // First frame with no selection yet: pick the first space so the shell
-        // never renders an empty main area while spaces exist.
-        if self.selected_space.is_none() {
+        // First frame with no selection yet: pick the first project so the
+        // canvas never boots project-less by accident — unless the user
+        // deliberately opted out.
+        if self.selected_space.is_none() && !self.no_project {
             self.selected_space = self.spaces.first().map(|s| s.id.clone());
         }
     }
@@ -629,8 +642,44 @@ impl AppState {
     }
 
     pub fn selected_space_row(&self) -> Option<&Space> {
+        if self.no_project {
+            return None;
+        }
         let id = self.selected_space.as_deref()?;
         self.spaces.iter().find(|s| s.id == id)
+    }
+
+    /// The device the new-session canvas targets: the picked project's host
+    /// when one is selected, else the explicit device pick, else this device.
+    pub fn effective_device_id(&self) -> Option<String> {
+        if let Some(space) = self.selected_space_row() {
+            return Some(space.device_id.clone());
+        }
+        self.selected_device
+            .clone()
+            .or_else(|| self.local_device_id.clone())
+    }
+
+    /// Pick the composer's target device. Keeps the project pick consistent:
+    /// a project on another device can't survive the switch — fall back to
+    /// the first project on the new device, else "no project".
+    pub fn select_device(&mut self, device_id: String, cx: &mut Context<Self>) {
+        let project_moves = self
+            .selected_space_row()
+            .is_some_and(|s| s.device_id != device_id);
+        if project_moves {
+            let first = self
+                .spaces_sorted()
+                .iter()
+                .find(|s| s.device_id == device_id)
+                .map(|s| s.id.clone());
+            self.no_project = first.is_none();
+            if first.is_some() {
+                self.selected_space = first;
+            }
+        }
+        self.selected_device = Some(device_id);
+        cx.notify();
     }
 
     pub fn space_row(&self, space_id: &str) -> Option<&Space> {
@@ -718,10 +767,10 @@ impl AppState {
     pub fn overview_chats(&self, now: DateTime<Utc>) -> Vec<(ChatIndicator, &Chat)> {
         let mut rows: Vec<(ChatIndicator, &Chat)> = self
             .visible_chats()
-            .filter(|c| {
-                c.space_id
-                    .as_deref()
-                    .is_some_and(|id| self.space_row(id).is_some())
+            .filter(|c| match c.space_id.as_deref() {
+                // Project-less sessions are first-class rows.
+                None => true,
+                Some(id) => self.space_row(id).is_some(),
             })
             .map(|c| (self.display_status_for(c, now), c))
             .collect();
@@ -853,15 +902,19 @@ impl AppState {
         self.transcript.clear();
         self.transcript_task = None;
         if let Some(id) = chat_id.as_deref() {
-            // A chat implies its space; `select_chat(None)` (the new-session
-            // canvas) stays within the current space.
-            if let Some(space_id) = self
-                .chats
-                .iter()
-                .find(|c| c.id == id)
-                .and_then(|c| c.space_id.clone())
-            {
-                self.selected_space = Some(space_id);
+            // A chat implies its project (or the lack of one); `select_chat(None)`
+            // (the new-session canvas) keeps the current project pick.
+            if let Some(chat) = self.chats.iter().find(|c| c.id == id) {
+                match chat.space_id.clone() {
+                    Some(space_id) => {
+                        self.selected_space = Some(space_id);
+                        self.no_project = false;
+                    }
+                    None => {
+                        self.no_project = true;
+                        self.selected_device = Some(chat.device_id.clone());
+                    }
+                }
             }
             self.mark_chat_seen(id, cx);
         }
@@ -871,12 +924,26 @@ impl AppState {
         cx.notify();
     }
 
-    /// Select a space; the caller (shell) decides which chat to land on.
+    /// Select a project; the caller (shell) decides which chat to land on.
+    /// `Some` clears a "Don't work in a project" opt-out and re-aims the
+    /// device pick at the project's host; `None` IS that opt-out.
     pub fn select_space(&mut self, space_id: Option<String>, cx: &mut Context<Self>) {
-        if self.selected_space == space_id {
+        match &space_id {
+            Some(id) => {
+                self.no_project = false;
+                if let Some(device) = self.space_row(id).map(|s| s.device_id.clone()) {
+                    self.selected_device = Some(device);
+                }
+            }
+            None => self.no_project = true,
+        }
+        if self.selected_space == space_id && space_id.is_some() {
+            cx.notify();
             return;
         }
-        self.selected_space = space_id;
+        if space_id.is_some() {
+            self.selected_space = space_id;
+        }
         cx.notify();
     }
 

@@ -546,7 +546,7 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
         )
         .expect("create space");
     core.workspace
-        .create_chat(chat_id, "space-title", None, Some(worktree.path.clone()))
+        .create_chat(chat_id, Some("space-title"), None, None, Some(worktree.path.clone()))
         .expect("create chat");
     core.workspace
         .set_chat_branch(chat_id, &worktree.branch)
