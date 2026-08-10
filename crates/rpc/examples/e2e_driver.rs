@@ -44,6 +44,11 @@ async fn device_id(client: &RpcClient, label: &str) -> String {
 }
 
 /// Subscribe to a watch-stream and poll items until `predicate` returns `Some`.
+///
+/// Stream end is NOT a failure: the engine ends watch streams deliberately at
+/// lifecycle boundaries (the chat2 cutover drops the s2 handle so watchers
+/// converge onto the new room), and the client contract — the UI does exactly
+/// this — is to resubscribe. The step deadline still bounds the whole wait.
 async fn wait_stream<T>(
     client: &RpcClient,
     method: &str,
@@ -51,30 +56,42 @@ async fn wait_stream<T>(
     what: &str,
     predicate: impl Fn(&serde_json::Value) -> Option<T>,
 ) -> T {
-    let mut rx = match client.subscribe(method, params).await {
-        Ok(rx) => rx,
-        Err(err) => fail(&format!("{what}: subscribe {method} failed: {err}")),
-    };
     let deadline = Instant::now() + STEP_TIMEOUT;
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
+    'resubscribe: loop {
+        if deadline.saturating_duration_since(Instant::now()).is_zero() {
             fail(&format!(
                 "{what}: timed out after {}s",
                 STEP_TIMEOUT.as_secs()
             ));
         }
-        match tokio::time::timeout(remaining, rx.recv()).await {
-            Ok(Some(item)) => {
-                if let Some(found) = predicate(&item) {
-                    return found;
-                }
+        let mut rx = match client.subscribe(method, params.clone()).await {
+            Ok(rx) => rx,
+            Err(err) => fail(&format!("{what}: subscribe {method} failed: {err}")),
+        };
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                fail(&format!(
+                    "{what}: timed out after {}s",
+                    STEP_TIMEOUT.as_secs()
+                ));
             }
-            Ok(None) => fail(&format!("{what}: stream ended early")),
-            Err(_) => fail(&format!(
-                "{what}: timed out after {}s",
-                STEP_TIMEOUT.as_secs()
-            )),
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Some(item)) => {
+                    if let Some(found) = predicate(&item) {
+                        return found;
+                    }
+                }
+                Ok(None) => {
+                    // Lifecycle boundary (e.g. chat2 cutover): resubscribe.
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    continue 'resubscribe;
+                }
+                Err(_) => fail(&format!(
+                    "{what}: timed out after {}s",
+                    STEP_TIMEOUT.as_secs()
+                )),
+            }
         }
     }
 }
@@ -209,14 +226,26 @@ async fn main() {
     .unwrap_or_else(|err| fail(&format!("QueueCommand on B: {err}")));
     pass("run command queued on B via the doc command queue");
 
-    // 5a. Assistant entry executed by A arrives back on B, complete, with the mock text.
+    // 5a. Assistant entry executed by A arrives back on B, complete, with the
+    // mock text. WatchDocMessages speaks the framed protocol: a full `reset`
+    // list on attach, then `upsert`/`append` deltas (each wrapping an
+    // `entry`) — collect candidates from both shapes.
     let (by_device, text) = wait_stream(
         &b,
         methods::WATCH_DOC_MESSAGES,
         serde_json::json!({ "chatId": chat_id }),
         "assistant transcript on B",
         |item| {
-            let entry = item.as_array()?.iter().find(|entry| {
+            let mut candidates: Vec<&serde_json::Value> = Vec::new();
+            if let Some(reset) = item.get("reset").and_then(|v| v.as_array()) {
+                candidates.extend(reset.iter());
+            }
+            for key in ["upsert", "append"] {
+                if let Some(deltas) = item.get(key).and_then(|v| v.as_array()) {
+                    candidates.extend(deltas.iter().filter_map(|d| d.get("entry")));
+                }
+            }
+            let entry = candidates.into_iter().find(|entry| {
                 entry.get("role").and_then(|v| v.as_str()) == Some("assistant")
                     && entry.get("status").and_then(|v| v.as_str()) == Some("complete")
             })?;

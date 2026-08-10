@@ -243,6 +243,9 @@ impl ChatDocHandle {
         if let Some(room) = lock(&self.room).as_ref() {
             room.probe();
         }
+        if let Some(chat2) = lock(&self.chat2).as_ref() {
+            chat2.probe();
+        }
         // Subscribe BEFORE the dirty check: a commit racing this attach then
         // sees a live receiver and publishes, instead of re-marking dirty
         // after our refresh and leaving the new watcher a cleared mirror.
@@ -380,7 +383,55 @@ impl DocHost {
 
     /// Wire the workspace host (engine assembly) — the source of chat-ownership rows.
     pub fn set_workspace(&self, workspace: WorkspaceHost) {
-        let _ = self.inner.workspace.set(workspace);
+        let chats = workspace.watch_chats();
+        if self.inner.workspace.set(workspace).is_ok() {
+            self.spawn_cutover_watcher(chats);
+        }
+    }
+
+    /// Live cutover convergence: when a registry chat row flips to roomGen 2
+    /// while this device holds an s2-mode handle, retire it NOW — a viewer
+    /// watching the chat at flip time otherwise stays frozen on the dead s2
+    /// room until they happen to reopen (the host writes only to chat2 from
+    /// the flip on). Dropping the handle ends the watch streams cleanly; the
+    /// UI's transcript/standing watches resubscribe and the fresh open takes
+    /// the chat2 adopt path. A handle with a LIVE local writer (a running
+    /// turn's doc ref) is left alone — the host never flips mid-run, and a
+    /// racing writer must never lose its doc out from under it.
+    fn spawn_cutover_watcher(&self, mut chats: watch::Receiver<Vec<komet_proto::Chat>>) {
+        let host = self.clone();
+        tokio::spawn(async move {
+            loop {
+                if chats.changed().await.is_err() {
+                    return; // workspace host gone (shutdown)
+                }
+                let flipped: Vec<String> = chats
+                    .borrow_and_update()
+                    .iter()
+                    .filter(|c| c.room_gen.unwrap_or(1) >= 2)
+                    .map(|c| c.id.clone())
+                    .collect();
+                if flipped.is_empty() {
+                    continue;
+                }
+                let mut handles = lock(&host.inner.handles);
+                for chat_id in flipped {
+                    let Some(handle) = handles.get(&chat_id) else {
+                        continue;
+                    };
+                    if lock(&handle.chat2_local_sub).is_some() {
+                        continue; // already chat2-mode
+                    }
+                    handle.retired.store(true, Ordering::Relaxed);
+                    let live_writer = Arc::strong_count(&handle.doc) > 1;
+                    if !live_writer {
+                        handles.remove(&chat_id);
+                        tracing::info!(chat = %chat_id,
+                            "s2 handle dropped on chat2 cutover; watchers resubscribe onto the new room");
+                    }
+                }
+            }
+        });
     }
 
     /// The workspace host, once wired (tests may assemble a DocHost without one).
@@ -395,9 +446,25 @@ impl DocHost {
     /// Open (or return) the chat's doc handle: load the local snapshot (or init fresh),
     /// start the change-driven task, and join the edge room when configured.
     pub fn open(&self, chat_id: &str) -> Result<Arc<ChatDocHandle>, EngineError> {
+        // The registry names the sync room generation (docs/chat2-sync.md
+        // M2): absent row / absent field = legacy s2. Read it BEFORE the
+        // cached-handle check — a cached s2-mode handle for a chat another
+        // device has since cut over to chat2 would otherwise serve its frozen
+        // fat lineage forever (the host writes only to the chat2 room now;
+        // this device's s2 room has gone permanently silent).
+        let chat_row = self
+            .workspace()
+            .and_then(|w| w.chat(chat_id).ok().flatten());
+        let registry_gen = chat_row.as_ref().and_then(|c| c.room_gen).unwrap_or(1);
         {
             let mut handles = lock(&self.inner.handles);
             if let Some(handle) = handles.get(chat_id) {
+                // s2-mode marker: the chat2 local-update subscription is
+                // installed before the chat2 dial, so its absence means this
+                // handle was built for the legacy room.
+                if registry_gen >= 2 && lock(&handle.chat2_local_sub).is_none() {
+                    handle.retired.store(true, Ordering::Relaxed);
+                }
                 if handle.retired.load(Ordering::Relaxed) && !self.pinned(handle) {
                     // A seed flipped this chat under a cached fat handle
                     // (review B1): drop it so this open converges onto the
@@ -409,13 +476,6 @@ impl DocHost {
                 }
             }
         }
-        // The registry names the sync room generation (docs/chat2-sync.md
-        // M2): absent row / absent field = legacy s2. Read it BEFORE the doc
-        // load — chat2 chats adopt (M3) and dial differently.
-        let chat_row = self
-            .workspace()
-            .and_then(|w| w.chat(chat_id).ok().flatten());
-        let registry_gen = chat_row.as_ref().and_then(|c| c.room_gen).unwrap_or(1);
         // B2/M5 guard: the LOCAL epoch is the second cutover signal. A crash
         // between the thin save and the registry flip (or a not-yet-synced
         // registry) must NOT route an epoch-2 doc back onto s2 — the s2
@@ -510,12 +570,6 @@ impl DocHost {
                 None => SessionDoc::init(chat_id)?,
             }
         };
-        // Re-queue survives the adopt: our own pending commands become fresh
-        // entries in the new lineage (the processed_commands ledger still
-        // guards against double execution regardless).
-        for command in &requeue_commands {
-            let _ = doc.queue_command(command);
-        }
         let doc = Arc::new(doc);
 
         let (changed_tx, changed_rx) = watch::channel(0u64);
@@ -583,6 +637,16 @@ impl DocHost {
                     true
                 }));
                 *lock(&handle.chat2_local_sub) = Some(sub);
+                // Re-queue survives the adopt: our own pending commands
+                // become fresh entries in the new lineage (the
+                // processed_commands ledger still guards double execution).
+                // Committed AFTER the local-update subscription above — a
+                // commit before it never enters the pending buffer or the
+                // client, so the requeued command would sit in the local doc
+                // and never reach the room (the host would never see it).
+                for command in &requeue_commands {
+                    let _ = doc.queue_command(command);
+                }
                 self.spawn_chat2_join(edge.clone(), &handle, chat2_cursor);
             } else {
                 // Host-side lazy migration (M1/M2): seeding runs in the
@@ -596,9 +660,15 @@ impl DocHost {
                     // Quiescent-only (review B1): a seed under a live run or
                     // watched transcript would strand everything written
                     // after the rebuild instant in a retired fat lineage.
-                    // This open is brand new — nothing watches yet; the
-                    // pinned re-check happens again right before the flip.
-                    self.spawn_chat2_seed(edge.clone(), chat_id, doc.clone());
+                    // Deferred until the s2 room has JOINED and the doc has
+                    // gone quiet: seeding straight from open() rebuilt from
+                    // the host's LOCAL doc before the room backfill landed —
+                    // rows contributed by other devices (a queued command, a
+                    // phone steer) forked away into the retired lineage, and
+                    // a nudge-triggered open seeded+dropped the handle out
+                    // from under the very command it was opened to execute
+                    // (e2e smoke, 2026-08-10).
+                    self.spawn_chat2_seed_when_quiet(edge.clone(), chat_id, &handle);
                 }
                 self.spawn_s2_join(edge, chat_id, &doc, &handle);
             }
@@ -688,12 +758,13 @@ impl DocHost {
         let http = self.inner.http.clone();
         let device = self.inner.config.device_id.clone();
         let weak = Arc::downgrade(handle);
+        let host = self.clone();
         tokio::spawn(async move {
-            let sink = Arc::new(crate::chat2_host::EngineChatSink::new(
-                doc.clone(),
-                store,
-                chat.clone(),
-            ));
+            let sink = Arc::new(crate::chat2_host::EngineChatSink::new(&doc, store, chat.clone()));
+            // The sink holds only a Weak doc ref (a strong one made every
+            // chat2 handle read as perma-pinned — LRU eviction dead); this
+            // task's own strong ref dies when the join resolves.
+            drop(doc);
             let fetcher = Arc::new(crate::chat2_host::EdgeCheckpointFetcher::new(
                 http,
                 edge.clone(),
@@ -722,6 +793,7 @@ impl DocHost {
                         let Some(handle) = weak.upgrade() else {
                             return; // evicted mid-dial: drop leaves the room
                         };
+                        let mut events = client.events();
                         {
                             // Store + drain under ONE client-lock critical
                             // section: the subscription pushes to the buffer
@@ -737,6 +809,35 @@ impl DocHost {
                             *client_slot = Some(client);
                         }
                         tracing::info!(chat = %chat, "chat2 room joined (converged)");
+                        // Host recovery duties (C3): a wiped room needs a
+                        // seed checkpoint or fresh readers see only
+                        // post-reset rows; rejected pushes reach peers only
+                        // through a checkpoint. Watcher dies with the handle.
+                        if host.is_host(&chat) {
+                            let host = host.clone();
+                            let weak = weak.clone();
+                            let chat = chat.clone();
+                            tokio::spawn(async move {
+                                use komet_sync::chat_client::ChatEvent;
+                                loop {
+                                    match events.recv().await {
+                                        Ok(ChatEvent::ServerReset) => {
+                                            let Some(handle) = weak.upgrade() else { return };
+                                            tracing::warn!(chat = %chat, "chat2 room reset; posting seed checkpoint");
+                                            host.spawn_chat2_checkpoint(&handle, "server-reset");
+                                        }
+                                        Ok(ChatEvent::PushRejected) => {
+                                            let Some(handle) = weak.upgrade() else { return };
+                                            tracing::warn!(chat = %chat, "chat2 push rejected; compensating via checkpoint");
+                                            host.spawn_chat2_checkpoint(&handle, "push-rejected");
+                                        }
+                                        Ok(_) => {}
+                                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                                    }
+                                }
+                            });
+                        }
                         return;
                     }
                     Ok(Err(err)) => {
@@ -766,6 +867,68 @@ impl DocHost {
     /// the seed checkpoint, persist the thin lineage locally, THEN flip the
     /// registry — each step idempotent, a crash before the flip leaves the
     /// chat on s2 and the next open retries (M5).
+    /// Defer a chat2 seed until the chat is verifiably quiet: the s2 room has
+    /// joined (the rebuild must include every row the room holds — seeding
+    /// from the pre-backfill local doc forked other devices' rows into the
+    /// retired lineage) and the doc frontier has stopped moving (a
+    /// nudge-burst in flight — an incoming queued command — must land and
+    /// execute first). Holds only a weak handle: eviction ends the wait.
+    fn spawn_chat2_seed_when_quiet(
+        &self,
+        edge: EdgeConfig,
+        chat_id: &str,
+        handle: &Arc<ChatDocHandle>,
+    ) {
+        const TICK: std::time::Duration = std::time::Duration::from_millis(500);
+        const JOIN_WAIT_TICKS: u32 = 120; // ≤60s for the room; offline stays s2
+        const QUIET_TICKS: u32 = 4; // 2s of frontier silence
+        let host = self.clone();
+        let chat = chat_id.to_string();
+        let weak = Arc::downgrade(handle);
+        tokio::spawn(async move {
+            let mut ticks = 0u32;
+            loop {
+                {
+                    let Some(handle) = weak.upgrade() else { return };
+                    if handle.retired.load(Ordering::Relaxed) {
+                        return; // another path already seeded
+                    }
+                    if lock(&handle.room).is_some() {
+                        break;
+                    }
+                }
+                ticks += 1;
+                if ticks >= JOIN_WAIT_TICKS {
+                    tracing::debug!(chat = %chat, "chat2 seed skipped: s2 room never joined");
+                    return;
+                }
+                tokio::time::sleep(TICK).await;
+            }
+            let mut quiet = 0u32;
+            let mut last_vv: Option<Vec<u8>> = None;
+            loop {
+                tokio::time::sleep(TICK).await;
+                let Some(handle) = weak.upgrade() else { return };
+                if handle.retired.load(Ordering::Relaxed) {
+                    return;
+                }
+                let vv = handle.doc.doc().oplog_vv().encode();
+                if last_vv.as_ref() == Some(&vv) {
+                    quiet += 1;
+                    if quiet >= QUIET_TICKS {
+                        let doc = handle.doc.clone();
+                        drop(handle);
+                        host.spawn_chat2_seed(edge, &chat, doc);
+                        return;
+                    }
+                } else {
+                    quiet = 0;
+                    last_vv = Some(vv);
+                }
+            }
+        });
+    }
+
     fn spawn_chat2_seed(&self, edge: EdgeConfig, chat_id: &str, doc: Arc<SessionDoc>) {
         {
             let mut seeding = lock(&self.inner.seeding);
@@ -797,7 +960,14 @@ impl DocHost {
         doc: Arc<SessionDoc>,
     ) -> Result<(), String> {
         use base64::Engine as _;
+        let vv_at_rebuild = doc.doc().oplog_vv().encode();
         let rebuilt = komet_doc::rebuild::rebuild_thin_doc(&doc).map_err(|e| e.to_string())?;
+        // The seed's own doc ref must be gone before the pinned re-check
+        // below: `pinned` reads `Arc::strong_count(&handle.doc) > 1`, and
+        // holding this clone made that true unconditionally — every seed
+        // aborted "became active mid-seed" and the cutover never flipped a
+        // single chat (v0.1.32 DOA).
+        drop(doc);
         if !rebuilt.sidecar.is_empty() {
             // Sidecar PARKED (docs/chat2-sync.md A2): full outputs are not
             // uploaded; they survive in the rollback snapshot + run journal.
@@ -836,10 +1006,18 @@ impl DocHost {
         // quiet open retries.
         {
             let handles = lock(&self.inner.handles);
-            if let Some(handle) = handles.get(chat_id)
-                && self.pinned(handle)
-            {
-                return Err("chat became active mid-seed; aborted before flip".into());
+            if let Some(handle) = handles.get(chat_id) {
+                if self.pinned(handle) {
+                    return Err("chat became active mid-seed; aborted before flip".into());
+                }
+                // Frontier seal (review B1's TOCTOU): ANY doc movement since
+                // the rebuild — a synced remote row, a local write that has
+                // already released its doc ref — means the thin lineage is
+                // missing it. Borrowed read (no Arc clone: that would trip
+                // the pinned check we just passed).
+                if handle.doc.doc().oplog_vv().encode() != vv_at_rebuild {
+                    return Err("doc advanced mid-seed; aborted before flip".into());
+                }
             }
         }
         // Rollback copy of the fat lineage BEFORE the thin one replaces it —
@@ -898,7 +1076,6 @@ impl DocHost {
     /// - tail sidecar: publish the last-64 transcript JSON for thin/instant
     ///   readers (the iOS fallback path).
     async fn chat2_maintenance(&self, handle: &Arc<ChatDocHandle>) {
-        use base64::Engine as _;
         if handle.retired.load(Ordering::Relaxed) {
             return;
         }
@@ -941,6 +1118,24 @@ impl DocHost {
         if stats.row_bytes <= 512 * 1024 && stats.row_count <= 200 {
             return;
         }
+        self.spawn_chat2_checkpoint(handle, "threshold");
+    }
+
+    /// POST a full checkpoint for a chat2 room (one in flight per handle).
+    /// Callers: the quiesce-tick threshold above, and the client recovery
+    /// events (`ServerReset` — a wiped room needs a seed checkpoint or every
+    /// fresh reader sees only post-reset rows; `PushRejected` — the rejected
+    /// ops reach peers only through a checkpoint).
+    fn spawn_chat2_checkpoint(&self, handle: &Arc<ChatDocHandle>, reason: &'static str) {
+        use base64::Engine as _;
+        let Some(edge) = self.inner.config.edge.clone() else {
+            return;
+        };
+        let stats = match &*lock(&handle.chat2) {
+            Some(client) => client.stats(),
+            None => return,
+        };
+        let chat_id = handle.chat_id.clone();
         if handle
             .checkpointing
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -981,7 +1176,7 @@ impl DocHost {
                 .await
             {
                 Ok(res) if res.status().is_success() => {
-                    tracing::info!(chat = %chat_id, seq_covered, "chat2 threshold checkpoint posted");
+                    tracing::info!(chat = %chat_id, seq_covered, reason, "chat2 checkpoint posted");
                     if let Some(handle) = weak_note.upgrade()
                         && let Some(client) = &*lock(&handle.chat2)
                     {
@@ -1083,6 +1278,12 @@ impl DocHost {
         for handle in handles {
             if let Some(room) = lock(&handle.room).as_ref() {
                 room.probe();
+            }
+            // chat2 rooms verify liveness on the same user signals — a
+            // deaf-but-ponging DO otherwise freezes a watched transcript
+            // for the whole background probe quiet window.
+            if let Some(chat2) = lock(&handle.chat2).as_ref() {
+                chat2.probe();
             }
         }
     }

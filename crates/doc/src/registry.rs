@@ -540,19 +540,36 @@ impl RegistryDoc {
         self.clock.next(Self::now_ms(), &device)
     }
 
-    fn enqueue_ops(&mut self, ops: Vec<RowOp>) {
+    fn enqueue_ops(&mut self, mut ops: Vec<RowOp>) {
         if ops.is_empty() {
             return;
         }
+        // The registry room rejects any batch over its op cap (500), and a
+        // rejected batch is a PERMANENT wedge: error frames carry no batch
+        // id, so the client can never retire it — it replays and fails on
+        // every reconnect, and every write queued behind it (session-status
+        // rows included) never propagates again. `delete_space` on a
+        // ≥250-chat space minted exactly such a batch. Chunk here so no
+        // writer can ever produce one; chunks apply in order, each
+        // atomically (only cross-chunk atomicity is given up).
+        const MAX_OPS_PER_BATCH: usize = 400;
         self.generation += 1;
-        // Batch ids only need device-lifetime uniqueness; the HLC of a fresh
-        // tick provides exactly that without a rng dependency.
-        let batch = format!("b-{}", self.next_hlc());
-        self.pending.push(PendingBatch {
-            batch,
-            ops,
-            in_flight: false,
-        });
+        while !ops.is_empty() {
+            let tail = if ops.len() > MAX_OPS_PER_BATCH {
+                ops.split_off(MAX_OPS_PER_BATCH)
+            } else {
+                Vec::new()
+            };
+            // Batch ids only need device-lifetime uniqueness; the HLC of a
+            // fresh tick provides exactly that without a rng dependency.
+            let batch = format!("b-{}", self.next_hlc());
+            self.pending.push(PendingBatch {
+                batch,
+                ops,
+                in_flight: false,
+            });
+            ops = tail;
+        }
     }
 
     fn write(&mut self, kind: &str, id: &str, op: OpKind, set: BTreeMap<String, Value>) {

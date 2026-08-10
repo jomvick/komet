@@ -1642,6 +1642,56 @@ async fn run_session(session: Session) {
         tokio::select! {
             res = async { turn.as_mut().expect("guarded by if").await }, if turn.is_some() => {
                 turn = None;
+                // Settle an in-flight `_session/steering` call BEFORE closing
+                // the turn: its response rides the same stdout as the prompt
+                // response, so by now it is (nearly always) already parsed —
+                // the select just hadn't polled it yet. Deciding it here keeps
+                // the ordering deterministic: an injection that landed in this
+                // turn emits its Steered boundary now, ahead of the drained
+                // tail and the Done (a Steered AFTER Done re-armed the
+                // consumer with no next turn — the stranded-Working bug); a
+                // rejected/unsettled call redelivers as the next turn. The
+                // timeout guards the flooded-incoming edge (reader blocked on
+                // a full channel never parses the response): past it the call
+                // is abandoned and the steer redelivered.
+                if let Some((text, mut fut)) = steering_call.take() {
+                    let outcome = match tokio::time::timeout(
+                        Duration::from_millis(1000),
+                        &mut fut,
+                    )
+                    .await
+                    {
+                        Ok(Ok(resp)) => resp
+                            .get("outcome")
+                            .and_then(Value::as_str)
+                            .unwrap_or("injected")
+                            .to_owned(),
+                        Ok(Err(_)) | Err(_) => "promptRequired".to_owned(),
+                    };
+                    if interrupted {
+                        // Winding down; abandoned like any queued steer.
+                    } else if outcome != "promptRequired" {
+                        let (prev, next) = rotate(&mut assistant_message_id);
+                        if !send(
+                            &event_tx,
+                            AgentEvent::Steered {
+                                assistant_message_id: Some(prev),
+                                next_assistant_message_id: Some(next),
+                            },
+                        )
+                        .await
+                        {
+                            break 'main;
+                        }
+                    } else {
+                        queued_steers.push_back(text);
+                    }
+                    // Followers waiting on the settled call have no live turn
+                    // to inject into anymore: boundary delivery.
+                    while let Some(next_text) = steer_backlog.pop_front() {
+                        queued_steers.push_back(next_text);
+                    }
+                }
                 // Updates streamed before the prompt response are already
                 // queued in stdout order — fold them into the turn before
                 // closing it (responses bypass the incoming queue).
@@ -1816,17 +1866,63 @@ async fn run_session(session: Session) {
                     // The run is winding down; the steer is abandoned like
                     // any queued steer at interrupt.
                 } else if outcome != "promptRequired" {
-                    let (prev, next) = rotate(&mut assistant_message_id);
-                    if !send(
-                        &event_tx,
-                        AgentEvent::Steered {
-                            assistant_message_id: Some(prev),
-                            next_assistant_message_id: Some(next),
-                        },
-                    )
-                    .await
-                    {
-                        break 'main;
+                    // Injected into a live turn → a Steered boundary. But if
+                    // the turn ended while the call was in flight, the
+                    // injection was consumed by THAT turn — its output
+                    // already streamed and the turn's Done already closed the
+                    // segment. Emitting Steered after that Done re-armed the
+                    // consumer (parked session → Working) with no next turn
+                    // and no Done ever coming — the stranded-Working /
+                    // eternal-timer bug. Post-turn: nothing left to do.
+                    if turn.is_some() {
+                        // Pre-injection updates can still sit in `incoming`
+                        // (responses bypass that queue): drain them into the
+                        // CURRENT segment first, or text the agent streamed
+                        // before the injection landed folds after the split —
+                        // the transcript attributes it to the reply-to-steer.
+                        let mut consumer_gone = false;
+                        while let Ok(inc) = incoming.try_recv() {
+                            match inc {
+                                Incoming::Notification { method, params }
+                                    if method == "session/update" =>
+                                {
+                                    for ev in session_update_events(&params, &session_id) {
+                                        if !send(&event_tx, ev).await {
+                                            consumer_gone = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                Incoming::Request { id, method, params } => {
+                                    handle_server_request_live(
+                                        &client,
+                                        id,
+                                        &method,
+                                        &params,
+                                        &request_input,
+                                    );
+                                }
+                                _ => {}
+                            }
+                            if consumer_gone {
+                                break;
+                            }
+                        }
+                        if consumer_gone {
+                            break 'main;
+                        }
+                        let (prev, next) = rotate(&mut assistant_message_id);
+                        if !send(
+                            &event_tx,
+                            AgentEvent::Steered {
+                                assistant_message_id: Some(prev),
+                                next_assistant_message_id: Some(next),
+                            },
+                        )
+                        .await
+                        {
+                            break 'main;
+                        }
                     }
                 } else if turn.is_some() {
                     // Raced the turn end: redeliver at the boundary the
@@ -1959,10 +2055,13 @@ async fn run_session(session: Session) {
         }
     }
 
-    shutdown_child(&mut child, kill_grace).await;
+    // Escalation dies BEFORE the child is reaped: after `shutdown_child`
+    // waits the pid, a still-armed SIGTERM/SIGKILL timer would fire at a
+    // freed (reusable) pid.
     if let Some(handle) = escalation {
         handle.abort();
     }
+    shutdown_child(&mut child, kill_grace).await;
 }
 
 #[cfg(test)]

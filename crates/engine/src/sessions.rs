@@ -78,6 +78,20 @@ struct RunHandle {
     cancel: watch::Sender<bool>,
     engine_tx: mpsc::UnboundedSender<AgentEvent>,
     pending_inputs: PendingInputs,
+    /// Steers accepted into the mailbox but not yet confirmed by a `Steered`
+    /// event — the at-least-once ledger. A run can die with accepted steers
+    /// still in its mailbox (idle reaper vs. a routed send; a mid-turn error
+    /// discarding queued boundary steers): the run task drains this at exit
+    /// and re-dispatches each entry as a fresh turn, so an accepted message
+    /// can never silently evaporate from a transcript that shows it as sent.
+    routed_steers: Arc<Mutex<std::collections::VecDeque<RoutedSteer>>>,
+}
+
+/// One accepted-but-unconfirmed steer: enough to re-dispatch it verbatim.
+#[derive(Debug, Clone)]
+struct RoutedSteer {
+    prompt: String,
+    message_id: String,
 }
 
 struct Inner {
@@ -243,38 +257,63 @@ impl SessionsEngine {
         chat_id: &str,
         harness_id: HarnessId,
         mut request: RunRequest,
-        message_id: Option<String>,
+        mut message_id: Option<String>,
         inject_resume: bool,
     ) -> Result<String, EngineError> {
-        let routed = lock(&self.inner.runs)
-            .get(chat_id)
-            .map(|h| (h.run_id.clone(), h.steerable, h.steer_tx.clone()));
-        if let Some((run_id, steerable, steer_tx)) = routed {
+        let routed = lock(&self.inner.runs).get(chat_id).map(|h| {
+            (
+                h.run_id.clone(),
+                h.steerable,
+                h.steer_tx.clone(),
+                h.routed_steers.clone(),
+            )
+        });
+        if let Some((run_id, steerable, steer_tx, ledger)) = routed {
             let message = SteerMessage {
                 prompt: request.prompt.clone(),
                 message_id: message_id.clone(),
             };
-            // The run can vanish between the map read and the send (drive_run
-            // removes the handle, then stamps the final status): re-check the
-            // registration AFTER the send, or a steer routed into a dying
-            // mailbox marks the session Working with no run behind it.
-            if steerable
-                && steer_tx.try_send(message).is_ok()
-                && self.is_live(chat_id, &run_id)
-            {
-                let user_id = message_id.unwrap_or_else(new_id);
+            if steerable && steer_tx.try_send(message).is_ok() {
+                // The run can vanish between the send and here (the idle
+                // reaper, a parked child death): the ledger entry below is
+                // the at-least-once guarantee — the run task's exit drain
+                // re-dispatches any accepted steer no `Steered` confirmed.
+                let user_id = message_id.clone().unwrap_or_else(new_id);
+                lock(&ledger).push_back(RoutedSteer {
+                    prompt: request.prompt.clone(),
+                    message_id: user_id.clone(),
+                });
                 let handle = self.doc_handle(chat_id)?;
                 handle.write_user_message(&user_id, &request.prompt, now_ms())?;
-                // Working BEFORE the lastMessageAt bump: both ride the
-                // workspace doc from this one peer, so causal order makes it
-                // impossible for an observer to hold [new message, old status]
-                // — that gap read as unseen-with-no-live-run = a phantom
-                // "completed" flash on every remote send (2026-07-31).
-                self.set_status(chat_id, SessionStatus::Working, false);
-                self.inner.note_message(chat_id, &request.prompt);
-                return Ok(run_id);
+                if self.is_live(chat_id, &run_id) {
+                    // Working BEFORE the lastMessageAt bump: both ride the
+                    // workspace doc from this one peer, so causal order makes it
+                    // impossible for an observer to hold [new message, old status]
+                    // — that gap read as unseen-with-no-live-run = a phantom
+                    // "completed" flash on every remote send (2026-07-31).
+                    self.set_status(chat_id, SessionStatus::Working, false);
+                    self.inner.note_message(chat_id, &request.prompt);
+                    return Ok(run_id);
+                }
+                // The run died around the send. If its exit drain already
+                // claimed the entry, that re-dispatch owns the message —
+                // otherwise reclaim it and fall through to a fresh run.
+                let reclaimed = {
+                    let mut ledger = lock(&ledger);
+                    let before = ledger.len();
+                    ledger.retain(|s| s.message_id != user_id);
+                    ledger.len() != before
+                };
+                if !reclaimed {
+                    self.inner.note_message(chat_id, &request.prompt);
+                    return Ok(run_id);
+                }
+                // Keep the already-written doc entry's id for the fresh run
+                // below (write_user_message dedupes by id).
+                message_id = Some(user_id);
             }
-            // Mailbox closed (runtime mid-teardown / non-steering harness): replace it.
+            // Mailbox closed (runtime mid-teardown / non-steering harness) or
+            // the routed run died with the message reclaimed: replace it.
             self.interrupt(chat_id).await?;
         }
 
@@ -333,6 +372,7 @@ impl SessionsEngine {
                 cancel: cancel_tx,
                 engine_tx,
                 pending_inputs,
+                routed_steers: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             },
         );
         self.set_status(chat_id, SessionStatus::Working, true);
@@ -378,8 +418,8 @@ impl SessionsEngine {
         let target = lock(&self.inner.runs)
             .get(chat_id)
             .filter(|h| h.steerable)
-            .map(|h| h.steer_tx.clone());
-        let Some(steer_tx) = target else {
+            .map(|h| (h.run_id.clone(), h.steer_tx.clone(), h.routed_steers.clone()));
+        let Some((run_id, steer_tx, ledger)) = target else {
             return Ok(SteerOutcome::NotSteerable);
         };
         let message = SteerMessage {
@@ -389,10 +429,36 @@ impl SessionsEngine {
         if steer_tx.try_send(message).is_err() {
             return Ok(SteerOutcome::NotSteerable);
         }
-        // Accepted: the steer prompt becomes a user entry immediately (client-minted id).
+        // Accepted: ledger first (at-least-once across a dying run), then the
+        // user entry (client-minted id), then Working BEFORE the
+        // lastMessageAt bump — same causal-order invariant as the dispatch
+        // route (an observer must never hold [new message, settled status]:
+        // the phantom "completed" flash, 2026-07-31).
         let user_id = message_id.unwrap_or_else(new_id);
+        lock(&ledger).push_back(RoutedSteer {
+            prompt: prompt.to_string(),
+            message_id: user_id.clone(),
+        });
         let handle = self.doc_handle(chat_id)?;
         handle.write_user_message(&user_id, prompt, now_ms())?;
+        if self.is_live(chat_id, &run_id) {
+            self.set_status(chat_id, SessionStatus::Working, false);
+            self.inner.note_message(chat_id, prompt);
+            return Ok(SteerOutcome::Accepted);
+        }
+        // The run died around the send. Exit drain claimed the entry → its
+        // re-dispatch owns the message; still ours → reclaim and report
+        // NotSteerable so the executor falls back to a fresh dispatch
+        // (same message id — the doc entry dedupes).
+        let reclaimed = {
+            let mut ledger = lock(&ledger);
+            let before = ledger.len();
+            ledger.retain(|s| s.message_id != user_id);
+            ledger.len() != before
+        };
+        if reclaimed {
+            return Ok(SteerOutcome::NotSteerable);
+        }
         self.inner.note_message(chat_id, prompt);
         Ok(SteerOutcome::Accepted)
     }
@@ -668,10 +734,26 @@ impl Inner {
                     started_at: None,
                     updated_at: now,
                 });
+            // `started_at` is the elapsed-timer base and must only ever mean
+            // "this turn". Entering Working from a settled state always
+            // restamps (a steer into a parked session is a NEW turn — reusing
+            // the old base showed the previous turn's 30min on send), and a
+            // settled session drops its base entirely so no later reader can
+            // resurrect a stale elapsed.
+            let was_active = matches!(
+                entry.status,
+                SessionStatus::Working | SessionStatus::AwaitingInput
+            );
             entry.status = status;
             entry.updated_at = now;
-            if fresh_start {
-                entry.started_at = Some(now);
+            match status {
+                SessionStatus::Working if fresh_start || !was_active => {
+                    entry.started_at = Some(now);
+                }
+                SessionStatus::Working | SessionStatus::AwaitingInput => {}
+                SessionStatus::Idle | SessionStatus::Errored => {
+                    entry.started_at = None;
+                }
             }
             let session = entry.clone();
             let mut list: Vec<Session> = statuses.values().cloned().collect();
@@ -1085,6 +1167,29 @@ async fn drive_run(
         // Any stream activity proves the run is alive — keep the session's
         // freshness inside the UI's 45s staleness window (throttled).
         inner.touch_session(&chat_id);
+        // The engine's input bridge is the sole authority on input requests:
+        // it mints the id and parks the resolver BEFORE emitting the event,
+        // so a legitimate id is always pending here. A harness emitting its
+        // own copy (a different id no resolver knows) would fold an
+        // unanswerable twin chip into the doc — and answering the twin would
+        // never resume the run. Dropped BEFORE the parked gate below: letting
+        // it un-park the session and then dropping it would disarm the idle
+        // reaper with no turn running (a leaked child no reap ever ends).
+        if let AgentEvent::InputRequested { request_id, .. } = &event {
+            let pending = lock(&inner.runs)
+                .get(&chat_id)
+                .map(|h| h.pending_inputs.clone());
+            let known = pending.is_some_and(|p| lock(&p).contains_key(request_id));
+            if !known {
+                tracing::warn!(
+                    chat = %chat_id,
+                    request = %request_id,
+                    "dropping harness-emitted InputRequested (unknown id; \
+                     the engine input bridge owns this lifecycle)"
+                );
+                continue;
+            }
+        }
         // PARKED: only a steer boundary (or an input round-trip / terminal
         // Done) re-opens the session. The ACP child keeps forwarding
         // `session/update` frames after a turn completes — late
@@ -1098,11 +1203,26 @@ async fn drive_run(
                     idle_since = None;
                     inner.set_status(&chat_id, SessionStatus::Working, true);
                 }
-                AgentEvent::InputRequested { .. }
-                | AgentEvent::InputResolved { .. }
-                | AgentEvent::Done { .. } => {
+                AgentEvent::Done { .. } => {
                     idle_since = None;
                 }
+                // A question with NO turn behind it (post-turn permission
+                // noise): answer it empty right here. Un-parking into
+                // AwaitingInput would disarm the idle reaper with no Done
+                // ever coming — stranded status, leaked warm child.
+                AgentEvent::InputRequested { request_id, .. } => {
+                    let resolver = lock(&inner.runs)
+                        .get(&chat_id)
+                        .and_then(|h| lock(&h.pending_inputs).remove(request_id));
+                    if let Some(tx) = resolver {
+                        let _ = tx.send(Vec::new());
+                    }
+                    tracing::debug!(chat = %chat_id, "parked session: post-turn input request auto-declined");
+                    continue;
+                }
+                // A stale answer settling after its turn already closed:
+                // nothing is running — stay parked.
+                AgentEvent::InputResolved { .. } => continue,
                 _ => continue,
             }
         }
@@ -1126,6 +1246,13 @@ async fn drive_run(
                 .any(|p| matches!(p, MessagePart::Tool { id: pid, .. } if pid == id))
         };
         match &event {
+            // The live plan chip is a deliberate singleton (every update
+            // reuses `LIVE_PLAN_TOOL_ID` so the fold refreshes in place):
+            // treating its reappearance after a park/steer reset as a stale
+            // echo dropped the todo list for the rest of the run — from the
+            // first boundary on, plans never rendered again.
+            AgentEvent::ToolCall { id, .. } if id == komet_proto::LIVE_PLAN_TOOL_ID => {}
+            AgentEvent::ToolResult { id, .. } if id == komet_proto::LIVE_PLAN_TOOL_ID => {}
             AgentEvent::ToolCall { id, .. } => {
                 if !in_segment(&folded, id) && seen_tools.contains(id) {
                     continue;
@@ -1211,6 +1338,18 @@ async fn drive_run(
             dirty = false;
             entry_id = next_assistant_message_id.clone().unwrap_or_else(new_id);
             segment_started = now_ms();
+            // The elapsed timer is per user message, not per child process: a
+            // steer boundary restarts it (matches the parked-resume path and
+            // the composer's optimistic overlay, which already reads 0:00).
+            inner.set_status(&chat_id, SessionStatus::Working, true);
+            // The boundary confirms delivery of the oldest accepted steer —
+            // retire its at-least-once ledger entry.
+            if let Some(h) = lock(&inner.runs)
+                .get(&chat_id)
+                .filter(|h| h.run_id == run_id)
+            {
+                lock(&h.routed_steers).pop_front();
+            }
             continue;
         }
 
@@ -1229,27 +1368,9 @@ async fn drive_run(
             } => {
                 inner.remember_harness_session(&chat_id, session_id, &run_cwd);
             }
-            AgentEvent::InputRequested { request_id, .. } => {
-                // The engine's input bridge is the sole authority on input
-                // requests: it mints the id and parks the resolver BEFORE
-                // emitting the event, so a legitimate id is always pending
-                // here. A harness emitting its own copy (a different id no
-                // resolver knows) would fold an unanswerable twin chip into
-                // the doc — and answering the twin would never resume the
-                // run. Drop such events.
-                let pending = lock(&inner.runs)
-                    .get(&chat_id)
-                    .map(|h| h.pending_inputs.clone());
-                let known = pending.is_some_and(|p| lock(&p).contains_key(request_id));
-                if !known {
-                    tracing::warn!(
-                        chat = %chat_id,
-                        request = %request_id,
-                        "dropping harness-emitted InputRequested (unknown id; \
-                         the engine input bridge owns this lifecycle)"
-                    );
-                    continue;
-                }
+            AgentEvent::InputRequested { .. } => {
+                // Known-id guaranteed: the unknown-id twin was dropped above,
+                // before the parked gate.
                 inner.set_status(&chat_id, SessionStatus::AwaitingInput, false);
             }
             AgentEvent::InputResolved { .. } => {
@@ -1274,6 +1395,21 @@ async fn drive_run(
         }
 
         if let AgentEvent::Done { status, .. } = &event {
+            // A question still pending at turn end can never be legitimately
+            // answered (its turn is over): drain the resolvers NOW, or a late
+            // `respond_input` finds one, emits InputResolved, and un-parks
+            // the session into Working with no turn behind it — stranded
+            // Working, timer forever, reaper disarmed. Empty answers unblock
+            // the harness-side bridge like an interrupt does.
+            let pending = lock(&inner.runs)
+                .get(&chat_id)
+                .filter(|h| h.run_id == run_id)
+                .map(|h| h.pending_inputs.clone());
+            if let Some(pending) = pending {
+                for (_, tx) in lock(&pending).drain() {
+                    let _ = tx.send(Vec::new());
+                }
+            }
             let message_status = match status {
                 DoneStatus::Interrupted => MessageStatus::Aborted,
                 DoneStatus::Completed | DoneStatus::Errored => MessageStatus::Complete,
@@ -1344,6 +1480,48 @@ async fn drive_run(
         }
     };
 
+    // Claim any accepted-but-unconfirmed steers BEFORE the handle goes away:
+    // a routed send that raced this exit either finds its entry gone (we own
+    // it — re-dispatched below) or reclaims it and starts a fresh run itself.
+    let orphans: Vec<RoutedSteer> = lock(&inner.runs)
+        .get(&chat_id)
+        .filter(|h| h.run_id == run_id)
+        .map(|h| std::mem::take(&mut *lock(&h.routed_steers)).into())
+        .unwrap_or_default();
     inner.remove_run(&chat_id, &run_id);
     inner.set_status(&chat_id, final_status, false);
+    if !interrupted && !orphans.is_empty() {
+        // The dying run accepted these into its mailbox but never confirmed a
+        // Steered boundary (idle-reaper race, a mid-turn error discarding
+        // queued boundary steers, a parked child death). Their user entries
+        // are already in the transcript — a message that shows as sent must
+        // never silently not run. Re-dispatch each as a fresh turn
+        // (write_user_message dedupes by id; resume is engine-injected).
+        let engine = SessionsEngine {
+            inner: inner.clone(),
+        };
+        let chat = chat_id.clone();
+        tokio::spawn(async move {
+            for steer in orphans {
+                let Some(mut request) = engine.last_request(&chat) else {
+                    tracing::warn!(chat = %chat, "orphaned steer lost: no run config to re-dispatch");
+                    break;
+                };
+                request.prompt = steer.prompt.clone();
+                request.resume = None;
+                request.attachments = Vec::new();
+                tracing::info!(chat = %chat, "re-dispatching steer orphaned by a dying run");
+                if let Err(err) = engine
+                    .dispatch(&chat, harness_id, request, Some(steer.message_id.clone()))
+                    .await
+                {
+                    tracing::warn!(chat = %chat, error = %err, "orphaned steer re-dispatch failed");
+                    engine
+                        .inner
+                        .set_status(&chat, SessionStatus::Errored, false);
+                    break;
+                }
+            }
+        });
+    }
 }
