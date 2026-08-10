@@ -383,10 +383,13 @@ impl Shell {
             trigger
         };
 
-        // Quick add-space button beside the trigger (the old section header's
-        // `+`, relocated).
+        // NEW SESSION beside the trigger (adding a project lives in the
+        // dropdown's "New project…" row now). While the sidebar is collapsed
+        // this same button fades into the titlebar instead
+        // (`render_session_title_bar`).
+        let on_canvas = self.state.read(cx).selected_chat.is_none();
         let add = div()
-            .id("add-space")
+            .id("sidebar-new-session")
             .size(px(24.0))
             .flex_none()
             .flex()
@@ -394,13 +397,20 @@ impl Shell {
             .justify_center()
             .rounded(px(6.0))
             .cursor_pointer()
-            .bg(motion::hover_blend(
-                "add-space",
-                crate::theme::wash(0.0),
-                crate::theme::wash(0.14),
-            ))
-            .on_hover(motion::hover_listener("add-space"))
-            .on_click(cx.listener(|this, _, _, cx| this.open_add_space(cx)))
+            .bg(if on_canvas {
+                crate::theme::glass_selected_bg()
+            } else {
+                motion::hover_blend(
+                    "sidebar-new-session",
+                    crate::theme::wash(0.0),
+                    crate::theme::wash(0.14),
+                )
+            })
+            .when(on_canvas, |el| {
+                el.shadow(crate::theme::glass_selected_shadows())
+            })
+            .on_hover(motion::hover_listener("sidebar-new-session"))
+            .on_click(cx.listener(|this, _, _, cx| this.open_new_session(cx)))
             .child(
                 icon(icons::PLUS)
                     .size(px(14.0))
@@ -577,13 +587,17 @@ impl Shell {
                     None => true,
                 })
                 .map(|(status, chat)| {
+                    // Line 1 is "project @ device" (t3code's project row);
+                    // project-less sessions read as their home-dir cwd `~`.
                     let space = state.space_for_chat(chat);
-                    let mut folder = space
-                        .map(|s| s.display_name().to_string())
-                        .unwrap_or_else(|| "?".to_string());
+                    let mut folder = match (space, chat.space_id.as_deref()) {
+                        (Some(space), _) => space.display_name().to_string(),
+                        (None, None) => "~".to_string(),
+                        (None, Some(_)) => "?".to_string(),
+                    };
                     // Unknown device → no fragment, same as the archived list.
                     if let Some(device) = state.device_name(&chat.device_id) {
-                        folder = format!("{folder}@{device}");
+                        folder = format!("{folder} @ {device}");
                     }
                     // The branch shows whenever the engine has stamped one —
                     // main-checkout sessions included, not just worktrees.

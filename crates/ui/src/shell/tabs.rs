@@ -1,268 +1,53 @@
-//! The session tab strip — replaces the chat header. A tab is a DEVICE-LOCAL
-//! viewport onto a synced session (`UiSettings.open_tabs`, the vec IS the
-//! order): closing one removes it here and nowhere else — the session keeps
-//! running on its host and stays in the sidebar, where a click reopens it.
-//! Archiving is a separate, explicit action (the sidebar row's context menu).
-//! Tabs mix spaces freely; the sidebar's space filter never touches the strip.
-//!
-//! Each tab: agent brand icon + title + a trailing slot that shows the status
-//! dot at rest and swaps to a close button on hover; right-click opens the
-//! close/close-others/close-right/close-left menu. `+` at the end opens the
-//! new-session canvas (the tab materializes on first send) in the sidebar's
-//! filter space — or the last selected space when the filter is "All". The
-//! strip inherits the old header's titlebar duties: 44px tall, drag region,
-//! animated window-controls inset, and the toggle-changes button (git spaces
-//! only).
-//!
-//! Styling and drag-reorder mirror the terminal tab bar
-//! (`terminal/panel.rs::render_tab_bar`) — same fixed-width tabs, drop-index
-//! math, 150ms sibling slide, and drag ghost. Overflow scrolls horizontally
-//! with edge fades.
+//! Session navigation — the horizontal tab strip is gone (wing 2026-08-10):
+//! the activity sidebar IS the session list, and the titlebar names the
+//! selected session (harness brand icon + title). When the sidebar is
+//! collapsed, a `+` new-session button fades into the titlebar's left end
+//! (riding the sidebar width tween). `UiSettings.open_tabs` is legacy — no
+//! longer read or written.
 
 use super::*;
-use crate::motion::TAB_SLIDE;
-use crate::terminal::panel::{drop_index, reorder_tabs, slide_offset};
-use komet_proto::ChatIndicator;
-
-/// Fixed tab width (terminal tabs use 118; session titles get a bit more).
-pub(super) const SESSION_TAB_WIDTH: f32 = 140.0;
-/// Flex gap between tabs — part of the drop-index slot width.
-const TAB_GAP: f32 = 4.0;
-/// Width of the overflow edge fades. Wide enough that per-glyph fade steps
-/// (title text fades glyph-by-glyph on glass) stay gentle.
-const FADE_WIDTH: f32 = 36.0;
-
-/// Drag-reorder state; `epoch` keys the 150ms slide animation restarts.
-pub(super) struct TabDragState {
-    from: usize,
-    over: usize,
-    epoch: usize,
-    prev_over: usize,
-}
-
-/// The dragged-tab payload (gpui drag-and-drop).
-struct TabDragPayload {
-    from: usize,
-    title: SharedString,
-    brand: Option<(&'static str, Option<gpui::Hsla>)>,
-}
-
-/// The floating tab rendered at the cursor while dragging.
-struct TabGhost {
-    title: SharedString,
-    brand: Option<(&'static str, Option<gpui::Hsla>)>,
-}
-
-impl Render for TabGhost {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::of(cx);
-        div()
-            .w(px(SESSION_TAB_WIDTH))
-            .h(px(28.0))
-            .px(px(Theme::SPACE_SM))
-            .flex()
-            .items_center()
-            .gap(px(6.0))
-            .rounded(px(Theme::CONTROL_RADIUS))
-            .bg(theme.surface_raised)
-            .border_1()
-            .border_color(theme.border_strong)
-            .text_size(px(12.0))
-            .text_color(theme.text)
-            .opacity(0.85)
-            .when_some(self.brand, |el, (path, tint)| {
-                el.child(
-                    icon(path)
-                        .size(px(14.0))
-                        .flex_none()
-                        .text_color(tint.unwrap_or(theme.text_muted)),
-                )
-            })
-            .child(div().truncate().child(self.title.clone()))
-    }
-}
-
-/// The neighbor to select after closing `closed`: the next tab, else the
-/// previous, else `None` (last tab → new-session canvas). Pure.
-pub(super) fn next_after_close(order: &[String], closed: &str) -> Option<String> {
-    let ix = order.iter().position(|id| id == closed)?;
-    if order.len() <= 1 {
-        return None;
-    }
-    Some(if ix + 1 < order.len() {
-        order[ix + 1].clone()
-    } else {
-        order[ix - 1].clone()
-    })
-}
 
 impl Shell {
-    /// The open tabs in VISUAL order: `open_tabs` minus ids the doc no longer
-    /// backs with a live (non-archived) chat. The stored vec is pruned
-    /// separately by [`Shell::sync_open_tabs`]; this read-only view just skips
-    /// rows that haven't been reconciled yet.
-    pub(super) fn open_tab_ids(&self, cx: &App) -> Vec<String> {
-        let Some(open) = self.settings.open_tabs.as_ref() else {
-            return Vec::new();
-        };
-        let state = self.state.read(cx);
-        open.iter()
-            .filter(|id| {
-                state
-                    .chats
-                    .iter()
-                    .any(|c| &c.id == *id && !c.archived)
-            })
-            .cloned()
-            .collect()
-    }
-
-    /// Reconcile the device-local tab list against the synced doc. Runs on
-    /// every state change (cheap set math), but only judges once the first
-    /// chats frame has landed — the pre-sync empty list would prune everything.
-    ///
-    /// - Pre-tabs settings file (`open_tabs: None`): seed from the last
-    ///   selected space's sessions, so the upgrade doesn't blank the strip.
-    /// - Prune archived/deleted chats (the selected chat is exempt: a
-    ///   just-sent new session's row hasn't synced yet).
-    /// - Any selected chat becomes a tab (sidebar clicks, boot restore,
-    ///   fresh sends — one invariant covers every selection path).
-    /// - Boot: with nothing selected yet, land on the first restored tab.
-    pub(super) fn sync_open_tabs(&mut self, cx: &mut Context<Self>) {
-        if !self.state.read(cx).chats_synced {
-            return;
-        }
-        let (selected, live): (Option<String>, std::collections::HashSet<String>) = {
+    /// Boot landing: the most recently active visible chat once the first
+    /// chats frame has synced (manual selection wins; no chats → the
+    /// new-session canvas shows).
+    pub(super) fn boot_select_chat(&mut self, cx: &mut Context<Self>) {
+        let first = {
             let state = self.state.read(cx);
-            (
-                state.selected_chat.clone(),
-                state.visible_chats().map(|c| c.id.clone()).collect(),
-            )
-        };
-        let mut changed = false;
-        if self.settings.open_tabs.is_none() {
-            let seed: Vec<String> = self
-                .settings
-                .last_space_id
-                .as_deref()
-                .map(|space| {
-                    self.state
-                        .read(cx)
-                        .chats_in_space(space)
-                        .iter()
-                        .map(|c| c.id.clone())
-                        .collect()
-                })
-                .unwrap_or_default();
-            self.settings.open_tabs = Some(seed);
-            changed = true;
-        }
-        let tabs = self.settings.open_tabs.as_mut().expect("seeded above");
-        let before = tabs.len();
-        tabs.retain(|id| live.contains(id) || selected.as_deref() == Some(id.as_str()));
-        changed |= tabs.len() != before;
-        if let Some(selected) = &selected
-            && !tabs.contains(selected)
-        {
-            tabs.push(selected.clone());
-            changed = true;
-        }
-        if changed {
-            self.schedule_save(cx);
-        }
-        // Boot landing: the first restored tab (manual selection wins; an
-        // empty strip stays on the new-session canvas).
-        if selected.is_none() && !self.state.read(cx).auto_selected {
-            let first = self
-                .settings
-                .open_tabs
-                .as_ref()
-                .and_then(|tabs| tabs.first().cloned());
-            if let Some(first) = first {
-                self.state.update(cx, |s, cx| s.select_chat(Some(first), cx));
+            if !state.chats_synced || state.selected_chat.is_some() || state.auto_selected {
+                return;
             }
-        }
-    }
-
-    /// Close a tab — a purely local act: the session is untouched (it keeps
-    /// running on its host and stays in the sidebar). Selection moves to a
-    /// neighbor; the last tab lands on the new-session canvas.
-    pub(super) fn close_session_tab(&mut self, chat_id: String, cx: &mut Context<Self>) {
-        let order = self.open_tab_ids(cx);
-        let selected = self.state.read(cx).selected_chat.clone();
-        if selected.as_deref() == Some(chat_id.as_str()) {
-            let next = next_after_close(&order, &chat_id);
-            self.state.update(cx, |s, cx| s.select_chat(next, cx));
-        }
-        if let Some(tabs) = self.settings.open_tabs.as_mut() {
-            tabs.retain(|id| id != &chat_id);
-        }
-        self.schedule_save(cx);
-        cx.notify();
-    }
-
-    /// Bulk closes (tab context menu). `keep_side`: retain tabs left/right of
-    /// the anchor per the flags. The anchor always survives; if the selected
-    /// tab was closed, selection lands on the anchor.
-    pub(super) fn close_tabs_around(
-        &mut self,
-        anchor: &str,
-        keep_left: bool,
-        keep_right: bool,
-        cx: &mut Context<Self>,
-    ) {
-        let order = self.open_tab_ids(cx);
-        let Some(anchor_ix) = order.iter().position(|id| id == anchor) else {
-            return;
+            state
+                .overview_chats(Utc::now())
+                .first()
+                .map(|(_, c)| c.id.clone())
         };
-        let kept: Vec<String> = order
-            .iter()
-            .enumerate()
-            .filter(|(ix, _)| match ix.cmp(&anchor_ix) {
-                std::cmp::Ordering::Less => keep_left,
-                std::cmp::Ordering::Equal => true,
-                std::cmp::Ordering::Greater => keep_right,
-            })
-            .map(|(_, id)| id.clone())
-            .collect();
-        let selected = self.state.read(cx).selected_chat.clone();
-        if let Some(selected) = selected
-            && !kept.contains(&selected)
-        {
+        if let Some(first) = first {
             self.state
-                .update(cx, |s, cx| s.select_chat(Some(anchor.to_string()), cx));
+                .update(cx, |s, cx| s.select_chat(Some(first), cx));
         }
-        self.settings.open_tabs = Some(kept);
-        self.schedule_save(cx);
-        cx.notify();
     }
 
-    /// Open a session as a tab (sidebar click): append if absent, focus.
-    pub(super) fn open_chat_tab(&mut self, chat_id: String, cx: &mut Context<Self>) {
+    /// Open a session from the sidebar: select it, the main area follows.
+    pub(super) fn open_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
         self.route = Route::Chat;
-        let tabs = self.settings.open_tabs.get_or_insert_with(Vec::new);
-        if !tabs.contains(&chat_id) {
-            tabs.push(chat_id.clone());
-            self.schedule_save(cx);
-        }
         self.state
             .update(cx, |s, cx| s.select_chat(Some(chat_id), cx));
         cx.notify();
     }
 
-    /// `+`: open the new-session canvas. Its space defaults to the sidebar's
-    /// filter space; under "All", the last selected space (wing's rule) — the
-    /// current space context stands when neither resolves.
-    pub(super) fn new_session_tab(&mut self, cx: &mut Context<Self>) {
+    /// `+` (sidebar header, or the titlebar while the sidebar is collapsed):
+    /// open the new-session canvas. A set sidebar filter re-homes the canvas
+    /// onto that project; under "All" the current pick (the last selected
+    /// project, restored from composer defaults) stands.
+    pub(super) fn open_new_session(&mut self, cx: &mut Context<Self>) {
         self.route = Route::Chat;
         let target = {
             let state = self.state.read(cx);
-            let exists = |id: &String| state.space_row(id).is_some();
             self.settings
                 .space_filter
                 .clone()
-                .filter(exists)
-                .or_else(|| self.settings.last_space_id.clone().filter(exists))
+                .filter(|id| state.space_row(id).is_some())
         };
         self.state.update(cx, |s, cx| {
             if target.is_some() {
@@ -273,433 +58,113 @@ impl Shell {
         cx.notify();
     }
 
-    /// Track the drop slot while a tab is dragged over the strip (150ms sibling
-    /// slides restart per committed `over` change — terminal-panel idiom).
-    fn update_tab_drag_over(&mut self, from: usize, over: usize, cx: &mut Context<Self>) {
-        match &mut self.tab_drag {
-            Some(drag) if drag.from == from => {
-                if drag.over != over {
-                    drag.prev_over = drag.over;
-                    drag.over = over;
-                    drag.epoch += 1;
-                    cx.notify();
-                }
-            }
-            _ => {
-                self.tab_drag = Some(TabDragState {
-                    from,
-                    over,
-                    epoch: 0,
-                    prev_over: from,
-                });
-                cx.notify();
-            }
-        }
-    }
-
-    /// Commit a drag: the reordered visual list becomes the stored list
-    /// (device-local; unreconciled ids drop out, which the prune would do
-    /// anyway).
-    fn commit_tab_reorder(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
-        let mut order = self.open_tab_ids(cx);
-        if from < order.len() {
-            reorder_tabs(&mut order, from, to);
-            self.settings.open_tabs = Some(order);
-            self.schedule_save(cx);
-        }
-        self.tab_drag = None;
-        cx.notify();
-    }
-
-    /// The tab strip: [scrollable tabs (edge fades)][+][drag spacer][toggle-changes].
-    pub(super) fn render_session_tab_strip(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    /// The unified titlebar in chat mode:
+    /// `[fading +] [harness icon + session title] … [toggle-changes]`.
+    /// Replaces the tab strip; inherits its titlebar duties (drag region,
+    /// animated left inset, the toggle-changes button on git projects).
+    pub(super) fn render_session_title_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
-        let now = Utc::now();
-        // A drag that ended off-strip (no drop event) must not strand the
-        // sibling slide offsets.
-        if self.tab_drag.is_some() && !cx.has_active_drag() {
-            self.tab_drag = None;
-        }
-        let order: Vec<String> = self.open_tab_ids(cx);
-        let tabs: Vec<(
-            String,
-            SharedString,
-            Option<komet_proto::HarnessId>,
-            ChatIndicator,
-        )> = {
+        let (title, harness, on_canvas): (SharedString, Option<komet_proto::HarnessId>, bool) = {
             let state = self.state.read(cx);
-            order
-                .iter()
-                .filter_map(|id| {
-                    let chat = state.chats.iter().find(|c| c.id == *id)?;
-                    Some((
-                        chat.id.clone(),
-                        SharedString::from(transcript::single_line(
-                            &chat.title.clone().unwrap_or_else(|| "New session".into()),
-                        )),
-                        chat.config.as_ref().map(|c| c.harness),
-                        state.display_status_for(chat, now),
-                    ))
-                })
-                .collect()
-        };
-        let selected = self.state.read(cx).selected_chat.clone();
-        // Keep the selected tab visible: on selection change, scroll it into
-        // view (minimal movement — a new session's tab materializes at the far
-        // right of an overflowing strip and would otherwise be stranded
-        // off-screen).
-        match selected.as_deref() {
-            Some(sel) if self.tabs_scrolled_to.as_deref() != Some(sel) => {
-                if let Some(ix) = order.iter().position(|id| id == sel) {
-                    self.tabs_scroll.scroll_to_item(ix);
-                }
-                self.tabs_scrolled_to = Some(sel.to_string());
+            match state.selected_chat_row() {
+                Some(chat) => (
+                    SharedString::from(transcript::single_line(
+                        &chat.title.clone().unwrap_or_else(|| "New session".into()),
+                    )),
+                    chat.config.as_ref().map(|c| c.harness),
+                    false,
+                ),
+                None => (SharedString::from("New session"), None, true),
             }
-            Some(_) => {}
-            None => self.tabs_scrolled_to = None,
-        }
-        // `+` needs at least one space to mint sessions into.
-        let has_space = !self.state.read(cx).spaces.is_empty();
+        };
         let git = self.space_git_detected(cx);
-        let hovered = self.tab_hover.clone();
-        let on_canvas = selected.is_none();
-        // No sessions yet → the canvas already shows; a `+` would be redundant.
-        let has_tabs = !tabs.is_empty();
-        let count = tabs.len();
-        let drag = self
-            .tab_drag
-            .as_ref()
-            .map(|d| (d.from, d.over, d.epoch, d.prev_over));
 
-        let tab_elements: Vec<AnyElement> =
-            tabs.into_iter()
-                .enumerate()
-                .map(|(ix, (id, title, harness, status))| {
-                    let is_selected = selected.as_deref() == Some(id.as_str());
-                    let is_hovered = hovered.as_deref() == Some(id.as_str());
-                    // Hover state lives in Shell (the trailing slot swaps dot ↔
-                    // close), so the wash snaps off it too — gpui allows only one
-                    // `on_hover` per element, and the state listener wins.
-                    let (text_color, bg) = if is_selected {
-                        (theme.text, crate::theme::glass_selected_bg())
-                    } else if is_hovered {
-                        (theme.text_muted.opacity(0.8), theme.glass_hover())
-                    } else {
-                        (theme.text_muted.opacity(0.6), crate::theme::wash(0.0))
-                    };
-                    let glyph_alpha = if is_selected { 0.9 } else { 0.6 };
-                    let brand = harness.map(crate::pickers::harness_brand_icon);
-                    let select_id = id.clone();
-                    let close_id = id.clone();
-                    let middle_id = id.clone();
-                    let menu_id = id.clone();
-                    let hover_id = id.clone();
-                    // NB: no `.occlude()` on the close button — the TAB already
-                    // occludes (for the titlebar drag region), and an occluding
-                    // child would block the tab's own hover hit-test: a flicker
-                    // loop (user-reported). `stop_propagation` on click is enough.
-                    let trailing: AnyElement = if is_hovered {
-                        div()
-                            .id(SharedString::from(format!("session-tab-close-{id}")))
-                            .size(px(20.0))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded(px(6.0))
-                            .hover(|s| s.bg(crate::theme::wash(0.14)))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.close_session_tab(close_id.clone(), cx);
-                            }))
-                            .child(
-                                icon(icons::CLOSE)
-                                    .size(px(12.0))
-                                    .text_color(theme.text_muted),
-                            )
-                            .into_any_element()
-                    } else {
-                        // Working animates (the sidebar's miniaturized gradient
-                        // spinner) instead of a static pink dot; every other
-                        // non-idle status stays a dot.
-                        let dot = spaces::status_dot_color(status, &theme);
-                        div()
-                            .size(px(20.0))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .when(status == ChatIndicator::Working, |el| {
-                                el.child(loaders::mini_gradient_spinner(
-                                    format!("tab-working-{id}"),
-                                    2.0,
-                                    cx.entity_id(),
-                                    cx,
-                                ))
-                            })
-                            .when(
-                                !matches!(status, ChatIndicator::Idle | ChatIndicator::Working),
-                                |el| el.child(div().size(px(6.0)).rounded_full().bg(dot)),
-                            )
-                            .into_any_element()
-                    };
-                    let tab_el = div()
-                        .id(SharedString::from(format!("session-tab-{id}")))
-                        .w(px(SESSION_TAB_WIDTH))
-                        .h(px(28.0))
-                        .flex_none()
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(6.0))
-                        .pl(px(8.0))
-                        .pr(px(4.0))
-                        .rounded(px(8.0))
-                        .text_size(px(12.0))
-                        .text_color(text_color)
-                        .bg(bg)
-                        .when(is_selected, |el| {
-                            el.shadow(crate::theme::glass_selected_shadows())
-                        })
-                        .cursor_pointer()
-                        // Tabs sit inside the titlebar drag strip — carve them out.
-                        // NOT `.occlude()`: a BlockMouse hitbox ends the hit test,
-                        // so the scroll container behind the tabs never saw wheel
-                        // events and an overflowing strip could not be scrolled
-                        // (tabs tile the whole region). ExceptScroll keeps the
-                        // drag-region carve-out and lets the strip scroll.
-                        .block_mouse_except_scroll()
-                        .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
-                        // Track hover in Shell state: the trailing slot flips
-                        // between dot and close button (hover_blend only fades
-                        // colors; child swaps need real state).
-                        .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                            if *hovered {
-                                this.tab_hover = Some(hover_id.clone());
-                            } else if this.tab_hover.as_deref() == Some(hover_id.as_str()) {
-                                this.tab_hover = None;
-                            }
-                            cx.notify();
-                        }))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.state
-                                .update(cx, |s, cx| s.select_chat(Some(select_id.clone()), cx));
-                        }))
-                        // Middle-click closes (terminal-tab parity).
-                        .on_mouse_down(
-                            MouseButton::Middle,
-                            cx.listener(move |this, _, _, cx| {
-                                cx.stop_propagation();
-                                this.close_session_tab(middle_id.clone(), cx);
-                            }),
-                        )
-                        // Right-click: close / close others / close to a side.
-                        .on_mouse_down(
-                            MouseButton::Right,
-                            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                cx.stop_propagation();
-                                this.tab_menu.open((menu_id.clone(), event.position));
-                                cx.notify();
-                            }),
-                        )
-                        .on_drag(
-                            TabDragPayload {
-                                from: ix,
-                                title: title.clone(),
-                                brand,
-                            },
-                            |payload, _point, _, cx| {
-                                let title = payload.title.clone();
-                                let brand = payload.brand;
-                                cx.stop_propagation();
-                                cx.new(|_| TabGhost { title, brand })
-                            },
-                        )
-                        .when_some(brand, |el, (path, tint)| {
-                            el.child(
-                                icon(path).size(px(14.0)).flex_none().text_color(
-                                    tint.unwrap_or(theme.text_muted).opacity(glyph_alpha),
-                                ),
-                            )
-                        })
-                        .child(div().flex_1().min_w_0().truncate().child(title))
-                        .child(trailing);
-
-                    // Sliding transform while a sibling is dragged over: animate
-                    // 150ms between committed offsets (terminal-panel idiom).
-                    match drag {
-                        Some((from, over, epoch, prev_over)) if ix != from => {
-                            let slot = SESSION_TAB_WIDTH + TAB_GAP;
-                            let target = slide_offset(ix, from, over) * slot;
-                            let start = slide_offset(ix, from, prev_over) * slot;
-                            div()
-                                .relative()
-                                .child(tab_el.with_animation(
-                                    SharedString::from(format!("session-tab-slide-{id}-{epoch}")),
-                                    TAB_SLIDE.animation(),
-                                    move |el, t| el.left(px(motion::lerp(start, target, t))),
-                                ))
-                                .into_any_element()
-                        }
-                        // The dragged tab is represented by the cursor ghost; its
-                        // flow slot renders as an INVISIBLE spacer. A dimmed tab
-                        // here overlapped whatever sibling slid into the vacated
-                        // slot (slide_offset moves one tab exactly there —
-                        // user-reported double-exposure).
-                        Some((from, ..)) if ix == from => div()
-                            .w(px(SESSION_TAB_WIDTH))
-                            .h(px(28.0))
-                            .flex_none()
-                            .into_any_element(),
-                        _ => tab_el.into_any_element(),
-                    }
-                })
-                .collect();
-
-        // `+` — the new-session canvas "is" the unmaterialized tab, so the
-        // button carries the active wash while the canvas shows.
-        let new_tab = div()
-            .id("session-tab-new")
-            .size(px(28.0))
-            .flex_none()
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded(px(8.0))
-            .cursor_pointer()
-            .bg(if on_canvas && has_space {
-                crate::theme::glass_selected_bg()
-            } else {
-                motion::hover_blend(
-                    "session-tab-new",
+        // The new-session `+` lives in the sidebar header; when the sidebar
+        // collapses it FADES into the titlebar here, riding the same width
+        // tween the sidebar animates on (1 at collapsed, 0 at open — no
+        // pop-in, and no dead hit-target while invisible).
+        let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
+        let open_width = self.settings.sidebar_width.max(1.0);
+        let plus_alpha = (1.0 - sidebar_now / open_width).clamp(0.0, 1.0);
+        let plus: Option<AnyElement> = (plus_alpha > 0.01).then(|| {
+            div()
+                .id("titlebar-new-session")
+                .size(px(24.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(6.0))
+                .opacity(plus_alpha)
+                .cursor_pointer()
+                .bg(motion::hover_blend(
+                    "titlebar-new-session",
                     theme.glass_hover().opacity(0.0),
                     theme.glass_hover(),
+                ))
+                .on_hover(motion::hover_listener("titlebar-new-session"))
+                .occlude()
+                .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
+                .on_click(cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.open_new_session(cx);
+                }))
+                .child(
+                    icon(icons::PLUS)
+                        .size(px(16.0))
+                        .text_color(theme.text_muted),
                 )
-            })
-            .when(on_canvas && has_space, |el| {
-                el.shadow(crate::theme::glass_selected_shadows())
-            })
-            .on_hover(motion::hover_listener("session-tab-new"))
-            .occlude()
-            .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
-            .on_click(cx.listener(|this, _, _, cx| {
-                cx.stop_propagation();
-                this.new_session_tab(cx);
-            }))
-            .child(
-                icon(icons::PLUS)
-                    .size(px(16.0))
-                    .text_color(theme.text_muted),
-            );
-
-        // Overflow: the tab region scrolls horizontally; edge fades appear on
-        // whichever side has hidden tabs (offset from the LAST frame — a
-        // one-frame lag is invisible). On GLASS the fades are an EdgeFade
-        // scope (per-glyph gradient); painted overlays only exist on opaque
-        // platforms, in the SHELL surface tone the strip now sits on.
-        let scrolled = -f32::from(self.tabs_scroll.offset().x);
-        let max_scroll = f32::from(self.tabs_scroll.max_offset().x);
-        let fade_left = scrolled > 1.0;
-        let fade_right = scrolled < max_scroll - 1.0;
-        let glass = theme.is_glass();
-        let bar_bg = theme.surface;
-        let scroll_for_drag = self.tabs_scroll.clone();
-        let tab_region = div()
-            .relative()
-            .min_w_0()
-            .child(
-                div()
-                    .id("session-tabs-scroll")
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(TAB_GAP))
-                    .min_w_0()
-                    .overflow_x_scroll()
-                    .track_scroll(&self.tabs_scroll)
-                    .on_drag_move::<TabDragPayload>(cx.listener(
-                        move |this, event: &gpui::DragMoveEvent<TabDragPayload>, _, cx| {
-                            let from = event.drag(cx).from;
-                            // Drop math runs in CONTENT coordinates: viewport-
-                            // relative x plus the scrolled-off width.
-                            let rel_x = f32::from(event.event.position.x)
-                                - f32::from(event.bounds.left())
-                                + -f32::from(scroll_for_drag.offset().x);
-                            let over = drop_index(rel_x, SESSION_TAB_WIDTH + TAB_GAP, count);
-                            this.update_tab_drag_over(from, over, cx);
-                        },
-                    ))
-                    .on_drop::<TabDragPayload>(cx.listener(
-                        move |this, payload: &TabDragPayload, _, cx| {
-                            let to = this
-                                .tab_drag
-                                .as_ref()
-                                .map(|d| d.over)
-                                .unwrap_or(payload.from);
-                            this.commit_tab_reorder(payload.from, to, cx);
-                        },
-                    ))
-                    .children(tab_elements),
-            )
-            .when(fade_left && !glass, |el| {
-                el.child(
-                    div()
-                        .absolute()
-                        .left_0()
-                        .top_0()
-                        .bottom_0()
-                        .w(px(FADE_WIDTH))
-                        .bg(gpui::linear_gradient(
-                            90.0,
-                            gpui::linear_color_stop(bar_bg, 0.0),
-                            gpui::linear_color_stop(bar_bg.opacity(0.0), 1.0),
-                        )),
-                )
-            })
-            .when(fade_right && !glass, |el| {
-                el.child(
-                    div()
-                        .absolute()
-                        .right_0()
-                        .top_0()
-                        .bottom_0()
-                        .w(px(FADE_WIDTH))
-                        .bg(gpui::linear_gradient(
-                            270.0,
-                            gpui::linear_color_stop(bar_bg, 0.0),
-                            gpui::linear_color_stop(bar_bg.opacity(0.0), 1.0),
-                        )),
-                )
-            });
-        let tab_region: AnyElement = if glass {
-            crate::edge_fade::edge_faded(FADE_WIDTH, false, false, tab_region)
-                .fade_left(fade_left)
-                .fade_right(fade_right)
                 .into_any_element()
-        } else {
-            tab_region.into_any_element()
-        };
+        });
 
-        // Tabs live above the INSET CARD: sidebar open → they start at the
-        // card's left edge (+ its content pad); collapsed → they glide left
-        // (on the sidebar width tween) until they sit next to the control
-        // cluster.
-        let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
-        let tabs_left = (sidebar_now + Theme::SPACE_LG).max(self.title_bar_content_start());
+        // Same glide as the old strip: content starts at the inset card's
+        // left edge while the sidebar is open, and slides toward the control
+        // cluster as it collapses.
+        let content_left = (sidebar_now + Theme::SPACE_LG).max(self.title_bar_content_start());
         let inner = div()
             .size_full()
             .flex()
             .items_center()
             .pt(px(Theme::TITLEBAR_TOP_PAD))
-            .gap(px(6.0))
-            .pl(px(tabs_left))
+            .gap(px(8.0))
+            .pl(px(content_left))
             .pr(px(titlebar_right_padding(
                 cfg!(target_os = "windows"),
                 Theme::SPACE_LG,
             )))
-            .child(tab_region)
-            .when(has_space && has_tabs, |el| el.child(new_tab))
+            .children(plus)
+            .child(
+                div()
+                    .min_w_0()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .when_some(
+                        harness.map(crate::pickers::harness_brand_icon),
+                        |el, (path, tint)| {
+                            el.child(
+                                icon(path)
+                                    .size(px(14.0))
+                                    .flex_none()
+                                    .text_color(tint.unwrap_or(theme.text_muted)),
+                            )
+                        },
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(12.0))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(if on_canvas {
+                                theme.text_muted.opacity(0.7)
+                            } else {
+                                theme.text.opacity(0.85)
+                            })
+                            .child(title),
+                    ),
+            )
             .child(div().flex_1())
             // Stable location: the toggle shows whether the pane is open or
             // not (the pane's own header is gone).
@@ -716,99 +181,7 @@ impl Shell {
         // the inset card. No bottom border — the card's own hairline is the
         // separation; the glass gutter shows between.
         let bar = div().h(px(Theme::TITLEBAR_HEIGHT)).flex_none().child(inner);
-        self.titlebar_drag_region("chat-tabs-titlebar", bar, cx)
+        self.titlebar_drag_region("chat-titlebar", bar, cx)
             .into_any_element()
-    }
-
-    fn close_tab_menu(&mut self, cx: &mut Context<Self>) {
-        if self.tab_menu.begin_close() {
-            popover::reap_popup(cx, |shell: &mut Self| &mut shell.tab_menu);
-            cx.notify();
-        }
-    }
-
-    /// Tab context menu (right-click): close, plus the bulk closes that apply
-    /// at this tab's position — rows that would close nothing are omitted.
-    pub(super) fn render_tab_menu(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let (chat_id, position) = self.tab_menu.get().cloned()?;
-        let closing = self.tab_menu.closing_since();
-        let theme = Theme::of(cx).clone();
-        let order = self.open_tab_ids(cx);
-        let ix = match order.iter().position(|id| id == &chat_id) {
-            Some(ix) => ix,
-            // The tab itself vanished mid-exit ("Close tab") — keep the card
-            // mounted so the fade still plays.
-            None if closing.is_some() => 0,
-            None => return None,
-        };
-        let has_others = order.len() > 1;
-        let has_right = ix + 1 < order.len();
-        let has_left = ix > 0;
-
-        let row = |label: &'static str,
-                   id: &'static str,
-                   keep_left: bool,
-                   keep_right: bool,
-                   cx: &mut Context<Self>| {
-            let target = chat_id.clone();
-            popover::menu_row(&theme, false, format!("{id}-{target}"))
-                .id(id)
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.close_tab_menu(cx);
-                    if keep_left && keep_right {
-                        this.close_session_tab(target.clone(), cx);
-                    } else {
-                        this.close_tabs_around(&target, keep_left, keep_right, cx);
-                    }
-                }))
-                .child(SharedString::from(label))
-        };
-
-        let mut menu = popover::popover_card(&theme)
-            .w(px(170.0))
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                this.close_tab_menu(cx);
-            }))
-            .flex()
-            .flex_col()
-            // keep_left && keep_right = "just this one" (see `row`).
-            .child(row("Close tab", "tab-menu-close", true, true, cx));
-        if has_others {
-            menu = menu.child(row("Close others", "tab-menu-others", false, false, cx));
-        }
-        if has_right {
-            menu = menu.child(row("Close to the right", "tab-menu-right", true, false, cx));
-        }
-        if has_left {
-            menu = menu.child(row("Close to the left", "tab-menu-left", false, true, cx));
-        }
-        Some(popover::menu_at(
-            "tab-context-menu",
-            position,
-            menu.into_any_element(),
-            closing,
-        ))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::next_after_close;
-
-    fn ids(list: &[&str]) -> Vec<String> {
-        list.iter().map(|s| s.to_string()).collect()
-    }
-
-    #[test]
-    fn close_selects_next_then_previous_then_canvas() {
-        let order = ids(&["a", "b", "c"]);
-        assert_eq!(next_after_close(&order, "a").as_deref(), Some("b"));
-        assert_eq!(next_after_close(&order, "b").as_deref(), Some("c"));
-        // Last tab: fall back to the previous one.
-        assert_eq!(next_after_close(&order, "c").as_deref(), Some("b"));
-        // Only tab: canvas.
-        assert_eq!(next_after_close(&ids(&["solo"]), "solo"), None);
-        // Unknown id: no opinion.
-        assert_eq!(next_after_close(&order, "zz"), None);
     }
 }

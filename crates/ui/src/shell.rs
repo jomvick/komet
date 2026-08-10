@@ -463,18 +463,6 @@ pub struct Shell {
     /// trigger's click tell "toggle closed" apart from "just dismissed by
     /// this same click" (same guard as `user_menu_dismissed_at`).
     spaces_menu_dismissed_at: Option<std::time::Instant>,
-    /// Session tab currently hovered (close button appears on hover).
-    tab_hover: Option<String>,
-    /// Session-tab context menu: (chat id, window position).
-    tab_menu: popover::Popup<(String, Point<Pixels>)>,
-    /// Session-tab drag-reorder in flight (see `tabs::TabDragState`).
-    tab_drag: Option<tabs::TabDragState>,
-    /// Scroll position of the session tab region (drives the edge fades and
-    /// the drop-index math under horizontal overflow).
-    tabs_scroll: gpui::ScrollHandle,
-    /// Chat id last auto-scrolled into view — scroll-to-selected fires once per
-    /// selection change, not every frame (which would fight manual scrolling).
-    tabs_scrolled_to: Option<String>,
     /// Scroll position of the sidebar lists region (drives its edge fades).
     sidebar_scroll: gpui::ScrollHandle,
     /// `settings.last_space_id` applied once after the first spaces frame.
@@ -667,11 +655,6 @@ impl Shell {
             add_space: None,
             spaces_menu: popover::Popup::default(),
             spaces_menu_dismissed_at: None,
-            tab_hover: None,
-            tab_menu: popover::Popup::default(),
-            tab_drag: None,
-            tabs_scroll: gpui::ScrollHandle::new(),
-            tabs_scrolled_to: None,
             sidebar_scroll: gpui::ScrollHandle::new(),
             space_boot_applied: false,
             sound_prev: std::collections::HashMap::new(),
@@ -813,9 +796,9 @@ impl Shell {
                 self.schedule_save(cx);
             }
         }
-        // Reconcile the device-local tab list (seed on upgrade, prune against
-        // the doc, selected-chat invariant, boot landing).
-        self.sync_open_tabs(cx);
+        // Boot landing: the most recent session once the first chats frame
+        // syncs (manual selection wins).
+        self.boot_select_chat(cx);
         // Heal a dangling sidebar filter (space deleted, possibly elsewhere):
         // fall back to "All" rather than filtering everything out.
         if state.read(cx).spaces_synced
@@ -1571,7 +1554,7 @@ impl Shell {
     /// and control cluster overlay its left end.
     fn render_title_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         match self.route {
-            Route::Chat => self.render_session_tab_strip(cx),
+            Route::Chat => self.render_session_title_bar(cx),
             Route::Settings(_) => {
                 let inner = div()
                     .size_full()
@@ -1881,31 +1864,44 @@ impl Shell {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        // Status is a rail, not a word (komet session-row.tsx): always present
-        // so rows align and state changes read in place. Working animates (the
-        // composer-strip spinner, miniaturized); every other status is a dot.
-        let dot_color = spaces::status_dot_color(status, theme);
-        let status_rail: AnyElement = if status == komet_proto::ChatIndicator::Working {
-            div()
-                .w(px(6.0))
+        // Activity, not position (t3code Sidebar): status is a colored word in
+        // the row's top-right corner — Working animates the composer-strip
+        // spinner beside it; Idle rows show the relative time instead.
+        let status_color = spaces::status_dot_color(status, theme);
+        let status_label: Option<&'static str> = match status {
+            komet_proto::ChatIndicator::Working => Some("Working"),
+            komet_proto::ChatIndicator::AwaitingInput => Some("Input"),
+            komet_proto::ChatIndicator::Errored => Some("Failed"),
+            komet_proto::ChatIndicator::Completed => Some("Done"),
+            komet_proto::ChatIndicator::Idle => None,
+        };
+        let corner: AnyElement = match status_label {
+            Some(label) => div()
                 .flex_none()
                 .flex()
+                .flex_row()
                 .items_center()
-                .justify_center()
-                .child(loaders::mini_gradient_spinner(
-                    format!("chat-working-{id}"),
-                    2.0,
-                    cx.entity_id(),
-                    cx,
-                ))
-                .into_any_element()
-        } else {
-            div()
-                .size(px(6.0))
-                .rounded_full()
+                .gap(px(5.0))
+                .when(status == komet_proto::ChatIndicator::Working, |el| {
+                    el.child(loaders::mini_gradient_spinner(
+                        format!("chat-working-{id}"),
+                        2.0,
+                        cx.entity_id(),
+                        cx,
+                    ))
+                })
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(status_color)
+                        .child(SharedString::from(label)),
+                )
+                .into_any_element(),
+            None => div()
                 .flex_none()
-                .bg(dot_color)
-                .into_any_element()
+                .text_size(px(11.0))
+                .child(time_ago.clone())
+                .into_any_element(),
         };
         let (hover, text) = (theme.glass_hover(), theme.text);
         let selected_wash = crate::theme::glass_selected_bg();
@@ -1944,7 +1940,7 @@ impl Shell {
             // A sidebar click opens the session as a tab (appends if absent,
             // focuses if present) — the reopen path for locally closed tabs.
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.open_chat_tab(select_id.clone(), cx);
+                this.open_chat(select_id.clone(), cx);
             }))
             .on_mouse_down(
                 MouseButton::Right,
@@ -1953,7 +1949,7 @@ impl Shell {
                     cx.notify();
                 }),
             )
-            // Line 1: status rail, space name, time-ago.
+            // Line 1: "project @ device", status word / time-ago right.
             .child(
                 div()
                     .w_full()
@@ -1961,7 +1957,6 @@ impl Shell {
                     .flex_row()
                     .items_center()
                     .gap(px(Theme::SPACE_SM))
-                    .child(status_rail)
                     .child(
                         div()
                             .flex_1()
@@ -1972,20 +1967,12 @@ impl Shell {
                             .text_color(subline)
                             .child(space_name),
                     )
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(px(11.0))
-                            .text_color(subline)
-                            .child(time_ago),
-                    ),
+                    .child(div().text_color(subline).child(corner)),
             )
-            // Line 2: the session title, aligned under the folder icon
-            // (rail 6 + gap 8).
+            // Line 2: the session title, flush left (t3code card line 2).
             .child(
                 div()
                     .w_full()
-                    .pl(px(14.0))
                     .truncate()
                     .text_size(px(13.0))
                     .line_height(px(17.0))
@@ -1996,7 +1983,6 @@ impl Shell {
             .child(
                 div()
                     .w_full()
-                    .pl(px(14.0))
                     .flex()
                     .flex_row()
                     .items_center()
@@ -2653,9 +2639,6 @@ impl Shell {
             overlays.push(popover::modal("rename-chat-dialog", viewport, card));
         }
 
-        if let Some(menu) = self.render_tab_menu(cx) {
-            overlays.push(menu);
-        }
         overlays.extend(self.render_space_overlays(viewport, window, cx));
         if let Some(overlay) = self.render_add_space_overlay(viewport, window, cx) {
             overlays.push(overlay);
