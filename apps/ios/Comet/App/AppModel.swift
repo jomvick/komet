@@ -427,12 +427,19 @@ final class AppModel {
         sessionStores.values.forEach { $0.flushToDisk() }
     }
 
-    /// Foreground hook: kick every room NOW (see RoomClient.kick) — after a
-    /// suspension the workspace room in particular stayed dead while chat
+    /// Foreground hook: kick every room NOW (see ChatRoomClient.kick) — after
+    /// a suspension the workspace room in particular stayed dead while chat
     /// views reconnected on open, freezing sidebar rows and Working
     /// indicators against perfectly live transcripts (2026-08-04).
     func foregrounded() {
         workspace?.kickRoom()
+        // Deliver any roomGen flips that landed while the store had no open
+        // view, then kick every room.
+        if let workspace {
+            for chat in workspace.chats {
+                sessionStores[chat.id]?.updateRoomGen(chat.roomGen)
+            }
+        }
         sessionStores.values.forEach { $0.kickRoom() }
     }
 
@@ -446,12 +453,17 @@ final class AppModel {
         guard let config else { return nil }
         if let existing = sessionStores[chat.id] {
             existing.hostDeviceId = chat.deviceId
+            // The registry flip to chat2 can land while the store is open —
+            // views re-derive `chat` from the registry on every change, so
+            // this accessor is the flip's delivery path.
+            existing.updateRoomGen(chat.roomGen)
             return existing
         }
         let store = SessionStore(chatId: chat.id, config: config)
         store.hostDeviceId = chat.deviceId
         sessionStores[chat.id] = store
         store.start()
+        store.updateRoomGen(chat.roomGen)
         return store
     }
 

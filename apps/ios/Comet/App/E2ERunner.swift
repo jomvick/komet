@@ -101,7 +101,8 @@ enum E2ERunner {
         let bigChat = Chat(id: bigChatId, deviceId: device.id, title: "big", archived: false,
                            cwd: nil, branch: nil, checkoutId: nil, config: nil,
                            lastMessagePreview: nil, lastMessageAt: nil, createdAt: nowMs(),
-                           spaceId: spaceId, lastSeenAt: nil)
+                           spaceId: spaceId, lastSeenAt: nil,
+                           roomGen: 2)  // the seeder fills a chat2 room now
         if let bigStore = model.sessionStore(for: bigChat) {
             let big = await poll(timeout: 20, label: "big doc backfill") {
                 bigStore.entries.count >= 40 ? bigStore.entries : nil

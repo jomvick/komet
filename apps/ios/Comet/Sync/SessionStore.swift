@@ -1,8 +1,17 @@
 // Session doc mirror — transcript entries + the durable command queue for one
-// chat (crates/doc/src/schema.rs). A viewer device never writes message
-// entries; it appends command ledger entries (rule 1) and lets the host drain
-// them. Optimistic echo: pending sends render locally under their client-minted
-// message id until the host writes the real entry with the same id.
+// chat (crates/doc/src/schema.rs), synced over the chat2 log relay
+// (docs/chat2-sync.md; s2 is dead on mobile). A viewer device never writes
+// message entries; it appends command ledger entries (rule 1) and lets the
+// host drain them. Optimistic echo: pending sends render locally under their
+// client-minted message id until the host writes the real entry with the
+// same id.
+//
+// The registry names the room generation (M2): the store connects only once
+// the chat row says roomGen 2. A gen-1 chat renders nothing and waits for
+// the host's migration sweep to flip it — the local doc is always the chat2
+// lineage; a cached pre-chat2 snapshot is never imported (unrelated Loro
+// histories would duplicate every message), only mined for our own pending
+// commands (M3) and left on disk as rollback.
 
 import Foundation
 import Loro
@@ -35,9 +44,17 @@ final class SessionStore {
     private(set) var pendingSends: [(messageId: String, text: String, at: Int64)] = []
 
     let doc = LoroDoc()
-    private var room: RoomClient?
+    /// The chat2 room cursor — the last server row seq folded into `doc`.
+    /// Persisted WITH the snapshot in one atomic file (DocDisk.saveChat2, the
+    /// C2 rule), so content and cursor can never diverge.
+    @ObservationIgnored private var cursor: UInt64 = 0
+    private var chatRoom: ChatRoomClient?
     private var subscriptions: [Subscription] = []
     private let config: AppConfig
+    /// Registry roomGen for this chat (M2): connect only at >= 2. One-way —
+    /// the registry never walks a chat back to s2.
+    @ObservationIgnored private var roomGen = 1
+    @ObservationIgnored private var started = false
 
     /// Demo mode: no room, entries driven externally.
     private let offline: Bool
@@ -79,28 +96,151 @@ final class SessionStore {
     @ObservationIgnored private var saver: DocSaver?
 
     func start() {
-        guard room == nil, !offline else { return }
-        // Local-first: last-synced transcript renders instantly (even when the
-        // host device is offline); the join backfills incrementally from here.
-        if DocDisk.load(into: doc, id: chatId) {
+        guard !started, !offline else { return }
+        started = true
+        // Local-first: the last-synced chat2 snapshot renders instantly (even
+        // when the host device is offline); the join backfills incrementally
+        // from its cursor.
+        if let saved = DocDisk.loadChat2(into: doc, id: chatId) {
+            cursor = saved
             project()
+        } else if DocDisk.legacySnapshotExists(id: chatId) {
+            // M3 discard-and-adopt: this device's cached doc predates the
+            // chat2 lineage. Carry over OUR OWN unresolved commands as fresh
+            // entries; the chat2 catch-up repopulates the transcript.
+            adoptLegacyCommands()
         }
-        saver = DocSaver(docId: chatId, doc: doc)
-        let client = RoomClient(roomId: chatId, doc: doc) { [config, chatId] in
-            await config.sessionSocketURL(chatId: chatId)
-        } events: { [weak self] event in
-            Task { @MainActor [weak self] in self?.handle(event) }
+        saver = DocSaver { [weak self] in
+            guard let self else { return }
+            DocDisk.saveChat2(doc: self.doc, id: self.chatId, cursor: self.cursor)
         }
-        room = client
-        let localSub = doc.subscribeLocalUpdate { [weak client, weak self] update in
-            guard let client else { return }
-            let bytes = [UInt8](update)
-            Task { await client.sendLocalUpdate(bytes) }
-            Task { @MainActor [weak self] in self?.saver?.poke() }
+        // Subscription BEFORE any connect: every local commit lands in the
+        // client when it exists; commits made earlier are covered by the
+        // first-contact full-log push below (cursor 0 whenever no client has
+        // ever acked — see connectIfReady).
+        let localSub = doc.subscribeLocalUpdate { [weak self] update in
+            let bytes = Data(update)
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                if let room = self.chatRoom {
+                    Task { await room.enqueue(update: bytes) }
+                }
+                self.saver?.poke()
+            }
         }
         subscriptions.append(localSub)
-        Task { await client.start() }
+        connectIfReady()
         project()
+    }
+
+    /// Registry projection hook (AppModel forwards the chat row's roomGen).
+    /// A gen-1 store connects the moment the host's migration sweep flips
+    /// the row.
+    func updateRoomGen(_ gen: Int?) {
+        let gen = gen ?? 1
+        if gen > roomGen { roomGen = gen }
+        connectIfReady()
+    }
+
+    private func connectIfReady() {
+        guard started, !offline, chatRoom == nil, roomGen >= 2 else { return }
+        let delegate = ChatRoomClient.Delegate(
+            cursor: { [weak self] in self?.cursor ?? 0 },
+            containsFrontier: { [weak self] frontier in
+                // Empty frontier = a checkpoint of an empty doc — nothing to
+                // fetch (mirror of EngineChatSink::contains_frontier).
+                guard !frontier.isEmpty else { return true }
+                guard let self,
+                      let vv = try? VersionVector.decode(bytes: frontier) else { return false }
+                return self.doc.oplogVv().includesVv(other: vv)
+            },
+            applyCheckpoint: { [weak self] bytes, seq in
+                guard let self,
+                      (try? self.doc.importWith(bytes: bytes, origin: "remote")) != nil else {
+                    return false
+                }
+                self.cursor = max(self.cursor, seq)
+                self.project()
+                self.saver?.poke()
+                return true
+            },
+            applyRow: { [weak self] bytes, seq in
+                guard let self else { return }
+                // Malformed remote bytes cost the row, never the doc. The
+                // cursor still advances: replaying a poison row forever is
+                // the wedge class chat2 replaces.
+                if (try? self.doc.importWith(bytes: bytes, origin: "remote")) == nil {
+                    roomLog.warning("chat2 \(self.chatId, privacy: .public): row import failed; skipping row \(seq)")
+                }
+                self.cursor = max(self.cursor, seq)
+                self.project()
+                self.saver?.poke()
+            },
+            advanceCursor: { [weak self] seq in
+                guard let self else { return }
+                self.cursor = max(self.cursor, seq)
+                self.saver?.poke()
+            },
+            event: { [weak self] event in self?.handle(event) }
+        )
+        let client = ChatRoomClient(
+            chatId: chatId, device: config.deviceId,
+            urlProvider: { [config, chatId] in await config.chat2SocketURL(chatId: chatId) },
+            checkpointRequest: { [config, chatId] in
+                await config.chat2CheckpointRequest(chatId: chatId)
+            },
+            delegate: delegate)
+        chatRoom = client
+        // First contact with the room (cursor 0): everything committed
+        // BEFORE the local-update subscription saw a client — an adopt's
+        // requeued commands, sends queued while waiting for the roomGen
+        // flip — is invisible to the push path, yet every later commit
+        // causally depends on it (doc_host.rs first-contact rule; rows built
+        // on unpushed deps sit in peers' pending-dep buffers forever). Push
+        // the doc's full update log as the join's first batch; once acked
+        // the cursor moves and this never re-arms.
+        if cursor == 0,
+           let all = try? doc.export(mode: .updates(from: VersionVector())), !all.isEmpty {
+            Task { await client.enqueue(update: all) }
+        }
+        Task { await client.start() }
+    }
+
+    /// Mine the retired s2 snapshot for OUR OWN still-pending commands and
+    /// re-queue them into the fresh lineage (doc_host.rs M3 requeue: same
+    /// command ids — the host's processed_commands ledger guards double
+    /// execution; basedOn is dropped, its turn ids don't exist here).
+    private func adoptLegacyCommands() {
+        let legacy = LoroDoc()
+        guard DocDisk.load(into: legacy, id: chatId),
+              let root = legacy.getDeepValue().mapValue,
+              let commands = root["commands"]?.listValue, !commands.isEmpty else { return }
+        let now = nowMs()
+        var carried = 0
+        let fresh = doc.getList(id: "commands")
+        for value in commands {
+            guard let m = value.mapValue,
+                  m["status"]?.stringValue == "pending",
+                  m["issuedBy"]?.stringValue == config.deviceId,
+                  let id = m["id"]?.stringValue,
+                  let kind = m["kind"]?.stringValue,
+                  let payload = m["payload"] else { continue }
+            if let expires = m["expiresAt"]?.i64Value, expires <= now { continue }
+            do {
+                let map = try fresh.pushContainer(child: LoroMap())
+                try map.insert(key: "id", v: id)
+                try map.insert(key: "kind", v: kind)
+                try map.insert(key: "payload", v: payload)
+                try map.insert(key: "issuedBy", v: config.deviceId)
+                try map.insert(key: "issuedAt", v: m["issuedAt"]?.i64Value ?? now)
+                try map.insert(key: "expiresAt", v: m["expiresAt"]?.i64Value ?? (now + commandDefaultTtlMs))
+                try map.insert(key: "status", v: "pending")
+                carried += 1
+            } catch {}
+        }
+        guard carried > 0 else { return }
+        doc.commit()
+        roomLog.info("chat2 \(self.chatId, privacy: .public): adopt carried \(carried) pending command(s) from the s2 lineage")
     }
 
     /// Backgrounding hook: persist immediately.
@@ -109,34 +249,31 @@ final class SessionStore {
     }
 
     /// Foreground hook: revive the room after a suspension (see
-    /// RoomClient.kick).
+    /// ChatRoomClient.kick). Also the catch-all re-check for a roomGen flip
+    /// that landed while this store had no open view.
     func kickRoom() {
-        guard let room else { return }
-        Task { await room.kick() }
+        connectIfReady()
+        guard let chatRoom else { return }
+        Task { await chatRoom.kick() }
     }
 
     func stop() {
         subscriptions.removeAll()
         saver?.flush()
-        if let room {
-            Task { await room.stop() }
+        if let chatRoom {
+            Task { await chatRoom.stop() }
         }
-        room = nil
+        chatRoom = nil
         connected = false
     }
 
-    private func handle(_ event: RoomEvent) {
+    private func handle(_ event: ChatRoomEvent) {
         switch event {
         case .connected:
             connected = true
             project()
         case .disconnected:
             connected = false
-        case .remoteUpdate:
-            project()
-            saver?.poke()
-        case .ephemeralUpdate:
-            break
         }
     }
 
@@ -153,8 +290,8 @@ final class SessionStore {
     /// session, and it runs on every remote update. On the main actor that
     /// stalled the first frame of a cached session and janked streaming.
     /// Reading the doc from a background task is the access class the design
-    /// already has: `RoomClient` is a non-main actor that imports into this
-    /// same doc, so it is concurrently read/written today regardless.
+    /// already has: `ChatRoomClient` applies through main-actor closures, but
+    /// the doc remains concurrently readable today regardless.
     ///
     /// Overlapping calls coalesce to a single trailing re-run — a streaming
     /// burst must not queue one whole-doc projection per token.

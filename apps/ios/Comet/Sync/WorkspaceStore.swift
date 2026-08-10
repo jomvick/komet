@@ -194,7 +194,8 @@ final class WorkspaceStore {
                         lastMessageAt: f["lastMessageAt"]?.int64Value,
                         createdAt: f["createdAt"]?.int64Value ?? 0,
                         spaceId: f["spaceId"]?.stringValue,
-                        lastSeenAt: f["lastSeenAt"]?.int64Value)
+                        lastSeenAt: f["lastSeenAt"]?.int64Value,
+                        roomGen: f["roomGen"]?.int64Value.map(Int.init))
         }
 
         var rows: [String: SessionRow] = [:]
@@ -341,6 +342,9 @@ final class WorkspaceStore {
             "cwd": .string(cwd ?? space.path),
             "spaceId": .string(space.id),
             "createdAt": .int(nowMs()),
+            // Born on chat2 (workspace_host.rs create_chat): a brand-new
+            // chat has an empty doc — nothing to seed, no migration race.
+            "roomGen": .int(2),
         ]
         if let branch {
             set["branch"] = .string(branch)
