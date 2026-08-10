@@ -570,10 +570,14 @@ impl DocHost {
                 let weak_push = Arc::downgrade(&handle);
                 let sub = doc.doc().subscribe_local_update(Box::new(move |bytes: &Vec<u8>| {
                     if let Some(handle) = weak_push.upgrade() {
-                        if let Some(client) = &*lock(&handle.chat2) {
-                            client.enqueue_update(bytes.clone());
-                        } else {
-                            lock(&handle.chat2_pending_local).push(bytes.clone());
+                        // The buffer push happens WHILE HOLDING the client
+                        // lock (verify pass: releasing it between the None
+                        // check and the push let the join's store+drain
+                        // slip between, orphaning the update forever).
+                        let client_guard = lock(&handle.chat2);
+                        match &*client_guard {
+                            Some(client) => client.enqueue_update(bytes.clone()),
+                            None => lock(&handle.chat2_pending_local).push(bytes.clone()),
                         }
                     }
                     true
@@ -718,17 +722,19 @@ impl DocHost {
                         let Some(handle) = weak.upgrade() else {
                             return; // evicted mid-dial: drop leaves the room
                         };
-                        *lock(&handle.chat2) = Some(client);
-                        // Drain dial-era commits (review B3): buffered
-                        // strictly before any direct enqueue can happen
-                        // (the subscription checks `chat2` AFTER this store,
-                        // so drained items are strictly older — no dupes).
-                        let pending: Vec<Vec<u8>> =
-                            std::mem::take(&mut *lock(&handle.chat2_pending_local));
-                        if let Some(client) = &*lock(&handle.chat2) {
+                        {
+                            // Store + drain under ONE client-lock critical
+                            // section: the subscription pushes to the buffer
+                            // while holding this same lock, so every commit
+                            // is either drained here or enqueued directly
+                            // after — never dropped between (verify pass).
+                            let mut client_slot = lock(&handle.chat2);
+                            let pending: Vec<Vec<u8>> =
+                                std::mem::take(&mut *lock(&handle.chat2_pending_local));
                             for update in pending {
                                 client.enqueue_update(update);
                             }
+                            *client_slot = Some(client);
                         }
                         tracing::info!(chat = %chat, "chat2 room joined (converged)");
                         return;
