@@ -254,7 +254,14 @@ impl SessionsEngine {
                 prompt: request.prompt.clone(),
                 message_id: message_id.clone(),
             };
-            if steerable && steer_tx.try_send(message).is_ok() {
+            // The run can vanish between the map read and the send (drive_run
+            // removes the handle, then stamps the final status): re-check the
+            // registration AFTER the send, or a steer routed into a dying
+            // mailbox marks the session Working with no run behind it.
+            if steerable
+                && steer_tx.try_send(message).is_ok()
+                && self.is_live(chat_id, &run_id)
+            {
                 let user_id = message_id.unwrap_or_else(new_id);
                 let handle = self.doc_handle(chat_id)?;
                 handle.write_user_message(&user_id, &request.prompt, now_ms())?;
@@ -814,16 +821,25 @@ fn render_parts(parts: &[MessagePart]) -> Vec<MessagePart> {
                 resolved,
                 output,
                 diff,
+                output_ref,
+                output_bytes,
+                diff_ref,
+                diff_stats,
             } => MessagePart::Tool {
                 id: id.clone(),
                 call: sanitize_tool_call(call),
                 is_error: *is_error,
                 resolved: *resolved,
-                // Output and diffs are deliberately kept (capped at fold
-                // time): unlike raw tool inputs they are the transcript's
-                // record of what happened, and the caps bound doc growth.
+                // Output summaries, diff stats, and sidecar refs are
+                // deliberately kept: unlike raw tool inputs they are the
+                // transcript's record of what happened, and the strip already
+                // bounded them (docs/chat2-sync.md A1).
                 output: output.clone(),
                 diff: diff.clone(),
+                output_ref: output_ref.clone(),
+                output_bytes: *output_bytes,
+                diff_ref: diff_ref.clone(),
+                diff_stats: diff_stats.clone(),
             },
             other => other.clone(),
         })
@@ -942,6 +958,13 @@ async fn drive_run(
 
     let doc_ref: &SessionDoc = &doc;
     let mut folded: Vec<MessagePart> = Vec::new();
+    // Every tool id this run has folded, across segment resets. Adapters
+    // re-emit shape-bearing `tool_call_update`s (title/rawInput refreshes,
+    // long-running completions) as full ToolCall events; once the fold has
+    // reset at a steer/park boundary those ids are gone from `folded`, and
+    // folding the echo would mint an orphan chip mid-text in the NEXT
+    // segment — the mid-word transcript splits.
+    let mut seen_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut entry_id = new_id();
     let mut segment_started = now_ms();
     let mut writer: Option<SegmentWriter<'_>> = None;
@@ -1016,6 +1039,13 @@ async fn drive_run(
             Some(event) = engine_rx.recv() => event,
             next = stream.next() => match next {
                 Some(Ok(event)) => event,
+                // A stream error while PARKED is a post-turn child death —
+                // the turn was already finalized, so the run ends clean
+                // instead of stamping a completed session Errored.
+                Some(Err(err)) if idle_since.is_some() => {
+                    tracing::warn!(chat = %chat_id, error = %err, "parked session child died; ending clean");
+                    break SessionStatus::Idle;
+                }
                 Some(Err(err)) => AgentEvent::Done {
                     status: DoneStatus::Errored,
                     result: None,
@@ -1055,10 +1085,26 @@ async fn drive_run(
         // Any stream activity proves the run is alive — keep the session's
         // freshness inside the UI's 45s staleness window (throttled).
         inner.touch_session(&chat_id);
-        // First event after parking idle = the next turn beginning (a routed
-        // dispatch steered in): the session is Working again.
-        if idle_since.take().is_some() {
-            inner.set_status(&chat_id, SessionStatus::Working, true);
+        // PARKED: only a steer boundary (or an input round-trip / terminal
+        // Done) re-opens the session. The ACP child keeps forwarding
+        // `session/update` frames after a turn completes — late
+        // tool_call_updates for long-running commands, command refreshes,
+        // reasoning heartbeats. Treating those as "the next turn" re-armed
+        // Working with no Done ever coming (the eternally-running session
+        // bug) and folded orphan parts into a phantom segment.
+        if idle_since.is_some() {
+            match &event {
+                AgentEvent::Steered { .. } => {
+                    idle_since = None;
+                    inner.set_status(&chat_id, SessionStatus::Working, true);
+                }
+                AgentEvent::InputRequested { .. }
+                | AgentEvent::InputResolved { .. }
+                | AgentEvent::Done { .. } => {
+                    idle_since = None;
+                }
+                _ => continue,
+            }
         }
         // Empty reasoning deltas are PURE heartbeats: redacted thinking and
         // tool-input-generation windows stream them with no text. They fold
@@ -1066,6 +1112,32 @@ async fn drive_run(
         // per long turn observed) — the touch above already did their job.
         if matches!(&event, AgentEvent::ReasoningDelta { text } if text.is_empty()) {
             continue;
+        }
+
+        // Stale tool echoes: a ToolCall/ToolResult naming an id folded in a
+        // PRIOR segment (the fold reset at a steer or park since) belongs to
+        // a chip that already rendered in its own entry. Folding the echo
+        // would splice a phantom chip into the middle of the current
+        // segment's streaming text (the mid-word transcript splits). Dropped;
+        // same-segment refreshes still land in place.
+        let in_segment = |folded: &[MessagePart], id: &str| {
+            folded
+                .iter()
+                .any(|p| matches!(p, MessagePart::Tool { id: pid, .. } if pid == id))
+        };
+        match &event {
+            AgentEvent::ToolCall { id, .. } => {
+                if !in_segment(&folded, id) && seen_tools.contains(id) {
+                    continue;
+                }
+                seen_tools.insert(id.clone());
+            }
+            AgentEvent::ToolResult { id, .. }
+                if !in_segment(&folded, id) && seen_tools.contains(id) =>
+            {
+                continue;
+            }
+            _ => {}
         }
 
         // Failed-resume fallback: an engine-injected `--resume` naming a session
@@ -1106,6 +1178,11 @@ async fn drive_run(
                     .await
                 {
                     tracing::error!(chat = %chat, error = %err, "fresh-session retry dispatch failed");
+                    // No run is coming: leaving the row Working would spin
+                    // the session forever with nothing behind it.
+                    engine
+                        .inner
+                        .set_status(&chat, SessionStatus::Errored, false);
                 }
             });
             return;
@@ -1188,6 +1265,12 @@ async fn drive_run(
         let skip_fold = matches!(&event, AgentEvent::SessionStarted { .. }) && !folded.is_empty();
         if !skip_fold {
             fold_event_into_parts(&mut folded, &event);
+            // R2 sidecar PARKED (2026-08-10, product call): the fold's
+            // summary/stats ARE the doc's whole record — no refs stamped, no
+            // uploads. Full outputs survive only in the host's local run
+            // journal. To reintroduce: `komet_doc::sidecar_payload(&event)`
+            // → `apply_sidecar_refs` → `doc_host.upload_tool_sidecar`, all
+            // still in place and tested.
         }
 
         if let AgentEvent::Done { status, .. } = &event {

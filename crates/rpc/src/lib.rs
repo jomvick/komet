@@ -111,6 +111,9 @@ pub mod methods {
     pub const UPLOAD_CHUNK: &str = "UploadChunk";
     pub const UPLOAD_COMMIT: &str = "UploadCommit";
     pub const READ_ATTACHMENT_CHUNK: &str = "ReadAttachmentChunk";
+    /// Lazy full-tool-output fetch from the R2 sidecar by doc-resident ref
+    /// (chat2-sync A3). Edge-direct from any device — never relay-forwarded.
+    pub const FETCH_TOOL_BLOB: &str = "FetchToolBlob";
     // Updates (ControlRpc, relay-forwardable — a device reports/applies its own
     // binary's update). Stream: current UpdateStatus, then every change.
     pub const UPDATE_STATUS: &str = "UpdateStatus";

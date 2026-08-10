@@ -30,7 +30,7 @@ await client.join({ roomId: room, crdtAdaptor: adaptor });
 const doc = adaptor.getDoc();
 const map = doc.getMap("devices");
 
-// COMPACT_LOG_ROWS = 1500; each commit is its own update row on the DO.
+// COMPACT_LOG_ROWS = 400; each commit is its own update row on the DO.
 const N = 1700;
 let maxRows = 0;
 for (let i = 0; i < N; i++) {

@@ -30,6 +30,14 @@
  *   PUT  /attachments/:sha256         — content-addressed upload
  *   GET  /attachments/:sha256
  *   HEAD /attachments/:sha256
+ *   PUT  /blob/:chatId/:partId        — tool-output sidecar (chat2-sync A2)
+ *   GET  /blob/:chatId/:partId
+ *   GET  /chat2/:chatId/ws            — chat2 log-relay room (wss, chat2-sync B)
+ *   GET|POST /chat2/:chatId/checkpoint — client-built doc snapshot (Range-resumable GET)
+ *   GET|PUT  /chat2/:chatId/tail      — host-published sidecars, served verbatim
+ *   GET|PUT  /chat2/:chatId/diff
+ *   GET  /chat2/:chatId/stats
+ *   POST /chat2/:chatId/reset
  */
 import { authenticate } from "./auth";
 import { handleAuthRoute } from "./auth-routes";
@@ -37,13 +45,27 @@ import { AUTH_USER_HEADER, ROOM_KIND_HEADER, type Env } from "./env";
 import { SessionRoom } from "./session-room";
 import { DeviceRoom } from "./device-room";
 import { RegistryRoom } from "./registry-room";
+import { ChatRoom } from "./chat-room";
 import installSh from "./install.sh";
 
-export { SessionRoom, DeviceRoom, RegistryRoom };
+export { SessionRoom, DeviceRoom, RegistryRoom, ChatRoom };
 
 const ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+
+/** `decodeURIComponent` that answers `undefined` for malformed %-escapes. */
+const safeDecode = (segment: string): string | undefined => {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return undefined;
+  }
+};
 const SHA256_RE = /^[a-f0-9]{64}$/;
+/** Tool part ids are harness-minted (`tool-1`, `call_x`, `m1#c1`-style) —
+ * wider than ID_RE but still no slashes, so a part id can't traverse keys. */
+const PART_RE = /^[A-Za-z0-9._:#~-]{1,200}$/;
 const MAX_ATTACHMENT_BYTES = 32 * 1024 * 1024; // mirrors today's upload cap
+const MAX_TOOL_BLOB_BYTES = 1024 * 1024;
 
 const json = (value: unknown, status = 200): Response =>
   new Response(JSON.stringify(value), {
@@ -169,6 +191,41 @@ export default {
     }
     if (parts[0] === "append" && parts[1] && ID_RE.test(parts[1]) && request.method === "POST") {
       return forward(env.SESSION_ROOMS, `s2/${parts[1]}`, request, auth.userId, "/append", "");
+    }
+
+    // ── chat2 rooms (docs/chat2-sync.md B): dumb log relays, one per chat.
+    //    Claim-on-first-join ownership enforced in the DO (chat ids are
+    //    client-minted). The DO handles /ws, /checkpoint (GET Range-resumable
+    //    + POST floor-guarded), host-published /tail + /diff sidecars,
+    //    /stats, /reset. ──────────────────────────────────────────────────────
+    if (parts[0] === "chat2" && parts[1] && ID_RE.test(parts[1]) && parts[2]) {
+      const room = `chat2/${parts[1]}`;
+      if (parts[2] === "ws" && parts.length === 3) {
+        if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
+          return json({ error: "expected websocket" }, 426);
+        }
+        return forward(
+          env.CHAT_ROOMS,
+          room,
+          request,
+          auth.userId,
+          "/ws",
+          `?chatId=${parts[1]}${deviceParam(url)}`
+        );
+      }
+      const routes: Record<string, string[]> = {
+        checkpoint: ["GET", "POST"],
+        tail: ["GET", "PUT"],
+        diff: ["GET", "PUT"],
+        stats: ["GET"],
+        reset: ["POST"]
+      };
+      if (parts.length === 3 && routes[parts[2]]?.includes(request.method)) {
+        // Query carries through (`seqCovered` on POST /checkpoint), as do
+        // headers (`x-chat2-frontier`, `range`).
+        return forward(env.CHAT_ROOMS, room, request, auth.userId, `/${parts[2]}`, url.search);
+      }
+      return json({ error: "not found" }, 404);
     }
 
     // ── workspace rooms (ARCHITECTURE §2.2/§6.1): same SessionRoom DO class;
@@ -299,6 +356,48 @@ export default {
       // and replayed on the host's next join.
       if (parts[2] === "nudge" && request.method === "POST") {
         return forward(env.DEVICE_ROOMS, `d2/${deviceId}`, request, auth.userId, "/nudge", "");
+      }
+    }
+
+    // ── R2 tool-output sidecar (docs/chat2-sync.md A2): full tool outputs
+    //    and diffs live here, keyed `{chatId}/{partId}[.diff]`; the doc keeps
+    //    only a one-line summary + this key. Straight R2, no DO involvement —
+    //    the doc stays thin whether or not these uploads land. Per-user
+    //    prefix = owner auth (same trust shape as /attachments). ────────────
+    if (parts[0] === "blob" && parts.length === 3 && ID_RE.test(parts[1])) {
+      // Percent-decode the part segment before validating: PART_RE allows
+      // `#` (`m1#c1`-style harness ids), which HTTP clients cannot send raw
+      // (fragment delimiter) — the host percent-encodes it. Decode-then-
+      // validate keeps traversal shut: `%2F` decodes to `/`, fails PART_RE.
+      const partId = safeDecode(parts[2]);
+      if (partId === undefined || !PART_RE.test(partId)) {
+        return json({ error: "bad part id" }, 400);
+      }
+      const key = `blob/${auth.userId}/${parts[1]}/${partId}`;
+      if (request.method === "PUT") {
+        const body = await request.arrayBuffer();
+        // Outputs are 4KiB-capped at the harness boundary; diffs can run
+        // larger but a sidecar entry is one tool result, never a dump.
+        if (body.byteLength > MAX_TOOL_BLOB_BYTES) return json({ error: "too_large" }, 413);
+        await env.BLOBS.put(key, body, {
+          httpMetadata: {
+            contentType: request.headers.get("content-type") ?? "text/plain; charset=utf-8"
+          }
+        });
+        return json({ ok: true, bytes: body.byteLength });
+      }
+      if (request.method === "GET" || request.method === "HEAD") {
+        const object =
+          request.method === "GET" ? await env.BLOBS.get(key) : await env.BLOBS.head(key);
+        if (!object) return json({ error: "not_found" }, 404);
+        const headers = new Headers();
+        object.writeHttpMetadata(headers);
+        headers.set("etag", object.httpEtag);
+        // Re-resolved tool parts overwrite their key, so short-lived caching only.
+        headers.set("cache-control", "private, max-age=300");
+        const body =
+          request.method === "GET" && "body" in object ? (object as R2ObjectBody).body : null;
+        return new Response(body, { headers });
       }
     }
 

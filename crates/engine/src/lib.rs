@@ -18,6 +18,7 @@ use komet_sync::DocsStore;
 pub mod agent_accounts;
 pub mod auth;
 pub mod diff_sync;
+pub mod chat2_host;
 pub mod doc_host;
 pub mod instance_lock;
 pub mod profile;

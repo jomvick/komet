@@ -132,6 +132,22 @@ async fn write_loop(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<Strin
     }
 }
 
+/// The id of a response, tolerantly. komet always sends numeric ids, but
+/// JSON-RPC lets a server echo them re-encoded — a string `"5"` or float
+/// `5.0` still names request 5. Dropping such a response would strand its
+/// caller forever (the session would spin Working with no per-turn timeout).
+fn response_id(id: &Value) -> Option<i64> {
+    if let Some(n) = id.as_i64() {
+        return Some(n);
+    }
+    if let Some(s) = id.as_str() {
+        return s.parse().ok();
+    }
+    id.as_f64()
+        .filter(|f| f.fract() == 0.0)
+        .map(|f| f as i64)
+}
+
 /// Parse stdout lines: responses resolve the pending map, everything else is
 /// forwarded in order. Non-JSON noise is skipped; on EOF all pending requests
 /// fail (their senders drop) and one final [`Incoming::Eof`] is delivered.
@@ -153,7 +169,7 @@ async fn read_loop(stdout: ChildStdout, pending: Pending, tx: mpsc::Sender<Incom
         match (method, id) {
             // Response: resolve the awaiting request.
             (None, Some(id)) => {
-                let Some(id) = id.as_i64() else { continue };
+                let Some(id) = response_id(id) else { continue };
                 let Some(sender) = pending.lock().expect("pending lock").remove(&id) else {
                     continue;
                 };

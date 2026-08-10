@@ -655,6 +655,7 @@ impl WorkspaceHost {
                 last_message_at: None,
                 created_at: Utc::now(),
                 harness_session_id: None,
+                room_gen: None,
                 harness_session_cwd: None,
                 space_id: Some(space.id.clone()),
                 last_seen_at: None,
@@ -783,6 +784,12 @@ impl WorkspaceHost {
         chat.device_id = device_id.to_string();
         self.mutate(|doc| doc.upsert_chat(&chat))?;
         Ok(true)
+    }
+
+    /// Flip the chat's sync room generation (docs/chat2-sync.md M2) — the
+    /// host calls this in the same breath as seeding the chat2 checkpoint.
+    pub fn set_chat_room_gen(&self, chat_id: &str, room_gen: u32) -> Result<bool, EngineError> {
+        Ok(self.mutate(|doc| doc.set_chat_room_gen(chat_id, room_gen))?)
     }
 
     pub fn set_chat_archived(&self, chat_id: &str, archived: bool) -> Result<bool, EngineError> {

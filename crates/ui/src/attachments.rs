@@ -277,7 +277,7 @@ const READ_CHUNK_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Race an RPC against `timeout` on the gpui background executor (these
 /// futures run under `cx.spawn`, so tokio's timer reactor isn't available).
-async fn call_with_timeout(
+pub(crate) async fn call_with_timeout(
     engine: &EngineHandle,
     executor: &BackgroundExecutor,
     method: &str,
