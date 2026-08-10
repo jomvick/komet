@@ -120,6 +120,19 @@ pub struct Chat {
     /// device clears the badge everywhere.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_seen_at: Option<DateTime<Utc>>,
+    /// Which sync room generation serves this chat (docs/chat2-sync.md M2):
+    /// `None`/1 = legacy s2 loro room, 2 = chat2 dumb relay. The HOST flips
+    /// this in the same breath as seeding the chat2 checkpoint; every device
+    /// dials the room the registry names. Per-chat and instantly revertible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room_gen: Option<u32>,
+}
+
+impl Chat {
+    /// True when this chat syncs over the chat2 dumb relay.
+    pub fn on_chat2(&self) -> bool {
+        self.room_gen.unwrap_or(1) >= 2
+    }
 }
 
 impl Chat {

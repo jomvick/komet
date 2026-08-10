@@ -140,7 +140,12 @@ pub fn plan_catch_up(
     // A cursor ahead of the server means the server lost state (reset/wipe);
     // our cursor is meaningless there — treat as fresh.
     let cursor = if cursor > state.head_seq { 0 } else { cursor };
-    if state.checkpoint_seq == 0 {
+    // Presence test is the SIZE, not the seq: a freshly SEEDED room's
+    // checkpoint legitimately covers seq 0 (M1 seeds before any rows
+    // exist), and seq==0 misread as "no checkpoint" made every adopted
+    // reader skip the seed and render an empty transcript (caught by the
+    // 2026-08-10 cutover gauntlet).
+    if state.checkpoint_size == 0 {
         return CatchUpPlan::RowsOnly { after: cursor };
     }
     if frontier_contained {
@@ -681,8 +686,10 @@ impl Actor {
         }
 
         // ── catch-up: checkpoint precision + row backfill ───────────────────
+        // Same presence rule as `plan_catch_up`: SIZE, not seq — a seeded
+        // room's checkpoint covers seq 0 (see the decision-table test).
         let contained =
-            state.checkpoint_seq == 0 || self.sink.contains_frontier(&state_frame.payload);
+            state.checkpoint_size == 0 || self.sink.contains_frontier(&state_frame.payload);
         let plan = plan_catch_up(cursor, &state, contained);
         let after = match plan {
             CatchUpPlan::RowsOnly { after } => after,

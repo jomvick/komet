@@ -23,6 +23,14 @@ fn main() {
     // Idempotence probe: rebuilding the REBUILT doc owes the sidecar nothing.
     let again = rebuild_thin_doc(&rebuilt.doc).expect("re-rebuild");
 
+    if let Some(out_prefix) = std::env::args().nth(2) {
+        std::fs::write(format!("{out_prefix}.thin.bin"), &thin_snapshot).unwrap();
+        std::fs::write(
+            format!("{out_prefix}.frontier.bin"),
+            rebuilt.doc.doc().oplog_vv().encode(),
+        )
+        .unwrap();
+    }
     println!(
         "RESULT:{}",
         serde_json::json!({

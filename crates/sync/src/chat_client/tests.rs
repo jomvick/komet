@@ -165,6 +165,24 @@ fn catch_up_plan_covers_the_decision_table() {
         row_count: 0,
         row_bytes: 0,
     };
+    // Seeded-at-zero room (M1): checkpointSeq 0 but a real blob — the
+    // presence test is SIZE; a fresh reader must fetch the seed.
+    let seeded = wire::StateHeader {
+        head_seq: 0,
+        seq_floor: 0,
+        checkpoint_seq: 0,
+        checkpoint_size: 276_000,
+        row_count: 0,
+        row_bytes: 0,
+    };
+    assert_eq!(
+        plan_catch_up(0, &seeded, false),
+        CatchUpPlan::CheckpointThenRows { after: 0 }
+    );
+    assert_eq!(
+        plan_catch_up(0, &seeded, true),
+        CatchUpPlan::RowsOnly { after: 0 }
+    );
     // Empty room / no checkpoint: rows from the cursor.
     assert_eq!(
         plan_catch_up(0, &state(0, 0), true),
@@ -636,4 +654,53 @@ async fn hung_checkpoint_fetch_fails_the_join_within_deadline() {
     .await;
     assert!(joined.is_err(), "hung fetch must not hang the join");
     let _keep = server.await.unwrap();
+}
+
+/// M1 seed shape: checkpointSeq 0 with a real blob. BOTH presence tests
+/// (plan_catch_up AND run_session's frontier short-circuit) must key on
+/// SIZE — the 2026-08-10 gauntlet caught seq==0 short-circuits in each,
+/// which would have made every adopted reader skip the seed and render an
+/// EMPTY transcript.
+#[tokio::test(start_paused = true)]
+async fn seeded_at_zero_room_fetches_the_checkpoint() {
+    let (pipe, mut end) = pipe_pair();
+    let sink = Arc::new(RecordingSink::default()); // frontier NOT contained
+    let (fetch, fetch_calls) = fetcher(b"seed-checkpoint-bytes");
+
+    let server = tokio::spawn(async move {
+        let after = serve_join(
+            &mut end,
+            serde_json::json!({"headSeq": 0, "seqFloor": 0, "checkpointSeq": 0,
+                "checkpointSize": 276_342, "rowCount": 0, "rowBytes": 0}),
+            &[7, 7, 7], // non-empty frontier the fresh doc can't contain
+            vec![],
+            false,
+        )
+        .await;
+        assert_eq!(after, 0);
+        end
+    });
+
+    let client = ChatClient::connect_with_tuned(
+        connector(vec![pipe]),
+        sink.clone(),
+        fetch,
+        "dev-a",
+        0,
+        ChatTuning::default(),
+    )
+    .await
+    .expect("join succeeds");
+    let _keep = server.await.unwrap();
+
+    assert_eq!(
+        fetch_calls.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "seed checkpoint fetched despite checkpointSeq == 0"
+    );
+    assert_eq!(
+        *lock(&sink.checkpoints),
+        vec![(b"seed-checkpoint-bytes".to_vec(), 0)]
+    );
+    client.shutdown().await;
 }

@@ -138,6 +138,7 @@ async fn main() {
         "caughtUpCursor": caught_up_cursor,
         "finalCursor": sink.cursor.load(Relaxed),
         "text": sink.doc.lock().unwrap().get_text("t").to_string(),
+        "messages": sink.doc.lock().unwrap().get_list("messages").len(),
     });
     println!("RESULT:{result}");
     client.shutdown().await;

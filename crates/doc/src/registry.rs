@@ -829,6 +829,10 @@ impl RegistryDoc {
             ),
             ("spaceId", opt_str(chat.space_id.as_deref())),
             ("lastSeenAt", opt_ms(chat.last_seen_at)),
+            (
+                "roomGen",
+                chat.room_gen.map(|g| json!(g)).unwrap_or(Value::Null),
+            ),
         ]);
         self.write(KIND_CHATS, &chat.id.clone(), OpKind::Upsert, set);
         Ok(())
@@ -918,6 +922,23 @@ impl RegistryDoc {
             chat_id,
             OpKind::Update,
             fields([("archived", json!(archived))]),
+        );
+        Ok(true)
+    }
+
+    /// Flip the chat's sync room generation (docs/chat2-sync.md M2). The
+    /// host calls this in the same breath as seeding the chat2 checkpoint;
+    /// LWW per-field like every registry write, so the flip is per-chat and
+    /// instantly revertible by writing 1 back.
+    pub fn set_chat_room_gen(&mut self, chat_id: &str, room_gen: u32) -> Result<bool, DocError> {
+        if !self.row_exists(KIND_CHATS, chat_id) {
+            return Ok(false);
+        }
+        self.write(
+            KIND_CHATS,
+            chat_id,
+            OpKind::Update,
+            fields([("roomGen", json!(room_gen))]),
         );
         Ok(true)
     }
