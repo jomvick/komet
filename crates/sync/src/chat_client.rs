@@ -39,6 +39,22 @@ const BACKOFF_BASE: Duration = Duration::from_millis(250);
 const BACKOFF_CAP: Duration = Duration::from_secs(30);
 /// Quiet-room probe cadence default (matches the registry's fleet math).
 const PROBE_QUIET_DEFAULT: Duration = Duration::from_secs(900);
+/// A checkpoint fetch that hasn't finished by now is treated as a dead link
+/// and the session redials (the fetch itself is Range-resumable, so a retry
+/// picks up where the bytes stopped). Sized for MAX_CHECKPOINT_BYTES over
+/// the 1.2 Mbps links this design exists for.
+const CHECKPOINT_FETCH_DEADLINE: Duration = Duration::from_secs(120);
+/// Re-push cadence after a `quota` rejection (server window is 60 s; pending
+/// batches must not wait for the next enqueue/probe to retry).
+const QUOTA_RETRY: Duration = Duration::from_secs(5);
+/// Client-side push cap: the DO's per-row cap (`chat-log.ts MAX_ROW_BYTES`,
+/// 1 MiB) minus frame-overhead headroom. The headroom matters: the runtime
+/// closes WS messages at 1 MiB BEFORE the DO runs, so a payload within a
+/// frame-header's width of the row cap would die with no error frame (and no
+/// batchId to retire) — the silent replay-forever wedge, again. Enforced at
+/// enqueue: a batch the server can never accept must not enter the replay
+/// queue.
+pub const MAX_PUSH_BYTES: usize = 1024 * 1024 - 4096;
 
 /// Per-client tuning.
 #[derive(Clone, Copy, Debug)]
@@ -67,6 +83,16 @@ pub enum ChatEvent {
     Disconnected,
     /// A remote device's presence beat arrived.
     Presence,
+    /// The server's headSeq is behind our persisted cursor — the room was
+    /// reset/wiped. The catch-up treats the cursor as fresh; the HOST should
+    /// react by re-seeding via checkpoint (chat-room.ts `/reset` recovery).
+    ServerReset,
+    /// A queued batch was permanently rejected (or refused at enqueue) and
+    /// dropped from the replay queue. The ops remain in the local doc; the
+    /// row-path for them is gone, so they reach peers only when THIS device
+    /// next posts a checkpoint — the C3 host should treat this event as a
+    /// checkpoint trigger, not a shrug.
+    PushRejected,
 }
 
 // ── engine-facing traits ────────────────────────────────────────────────────
@@ -228,6 +254,15 @@ struct Shared {
     pending: VecDeque<PendingPush>,
     /// Last hello/probe view of the server log (checkpoint-policy inputs).
     server: Option<wire::StateHeader>,
+    /// Set by a transient (`quota`) rejection: re-push at this instant
+    /// instead of waiting for the next enqueue/probe/reconnect.
+    retry_at: Option<tokio::time::Instant>,
+    /// True while draining a quota-rejected queue. Retry ticks then probe
+    /// with the HEAD batch only (a full-queue replay would itself consume
+    /// the server's quota window — N pending × 12 ticks/window livelocks
+    /// past N≈25), and each ack immediately re-arms the clock until the
+    /// queue empties.
+    quota_blocked: bool,
 }
 
 /// `komet sync` surface (plan: cursor / headSeq / floorLag / pendingPushes).
@@ -244,6 +279,9 @@ pub struct ChatStatsSnapshot {
     pub rejoins: u64,
     pub disconnects: u64,
     pub rejected: u64,
+    /// Times a hello found the server behind our cursor (room reset/wiped).
+    /// Nonzero means the host owes the room a re-seed checkpoint.
+    pub server_resets: u64,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -271,6 +309,7 @@ struct Flags {
     rejoins: std::sync::atomic::AtomicU64,
     disconnects: std::sync::atomic::AtomicU64,
     rejected: std::sync::atomic::AtomicU64,
+    server_resets: std::sync::atomic::AtomicU64,
 }
 
 impl ChatClient {
@@ -350,6 +389,7 @@ impl ChatClient {
             redial_rx,
             presence_rx,
             flags: flags.clone(),
+            resumed: false,
         };
         let task = tokio::spawn(actor.run(ready_tx));
 
@@ -382,7 +422,23 @@ impl ChatClient {
 
     /// Queue one local update batch for push (a fresh batch id is minted; the
     /// batch survives reconnects until acked — the server dedupes replays).
+    ///
+    /// Batches over [`MAX_PUSH_BYTES`] are refused here: the server can never
+    /// accept them (`MAX_ROW_BYTES`), and a queued-forever batch would replay
+    /// on every reconnect — the exact wedge class chat2 replaces. The ops
+    /// stay in the local doc and reach peers via the next checkpoint.
     pub fn enqueue_update(&self, bytes: Vec<u8>) {
+        if bytes.len() > MAX_PUSH_BYTES {
+            use std::sync::atomic::Ordering::Relaxed;
+            tracing::error!(
+                bytes = bytes.len(),
+                "chat2: update exceeds the row cap; not queued (post-strip \
+                 updates are KB-scale — this is an upstream bug)"
+            );
+            self.flags.rejected.fetch_add(1, Relaxed);
+            let _ = self.events.send(ChatEvent::PushRejected);
+            return;
+        }
         {
             let mut shared = lock(&self.shared);
             shared.pending.push_back(PendingPush {
@@ -423,7 +479,10 @@ impl ChatClient {
         ChatStatsSnapshot {
             connected: self.flags.connected.load(Relaxed),
             cursor: shared.cursor,
-            head_seq: server.head_seq.max(shared.cursor),
+            // The server's honest view — deliberately NOT clamped to the
+            // cursor: cursor > headSeq is the reset signal and must stay
+            // visible to the observability surface, not be masked by it.
+            head_seq: server.head_seq,
             seq_floor: server.seq_floor,
             checkpoint_seq: server.checkpoint_seq,
             row_count: server.row_count,
@@ -432,6 +491,7 @@ impl ChatClient {
             rejoins: self.flags.rejoins.load(Relaxed),
             disconnects: self.flags.disconnects.load(Relaxed),
             rejected: self.flags.rejected.load(Relaxed),
+            server_resets: self.flags.server_resets.load(Relaxed),
         }
     }
 
@@ -468,6 +528,18 @@ struct Actor {
     redial_rx: mpsc::Receiver<()>,
     presence_rx: mpsc::Receiver<(i64, Vec<u8>)>,
     flags: Arc<Flags>,
+    /// False until the first backfill of THIS client instance completes.
+    /// (Continuity is instance-scoped: a host that restores an older doc
+    /// snapshot must construct a fresh `ChatClient` — C3 wiring contract.)
+    /// The first
+    /// backfill must NOT exclude own rows: after a restart the pending queue
+    /// is gone, and a restored-backup/copied-device doc may be missing its
+    /// own post-backup writes — they exist only on the server. Loro
+    /// re-import of rows the doc does hold is a no-op, so redownloading own
+    /// bytes once is pure safety. Same-process reconnects have queue
+    /// continuity and skip them (the reconnect-after-offline-work path the
+    /// spec optimizes).
+    resumed: bool,
 }
 
 enum SessionEnd {
@@ -593,6 +665,21 @@ impl Actor {
         }
         let _ = self.events.send(ChatEvent::Connected);
 
+        // Server behind our cursor = the room was reset/wiped. plan_catch_up
+        // treats the cursor as fresh; SURFACE the signal too — the host's
+        // re-seed recovery (chat-room.ts /reset) hangs off this event, and
+        // masking it was exactly how the s2 wedge class stayed invisible.
+        if cursor > state.head_seq {
+            self.flags.server_resets.fetch_add(1, Relaxed);
+            tracing::warn!(
+                cursor,
+                head_seq = state.head_seq,
+                "chat2: server lost state (headSeq < cursor) — treating as \
+                 fresh; host should re-seed via checkpoint"
+            );
+            let _ = self.events.send(ChatEvent::ServerReset);
+        }
+
         // ── catch-up: checkpoint precision + row backfill ───────────────────
         let contained =
             state.checkpoint_seq == 0 || self.sink.contains_frontier(&state_frame.payload);
@@ -605,10 +692,23 @@ impl Actor {
                     checkpoint_size = state.checkpoint_size,
                     "chat2: fetching checkpoint"
                 );
-                let bytes = match self.fetcher.fetch().await {
-                    Ok(bytes) => bytes,
-                    Err(err) => {
+                // Deadline + shutdown-interruptible: a hung fetch (half-open
+                // TCP, stalled link) must neither pin the actor forever nor
+                // block `shutdown()`. The fetch is Range-resumable, so the
+                // redial retries from wherever the bytes stopped.
+                let fetch = self.fetcher.fetch();
+                let fetched = tokio::select! {
+                    fetched = tokio::time::timeout(CHECKPOINT_FETCH_DEADLINE, fetch) => fetched,
+                    _ = self.shutdown.changed() => return SessionEnd::Stop,
+                };
+                let bytes = match fetched {
+                    Ok(Ok(bytes)) => bytes,
+                    Ok(Err(err)) => {
                         tracing::warn!(error = %err, "chat2: checkpoint fetch failed");
+                        return SessionEnd::Reconnect;
+                    }
+                    Err(_) => {
+                        tracing::warn!("chat2: checkpoint fetch timed out; redialing");
                         return SessionEnd::Reconnect;
                     }
                 };
@@ -632,7 +732,9 @@ impl Actor {
             frame_type::ROWS_REQ,
             &wire::RowsReqHeader {
                 after,
-                exclude_own: true,
+                // First backfill of this process redownloads own rows (see
+                // `Actor::resumed`); reconnects skip them.
+                exclude_own: self.resumed,
             },
             &[],
         );
@@ -664,6 +766,7 @@ impl Actor {
             tracing::warn!("chat2: backfill did not complete");
             return SessionEnd::Reconnect;
         };
+        self.resumed = true;
         if let Some(ready) = ready.take() {
             let _ = ready.send(Ok(()));
         }
@@ -681,6 +784,9 @@ impl Actor {
         loop {
             let quiet_probe_at = last_frame + self.tuning.probe_quiet;
             let deadline_at = probe_deadline
+                .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(86_400));
+            let retry_at = lock(&self.shared)
+                .retry_at
                 .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(86_400));
             tokio::select! {
                 frame = pipe.rx.recv() => {
@@ -723,6 +829,15 @@ impl Actor {
                     tracing::info!("chat2: redial requested");
                     return SessionEnd::Reconnect;
                 }
+                // Transient (quota) rejection: probe with the HEAD batch on
+                // a short clock (see `Shared::quota_blocked`); acks re-arm
+                // the clock so the queue drains one-per-grant.
+                _ = tokio::time::sleep_until(retry_at) => {
+                    lock(&self.shared).retry_at = None;
+                    if !self.push_head(&mut pipe).await {
+                        return SessionEnd::Reconnect;
+                    }
+                }
                 _ = tokio::time::sleep_until(quiet_probe_at) => {
                     if !self.send_probe(&mut pipe, &mut probe_deadline).await {
                         return SessionEnd::Reconnect;
@@ -755,6 +870,26 @@ impl Actor {
             *probe_deadline = Some(tokio::time::Instant::now() + PROBE_DEADLINE);
         }
         true
+    }
+
+    /// Send only the queue's head batch — the quota-probe path.
+    async fn push_head(&self, pipe: &mut BinPipe) -> bool {
+        let frame = {
+            let shared = lock(&self.shared);
+            shared.pending.front().map(|push| {
+                wire::encode(
+                    frame_type::PUSH,
+                    &wire::PushHeader {
+                        batch_id: &push.batch_id,
+                    },
+                    &push.bytes,
+                )
+            })
+        };
+        match frame {
+            Some(frame) => pipe.tx.send(frame).await.is_ok(),
+            None => true,
+        }
     }
 
     async fn push_pending(&self, pipe: &mut BinPipe) -> bool {
@@ -805,6 +940,15 @@ impl Actor {
                 shared.pending.retain(|p| p.batch_id != ack.batch_id);
                 shared.cursor = shared.cursor.max(ack.seq);
                 let cursor = shared.cursor;
+                // Quota drain: each grant immediately probes the next head
+                // batch (one-per-grant, never a full-queue burst).
+                if shared.quota_blocked {
+                    if shared.pending.is_empty() {
+                        shared.quota_blocked = false;
+                    } else {
+                        shared.retry_at = Some(tokio::time::Instant::now());
+                    }
+                }
                 drop(shared);
                 self.sink.advance_cursor(cursor);
                 let _ = self.events.send(ChatEvent::Applied);
@@ -829,6 +973,37 @@ impl Actor {
                 self.flags.rejected.fetch_add(1, Relaxed);
                 let code = frame.header["code"].as_str().unwrap_or("?").to_string();
                 let message = frame.header["message"].as_str().unwrap_or("").to_string();
+                let batch_id = frame.header["batchId"].as_str().unwrap_or("");
+                match code.as_str() {
+                    // Permanent verdicts on a specific batch: retire it, or
+                    // it replays on every nudge/reconnect forever — the
+                    // wedge class this design exists to kill. The ops stay
+                    // in the local doc and travel with the next checkpoint.
+                    "too_large" | "empty" | "bad_push" if !batch_id.is_empty() => {
+                        let mut shared = lock(&self.shared);
+                        let before = shared.pending.len();
+                        shared.pending.retain(|p| p.batch_id != batch_id);
+                        let dropped = before != shared.pending.len();
+                        drop(shared);
+                        if dropped {
+                            tracing::error!(
+                                code,
+                                batch_id,
+                                "chat2: batch permanently rejected — retired \
+                                 from the replay queue"
+                            );
+                            let _ = self.events.send(ChatEvent::PushRejected);
+                        }
+                    }
+                    // Transient: the quota window passes on its own — keep
+                    // the batch queued and head-probe on a short clock.
+                    "quota" => {
+                        let mut shared = lock(&self.shared);
+                        shared.quota_blocked = true;
+                        shared.retry_at = Some(tokio::time::Instant::now() + QUOTA_RETRY);
+                    }
+                    _ => {}
+                }
                 tracing::warn!(code, message, "chat2: server rejected a frame");
             }
             other => {

@@ -51,6 +51,15 @@ import installSh from "./install.sh";
 export { SessionRoom, DeviceRoom, RegistryRoom, ChatRoom };
 
 const ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
+
+/** `decodeURIComponent` that answers `undefined` for malformed %-escapes. */
+const safeDecode = (segment: string): string | undefined => {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return undefined;
+  }
+};
 const SHA256_RE = /^[a-f0-9]{64}$/;
 /** Tool part ids are harness-minted (`tool-1`, `call_x`, `m1#c1`-style) —
  * wider than ID_RE but still no slashes, so a part id can't traverse keys. */
@@ -355,8 +364,16 @@ export default {
     //    only a one-line summary + this key. Straight R2, no DO involvement —
     //    the doc stays thin whether or not these uploads land. Per-user
     //    prefix = owner auth (same trust shape as /attachments). ────────────
-    if (parts[0] === "blob" && parts.length === 3 && ID_RE.test(parts[1]) && PART_RE.test(parts[2])) {
-      const key = `blob/${auth.userId}/${parts[1]}/${parts[2]}`;
+    if (parts[0] === "blob" && parts.length === 3 && ID_RE.test(parts[1])) {
+      // Percent-decode the part segment before validating: PART_RE allows
+      // `#` (`m1#c1`-style harness ids), which HTTP clients cannot send raw
+      // (fragment delimiter) — the host percent-encodes it. Decode-then-
+      // validate keeps traversal shut: `%2F` decodes to `/`, fails PART_RE.
+      const partId = safeDecode(parts[2]);
+      if (partId === undefined || !PART_RE.test(partId)) {
+        return json({ error: "bad part id" }, 400);
+      }
+      const key = `blob/${auth.userId}/${parts[1]}/${partId}`;
       if (request.method === "PUT") {
         const body = await request.arrayBuffer();
         // Outputs are 4KiB-capped at the harness boundary; diffs can run

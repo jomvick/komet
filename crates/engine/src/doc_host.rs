@@ -696,7 +696,7 @@ impl DocHost {
             "{}/blob/{}/{}",
             edge.url.trim_end_matches('/'),
             chat_id,
-            payload.part_id
+            encode_part_segment(&payload.part_id)
         );
         runtime.spawn(async move {
             let Some(bearer) = edge.bearer().await else {
@@ -759,7 +759,16 @@ impl DocHost {
         let Some(bearer) = edge.bearer().await else {
             return Err(EngineError::Other("signed out".into()));
         };
-        let url = format!("{}/blob/{}", edge.url.trim_end_matches('/'), blob_ref);
+        // `valid` above guarantees the split; re-split to encode the part
+        // segment for transport (PART_RE allows `#`, which a raw URL would
+        // truncate as a fragment — the 2026-08-10 silent-collision bug).
+        let (chat, part) = blob_ref.split_once('/').expect("validated above");
+        let url = format!(
+            "{}/blob/{}/{}",
+            edge.url.trim_end_matches('/'),
+            chat,
+            encode_part_segment(part)
+        );
         let res = self
             .inner
             .http
@@ -1133,6 +1142,35 @@ pub fn respond_input_prompt(
         }
     }
     lines.join("\n")
+}
+
+/// Percent-encode one URL path segment of a sidecar part id. PART_RE's
+/// alphabet includes `#` and `:` — legal in R2 keys and doc refs, but a raw
+/// `#` in a URL is a fragment delimiter (the request would silently hit the
+/// truncated key, colliding parts). The Worker decodes before validating.
+fn encode_part_segment(part_id: &str) -> String {
+    let mut out = String::with_capacity(part_id.len());
+    for byte in part_id.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod part_segment_tests {
+    use super::encode_part_segment;
+
+    #[test]
+    fn hash_and_colon_are_escaped_unreserved_pass_through() {
+        assert_eq!(encode_part_segment("m1#c1"), "m1%23c1");
+        assert_eq!(encode_part_segment("tool:call_9"), "tool%3Acall_9");
+        assert_eq!(encode_part_segment("plain-id_0.diff~"), "plain-id_0.diff~");
+    }
 }
 
 /// Per-chat background task: reacts to doc changes (local commits and remote imports)

@@ -1220,6 +1220,11 @@ pub struct Transcript {
     /// Deliberately NOT cleared on chat switch: refs are chat-qualified and a
     /// fetched blob stays valid.
     blob_details: HashMap<SharedString, BlobFetch>,
+    /// Monotonic fetch order per blob ref: when a tool has BOTH a diff and
+    /// an output blob fetched, the chip shows the one requested most
+    /// recently (click "Show full output" after a diff → see the output).
+    blob_fetch_order: HashMap<SharedString, u64>,
+    blob_fetch_counter: u64,
     _observe: Subscription,
 }
 
@@ -1277,6 +1282,8 @@ impl Transcript {
             attachment_loads: HashMap::new(),
             attachment_retries: HashMap::new(),
             blob_details: HashMap::new(),
+            blob_fetch_order: HashMap::new(),
+            blob_fetch_counter: 0,
             _observe: observe,
         };
         this.sync(cx);
@@ -1647,11 +1654,20 @@ impl Transcript {
     /// [`ToolDetail`] once, off the render path. Re-entry while Loading/Ready
     /// is a no-op; Failed re-arms as a retry (the affordance label says so).
     fn spawn_blob_fetch(&mut self, blob_ref: SharedString, cx: &mut Context<Self>) {
-        if matches!(
-            self.blob_details.get(&blob_ref),
-            Some(BlobFetch::Loading(_) | BlobFetch::Ready(_))
-        ) {
-            return;
+        // Rank BEFORE the already-fetched guard: clicking a Ready ref is the
+        // "show me this one again" toggle (recency bump + repaint, no
+        // re-fetch) — with both a diff and an output fetched, the two
+        // affordances must be able to trade places forever.
+        self.blob_fetch_counter += 1;
+        self.blob_fetch_order
+            .insert(blob_ref.clone(), self.blob_fetch_counter);
+        match self.blob_details.get(&blob_ref) {
+            Some(BlobFetch::Ready(_)) => {
+                cx.notify();
+                return;
+            }
+            Some(BlobFetch::Loading(_)) => return,
+            Some(BlobFetch::Failed) | None => {}
         }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
@@ -2221,38 +2237,70 @@ impl Transcript {
         let details: Vec<Option<Arc<ToolDetail>>> = tools
             .iter()
             .map(|tool| {
+                // Among fetched blobs, the most recently REQUESTED one wins —
+                // a tool can carry both a diff and an output ref, and the
+                // user's last click decides which upgrade is showing.
+                let mut best: Option<(u64, Arc<ToolDetail>)> = None;
                 for blob_ref in [&tool.diff_ref, &tool.output_ref].into_iter().flatten() {
                     if let Some(BlobFetch::Ready(detail)) = self.blob_details.get(blob_ref) {
-                        return Some(detail.clone());
+                        let order = self.blob_fetch_order.get(blob_ref).copied().unwrap_or(0);
+                        if best.as_ref().is_none_or(|(o, _)| order > *o) {
+                            best = Some((order, detail.clone()));
+                        }
                     }
                 }
-                tool.detail.clone()
+                best.map(|(_, d)| d).or_else(|| tool.detail.clone())
             })
             .collect();
         // Fetch affordance under each open detail whose full payload is still
-        // sidecar-only: `(ref, label)`. Diff first — the richer upgrade.
+        // sidecar-only: `(ref, label)`. Diff offered first (the richer
+        // upgrade), then the output — a fetched ref hands the affordance to
+        // the NEXT unfetched one instead of retiring it (both must stay
+        // reachable when a tool has both).
         let affordances: Vec<Option<(SharedString, SharedString)>> = tools
             .iter()
             .map(|tool| {
-                let (blob_ref, what, bytes) = if let Some(r) = &tool.diff_ref {
-                    (r, "diff", None)
-                } else if let Some(r) = &tool.output_ref {
-                    (r, "output", tool.output_bytes)
-                } else {
-                    return None;
-                };
-                let label = match self.blob_details.get(blob_ref) {
-                    Some(BlobFetch::Ready(_)) => return None,
-                    Some(BlobFetch::Loading(_)) => format!("Loading full {what}…"),
-                    Some(BlobFetch::Failed) => {
-                        format!("Couldn't load full {what} — tap to retry")
+                // The currently-displayed ref (same recency rule as
+                // `details` above): its affordance is spent; any OTHER
+                // Ready ref stays offered as a no-fetch toggle.
+                let shown: Option<&SharedString> = {
+                    let mut best: Option<(u64, &SharedString)> = None;
+                    for blob_ref in [&tool.diff_ref, &tool.output_ref].into_iter().flatten() {
+                        if matches!(self.blob_details.get(blob_ref), Some(BlobFetch::Ready(_))) {
+                            let order =
+                                self.blob_fetch_order.get(blob_ref).copied().unwrap_or(0);
+                            if best.is_none_or(|(o, _)| order > o) {
+                                best = Some((order, blob_ref));
+                            }
+                        }
                     }
-                    None => match bytes {
-                        Some(b) => format!("Show full {what} ({})", format_kb(b)),
-                        None => format!("Show full {what}"),
-                    },
+                    best.map(|(_, r)| r)
                 };
-                Some((blob_ref.clone(), SharedString::from(label)))
+                let candidates = [
+                    (tool.diff_ref.as_ref(), "diff", None),
+                    (tool.output_ref.as_ref(), "output", tool.output_bytes),
+                ];
+                for (blob_ref, what, bytes) in candidates {
+                    let Some(blob_ref) = blob_ref else { continue };
+                    let label = match self.blob_details.get(blob_ref) {
+                        Some(BlobFetch::Ready(_)) => {
+                            if shown == Some(blob_ref) {
+                                continue;
+                            }
+                            format!("Show full {what}")
+                        }
+                        Some(BlobFetch::Loading(_)) => format!("Loading full {what}…"),
+                        Some(BlobFetch::Failed) => {
+                            format!("Couldn't load full {what} — tap to retry")
+                        }
+                        None => match bytes {
+                            Some(b) => format!("Show full {what} ({})", format_kb(b)),
+                            None => format!("Show full {what}"),
+                        },
+                    };
+                    return Some((blob_ref.clone(), SharedString::from(label)));
+                }
+                None
             })
             .collect();
         // Which chips have their detail block open (render-local, analytic —

@@ -32,7 +32,12 @@ pub fn summarize_tool_output(text: &str) -> Option<String> {
         }
         chars += 1;
     }
-    let cut = end < line.len() || text.trim_end().len() > line.len();
+    // "…" means content beyond this line exists in the sidecar — measure the
+    // REMAINDER after the summarized line, not total length (leading blank
+    // lines used to false-positive the marker).
+    let offset = line.as_ptr() as usize - text.as_ptr() as usize;
+    let rest = &text[offset + line.len()..];
+    let cut = end < line.len() || !rest.trim().is_empty();
     let mut out = line[..end].to_owned();
     if cut {
         out.push('…');
@@ -644,6 +649,15 @@ mod tests {
         assert_eq!(
             summarize_tool_output("\n\nfirst real\nsecond"),
             Some("first real…".into())
+        );
+        // Leading blank lines alone are NOT "more content" — no false "…".
+        assert_eq!(
+            summarize_tool_output("\n\nonly line"),
+            Some("only line".into())
+        );
+        assert_eq!(
+            summarize_tool_output("only line\n\n  \n"),
+            Some("only line".into())
         );
         let long = "x".repeat(TOOL_OUTPUT_SUMMARY_MAX + 40);
         let summary = summarize_tool_output(&long).unwrap();

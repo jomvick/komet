@@ -311,21 +311,28 @@ export class ChatRoom implements DurableObject {
     payload: Uint8Array
   ): void {
     const batchId = typeof header.batchId === "string" ? header.batchId : "";
+    // Push errors carry the batchId so clients can RETIRE permanently
+    // rejected batches from their replay queues (an unretireable batch
+    // replays on every reconnect forever — the wedge class this replaces).
     if (!state.ready || batchId === "" || batchId.length > 128) {
       this.recordPush(state.device, false);
-      send(ws, FRAME.error, { code: "bad_push", message: "hello first / malformed push" });
+      send(ws, FRAME.error, { code: "bad_push", message: "hello first / malformed push", batchId });
       return;
     }
     if (!this.admitQuota(state.device, payload.byteLength)) {
       this.recordPush(state.device, false);
-      send(ws, FRAME.error, { code: "quota", message: "per-device push quota exceeded" });
+      send(ws, FRAME.error, { code: "quota", message: "per-device push quota exceeded", batchId });
       return;
     }
     const sql = this.ctx.storage.sql;
     const outcome = appendRow(sql, state.device, batchId, payload, Date.now());
     if (!outcome.ok) {
       this.recordPush(state.device, false);
-      send(ws, FRAME.error, { code: outcome.error, message: `push rejected: ${outcome.error}` });
+      send(ws, FRAME.error, {
+        code: outcome.error,
+        message: `push rejected: ${outcome.error}`,
+        batchId
+      });
       return;
     }
     this.recordPush(state.device, true);
