@@ -446,7 +446,7 @@ async fn delete_space_cascades_chats_and_sessions() {
         )
         .expect("space row");
     core.workspace
-        .create_chat("chat-1", "space-1", None, None)
+        .create_chat("chat-1", Some("space-1"), None, None, None)
         .expect("chat row");
     let chat = core
         .workspace
@@ -487,7 +487,7 @@ async fn diff_sync_publishes_and_updates_chat_branch() {
         )
         .expect("space row");
     core.workspace
-        .create_chat("chat-diff", "space-diff", None, None)
+        .create_chat("chat-diff", Some("space-diff"), None, None, None)
         .expect("chat row");
     core.diff_sync.reconcile_now().await;
 
@@ -711,7 +711,7 @@ async fn rpc_dispatch_for_m5_methods() {
         .create_space("space-term", &core.device_id, &repo_path, None, true)
         .expect("search space");
     core.workspace
-        .create_chat("search-chat", "space-term", None, None)
+        .create_chat("search-chat", Some("space-term"), None, None, None)
         .expect("search chat");
     let space_matches = client
         .call(
@@ -748,7 +748,8 @@ async fn rpc_dispatch_for_m5_methods() {
     core.workspace
         .create_chat(
             "outside-chat",
-            "space-term",
+            Some("space-term"),
+            None,
             None,
             Some(outside.to_string_lossy().into_owned()),
         )

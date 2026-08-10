@@ -625,29 +625,49 @@ impl WorkspaceHost {
 
     // ── Mutate surface (LWW writes accepted from any device) ────────────────
 
-    /// Create a chat *in a space*: the space fixes the host device and base cwd
-    /// (`cwd` override = an isolated-worktree path). Fails when the space row is
-    /// missing — the UI always creates chats from a picked space.
+    /// Create a chat, usually *in a project*: the project fixes the host device
+    /// and base cwd (`cwd` override = an isolated-worktree path). With no
+    /// `space_id` the chat is project-less: `device_id` picks the host and the
+    /// cwd defaults to `~` (expanded host-side when the run spawns).
     pub fn create_chat(
         &self,
         chat_id: &str,
-        space_id: &str,
+        space_id: Option<&str>,
+        device_id: Option<&str>,
         config: Option<ChatConfig>,
         cwd: Option<String>,
     ) -> Result<(), EngineError> {
         if self.read(|doc| doc.chat(chat_id))?.is_some() {
             return Ok(()); // idempotent: optimistic client retries never duplicate
         }
-        let Some(space) = self.read(|doc| doc.space(space_id))? else {
-            return Err(EngineError::Other(format!("no such space: {space_id}")));
+        let space = match space_id {
+            Some(space_id) => match self.read(|doc| doc.space(space_id))? {
+                Some(space) => Some(space),
+                None => return Err(EngineError::Other(format!("no such space: {space_id}"))),
+            },
+            None => None,
+        };
+        let host_device = match (&space, device_id) {
+            (Some(space), _) => space.device_id.clone(),
+            (None, Some(device_id)) => device_id.to_string(),
+            (None, None) => {
+                return Err(EngineError::Other(
+                    "createChat needs a spaceId or a deviceId".into(),
+                ));
+            }
         };
         self.mutate(|doc| {
             doc.upsert_chat(&Chat {
                 id: chat_id.to_string(),
-                device_id: space.device_id.clone(),
+                device_id: host_device.clone(),
                 title: None,
                 archived: false,
-                cwd: Some(cwd.unwrap_or_else(|| space.path.clone())),
+                cwd: Some(cwd.unwrap_or_else(|| {
+                    space
+                        .as_ref()
+                        .map(|s| s.path.clone())
+                        .unwrap_or_else(|| "~".to_string())
+                })),
                 branch: None,
                 checkout_id: None,
                 config,
@@ -660,7 +680,7 @@ impl WorkspaceHost {
                 // go through the seed+flip path (the host migration sweep).
                 room_gen: Some(2),
                 harness_session_cwd: None,
-                space_id: Some(space.id.clone()),
+                space_id: space.as_ref().map(|s| s.id.clone()),
                 last_seen_at: None,
             })
         })?;

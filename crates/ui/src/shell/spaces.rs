@@ -1,68 +1,39 @@
-//! Spaces sidebar: the spaces list (folder + device rows), the global
-//! Sessions list, and the add-space palette (⌘K-style: device tabs + filtered
-//! folder browser).
+//! Spaces sidebar: the space-filter dropdown (searchable, with "All projects"),
+//! the filtered Sessions list, and the add-space palette (⌘K-style: device
+//! tabs + filtered folder browser).
 //!
-//! A space = a synced (device, folder) pair; the sidebar's job is switching
-//! between them and surfacing which sessions want attention. Child module of
-//! `shell` so it renders straight off `Shell`'s private state.
+//! A space = a synced (device, folder) pair. Spaces stopped being a
+//! navigation spine when tabs went device-local: the dropdown only FILTERS
+//! the sidebar's session list (never the tab strip) and hosts space
+//! management (add via the palette; rename/delete via row context menus).
+//! Child module of `shell` so it renders straight off `Shell`'s private state.
 
 use super::*;
-use crate::motion::TAB_SLIDE;
 use crate::pickers::{breadcrumbs, browser_rows, parent_path};
-use crate::terminal::panel::{drop_index, reorder_tabs, slide_offset};
 use komet_proto::{ChatIndicator, Device, FolderListing, Space};
 use gpui::FocusHandle;
 
-/// Space-row slot height for drag drop-index math: py(6)×2 + 17px line ≈ 29,
-/// plus the 2px column gap.
-const SPACE_ROW_SLOT: f32 = 31.0;
-
-/// Drag-reorder state for the spaces list; `epoch` keys the 150ms slide
-/// animation restarts (the session-tab idiom, vertical).
-pub(super) struct SpaceDragState {
-    from: usize,
-    over: usize,
-    epoch: usize,
-    prev_over: usize,
+/// The space-filter dropdown, `Some` while open. The same searchable-menu
+/// recipe as the composer's ref picker: filter input on top
+/// (`PaletteSearch` context so ↑↓/⏎ bubble to the card), ranked substring
+/// rows, keyboard highlight.
+pub(super) struct SpacesMenu {
+    search: Entity<ComposerInput>,
+    /// Keyboard highlight within [`Shell::spaces_menu_rows`].
+    active: usize,
+    /// Tracked on the card — puts it on the keyboard dispatch path while the
+    /// search input holds focus (the structure every working picker uses).
+    focus: FocusHandle,
+    list_scroll: gpui::ScrollHandle,
+    _search_events: Subscription,
 }
 
-/// The dragged-row payload (gpui drag-and-drop).
-struct SpaceDragPayload {
-    from: usize,
-    name: SharedString,
-}
-
-/// The floating row rendered at the cursor while dragging.
-struct SpaceGhost {
-    name: SharedString,
-}
-
-impl Render for SpaceGhost {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::of(cx);
-        div()
-            .w(px(200.0))
-            .h(px(29.0))
-            .px(px(Theme::SPACE_SM))
-            .flex()
-            .items_center()
-            .gap(px(Theme::SPACE_SM))
-            .rounded(px(8.0))
-            .bg(theme.surface_raised)
-            .border_1()
-            .border_color(theme.border_strong)
-            .text_size(px(13.0))
-            .font_weight(gpui::FontWeight::MEDIUM)
-            .text_color(theme.text)
-            .opacity(0.85)
-            .child(
-                icon(icons::FOLDER)
-                    .size(px(16.0))
-                    .flex_none()
-                    .text_color(theme.text_muted),
-            )
-            .child(div().truncate().child(self.name.clone()))
-    }
+/// One row of the open dropdown, in display order.
+#[derive(Clone, PartialEq)]
+pub(super) enum SpacesMenuRow {
+    All,
+    Space(String),
+    AddSpace,
 }
 
 /// The add-space palette (a command-K surface, summoned by ⌘K): search bar
@@ -113,14 +84,16 @@ pub(super) struct RenameSpaceDialog {
 pub(super) fn status_dot_color(status: ChatIndicator, theme: &Theme) -> gpui::Hsla {
     match status {
         // Pink, not amber — the harsh yellow read as a warning; running is
-        // routine (user request).
+        // routine (user request). Non-done statuses sit well below full
+        // strength: at full alpha the colored words shouted across the
+        // whole sidebar (user request) — only Done keeps its pop.
         ChatIndicator::Working => {
-            theme.busy.opacity(0.85) // pink-400
+            theme.busy.opacity(0.55) // pink-400, muted
         }
         // Blue: "asking you a question" must read differently from "busy
         // working" at a glance.
-        ChatIndicator::AwaitingInput => theme.accent.opacity(0.9),
-        ChatIndicator::Errored => theme.danger,
+        ChatIndicator::AwaitingInput => theme.accent.opacity(0.6),
+        ChatIndicator::Errored => theme.danger.opacity(0.65),
         // Green: finished-but-unseen reads as "ready for you".
         ChatIndicator::Completed => {
             theme.success.opacity(0.9) // emerald-400
@@ -130,472 +103,506 @@ pub(super) fn status_dot_color(status: ChatIndicator, theme: &Theme) -> gpui::Hs
 }
 
 impl Shell {
-    // ---- space switching ----
+    // ---- space filter ----
 
-    /// Land in a space: remembered tab if alive, else the most recent chat in
-    /// the space, else the new-session canvas. Persists `last_space_id`.
-    pub(super) fn activate_space(&mut self, space_id: String, cx: &mut Context<Self>) {
+    /// Set the sidebar's session filter (`None` = All spaces). On the
+    /// new-session canvas the space context follows the filter — the canvas
+    /// default is "the space you're looking at".
+    pub(super) fn set_space_filter(&mut self, filter: Option<String>, cx: &mut Context<Self>) {
+        self.settings.space_filter = filter.clone();
+        if let Some(space_id) = filter
+            && self.state.read(cx).selected_chat.is_none()
+        {
+            self.state
+                .update(cx, |s, cx| s.select_space(Some(space_id), cx));
+        }
+        self.close_spaces_menu(cx);
+        self.schedule_save(cx);
+        cx.notify();
+    }
+
+    /// Close the space-filter dropdown through the exit animation (no-op when
+    /// it isn't open). Every close path funnels here so the menu always
+    /// animates out instead of vanishing.
+    fn close_spaces_menu(&mut self, cx: &mut Context<Self>) {
+        if self.spaces_menu.begin_close() {
+            popover::reap_popup(cx, |shell: &mut Self| &mut shell.spaces_menu);
+            cx.notify();
+        }
+    }
+
+    /// Land in a just-added space: filter the sidebar to it and open the
+    /// new-session canvas there.
+    pub(super) fn land_in_space(&mut self, space_id: String, cx: &mut Context<Self>) {
         self.route = Route::Chat;
+        self.settings.space_filter = Some(space_id.clone());
+        self.settings.last_space_id = Some(space_id.clone());
         self.state.update(cx, |s, cx| {
-            s.select_space(Some(space_id.clone()), cx);
+            s.select_space(Some(space_id), cx);
+            s.select_chat(None, cx);
         });
-        let target = {
-            let state = self.state.read(cx);
-            let in_space = |id: &str| {
-                state
-                    .visible_chats()
-                    .any(|c| c.id == id && c.space_id.as_deref() == Some(space_id.as_str()))
-            };
-            self.space_last_chat
-                .get(&space_id)
-                .filter(|id| in_space(id))
-                .cloned()
-                .or_else(|| {
-                    // `visible_chats` is recency-sorted — first match is the
-                    // most recent chat of the space.
-                    state
-                        .visible_chats()
-                        .find(|c| c.space_id.as_deref() == Some(space_id.as_str()))
-                        .map(|c| c.id.clone())
-                })
-        };
-        self.state.update(cx, |s, cx| s.select_chat(target, cx));
-        self.settings.last_space_id = Some(space_id);
         self.schedule_save(cx);
         cx.notify();
     }
 
     // ---- sidebar sections ----
 
-    /// The "Spaces" section: tracked header + add button, then a row per space.
-    pub(super) fn render_spaces_section(
+    /// The filter's display rows: "All projects", then spaces matching the
+    /// search (ranked — `popover::filter_indices`), then "New project…".
+    /// "All" only shows on an empty query (searching means hunting a space).
+    fn spaces_menu_rows(&self, cx: &App) -> Vec<SpacesMenuRow> {
+        let query = self
+            .spaces_menu
+            .get()
+            .map(|menu| menu.search.read(cx).text().to_string())
+            .unwrap_or_default();
+        let state = self.state.read(cx);
+        let spaces = state.spaces_sorted();
+        let names: Vec<String> = spaces
+            .iter()
+            .map(|s| s.display_name().to_string())
+            .collect();
+        let mut rows: Vec<SpacesMenuRow> = Vec::new();
+        if query.trim().is_empty() {
+            rows.push(SpacesMenuRow::All);
+        }
+        rows.extend(
+            popover::filter_indices(&query, &names)
+                .into_iter()
+                .map(|ix| SpacesMenuRow::Space(spaces[ix].id.clone())),
+        );
+        rows.push(SpacesMenuRow::AddSpace);
+        rows
+    }
+
+    fn open_spaces_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // "PaletteSearch" context: ↑↓/⏎ stay unbound in the input and bubble
+        // to the card's key handler.
+        let search =
+            cx.new(|cx| ComposerInput::with_context("Search projects…", "PaletteSearch", cx));
+        let search_events = cx.subscribe(&search, |this: &mut Shell, _, event, cx| {
+            if matches!(event, ComposerInputEvent::Edited) {
+                if let Some(menu) = this.spaces_menu.open_mut() {
+                    menu.active = 0;
+                }
+                cx.notify();
+            }
+        });
+        // The highlight starts ON the current filter row.
+        let current = self.settings.space_filter.clone();
+        let handle = search.read(cx).focus_handle(cx);
+        self.spaces_menu.open(SpacesMenu {
+            search,
+            active: 0,
+            focus: cx.focus_handle(),
+            list_scroll: gpui::ScrollHandle::new(),
+            _search_events: search_events,
+        });
+        let rows = self.spaces_menu_rows(cx);
+        let start = match &current {
+            None => 0,
+            Some(id) => rows
+                .iter()
+                .position(|row| matches!(row, SpacesMenuRow::Space(s) if s == id))
+                .unwrap_or(0),
+        };
+        if let Some(menu) = self.spaces_menu.open_mut() {
+            menu.active = start;
+        }
+        // Focusable before first paint (the add-space palette's proven order).
+        window.focus(&handle, cx);
+        cx.notify();
+    }
+
+    fn activate_spaces_menu_row(&mut self, row: SpacesMenuRow, cx: &mut Context<Self>) {
+        match row {
+            SpacesMenuRow::All => self.set_space_filter(None, cx),
+            SpacesMenuRow::Space(id) => self.set_space_filter(Some(id), cx),
+            SpacesMenuRow::AddSpace => {
+                self.close_spaces_menu(cx);
+                self.open_add_space(cx);
+            }
+        }
+    }
+
+    /// Dropdown keys (bubbling from the focused search input): ↑↓ navigate,
+    /// ⏎ activates the highlighted row, esc closes.
+    fn spaces_menu_key(&mut self, event: &gpui::KeyDownEvent, cx: &mut Context<Self>) {
+        // The card stays mounted (and focused) through the exit animation —
+        // keys must not drive a dying menu.
+        if !self.spaces_menu.is_open() {
+            return;
+        }
+        let key = popover::classify_key(
+            event.keystroke.key.as_str(),
+            event.keystroke.modifiers.platform,
+            event.keystroke.modifiers.control,
+        );
+        match key {
+            popover::MenuKey::Escape => {
+                self.close_spaces_menu(cx);
+            }
+            popover::MenuKey::Up | popover::MenuKey::Down => {
+                let count = self.spaces_menu_rows(cx).len();
+                let delta = if key == popover::MenuKey::Up { -1 } else { 1 };
+                if let Some(menu) = self.spaces_menu.open_mut() {
+                    menu.active = popover::menu_step(Some(menu.active), count, delta).unwrap_or(0);
+                    menu.list_scroll.scroll_to_item(menu.active);
+                    cx.notify();
+                }
+            }
+            popover::MenuKey::Enter | popover::MenuKey::ModEnter => {
+                let row = {
+                    let active = self.spaces_menu.get().map(|m| m.active).unwrap_or(0);
+                    self.spaces_menu_rows(cx).get(active).cloned()
+                };
+                if let Some(row) = row {
+                    self.activate_spaces_menu_row(row, cx);
+                }
+            }
+            popover::MenuKey::Backspace | popover::MenuKey::Other => {}
+        }
+    }
+
+    /// The sidebar's space-filter row: current filter ("All projects" or the
+    /// space's name) + chevron, the dropdown floating beneath while open.
+    /// Sits OUTSIDE the sidebar's scroll region so the float never clips.
+    pub(super) fn render_spaces_filter(
         &mut self,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        // A drag that ended off-list (no drop event) must not strand the
-        // sibling slide offsets.
-        if self.space_drag.is_some() && !cx.has_active_drag() {
-            self.space_drag = None;
-        }
-        let (spaces, selected, device_names, offline_devices, attention): (
-            Vec<Space>,
-            Option<String>,
-            std::collections::HashMap<String, String>,
-            std::collections::HashSet<String>,
-            std::collections::HashMap<String, ChatIndicator>,
-        ) = {
-            let now = Utc::now();
+        let filter = self.settings.space_filter.clone();
+        // Name + the dropdown rows' "@ device" tag on the trigger itself, so
+        // the filtered space's host reads without opening the picker.
+        let (label, device_tag): (SharedString, Option<(SharedString, bool)>) = {
             let state = self.state.read(cx);
-            let spaces = state.spaces.clone();
-            let device_names = spaces
-                .iter()
-                .map(|s| {
+            match filter.as_deref().and_then(|id| state.space_row(id)) {
+                Some(space) => {
+                    let (tag, offline) = state.space_device_tag(space, Utc::now());
                     (
-                        s.device_id.clone(),
-                        state
-                            .device_name(&s.device_id)
-                            .unwrap_or("Unknown device")
-                            .to_string(),
+                        space.display_name().to_string().into(),
+                        Some((tag.into(), offline)),
                     )
-                })
-                .collect();
-            // Host-presence (the revived "Remote" signal): a remote space whose
-            // device heartbeat lapsed shows offline — a host outage, not slow sync.
-            let offline_devices = spaces
-                .iter()
-                .map(|s| s.device_id.clone())
-                .filter(|id| !state.device_online(id, now))
-                .collect();
-            // Spaces with a live/awaiting session get an aggregate dot (the
-            // most urgent member status wins) so the attention signal survives
-            // even with the Sessions list scrolled off.
-            let mut attention: std::collections::HashMap<String, ChatIndicator> =
-                std::collections::HashMap::new();
-            for chat in state.visible_chats() {
-                let status = state.display_status_for(chat, now);
-                if !matches!(
-                    status,
-                    ChatIndicator::Working | ChatIndicator::AwaitingInput
-                ) {
-                    continue;
                 }
-                let Some(space_id) = chat.space_id.clone() else {
-                    continue;
-                };
-                attention
-                    .entry(space_id)
-                    .and_modify(|held| {
-                        if crate::state::attention_rank(status)
-                            < crate::state::attention_rank(*held)
-                        {
-                            *held = status;
-                        }
-                    })
-                    .or_insert(status);
+                None => (SharedString::from("All projects"), None),
             }
-            (
-                spaces,
-                state.selected_space.clone(),
-                device_names,
-                offline_devices,
-                attention,
-            )
         };
-        // Manual (drag) order overrides the synced creation order — device-
-        // local, resolved exactly like the session-tab order.
-        let spaces: Vec<Space> = {
-            let created: Vec<String> = spaces.iter().map(|s| s.id.clone()).collect();
-            let order = super::tabs::resolve_tab_order(&created, &self.settings.space_order);
-            let mut by_id: std::collections::HashMap<String, Space> =
-                spaces.into_iter().map(|s| (s.id.clone(), s)).collect();
-            order.iter().filter_map(|id| by_id.remove(id)).collect()
-        };
+        let open = self.spaces_menu.is_open();
 
-        let header = div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_between()
-            .px(px(Theme::SPACE_SM))
-            .pt(px(8.0))
-            .pb(px(4.0))
-            .child(
-                div()
-                    .text_size(px(11.0))
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(theme.text_muted.opacity(0.6))
-                    .child(SharedString::from("Spaces")),
-            )
-            .child(
-                div()
-                    .id("add-space")
-                    .size(px(20.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(5.0))
-                    .cursor_pointer()
-                    .bg(motion::hover_blend(
-                        "add-space",
-                        crate::theme::wash(0.0),
-                        crate::theme::wash(0.14),
-                    ))
-                    .on_hover(motion::hover_listener("add-space"))
-                    .on_click(cx.listener(|this, _, _, cx| this.open_add_space(cx)))
-                    .child(
-                        icon(icons::PLUS)
-                            .size(px(14.0))
-                            .text_color(theme.text_muted.opacity(0.7)),
-                    ),
-            );
-
-        let mut column = div().flex().flex_col().child(header);
-        if spaces.is_empty() {
-            // Ghost row: the empty-state affordance mirrors a space row.
-            column = column.child(
-                div()
-                    .id("add-space-ghost")
-                    .mx(px(0.0))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(Theme::SPACE_SM))
-                    .rounded(px(8.0))
-                    .px(px(Theme::SPACE_SM))
-                    .py(px(6.0))
-                    .text_size(px(13.0))
-                    .text_color(motion::hover_blend(
-                        "add-space-ghost",
-                        theme.text_muted,
-                        theme.text,
-                    ))
-                    .bg(motion::hover_blend(
-                        "add-space-ghost",
-                        theme.glass_hover().opacity(0.0),
-                        theme.glass_hover(),
-                    ))
-                    .on_hover(motion::hover_listener("add-space-ghost"))
-                    .cursor_pointer()
-                    .on_click(cx.listener(|this, _, _, cx| this.open_add_space(cx)))
-                    .child(
-                        icon(icons::FOLDER)
-                            .size(px(16.0))
-                            .text_color(theme.text_muted),
-                    )
-                    .child(SharedString::from("Add space")),
-            );
-        } else {
-            let count = spaces.len();
-            let drag = self
-                .space_drag
-                .as_ref()
-                .map(|d| (d.from, d.over, d.epoch, d.prev_over));
-            let rows: Vec<AnyElement> = spaces
-                .into_iter()
-                .enumerate()
-                .map(|(ix, space)| {
-                    let id = space.id.clone();
-                    let device_name = device_names
-                        .get(&space.device_id)
-                        .cloned()
-                        .unwrap_or_else(|| "Unknown device".to_string());
-                    let host_offline = offline_devices.contains(&space.device_id);
-                    let is_selected = selected.as_deref() == Some(space.id.as_str());
-                    let attention = attention.get(&space.id).copied();
-                    let row = self.render_space_row(
-                        ix,
-                        space,
-                        device_name,
-                        host_offline,
-                        is_selected,
-                        attention,
-                        theme,
-                        cx,
-                    );
-                    // Sliding transform while a sibling is dragged over —
-                    // the session-tab idiom, vertical.
-                    match drag {
-                        Some((from, over, epoch, prev_over)) if ix != from => {
-                            let target = slide_offset(ix, from, over) * SPACE_ROW_SLOT;
-                            let start = slide_offset(ix, from, prev_over) * SPACE_ROW_SLOT;
-                            div()
-                                .relative()
-                                .child(row.with_animation(
-                                    SharedString::from(format!("space-slide-{id}-{epoch}")),
-                                    TAB_SLIDE.animation(),
-                                    move |el, t| el.top(px(motion::lerp(start, target, t))),
-                                ))
-                                .into_any_element()
-                        }
-                        // The dragged row renders as an invisible spacer; the
-                        // cursor ghost represents it.
-                        Some((from, ..)) if ix == from => div()
-                            .h(px(SPACE_ROW_SLOT - 2.0))
-                            .flex_none()
-                            .into_any_element(),
-                        _ => row.into_any_element(),
-                    }
-                })
-                .collect();
-            column = column.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.0))
-                    .on_drag_move::<SpaceDragPayload>(cx.listener(
-                        move |this, event: &gpui::DragMoveEvent<SpaceDragPayload>, _, cx| {
-                            let from = event.drag(cx).from;
-                            let rel_y =
-                                f32::from(event.event.position.y) - f32::from(event.bounds.top());
-                            let over = drop_index(rel_y, SPACE_ROW_SLOT, count);
-                            this.update_space_drag_over(from, over, cx);
-                        },
-                    ))
-                    .on_drop::<SpaceDragPayload>(cx.listener(
-                        move |this, payload: &SpaceDragPayload, _, cx| {
-                            let to = this
-                                .space_drag
-                                .as_ref()
-                                .map(|d| d.over)
-                                .unwrap_or(payload.from);
-                            this.commit_space_reorder(payload.from, to, cx);
-                        },
-                    ))
-                    .children(rows),
-            );
-        }
-        column.into_any_element()
-    }
-
-    /// Track the drop slot while a space row is dragged over the list (150ms
-    /// sibling slides restart per committed `over` change).
-    fn update_space_drag_over(&mut self, from: usize, over: usize, cx: &mut Context<Self>) {
-        match &mut self.space_drag {
-            Some(drag) if drag.from == from => {
-                if drag.over != over {
-                    drag.prev_over = drag.over;
-                    drag.over = over;
-                    drag.epoch += 1;
-                    cx.notify();
-                }
-            }
-            _ => {
-                self.space_drag = Some(SpaceDragState {
-                    from,
-                    over,
-                    epoch: 0,
-                    prev_over: from,
-                });
-                cx.notify();
-            }
-        }
-    }
-
-    /// Commit a drag: persist the new visual order (device-local).
-    fn commit_space_reorder(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
-        let created: Vec<String> = self
-            .state
-            .read(cx)
-            .spaces
-            .iter()
-            .map(|s| s.id.clone())
-            .collect();
-        let mut order = super::tabs::resolve_tab_order(&created, &self.settings.space_order);
-        if from < order.len() {
-            reorder_tabs(&mut order, from, to);
-            self.settings.space_order = order;
-            self.schedule_save(cx);
-        }
-        self.space_drag = None;
-        cx.notify();
-    }
-
-    /// One space row: folder icon + folder name, device name subline.
-    /// `host_offline` marks a remote host whose presence heartbeat lapsed.
-    #[allow(clippy::too_many_arguments)]
-    fn render_space_row(
-        &self,
-        ix: usize,
-        space: Space,
-        device_name: String,
-        host_offline: bool,
-        selected: bool,
-        attention: Option<ChatIndicator>,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> gpui::Stateful<gpui::Div> {
-        let id = space.id.clone();
-        let name: SharedString = space.display_name().to_string().into();
-        let fade_key = format!("space-row-{id}");
-        let rest_bg = if selected {
-            crate::theme::glass_selected_bg()
-        } else {
-            crate::theme::wash(0.0)
-        };
-        let rest_text = if selected {
-            theme.text
-        } else {
-            theme.text.opacity(0.8)
-        };
-        let select_id = id.clone();
-        let menu_id = id.clone();
-        // One line: "name @ device" — the folder name carries the weight, the
-        // device tag rides along slightly muted. Long names truncate; the
-        // device tag stays visible.
-        div()
-            .id(SharedString::from(format!("space-{id}")))
+        let trigger = div()
+            .id("spaces-filter")
+            .flex_1()
+            .min_w_0()
+            .h(px(29.0))
             .flex()
             .flex_row()
             .items_center()
             .gap(px(Theme::SPACE_SM))
             .rounded(px(8.0))
             .px(px(Theme::SPACE_SM))
-            .py(px(6.0))
-            .text_color(motion::hover_blend(&fade_key, rest_text, theme.text))
-            // Selected rows pin their hover target to the selected fill — see
-            // the chat-row comment in shell.rs (light hover sits below the
-            // near-opaque selected fill; blending toward it dims the row).
-            .bg(motion::hover_blend(
-                &fade_key,
-                rest_bg,
-                if selected {
-                    rest_bg
-                } else {
-                    theme.glass_hover()
-                },
+            .text_size(px(13.0))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(motion::hover_blend(
+                "spaces-filter",
+                theme.text.opacity(0.8),
+                theme.text,
             ))
-            .when(selected, |el| {
-                el.shadow(crate::theme::glass_selected_shadows())
+            .bg(if open {
+                theme.glass_hover()
+            } else {
+                motion::hover_blend(
+                    "spaces-filter",
+                    theme.glass_hover().opacity(0.0),
+                    theme.glass_hover(),
+                )
             })
-            .on_hover(motion::hover_listener(fade_key))
+            .on_hover(motion::hover_listener("spaces-filter"))
             .cursor_pointer()
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.activate_space(select_id.clone(), cx);
+            .on_click(cx.listener(|this, _, window, cx| {
+                // The menu's `on_mouse_down_out` already closed it on this
+                // click's mouse-down (the trigger is outside the card), so by
+                // the time the click lands the menu reads as closed — without
+                // the guard, clicking the open trigger would close-and-reopen.
+                let just_dismissed = this
+                    .spaces_menu_dismissed_at
+                    .is_some_and(|at| at.elapsed() < Duration::from_millis(400));
+                this.spaces_menu_dismissed_at = None;
+                if this.spaces_menu.is_open() {
+                    this.close_spaces_menu(cx);
+                } else if !just_dismissed {
+                    this.open_spaces_menu(window, cx);
+                }
             }))
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                    this.space_menu = Some((menu_id.clone(), event.position));
-                    cx.notify();
-                }),
-            )
-            .on_drag(
-                SpaceDragPayload {
-                    from: ix,
-                    name: name.clone(),
-                },
-                |payload, _point, _, cx| {
-                    let name = payload.name.clone();
-                    cx.stop_propagation();
-                    cx.new(|_| SpaceGhost { name })
-                },
-            )
-            // Status dot LEADS the row (like session rows) so its position is
-            // stable — appearing/disappearing at the right edge made the row
-            // jitter (user request). Faint at rest, colored under attention.
-            .child(
-                div().size(px(6.0)).rounded_full().flex_none().bg(attention
-                    .map(|status| status_dot_color(status, theme))
-                    .unwrap_or_else(|| crate::theme::ink(0.14))),
-            )
             .child(
                 icon(icons::FOLDER)
                     .size(px(16.0))
                     .flex_none()
                     .text_color(theme.text_muted),
             )
+            // flex_1 pushes the caret to the trigger's right edge and gives
+            // long space names a bound to truncate against; the "@ device"
+            // tag hugs the name inside it rather than sitting by the caret.
             .child(
                 div()
+                    .flex_1()
                     .min_w_0()
-                    .truncate()
-                    .text_size(px(13.0))
-                    .line_height(px(17.0))
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .child(name),
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(div().min_w_0().truncate().child(label))
+                    .when_some(device_tag, |el, (tag, offline)| {
+                        el.child(
+                            div()
+                                .flex_none()
+                                .text_size(px(10.0))
+                                .font_weight(gpui::FontWeight::NORMAL)
+                                .text_color(theme.text_muted.opacity(0.45))
+                                .child(tag),
+                        )
+                        // Disconnected glyph, not the word (user request).
+                        .when(offline, |el| {
+                            el.child(
+                                icon(icons::WIFI_OFF)
+                                    .size(px(12.0))
+                                    .flex_none()
+                                    .text_color(theme.warning.opacity(0.8)),
+                            )
+                        })
+                    }),
             )
-            .child(div().flex_1())
             .child(
-                div()
+                icon(icons::ALT_ARROW_DOWN)
+                    .size(px(14.0))
                     .flex_none()
-                    .min_w_0()
-                    .truncate()
-                    .text_size(px(12.0))
-                    .line_height(px(17.0))
-                    .text_color(if host_offline {
-                        theme.warning.opacity(0.8)
-                    } else {
-                        theme.text_muted.opacity(0.6)
-                    })
-                    .child(SharedString::from(if host_offline {
-                        format!("@ {device_name} · offline")
-                    } else {
-                        format!("@ {device_name}")
-                    })),
-            )
+                    .text_color(theme.text_muted.opacity(0.6)),
+            );
+        let trigger = if self.spaces_menu.get().is_some() {
+            let closing = self.spaces_menu.closing_since();
+            let menu = self.render_spaces_menu(theme, cx);
+            trigger.relative().child(popover::anchored_menu_below(
+                "spaces-filter-menu",
+                menu,
+                closing,
+            ))
+        } else {
+            trigger
+        };
+
+        // NEW SESSION beside the trigger (adding a project lives in the
+        // dropdown's "New project…" row now). While the sidebar is collapsed
+        // this same button fades into the titlebar instead
+        // (`render_session_title_bar`). A plain button — the canvas showing
+        // is not an "active" state worth a selected wash (user feedback).
+        let add = div()
+            .id("sidebar-new-session")
+            .size(px(24.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(6.0))
+            .cursor_pointer()
+            .bg(motion::hover_blend(
+                "sidebar-new-session",
+                crate::theme::wash(0.0),
+                crate::theme::wash(0.14),
+            ))
+            .on_hover(motion::hover_listener("sidebar-new-session"))
+            .on_click(cx.listener(|this, _, _, cx| this.open_new_session(cx)))
+            .child(
+                icon(icons::PLUS)
+                    .size(px(14.0))
+                    .text_color(theme.text_muted.opacity(0.7)),
+            );
+
+        div()
+            .flex_none()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(4.0))
+            .px(px(Theme::SPACE_SM))
+            .pt(px(8.0))
+            .pb(px(4.0))
+            .child(trigger)
+            .child(add)
+            .into_any_element()
     }
 
-    /// The global "Sessions" list: every session across all spaces (idle
-    /// included), attention-sorted. Rows are keyed for the FLIP resort glide.
+    /// The dropdown card: search on top, "All projects" + space rows (check on
+    /// the active filter; right-click for rename/remove) + "New project…".
+    fn render_spaces_menu(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let (search, active, focus, list_scroll) = {
+            let Some(menu) = self.spaces_menu.get() else {
+                return div().into_any_element();
+            };
+            (
+                menu.search.clone(),
+                menu.active,
+                menu.focus.clone(),
+                menu.list_scroll.clone(),
+            )
+        };
+        let rows = self.spaces_menu_rows(cx);
+        let filter = self.settings.space_filter.clone();
+        let now = Utc::now();
+        // (name, device tag) per space row — presence reuses the session
+        // rows' heartbeat signal.
+        let details: Vec<(SpacesMenuRow, SharedString, Option<SharedString>, bool)> = {
+            let state = self.state.read(cx);
+            rows.iter()
+                .map(|row| match row {
+                    SpacesMenuRow::All => {
+                        (row.clone(), SharedString::from("All projects"), None, false)
+                    }
+                    SpacesMenuRow::Space(id) => match state.space_row(id) {
+                        Some(space) => {
+                            let (tag, offline) = state.space_device_tag(space, now);
+                            (
+                                row.clone(),
+                                space.display_name().to_string().into(),
+                                Some(tag.into()),
+                                offline,
+                            )
+                        }
+                        None => (row.clone(), SharedString::from("?"), None, false),
+                    },
+                    SpacesMenuRow::AddSpace => {
+                        (row.clone(), SharedString::from("New project…"), None, false)
+                    }
+                })
+                .collect()
+        };
+
+        let list = div()
+            .id("spaces-menu-list")
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .max_h(px(224.0))
+            .overflow_y_scroll()
+            .track_scroll(&list_scroll)
+            .children(
+                details
+                    .into_iter()
+                    .enumerate()
+                    .map(|(ix, (row, label, tag, offline))| {
+                        let is_selected = match &row {
+                            SpacesMenuRow::All => filter.is_none(),
+                            SpacesMenuRow::Space(id) => filter.as_deref() == Some(id.as_str()),
+                            SpacesMenuRow::AddSpace => false,
+                        };
+                        let leading = match &row {
+                            SpacesMenuRow::AddSpace => icons::PLUS,
+                            _ => icons::FOLDER,
+                        };
+                        let menu_space = match &row {
+                            SpacesMenuRow::Space(id) => Some(id.clone()),
+                            _ => None,
+                        };
+                        let activate = row.clone();
+                        popover::menu_row_nav(
+                            theme,
+                            is_selected,
+                            ix == active,
+                            format!("spaces-menu-row-{ix}"),
+                        )
+                        .id(("spaces-menu-row", ix))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.activate_spaces_menu_row(activate.clone(), cx);
+                        }))
+                        .when_some(menu_space, |el, space_id| {
+                            el.on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                    this.space_menu.open((space_id.clone(), event.position));
+                                    cx.notify();
+                                }),
+                            )
+                        })
+                        .child(
+                            icon(leading)
+                                .size(px(15.0))
+                                .flex_none()
+                                .text_color(theme.text_muted.opacity(0.8)),
+                        )
+                        .child(div().flex_1().min_w_0().truncate().child(label))
+                        .when_some(tag, |el, tag| {
+                            el.child(
+                                div()
+                                    .flex_none()
+                                    .text_size(px(10.0))
+                                    .text_color(theme.text_muted.opacity(0.45))
+                                    .child(tag),
+                            )
+                            // Disconnected glyph, not the word (user request).
+                            .when(offline, |el| {
+                                el.child(
+                                    icon(icons::WIFI_OFF)
+                                        .size(px(12.0))
+                                        .flex_none()
+                                        .text_color(theme.warning.opacity(0.8)),
+                                )
+                            })
+                        })
+                        // No check glyph — the selected row's wash (menu_row's
+                        // active styling) is the selection signal.
+                    }),
+            );
+
+        popover::popover_card(theme)
+            .w(px(248.0))
+            .track_focus(&focus)
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                this.spaces_menu_key(event, cx)
+            }))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                this.spaces_menu_dismissed_at = Some(std::time::Instant::now());
+                this.close_spaces_menu(cx);
+            }))
+            .flex()
+            .flex_col()
+            .child(popover::search_input_frame(
+                theme,
+                search.into_any_element(),
+            ))
+            .child(list)
+            .into_any_element()
+    }
+
+    /// The sidebar's Sessions list: every session (idle included) of the
+    /// filter space — or all spaces under "All" — attention-sorted. Rows are
+    /// keyed for the FLIP resort glide.
     pub(super) fn render_active_rows(
         &mut self,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> Vec<(String, f32, AnyElement)> {
         let now = Utc::now();
+        let filter = self.settings.space_filter.clone();
         let rows: Vec<(ChatIndicator, komet_proto::Chat, String, Option<String>)> = {
             let state = self.state.read(cx);
             state
                 .overview_chats(now)
                 .into_iter()
+                .filter(|(_, chat)| match &filter {
+                    Some(space_id) => chat.space_id.as_deref() == Some(space_id.as_str()),
+                    None => true,
+                })
                 .map(|(status, chat)| {
+                    // Line 1 is "project @ device" (t3code's project row);
+                    // project-less sessions read as their home-dir cwd `~`.
                     let space = state.space_for_chat(chat);
-                    let mut folder = space
-                        .map(|s| s.display_name().to_string())
-                        .unwrap_or_else(|| "?".to_string());
+                    let mut folder = match (space, chat.space_id.as_deref()) {
+                        (Some(space), _) => space.display_name().to_string(),
+                        (None, None) => "~".to_string(),
+                        (None, Some(_)) => "?".to_string(),
+                    };
                     // Unknown device → no fragment, same as the archived list.
                     if let Some(device) = state.device_name(&chat.device_id) {
-                        folder = format!("{folder}@{device}");
+                        folder = format!("{folder} @ {device}");
                     }
                     // The branch shows whenever the engine has stamped one —
                     // main-checkout sessions included, not just worktrees.
@@ -629,12 +636,256 @@ impl Shell {
                     harness,
                     status,
                     is_selected,
+                    false,
                     theme,
                     cx,
                 );
                 (format!("c:{}", chat.id), height, element)
             })
             .collect()
+    }
+
+    /// The sidebar's archived shelf — a direct port of t3code's settled
+    /// shelf: header is label + hairline + chevron ("Archived (N)" closed,
+    /// "Archived" open), rows are 36px SLIM one-liners (dimmed harness mark,
+    /// title, time-ago right — the time yields to Unarchive on row hover),
+    /// and the tail pages behind an explicit "Show N more" row (initial 10,
+    /// +25 a click). `None` when nothing is archived under the current
+    /// project filter.
+    pub(super) fn render_archived_section(
+        &mut self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        const INITIAL: usize = 10;
+        const PAGE: usize = 25;
+        let now = Utc::now();
+        let filter = self.settings.space_filter.clone();
+        let rows: Vec<komet_proto::Chat> = {
+            let state = self.state.read(cx);
+            state
+                .chats
+                .iter()
+                .filter(|c| c.archived)
+                .filter(|chat| match &filter {
+                    Some(space_id) => chat.space_id.as_deref() == Some(space_id.as_str()),
+                    None => true,
+                })
+                .cloned()
+                .collect()
+        };
+        if rows.is_empty() {
+            return None;
+        }
+        let total = rows.len();
+        let open = self.archived_open;
+        let shown = self.archived_shown.max(INITIAL);
+        // Header (t3code settled-shelf toggle): muted 12px label, a hairline
+        // filling the middle, chevron flipping open/closed. The count only
+        // shows while collapsed — expanded, the rows speak for themselves.
+        let label: SharedString = if open {
+            "Archived".into()
+        } else {
+            format!("Archived ({total})").into()
+        };
+        let header = div()
+            .id("archived-toggle")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .mt(px(12.0))
+            .mb(px(4.0))
+            .px(px(10.0))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.archived_open = !this.archived_open;
+                this.archived_shown = INITIAL;
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .flex_none()
+                    .text_size(px(12.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text_muted.opacity(0.5))
+                    .child(label),
+            )
+            .child(div().h(px(1.0)).flex_1().bg(theme.border.opacity(0.6)))
+            .child(
+                crate::icons::icon(if open {
+                    crate::icons::ALT_ARROW_DOWN
+                } else {
+                    crate::icons::ALT_ARROW_RIGHT
+                })
+                .size(px(12.0))
+                .flex_none()
+                .text_color(theme.text_muted.opacity(0.5)),
+            );
+        let mut section = div().flex().flex_col().child(header);
+        if open {
+            let selected = self.state.read(cx).selected_chat.clone();
+            let selected_wash = crate::theme::glass_selected_bg();
+            let mut list = div().flex().flex_col().gap(px(2.0));
+            for chat in rows.into_iter().take(shown) {
+                let id = chat.id.clone();
+                let hovered = self.archived_hover.as_deref() == Some(id.as_str());
+                let is_selected = selected.as_deref() == Some(id.as_str());
+                let title: SharedString = transcript::single_line(
+                    &chat.title.clone().unwrap_or_else(|| "New session".into()),
+                )
+                .into();
+                let time_ago: SharedString =
+                    format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now).into();
+                let (mark, tint) = chat
+                    .config
+                    .as_ref()
+                    .map(|c| crate::pickers::harness_brand_icon(c.harness))
+                    .unwrap_or((crate::icons::CHAT_ROUND_LINE, None));
+                // Right slot: time at rest; the Unarchive affordance takes
+                // its place on row hover (t3code: "only the time/jump label
+                // yields to the settle affordance").
+                let right: AnyElement = if hovered {
+                    let restore_id = id.clone();
+                    // Metrics match the active rows' Archive pill exactly
+                    // (18px pill, 11px icon, 10px label, padding bled right)
+                    // — two sizes of the same affordance read as a mistake.
+                    div()
+                        .id(SharedString::from(format!("archived-restore-{id}")))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(4.0))
+                        .h(px(18.0))
+                        .px(px(4.0))
+                        .mr(px(-4.0))
+                        .rounded(px(5.0))
+                        .bg(crate::theme::wash(0.10))
+                        .hover(|s| s.bg(crate::theme::wash(0.18)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.set_chat_archived(restore_id.clone(), false, cx);
+                        }))
+                        .child(
+                            crate::icons::icon(crate::icons::ARCHIVE_UP_MINIMALISTIC)
+                                .size(px(11.0))
+                                .flex_none()
+                                .text_color(theme.text_muted),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(10.0))
+                                .text_color(theme.text_muted)
+                                .child(SharedString::from("Unarchive")),
+                        )
+                        .into_any_element()
+                } else {
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(theme.text_muted.opacity(0.55))
+                        .child(time_ago)
+                        .into_any_element()
+                };
+                let hover_id = id.clone();
+                let open_id = id.clone();
+                let menu_id = id.clone();
+                list = list.child(
+                    div()
+                        .id(SharedString::from(format!("archived-{id}")))
+                        .h(px(36.0))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(10.0))
+                        .px(px(10.0))
+                        .rounded(px(6.0))
+                        .cursor_pointer()
+                        .when(is_selected, |el| el.bg(selected_wash))
+                        .when(!is_selected, |el| {
+                            el.hover(|s| s.bg(theme.glass_hover()))
+                        })
+                        .on_hover(cx.listener(move |this, entered: &bool, _, cx| {
+                            if *entered {
+                                if this.archived_hover.as_deref() != Some(hover_id.as_str()) {
+                                    this.archived_hover = Some(hover_id.clone());
+                                    cx.notify();
+                                }
+                            } else if this.archived_hover.as_deref() == Some(hover_id.as_str()) {
+                                this.archived_hover = None;
+                                cx.notify();
+                            }
+                        }))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.open_chat(open_id.clone(), cx);
+                        }))
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
+                                this.chat_menu.open((menu_id.clone(), event.position));
+                                cx.notify();
+                            }),
+                        )
+                        // Archived history recedes: dimmed mark at rest,
+                        // restored on hover (t3code's grayscale favicon).
+                        .child(
+                            crate::icons::icon(mark)
+                                .size(px(14.0))
+                                .flex_none()
+                                .text_color(if hovered || is_selected {
+                                    tint.unwrap_or(theme.text_muted)
+                                } else {
+                                    tint.unwrap_or(theme.text_muted).opacity(0.4)
+                                }),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(13.0))
+                                .text_color(if hovered || is_selected {
+                                    theme.text
+                                } else {
+                                    theme.text.opacity(0.55)
+                                })
+                                .child(title),
+                        )
+                        .child(right),
+                );
+            }
+            // Mount fade: the shelf popping in whole read as jank — a quick
+            // fade on the expanded list softens the accordion.
+            section = section.child(motion::fade_quick("archived-list", list));
+            if total > shown {
+                let remaining = (total - shown).min(PAGE);
+                section = section.child(
+                    div()
+                        .id("archived-more")
+                        .h(px(36.0))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(10.0))
+                        .px(px(10.0))
+                        .rounded(px(6.0))
+                        .text_size(px(13.0))
+                        .text_color(theme.text_muted.opacity(0.55))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(theme.glass_hover()).text_color(theme.text))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.archived_shown = this.archived_shown.max(INITIAL) + PAGE;
+                            cx.notify();
+                        }))
+                        .child(
+                            crate::icons::icon(crate::icons::PLUS)
+                                .size(px(14.0))
+                                .flex_none(),
+                        )
+                        .child(SharedString::from(format!("Show {remaining} more"))),
+                );
+            }
+        }
+        Some(section.pb(px(Theme::SPACE_SM)).into_any_element())
     }
 
     // ---- add-space flow (the ⌘K palette) ----
@@ -845,7 +1096,7 @@ impl Shell {
             .map(|s| s.id.clone())
         {
             self.add_space = None;
-            self.activate_space(existing, cx);
+            self.land_in_space(existing, cx);
             return;
         }
         let Some(flow) = self.add_space.as_mut() else {
@@ -886,7 +1137,7 @@ impl Shell {
                 match result {
                     Ok(_) => {
                         shell.add_space = None;
-                        shell.activate_space(submit_id.clone(), cx);
+                        shell.land_in_space(submit_id.clone(), cx);
                     }
                     Err(err) => {
                         // Roll the optimistic row back; surface the error inline.
@@ -1553,15 +1804,22 @@ impl Shell {
 
     // ---- space context menu / rename / delete overlays ----
 
+    fn close_space_menu(&mut self, cx: &mut Context<Self>) {
+        if self.space_menu.begin_close() {
+            popover::reap_popup(cx, |shell: &mut Self| &mut shell.space_menu);
+            cx.notify();
+        }
+    }
+
     pub(super) fn open_rename_space(&mut self, space_id: String, cx: &mut Context<Self>) {
-        self.space_menu = None;
+        self.close_space_menu(cx);
         let current = self
             .state
             .read(cx)
             .space_row(&space_id)
             .map(|s| s.display_name().to_string())
             .unwrap_or_default();
-        let input = cx.new(|cx| ComposerInput::new("Space name", cx));
+        let input = cx.new(|cx| ComposerInput::new("Project name", cx));
         input.update(cx, |input, cx| input.set_text(current, cx));
         let events = cx.subscribe(&input, |this: &mut Shell, _, event, cx| {
             if matches!(event, ComposerInputEvent::Submitted) {
@@ -1611,14 +1869,14 @@ impl Shell {
         let theme = Theme::of(cx).clone();
         let mut overlays: Vec<AnyElement> = Vec::new();
 
-        if let Some((space_id, position)) = self.space_menu.clone() {
+        if let Some((space_id, position)) = self.space_menu.get().cloned() {
+            let closing = self.space_menu.closing_since();
             let rename_id = space_id.clone();
             let delete_id = space_id.clone();
             let menu = popover::popover_card(&theme)
                 .w(px(170.0))
                 .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                    this.space_menu = None;
-                    cx.notify();
+                    this.close_space_menu(cx);
                 }))
                 .flex()
                 .flex_col()
@@ -1637,7 +1895,7 @@ impl Shell {
                         .id("space-menu-delete")
                         .text_color(theme.danger)
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.space_menu = None;
+                            this.close_space_menu(cx);
                             this.delete_space_confirm = Some(delete_id.clone());
                             cx.notify();
                         }))
@@ -1649,7 +1907,12 @@ impl Shell {
                         .child(SharedString::from("Remove…")),
                 )
                 .into_any_element();
-            overlays.push(popover::menu_at("space-context-menu", position, menu));
+            overlays.push(popover::menu_at(
+                "space-context-menu",
+                position,
+                menu,
+                closing,
+            ));
         }
 
         if let Some(dialog) = &mut self.rename_space_dialog {
@@ -1664,7 +1927,7 @@ impl Shell {
                         cx.notify();
                     }
                 }))
-                .child(popover::dialog_title(&theme, "Rename space"))
+                .child(popover::dialog_title(&theme, "Rename project"))
                 .child(
                     div()
                         .mt(px(12.0))
@@ -1704,7 +1967,7 @@ impl Shell {
                 (
                     space
                         .map(|s| s.display_name().to_string())
-                        .unwrap_or_else(|| "this space".into()),
+                        .unwrap_or_else(|| "this project".into()),
                     space
                         .and_then(|s| state.device_name(&s.device_id))
                         .unwrap_or("its device")
@@ -1722,7 +1985,7 @@ impl Shell {
                 )
             };
             let card = popover::dialog_card(&theme)
-                .child(popover::dialog_title(&theme, "Remove space?"))
+                .child(popover::dialog_title(&theme, "Remove project?"))
                 .child(div().mt(px(6.0)).child(popover::dialog_body(&theme, copy)))
                 .child(
                     div()

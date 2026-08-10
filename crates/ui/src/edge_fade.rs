@@ -17,6 +17,9 @@ use gpui::{
 pub fn edge_faded(band: f32, top: bool, bottom: bool, child: impl IntoElement) -> EdgeFaded {
     EdgeFaded {
         band,
+        band_top: None,
+        band_bottom: None,
+        inset_top: 0.0,
         top,
         bottom,
         left: false,
@@ -27,6 +30,9 @@ pub fn edge_faded(band: f32, top: bool, bottom: bool, child: impl IntoElement) -
 
 pub struct EdgeFaded {
     band: f32,
+    band_top: Option<f32>,
+    band_bottom: Option<f32>,
+    inset_top: f32,
     top: bool,
     bottom: bool,
     left: bool,
@@ -42,6 +48,29 @@ impl EdgeFaded {
 
     pub fn fade_right(mut self, on: bool) -> Self {
         self.right = on;
+        self
+    }
+
+    /// Override the ramp height at the TOP edge only. Asymmetric bands let
+    /// content fade across chrome of different heights — a short titlebar
+    /// above vs a tall composer stack below.
+    pub fn band_top(mut self, px: f32) -> Self {
+        self.band_top = Some(px);
+        self
+    }
+
+    /// [`Self::band_top`], for the bottom edge.
+    pub fn band_bottom(mut self, px: f32) -> Self {
+        self.band_bottom = Some(px);
+        self
+    }
+
+    /// Pull the fade's TOP edge `px` inside the wrapper: gpui clamps the ramp
+    /// to 0 past an active edge, so content between the wrapper's real top
+    /// and the inset edge paints fully transparent — content under opaque-ish
+    /// chrome (titlebar TEXT) vanishes before it can overlap.
+    pub fn inset_top(mut self, px: f32) -> Self {
+        self.inset_top = px;
         self
     }
 }
@@ -90,13 +119,20 @@ impl Element for EdgeFaded {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let fade = (self.top || self.bottom || self.left || self.right).then(|| EdgeFade {
-            bounds,
-            band: px(self.band),
-            top: self.top,
-            bottom: self.bottom,
-            left: self.left,
-            right: self.right,
+        let fade = (self.top || self.bottom || self.left || self.right).then(|| {
+            let mut bounds = bounds;
+            bounds.origin.y += px(self.inset_top);
+            bounds.size.height -= px(self.inset_top);
+            EdgeFade {
+                bounds,
+                band: px(self.band),
+                band_top: self.band_top.map(px),
+                band_bottom: self.band_bottom.map(px),
+                top: self.top,
+                bottom: self.bottom,
+                left: self.left,
+                right: self.right,
+            }
         });
         window.with_edge_fade(fade, |window| self.child.paint(window, cx));
     }
