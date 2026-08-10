@@ -1,27 +1,35 @@
-// Composer — the floating glass shell, a port of the old mobile app's
-// composer (compact↔expanded morph, 36pt controls, focus-widen) carrying the
-// desktop's Send→Steer→Stop semantics: live run + text = steer (same
-// up-arrow), live run + empty = stop.
+// Composer — the floating glass shell in the t3 mobile composer's shape: a
+// collapsed capsule (editor + send circle) that morphs into an expanded card
+// with a toolbar ROW below it (attach circle · scrolling chips · pinned send)
+// when the editor takes focus. Carries the desktop's Send→Steer→Stop
+// semantics: live run + text = steer (same up-arrow), live run + empty = stop.
 //
-// The compact→expanded flip is deterministic (newline or >26 chars), NOT
-// content-size measured — measurement oscillates at the boundary.
+// Expansion is focus-driven like t3's, with the old deterministic content
+// triggers kept as a floor (attachments, newline, >26 chars) — content-size
+// measurement oscillates at the boundary, so it is never measured.
 
 import PhotosUI
 import SwiftUI
 
-/// Shared glass shell + input + action row. `chips` (leading accessory views)
-/// force the expanded layout — the desktop keeps new-session composers
-/// expanded because the pickers need the full row.
+/// Shared glass shell + input + action row. `chips` render in the expanded
+/// toolbar row between the attach and send circles.
 struct ComposerShell<Chips: View>: View {
     @Binding var draft: String
     var placeholder = "Message"
     var sendEnabled: Bool
     var showStop: Bool
     var busy = false
+    /// New-session composers stay expanded — the picker chips ARE the page.
+    var alwaysExpanded = false
+    /// Hold the expanded layout while a picker sheet is up: presenting the
+    /// sheet blurs the editor, and collapsing on that blur flaps the
+    /// transcript's bottom inset mid-presentation (t3 derives expansion from
+    /// focus OR sheet-active for exactly this reason).
+    var keepExpanded = false
     var onSend: () -> Void
     var onStop: () -> Void = {}
     /// Staged image attachments (attachment-ui.tsx AttachmentStrip inside the
-    /// pill). Non-empty forces the expanded layout, like chips.
+    /// pill). Non-empty forces the expanded layout, like focus.
     var attachments: [StagedAttachment] = []
     /// Present the photo picker; nil hides the attach button.
     var onAttach: (() -> Void)? = nil
@@ -31,8 +39,14 @@ struct ComposerShell<Chips: View>: View {
     @FocusState private var focused: Bool
 
     private var expanded: Bool {
-        Chips.self != EmptyView.self || !attachments.isEmpty
+        alwaysExpanded || keepExpanded || focused || !attachments.isEmpty
             || draft.contains("\n") || draft.count > 26
+    }
+
+    /// One animatable shape for background/glass/hairline: capsule-radius
+    /// collapsed (46pt tall pill), 20pt card expanded (t3's 999↔20 morph).
+    private var surfaceShape: RoundedRectangle {
+        RoundedRectangle(cornerRadius: expanded ? 20 : 24)
     }
 
     // Switching between VStack/HStack via AnyLayout (rather than an if/else
@@ -46,23 +60,30 @@ struct ComposerShell<Chips: View>: View {
     }
 
     var body: some View {
+        surface
+            // Focus-widen: margins pull in slightly while typing (chat-session.tsx).
+            .padding(.horizontal, focused ? 10 : 16)
+            .motionAnimation(Motion.resize, value: focused)
+            .motionAnimation(Motion.collapse, value: expanded)
+    }
+
+    /// The glass surface: collapsed = editor + send in one capsule row;
+    /// expanded = attachment strip over a tall editor, with the control row
+    /// (attach circle · scrolling chips · pinned send) along the card's
+    /// bottom edge — everything stays inside the glass.
+    private var surface: some View {
         shellLayout {
             if expanded, !attachments.isEmpty {
                 AttachmentStripView(attachments: attachments, remove: onRemoveAttachment)
-                    .padding(.horizontal, 16)
-                    .padding(.top, 12)
-            }
-            if !expanded, onAttach != nil {
-                attachButton
-                    .padding(.leading, 7)
+                    .padding(.bottom, 10)
             }
             input
-                .padding(.horizontal, expanded ? 20 : 0)
-                .padding(.leading, expanded ? 0 : (onAttach == nil ? 20 : 4))
-                .padding(.top, expanded ? 15 : 0)
-                .padding(.vertical, expanded ? 0 : 15)
+                .padding(.leading, expanded ? 4 : 13)
+                .padding(.trailing, expanded ? 4 : 0)
+                .padding(.vertical, expanded ? 4 : 5)
+                .frame(minHeight: expanded ? 64 : nil, alignment: .topLeading)
             if expanded {
-                HStack(spacing: 10) {
+                HStack(spacing: 8) {
                     if onAttach != nil {
                         attachButton
                     }
@@ -73,23 +94,19 @@ struct ComposerShell<Chips: View>: View {
                         }
                     }
                     .scrollClipDisabled(false)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     actionButton
                 }
-                .padding(.horizontal, 10)
-                .padding(.top, 10)
-                .padding(.bottom, 10)
+                .padding(.top, 8)
             } else {
                 actionButton
-                    .padding(.trailing, 7)
             }
         }
-        .background(whiteAlpha(0.04), in: RoundedRectangle(cornerRadius: 28))
-        .glassEffect(.regular.interactive(), in: RoundedRectangle(cornerRadius: 28))
-        .overlay(RoundedRectangle(cornerRadius: 28).strokeBorder(whiteAlpha(0.05), lineWidth: 1))
-        // Focus-widen: margins pull in slightly while typing (chat-session.tsx).
-        .padding(.horizontal, focused ? 10 : 16)
-        .motionAnimation(Motion.resize, value: focused)
-        .motionAnimation(Motion.collapse, value: expanded)
+        .padding(.horizontal, expanded ? 12 : 5)
+        .padding(.vertical, expanded ? 12 : 5)
+        .background(whiteAlpha(0.04), in: surfaceShape)
+        .glassEffect(.regular.interactive(), in: surfaceShape)
+        .overlay(surfaceShape.strokeBorder(whiteAlpha(0.05), lineWidth: 1))
     }
 
     private var input: some View {
@@ -106,10 +123,11 @@ struct ComposerShell<Chips: View>: View {
             onAttach?()
         } label: {
             Image(systemName: "plus")
-                .font(.system(size: 15, weight: .medium))
+                .font(.system(size: 16, weight: .medium))
                 .foregroundStyle(Theme.textMuted)
-                .frame(width: 36, height: 36)
+                .frame(width: 40, height: 40)
                 .background(whiteAlpha(0.06), in: Circle())
+                .overlay(Circle().strokeBorder(whiteAlpha(0.08), lineWidth: 1))
                 .contentShape(Circle())
         }
         .buttonStyle(.plain)
@@ -146,7 +164,7 @@ struct ComposerShell<Chips: View>: View {
                         .foregroundStyle(buttonActive ? Theme.bg : Theme.textFaint)
                 }
             }
-            .frame(width: 36, height: 36)
+            .frame(width: 40, height: 40)
             .background(buttonActive ? AnyShapeStyle(Theme.text) : AnyShapeStyle(whiteAlpha(0.10)),
                         in: Circle())
             .contentShape(Circle())
@@ -162,9 +180,11 @@ struct ComposerShell<Chips: View>: View {
     }
 }
 
-/// The live-chat composer: config is locked once the chat exists, so no chips —
-/// input, the photo attach button, and the morphing action button.
+/// The live-chat composer: input, the photo attach button, the model + trait
+/// picker chips (harness stays locked mid-chat; picks merge into the chat's
+/// config row for the next dispatch), and the morphing action button.
 struct ComposerView: View {
+    @Environment(AppModel.self) private var model
     let store: SessionStore
     let chat: Chat
     let runLive: Bool
@@ -175,6 +195,26 @@ struct ComposerView: View {
     @State private var showPicker = false
     @State private var uploading = false
     @State private var uploadError: String?
+    @State private var showModelPicker = false
+    @State private var showTraitPicker = false
+    /// Live catalog for the chat's harness from its space's device.
+    @State private var catalogs: [String: [ModelInfo]] = [:]
+
+    private var harness: String { chat.config?.harness ?? "claude-code" }
+
+    private var models: [ModelInfo] {
+        catalogs[harness] ?? HarnessCatalog.models(for: harness)
+    }
+
+    private var currentModel: ModelInfo {
+        models.first { $0.id == chat.config?.model } ?? HarnessCatalog.defaultModel(for: harness)
+    }
+
+    private var currentReasoning: String? {
+        guard !currentModel.reasoningLevels.isEmpty else { return nil }
+        if let r = chat.config?.reasoning, currentModel.reasoningLevels.contains(r) { return r }
+        return HarnessCatalog.defaultReasoning(for: currentModel)
+    }
 
     var body: some View {
         VStack(spacing: 6) {
@@ -191,13 +231,21 @@ struct ComposerView: View {
                 sendEnabled: true,
                 showStop: runLive,
                 busy: uploading,
+                keepExpanded: showModelPicker || showTraitPicker,
                 onSend: send,
                 onStop: { store.sendInterrupt() },
                 attachments: attachments,
                 onAttach: { showPicker = true },
                 onRemoveAttachment: { id in attachments.removeAll { $0.id == id } }
             ) {
-                EmptyView()
+                ComposerChip(label: currentModel.label, badgeHarness: harness) {
+                    showModelPicker = true
+                }
+                if let currentReasoning {
+                    ComposerChip(label: HarnessCatalog.reasoningLabel(currentReasoning)) {
+                        showTraitPicker = true
+                    }
+                }
             }
         }
         .photosPicker(isPresented: $showPicker, selection: $pickerItems,
@@ -206,6 +254,50 @@ struct ComposerView: View {
             guard !items.isEmpty else { return }
             stage(items)
         }
+        .sheet(isPresented: $showModelPicker) {
+            ModelPickerSheet(
+                harness: .constant(harness),
+                modelId: Binding(
+                    get: { currentModel.id },
+                    set: { writeConfig(model: $0, reasoning: chat.config?.reasoning) }
+                ),
+                reasoning: Binding(
+                    get: { chat.config?.reasoning },
+                    set: { writeConfig(model: chat.config?.model, reasoning: $0) }
+                ),
+                lockedHarness: true,
+                catalogs: catalogs
+            )
+        }
+        .sheet(isPresented: $showTraitPicker) {
+            TraitPickerSheet(
+                reasoning: Binding(
+                    get: { currentReasoning },
+                    set: { writeConfig(model: chat.config?.model, reasoning: $0) }
+                ),
+                levels: currentModel.reasoningLevels
+            )
+        }
+        .task(id: "\(chat.id)/\(harness)") {
+            guard let space = model.space(for: chat) else { return }
+            catalogs[harness] = await model.listModels(space: space, harness: harness)
+        }
+        .onAppear {
+            if model.launchSheet == "config" {
+                model.launchSheet = nil
+                showModelPicker = true
+            }
+        }
+    }
+
+    /// Merge a model/effort change into the chat's config row (LWW; the host
+    /// picks it up on the next run dispatch). Copies preserve modelOptions.
+    private func writeConfig(model newModel: String?, reasoning newReasoning: String?) {
+        var config = chat.config ?? ChatConfig(harness: harness, model: nil,
+                                               reasoning: nil, sandbox: "workspace-write")
+        config.model = newModel
+        config.reasoning = newReasoning
+        model.setChatConfig(chatId: chat.id, config: config)
     }
 
     /// Load picked photos into staged attachments (HEIC transcodes to JPEG;

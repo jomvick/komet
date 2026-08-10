@@ -1,7 +1,7 @@
-// Home — the mobile shell. The desktop sidebar's two sections become the
-// phone's home screen: Spaces (grouped work) and Sessions (the global
-// attention-sorted list). Tabs-as-sessions don't fit a phone; a space opens
-// into its own session list instead, and close=archive becomes swipe-to-archive.
+// Home — the mobile shell. The desktop sidebar collapses into one screen: a
+// space dropdown in the nav bar (default "All") scopes the attention-sorted
+// session list below it. Tabs-as-sessions don't fit a phone; close=archive
+// becomes swipe-to-archive.
 
 import SwiftUI
 
@@ -15,11 +15,16 @@ struct HomeView: View {
     @Environment(AppModel.self) private var model
     @State private var path: [Route] = []
     @State private var showNewSpace = false
+    // "" = All. Sticky across launches; falls back to All if the space is gone.
+    @AppStorage("homeSpaceFilter") private var spaceFilter: String = ""
+
+    private var selectedSpace: Space? {
+        model.spaces.first { $0.id == spaceFilter }
+    }
 
     var body: some View {
         NavigationStack(path: $path) {
             List {
-                spacesSection
                 sessionsSection
             }
             .listStyle(.plain)
@@ -39,25 +44,28 @@ struct HomeView: View {
                 }
             }
             .toolbar {
+                // One leading item: a second topBarLeading entry gets folded
+                // into a "…" overflow next to the dropdown. The item's SHARED
+                // glass is hidden and the selector wears its own capsule, so
+                // the connect spinner sits bare on the bar beside it instead
+                // of inside the button's glass.
                 ToolbarItem(placement: .topBarLeading) {
-                    // In the bar, not the list: as a list row it appeared and
-                    // vanished with the connection and shoved the content down.
-                    if !model.connected {
-                        ProgressView()
-                            .controlSize(.mini)
-                            .tint(Theme.textMuted)
-                            .accessibilityLabel("Connecting")
+                    HStack(spacing: 10) {
+                        spaceDropdown
+                        // In the bar, not the list: as a list row it appeared
+                        // and vanished with the connection and shoved the
+                        // content down.
+                        if !model.connected {
+                            ProgressView()
+                                .controlSize(.mini)
+                                .tint(Theme.textMuted)
+                                .accessibilityLabel("Connecting")
+                        }
                     }
                 }
-                // Bare spinner — no glass capsule behind it.
                 .sharedBackgroundVisibility(.hidden)
                 ToolbarItem(placement: .topBarTrailing) {
-                    Button {
-                        showNewSpace = true
-                    } label: {
-                        Image(systemName: "plus")
-                    }
-                    .accessibilityLabel("New space")
+                    newButton
                 }
                 ToolbarItem(placement: .topBarTrailing) {
                     Menu {
@@ -98,30 +106,107 @@ struct HomeView: View {
         }
     }
 
-    // MARK: Spaces
+    // MARK: Space dropdown
 
-    private var spacesSection: some View {
-        Section {
-            if model.spaces.isEmpty {
-                Text("No spaces yet — add one from a desktop device")
-                    .font(Theme.sans(12))
-                    .foregroundStyle(Theme.textFaint)
-                    .listRowBackground(Color.clear)
-                    .listRowSeparator(.hidden)
-            }
+    /// The nav-bar dropdown that scopes the session list — a NATIVE glass
+    /// menu. Rows are Buttons, not a Picker: Picker menu rows drop two-Text
+    /// subtitles, while Button rows map to UIAction subtitles, so each space
+    /// shows its owning device ("@ mac") on the small second line without the
+    /// three-line title wraps. Selection carries a checkmark in the icon slot.
+    private var spaceDropdown: some View {
+        Menu {
+            spaceMenuButton(id: "", title: "All", subtitle: nil)
             ForEach(model.spaces) { space in
-                Button {
-                    path.append(.space(space.id))
-                } label: {
-                    SpaceRow(space: space)
-                }
-                .buttonStyle(PressWashButtonStyle())
-                .listRowBackground(Color.clear)
-                .listRowSeparator(.hidden)
-                .listRowInsets(EdgeInsets(top: 2, leading: 12, bottom: 2, trailing: 12))
+                spaceMenuButton(id: space.id, title: space.displayName,
+                                subtitle: deviceTag(space))
             }
-        } header: {
-            sectionHeader("Spaces")
+            Divider()
+            Button {
+                showNewSpace = true
+            } label: {
+                Label("New space…", systemImage: "folder.badge.plus")
+            }
+        } label: {
+            HStack(spacing: 5) {
+                Text(selectedSpace?.displayName ?? "All")
+                    .font(Theme.sans(14, weight: .semibold))
+                    .foregroundStyle(Theme.text)
+                    .lineLimit(1)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 9, weight: .bold))
+                    .foregroundStyle(Theme.textFaint)
+            }
+            // Keep long space names from swallowing the whole bar; the owning
+            // device lives on the menu rows ("@ mac"), not up here.
+            .frame(maxWidth: 220, alignment: .leading)
+            // Its own glass capsule (the item's shared glass is hidden so the
+            // connect spinner doesn't ride inside the button).
+            .padding(.horizontal, 16)
+            .frame(height: 44)
+            .glassEffect(.regular.interactive(), in: Capsule())
+        }
+        .accessibilityLabel("Filter by space")
+    }
+
+    private func deviceTag(_ space: Space) -> String {
+        let name = model.deviceName(space.deviceId)
+        return model.deviceOnline(space.deviceId) ? "@ \(name)" : "@ \(name) · offline"
+    }
+
+    private func spaceMenuButton(id: String, title: String, subtitle: String?) -> some View {
+        let selected = id.isEmpty ? selectedSpace == nil : spaceFilter == id
+        return Button {
+            spaceFilter = id
+        } label: {
+            if selected {
+                Label {
+                    Text(title)
+                    if let subtitle { Text(subtitle) }
+                } icon: {
+                    Image(systemName: "checkmark")
+                }
+            } else {
+                Text(title)
+                if let subtitle { Text(subtitle) }
+            }
+        }
+    }
+
+    /// "+" starts a session in the scoped space; under All it asks which
+    /// space first. With no spaces yet it falls through to space creation.
+    @ViewBuilder private var newButton: some View {
+        if let space = selectedSpace {
+            Button {
+                path.append(.newSession(spaceId: space.id))
+            } label: {
+                Image(systemName: "plus")
+            }
+            .accessibilityLabel("New session")
+        } else if model.spaces.isEmpty {
+            Button {
+                showNewSpace = true
+            } label: {
+                Image(systemName: "plus")
+            }
+            .accessibilityLabel("New space")
+        } else {
+            Menu {
+                Section("New session in…") {
+                    ForEach(model.spaces) { space in
+                        Button {
+                            path.append(.newSession(spaceId: space.id))
+                        } label: {
+                            // Button rows render the second Text as the
+                            // subtitle line (same pattern as the space menu).
+                            Text(space.displayName)
+                            Text(deviceTag(space))
+                        }
+                    }
+                }
+            } label: {
+                Image(systemName: "plus")
+            }
+            .accessibilityLabel("New session")
         }
     }
 
@@ -129,9 +214,11 @@ struct HomeView: View {
 
     private var sessionsSection: some View {
         Section {
-            let chats = model.overviewChats
+            let chats = selectedSpace.map { model.chats(in: $0.id) } ?? model.overviewChats
             if chats.isEmpty {
-                Text("No sessions yet")
+                Text(model.spaces.isEmpty
+                    ? "No spaces yet — add one from a desktop device"
+                    : "No sessions yet")
                     .font(Theme.sans(12))
                     .foregroundStyle(Theme.textFaint)
                     .listRowBackground(Color.clear)
@@ -141,6 +228,8 @@ struct HomeView: View {
                 Button {
                     path.append(.chat(chat.id))
                 } label: {
+                    // Location shows even when scoped — without it the row's
+                    // first line is just a floating dot and a timestamp.
                     ChatRow(chat: chat, showLocation: true)
                 }
                 .buttonStyle(PressWashButtonStyle())
@@ -157,60 +246,11 @@ struct HomeView: View {
                 }
             }
             .motionAnimation(Motion.resort, value: chats.map(\.id))
-        } header: {
-            sectionHeader("Sessions")
         }
-    }
-
-    private func sectionHeader(_ title: String) -> some View {
-        Text(title)
-            .font(Theme.sans(11, weight: .medium))
-            .foregroundStyle(Theme.textMuted.opacity(0.6))
-            .textCase(nil)
-            .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 3, trailing: 16))
     }
 }
 
 // MARK: - Rows
-
-struct SpaceRow: View {
-    @Environment(AppModel.self) private var model
-    let space: Space
-
-    var body: some View {
-        HStack(spacing: 8) {
-            // Leading 6pt aggregate dot — position stable, most-urgent member.
-            let agg = model.spaceIndicator(space.id)
-            Circle()
-                .fill((agg == .working || agg == .awaitingInput) ? (agg?.dotColor ?? whiteAlpha(0.14)) : whiteAlpha(0.14))
-                .frame(width: 6, height: 6)
-            Image(systemName: "folder")
-                .font(.system(size: 13))
-                .foregroundStyle(Theme.textMuted)
-            Text(space.displayName)
-                .font(Theme.sans(13, weight: .medium))
-                .foregroundStyle(Theme.text)
-                .lineLimit(1)
-            Spacer(minLength: 8)
-            deviceTag
-            Image(systemName: "chevron.right")
-                .font(.system(size: 10, weight: .medium))
-                .foregroundStyle(Theme.textFaint.opacity(0.6))
-        }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 8)
-        .contentShape(RoundedRectangle(cornerRadius: 8))
-    }
-
-    private var deviceTag: some View {
-        let online = model.deviceOnline(space.deviceId)
-        let name = model.deviceName(space.deviceId)
-        return Text(online ? "@ \(name)" : "@ \(name) · offline")
-            .font(Theme.sans(12))
-            .foregroundStyle(online ? Theme.textMuted.opacity(0.6) : Theme.warning.opacity(0.8))
-            .lineLimit(1)
-    }
-}
 
 /// The desktop session row (shell.rs `render_chat_row`), line for line: the
 /// status rail leads a muted context line carrying the space name and the
@@ -285,17 +325,15 @@ struct ChatRow: View {
         .contentShape(RoundedRectangle(cornerRadius: 8))
     }
 
-    /// "space · device", with offline marker. The space name (not the cwd
-    /// basename) is what the desktop row shows — they differ once a space has
-    /// been renamed, or when the session runs in a worktree off to the side.
+    /// "space @ device" (the session header's format). The space name (not
+    /// the cwd basename) is what the desktop row shows — they differ once a
+    /// space has been renamed, or when the session runs in a worktree off to
+    /// the side. No offline marker: the dropdown carries device liveness.
     private var location: String {
         let space = model.space(for: chat)?.displayName
             ?? chat.cwd.map { ($0 as NSString).lastPathComponent }
             ?? "?"
-        let name = model.deviceName(chat.deviceId)
-        return model.deviceOnline(chat.deviceId)
-            ? "\(space) · \(name)"
-            : "\(space) · \(name) (offline)"
+        return "\(space) @ \(model.deviceName(chat.deviceId))"
     }
 }
 

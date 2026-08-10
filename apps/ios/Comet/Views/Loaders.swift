@@ -172,8 +172,10 @@ struct HarnessBadge: View {
     var neutral: Color = Theme.text
 
     var body: some View {
-        BrandMarkShape(mark: BrandMark.forHarness(harness))
-            .fill((BrandMark.brandTint(for: harness) ?? neutral).opacity(dimmed ? 0.6 : 0.9))
+        let mark = BrandMark.forHarness(harness)
+        BrandMarkShape(mark: mark)
+            .fill((BrandMark.brandTint(for: harness) ?? neutral).opacity(dimmed ? 0.6 : 0.9),
+                  style: FillStyle(eoFill: mark.evenOddFill))
             .frame(width: size, height: size)
     }
 }

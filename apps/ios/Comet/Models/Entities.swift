@@ -36,6 +36,11 @@ struct ChatConfig: Hashable, Codable {
     var harness: String
     var model: String?
     var reasoning: String?
+    /// Harness-specific option picks (option id → choice id, proto
+    /// `ChatConfig.model_options`). Round-tripped so a mobile config edit
+    /// never clobbers options the desktop pickers set — `setChatConfig`
+    /// rewrites the whole `config` field under per-field LWW.
+    var modelOptions: [String: JSONValue] = [:]
     var sandbox: String?
 }
 
@@ -251,7 +256,7 @@ struct RunRequest: Codable {
     var harness: String?
     var model: String?
     var reasoning: String?
-    var modelOptions: [String: String] = [:]
+    var modelOptions: [String: JSONValue] = [:]
     var cwd: String
     var sandbox: String = "workspace-write"
     var autoApprove: Bool = true

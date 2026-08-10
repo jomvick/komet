@@ -441,6 +441,7 @@ final class SessionStore {
                                  harness: chat.config?.harness,
                                  model: chat.config?.model,
                                  reasoning: chat.config?.reasoning,
+                                 modelOptions: chat.config?.modelOptions ?? [:],
                                  cwd: chat.cwd ?? "",
                                  sandbox: chat.config?.sandbox ?? "workspace-write",
                                  attachments: attachments)

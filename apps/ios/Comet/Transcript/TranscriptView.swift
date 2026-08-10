@@ -66,6 +66,13 @@ struct TranscriptView: View {
         // Drag past the composer and the keyboard follows the finger down —
         // the Messages-style interactive dismissal.
         .scrollDismissesKeyboard(.interactively)
+        // Tap anywhere in the transcript to put the keyboard away (t3's
+        // tap-to-blur; TapGesture already cancels on drag-sized movement).
+        // Simultaneous so fold toggles and row buttons still receive theirs.
+        .simultaneousGesture(TapGesture().onEnded {
+            UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder),
+                                            to: nil, from: nil, for: nil)
+        })
         // Held invisible until it has settled at the bottom, then faded in.
         // The settling itself is unavoidable (see settleToBottom) — what is
         // avoidable is WATCHING it: painting mid-settle is what read as the
@@ -82,14 +89,42 @@ struct TranscriptView: View {
             // Projection is off-main, so a cached transcript usually lands after
             // the pass above ran on an empty list. Only ever hides a transcript
             // that has never been shown — re-hiding a visible one is what made
-            // it blink out mid-typing.
-            guard !isEmpty, !hydrated, !store.hasRevealed else { return }
+            // it blink out mid-typing. `hydrated` is the one-shot: it seeds
+            // true for stores that have already revealed content, so this
+            // fires exactly once, on a fresh store's first non-empty rows.
+            guard !isEmpty, !hydrated else { return }
             hydrated = true
             settled = false
             Task { await settleToBottom() }
         }
-        .onScrollGeometryChange(for: CGFloat.self) { $0.contentSize.height } action: { [scroll] _, new in
+        .onScrollGeometryChange(for: CGFloat.self) { $0.contentSize.height } action: { [scroll] old, new in
             scroll.contentHeight = new
+            // Estimated row heights keep resolving after the settle, and a
+            // SHRINK leaves the held offset past the content — a black
+            // viewport until the user's scroll clamps it (t3 re-pins on
+            // itemLayout for exactly this). Keep a pinned feed glued through
+            // reflows; never touch a user's in-flight drag.
+            if scroll.pinned, !scroll.userScrolling, new < old - 1 {
+                scrollPosition.scrollTo(edge: .bottom)
+            }
+        }
+        .onScrollGeometryChange(for: CGFloat.self) { $0.containerSize.height + $0.contentInsets.bottom } action: { _, _ in
+            // The viewport resized under the content — keyboard up/down, the
+            // composer's capsule↔card morph, the question-panel swap. t3's
+            // rule for exactly this ("keyboardLiftBehavior=whenAtEnd" +
+            // inset re-report on remount): a feed pinned at the end follows
+            // the new bottom IMMEDIATELY; an unpinned reader stays put —
+            // unless the resize stranded the offset past the content (blank
+            // viewport), which is clamped back to the bottom. Without this,
+            // focusing the composer could leave the transcript scrolled out
+            // of range (blank until touched) or resting a viewport short
+            // (content "appears" only when the next resize brought it back).
+            guard !scroll.userScrolling else { return }  // their drag wins
+            if scroll.pinned || scroll.distanceFromBottom < -1 {
+                // Unanimated: this tracks the keyboard's own animation
+                // frames; a spring here would fight it.
+                scrollPosition.scrollTo(edge: .bottom)
+            }
         }
         .onScrollPhaseChange { [scroll] _, newPhase in
             // Desktop rule: the pin breaks only on USER input (wheel-up/drag),
@@ -97,7 +132,14 @@ struct TranscriptView: View {
             scroll.userScrolling = newPhase == .interacting || newPhase == .decelerating
         }
         .onScrollGeometryChange(for: CGFloat.self) { geo in
-            max(0, geo.contentSize.height + geo.contentInsets.bottom - geo.containerSize.height - geo.contentOffset.y)
+            // Inset-proof distance: visibleRect is already contentInsets-
+            // adjusted, so this is 0 at the VISUAL bottom whether or not the
+            // keyboard is up. The old offset+insets formula double-counted
+            // the keyboard inset (~keyboard-height at the bottom), which
+            // both pinned the jump button on and put the 70pt re-stick band
+            // permanently out of reach while typing. Unclamped on purpose:
+            // negative = stranded past the content (the resize clamp's cue).
+            geo.contentSize.height - geo.visibleRect.maxY
         } action: { [scroll] old, new in
             scroll.distanceFromBottom = new
             if scroll.userScrolling, new > old + 1, new > 2 {
@@ -108,8 +150,12 @@ struct TranscriptView: View {
                 scroll.pinned = true
             }
             // The only observable write, and only at the threshold crossing —
-            // it re-renders the tiny jump button, never this body.
-            let show = new > Self.jumpThreshold
+            // it re-renders the tiny jump button, never this body. Gated on
+            // the PIN, not just distance: with the keyboard up, UIKit
+            // double-counts the bottom inset (t3's "nativeInsetOvercount"),
+            // so distance reads ~keyboard-height at the visual bottom and the
+            // raw threshold kept the button up for a pinned feed.
+            let show = !scroll.pinned && new > Self.jumpThreshold
             if scroll.showJump != show { scroll.showJump = show }
         }
         .onChange(of: contentSignature(rows)) {
@@ -183,7 +229,15 @@ struct TranscriptView: View {
             try? await Task.sleep(nanoseconds: 30_000_000)
         }
         settled = true
-        store.hasRevealed = true
+        // Revealed-with-CONTENT only: a settle that ran against a still-empty
+        // projection must not latch, or the rows landing a beat later find
+        // `hasRevealed` true, seed `hydrated`/`settled` from it on the next
+        // view identity, and skip their own settle — the transcript then
+        // rests wherever the empty pass left it (out of view until a resize
+        // — focusing the composer — happened to drag it back).
+        if !store.entries.isEmpty || !store.pendingSends.isEmpty {
+            store.hasRevealed = true
+        }
     }
 
     // Streamed growth signature: last row id + version + count. Any append or

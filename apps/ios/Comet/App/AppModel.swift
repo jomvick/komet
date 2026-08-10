@@ -267,6 +267,20 @@ final class AppModel {
         return workspace?.deviceOnline(deviceId) ?? false
     }
 
+    /// Live harness catalog from the space's owning device (Settings → Agents
+    /// gates which agents a device offers); static pair when unreachable.
+    func listHarnesses(space: Space) async -> [HarnessInfo] {
+        if demo != nil {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            return HarnessCatalog.harnesses
+        }
+        if let live = await workspace?.listHarnesses(deviceId: space.deviceId),
+           !live.isEmpty {
+            return live
+        }
+        return HarnessCatalog.harnesses
+    }
+
     /// Live model catalog from the space's owning device (the desktop's
     /// "catalog source = the device that runs the session" rule); static
     /// fallback when the device is unreachable.
