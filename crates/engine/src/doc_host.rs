@@ -915,6 +915,37 @@ impl DocHost {
                             *client_slot = Some(client);
                         }
                         tracing::info!(chat = %chat, "chat2 room joined (converged)");
+                        // Bootstrap heal: a room with NO checkpoint can't
+                        // cover its rows' causal deps for cold readers — a
+                        // pre-0.1.34 first contact whose init batch never
+                        // went up (every reader parks every row on missing
+                        // deps, transcript invisible forever), or a host
+                        // whose WS pushes strand. The checkpoint is the
+                        // universal patch: full doc over plain HTTP. Checked
+                        // once, shortly after join (an idle chat never hits
+                        // the quiesce tick, so the tick can't be the only
+                        // trigger).
+                        if host.is_host(&chat) {
+                            let host = host.clone();
+                            let weak = weak.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                                let Some(handle) = weak.upgrade() else { return };
+                                let no_checkpoint = lock(&handle.chat2)
+                                    .as_ref()
+                                    .is_some_and(|c| c.stats().checkpoint_size == 0);
+                                let has_content = handle
+                                    .doc
+                                    .read_entries()
+                                    .map(|e| !e.is_empty())
+                                    .unwrap_or(false);
+                                if no_checkpoint && has_content {
+                                    tracing::info!(chat = %handle.chat_id,
+                                        "chat2 room has rows but no checkpoint; posting bootstrap checkpoint");
+                                    host.spawn_chat2_checkpoint(&handle, "bootstrap");
+                                }
+                            });
+                        }
                         // Host recovery duties (C3): a wiped room needs a
                         // seed checkpoint or fresh readers see only
                         // post-reset rows; rejected pushes reach peers only
