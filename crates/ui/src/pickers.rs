@@ -406,6 +406,8 @@ impl Pickers {
             Some("traits") => Some(PickerKind::HarnessModel),
             Some("branch") => Some(PickerKind::Branch),
             Some("checkout") => Some(PickerKind::Checkout),
+            Some("project") => Some(PickerKind::Space),
+            Some("device") => Some(PickerKind::Device),
             _ => None,
         };
         let mut open = popover::Popup::default();

@@ -782,6 +782,7 @@ impl Shell {
         if !self.space_boot_applied && !state.read(cx).spaces.is_empty() {
             self.space_boot_applied = true;
             if state.read(cx).selected_chat.is_none()
+                && !state.read(cx).no_project
                 && let Some(last) = self.settings.last_space_id.clone()
                 && state.read(cx).space_row(&last).is_some()
             {
