@@ -164,6 +164,9 @@ struct DocHostInner {
     sessions: OnceLock<SessionsEngine>,
     workspace: OnceLock<WorkspaceHost>,
     handles: Mutex<HashMap<String, Arc<ChatDocHandle>>>,
+    /// Shared client for sidecar blob PUT/GET (30s timeout, uploads.rs
+    /// discipline — diff_sync's untimed client hung on dead links).
+    http: reqwest::Client,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -335,6 +338,10 @@ impl DocHost {
                 sessions: OnceLock::new(),
                 workspace: OnceLock::new(),
                 handles: Mutex::new(HashMap::new()),
+                http: reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(30))
+                    .build()
+                    .unwrap_or_else(|_| reqwest::Client::new()),
             }),
         }
     }
@@ -670,6 +677,106 @@ impl DocHost {
                 }
             }
         });
+    }
+
+    /// Upload a tool result's full output/diff to the R2 sidecar
+    /// (`PUT {edge}/blob/{chatId}/{partId}[.diff]`, docs/chat2-sync.md A2).
+    /// Fire-and-forget: the doc already carries the summary, so a lost upload
+    /// degrades to "full output unavailable" — it must never block or fail
+    /// the run. Offline/edge-less engines skip silently.
+    pub fn upload_tool_sidecar(&self, chat_id: &str, payload: komet_doc::SidecarPayload) {
+        let Some(edge) = self.inner.config.edge.clone() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return; // bare sync callers (unit tests) skip rather than panic
+        };
+        let http = self.inner.http.clone();
+        let base = format!(
+            "{}/blob/{}/{}",
+            edge.url.trim_end_matches('/'),
+            chat_id,
+            payload.part_id
+        );
+        runtime.spawn(async move {
+            let Some(bearer) = edge.bearer().await else {
+                return; // signed out; summary-only until the next session
+            };
+            let mut puts: Vec<(String, &'static str, Vec<u8>)> = Vec::new();
+            if let Some(output) = &payload.output {
+                puts.push((
+                    base.clone(),
+                    "text/plain; charset=utf-8",
+                    output.clone().into_bytes(),
+                ));
+            }
+            if let Some(diff) = &payload.diff
+                && let Ok(json) = serde_json::to_vec(diff)
+            {
+                puts.push((format!("{base}.diff"), "application/json", json));
+            }
+            for (url, content_type, body) in puts {
+                let sent = http
+                    .put(&url)
+                    .bearer_auth(&bearer)
+                    .header("content-type", content_type)
+                    .body(body)
+                    .send()
+                    .await;
+                match sent {
+                    Ok(res) if res.status().is_success() => {}
+                    Ok(res) => tracing::warn!(url, status = res.status().as_u16(),
+                        "tool sidecar upload rejected"),
+                    Err(err) => {
+                        tracing::warn!(url, error = %err, "tool sidecar upload failed (best-effort)")
+                    }
+                }
+            }
+        });
+    }
+
+    /// Fetch a sidecar blob by its doc-resident ref (`{chatId}/{partId}` or
+    /// `…​.diff`) — the UI's lazy "Show full output" path, served over RPC
+    /// because the UI crate has no HTTP client or edge bearer.
+    pub async fn fetch_tool_blob(&self, blob_ref: &str) -> Result<String, EngineError> {
+        // Same shape `apply_sidecar_refs` writes; anything else is a forged ref.
+        let valid = blob_ref.split_once('/').is_some_and(|(chat, part)| {
+            !chat.is_empty()
+                && chat.len() <= 128
+                && chat.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+                && !part.is_empty()
+                && part.len() <= 200
+                && part
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"._:#~-".contains(&b))
+        });
+        if !valid {
+            return Err(EngineError::Other(format!("bad blob ref: {blob_ref}")));
+        }
+        let Some(edge) = self.inner.config.edge.clone() else {
+            return Err(EngineError::Other("offline: no edge configured".into()));
+        };
+        let Some(bearer) = edge.bearer().await else {
+            return Err(EngineError::Other("signed out".into()));
+        };
+        let url = format!("{}/blob/{}", edge.url.trim_end_matches('/'), blob_ref);
+        let res = self
+            .inner
+            .http
+            .get(&url)
+            .bearer_auth(&bearer)
+            .send()
+            .await
+            .map_err(|e| EngineError::Other(format!("sidecar fetch failed: {e}")))?;
+        if !res.status().is_success() {
+            return Err(EngineError::Other(format!(
+                "sidecar fetch: HTTP {}",
+                res.status().as_u16()
+            )));
+        }
+        res.text()
+            .await
+            .map_err(|e| EngineError::Other(format!("sidecar body read failed: {e}")))
     }
 
     /// §2.2 writer discipline: we host a chat iff its workspace row's `deviceId` is

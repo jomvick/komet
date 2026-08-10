@@ -198,6 +198,13 @@ pub struct ToolItem {
     /// Precomputed here because rows are cached by fingerprint — diffing and
     /// tokenizing per paint would run on every scroll frame.
     pub detail: Option<Arc<ToolDetail>>,
+    /// Sidecar key of the full output (chat2-sync A3) — the doc carries only
+    /// a one-line summary; expanding offers a lazy "Show full output" fetch.
+    pub output_ref: Option<SharedString>,
+    /// Full-output size, for the affordance label ("Show full output (12 KB)").
+    pub output_bytes: Option<u64>,
+    /// Sidecar key of the full diff (doc carries only per-file stats).
+    pub diff_ref: Option<SharedString>,
 }
 
 /// A chip's expandable detail payload.
@@ -216,6 +223,12 @@ pub enum ToolDetail {
         file: Arc<crate::changes::FileDiff>,
         highlight: Option<Arc<Vec<Vec<crate::markdown::highlight::Token>>>>,
     },
+    /// Per-file `+N −N` stat rows — what the thin doc keeps of an edit
+    /// (chat2-sync A1). The full diff upgrades this to [`ToolDetail::Diff`]
+    /// via the sidecar fetch.
+    Stats {
+        stats: Arc<Vec<komet_doc::ToolDiffStat>>,
+    },
 }
 
 /// Max verbatim output lines per chip before the counted tail row.
@@ -232,10 +245,12 @@ const OUTPUT_BODY_PAD: f32 = 12.0;
 const DETAIL_SEPARATOR: f32 = 1.0;
 
 /// Build a tool part's expandable detail. A diff wins over raw output (it is
-/// the more structured record of the same action).
+/// the more structured record of the same action); post-strip docs carry diff
+/// STATS instead of inline diff text, which win the same way.
 pub fn tool_detail(
     output: Option<&str>,
     diff: Option<&komet_proto::ToolDiff>,
+    diff_stats: Option<&[komet_doc::ToolDiffStat]>,
 ) -> Option<ToolDetail> {
     if let Some(diff) = diff {
         let file = diff_to_file(diff);
@@ -246,6 +261,11 @@ pub fn tool_detail(
         return Some(ToolDetail::Diff {
             file: Arc::new(file),
             highlight,
+        });
+    }
+    if let Some(stats) = diff_stats.filter(|s| !s.is_empty()) {
+        return Some(ToolDetail::Stats {
+            stats: Arc::new(stats.to_vec()),
         });
     }
     let output = output?;
@@ -467,7 +487,18 @@ fn tool_fingerprint(tools: &[ToolItem], auto_open: bool) -> u64 {
                 acc.extend_from_slice(&file.deletions.to_le_bytes());
                 acc.extend_from_slice(&(file.hunks.len() as u32).to_le_bytes());
             }
+            Some(ToolDetail::Stats { stats }) => {
+                acc.push(3);
+                for stat in stats.iter() {
+                    acc.extend_from_slice(stat.path.as_bytes());
+                    acc.extend_from_slice(&stat.additions.to_le_bytes());
+                    acc.extend_from_slice(&stat.deletions.to_le_bytes());
+                }
+            }
         }
+        // Sidecar refs arriving after the resolve tick must re-splice too —
+        // they add the fetch affordance without changing the detail payload.
+        acc.push(t.output_ref.is_some() as u8 | (t.diff_ref.is_some() as u8) << 1);
     }
     acc.push(auto_open as u8);
     fnv1a(&acc)
@@ -559,13 +590,21 @@ pub fn rows_for_entry(
                 resolved,
                 output,
                 diff,
+                output_ref,
+                output_bytes,
+                diff_ref,
+                diff_stats,
                 ..
             } => {
                 pending_group.push(ToolItem {
                     call: call.clone(),
                     is_error: *is_error,
                     resolved: *resolved,
-                    detail: tool_detail(output.as_deref(), diff.as_ref()).map(Arc::new),
+                    detail: tool_detail(output.as_deref(), diff.as_ref(), diff_stats.as_deref())
+                        .map(Arc::new),
+                    output_ref: output_ref.clone().map(SharedString::from),
+                    output_bytes: *output_bytes,
+                    diff_ref: diff_ref.clone().map(SharedString::from),
                 });
                 group_last_part_ix = part_ix;
             }
@@ -884,8 +923,52 @@ pub fn detail_height(detail: &ToolDetail) -> f32 {
             rows as f32 * OUTPUT_LINE_HEIGHT + OUTPUT_BODY_PAD
         }
         ToolDetail::Diff { file, .. } => crate::changes::body_height(file),
+        ToolDetail::Stats { stats } => stats.len() as f32 * OUTPUT_LINE_HEIGHT + OUTPUT_BODY_PAD,
     };
     DETAIL_SEPARATOR + body
+}
+
+/// Height of the "Show full output/diff" affordance row appended below an
+/// open detail whose full payload lives in the sidecar (chat2-sync A3).
+pub const BLOB_AFFORDANCE_HEIGHT: f32 = 24.0;
+
+/// Line cap for a FETCHED full output (a defensive ceiling, not a doc cap —
+/// the harness bounds outputs at 4KiB, so this is rarely reached).
+const FULL_OUTPUT_MAX_LINES: usize = 400;
+
+/// Build the upgraded detail from a fetched sidecar blob. Diff blobs parse
+/// the `ToolDiff` JSON through the same pipeline as inline diffs; output
+/// blobs render (near-)uncapped — fetching past the summary was the point.
+fn blob_detail(text: &str, is_diff: bool) -> Option<ToolDetail> {
+    if is_diff {
+        let diff: komet_proto::ToolDiff = serde_json::from_str(text).ok()?;
+        return tool_detail(None, Some(&diff), None);
+    }
+    let mut lines: Vec<SharedString> = text
+        .lines()
+        .map(|l| SharedString::from(l.to_owned()))
+        .collect();
+    while lines.last().is_some_and(|l| l.trim().is_empty()) {
+        lines.pop();
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    let truncated_by = lines.len().saturating_sub(FULL_OUTPUT_MAX_LINES);
+    lines.truncate(FULL_OUTPUT_MAX_LINES);
+    Some(ToolDetail::Output {
+        lines,
+        truncated_by,
+    })
+}
+
+/// Compact byte size for the fetch affordance label ("812 B", "12 KB").
+fn format_kb(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else {
+        format!("{} KB", bytes.div_ceil(1024))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1131,7 +1214,21 @@ pub struct Transcript {
     attachment_loads: HashMap<(String, String), Task<()>>,
     /// Scheduled retry wake-ups for errored sources (the 2s→15s ladder).
     attachment_retries: HashMap<(String, String), Task<()>>,
+    /// Sidecar blob fetches keyed by doc ref (`chatId/partId[.diff]`,
+    /// chat2-sync A3). `Ready` holds the UPGRADED detail, built once on
+    /// arrival — render swaps it in per chip; rows never rebuild for it.
+    /// Deliberately NOT cleared on chat switch: refs are chat-qualified and a
+    /// fetched blob stays valid.
+    blob_details: HashMap<SharedString, BlobFetch>,
     _observe: Subscription,
+}
+
+/// One sidecar blob fetch's lifecycle.
+enum BlobFetch {
+    Loading(#[allow(dead_code)] Task<()>),
+    /// Failed with the affordance re-armed as a retry.
+    Failed,
+    Ready(Arc<ToolDetail>),
 }
 
 impl Transcript {
@@ -1179,6 +1276,7 @@ impl Transcript {
             attachment_preview: None,
             attachment_loads: HashMap::new(),
             attachment_retries: HashMap::new(),
+            blob_details: HashMap::new(),
             _observe: observe,
         };
         this.sync(cx);
@@ -1543,6 +1641,48 @@ impl Transcript {
             );
         }
         rows
+    }
+
+    /// Fetch a sidecar blob (full tool output or diff) and build its upgraded
+    /// [`ToolDetail`] once, off the render path. Re-entry while Loading/Ready
+    /// is a no-op; Failed re-arms as a retry (the affordance label says so).
+    fn spawn_blob_fetch(&mut self, blob_ref: SharedString, cx: &mut Context<Self>) {
+        if matches!(
+            self.blob_details.get(&blob_ref),
+            Some(BlobFetch::Loading(_) | BlobFetch::Ready(_))
+        ) {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let is_diff = blob_ref.ends_with(".diff");
+        let ref_key = blob_ref.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let reply = crate::attachments::call_with_timeout(
+                &engine,
+                cx.background_executor(),
+                komet_rpc::methods::FETCH_TOOL_BLOB,
+                serde_json::json!({ "blobRef": ref_key.as_ref() }),
+                Duration::from_secs(20),
+            )
+            .await;
+            let fetched = match reply {
+                Ok(value) => {
+                    let text = value.get("text").and_then(|t| t.as_str()).unwrap_or_default();
+                    blob_detail(text, is_diff)
+                        .map(|d| BlobFetch::Ready(Arc::new(d)))
+                        .unwrap_or(BlobFetch::Failed)
+                }
+                Err(_) => BlobFetch::Failed,
+            };
+            this.update(cx, |this, cx| {
+                this.blob_details.insert(ref_key, fetched);
+                cx.notify();
+            })
+            .ok();
+        });
+        self.blob_details.insert(blob_ref, BlobFetch::Loading(task));
     }
 
     fn toggle_fold(&mut self, row_id: SharedString, open_height: f32, auto_open: bool) {
@@ -2074,13 +2214,54 @@ impl Transcript {
     ) -> AnyElement {
         let fold = self.folds.get(row_id).copied().unwrap_or_default();
         let open = fold.open.unwrap_or(auto_open);
+        // Chips render their EFFECTIVE detail: the precomputed doc-resident
+        // one, upgraded in place by a fetched sidecar blob (chat2-sync A3).
+        // Resolved per paint (a HashMap probe per chip) so fetched content
+        // needs no row rebuild — arrival is a cx.notify, like a fold toggle.
+        let details: Vec<Option<Arc<ToolDetail>>> = tools
+            .iter()
+            .map(|tool| {
+                for blob_ref in [&tool.diff_ref, &tool.output_ref].into_iter().flatten() {
+                    if let Some(BlobFetch::Ready(detail)) = self.blob_details.get(blob_ref) {
+                        return Some(detail.clone());
+                    }
+                }
+                tool.detail.clone()
+            })
+            .collect();
+        // Fetch affordance under each open detail whose full payload is still
+        // sidecar-only: `(ref, label)`. Diff first — the richer upgrade.
+        let affordances: Vec<Option<(SharedString, SharedString)>> = tools
+            .iter()
+            .map(|tool| {
+                let (blob_ref, what, bytes) = if let Some(r) = &tool.diff_ref {
+                    (r, "diff", None)
+                } else if let Some(r) = &tool.output_ref {
+                    (r, "output", tool.output_bytes)
+                } else {
+                    return None;
+                };
+                let label = match self.blob_details.get(blob_ref) {
+                    Some(BlobFetch::Ready(_)) => return None,
+                    Some(BlobFetch::Loading(_)) => format!("Loading full {what}…"),
+                    Some(BlobFetch::Failed) => {
+                        format!("Couldn't load full {what} — tap to retry")
+                    }
+                    None => match bytes {
+                        Some(b) => format!("Show full {what} ({})", format_kb(b)),
+                        None => format!("Show full {what}"),
+                    },
+                };
+                Some((blob_ref.clone(), SharedString::from(label)))
+            })
+            .collect();
         // Which chips have their detail block open (render-local, analytic —
         // the FINAL state; a mid-tween detail already counts as its target).
-        let detail_folds: Vec<FoldState> = tools
+        let detail_folds: Vec<FoldState> = details
             .iter()
             .enumerate()
-            .map(|(ix, tool)| {
-                if tool.detail.is_none() {
+            .map(|(ix, detail)| {
+                if detail.is_none() {
                     return FoldState::default();
                 }
                 self.tool_details
@@ -2089,17 +2270,25 @@ impl Transcript {
                     .unwrap_or_default()
             })
             .collect();
-        let detail_opens: Vec<bool> = tools
+        let detail_opens: Vec<bool> = details
             .iter()
             .zip(&detail_folds)
-            .map(|(tool, fold)| tool.detail.is_some() && fold.open.unwrap_or(false))
+            .map(|(detail, fold)| detail.is_some() && fold.open.unwrap_or(false))
             .collect();
         let open_height = chips_height(tools.len())
-            + tools
+            + details
                 .iter()
+                .zip(&affordances)
                 .zip(&detail_opens)
                 .filter(|(_, open)| **open)
-                .filter_map(|(tool, _)| tool.detail.as_deref().map(detail_height))
+                .map(|((detail, affordance), _)| {
+                    detail.as_deref().map_or(0.0, detail_height)
+                        + if affordance.is_some() {
+                            BLOB_AFFORDANCE_HEIGHT
+                        } else {
+                            0.0
+                        }
+                })
                 .sum::<f32>();
         let target = if open { open_height } else { 0.0 };
         let summary = tool_group_summary(tools);
@@ -2154,8 +2343,14 @@ impl Transcript {
             .flex_col()
             .gap(px(CHIP_GAP))
             .children(tools.iter().enumerate().map(|(ix, tool)| {
-                let Some(detail) = tool.detail.clone() else {
+                let Some(detail) = details[ix].clone() else {
                     return tool_chip(tool, theme);
+                };
+                let affordance = affordances[ix].clone();
+                let affordance_h = if affordance.is_some() {
+                    BLOB_AFFORDANCE_HEIGHT
+                } else {
+                    0.0
                 };
                 let open = detail_opens[ix];
                 let dfold = detail_folds[ix];
@@ -2172,7 +2367,7 @@ impl Transcript {
                 // (user report: "tool calls cut off at the bottom"). The
                 // explicit height is also what the open/close tween animates.
                 let closed_h = CHIP_CARD_HEIGHT;
-                let open_h = CHIP_CARD_HEIGHT + detail_height(&detail);
+                let open_h = CHIP_CARD_HEIGHT + detail_height(&detail) + affordance_h;
                 let card_target = if open { open_h } else { closed_h };
                 let animating = dfold.epoch > 0
                     && dfold
@@ -2217,6 +2412,32 @@ impl Transcript {
                                 .bg(crate::theme::hairline(0.06)),
                         )
                         .child(detail_body(&detail, theme));
+                    if let Some((blob_ref, label)) = affordance {
+                        let loading = matches!(
+                            self.blob_details.get(&blob_ref),
+                            Some(BlobFetch::Loading(_))
+                        );
+                        let mut row = div()
+                            .id(SharedString::from(format!("{key}-blob")))
+                            .h(px(BLOB_AFFORDANCE_HEIGHT))
+                            .flex_none()
+                            .px(px(12.0))
+                            .flex()
+                            .items_center()
+                            .text_size(px(10.5))
+                            .text_color(theme.text_faint)
+                            .child(label);
+                        if !loading {
+                            row = row
+                                .cursor_pointer()
+                                .hover(|s| s.text_color(theme.text_muted))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.spawn_blob_fetch(blob_ref.clone(), cx);
+                                    cx.notify();
+                                }));
+                        }
+                        card = card.child(row);
+                    }
                 }
                 let card: AnyElement = if animating {
                     let from = dfold.from;
@@ -2518,6 +2739,41 @@ fn detail_body(detail: &ToolDetail, theme: &Theme) -> AnyElement {
                 highlight.clone(),
                 theme,
             ))
+            .into_any_element(),
+        ToolDetail::Stats { stats } => body
+            .py(px(6.0))
+            .font_family(theme.font_mono.clone())
+            .text_size(px(11.5))
+            .children(stats.iter().map(|stat| {
+                div()
+                    .h(px(OUTPUT_LINE_HEIGHT))
+                    .w_full()
+                    .min_w_0()
+                    .px(px(12.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .truncate()
+                            .text_color(theme.text.opacity(0.85))
+                            .child(SharedString::from(stat.path.clone())),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(theme.success)
+                            .child(SharedString::from(format!("+{}", stat.additions))),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(theme.danger)
+                            .child(SharedString::from(format!("−{}", stat.deletions))),
+                    )
+            }))
             .into_any_element(),
         ToolDetail::Output {
             lines,
@@ -2981,6 +3237,10 @@ mod tests {
             resolved: true,
             output: None,
             diff: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
+            diff_stats: None,
         }
     }
 
@@ -3259,7 +3519,7 @@ mod tests {
             old_text: Some(old.join("\n") + "\n"),
             new_text: new.join("\n") + "\n",
         };
-        let Some(ToolDetail::Diff { file, highlight }) = tool_detail(None, Some(&diff)) else {
+        let Some(ToolDetail::Diff { file, highlight }) = tool_detail(None, Some(&diff), None) else {
             panic!("expected diff detail");
         };
         // One hunk: the change plus 3 context lines each side, real numbers.
@@ -3292,7 +3552,7 @@ mod tests {
             old_text: None,
             new_text: "only\n".into(),
         };
-        let Some(ToolDetail::Diff { file, highlight }) = tool_detail(None, Some(&created)) else {
+        let Some(ToolDetail::Diff { file, highlight }) = tool_detail(None, Some(&created), None) else {
             panic!("expected diff detail");
         };
         assert_eq!(file.status, crate::changes::FileStatus::Added);
@@ -3306,7 +3566,7 @@ mod tests {
         let Some(ToolDetail::Output {
             lines,
             truncated_by,
-        }) = tool_detail(Some(&output), None)
+        }) = tool_detail(Some(&output), None, None)
         else {
             panic!("expected output detail");
         };
@@ -3315,8 +3575,8 @@ mod tests {
         assert_eq!(lines[0].as_ref(), "    indented 0");
 
         // Nothing → no affordance.
-        assert!(tool_detail(None, None).is_none());
-        assert!(tool_detail(Some("\n\n"), None).is_none());
+        assert!(tool_detail(None, None, None).is_none());
+        assert!(tool_detail(Some("\n\n"), None, None).is_none());
     }
 
     #[test]
@@ -3326,6 +3586,9 @@ mod tests {
             is_error: false,
             resolved: true,
             detail: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
         };
         let edit = |p: &str| ToolItem {
             call: ToolCall::EditFile {
@@ -3336,6 +3599,9 @@ mod tests {
             is_error: false,
             resolved: true,
             detail: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
         };
         let tools = vec![
             exec("ls"),
@@ -3362,6 +3628,9 @@ mod tests {
                 is_error: false,
                 resolved: true,
                 detail: None,
+                output_ref: None,
+                output_bytes: None,
+                diff_ref: None,
             },
             ToolItem {
                 call: ToolCall::Glob {
@@ -3370,12 +3639,18 @@ mod tests {
                 is_error: false,
                 resolved: true,
                 detail: None,
+                output_ref: None,
+                output_bytes: None,
+                diff_ref: None,
             },
             ToolItem {
                 call: ToolCall::WebSearch { query: "q".into() },
                 is_error: false,
                 resolved: true,
                 detail: None,
+                output_ref: None,
+                output_bytes: None,
+                diff_ref: None,
             },
         ];
         assert_eq!(tool_group_summary(&tools), "Read 1 file · searched 2 times");

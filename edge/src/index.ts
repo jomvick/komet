@@ -30,6 +30,8 @@
  *   PUT  /attachments/:sha256         — content-addressed upload
  *   GET  /attachments/:sha256
  *   HEAD /attachments/:sha256
+ *   PUT  /blob/:chatId/:partId        — tool-output sidecar (chat2-sync A2)
+ *   GET  /blob/:chatId/:partId
  */
 import { authenticate } from "./auth";
 import { handleAuthRoute } from "./auth-routes";
@@ -43,7 +45,11 @@ export { SessionRoom, DeviceRoom, RegistryRoom };
 
 const ID_RE = /^[A-Za-z0-9_-]{1,128}$/;
 const SHA256_RE = /^[a-f0-9]{64}$/;
+/** Tool part ids are harness-minted (`tool-1`, `call_x`, `m1#c1`-style) —
+ * wider than ID_RE but still no slashes, so a part id can't traverse keys. */
+const PART_RE = /^[A-Za-z0-9._:#~-]{1,200}$/;
 const MAX_ATTACHMENT_BYTES = 32 * 1024 * 1024; // mirrors today's upload cap
+const MAX_TOOL_BLOB_BYTES = 1024 * 1024;
 
 const json = (value: unknown, status = 200): Response =>
   new Response(JSON.stringify(value), {
@@ -299,6 +305,40 @@ export default {
       // and replayed on the host's next join.
       if (parts[2] === "nudge" && request.method === "POST") {
         return forward(env.DEVICE_ROOMS, `d2/${deviceId}`, request, auth.userId, "/nudge", "");
+      }
+    }
+
+    // ── R2 tool-output sidecar (docs/chat2-sync.md A2): full tool outputs
+    //    and diffs live here, keyed `{chatId}/{partId}[.diff]`; the doc keeps
+    //    only a one-line summary + this key. Straight R2, no DO involvement —
+    //    the doc stays thin whether or not these uploads land. Per-user
+    //    prefix = owner auth (same trust shape as /attachments). ────────────
+    if (parts[0] === "blob" && parts.length === 3 && ID_RE.test(parts[1]) && PART_RE.test(parts[2])) {
+      const key = `blob/${auth.userId}/${parts[1]}/${parts[2]}`;
+      if (request.method === "PUT") {
+        const body = await request.arrayBuffer();
+        // Outputs are 4KiB-capped at the harness boundary; diffs can run
+        // larger but a sidecar entry is one tool result, never a dump.
+        if (body.byteLength > MAX_TOOL_BLOB_BYTES) return json({ error: "too_large" }, 413);
+        await env.BLOBS.put(key, body, {
+          httpMetadata: {
+            contentType: request.headers.get("content-type") ?? "text/plain; charset=utf-8"
+          }
+        });
+        return json({ ok: true, bytes: body.byteLength });
+      }
+      if (request.method === "GET" || request.method === "HEAD") {
+        const object =
+          request.method === "GET" ? await env.BLOBS.get(key) : await env.BLOBS.head(key);
+        if (!object) return json({ error: "not_found" }, 404);
+        const headers = new Headers();
+        object.writeHttpMetadata(headers);
+        headers.set("etag", object.httpEtag);
+        // Re-resolved tool parts overwrite their key, so short-lived caching only.
+        headers.set("cache-control", "private, max-age=300");
+        const body =
+          request.method === "GET" && "body" in object ? (object as R2ObjectBody).body : null;
+        return new Response(body, { headers });
       }
     }
 

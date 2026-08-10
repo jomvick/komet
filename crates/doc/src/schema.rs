@@ -71,12 +71,25 @@ struct DocPartJson {
     resolved: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     message: Option<String>,
-    /// Capped tool output (additive — absent on old rows and old writers).
+    /// Tool output summary (additive — absent on old rows and old writers;
+    /// pre-strip writers stored up to 4KB of capped output here).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     output: Option<String>,
-    /// Capped inline tool diff (additive).
+    /// Capped inline tool diff (additive; pre-strip writers only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     diff: Option<serde_json::Value>,
+    /// Sidecar key of the full output (additive, docs/chat2-sync.md A1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    output_ref: Option<String>,
+    /// Full-output byte length (additive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    output_bytes: Option<u64>,
+    /// Sidecar key of the full diff JSON (additive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    diff_ref: Option<String>,
+    /// Per-file diff stats (additive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    diff_stats: Option<serde_json::Value>,
 }
 
 /// App parts → doc part json (mirror of `toDocParts`).
@@ -95,6 +108,10 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             resolved,
             output,
             diff,
+            output_ref,
+            output_bytes,
+            diff_ref,
+            diff_stats,
         } => DocPartJson {
             id: id.clone(),
             kind: "tool".into(),
@@ -104,6 +121,10 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             is_error: if *resolved { Some(*is_error) } else { None },
             output: output.clone(),
             diff: diff.as_ref().map(serde_json::to_value).transpose()?,
+            output_ref: output_ref.clone(),
+            output_bytes: *output_bytes,
+            diff_ref: diff_ref.clone(),
+            diff_stats: diff_stats.as_ref().map(serde_json::to_value).transpose()?,
             ..Default::default()
         },
         MessagePart::Input {
@@ -138,6 +159,10 @@ fn from_doc_part(p: DocPartJson) -> MessagePart {
                 resolved: p.is_error.is_some(),
                 output: p.output,
                 diff: p.diff.and_then(|d| serde_json::from_value(d).ok()),
+                output_ref: p.output_ref,
+                output_bytes: p.output_bytes,
+                diff_ref: p.diff_ref,
+                diff_stats: p.diff_stats.and_then(|s| serde_json::from_value(s).ok()),
             },
             None => MessagePart::Text {
                 id: p.id,
@@ -524,6 +549,18 @@ fn push_part(parts: &LoroList, part: &MessagePart) -> Result<(), DocError> {
     if let Some(diff) = &doc_part.diff {
         map.insert("diff", loro_value_from_json(diff))?;
     }
+    if let Some(output_ref) = &doc_part.output_ref {
+        map.insert("outputRef", output_ref.as_str())?;
+    }
+    if let Some(output_bytes) = doc_part.output_bytes {
+        map.insert("outputBytes", output_bytes as i64)?;
+    }
+    if let Some(diff_ref) = &doc_part.diff_ref {
+        map.insert("diffRef", diff_ref.as_str())?;
+    }
+    if let Some(diff_stats) = &doc_part.diff_stats {
+        map.insert("diffStats", loro_value_from_json(diff_stats))?;
+    }
     Ok(())
 }
 
@@ -749,6 +786,18 @@ fn update_part_fields(map: &LoroMap, part: &MessagePart) -> Result<(), DocError>
     if let Some(diff) = &doc_part.diff {
         map.insert("diff", loro_value_from_json(diff))?;
     }
+    if let Some(output_ref) = &doc_part.output_ref {
+        map.insert("outputRef", output_ref.as_str())?;
+    }
+    if let Some(output_bytes) = doc_part.output_bytes {
+        map.insert("outputBytes", output_bytes as i64)?;
+    }
+    if let Some(diff_ref) = &doc_part.diff_ref {
+        map.insert("diffRef", diff_ref.as_str())?;
+    }
+    if let Some(diff_stats) = &doc_part.diff_stats {
+        map.insert("diffStats", loro_value_from_json(diff_stats))?;
+    }
     if let Some(text) = &doc_part.text {
         // Defensive path only — the fold never rewrites earlier text.
         if let Some(loro::ValueOrContainer::Container(loro::Container::Text(t))) = map.get("text") {
@@ -958,10 +1007,11 @@ mod tests {
     }
 
     /// The ToolResult resolution path goes through `update_part_fields` —
-    /// output and diff must survive the doc round trip (regression: they were
-    /// silently dropped there while `to_doc_part` carried them).
+    /// the stripped output summary, sidecar refs, and diff stats must survive
+    /// the doc round trip (regression: output/diff were silently dropped
+    /// there while `to_doc_part` carried them).
     #[test]
-    fn segment_writer_round_trips_tool_output_and_diff() {
+    fn segment_writer_round_trips_stripped_tool_fields() {
         let doc = SessionDoc::init("chat-2").unwrap();
         let mut writer = SegmentWriter::begin(&doc, "a1", "dev-a", 5).unwrap();
 
@@ -981,25 +1031,77 @@ mod tests {
             &AgentEvent::ToolResult {
                 id: "t1".into(),
                 is_error: false,
-                output: Some("total 0".into()),
+                output: Some("total 0\nmore lines".into()),
                 diff: Some(komet_proto::ToolDiff {
                     path: "/w/a.rs".into(),
-                    old_text: Some("old".into()),
-                    new_text: "new".into(),
+                    old_text: Some("old\n".into()),
+                    new_text: "new\n".into(),
                 }),
             },
         );
+        crate::parts::apply_sidecar_refs("chat-2", &mut folded);
         writer.sync(&folded).unwrap();
         writer.finish(&folded, MessageStatus::Complete).unwrap();
 
         let entries = doc.read_entries().unwrap();
         match &entries[0].parts[0] {
+            MessagePart::Tool {
+                output,
+                output_ref,
+                output_bytes,
+                diff,
+                diff_ref,
+                diff_stats,
+                ..
+            } => {
+                assert_eq!(output.as_deref(), Some("total 0…"));
+                assert_eq!(output_ref.as_deref(), Some("chat-2/t1"));
+                assert_eq!(*output_bytes, Some("total 0\nmore lines".len() as u64));
+                assert!(diff.is_none(), "no inline diff text in the doc");
+                assert_eq!(diff_ref.as_deref(), Some("chat-2/t1.diff"));
+                let stats = diff_stats.as_ref().expect("stats survive");
+                assert_eq!(stats[0].path, "/w/a.rs");
+                assert_eq!((stats[0].additions, stats[0].deletions), (1, 1));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    /// Old pre-strip docs carry inline `output`/`diff` — they must still read
+    /// back (schema changes are serde-additive ONLY; old readers, old docs).
+    #[test]
+    fn pre_strip_doc_parts_still_round_trip() {
+        let doc = SessionDoc::init("chat-3").unwrap();
+        doc.push_message(&SessionMessageEntry {
+            id: "m1".into(),
+            role: MessageRole::Assistant,
+            parts: vec![MessagePart::Tool {
+                id: "t1".into(),
+                call: ToolCall::Exec { command: "ls".into() },
+                is_error: false,
+                resolved: true,
+                output: Some("full inline output\nline 2".into()),
+                diff: Some(komet_proto::ToolDiff {
+                    path: "/w/a.rs".into(),
+                    old_text: Some("old".into()),
+                    new_text: "new".into(),
+                }),
+                output_ref: None,
+                output_bytes: None,
+                diff_ref: None,
+                diff_stats: None,
+            }],
+            created_at: 1,
+            device_id: "dev-a".into(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+        })
+        .unwrap();
+        let entries = doc.read_entries().unwrap();
+        match &entries[0].parts[0] {
             MessagePart::Tool { output, diff, .. } => {
-                assert_eq!(output.as_deref(), Some("total 0"));
-                let diff = diff.as_ref().expect("diff survives");
-                assert_eq!(diff.path, "/w/a.rs");
-                assert_eq!(diff.old_text.as_deref(), Some("old"));
-                assert_eq!(diff.new_text, "new");
+                assert_eq!(output.as_deref(), Some("full inline output\nline 2"));
+                assert_eq!(diff.as_ref().unwrap().new_text, "new");
             }
             other => panic!("unexpected {other:?}"),
         }
