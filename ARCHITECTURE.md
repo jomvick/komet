@@ -63,10 +63,12 @@ The resolved profile selects the session snapshots, registry snapshot, run journ
 | Scope | Store and journals | Uploads |
 | --- | --- | --- |
 | `Local` | `{data_dir}/profiles/local/` | `{data_dir}/profiles/local/uploads/` |
-| `Synced` | `{data_dir}/orgs/{org_id}/{user_id}/` | `{data_dir}/uploads/` |
-| `Development` | `{data_dir}/orgs/{org_id}/{user_id}/` | `{data_dir}/uploads/` |
+| `Synced` | `{data_dir}/orgs/{org_id}/{user_id}/` | `{data_dir}/orgs/{org_id}/{user_id}/uploads/` |
+| `Development` | `{data_dir}/orgs/{org_id}/{user_id}/` | `{data_dir}/orgs/{org_id}/{user_id}/uploads/` |
 
-The synced and development roots intentionally preserve the historical cloud layout. Local identity lives in `{data_dir}/local-profile.json`; its UUID is stable across restarts and is not an account or development identity.
+The synced and development store roots preserve the historical cloud layout while their attachment caches are account-scoped. Local identity lives in `{data_dir}/local-profile.json`; its UUID is stable across restarts and is not an account or development identity.
+
+Older releases wrote every synced and development attachment to `{data_dir}/uploads/`, and persisted those absolute paths in transcripts. On upgrade, the first synced or development account that opens this legacy cache claims it in `{data_dir}/legacy-uploads-owner.json`. That account may read the cache as a compatibility fallback, but all new staging and commits use its account-scoped uploads root; other accounts cannot read or write the legacy cache.
 
 Device identity and machine resources remain device-scoped under the common data directory: `device-id`, repository registration, managed worktrees, agent credentials/accounts, and UI settings. They are available across profiles, but they do not contain or expose another profile's transcripts or attachments.
 

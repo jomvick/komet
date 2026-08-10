@@ -2,10 +2,10 @@
 //! (feature-inventory §3.7 "Uploads"; port of komet's `uploads.ts`).
 //!
 //! The UI streams a file as base64 chunks (~60KB, sized for the relay when the
-//! target device is remote); chunks stage on disk under `{data_dir}/uploads/tmp/
+//! target device is remote); chunks stage on disk under `{uploads_root}/tmp/
 //! {uploadId}/{seq}.b64` (surviving an engine restart mid-upload, unlike komet's
 //! in-memory buffers), and `commit` assembles them into
-//! `{data_dir}/uploads/{id8}-{name}` and returns the absolute path, which the
+//! `{uploads_root}/{id8}-{name}` and returns the absolute path, which the
 //! composer appends to the prompt so the agent can read the file from disk.
 //!
 //! On commit the assembled bytes are also mirrored to the edge, best-effort:
@@ -53,10 +53,12 @@ pub struct AttachmentChunk {
 }
 
 struct UploadsInner {
-    /// Durable home for committed attachments (`{data_dir}/uploads`).
+    /// Profile-scoped durable home for new committed attachments.
     dir: PathBuf,
-    /// Chunk staging (`{data_dir}/uploads/tmp/{uploadId}/`).
+    /// Chunk staging (`{uploads_root}/tmp/{uploadId}/`).
     tmp: PathBuf,
+    /// Historical roots accepted for reads only. Writes and staging never use them.
+    read_only_roots: Vec<PathBuf>,
     edge: Option<EdgeConfig>,
     http: reqwest::Client,
 }
@@ -74,10 +76,23 @@ impl Uploads {
 
     /// Use an already-resolved profile uploads directory.
     pub fn from_root(dir: &Path, edge: Option<EdgeConfig>) -> Self {
+        Self::from_root_with_fallback(dir, None, edge)
+    }
+
+    /// Use a profile root for all writes and an optional legacy read-only root.
+    pub fn from_root_with_fallback(
+        dir: &Path,
+        legacy_read_root: Option<&Path>,
+        edge: Option<EdgeConfig>,
+    ) -> Self {
         Self {
             inner: Arc::new(UploadsInner {
                 tmp: dir.join("tmp"),
                 dir: dir.to_path_buf(),
+                read_only_roots: legacy_read_root
+                    .into_iter()
+                    .map(Path::to_path_buf)
+                    .collect(),
                 edge,
                 http: reqwest::Client::builder()
                     .timeout(Duration::from_secs(30))
@@ -234,6 +249,7 @@ impl Uploads {
         // Canonicalize BOTH sides so `..` segments and symlinks can't escape.
         let resolved = std::fs::canonicalize(path).map_err(|_| outside())?;
         let allowed = std::iter::once(&self.inner.dir)
+            .chain(self.inner.read_only_roots.iter())
             .chain(extra_roots.iter())
             .filter_map(|root| std::fs::canonicalize(root).ok())
             .any(|root| resolved.starts_with(&root) && resolved != root);

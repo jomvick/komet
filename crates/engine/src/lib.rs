@@ -17,8 +17,8 @@ use komet_sync::DocsStore;
 
 pub mod agent_accounts;
 pub mod auth;
-pub mod diff_sync;
 pub mod chat2_host;
+pub mod diff_sync;
 pub mod doc_host;
 pub mod instance_lock;
 pub mod profile;
@@ -165,6 +165,7 @@ impl EngineCore {
         // SQLite snapshots + journals. Taken before any store opens or the IPC
         // port binds; held (and kernel-released on crash) for the engine's life.
         let lock = InstanceLock::acquire(data_dir)?;
+        let legacy_uploads_root = profile.claim_legacy_uploads_root()?;
         let device_id = load_or_create_device_id(data_dir)?;
         // This device's harness enablement (Settings → Agents) rides the
         // engine data dir — per-device, like the CLI installs it gates.
@@ -201,7 +202,11 @@ impl EngineCore {
         }
         let repos = Repos::new(data_dir, &device_id);
         let terminals = Terminals::new();
-        let uploads = Uploads::from_root(profile.uploads_root(), edge.clone());
+        let uploads = Uploads::from_root_with_fallback(
+            profile.uploads_root(),
+            legacy_uploads_root.as_deref(),
+            edge.clone(),
+        );
         let agent_accounts = AgentAccounts::new(AgentAccountsConfig::detect(data_dir));
         sessions.set_titles(TitleGenerator::new(
             workspace.clone(),
