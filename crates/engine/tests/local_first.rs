@@ -107,6 +107,33 @@ async fn clean_local_auth_construction_does_not_probe_edge_health() {
 }
 
 #[tokio::test]
+async fn local_runtime_does_not_start_the_edge_updater() {
+    let dir = tempfile::tempdir().unwrap();
+    let (edge_url, requests, edge_task) = rejecting_edge().await;
+    let config = config(dir.path(), edge_url, Some("client_test"), None);
+    let auth = Engine::build_auth(&config).await;
+    let scope = Engine::initial_workspace_scope(&auth);
+    let profile = Engine::resolve_profile(&config, &auth, scope)
+        .unwrap()
+        .expect("local profile is ready");
+
+    let runtime = Engine::assemble_runtime(&config, auth, profile)
+        .await
+        .unwrap();
+
+    assert_eq!(scope, WorkspaceScope::Local);
+    assert!(runtime.core().links().is_none());
+    assert!(
+        runtime.core().updater().is_none(),
+        "local runtime must not start an Edge updater"
+    );
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
+
+    runtime.shutdown().await;
+    edge_task.abort();
+}
+
+#[tokio::test]
 async fn revoked_captured_session_stays_on_its_synced_cache() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(

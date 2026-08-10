@@ -544,18 +544,20 @@ impl Engine {
             edge.clone(),
         )?;
         core.set_auth(auth.clone());
-        // Release checker: polls {edge}/releases on a 6h cadence; headless
-        // installs with KOMET_AUTO_UPDATE=1 apply + restart themselves — gated
-        // on quiescence so a restart never lands under a live run or open PTY.
-        let quiescent: komet_update::QuiescentCheck = {
-            let sessions = core.sessions.clone();
-            let terminals = core.terminals.clone();
-            Arc::new(move || !sessions.any_active() && !terminals.any_open())
-        };
-        core.set_updater(komet_update::Updater::spawn(
-            config.edge_url.clone(),
-            Some(quiescent),
-        ));
+        if online {
+            // Release checker: polls {edge}/releases on a 6h cadence; headless
+            // installs with KOMET_AUTO_UPDATE=1 apply + restart themselves — gated
+            // on quiescence so a restart never lands under a live run or open PTY.
+            let quiescent: komet_update::QuiescentCheck = {
+                let sessions = core.sessions.clone();
+                let terminals = core.terminals.clone();
+                Arc::new(move || !sessions.any_active() && !terminals.any_open())
+            };
+            core.set_updater(komet_update::Updater::spawn(
+                config.edge_url.clone(),
+                Some(quiescent),
+            ));
+        }
         tracing::info!(device_id = %core.device_id, "engine core assembled");
 
         let host_relay = edge.as_ref().map(|edge| {
