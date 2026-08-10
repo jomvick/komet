@@ -470,6 +470,21 @@ impl ChatClient {
         let _ = self.redial.try_send(());
     }
 
+    /// The host posted a checkpoint covering `seq_covered` (C3 policy):
+    /// fold it into the cached server view so the thresholds don't re-trip
+    /// on stale hello-time numbers every quiesce tick (the DO doesn't
+    /// broadcast state after a checkpoint commit).
+    pub fn note_checkpoint(&self, seq_covered: u64, size: u64) {
+        let mut shared = lock(&self.shared);
+        if let Some(server) = &mut shared.server {
+            server.checkpoint_seq = seq_covered;
+            server.checkpoint_size = size;
+            server.seq_floor = seq_covered;
+            server.row_count = 0;
+            server.row_bytes = 0;
+        }
+    }
+
     pub fn stats(&self) -> ChatStatsSnapshot {
         use std::sync::atomic::Ordering::Relaxed;
         let shared = lock(&self.shared);

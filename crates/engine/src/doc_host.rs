@@ -195,6 +195,9 @@ pub struct ChatDocHandle {
     /// Last known snapshot blob size — the eviction budget estimate's input.
     snapshot_bytes: AtomicUsize,
     room: Mutex<Option<RoomClient>>,
+    /// A threshold checkpoint POST is in flight (review H1: the quiesce
+    /// tick must not stack concurrent full-snapshot uploads).
+    checkpointing: Arc<AtomicBool>,
     /// Set when a chat2 seed replaced this handle's lineage on disk: every
     /// further snapshot save from this handle is a stale FAT doc that would
     /// clobber the thin one — retired handles never persist again.
@@ -202,6 +205,11 @@ pub struct ChatDocHandle {
     /// chat2 relay client (docs/chat2-sync.md C3) — populated instead of
     /// `room` when the registry names roomGen 2 for this chat.
     chat2: Mutex<Option<komet_sync::ChatClient>>,
+    /// Local commits made before the relay connects (the dial can take up
+    /// to a minute; offline, forever): buffered here by the subscription
+    /// below and drained into the client on join (review B3 — a user
+    /// message typed during the dial must not silently never sync).
+    chat2_pending_local: Mutex<Vec<Vec<u8>>>,
     /// Local-update feed into the chat2 client (drop = unsubscribe).
     chat2_local_sub: Mutex<Option<loro::Subscription>>,
     /// Doc subscription (drop = unsubscribe) — bumps the change watch on every commit.
@@ -387,9 +395,19 @@ impl DocHost {
     /// Open (or return) the chat's doc handle: load the local snapshot (or init fresh),
     /// start the change-driven task, and join the edge room when configured.
     pub fn open(&self, chat_id: &str) -> Result<Arc<ChatDocHandle>, EngineError> {
-        if let Some(handle) = lock(&self.inner.handles).get(chat_id) {
-            handle.touch();
-            return Ok(handle.clone());
+        {
+            let mut handles = lock(&self.inner.handles);
+            if let Some(handle) = handles.get(chat_id) {
+                if handle.retired.load(Ordering::Relaxed) && !self.pinned(handle) {
+                    // A seed flipped this chat under a cached fat handle
+                    // (review B1): drop it so this open converges onto the
+                    // thin lineage + chat2 room.
+                    handles.remove(chat_id);
+                } else {
+                    handle.touch();
+                    return Ok(handle.clone());
+                }
+            }
         }
         // The registry names the sync room generation (docs/chat2-sync.md
         // M2): absent row / absent field = legacy s2. Read it BEFORE the doc
@@ -397,15 +415,48 @@ impl DocHost {
         let chat_row = self
             .workspace()
             .and_then(|w| w.chat(chat_id).ok().flatten());
-        let room_gen = chat_row.as_ref().and_then(|c| c.room_gen).unwrap_or(1);
+        let registry_gen = chat_row.as_ref().and_then(|c| c.room_gen).unwrap_or(1);
+        // B2/M5 guard: the LOCAL epoch is the second cutover signal. A crash
+        // between the thin save and the registry flip (or a not-yet-synced
+        // registry) must NOT route an epoch-2 doc back onto s2 — the s2
+        // room's fat doc would merge into the unrelated thin lineage and
+        // duplicate every message. Local epoch >= 2 forces the chat2 branch
+        // and best-effort completes the flip.
+        let stored = self.inner.store.load_snapshot_with_cursor(chat_id)?;
+        let stored_epoch = stored.as_ref().map(|(_, _, e)| *e).unwrap_or(0);
+        let room_gen = if stored_epoch >= crate::chat2_host::CHAT2_DOC_EPOCH {
+            if registry_gen < 2
+                && let Some(ws) = self.workspace()
+            {
+                let _ = ws.set_chat_room_gen(chat_id, 2);
+                tracing::info!(chat = %chat_id,
+                    "completed interrupted chat2 flip (local epoch 2, registry said s2)");
+            }
+            2
+        } else {
+            registry_gen
+        };
         let mut snapshot_len = 0usize;
         let mut chat2_cursor = 0u64;
         let mut requeue_commands: Vec<SessionCommandEntry> = Vec::new();
         let doc = if room_gen >= 2 {
-            match self.inner.store.load_snapshot_with_cursor(chat_id)? {
+            match stored {
                 Some((bytes, cursor, epoch)) if epoch >= crate::chat2_host::CHAT2_DOC_EPOCH => {
                     snapshot_len = bytes.len();
                     chat2_cursor = cursor;
+                    let raw = loro::LoroDoc::new();
+                    raw.import(&bytes)
+                        .map_err(|e| EngineError::Other(format!("snapshot import failed: {e}")))?;
+                    SessionDoc::from_doc(raw)
+                }
+                Some((bytes, _cursor, epoch)) if self.inner.config.edge.is_none() => {
+                    // Offline/edge-less: adopting would blank a readable
+                    // transcript with no way to catch up (review B4). Keep
+                    // the old doc read-only-ish; the adopt runs on the next
+                    // online open.
+                    tracing::info!(chat = %chat_id, old_epoch = epoch,
+                        "chat2 adopt deferred (no edge configured)");
+                    snapshot_len = bytes.len();
                     let raw = loro::LoroDoc::new();
                     raw.import(&bytes)
                         .map_err(|e| EngineError::Other(format!("snapshot import failed: {e}")))?;
@@ -420,10 +471,14 @@ impl DocHost {
                     // is the self-repair path: no user action, ever.
                     tracing::info!(chat = %chat_id, old_epoch = epoch,
                         "chat2 adopt: discarding pre-chat2 local doc (rollback copy kept)");
-                    let _ = self
-                        .inner
-                        .store
-                        .save_snapshot(&format!("{chat_id}.pre-chat2"), &bytes);
+                    let rollback_id = format!("{chat_id}.pre-chat2");
+                    // A re-adopt after a mid-catch-up crash reruns this path
+                    // with a near-empty doc under `chat_id` — the FIRST
+                    // rollback copy is the real transcript; never overwrite
+                    // it (review B5).
+                    if matches!(self.inner.store.load_snapshot(&rollback_id), Ok(None)) {
+                        let _ = self.inner.store.save_snapshot(&rollback_id, &bytes);
+                    }
                     if let Ok(raw) = {
                         let old = loro::LoroDoc::new();
                         old.import(&bytes).map(|_| old)
@@ -444,8 +499,8 @@ impl DocHost {
                 None => SessionDoc::init(chat_id)?,
             }
         } else {
-            match self.inner.store.load_snapshot(chat_id)? {
-                Some(bytes) => {
+            match stored {
+                Some((bytes, _, _)) => {
                     snapshot_len = bytes.len();
                     let raw = loro::LoroDoc::new();
                     raw.import(&bytes)
@@ -482,7 +537,9 @@ impl DocHost {
             snapshot_bytes: AtomicUsize::new(snapshot_len),
             room: Mutex::new(None),
             retired: AtomicBool::new(false),
+            checkpointing: Arc::new(AtomicBool::new(false)),
             chat2: Mutex::new(None),
+            chat2_pending_local: Mutex::new(Vec::new()),
             chat2_local_sub: Mutex::new(None),
             _sub: sub,
         });
@@ -506,6 +563,22 @@ impl DocHost {
         // wake redials immediately; eviction/purge ends the loop via `weak`.
         if let Some(edge) = &self.inner.config.edge {
             if room_gen >= 2 {
+                // Subscription BEFORE the dial (review B3): every local
+                // commit lands in the client when connected, else in the
+                // pending buffer the join drains — nothing composed during
+                // (or before) the dial is lost to the room.
+                let weak_push = Arc::downgrade(&handle);
+                let sub = doc.doc().subscribe_local_update(Box::new(move |bytes: &Vec<u8>| {
+                    if let Some(handle) = weak_push.upgrade() {
+                        if let Some(client) = &*lock(&handle.chat2) {
+                            client.enqueue_update(bytes.clone());
+                        } else {
+                            lock(&handle.chat2_pending_local).push(bytes.clone());
+                        }
+                    }
+                    true
+                }));
+                *lock(&handle.chat2_local_sub) = Some(sub);
                 self.spawn_chat2_join(edge.clone(), &handle, chat2_cursor);
             } else {
                 // Host-side lazy migration (M1/M2): seeding runs in the
@@ -516,6 +589,11 @@ impl DocHost {
                     .as_ref()
                     .is_some_and(|c| c.device_id == self.inner.config.device_id);
                 if is_host && chat_row.is_some() {
+                    // Quiescent-only (review B1): a seed under a live run or
+                    // watched transcript would strand everything written
+                    // after the rebuild instant in a retired fat lineage.
+                    // This open is brand new — nothing watches yet; the
+                    // pinned re-check happens again right before the flip.
                     self.spawn_chat2_seed(edge.clone(), chat_id, doc.clone());
                 }
                 self.spawn_s2_join(edge, chat_id, &doc, &handle);
@@ -641,21 +719,17 @@ impl DocHost {
                             return; // evicted mid-dial: drop leaves the room
                         };
                         *lock(&handle.chat2) = Some(client);
-                        // Local commits feed the relay: one opaque update
-                        // per commit tick, replayed-until-acked by the
-                        // client's pending queue.
-                        let weak_push = Arc::downgrade(&handle);
-                        let sub = doc.doc().subscribe_local_update(Box::new(
-                            move |bytes: &Vec<u8>| {
-                                if let Some(handle) = weak_push.upgrade()
-                                    && let Some(client) = &*lock(&handle.chat2)
-                                {
-                                    client.enqueue_update(bytes.clone());
-                                }
-                                true
-                            },
-                        ));
-                        *lock(&handle.chat2_local_sub) = Some(sub);
+                        // Drain dial-era commits (review B3): buffered
+                        // strictly before any direct enqueue can happen
+                        // (the subscription checks `chat2` AFTER this store,
+                        // so drained items are strictly older — no dupes).
+                        let pending: Vec<Vec<u8>> =
+                            std::mem::take(&mut *lock(&handle.chat2_pending_local));
+                        if let Some(client) = &*lock(&handle.chat2) {
+                            for update in pending {
+                                client.enqueue_update(update);
+                            }
+                        }
                         tracing::info!(chat = %chat, "chat2 room joined (converged)");
                         return;
                     }
@@ -748,12 +822,27 @@ impl DocHost {
         if !res.status().is_success() {
             return Err(format!("seed checkpoint HTTP {}", res.status()));
         }
-        // Rollback copy of the fat lineage BEFORE the thin one replaces it.
-        if let Ok(Some(old)) = self.inner.store.load_snapshot(chat_id) {
-            let _ = self
-                .inner
-                .store
-                .save_snapshot(&format!("{chat_id}.pre-chat2"), &old);
+        // PINNED RE-CHECK before anything irreversible (review B1): if a
+        // run/watcher attached during the rebuild+POST, abort — everything
+        // they write would fork away from the thin lineage. The orphan
+        // checkpoint in the chat2 room is harmless (wholly replaced by the
+        // next seed's seqCovered=0 POST); the chat stays on s2 and the next
+        // quiet open retries.
+        {
+            let handles = lock(&self.inner.handles);
+            if let Some(handle) = handles.get(chat_id)
+                && self.pinned(handle)
+            {
+                return Err("chat became active mid-seed; aborted before flip".into());
+            }
+        }
+        // Rollback copy of the fat lineage BEFORE the thin one replaces it —
+        // never overwriting an existing copy (review B5).
+        let rollback_id = format!("{chat_id}.pre-chat2");
+        if matches!(self.inner.store.load_snapshot(&rollback_id), Ok(None))
+            && let Ok(Some(old)) = self.inner.store.load_snapshot(chat_id)
+        {
+            let _ = self.inner.store.save_snapshot(&rollback_id, &old);
         }
         self.inner
             .store
@@ -841,24 +930,39 @@ impl DocHost {
                     .await;
             });
         }
-        // Threshold checkpoint (rowBytes > 512KB || rows > 200).
+        // Threshold checkpoint (rowBytes > 512KB || rows > 200), one in
+        // flight at a time (review H1).
         if stats.row_bytes <= 512 * 1024 && stats.row_count <= 200 {
             return;
         }
+        if handle
+            .checkpointing
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        let in_flight = handle.checkpointing.clone();
         let Ok(snapshot) = handle.doc.export_snapshot() else {
+            in_flight.store(false, Ordering::Release);
             return;
         };
         let frontier = handle.doc.doc().oplog_vv().encode();
         let seq_covered = stats.cursor;
         let http = self.inner.http.clone();
+        let weak_note = Arc::downgrade(handle);
         tokio::spawn(async move {
-            let Some(bearer) = edge.bearer().await else { return };
+            let Some(bearer) = edge.bearer().await else {
+                in_flight.store(false, Ordering::Release);
+                return;
+            };
             let url = format!(
                 "{}/chat2/{}/checkpoint?seqCovered={}",
                 edge.url.trim_end_matches('/'),
                 chat_id,
                 seq_covered
             );
+            let size = snapshot.len() as u64;
             match http
                 .post(&url)
                 .bearer_auth(&bearer)
@@ -872,6 +976,11 @@ impl DocHost {
             {
                 Ok(res) if res.status().is_success() => {
                     tracing::info!(chat = %chat_id, seq_covered, "chat2 threshold checkpoint posted");
+                    if let Some(handle) = weak_note.upgrade()
+                        && let Some(client) = &*lock(&handle.chat2)
+                    {
+                        client.note_checkpoint(seq_covered, size);
+                    }
                 }
                 Ok(res) => {
                     tracing::warn!(chat = %chat_id, status = res.status().as_u16(),
@@ -881,6 +990,7 @@ impl DocHost {
                     tracing::warn!(chat = %chat_id, error = %err, "chat2 checkpoint POST failed");
                 }
             }
+            in_flight.store(false, Ordering::Release);
         });
     }
 
