@@ -162,6 +162,21 @@ case "$promptline" in
   fi
   ;;
 
+*scenario:steer-race*)
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"first"}}'
+  read -r steerline || exit 1
+  sid=$(rid "$steerline")
+  has "$steerline" '"method":"_session/steering"' || exit 1
+  # The exact turn-end race: the injection lands in the turn's tail and the
+  # PROMPT response hits the wire before the steering response does. The
+  # harness must settle the steering call at the boundary — Steered before
+  # Done, never after — instead of stranding the session or re-prompting.
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"steered"}}'
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  sleep 0.2
+  emit "{\"id\":$sid,\"result\":{\"outcome\":\"injected\"}}"
+  ;;
+
 *scenario:steer-queue*)
   update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"first"}}'
   read -r steerline || exit 1

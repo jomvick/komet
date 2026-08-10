@@ -579,6 +579,18 @@ impl AppState {
         })
     }
 
+    /// When the in-flight send (if any, inside the TTL) was fired — the
+    /// elapsed-timer base while the overlay reads as Working. The session
+    /// row's `started_at` still belongs to the PREVIOUS turn during this
+    /// window, and showing it made a fresh send open at the old turn's
+    /// half-hour mark.
+    pub fn pending_send_started(&self, chat_id: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        self.pending_sends
+            .get(chat_id)
+            .filter(|p| now.signed_duration_since(p.started).num_milliseconds() <= PENDING_SEND_TTL_MS)
+            .map(|p| p.started)
+    }
+
     /// The host executed the queued command iff the sent message's id showed
     /// up in the transcript (it writes the message before — causally with —
     /// the Working status; sessions.rs dispatch paths).

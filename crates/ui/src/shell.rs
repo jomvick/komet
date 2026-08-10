@@ -3069,10 +3069,18 @@ impl Shell {
             return strip.into_any_element();
         };
         let indicator = state.indicator_for(&chat_id, now);
-        let elapsed_secs = state
+        // Timer base: the freshest of the session row's turn start and the
+        // in-flight send. During the send→ack window the row (if any) still
+        // carries the PREVIOUS turn's start, and using it opened the timer at
+        // the old turn's elapsed instead of 0:00.
+        let started = state
             .session_for(&chat_id)
             .and_then(|s| s.started_at)
-            .map(|t| now.signed_duration_since(t).num_seconds())
+            .into_iter()
+            .chain(state.pending_send_started(&chat_id, now))
+            .max();
+        let elapsed_secs = started
+            .map(|t| now.signed_duration_since(t).num_seconds().max(0))
             .unwrap_or(0);
         let sending = self.composer.read(cx).is_sending();
 

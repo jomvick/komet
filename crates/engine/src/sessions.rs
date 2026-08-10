@@ -668,10 +668,26 @@ impl Inner {
                     started_at: None,
                     updated_at: now,
                 });
+            // `started_at` is the elapsed-timer base and must only ever mean
+            // "this turn". Entering Working from a settled state always
+            // restamps (a steer into a parked session is a NEW turn — reusing
+            // the old base showed the previous turn's 30min on send), and a
+            // settled session drops its base entirely so no later reader can
+            // resurrect a stale elapsed.
+            let was_active = matches!(
+                entry.status,
+                SessionStatus::Working | SessionStatus::AwaitingInput
+            );
             entry.status = status;
             entry.updated_at = now;
-            if fresh_start {
-                entry.started_at = Some(now);
+            match status {
+                SessionStatus::Working if fresh_start || !was_active => {
+                    entry.started_at = Some(now);
+                }
+                SessionStatus::Working | SessionStatus::AwaitingInput => {}
+                SessionStatus::Idle | SessionStatus::Errored => {
+                    entry.started_at = None;
+                }
             }
             let session = entry.clone();
             let mut list: Vec<Session> = statuses.values().cloned().collect();
@@ -1085,6 +1101,29 @@ async fn drive_run(
         // Any stream activity proves the run is alive — keep the session's
         // freshness inside the UI's 45s staleness window (throttled).
         inner.touch_session(&chat_id);
+        // The engine's input bridge is the sole authority on input requests:
+        // it mints the id and parks the resolver BEFORE emitting the event,
+        // so a legitimate id is always pending here. A harness emitting its
+        // own copy (a different id no resolver knows) would fold an
+        // unanswerable twin chip into the doc — and answering the twin would
+        // never resume the run. Dropped BEFORE the parked gate below: letting
+        // it un-park the session and then dropping it would disarm the idle
+        // reaper with no turn running (a leaked child no reap ever ends).
+        if let AgentEvent::InputRequested { request_id, .. } = &event {
+            let pending = lock(&inner.runs)
+                .get(&chat_id)
+                .map(|h| h.pending_inputs.clone());
+            let known = pending.is_some_and(|p| lock(&p).contains_key(request_id));
+            if !known {
+                tracing::warn!(
+                    chat = %chat_id,
+                    request = %request_id,
+                    "dropping harness-emitted InputRequested (unknown id; \
+                     the engine input bridge owns this lifecycle)"
+                );
+                continue;
+            }
+        }
         // PARKED: only a steer boundary (or an input round-trip / terminal
         // Done) re-opens the session. The ACP child keeps forwarding
         // `session/update` frames after a turn completes — late
@@ -1211,6 +1250,10 @@ async fn drive_run(
             dirty = false;
             entry_id = next_assistant_message_id.clone().unwrap_or_else(new_id);
             segment_started = now_ms();
+            // The elapsed timer is per user message, not per child process: a
+            // steer boundary restarts it (matches the parked-resume path and
+            // the composer's optimistic overlay, which already reads 0:00).
+            inner.set_status(&chat_id, SessionStatus::Working, true);
             continue;
         }
 
@@ -1229,27 +1272,9 @@ async fn drive_run(
             } => {
                 inner.remember_harness_session(&chat_id, session_id, &run_cwd);
             }
-            AgentEvent::InputRequested { request_id, .. } => {
-                // The engine's input bridge is the sole authority on input
-                // requests: it mints the id and parks the resolver BEFORE
-                // emitting the event, so a legitimate id is always pending
-                // here. A harness emitting its own copy (a different id no
-                // resolver knows) would fold an unanswerable twin chip into
-                // the doc — and answering the twin would never resume the
-                // run. Drop such events.
-                let pending = lock(&inner.runs)
-                    .get(&chat_id)
-                    .map(|h| h.pending_inputs.clone());
-                let known = pending.is_some_and(|p| lock(&p).contains_key(request_id));
-                if !known {
-                    tracing::warn!(
-                        chat = %chat_id,
-                        request = %request_id,
-                        "dropping harness-emitted InputRequested (unknown id; \
-                         the engine input bridge owns this lifecycle)"
-                    );
-                    continue;
-                }
+            AgentEvent::InputRequested { .. } => {
+                // Known-id guaranteed: the unknown-id twin was dropped above,
+                // before the parked gate.
                 inner.set_status(&chat_id, SessionStatus::AwaitingInput, false);
             }
             AgentEvent::InputResolved { .. } => {

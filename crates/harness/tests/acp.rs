@@ -366,6 +366,52 @@ async fn steering_extension_injects_mid_turn() {
     assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
 }
 
+/// The steering response racing the turn's own end: the injection landed in
+/// the dying turn, and the prompt response reached the wire first. The
+/// boundary must still be emitted BEFORE the Done — a Steered after Done
+/// re-armed the consumer (parked session → Working) with no next turn and no
+/// Done ever coming (the stranded-Working / eternal-timer bug).
+#[tokio::test]
+async fn steer_racing_the_turn_end_never_emits_steered_after_done() {
+    let (controls, steer, _token) = controls();
+    let harness = harness();
+    let stream = harness
+        .run(request("scenario:steer-race"), controls)
+        .await
+        .expect("run starts");
+    let events = tokio::time::timeout(Duration::from_secs(10), async move {
+        let mut events = Vec::new();
+        let mut stream = stream;
+        while let Some(ev) = stream.next().await {
+            let ev = ev.expect("stream event");
+            if matches!(ev, AgentEvent::TextDelta { ref text } if text == "first") {
+                steer
+                    .send(SteerMessage {
+                        prompt: "redirect please".into(),
+                        message_id: None,
+                    })
+                    .await
+                    .expect("steer sent");
+            }
+            events.push(ev);
+        }
+        events
+    })
+    .await
+    .expect("run finished in time");
+
+    assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)], "{events:?}");
+    let steered = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::Steered { .. }))
+        .expect("steer landed in the turn: a Steered boundary must exist");
+    let done = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::Done { .. }))
+        .expect("checked above");
+    assert!(steered < done, "Steered after Done strands the session: {events:?}");
+}
+
 #[tokio::test]
 async fn rejected_steer_queues_and_delivers_at_the_turn_boundary() {
     let (controls, steer, _token) = controls();
