@@ -2078,11 +2078,7 @@ impl Transcript {
                                 .line_height(px(22.0))
                                 .text_color(theme.text)
                                 .when(pending, |el| el.opacity(0.65))
-                                .child(if mentions.is_empty() {
-                                    text.into_any_element()
-                                } else {
-                                    user_mention_text(text, mentions, &theme)
-                                }),
+                                .child(user_bubble_text(&row.id, text, mentions, &theme)),
                         ),
                     );
                 }
@@ -2679,7 +2675,12 @@ impl Transcript {
 /// gpui's line-layout cache (identical text + runs ⇒ reuse) and the underlay
 /// repaints O(chips) quads — no layout work, no re-projection (spans were
 /// computed once in [`rows_for_entry`]).
-fn user_mention_text(
+/// The user bubble's text: runs split at mention-chip boundaries (one plain
+/// run when there are none), with the same selection machinery as rendered
+/// markdown — the element registers into the frame's document-ordered
+/// registry, so drags select, span into adjacent rows, and Cmd+C copies.
+fn user_bubble_text(
+    row_id: &SharedString,
     text: SharedString,
     mentions: Arc<Vec<crate::composer::SentMentionSpan>>,
     theme: &Theme,
@@ -2718,6 +2719,8 @@ fn user_mention_text(
     let styled = StyledText::new(text.clone()).with_runs(runs);
     let layout = styled.layout().clone();
     let wash = theme.code_wash;
+    let sel_key: std::sync::Arc<str> = format!("{row_id}:u").into();
+    let sel_theme = theme.clone();
     let underlay = canvas(
         |_, _, _| (),
         move |_, _, window, _| {
@@ -2733,6 +2736,7 @@ fn user_mention_text(
                     ));
                 }
             }
+            render::paint_text_selection(window, &sel_key, &text, &layout, &sel_theme);
         },
     )
     .absolute()
