@@ -383,6 +383,18 @@ pub fn anchored_menu_below(
     content: AnyElement,
     closing: Option<std::time::Instant>,
 ) -> AnyElement {
+    anchored_menu_below_gap(id, content, closing, 6.0)
+}
+
+/// [`anchored_menu_below`] with a caller-chosen trigger→card gap — the
+/// changes-header dropdowns hang off a tight titlebar band and need more
+/// breathing room than the default 6px (user report; t3code sits near 10).
+pub fn anchored_menu_below_gap(
+    id: impl Into<SharedString>,
+    content: AnyElement,
+    closing: Option<std::time::Instant>,
+    gap: f32,
+) -> AnyElement {
     let exit = closing.map(exit_progress);
     let content = frosted_menu(exit, content);
     div()
@@ -398,7 +410,7 @@ pub fn anchored_menu_below(
                     .child(menu_motion(
                         id.into(),
                         exit,
-                        div().occlude().pt(px(6.0)).child(content),
+                        div().occlude().pt(px(gap)).child(content),
                     )),
             )
             .priority(1)
