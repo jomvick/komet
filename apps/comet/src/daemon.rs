@@ -226,7 +226,7 @@ fn captured_env() -> Vec<(String, String)> {
 
 fn render_systemd_unit(exe: &Path, env: &[(String, String)]) -> String {
     let mut unit = String::from(
-        "[Unit]\nDescription=Komet native headless engine\nAfter=network-online.target\n\n[Service]\n",
+        "[Unit]\nDescription=Komet native headless engine\nAfter=network-online.target\nStartLimitIntervalSec=60\nStartLimitBurst=5\n\n[Service]\n",
     );
     for (key, value) in env {
         // systemd unquotes the value; escape the characters it treats specially.
@@ -392,6 +392,8 @@ mod tests {
         assert!(unit.contains("Environment=\"KOMET_EDGE_URL=https://edge.example\"\n"));
         // Inner quotes escaped so systemd re-parses the value verbatim.
         assert!(unit.contains("Environment=\"RUST_LOG=info,komet=\\\"debug\\\"\"\n"));
+        assert!(unit.contains("StartLimitIntervalSec=60\n"));
+        assert!(unit.contains("StartLimitBurst=5\n"));
         assert!(unit.contains("Restart=on-failure"));
         assert!(!unit.contains("session.json"));
         assert!(!unit.contains("ConditionPathExists"));
@@ -403,6 +405,8 @@ mod tests {
     fn curl_installer_always_starts_the_local_capable_service() {
         let installer = include_str!("../../../edge/src/install.sh");
         assert!(!installer.contains("session.json"));
+        assert!(installer.contains("StartLimitIntervalSec=60\n"));
+        assert!(installer.contains("StartLimitBurst=5\n"));
         assert!(installer.contains("systemctl --user enable komet-native"));
         assert!(installer.contains("systemctl --user restart komet-native"));
     }
