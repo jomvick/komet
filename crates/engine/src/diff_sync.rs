@@ -323,33 +323,49 @@ fn exceeds_watch_budget(root: &Path) -> bool {
     false
 }
 
+/// Which paths a checkout's entry live-watches.
+///
+/// A recursive `notify` watch installs one OS watch per subdirectory and has
+/// no way to prune subtrees. On a checkout carrying big dependency trees
+/// (node_modules, target/, vendored deps) that is tens of thousands of
+/// watches: the watcher thread pegs a core just maintaining them — even with
+/// the tree completely idle — which starved a real device's whole async
+/// runtime (presence heartbeats and IPC stalled; it showed permanently
+/// offline). So the worktree root is only watched when it fits
+/// [`MAX_WATCH_DIRS`].
+///
+/// An over-budget root still gets its GIT DIR watched (a bounded tree —
+/// objects fanout + refs): commits, index moves, and branch switches then
+/// refresh the diff instantly, and only raw working-tree edits wait for the
+/// repair tick. Without this, a commit right after an edit left the pane
+/// showing the pre-commit diff for up to two minutes (user report — the
+/// dev checkout's target/ alone blows the budget). Linked worktrees keep
+/// their git dir outside the root, so it rides along whenever the root's
+/// watch doesn't already cover it.
+fn watch_targets(identity: &CheckoutIdentity) -> Vec<PathBuf> {
+    let mut targets = Vec::new();
+    let root_fits = !exceeds_watch_budget(&identity.root);
+    if root_fits {
+        targets.push(identity.root.clone());
+    } else {
+        tracing::info!(path = %identity.root.display(),
+            "diff-sync: tree too large to watch live; watching the git dir, edits ride the repair tick");
+    }
+    let git_covered = root_fits && identity.git_dir.starts_with(&identity.root);
+    if !git_covered && !exceeds_watch_budget(&identity.git_dir) {
+        targets.push(identity.git_dir.clone());
+    }
+    targets
+}
+
 fn add_entry(inner: &Arc<DiffSyncInner>, identity: CheckoutIdentity, chats: Vec<Chat>) {
     let (kick_tx, kick_rx) = mpsc::unbounded_channel();
 
-    // Recursive watchers on the worktree root and (for linked worktrees) the git
+    // Recursive watchers on the worktree root (budget permitting) and the git
     // dir — HEAD/index churn and file edits both land here. Failures are fine:
     // the initial + repair sync still keep the snapshot correct.
     let mut watchers = Vec::new();
-    let mut targets: Vec<&PathBuf> = vec![&identity.root];
-    if !identity.git_dir.starts_with(&identity.root) {
-        targets.push(&identity.git_dir);
-    }
-    for target in targets {
-        // A recursive `notify` watch installs one OS watch per subdirectory and
-        // has no way to prune subtrees. On a checkout carrying big dependency
-        // trees (node_modules, vendored deps) that is tens of thousands of
-        // watches: the watcher thread pegs a core just maintaining them — even
-        // with the tree completely idle — which starved a real device's whole
-        // async runtime (presence heartbeats and IPC stalled; it showed
-        // permanently offline). If the tree blows the budget, skip the live
-        // watch entirely; the 2-minute repair tick still keeps the diff
-        // correct, just not instantly. Bounded so the probe itself stays cheap
-        // on a pathological tree.
-        if exceeds_watch_budget(target) {
-            tracing::info!(path = %target.display(),
-                "diff-sync: tree too large to watch live; relying on the repair tick");
-            continue;
-        }
+    for target in watch_targets(&identity) {
         let tx = kick_tx.clone();
         let watcher =
             notify::recommended_watcher(move |event: Result<notify::Event, notify::Error>| {
@@ -360,7 +376,7 @@ fn add_entry(inner: &Arc<DiffSyncInner>, identity: CheckoutIdentity, chats: Vec<
         match watcher {
             Ok(mut watcher) => {
                 use notify::Watcher as _;
-                match watcher.watch(target, notify::RecursiveMode::Recursive) {
+                match watcher.watch(&target, notify::RecursiveMode::Recursive) {
                     Ok(()) => watchers.push(watcher),
                     Err(err) => {
                         tracing::debug!(path = %target.display(), error = %err, "diff-sync: watch failed")
@@ -1059,7 +1075,7 @@ pub async fn capture_turn_diff(
 
 #[cfg(test)]
 mod watch_budget_tests {
-    use super::{MAX_WATCH_DIRS, exceeds_watch_budget};
+    use super::{CheckoutIdentity, MAX_WATCH_DIRS, exceeds_watch_budget, watch_targets};
 
     #[test]
     fn small_tree_is_watchable() {
@@ -1081,6 +1097,56 @@ mod watch_budget_tests {
             std::fs::create_dir(root.join(format!("d{i}"))).unwrap();
         }
         assert!(exceeds_watch_budget(root));
+    }
+
+    fn identity(root: &std::path::Path, git_dir: &std::path::Path) -> CheckoutIdentity {
+        CheckoutIdentity {
+            id: "test".into(),
+            root: root.to_path_buf(),
+            git_dir: git_dir.to_path_buf(),
+        }
+    }
+
+    #[test]
+    fn small_checkout_watches_root_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".git/refs")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        // The root watch covers the inline .git — no second watcher.
+        assert_eq!(
+            watch_targets(&identity(root, &root.join(".git"))),
+            vec![root.to_path_buf()]
+        );
+    }
+
+    #[test]
+    fn linked_worktree_watches_root_and_git_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("wt");
+        let git_dir = tmp.path().join("main/.git/worktrees/wt");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(&git_dir).unwrap();
+        assert_eq!(
+            watch_targets(&identity(&root, &git_dir)),
+            vec![root.clone(), git_dir]
+        );
+    }
+
+    #[test]
+    fn over_budget_root_falls_back_to_the_git_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".git/refs")).unwrap();
+        // Blow the budget with a flat dependency-tree stand-in.
+        for i in 0..(MAX_WATCH_DIRS + 50) {
+            std::fs::create_dir(root.join(format!("d{i}"))).unwrap();
+        }
+        // Commits/index churn must still watch live even though edits can't.
+        assert_eq!(
+            watch_targets(&identity(root, &root.join(".git"))),
+            vec![root.join(".git")]
+        );
     }
 
     #[cfg(unix)]
