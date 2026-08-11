@@ -1498,6 +1498,10 @@ impl DocHost {
             turn_id: Some(m.id.clone()),
             frontier: None,
         });
+        let is_message = matches!(
+            payload,
+            SessionCommandPayload::Run { .. } | SessionCommandPayload::Steer { .. }
+        );
         handle.doc.queue_command(&SessionCommandEntry {
             id: id.clone(),
             payload,
@@ -1508,6 +1512,21 @@ impl DocHost {
             status: SessionCommandStatus::Pending,
             resolution: None,
         })?;
+        // Sending a message revives an archived chat: the user is acting in it
+        // again, so the LWW row flips back to active on every device. Best-
+        // effort — the command itself is durable regardless.
+        if is_message {
+            if let Some(workspace) = self.workspace() {
+                match workspace.chat(chat_id) {
+                    Ok(Some(chat)) if chat.archived => {
+                        if let Err(err) = workspace.set_chat_archived(chat_id, false) {
+                            tracing::warn!(chat = %chat_id, error = %err, "unarchive on send failed");
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
         // §7 durable delivery: when another device hosts this chat, nudge its device
         // room so a cold host opens the doc and drains the queue. Fire-and-forget —
         // the command is durable in the doc either way (a host that opens the chat
