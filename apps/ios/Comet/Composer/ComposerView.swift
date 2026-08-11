@@ -117,6 +117,16 @@ struct ComposerShell<Chips: View>: View {
         .background(whiteAlpha(0.04), in: surfaceShape)
         .glassEffect(.regular.interactive(), in: surfaceShape)
         .overlay(surfaceShape.strokeBorder(whiteAlpha(0.05), lineWidth: 1))
+        // The whole glass surface focuses the editor, not just the TextField's
+        // own text box: the collapsed pill is mostly padding, and a tap that
+        // misses the text box falls through to the transcript underneath —
+        // whose tap-to-blur then RESIGNS the keyboard. That's the "have to
+        // press a few times" miss. Buttons and chips still win their taps.
+        // Masked to .subviews while focused so cursor-placement taps inside
+        // the editor stay fully native.
+        .contentShape(surfaceShape)
+        .gesture(TapGesture().onEnded { focused = true },
+                 including: focused ? .subviews : .all)
     }
 
     private var input: some View {

@@ -134,6 +134,16 @@ struct SessionView: View {
             // The keyboard's own transition bounds the transcript's no-correct
             // window; didShow/didHide land the single measured glide.
             .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in
+                // Re-arm the pin while the numbers are still honest (the
+                // keyboard inset hasn't applied yet): a few points of
+                // scroll-up breaks the pin though the feed still reads as
+                // at-bottom, and the didShow correction only lifts a PINNED
+                // feed — that near-bottom feed was left parked behind the
+                // keyboard. Same 70pt band as the re-engage rule.
+                if !scroll.userScrolling,
+                   scroll.distanceFromBottom <= TranscriptView.stickThreshold {
+                    scroll.pinned = true
+                }
                 scroll.keyboardTransitioning = true
             }
             .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardDidShowNotification)) { _ in

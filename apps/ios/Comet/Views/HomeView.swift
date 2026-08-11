@@ -55,6 +55,11 @@ struct HomeView: View {
                 ToolbarItem(placement: .topBarLeading) {
                     HStack(spacing: 10) {
                         spaceDropdown
+                            // The hidden shared glass still reserves its
+                            // content inset, landing the capsule's edge at
+                            // ~30pt while the list rows' rail starts at 20 —
+                            // pull it back onto the content's left line.
+                            .padding(.leading, -10)
                         // In the bar, not the list: as a list row it appeared
                         // and vanished with the connection and shoved the
                         // content down.
