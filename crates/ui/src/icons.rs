@@ -76,6 +76,9 @@ icon_assets![
     // terminal/plus/close ports) — the set has no return glyph.
     (RETURN, "return"),
     (ALT_ARROW_DOWN, "alt-arrow-down"),
+    // Hand-drawn expand/maximize arrows in the Solar Linear style (like the
+    // terminal/plus/return ports) — the set has no expand glyph.
+    (EXPAND_ARROWS, "expand-arrows"),
     (ALT_ARROW_LEFT, "alt-arrow-left"),
     (ALT_ARROW_RIGHT, "alt-arrow-right"),
     (SMARTPHONE, "smartphone"),

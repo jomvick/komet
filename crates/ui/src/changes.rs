@@ -558,12 +558,6 @@ async fn yield_now() {
     .await
 }
 
-/// Shell-facing events from the pane's toolbar.
-pub enum PaneEvent {
-    /// The expand button: widen/restore the panel (shell owns the width).
-    ToggleExpand,
-}
-
 /// The Changes pane entity. Lazy: no RPC until [`Changes::ensure_watch`] runs
 /// (the shell calls it when the pane first opens).
 pub struct Changes {
@@ -601,8 +595,6 @@ pub struct Changes {
     ref_menu: Popup<()>,
     _observe: Subscription,
 }
-
-impl gpui::EventEmitter<PaneEvent> for Changes {}
 
 impl Changes {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
@@ -1294,8 +1286,10 @@ impl Changes {
             .into_any_element()
     }
 
-    /// A small hover-washed icon button for the toolbar.
-    fn toolbar_button(
+    /// A small hover-washed icon button for the pane header. The header lives
+    /// inside the titlebar drag strip, so the button occludes and swallows the
+    /// mouse-down (same discipline as the shell's `header_icon_button`).
+    fn header_button(
         id: &'static str,
         icon_path: &'static str,
         theme: &Theme,
@@ -1315,6 +1309,10 @@ impl Changes {
                 crate::theme::wash(0.14),
             ))
             .on_hover(motion::hover_listener(id))
+            .occlude()
+            .on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
+                window.prevent_default()
+            })
             .child(
                 crate::icons::icon(icon_path)
                     .size(px(14.0))
@@ -1322,14 +1320,20 @@ impl Changes {
             )
     }
 
-    /// Toolbar: the scope dropdown on the left, fold-all + expand on the
-    /// right (t3code parity).
-    fn render_toolbar(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    /// The pane-header controls: scope dropdown, `{branch} → {base ⌄}` ref
+    /// selector (branch scope), fold-all. Rendered BY THE SHELL inside the
+    /// session titlebar's trailing section (the band above the pane) — the
+    /// titlebar overlay owns that strip's hit-testing, so controls mounted
+    /// under it would never see a click. The expand and close buttons ride
+    /// alongside, shell-owned (they mutate shell state).
+    pub fn render_header_controls(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::of(cx).clone();
         let scope = self.scope;
         let trigger = div()
             .id("changes-scope-trigger")
             .h(px(24.0))
             .px(px(8.0))
+            .flex_none()
             .flex()
             .flex_row()
             .items_center()
@@ -1342,7 +1346,12 @@ impl Changes {
                 crate::theme::wash(0.14),
             ))
             .on_hover(motion::hover_listener("changes-scope-trigger"))
+            .occlude()
+            .on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
+                window.prevent_default()
+            })
             .on_click(cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
                 if this.scope_menu.is_open() {
                     this.close_scope_menu(cx);
                 } else {
@@ -1363,7 +1372,7 @@ impl Changes {
             );
         let trigger = if self.scope_menu.get().is_some() {
             let closing = self.scope_menu.closing_since();
-            let menu = self.render_scope_menu(theme, cx);
+            let menu = self.render_scope_menu(&theme, cx);
             trigger.relative().child(popover::anchored_menu_below(
                 "changes-scope-menu",
                 menu,
@@ -1373,29 +1382,22 @@ impl Changes {
             trigger
         };
 
-        let fold = Self::toolbar_button("changes-fold-all", crate::icons::SORT_VERTICAL, theme)
-            .on_click(cx.listener(|this, _, _, cx| this.toggle_collapse_all(cx)));
-        let expand = Self::toolbar_button(
-            "changes-expand-pane",
-            crate::icons::SIDEBAR_MINIMALISTIC,
-            theme,
-        )
-        .on_click(cx.listener(|_, _, _, cx| cx.emit(PaneEvent::ToggleExpand)));
+        let fold = Self::header_button("changes-fold-all", crate::icons::SORT_VERTICAL, &theme)
+            .on_click(cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.toggle_collapse_all(cx);
+            }));
 
         div()
-            .flex_none()
-            .h(px(40.0))
+            .size_full()
             .flex()
             .flex_row()
             .items_center()
             .gap(px(6.0))
-            .px(px(Theme::SPACE_MD))
-            .border_b_1()
-            .border_color(crate::theme::hairline(0.06))
             .child(trigger)
+            .children(self.render_ref_selector(&theme, cx))
             .child(div().flex_1())
             .child(fold)
-            .child(expand)
             .into_any_element()
     }
 
@@ -1421,8 +1423,12 @@ impl Changes {
     }
 
     /// `{branch} → {base ⌄}` — which ref the branch scope compares against
-    /// (t3code's ref strip). Branch scope only.
-    fn render_ref_strip(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+    /// (t3code's ref strip), inlined into the pane header. Branch scope only.
+    fn render_ref_selector(
+        &mut self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         if self.scope != DiffScope::Branch {
             return None;
         }
@@ -1440,6 +1446,7 @@ impl Changes {
             .id("changes-ref-trigger")
             .h(px(22.0))
             .px(px(6.0))
+            .flex_none()
             .flex()
             .flex_row()
             .items_center()
@@ -1452,7 +1459,12 @@ impl Changes {
                 crate::theme::wash(0.12),
             ))
             .on_hover(motion::hover_listener("changes-ref-trigger"))
+            .occlude()
+            .on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
+                window.prevent_default()
+            })
             .on_click(cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
                 if this.ref_menu.is_open() {
                     this.close_ref_menu(cx);
                 } else {
@@ -1485,15 +1497,11 @@ impl Changes {
         };
         Some(
             div()
-                .flex_none()
-                .h(px(32.0))
+                .min_w_0()
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap(px(8.0))
-                .px(px(Theme::SPACE_MD))
-                .border_b_1()
-                .border_color(crate::theme::hairline(0.06))
+                .gap(px(6.0))
                 .child(
                     div()
                         .min_w_0()
@@ -1940,14 +1948,10 @@ impl Render for Changes {
             }
         };
 
-        let toolbar = self.render_toolbar(&theme, cx);
-        let ref_strip = self.render_ref_strip(&theme, cx);
         div()
             .size_full()
             .flex()
             .flex_col()
-            .child(toolbar)
-            .children(ref_strip)
             .when_some(error, |el, message| {
                 el.child(
                     div()

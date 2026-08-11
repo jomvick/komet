@@ -536,6 +536,13 @@ pub struct Shell {
     debug_gate: Option<GatePhase>,
     sidebar_tween: Option<WidthTween>,
     right_tween: Option<WidthTween>,
+    /// Changes-panel takeover (the header's expand button): the panel fills
+    /// everything right of the sidebar and the conversation column collapses
+    /// to zero. Session-local view state — never persisted, reset on close.
+    right_pane_expanded: bool,
+    /// Viewport width stamped each frame at render — the expanded panel's
+    /// width target ([`Self::right_target`] has no `Window`).
+    viewport_width: f32,
     terminal_tween: Option<WidthTween>,
     /// Last observed `window.is_fullscreen()` (`None` before first paint) —
     /// flips key the traffic-light inset tween.
@@ -708,6 +715,8 @@ impl Shell {
             debug_gate,
             sidebar_tween: None,
             right_tween: None,
+            right_pane_expanded: false,
+            viewport_width: 1280.0,
             terminal_tween: None,
             fullscreen: None,
             titlebar_tween: None,
@@ -943,10 +952,16 @@ impl Shell {
     }
 
     fn right_target(&self, cx: &App) -> f32 {
-        if self.right_pane_open(cx) {
-            self.settings.right_pane_width
-        } else {
+        if !self.right_pane_open(cx) {
             0.0
+        } else if self.right_pane_expanded {
+            // Takeover: everything right of the sidebar; the conversation
+            // column (flex_1) collapses to zero behind it. Rides the sidebar's
+            // width tween so a sidebar toggle mid-takeover stays seamless.
+            let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
+            (self.viewport_width - sidebar_now).max(RIGHT_PANE_MIN)
+        } else {
+            self.settings.right_pane_width
         }
     }
 
@@ -966,6 +981,11 @@ impl Shell {
         let from = self.right_target(cx);
         let key = self.panel_key(cx);
         let open = self.panels.toggle_changes(&key);
+        if !open {
+            // Closing always leaves takeover mode — reopening at full bleed
+            // with the conversation gone read as a broken chat.
+            self.right_pane_expanded = false;
+        }
         self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
         if open {
             // Lazy: the Changes entity (and its WatchCheckoutDiffs) exists only
@@ -981,11 +1001,6 @@ impl Shell {
             return changes.clone();
         }
         let changes = cx.new(|cx| Changes::new(self.state.clone(), cx));
-        // The pane's expand button changes shell-owned width settings.
-        cx.subscribe(&changes, |this, _, event, cx| match event {
-            crate::changes::PaneEvent::ToggleExpand => this.toggle_right_pane_expand(cx),
-        })
-        .detach();
         self.changes = Some(changes.clone());
         changes
     }
@@ -3414,6 +3429,9 @@ impl Shell {
             .pt(px(Theme::TITLEBAR_HEIGHT))
             .child(content);
         let target = self.right_target(cx);
+        // Takeover mode has no drag width — the handle would fight the
+        // viewport-derived target.
+        let handle = (!self.right_pane_expanded).then_some(handle);
         self.pane_container(
             self.right_tween,
             target,
@@ -3421,24 +3439,19 @@ impl Shell {
                 .h_full()
                 .relative()
                 .child(panel)
-                .child(handle)
+                .children(handle)
                 .into_any_element(),
         )
     }
 
-    /// Toggle the changes panel between its saved width and the expanded
-    /// maximum (the Changes toolbar's expand button, t3code parity). Rides the
-    /// same width tween as open/close so the jump glides.
+    /// Toggle the changes-panel takeover (the header's expand button, t3code
+    /// parity): the panel grows to fill everything right of the sidebar,
+    /// hiding the conversation column; toggling back restores the saved
+    /// width. Rides the same width tween as open/close so the jump glides.
     fn toggle_right_pane_expand(&mut self, cx: &mut Context<Self>) {
         let from = self.right_target(cx);
-        let expanded = self.settings.right_pane_width >= RIGHT_PANE_MAX - 1.0;
-        self.settings.right_pane_width = if expanded {
-            RIGHT_PANE_DEFAULT
-        } else {
-            RIGHT_PANE_MAX
-        };
+        self.right_pane_expanded = !self.right_pane_expanded;
         self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
-        self.schedule_save(cx);
         cx.notify();
     }
 
@@ -4169,7 +4182,11 @@ impl Render for Shell {
                 }
                 // MessageRail width gate: hide below 48rem of main-panel width.
                 let viewport = f32::from(window.viewport_size().width);
-                let main_width = viewport - self.sidebar_target() - self.right_target(cx) - 10.0;
+                // Stamped for `right_target` — the expanded changes panel
+                // sizes itself to the viewport.
+                self.viewport_width = viewport;
+                let main_width =
+                    (viewport - self.sidebar_target() - self.right_target(cx) - 10.0).max(0.0);
                 // Clearance excludes the terminal dock: the transcript
                 // viewport ends at the dock's top (see the underlay in
                 // `render_main`), so only the chrome above it overlaps.
