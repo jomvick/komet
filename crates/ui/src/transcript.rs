@@ -1213,6 +1213,8 @@ pub struct Transcript {
     copied_clear: Option<Task<()>>,
     /// Transcript attachment being viewed full-size (click a user thumbnail).
     attachment_preview: Option<crate::attachments::PreviewImage>,
+    /// Focused while the lightbox is open so Escape reaches it.
+    attachment_preview_focus: gpui::FocusHandle,
     /// In-flight ReadAttachmentChunk loads, keyed `(deviceId, path)` — one per
     /// source; results land in the global attachment cache.
     attachment_loads: HashMap<(String, String), Task<()>>,
@@ -1284,6 +1286,7 @@ impl Transcript {
             copied_code: None,
             copied_clear: None,
             attachment_preview: None,
+            attachment_preview_focus: cx.focus_handle(),
             attachment_loads: HashMap::new(),
             attachment_retries: HashMap::new(),
             blob_details: HashMap::new(),
@@ -1905,8 +1908,9 @@ impl Transcript {
                         .border_color(crate::theme::hairline(0.11))
                         .bg(crate::theme::ink(0.035))
                         .cursor_pointer()
-                        .on_click(cx.listener(move |this, _, _, cx| {
+                        .on_click(cx.listener(move |this, _, window, cx| {
                             this.attachment_preview = Some(preview.clone());
+                            window.focus(&this.attachment_preview_focus, cx);
                             cx.notify();
                         }))
                         .child(
@@ -3156,6 +3160,7 @@ impl Render for Transcript {
             return root.child(crate::attachments::lightbox(
                 window.viewport_size(),
                 &preview,
+                &self.attachment_preview_focus,
                 move |_, cx| {
                     weak.update(cx, |this, cx| {
                         this.attachment_preview = None;

@@ -644,14 +644,18 @@ pub struct PreviewImage {
 
 /// The bare lightbox: dim scrim, the image at ≤85vh/90vw, the file name under
 /// it. Any click closes (the whole dialog is the close button, as in the
-/// original's `cursor-zoom-out` figure).
+/// original's `cursor-zoom-out` figure), and so does Escape — `focus` must be
+/// focused by the caller when the preview opens so the key reaches us.
 pub fn lightbox(
     viewport: Size<gpui::Pixels>,
     preview: &PreviewImage,
+    focus: &gpui::FocusHandle,
     on_close: impl Fn(&mut gpui::Window, &mut gpui::App) + 'static,
 ) -> AnyElement {
     let max_h = px(f32::from(viewport.height) * 0.85);
     let max_w = px(f32::from(viewport.width) * 0.9);
+    let on_close = std::rc::Rc::new(on_close);
+    let close_on_key = on_close.clone();
     gpui::deferred(
         gpui::anchored()
             .position(gpui::point(px(0.0), px(0.0)))
@@ -659,6 +663,7 @@ pub fn lightbox(
                 div()
                     .id("attachment-lightbox")
                     .occlude()
+                    .track_focus(focus)
                     .w(viewport.width)
                     .h(viewport.height)
                     .bg(crate::popover::scrim_alpha(0.7))
@@ -668,6 +673,12 @@ pub fn lightbox(
                     .justify_center()
                     .gap(px(12.0))
                     .cursor_pointer()
+                    .on_key_down(move |event: &gpui::KeyDownEvent, window, cx| {
+                        if event.keystroke.key == "escape" {
+                            cx.stop_propagation();
+                            close_on_key(window, cx);
+                        }
+                    })
                     .on_click(move |_, window, cx| on_close(window, cx))
                     .child(
                         img(preview.image.clone())

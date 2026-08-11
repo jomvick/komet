@@ -3233,6 +3233,12 @@ pub struct Composer {
     attachments: HashMap<String, Vec<StagedAttachment>>,
     /// The staged attachment being viewed full-size (click a thumbnail).
     preview: Option<attachments::PreviewImage>,
+    /// Focused while the lightbox is open so Escape reaches it; the input
+    /// gets focus back on close.
+    preview_focus: FocusHandle,
+    /// Focus grab deferred to the next render (open sites don't all have a
+    /// `Window` — the `KOMET_ATTACH_PREVIEW` boot knob opens in `new`).
+    preview_focus_pending: bool,
     /// In-flight file-picker prompt (paperclip).
     picker_task: Option<Task<()>>,
     mention_task: Option<Task<()>>,
@@ -3353,6 +3359,8 @@ impl Composer {
             drafts: HashMap::new(),
             attachments: HashMap::new(),
             preview: None,
+            preview_focus: cx.focus_handle(),
+            preview_focus_pending: false,
             picker_task: None,
             mention_task: None,
             mention: FileMentionState::default(),
@@ -3406,6 +3414,7 @@ impl Composer {
                     name: first.name.clone().into(),
                     image: first.image.clone(),
                 });
+                composer.preview_focus_pending = true;
             }
             if !staged.is_empty() {
                 composer
@@ -3523,6 +3532,7 @@ impl Composer {
                             .cursor_pointer()
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.preview = Some(preview.clone());
+                                this.preview_focus_pending = true;
                                 cx.notify();
                             }))
                             .child(
@@ -3534,7 +3544,10 @@ impl Composer {
                                     .object_fit(ObjectFit::Cover),
                             ),
                     )
-                    .child(
+                    // Own layer: inside the frosted pill everything shares one
+                    // draw order and images render last, so without it the
+                    // thumbnail paints OVER this button (user report).
+                    .child(crate::frost::layered(
                         div()
                             .id(("composer-att-remove", ix))
                             .absolute()
@@ -3551,6 +3564,10 @@ impl Composer {
                             .opacity(0.0)
                             .group_hover(group, |s| s.opacity(1.0))
                             .on_click(cx.listener(move |this, _, _, cx| {
+                                // The button overhangs the thumbnail, whose
+                                // hitbox is right underneath — don't let the
+                                // same click also open the preview.
+                                cx.stop_propagation();
                                 this.remove_attachment(&remove_id, cx);
                             }))
                             .child(
@@ -3558,7 +3575,7 @@ impl Composer {
                                     .size(px(14.0))
                                     .text_color(theme.text_muted),
                             ),
-                    ),
+                    )),
             );
         }
         Some(strip)
@@ -4372,13 +4389,26 @@ impl Composer {
         let message_id = uuid::Uuid::new_v4().to_string();
         let created_at = chrono::Utc::now().timestamp_millis();
 
-        // Image-only sends echo the same body `with_attachments` will use, so
-        // the bubble never renders empty (refs are upserted in post-upload).
-        let echo_text = if text.is_empty() && !staged.is_empty() {
-            attachments::ATTACHMENT_ONLY_TEXT.to_string()
-        } else {
-            text.clone()
-        };
+        // The echo carries synthetic attachment refs from the first frame, so
+        // photos render while the send is still pending instead of waiting for
+        // the upload to finish (real paths replace them in the post-upload
+        // refresh). The refs resolve instantly: the staged bytes are seeded
+        // into the transcript cache under every device key the transcript
+        // consults, and the synthetic paths never persist — the queued command
+        // and the doc entry are built from `with_attachments` on real paths.
+        let echo_paths: Vec<String> = staged
+            .iter()
+            .map(|att| format!("pending/{}/{}", att.id, att.name))
+            .collect();
+        let echo_text = attachments::with_attachments(&text, &echo_paths);
+        for (path, att) in echo_paths.iter().zip(&staged) {
+            attachments::seed_attachment(&device_id, path, &att.name, att.image.clone());
+            if let Some(local) = local_device_id.as_deref()
+                && local != device_id
+            {
+                attachments::seed_attachment(local, path, &att.name, att.image.clone());
+            }
+        }
 
         // Optimistic echo (client-minted id doubles as the persisted message id,
         // so the doc frame dedups it away).
@@ -5506,16 +5536,24 @@ impl Render for Composer {
         };
         // Full-size preview of a staged thumbnail (AttachmentPreviewDialog).
         if let Some(preview) = self.preview.clone() {
+            if std::mem::take(&mut self.preview_focus_pending) {
+                window.focus(&self.preview_focus, cx);
+            }
             let weak = cx.weak_entity();
             return container.child(attachments::lightbox(
                 window.viewport_size(),
                 &preview,
-                move |_, cx| {
-                    weak.update(cx, |this, cx| {
+                &self.preview_focus,
+                move |window, cx| {
+                    // Hand focus back to the input so typing (and the next
+                    // Escape) lands where it did before the lightbox opened.
+                    if let Ok(input_focus) = weak.update(cx, |this, cx| {
                         this.preview = None;
                         cx.notify();
-                    })
-                    .ok();
+                        this.input.read(cx).focus_handle.clone()
+                    }) {
+                        window.focus(&input_focus, cx);
+                    }
                 },
             ));
         }

@@ -861,6 +861,9 @@ impl Shell {
                 section = section.child(
                     div()
                         .id("archived-more")
+                        // Sits outside the rows' gapped column — match the
+                        // list's 2px row gap or it fuses with the last row.
+                        .mt(px(2.0))
                         .h(px(36.0))
                         .flex()
                         .flex_row()
