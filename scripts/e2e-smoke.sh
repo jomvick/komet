@@ -88,7 +88,11 @@ fi
 
 # ── 2. Build the binaries (workspace target is warm in CI/dev) ─────────────────
 echo "build: komet + e2e_driver"
-(cd "$ROOT" && cargo build -q -p komet -p komet-rpc --example e2e_driver)
+# Two invocations: a single one with `--example` builds ONLY the example
+# (the target filter applies across every -p), silently skipping the komet
+# bin — the smoke then dies on "No such file or directory".
+(cd "$ROOT" && cargo build -q -p komet)
+(cd "$ROOT" && cargo build -q -p komet-rpc --example e2e_driver)
 KOMET="$ROOT/target/debug/komet"
 DRIVER="$ROOT/target/debug/examples/e2e_driver"
 

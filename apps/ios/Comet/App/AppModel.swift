@@ -46,6 +46,9 @@ final class AppModel {
     var launchSheet: String?
     /// Screenshot rig: auto-send a canned prompt from the new-session canvas.
     var launchAutosend = false
+    /// Screenshot rig: the session composer takes keyboard focus after ~1.5s,
+    /// to drive the keyboard-up transcript states headless.
+    var launchFocusComposer = false
 
     func restore() {
         if demo != nil { return }
@@ -99,6 +102,13 @@ final class AppModel {
                         demo.sessionStore(for: chatId)
                             .setEntries(BenchRunner.syntheticEntries(turns: 120))
                     }
+                    if args.contains("-huge"), let demo {
+                        // Warm-reopen stress at real-conversation scale — the
+                        // estimated-height error grows with row count, and the
+                        // settle must converge against it.
+                        demo.sessionStore(for: chatId)
+                            .setEntries(BenchRunner.syntheticEntries(turns: 600))
+                    }
                     if args.contains("-stream"), let demo {
                         // Screenshot rig: kick off the scripted streaming reply.
                         let store = demo.sessionStore(for: chatId)
@@ -115,6 +125,36 @@ final class AppModel {
                 launchSheet = args[ix + 1]
             }
             launchAutosend = args.contains("-autosend")
+            launchFocusComposer = args.contains("-focuscomposer")
+            // Rig: open with an EMPTY transcript that lands in bulk 2.5s
+            // later — the live checkpoint-backfill shape (loader → reveal).
+            if args.contains("-hydrate-late"), case .chat(let lateId)? = launchRoute, let demo {
+                let store = demo.sessionStore(for: lateId)
+                let full = store.entries
+                store.setEntries([])
+                Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 2_500_000_000)
+                    store.setEntries(full)
+                }
+            }
+            // Animation rig: "-archive-after chatId:secs" / "-unarchive-after
+            // chatId:secs" fire the same animated mutation the swipe actions
+            // use, so the list hand-off can be recorded headless.
+            func scheduledToggle(_ flag: String, archived: Bool) {
+                guard let ix = args.firstIndex(of: flag), ix + 1 < args.count else { return }
+                let parts = args[ix + 1].split(separator: ":")
+                guard parts.count == 2, let secs = Double(parts[1]) else { return }
+                let chatId = String(parts[0])
+                Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: UInt64(secs * 1_000_000_000))
+                    withAnimation(Motion.resort) {
+                        if archived { self.archive(chatId: chatId) }
+                        else { self.unarchive(chatId: chatId) }
+                    }
+                }
+            }
+            scheduledToggle("-archive-after", archived: true)
+            scheduledToggle("-unarchive-after", archived: false)
             return
         }
         guard let url = URL(string: edgeURLString), !storedUserId.isEmpty, !storedOrgId.isEmpty else {
@@ -267,6 +307,20 @@ final class AppModel {
         return workspace?.deviceOnline(deviceId) ?? false
     }
 
+    /// Live harness catalog from the space's owning device (Settings → Agents
+    /// gates which agents a device offers); static pair when unreachable.
+    func listHarnesses(space: Space) async -> [HarnessInfo] {
+        if demo != nil {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+            return HarnessCatalog.harnesses
+        }
+        if let live = await workspace?.listHarnesses(deviceId: space.deviceId),
+           !live.isEmpty {
+            return live
+        }
+        return HarnessCatalog.harnesses
+    }
+
     /// Live model catalog from the space's owning device (the desktop's
     /// "catalog source = the device that runs the session" rule); static
     /// fallback when the device is unreachable.
@@ -391,14 +445,27 @@ final class AppModel {
         return await workspace?.createSpace(deviceId: deviceId, path: path, gitDetected: gitDetected)
     }
 
-    func archive(chatId: String) {
+    /// Archived chats under the same scope as the list above the shelf.
+    func archivedChats(in spaceId: String? = nil) -> [Chat] {
+        if let demo {
+            return sortActive(demo.chats.filter {
+                $0.archived && (spaceId == nil || $0.spaceId == spaceId)
+            })
+        }
+        return workspace?.archivedChats(in: spaceId) ?? []
+    }
+
+    func archive(chatId: String) { setArchived(chatId: chatId, archived: true) }
+    func unarchive(chatId: String) { setArchived(chatId: chatId, archived: false) }
+
+    private func setArchived(chatId: String, archived: Bool) {
         if let demo {
             if let ix = demo.chats.firstIndex(where: { $0.id == chatId }) {
-                demo.chats[ix].archived = true
+                demo.chats[ix].archived = archived
             }
             return
         }
-        workspace?.setArchived(chatId: chatId, archived: true)
+        workspace?.setArchived(chatId: chatId, archived: archived)
     }
 
     func setChatConfig(chatId: String, config: ChatConfig) {
@@ -427,12 +494,19 @@ final class AppModel {
         sessionStores.values.forEach { $0.flushToDisk() }
     }
 
-    /// Foreground hook: kick every room NOW (see RoomClient.kick) — after a
-    /// suspension the workspace room in particular stayed dead while chat
+    /// Foreground hook: kick every room NOW (see ChatRoomClient.kick) — after
+    /// a suspension the workspace room in particular stayed dead while chat
     /// views reconnected on open, freezing sidebar rows and Working
     /// indicators against perfectly live transcripts (2026-08-04).
     func foregrounded() {
         workspace?.kickRoom()
+        // Deliver any roomGen flips that landed while the store had no open
+        // view, then kick every room.
+        if let workspace {
+            for chat in workspace.chats {
+                sessionStores[chat.id]?.updateRoomGen(chat.roomGen)
+            }
+        }
         sessionStores.values.forEach { $0.kickRoom() }
     }
 
@@ -446,12 +520,17 @@ final class AppModel {
         guard let config else { return nil }
         if let existing = sessionStores[chat.id] {
             existing.hostDeviceId = chat.deviceId
+            // The registry flip to chat2 can land while the store is open —
+            // views re-derive `chat` from the registry on every change, so
+            // this accessor is the flip's delivery path.
+            existing.updateRoomGen(chat.roomGen)
             return existing
         }
         let store = SessionStore(chatId: chat.id, config: config)
         store.hostDeviceId = chat.deviceId
         sessionStores[chat.id] = store
         store.start()
+        store.updateRoomGen(chat.roomGen)
         return store
     }
 

@@ -31,13 +31,16 @@ struct SpaceView: View {
                 .listRowInsets(EdgeInsets(top: 1, leading: 12, bottom: 1, trailing: 12))
                 .swipeActions(edge: .trailing, allowsFullSwipe: true) {
                     Button {
-                        model.archive(chatId: chat.id)
+                        withAnimation(Motion.resort) {
+                            model.archive(chatId: chat.id)
+                        }
                     } label: {
                         Label("Archive", systemImage: "archivebox")
                     }
                     .tint(Theme.surfaceRaised)
                 }
             }
+            ArchivedSection(spaceId: spaceId, path: $path)
         }
         .listStyle(.plain)
         .environment(\.defaultMinListRowHeight, 10)

@@ -5,6 +5,7 @@
 // carries the agent/model chip, and sending mints the chat, queues the first
 // run, and swaps straight into the live session.
 
+import PhotosUI
 import SwiftUI
 
 struct NewSessionView: View {
@@ -19,8 +20,16 @@ struct NewSessionView: View {
 
     @State private var draft = ""
     @State private var showPicker = false
+    @State private var showTraitPicker = false
     @State private var showRefPicker = false
     @State private var showCheckoutPicker = false
+    @State private var attachments: [StagedAttachment] = []
+    @State private var pickerItems: [PhotosPickerItem] = []
+    @State private var showPhotoPicker = false
+    @State private var attachError: String?
+    /// Live harness list from the space's device (Settings → Agents gate);
+    /// static pair until it loads.
+    @State private var liveHarnesses: [HarnessInfo]?
     /// Live per-harness catalogs from the space's device (static fallback).
     @State private var catalogs: [String: [ModelInfo]] = [:]
     @State private var refs: [RepoRef] = []
@@ -28,9 +37,16 @@ struct NewSessionView: View {
     @State private var checkoutKind: CheckoutKind = .local
     @State private var busy = false
     @FocusState private var focused: Bool
+    /// Basis for the leading header's fixed width (SessionView's pattern —
+    /// iOS 26 proposes leading toolbar items almost nothing).
+    @State private var viewWidth: CGFloat = 0
 
     private var space: Space? {
         model.spaces.first { $0.id == spaceId }
+    }
+
+    private var harnesses: [HarnessInfo] {
+        liveHarnesses ?? HarnessCatalog.harnesses
     }
 
     private var models: [ModelInfo] {
@@ -68,15 +84,36 @@ struct NewSessionView: View {
                 offlineNotice(space: space)
             }
 
+            // Where-it-runs scope row (checkout + base ref), left-aligned
+            // above the composer — the composer pill keeps only the agent chip.
+            if space?.gitDetected == true {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        chip(icon: checkoutIcon, label: checkoutLabel) {
+                            focused = false
+                            showCheckoutPicker = true
+                        }
+                        chip(icon: .gitBranch, label: refLabel) {
+                            focused = false
+                            showRefPicker = true
+                        }
+                    }
+                    .padding(.horizontal, 16)
+                }
+                .padding(.bottom, 8)
+            }
+
             composer
                 .padding(.bottom, 8)
         }
         .background(Theme.bg.ignoresSafeArea())
+        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { viewWidth = $0 }
         .navigationTitle("New session")  // feeds the back menu
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar(removing: .title)  // the leading header owns the bar
         .toolbar {
-            ToolbarItem(placement: .principal) {
-                VStack(spacing: 1) {
+            ToolbarItem(placement: .topBarLeading) {
+                VStack(alignment: .leading, spacing: 1) {
                     Text("New session")
                         .font(Theme.sans(13, weight: .medium))
                         .foregroundStyle(Theme.text)
@@ -85,9 +122,15 @@ struct NewSessionView: View {
                             .font(Theme.sans(10.5))
                             .foregroundStyle(Theme.textMuted.opacity(0.6))
                             .lineLimit(1)
+                            .truncationMode(.middle)
                     }
                 }
+                // 170: enough slack that the bar never evicts the item into
+                // the "…" overflow (SessionView.headerChromeInset).
+                .frame(width: max(140, viewWidth - 170), alignment: .leading)
             }
+            // Bare text on the bar, not a glass capsule.
+            .sharedBackgroundVisibility(.hidden)
         }
         .sheet(isPresented: $showRefPicker) {
             RefPickerSheet(refs: refs, selected: selectedRef) { ref in
@@ -110,10 +153,24 @@ struct NewSessionView: View {
                 }
             }
         }
-        .task(id: "\(spaceId)/\(harness)") {
-            // Live model catalog from the device that will run the session.
+        .task(id: spaceId) {
+            // Live harness list + a model catalog per harness, all from the
+            // device that will run the session (the picker shows one sectioned
+            // list across harnesses, so it needs every catalog up front).
             guard let space else { return }
-            catalogs[harness] = await model.listModels(space: space, harness: harness)
+            let list = await model.listHarnesses(space: space)
+            liveHarnesses = list
+            if !list.contains(where: { $0.id == harness }), let first = list.first {
+                harness = first.id
+            }
+            await withTaskGroup(of: (String, [ModelInfo]).self) { group in
+                for h in list {
+                    group.addTask { (h.id, await model.listModels(space: space, harness: h.id)) }
+                }
+                for await (id, catalog) in group {
+                    catalogs[id] = catalog
+                }
+            }
         }
         .sheet(isPresented: $showPicker) {
             ModelPickerSheet(harness: $harness, modelId: Binding(
@@ -122,7 +179,19 @@ struct NewSessionView: View {
             ), reasoning: Binding(
                 get: { reasoning },
                 set: { storedReasoning = $0 ?? "" }
-            ), catalogs: catalogs)
+            ), harnesses: harnesses, catalogs: catalogs)
+        }
+        .sheet(isPresented: $showTraitPicker) {
+            TraitPickerSheet(reasoning: Binding(
+                get: { reasoning },
+                set: { storedReasoning = $0 ?? "" }
+            ), levels: selectedModel.reasoningLevels)
+        }
+        .photosPicker(isPresented: $showPhotoPicker, selection: $pickerItems,
+                      maxSelectionCount: 8, matching: .images)
+        .onChange(of: pickerItems) { _, items in
+            guard !items.isEmpty else { return }
+            stage(items)
         }
         .onAppear {
             focused = true
@@ -140,54 +209,61 @@ struct NewSessionView: View {
     // MARK: Composer
 
     private var composer: some View {
-        ComposerShell(
-            draft: $draft,
-            placeholder: "Do anything…",
-            sendEnabled: space != nil,
-            showStop: false,
-            busy: busy,
-            onSend: send
-        ) {
-            // Agent chip — brand mark + model, opens the picker sheet
-            // (desktop's in-pill HarnessModel trigger chip).
-            Button {
-                focused = false
-                showPicker = true
-            } label: {
-                HStack(spacing: 6) {
-                    HarnessBadge(harness: harness, size: 15)
-                    Text(selectedModel.label)
-                        .font(Theme.sans(13, weight: .medium))
-                        .foregroundStyle(Theme.text.opacity(0.9))
-                        .lineLimit(1)
-                    if let reasoning {
-                        Text(HarnessCatalog.reasoningLabel(reasoning))
-                            .font(Theme.sans(12))
-                            .foregroundStyle(Theme.textMuted)
+        VStack(spacing: 6) {
+            if let attachError {
+                Text(attachError)
+                    .font(Theme.sans(12))
+                    .foregroundStyle(Theme.danger)
+                    .lineLimit(2)
+                    .padding(.horizontal, 24)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            ComposerShell(
+                draft: $draft,
+                placeholder: "Do anything…",
+                sendEnabled: space != nil,
+                showStop: false,
+                busy: busy,
+                alwaysExpanded: true,
+                onSend: send,
+                attachments: attachments,
+                onAttach: { showPhotoPicker = true },
+                onRemoveAttachment: { id in attachments.removeAll { $0.id == id } }
+            ) {
+                // Model + trait chips, split like the desktop's footer pickers
+                // (they ride right of the shell's attach button).
+                ComposerChip(label: selectedModel.label, badgeHarness: harness) {
+                    focused = false
+                    showPicker = true
+                }
+                if let reasoning {
+                    ComposerChip(label: HarnessCatalog.reasoningLabel(reasoning)) {
+                        focused = false
+                        showTraitPicker = true
                     }
-                    Image(systemName: "chevron.up.chevron.down")
-                        .font(.system(size: 9, weight: .medium))
-                        .foregroundStyle(Theme.textFaint)
                 }
-                .padding(.horizontal, 13)
-                .frame(height: 36)
-                .background(whiteAlpha(0.10), in: Capsule())
             }
-            .buttonStyle(ChipPressButtonStyle())
+        }
+    }
 
-            // Checkout + ref chips — the desktop footer (git spaces only).
-            if space?.gitDetected == true {
-                chip(icon: checkoutIcon, label: checkoutLabel) {
-                    focused = false
-                    showCheckoutPicker = true
+    /// Load picked photos into staged attachments (ComposerView.stage's twin —
+    /// the upload happens on send, once the chat and its store exist).
+    private func stage(_ items: [PhotosPickerItem]) {
+        Task { @MainActor in
+            var failed = 0
+            for item in items {
+                guard let data = try? await item.loadTransferable(type: Data.self),
+                      let staged = StagedAttachment.stage(data: data) else {
+                    failed += 1
+                    continue
                 }
-                .layoutPriority(-1)
-                chip(icon: .gitBranch, label: refLabel) {
-                    focused = false
-                    showRefPicker = true
-                }
-                .layoutPriority(-1)
+                attachments.append(staged)
             }
+            pickerItems = []
+            attachError = failed > 0
+                ? (failed == 1 ? "One image couldn't be attached (unsupported or over 24 MB)."
+                               : "\(failed) images couldn't be attached (unsupported or over 24 MB).")
+                : nil
         }
     }
 
@@ -201,8 +277,9 @@ struct NewSessionView: View {
                     .lineLimit(1)
             }
             .padding(.horizontal, 12)
-            .frame(height: 36)
-            .background(whiteAlpha(0.10), in: Capsule())
+            .frame(height: 40)
+            .background(whiteAlpha(0.08), in: Capsule())
+            .overlay(Capsule().strokeBorder(whiteAlpha(0.08), lineWidth: 1))
         }
         .buttonStyle(ChipPressButtonStyle())
     }
@@ -268,6 +345,7 @@ struct NewSessionView: View {
     private var canSend: Bool {
         guard !busy, space != nil else { return false }
         return !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || !attachments.isEmpty
     }
 
     private func offlineNotice(space: Space) -> some View {
@@ -316,9 +394,26 @@ struct NewSessionView: View {
                 busy = false
                 return
             }
-            store.sendRun(prompt: prompt, chat: chat)
+            // Upload staged images now that the chat's store exists; the doc
+            // entry must never point at files that don't (ComposerView.send).
+            var paths: [String] = []
+            for att in attachments {
+                do {
+                    let path = try await store.uploadAttachment(name: att.name, data: att.data)
+                    AttachmentImageCache.shared.seed(deviceId: chat.deviceId, path: path,
+                                                     name: att.name, data: att.data)
+                    paths.append(path)
+                } catch {
+                    attachError = "Attachment upload failed — \(error.localizedDescription)"
+                    busy = false
+                    return
+                }
+            }
+            store.sendRun(prompt: paths.isEmpty ? prompt : withAttachments(text: prompt, paths: paths),
+                          chat: chat, attachments: paths)
             UIImpactFeedbackGenerator(style: .light).impactOccurred()
             draft = ""
+            attachments = []
             busy = false
             // Replace the canvas with the live session (in-place swap, no
             // back-through-canvas).
@@ -330,22 +425,46 @@ struct NewSessionView: View {
     }
 }
 
-// MARK: - Model / effort picker sheet
+// MARK: - Composer chip
 
-/// Detent bottom sheet in the old app's ModelEffortMenu layout: harness tabs
-/// (hidden once a chat exists — harness is locked, like the old app), a
-/// grouped card of models, and the effort ladder in the same select-row style.
-/// Mid-session checkout context: the read-only kind label plus the live ref
-/// list (the desktop keeps its branch selector interactive mid-session).
-struct SessionCheckoutContext {
-    var isWorktree: Bool
-    var cwd: String
-    var refs: [RepoRef]
-    var currentBranch: String?
-    /// Returns git's error to surface inline, or nil on success.
-    var onPick: (RepoRef) async -> String?
+/// The composer's picker trigger chip: optional brand mark, label, chevron —
+/// one per picker, split like the desktop's footer (model | traits).
+struct ComposerChip: View {
+    let label: String
+    var badgeHarness: String?
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                if let badgeHarness {
+                    HarnessBadge(harness: badgeHarness, size: 15)
+                }
+                Text(label)
+                    .font(Theme.sans(13, weight: .medium))
+                    .foregroundStyle(Theme.text.opacity(0.9))
+                    .lineLimit(1)
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(Theme.textFaint)
+            }
+            .padding(.horizontal, 13)
+            .frame(height: 40)
+            .background(whiteAlpha(0.08), in: Capsule())
+            .overlay(Capsule().strokeBorder(whiteAlpha(0.08), lineWidth: 1))
+        }
+        .buttonStyle(ChipPressButtonStyle())
+    }
 }
 
+// MARK: - Model picker sheet
+
+/// Detent bottom sheet in the t3 settings-sheet layout: one scrolling list of
+/// models sectioned per harness (collapsible uppercase provider headers with
+/// the brand mark — picking a model picks its harness), the selected row a
+/// filled high-contrast pill with a trailing checkmark. Effort lives in its
+/// own TraitPickerSheet, split like the desktop's footer pickers. Harness
+/// sections collapse to one once a chat exists — harness is locked mid-chat.
 struct ModelPickerSheet: View {
     @Environment(\.dismiss) private var dismiss
     @Binding var harness: String
@@ -353,71 +472,49 @@ struct ModelPickerSheet: View {
     @Binding var reasoning: String?
     /// True when reconfiguring a live chat: the harness can't change mid-chat.
     var lockedHarness = false
+    /// Harness sections to offer (the device's live list; static fallback).
+    var harnesses: [HarnessInfo] = []
     /// Live per-harness catalogs from the device (static fallback when absent).
     var catalogs: [String: [ModelInfo]] = [:]
-    /// Present on live git chats: checkout label + switchable refs.
-    var checkout: SessionCheckoutContext?
 
     private func models(for harness: String) -> [ModelInfo] {
         catalogs[harness] ?? HarnessCatalog.models(for: harness)
     }
 
-    @State private var switching: String?
-    @State private var switchError: String?
+    private var sections: [HarnessInfo] {
+        if lockedHarness {
+            return [HarnessInfo(id: harness, label: HarnessCatalog.label(for: harness))]
+        }
+        return harnesses.isEmpty ? HarnessCatalog.harnesses : harnesses
+    }
+
+    /// Accordion state: which harness sections show their models. Seeded with
+    /// the current harness — with several agents enabled a flat list of every
+    /// catalog is unmanageable (t3's collapsible provider folds).
+    @State private var openSections: Set<String> = []
 
     var body: some View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 22) {
-                    if !lockedHarness {
-                        HStack(spacing: 8) {
-                            ForEach(HarnessCatalog.harnesses) { h in
-                                harnessTab(h)
-                            }
-                            Spacer(minLength: 0)
-                        }
-                    }
-
-                    VStack(alignment: .leading, spacing: 8) {
+                    VStack(alignment: .leading, spacing: 4) {
                         SheetLabel("Model")
-                        SheetCard {
-                            let models = models(for: harness)
-                            ForEach(Array(models.enumerated()), id: \.element.id) { ix, m in
-                                SheetSelectRow(title: m.label,
-                                               subtitle: m.description,
-                                               selected: m.id == modelId,
-                                               leading: nil) {
-                                    select(model: m)
-                                }
-                                if ix < models.count - 1 {
-                                    SheetSeparator()
-                                }
+                        ForEach(sections) { h in
+                            if sections.count > 1 {
+                                sectionHeader(h)
                             }
-                        }
-                    }
-
-                    if let m = selectedModel, !m.reasoningLevels.isEmpty {
-                        VStack(alignment: .leading, spacing: 8) {
-                            SheetLabel("Effort")
-                            SheetCard {
-                                ForEach(Array(m.reasoningLevels.enumerated()), id: \.element) { ix, level in
-                                    SheetSelectRow(title: HarnessCatalog.reasoningLabel(level),
-                                                   subtitle: Self.effortHint(level),
-                                                   selected: reasoning == level,
-                                                   leading: nil) {
-                                        reasoning = level
-                                    }
-                                    if ix < m.reasoningLevels.count - 1 {
-                                        SheetSeparator()
+                            if sections.count == 1 || openSections.contains(h.id) {
+                                ForEach(models(for: h.id)) { m in
+                                    PickRow(title: m.label,
+                                            subtitle: m.description,
+                                            selected: harness == h.id && m.id == modelId) {
+                                        select(harness: h.id, model: m)
                                     }
                                 }
                             }
                         }
                     }
-
-                    if let checkout {
-                        checkoutSection(checkout)
-                    }
+                    .onAppear { openSections = [harness] }
                 }
                 .padding(20)
                 .padding(.bottom, 12)
@@ -447,30 +544,45 @@ struct ModelPickerSheet: View {
         models(for: harness).first { $0.id == modelId }
     }
 
-    private func harnessTab(_ h: HarnessInfo) -> some View {
-        let selected = harness == h.id
+    /// t3's collapsible ProviderHeader: brand mark + tracked-out uppercase
+    /// provider name, trailing model count + chevron; tapping folds the section.
+    private func sectionHeader(_ h: HarnessInfo) -> some View {
+        let open = openSections.contains(h.id)
         return Button {
-            guard harness != h.id else { return }
             UISelectionFeedbackGenerator().selectionChanged()
-            harness = h.id
-            let fallback = HarnessCatalog.defaultModel(for: h.id)
-            modelId = fallback.id
-            reasoning = HarnessCatalog.defaultReasoning(for: fallback)
+            withAnimation(Motion.collapse) {
+                if open { openSections.remove(h.id) } else { openSections.insert(h.id) }
+            }
         } label: {
             HStack(spacing: 7) {
-                HarnessBadge(harness: h.id, size: 15, dimmed: !selected)
-                Text(h.label)
-                    .font(Theme.sans(13, weight: .medium))
-                    .foregroundStyle(selected ? Theme.text : Theme.textMuted)
+                HarnessBadge(harness: h.id, size: 13)
+                Text(h.label.uppercased())
+                    .font(Theme.sans(10.5, weight: .medium))
+                    .kerning(1.2)
+                    .foregroundStyle(Theme.textMuted.opacity(0.7))
+                Spacer(minLength: 8)
+                if !open {
+                    Text("\(models(for: h.id).count)")
+                        .font(Theme.sans(10.5))
+                        .foregroundStyle(Theme.textFaint)
+                }
+                Image(systemName: open ? "chevron.up" : "chevron.down")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(Theme.textFaint)
             }
-            .padding(.horizontal, 14)
-            .frame(height: 36)
-            .background(selected ? whiteAlpha(0.15) : whiteAlpha(0.05), in: Capsule())
+            .padding(.horizontal, 4)
+            .padding(.top, 12)
+            .padding(.bottom, 6)
+            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
     }
 
-    private func select(model m: ModelInfo) {
+    private func select(harness harnessId: String, model m: ModelInfo) {
+        UISelectionFeedbackGenerator().selectionChanged()
+        if harness != harnessId {
+            harness = harnessId
+        }
         modelId = m.id
         if let current = reasoning, m.reasoningLevels.contains(current) {
             return
@@ -478,117 +590,59 @@ struct ModelPickerSheet: View {
         reasoning = HarnessCatalog.defaultReasoning(for: m)
     }
 
-    /// Checkout: read-only kind (fixed at creation — resume is cwd-scoped)
-    /// plus the LIVE ref list: retarget onto a ref's worktree, or git-checkout
-    /// in the session's own folder.
-    @ViewBuilder
-    private func checkoutSection(_ checkout: SessionCheckoutContext) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            SheetLabel("Checkout")
-            SheetCard {
-                HStack(spacing: 12) {
-                    LineIconView(checkout.isWorktree ? .folderWithFiles : .folder,
-                                 size: 16, color: Theme.textMuted)
-                        .frame(width: 22)
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(checkout.isWorktree ? "Worktree" : "Local checkout")
-                            .font(Theme.sans(15))
-                            .foregroundStyle(Theme.text)
-                        Text(checkout.cwd)
-                            .font(Theme.mono(11.5))
-                            .foregroundStyle(Theme.textMuted)
-                            .lineLimit(1)
-                            .truncationMode(.head)
-                    }
-                    Spacer(minLength: 0)
-                }
-                .padding(.horizontal, 16)
-                .padding(.vertical, 11)
-            }
-        }
+}
 
-        VStack(alignment: .leading, spacing: 8) {
-            SheetLabel("Ref")
-            if checkout.refs.isEmpty {
-                Text("Loading refs from the device…")
-                    .font(Theme.sans(13))
-                    .foregroundStyle(Theme.textFaint)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 20)
-            } else {
-                SheetCard {
-                    ForEach(Array(checkout.refs.enumerated()), id: \.element.name) { ix, ref in
-                        refRow(ref, checkout: checkout)
-                        if ix < checkout.refs.count - 1 {
-                            SheetSeparator()
+// MARK: - Trait (effort) picker sheet
+
+/// The effort ladder in its own detent sheet — the composer's second picker
+/// chip, split from the model list like the desktop's Traits dropdown.
+struct TraitPickerSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    @Binding var reasoning: String?
+    let levels: [String]
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 4) {
+                    SheetLabel("Effort")
+                    ForEach(levels, id: \.self) { level in
+                        PickRow(title: HarnessCatalog.reasoningLabel(level),
+                                subtitle: Self.effortHint(level),
+                                selected: reasoning == level) {
+                            UISelectionFeedbackGenerator().selectionChanged()
+                            reasoning = level
                         }
                     }
                 }
+                .padding(20)
+                .padding(.bottom, 12)
             }
-            if let switchError {
-                Text(switchError)
-                    .font(Theme.sans(12.5))
-                    .foregroundStyle(Theme.danger)
-                    .padding(.horizontal, 4)
-            }
-        }
-    }
-
-    private func refRow(_ ref: RepoRef, checkout: SessionCheckoutContext) -> some View {
-        let selected = ref.name == checkout.currentBranch
-        return Button {
-            guard switching == nil, !selected else { return }
-            UISelectionFeedbackGenerator().selectionChanged()
-            switchError = nil
-            switching = ref.name
-            Task { @MainActor in
-                let result = await checkout.onPick(ref)
-                switching = nil
-                switchError = result
-            }
-        } label: {
-            HStack(spacing: 12) {
-                LineIconView(.gitBranch, size: 15, color: Theme.textMuted)
-                    .frame(width: 20)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(ref.name)
-                        .font(Theme.sans(15))
-                        .foregroundStyle(Theme.text)
-                    if let subtitle = refSubtitle(ref, checkout: checkout) {
-                        Text(subtitle)
-                            .font(Theme.sans(12.5))
-                            .foregroundStyle(Theme.textMuted)
+            .background(SheetStyle.panel)
+            .navigationTitle("Traits")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button {
+                        dismiss()
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 13, weight: .semibold))
                     }
-                }
-                Spacer(minLength: 8)
-                if switching == ref.name {
-                    ProgressView()
-                        .controlSize(.small)
-                        .tint(Theme.textMuted)
-                } else {
-                    Image(systemName: "checkmark")
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(Theme.text)
-                        .opacity(selected ? 1 : 0)
+                    .accessibilityLabel("Close")
                 }
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 11)
-            .contentShape(Rectangle())
         }
-        .buttonStyle(SheetRowButtonStyle())
-    }
-
-    private func refSubtitle(_ ref: RepoRef, checkout: SessionCheckoutContext) -> String? {
-        if ref.worktreePath == checkout.cwd { return "This session's worktree" }
-        if let worktree = ref.worktreePath, worktree != checkout.cwd { return "Switches to its worktree" }
-        if ref.current { return "Main checkout" }
-        return nil
+        .presentationDetents([.medium, .large])
+        .presentationDragIndicator(.visible)
+        .presentationCornerRadius(32)
+        .preferredColorScheme(.dark)
     }
 
     /// One-line hints for the ladder (the special modes deserve explanation).
     static func effortHint(_ level: String) -> String? {
         switch level {
+        case "minimal": return "Quickest, lightest touch"
         case "low": return "Fastest responses"
         case "medium": return "Balanced speed and depth"
         case "high": return "Thorough reasoning"
@@ -599,6 +653,62 @@ struct ModelPickerSheet: View {
         case "ultrathink": return "Deep-thinking prompt mode"
         default: return nil
         }
+    }
+}
+
+// MARK: - Shared picker row
+
+/// t3's ModelRow — the ONE row style every picker sheet uses (model, trait,
+/// ref, checkout): the selected row is a filled high-contrast pill with a
+/// trailing checkmark; unselected rows sit almost flat on the sheet. Optional
+/// leading line icon and a busy spinner for rows whose pick runs async (git
+/// checkouts).
+struct PickRow: View {
+    let title: String
+    var subtitle: String?
+    var icon: LineIcon?
+    var busy = false
+    let selected: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 10) {
+                if let icon {
+                    LineIconView(icon, size: 15,
+                                 color: selected ? Theme.bg : Theme.textMuted)
+                        .frame(width: 20)
+                }
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .font(Theme.sans(15, weight: .medium))
+                        .foregroundStyle(selected ? Theme.bg : Theme.text)
+                    if let subtitle {
+                        Text(subtitle)
+                            .font(Theme.sans(12))
+                            .foregroundStyle(selected ? Theme.bg.opacity(0.65) : Theme.textMuted)
+                    }
+                }
+                Spacer(minLength: 8)
+                if busy {
+                    ProgressView()
+                        .controlSize(.small)
+                        .tint(selected ? Theme.bg : Theme.textMuted)
+                } else {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 13, weight: .semibold))
+                        .foregroundStyle(Theme.bg)
+                        .opacity(selected ? 1 : 0)
+                }
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 11)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(selected ? AnyShapeStyle(Theme.text) : AnyShapeStyle(whiteAlpha(0.03)),
+                        in: RoundedRectangle(cornerRadius: 12))
+            .contentShape(RoundedRectangle(cornerRadius: 12))
+        }
+        .buttonStyle(SheetRowButtonStyle())
     }
 }
 
@@ -621,7 +731,7 @@ struct RefPickerSheet: View {
     var body: some View {
         NavigationStack {
             ScrollView {
-                VStack(alignment: .leading, spacing: 8) {
+                VStack(alignment: .leading, spacing: 4) {
                     SheetLabel("Ref")
                     if refs.isEmpty {
                         Text("Loading refs from the device…")
@@ -630,13 +740,8 @@ struct RefPickerSheet: View {
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 28)
                     } else {
-                        SheetCard {
-                            ForEach(Array(refs.enumerated()), id: \.element.name) { ix, ref in
-                                row(ref)
-                                if ix < refs.count - 1 {
-                                    SheetSeparator()
-                                }
-                            }
+                        ForEach(refs, id: \.name) { ref in
+                            row(ref)
                         }
                     }
                     if let error {
@@ -644,6 +749,7 @@ struct RefPickerSheet: View {
                             .font(Theme.sans(12.5))
                             .foregroundStyle(Theme.danger)
                             .padding(.horizontal, 4)
+                            .padding(.top, 4)
                     }
                 }
                 .padding(20)
@@ -670,7 +776,10 @@ struct RefPickerSheet: View {
     }
 
     private func row(_ ref: RepoRef) -> some View {
-        Button {
+        PickRow(title: ref.name,
+                subtitle: subtitle(for: ref),
+                busy: switching == ref.name,
+                selected: ref.name == selected) {
             guard switching == nil else { return }
             UISelectionFeedbackGenerator().selectionChanged()
             error = nil
@@ -684,37 +793,7 @@ struct RefPickerSheet: View {
                     dismiss()
                 }
             }
-        } label: {
-            HStack(spacing: 12) {
-                LineIconView(.gitBranch, size: 15, color: Theme.textMuted)
-                    .frame(width: 20)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(ref.name)
-                        .font(Theme.sans(15))
-                        .foregroundStyle(Theme.text)
-                    if let subtitle = subtitle(for: ref) {
-                        Text(subtitle)
-                            .font(Theme.sans(12.5))
-                            .foregroundStyle(Theme.textMuted)
-                    }
-                }
-                Spacer(minLength: 8)
-                if switching == ref.name {
-                    ProgressView()
-                        .controlSize(.small)
-                        .tint(Theme.textMuted)
-                } else {
-                    Image(systemName: "checkmark")
-                        .font(.system(size: 14, weight: .semibold))
-                        .foregroundStyle(Theme.text)
-                        .opacity(ref.name == selected ? 1 : 0)
-                }
-            }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 11)
-            .contentShape(Rectangle())
         }
-        .buttonStyle(SheetRowButtonStyle())
     }
 
     private func subtitle(for ref: RepoRef) -> String? {
@@ -738,19 +817,15 @@ struct CheckoutPickerSheet: View {
     var body: some View {
         NavigationStack {
             ScrollView {
-                VStack(alignment: .leading, spacing: 8) {
+                VStack(alignment: .leading, spacing: 4) {
                     SheetLabel("Checkout")
-                    SheetCard {
-                        row(.local,
-                            icon: selectedRefHasWorktree ? .folderWithFiles : .folder,
-                            title: selectedRefHasWorktree ? "Current worktree" : "Current checkout",
-                            subtitle: selectedRefHasWorktree
-                                ? "Reuse the picked ref's existing worktree"
-                                : "Run in the space's folder as-is")
-                        SheetSeparator()
-                        row(.newWorktree, icon: .folderWithFiles, title: "New worktree",
-                            subtitle: "A fresh isolated worktree created off the picked base ref")
-                    }
+                    row(.local,
+                        title: selectedRefHasWorktree ? "Current worktree" : "Current checkout",
+                        subtitle: selectedRefHasWorktree
+                            ? "Reuse the picked ref's existing worktree"
+                            : "Run in the space's folder as-is")
+                    row(.newWorktree, title: "New worktree",
+                        subtitle: "A fresh isolated worktree created off the picked base ref")
                 }
                 .padding(20)
             }
@@ -775,33 +850,11 @@ struct CheckoutPickerSheet: View {
         .preferredColorScheme(.dark)
     }
 
-    private func row(_ rowKind: CheckoutKind, icon: LineIcon, title: String, subtitle: String) -> some View {
-        Button {
+    private func row(_ rowKind: CheckoutKind, title: String, subtitle: String) -> some View {
+        PickRow(title: title, subtitle: subtitle, selected: rowKind == kind) {
             UISelectionFeedbackGenerator().selectionChanged()
             onPick(rowKind)
             dismiss()
-        } label: {
-            HStack(spacing: 12) {
-                LineIconView(icon, size: 16, color: Theme.textMuted)
-                    .frame(width: 22)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(title)
-                        .font(Theme.sans(15))
-                        .foregroundStyle(Theme.text)
-                    Text(subtitle)
-                        .font(Theme.sans(12.5))
-                        .foregroundStyle(Theme.textMuted)
-                }
-                Spacer(minLength: 8)
-                Image(systemName: "checkmark")
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundStyle(Theme.text)
-                    .opacity(rowKind == kind ? 1 : 0)
-            }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 11)
-            .contentShape(Rectangle())
         }
-        .buttonStyle(SheetRowButtonStyle())
     }
 }

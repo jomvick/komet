@@ -181,6 +181,7 @@ final class WorkspaceStore {
                 chatConfig = ChatConfig(harness: c["harness"]?.stringValue ?? "claude-code",
                                         model: c["model"]?.stringValue,
                                         reasoning: c["reasoning"]?.stringValue,
+                                        modelOptions: c["modelOptions"]?.objectValue ?? [:],
                                         sandbox: c["sandbox"]?.stringValue)
             }
             return Chat(id: f["id"]?.stringValue ?? row.id, deviceId: deviceId,
@@ -194,7 +195,8 @@ final class WorkspaceStore {
                         lastMessageAt: f["lastMessageAt"]?.int64Value,
                         createdAt: f["createdAt"]?.int64Value ?? 0,
                         spaceId: f["spaceId"]?.stringValue,
-                        lastSeenAt: f["lastSeenAt"]?.int64Value)
+                        lastSeenAt: f["lastSeenAt"]?.int64Value,
+                        roomGen: f["roomGen"]?.int64Value.map(Int.init))
         }
 
         var rows: [String: SessionRow] = [:]
@@ -229,6 +231,14 @@ final class WorkspaceStore {
     /// Sessions section — so it follows that list's ordering instead.
     func chats(in spaceId: String) -> [Chat] {
         sortActive(chats.filter { !$0.archived && $0.spaceId == spaceId })
+    }
+
+    /// Archived chats under an optional space scope, recency order — feeds the
+    /// Archived shelf (shell/spaces.rs `render_archived_section`). Unlike
+    /// `overviewChats`, a live space is not required: an archived session of a
+    /// deleted space should still be reachable for unarchive.
+    func archivedChats(in spaceId: String? = nil) -> [Chat] {
+        sortActive(chats.filter { $0.archived && (spaceId == nil || $0.spaceId == spaceId) })
     }
 
     func indicator(for chat: Chat) -> ChatIndicator {
@@ -280,6 +290,29 @@ final class WorkspaceStore {
 
     /// ListModels — the target device's live harness catalog (the desktop
     /// discovers models from the CLI itself; static lists are only fallback).
+    /// The device's harness catalog (`ListHarnesses` → `[HarnessDescriptor]`),
+    /// filtered to what the composer may offer: installed AND enabled (the
+    /// Settings → Agents gate; absent `enabled` falls back to the engine's
+    /// `default_enabled()` pair, matching `descriptor_enabled`).
+    func listHarnesses(deviceId: String) async -> [HarnessInfo]? {
+        struct WireHarness: Decodable {
+            var id: String
+            var name: String
+            var installed: Bool?
+            var enabled: Bool?
+        }
+        let wire: [WireHarness]? = try? await relay(for: deviceId)
+            .call(method: "ListHarnesses", params: [:])
+        return wire.map { list in
+            list.filter { h in
+                h.id != "mock"
+                    && (h.installed ?? true)
+                    && (h.enabled ?? ["claude-code", "codex"].contains(h.id))
+            }
+            .map { HarnessInfo(id: $0.id, label: $0.name) }
+        }
+    }
+
     func listModels(deviceId: String, harness: String) async -> [ModelInfo]? {
         struct WireModel: Decodable {
             var id: String
@@ -341,6 +374,9 @@ final class WorkspaceStore {
             "cwd": .string(cwd ?? space.path),
             "spaceId": .string(space.id),
             "createdAt": .int(nowMs()),
+            // Born on chat2 (workspace_host.rs create_chat): a brand-new
+            // chat has an empty doc — nothing to seed, no migration race.
+            "roomGen": .int(2),
         ]
         if let branch {
             set["branch"] = .string(branch)

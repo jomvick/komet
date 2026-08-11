@@ -139,7 +139,7 @@ async fn local_and_synced_profiles_remain_isolated_across_restarts() {
             )
             .expect("create local space");
         core.workspace
-            .create_chat("local-chat", "local-space", None, None)
+            .create_chat("local-chat", Some("local-space"), None, None, None)
             .expect("create local chat");
         core.workspace
             .rename_chat("local-chat", "Private local session")
@@ -192,7 +192,7 @@ async fn local_and_synced_profiles_remain_isolated_across_restarts() {
             )
             .expect("create synced space");
         core.workspace
-            .create_chat("synced-chat", "synced-space", None, None)
+            .create_chat("synced-chat", Some("synced-space"), None, None, None)
             .expect("create synced chat");
         shutdown(core).await;
     }
@@ -336,7 +336,7 @@ async fn existing_session_opens_the_historical_cloud_layout_in_place() {
             )
             .expect("create historical space");
         core.workspace
-            .create_chat("legacy-chat", "legacy-space", None, None)
+            .create_chat("legacy-chat", Some("legacy-space"), None, None, None)
             .expect("create historical chat");
         shutdown(core).await;
     }
@@ -555,7 +555,13 @@ async fn signing_in_does_not_activate_sync_for_the_running_local_profile() {
     runtime
         .core()
         .workspace
-        .create_chat("still-local-chat", "still-local-space", None, None)
+        .create_chat(
+            "still-local-chat",
+            Some("still-local-space"),
+            None,
+            None,
+            None,
+        )
         .expect("create chat after sign in");
     runtime
         .core()

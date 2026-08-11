@@ -528,12 +528,27 @@ pub struct AppState {
     /// Sorted (see [`sort_chats`]); includes archived rows — views filter.
     pub chats: Vec<Chat>,
     pub sessions: Vec<Session>,
-    /// The space whose tabs fill the main area. Healed by [`Self::apply_spaces`]
-    /// when the row vanishes; selecting a chat implies its space.
+    /// The project the new-session canvas mints into. Healed by
+    /// [`Self::apply_spaces`] when the row vanishes; selecting a chat implies
+    /// its project.
     pub selected_space: Option<String>,
+    /// Deliberate "Don't work in a project" pick: while set, the canvas mints
+    /// project-less sessions (cwd `~` on the picked device) and
+    /// [`Self::selected_space_row`] reads as `None` — healing must NOT
+    /// re-select a project underneath it.
+    pub no_project: bool,
+    /// The composer's device pick — where project-less sessions run, and the
+    /// device whose projects the project picker lists. `None` falls back to
+    /// the local device.
+    pub selected_device: Option<String>,
     pub selected_chat: Option<String>,
     /// Boot auto-select happened (or a manual selection superseded it).
     pub auto_selected: bool,
+    /// First chats / spaces watch frame has landed — device-local state that
+    /// prunes against the doc (open tabs, the sidebar space filter) must not
+    /// judge by the empty pre-sync lists.
+    pub chats_synced: bool,
+    pub spaces_synced: bool,
     /// Joined transcript of the selected chat (continuations folded engine-side).
     pub transcript: Vec<SessionMessageEntry>,
     /// Optimistic user echoes per chat id, shown until the doc frame carrying
@@ -572,6 +587,8 @@ impl AppState {
             chats: Vec::new(),
             sessions: Vec::new(),
             selected_space: None,
+            no_project: false,
+            selected_device: None,
             selected_chat: None,
             transcript: Vec::new(),
             echoes: HashMap::new(),
@@ -583,6 +600,8 @@ impl AppState {
             watch_tasks: Vec::new(),
             transcript_task: None,
             auto_selected: false,
+            chats_synced: false,
+            spaces_synced: false,
         }
     }
 
@@ -591,6 +610,7 @@ impl AppState {
     pub fn apply_chats(&mut self, mut chats: Vec<Chat>) {
         sort_chats(&mut chats);
         self.chats = chats;
+        self.chats_synced = true;
         if let Some(selected) = &self.selected_chat
             && !self.chats.iter().any(|c| &c.id == selected)
         {
@@ -608,18 +628,23 @@ impl AppState {
     pub fn apply_spaces(&mut self, mut spaces: Vec<Space>) {
         sort_spaces(&mut spaces);
         self.spaces = spaces;
-        // Heal a vanished selection (space deleted elsewhere): fall back to the
-        // first space; its chats died with it, so a matching chat selection is
-        // healed by the accompanying chats frame (`apply_chats`).
+        self.spaces_synced = true;
+        // Heal a vanished selection (project deleted elsewhere): fall back to
+        // the first project; its chats died with it, so a matching chat
+        // selection is healed by the accompanying chats frame (`apply_chats`).
+        // The picker lists projects per-device, so healing prefers one on the
+        // picked device — a global fallback would silently re-aim the canvas
+        // at another machine.
         if let Some(selected) = &self.selected_space
             && !self.spaces.iter().any(|s| &s.id == selected)
         {
-            self.selected_space = self.spaces.first().map(|s| s.id.clone());
+            self.selected_space = self.first_space_on_picked_device();
         }
-        // First frame with no selection yet: pick the first space so the shell
-        // never renders an empty main area while spaces exist.
-        if self.selected_space.is_none() {
-            self.selected_space = self.spaces.first().map(|s| s.id.clone());
+        // First frame with no selection yet: pick the first project so the
+        // canvas never boots project-less by accident — unless the user
+        // deliberately opted out.
+        if self.selected_space.is_none() && !self.no_project {
+            self.selected_space = self.first_space_on_picked_device();
         }
     }
 
@@ -634,6 +659,21 @@ impl AppState {
 
     pub fn apply_devices(&mut self, devices: Vec<Device>) {
         self.devices = devices;
+    }
+
+    /// First project on the composer's picked device (falling back through
+    /// the local device, then any project at all — better a cross-device
+    /// project than a surprise project-less canvas). Display order.
+    fn first_space_on_picked_device(&self) -> Option<String> {
+        let device = self
+            .selected_device
+            .as_deref()
+            .or(self.local_device_id.as_deref());
+        let sorted = self.spaces_sorted();
+        device
+            .and_then(|d| sorted.iter().find(|s| s.device_id == d).copied())
+            .or_else(|| sorted.first().copied())
+            .map(|s| s.id.clone())
     }
 
     pub fn apply_update(&mut self, status: komet_update::UpdateStatus) {
@@ -739,6 +779,18 @@ impl AppState {
         })
     }
 
+    /// When the in-flight send (if any, inside the TTL) was fired — the
+    /// elapsed-timer base while the overlay reads as Working. The session
+    /// row's `started_at` still belongs to the PREVIOUS turn during this
+    /// window, and showing it made a fresh send open at the old turn's
+    /// half-hour mark.
+    pub fn pending_send_started(&self, chat_id: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
+        self.pending_sends
+            .get(chat_id)
+            .filter(|p| now.signed_duration_since(p.started).num_milliseconds() <= PENDING_SEND_TTL_MS)
+            .map(|p| p.started)
+    }
+
     /// The host executed the queued command iff the sent message's id showed
     /// up in the transcript (it writes the message before — causally with —
     /// the Working status; sessions.rs dispatch paths).
@@ -768,12 +820,57 @@ impl AppState {
     }
 
     pub fn selected_space_row(&self) -> Option<&Space> {
+        if self.no_project {
+            return None;
+        }
         let id = self.selected_space.as_deref()?;
         self.spaces.iter().find(|s| s.id == id)
     }
 
+    /// The device the new-session canvas targets: the picked project's host
+    /// when one is selected, else the explicit device pick, else this device.
+    pub fn effective_device_id(&self) -> Option<String> {
+        if let Some(space) = self.selected_space_row() {
+            return Some(space.device_id.clone());
+        }
+        self.selected_device
+            .clone()
+            .or_else(|| self.local_device_id.clone())
+    }
+
+    /// Pick the composer's target device. Keeps the project pick consistent:
+    /// a project on another device can't survive the switch — fall back to
+    /// the first project on the new device, else "no project".
+    pub fn select_device(&mut self, device_id: String, cx: &mut Context<Self>) {
+        let project_moves = self
+            .selected_space_row()
+            .is_some_and(|s| s.device_id != device_id);
+        if project_moves {
+            let first = self
+                .spaces_sorted()
+                .iter()
+                .find(|s| s.device_id == device_id)
+                .map(|s| s.id.clone());
+            self.no_project = first.is_none();
+            if first.is_some() {
+                self.selected_space = first;
+            }
+        }
+        self.selected_device = Some(device_id);
+        cx.notify();
+    }
+
     pub fn space_row(&self, space_id: &str) -> Option<&Space> {
         self.spaces.iter().find(|s| s.id == space_id)
+    }
+
+    /// Spaces in display order — case-insensitive alphabetical, the order
+    /// both space selectors (sidebar filter, composer picker) list rows in.
+    /// Ties break on id so the order is stable across renders.
+    pub fn spaces_sorted(&self) -> Vec<&Space> {
+        let mut spaces: Vec<&Space> = self.spaces.iter().collect();
+        spaces.sort_by_key(|s| (s.display_name().to_lowercase(), s.id.clone()));
+        spaces
     }
 
     pub fn space_for_chat(&self, chat: &Chat) -> Option<&Space> {
@@ -812,6 +909,16 @@ impl AppState {
         }
     }
 
+    /// The "@ device" tag for a space — shared by the space pickers' rows,
+    /// the sidebar filter trigger, and the composer's space chip. Returns
+    /// `(tag, offline)`; staleness renders as a disconnected GLYPH at the
+    /// call sites (user request), never words in the tag.
+    pub fn space_device_tag(&self, space: &Space, now: DateTime<Utc>) -> (String, bool) {
+        let offline = !self.device_online(&space.device_id, now);
+        let device = self.device_name(&space.device_id).unwrap_or("Unknown device");
+        (format!("@ {device}"), offline)
+    }
+
     /// Does the selected space's folder have git? Drives the branch picker and
     /// the diff sidebar (owner-stamped, synced — no RPC).
     pub fn selected_space_git(&self) -> bool {
@@ -834,10 +941,10 @@ impl AppState {
     pub fn overview_chats(&self, now: DateTime<Utc>) -> Vec<(ChatIndicator, &Chat)> {
         let mut rows: Vec<(ChatIndicator, &Chat)> = self
             .visible_chats()
-            .filter(|c| {
-                c.space_id
-                    .as_deref()
-                    .is_some_and(|id| self.space_row(id).is_some())
+            .filter(|c| match c.space_id.as_deref() {
+                // Project-less sessions are first-class rows.
+                None => true,
+                Some(id) => self.space_row(id).is_some(),
             })
             .map(|c| (self.display_status_for(c, now), c))
             .collect();
@@ -981,15 +1088,19 @@ impl AppState {
         self.transcript.clear();
         self.transcript_task = None;
         if let Some(id) = chat_id.as_deref() {
-            // A chat implies its space; `select_chat(None)` (the new-session
-            // canvas) stays within the current space.
-            if let Some(space_id) = self
-                .chats
-                .iter()
-                .find(|c| c.id == id)
-                .and_then(|c| c.space_id.clone())
-            {
-                self.selected_space = Some(space_id);
+            // A chat implies its project (or the lack of one); `select_chat(None)`
+            // (the new-session canvas) keeps the current project pick.
+            if let Some(chat) = self.chats.iter().find(|c| c.id == id) {
+                match chat.space_id.clone() {
+                    Some(space_id) => {
+                        self.selected_space = Some(space_id);
+                        self.no_project = false;
+                    }
+                    None => {
+                        self.no_project = true;
+                        self.selected_device = Some(chat.device_id.clone());
+                    }
+                }
             }
             self.mark_chat_seen(id, cx);
         }
@@ -999,12 +1110,26 @@ impl AppState {
         cx.notify();
     }
 
-    /// Select a space; the caller (shell) decides which chat to land on.
+    /// Select a project; the caller (shell) decides which chat to land on.
+    /// `Some` clears a "Don't work in a project" opt-out and re-aims the
+    /// device pick at the project's host; `None` IS that opt-out.
     pub fn select_space(&mut self, space_id: Option<String>, cx: &mut Context<Self>) {
-        if self.selected_space == space_id {
+        match &space_id {
+            Some(id) => {
+                self.no_project = false;
+                if let Some(device) = self.space_row(id).map(|s| s.device_id.clone()) {
+                    self.selected_device = Some(device);
+                }
+            }
+            None => self.no_project = true,
+        }
+        if self.selected_space == space_id && space_id.is_some() {
+            cx.notify();
             return;
         }
-        self.selected_space = space_id;
+        if space_id.is_some() {
+            self.selected_space = space_id;
+        }
         cx.notify();
     }
 
@@ -1076,50 +1201,53 @@ fn spawn_deferred_engine_watch(
     }))
 }
 
-/// Subscribe to a watch method and pump each frame through `apply`. Runs on the
-/// gpui executor; ends when the stream closes or the entity is released.
-/// Chats watch with boot auto-select: komet's `/` route redirected to the
-/// last-used chat; we approximate by selecting the most recent unarchived chat
-/// on the first frame when nothing is selected yet (manual selection wins).
+/// Chats watch. Boot selection is the shell's job (it lands on the first
+/// restored open tab, device-local state this entity can't see); this task
+/// only pumps frames.
 fn spawn_chats_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<()> {
     cx.spawn(async move |this, cx| {
-        let mut rx = match handle
-            .client()
-            .subscribe(methods::WATCH_CHATS, serde_json::json!({}))
-            .await
-        {
-            Ok(rx) => rx,
-            Err(err) => {
-                tracing::debug!(error = %err, "chats watch unavailable");
-                return;
-            }
-        };
-        while let Some(value) = rx.recv().await {
-            let parsed: Vec<Chat> = match serde_json::from_value(value) {
-                Ok(parsed) => parsed,
+        // Resubscribe loop (same contract as the transcript watch): a daemon
+        // restart or RPC drop ends the stream, and a bare return here froze
+        // the sidebar until app restart — new chats, renames and archives
+        // from every device silently stopped arriving.
+        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+        loop {
+            let mut rx = match handle
+                .client()
+                .subscribe(methods::WATCH_CHATS, serde_json::json!({}))
+                .await
+            {
+                Ok(rx) => rx,
                 Err(err) => {
-                    tracing::warn!(error = %err, "dropping malformed chats frame");
+                    tracing::debug!(error = %err, "chats watch unavailable; retrying");
+                    if this.update(cx, |_, _| {}).is_err() {
+                        return;
+                    }
+                    cx.background_executor().timer(RETRY_DELAY).await;
                     continue;
                 }
             };
-            let alive = this.update(cx, |state, cx| {
-                state.apply_chats(parsed);
-                if state.selected_chat.is_none() && !state.auto_selected {
-                    let most_recent = state
-                        .chats
-                        .iter()
-                        .find(|c| !c.archived)
-                        .map(|c| c.id.clone());
-                    if let Some(chat_id) = most_recent {
-                        state.auto_selected = true;
-                        state.select_chat(Some(chat_id), cx);
+            while let Some(value) = rx.recv().await {
+                let parsed: Vec<Chat> = match serde_json::from_value(value) {
+                    Ok(parsed) => parsed,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "dropping malformed chats frame");
+                        continue;
                     }
+                };
+                let alive = this.update(cx, |state, cx| {
+                    state.apply_chats(parsed);
+                    cx.notify();
+                });
+                if alive.is_err() {
+                    return;
                 }
-                cx.notify();
-            });
-            if alive.is_err() {
-                break;
             }
+            tracing::debug!("chats stream ended; resubscribing");
+            if this.update(cx, |_, _| {}).is_err() {
+                return;
+            }
+            cx.background_executor().timer(RETRY_DELAY).await;
         }
     })
 }
@@ -1131,32 +1259,49 @@ fn spawn_watch<T: DeserializeOwned + 'static>(
     apply: fn(&mut AppState, T),
 ) -> Task<()> {
     cx.spawn(async move |this, cx| {
-        let mut rx = match handle
-            .client()
-            .subscribe(method, serde_json::json!({}))
-            .await
-        {
-            Ok(rx) => rx,
-            Err(err) => {
-                tracing::debug!(method, error = %err, "watch unavailable");
-                return;
-            }
-        };
-        while let Some(value) = rx.recv().await {
-            let parsed: T = match serde_json::from_value(value) {
-                Ok(parsed) => parsed,
+        // Resubscribe loop: these are the standing Sessions/Devices/Spaces
+        // watches — a daemon restart ended the stream and a bare return froze
+        // them for the rest of the app's life (remote Working dots staled out
+        // to nothing after 45s, and Idle/Completed transitions from other
+        // devices never arrived again — "the session never completes").
+        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+        loop {
+            let mut rx = match handle
+                .client()
+                .subscribe(method, serde_json::json!({}))
+                .await
+            {
+                Ok(rx) => rx,
                 Err(err) => {
-                    tracing::warn!(method, error = %err, "dropping malformed watch frame");
+                    tracing::debug!(method, error = %err, "watch unavailable; retrying");
+                    if this.update(cx, |_, _| {}).is_err() {
+                        return;
+                    }
+                    cx.background_executor().timer(RETRY_DELAY).await;
                     continue;
                 }
             };
-            let alive = this.update(cx, |state, cx| {
-                apply(state, parsed);
-                cx.notify();
-            });
-            if alive.is_err() {
-                break;
+            while let Some(value) = rx.recv().await {
+                let parsed: T = match serde_json::from_value(value) {
+                    Ok(parsed) => parsed,
+                    Err(err) => {
+                        tracing::warn!(method, error = %err, "dropping malformed watch frame");
+                        continue;
+                    }
+                };
+                let alive = this.update(cx, |state, cx| {
+                    apply(state, parsed);
+                    cx.notify();
+                });
+                if alive.is_err() {
+                    return;
+                }
             }
+            tracing::debug!(method, "watch stream ended; resubscribing");
+            if this.update(cx, |_, _| {}).is_err() {
+                return;
+            }
+            cx.background_executor().timer(RETRY_DELAY).await;
         }
     })
 }
@@ -2022,15 +2167,17 @@ mod tests {
             .map(|c| c.id.as_str())
             .collect();
         assert_eq!(ids, ["old", "new"]);
-        // The overview shows every live-space chat (idle included) — chats of
-        // unknown spaces stay hidden. Completed ("old") outranks idle ("new").
+        // The overview shows every live-space chat (idle included) PLUS
+        // project-less chats (first-class since the project selectors);
+        // chats of unknown spaces stay hidden. Completed ("old") outranks
+        // idle ("new"/"dangling").
         let now = Utc::now();
         let overview: Vec<&str> = state
             .overview_chats(now)
             .iter()
             .map(|(_, c)| c.id.as_str())
             .collect();
-        assert_eq!(overview, ["old", "new"]);
+        assert_eq!(overview, ["old", "new", "dangling"]);
     }
 
     #[test]

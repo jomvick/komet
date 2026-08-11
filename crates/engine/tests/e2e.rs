@@ -1614,7 +1614,7 @@ async fn real_claude_sees_uploaded_image_inline() {
     .expect("engine core assembles");
     // Pre-title the chat so the auto-titler doesn't spend a second model call.
     core.workspace
-        .create_chat(CHAT, &core.device_id, None, Some("/tmp".into()))
+        .create_chat(CHAT, None, Some(&core.device_id), None, Some("/tmp".into()))
         .expect("create chat row");
     core.workspace
         .rename_chat(CHAT, "Pre-titled")
@@ -1924,4 +1924,123 @@ async fn stale_tool_echo_after_steer_boundary_does_not_split_text() {
         }],
         "stale echo must not split the streaming text"
     );
+}
+
+/// The elapsed timer's base (`started_at`) is per user message: a settled
+/// session drops it (no reader can resurrect the previous turn's elapsed —
+/// the "timer opens at 30:00 on send" bug), and a steer into a PARKED
+/// persistent session restamps it fresh for the new turn.
+#[tokio::test]
+async fn parked_steer_restamps_started_at_and_idle_clears_it() {
+    // Steerable harness whose stream stays open after the turn's Done — the
+    // engine parks the session — and whose steering mailbox drives turn two.
+    struct ParkingHarness;
+    #[async_trait]
+    impl Harness for ParkingHarness {
+        fn id(&self) -> HarnessId {
+            HarnessId::Mock
+        }
+        fn display_name(&self) -> &str {
+            "Parking"
+        }
+        fn supports_steering(&self) -> bool {
+            true
+        }
+        fn steering_mode(&self) -> SteeringMode {
+            SteeringMode::StepBoundary
+        }
+        fn reasoning_levels(&self) -> &[ReasoningLevel] {
+            &[]
+        }
+        async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+            Ok(vec![])
+        }
+        async fn run(
+            &self,
+            _request: RunRequest,
+            mut controls: RunControls,
+        ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+            let (tx, rx) = tokio::sync::mpsc::channel::<Result<AgentEvent, HarnessError>>(16);
+            tokio::spawn(async move {
+                let _ = tx
+                    .send(Ok(AgentEvent::TextDelta {
+                        text: "turn one".into(),
+                    }))
+                    .await;
+                let _ = tx.send(Ok(done(DoneStatus::Completed))).await;
+                // Parked. The next steer is turn two.
+                if let Some(_msg) = controls.steering.recv().await {
+                    let _ = tx
+                        .send(Ok(AgentEvent::Steered {
+                            assistant_message_id: None,
+                            next_assistant_message_id: None,
+                        }))
+                        .await;
+                    let _ = tx
+                        .send(Ok(AgentEvent::TextDelta {
+                            text: "turn two".into(),
+                        }))
+                        .await;
+                    // Hold the turn open so the test's poll observes Working
+                    // (the transition is otherwise sub-millisecond).
+                    tokio::time::sleep(Duration::from_millis(400)).await;
+                    let _ = tx.send(Ok(done(DoneStatus::Completed))).await;
+                }
+            });
+            Ok(futures::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|event| (event, rx))
+            })
+            .boxed())
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), Arc::new(ParkingHarness));
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-run-park-timer",
+        SessionCommandPayload::Run {
+            request: run_request("first"),
+            message_id: "m-1".into(),
+        },
+    );
+    wait_for(
+        || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Idle),
+        "turn one to park",
+    )
+    .await;
+    let parked = core.sessions.session_status(CHAT).unwrap();
+    assert_eq!(
+        parked.started_at, None,
+        "a settled session must drop its timer base"
+    );
+
+    let before_steer = chrono::Utc::now();
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-steer-park-timer",
+        SessionCommandPayload::Steer {
+            prompt: "next".into(),
+            message_id: Some("m-2".into()),
+        },
+    );
+    wait_for(
+        || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Working),
+        "turn two working",
+    )
+    .await;
+    let working = core.sessions.session_status(CHAT).unwrap();
+    let started = working.started_at.expect("Working carries a timer base");
+    assert!(
+        started >= before_steer,
+        "steer into a parked session must restamp started_at (got {started}, steered at {before_steer})"
+    );
+
+    wait_for(
+        || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Idle),
+        "turn two to settle",
+    )
+    .await;
+    assert_eq!(core.sessions.session_status(CHAT).unwrap().started_at, None);
 }

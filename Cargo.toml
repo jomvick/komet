@@ -13,7 +13,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.32"
+version = "0.1.41"
 edition = "2024"
 license = "MIT"
 publish = false
@@ -45,15 +45,19 @@ loro-protocol = "0.3"
 # idle release of blur/path intermediates, instance pool shrink,
 # KOMET_GPU_STATS=1 diagnostics); b687328 adds ImageSource::evict (frees
 # sprite-atlas tiles — remove_asset alone leaked them, see
-# attachments::flush_evicted); ac135eb adds device memory to the stats line.
-gpui = { git = "https://github.com/wingleeio/zed", rev = "ac135eb227c0784e4bb8f09ae3c3ff6bffd8a827" }
-gpui_platform = { git = "https://github.com/wingleeio/zed", rev = "ac135eb227c0784e4bb8f09ae3c3ff6bffd8a827", features = [
+# attachments::flush_evicted); ac135eb adds device memory to the stats line;
+# f596cde fixes destination alpha on transparent windows (Porter-Duff OVER,
+# not additive); 53518c0 merges the edge-fade line: per-edge fade bands +
+# per-pixel EdgeFade for quads/images (true fade-into-glass), and
+# object-fit Cover cropping via atlas-tile UVs so image corner radii hold.
+gpui = { git = "https://github.com/wingleeio/zed", rev = "53518c0b883fcefcb456fba1942405216df133ba" }
+gpui_platform = { git = "https://github.com/wingleeio/zed", rev = "53518c0b883fcefcb456fba1942405216df133ba", features = [
     "wayland",
     "x11",
     "font-kit",
     "runtime_shaders",
 ] }
-gpui_tokio = { git = "https://github.com/wingleeio/zed", rev = "ac135eb227c0784e4bb8f09ae3c3ff6bffd8a827" }
+gpui_tokio = { git = "https://github.com/wingleeio/zed", rev = "53518c0b883fcefcb456fba1942405216df133ba" }
 
 # diffs
 similar = "2"

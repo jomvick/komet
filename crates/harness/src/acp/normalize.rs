@@ -255,11 +255,11 @@ pub(crate) fn map_update(update: &Value) -> Vec<AgentEvent> {
             // update refresh the same chip (fold refreshes in place by id).
             vec![
                 AgentEvent::ToolCall {
-                    id: "acp-plan".into(),
+                    id: komet_proto::LIVE_PLAN_TOOL_ID.into(),
                     call: ToolCall::Todo { items },
                 },
                 AgentEvent::ToolResult {
-                    id: "acp-plan".into(),
+                    id: komet_proto::LIVE_PLAN_TOOL_ID.into(),
                     is_error: false,
                     output: None,
                     diff: None,
@@ -492,7 +492,7 @@ mod tests {
         assert_eq!(
             events[0],
             AgentEvent::ToolCall {
-                id: "acp-plan".into(),
+                id: komet_proto::LIVE_PLAN_TOOL_ID.into(),
                 call: ToolCall::Todo {
                     items: vec![
                         TodoItem {

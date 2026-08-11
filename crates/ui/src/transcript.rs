@@ -1195,6 +1195,10 @@ pub struct Transcript {
     scroll_anim: Option<Task<()>>,
     /// MessageRail width gate (set by the shell from the container width).
     rail_enabled: bool,
+    /// Height of the shell's composer/status/terminal stack overlaying the
+    /// transcript's bottom (measured last frame): the last row pads past it
+    /// so pinned content rests above the glass chrome it scrolls under.
+    bottom_clearance: f32,
     /// Hovered rail tick (grows + shows the preview card).
     rail_hover: Option<usize>,
     /// `(row id, entry id)` under the pointer — reveals the entry's timestamp
@@ -1209,6 +1213,8 @@ pub struct Transcript {
     copied_clear: Option<Task<()>>,
     /// Transcript attachment being viewed full-size (click a user thumbnail).
     attachment_preview: Option<crate::attachments::PreviewImage>,
+    /// Focused while the lightbox is open so Escape reaches it.
+    attachment_preview_focus: gpui::FocusHandle,
     /// In-flight ReadAttachmentChunk loads, keyed `(deviceId, path)` — one per
     /// source; results land in the global attachment cache.
     attachment_loads: HashMap<(String, String), Task<()>>,
@@ -1274,11 +1280,13 @@ impl Transcript {
             spring_scheduled: false,
             scroll_anim: None,
             rail_enabled: true,
+            bottom_clearance: 0.0,
             rail_hover: None,
             hovered_entry: None,
             copied_code: None,
             copied_clear: None,
             attachment_preview: None,
+            attachment_preview_focus: cx.focus_handle(),
             attachment_loads: HashMap::new(),
             attachment_retries: HashMap::new(),
             blob_details: HashMap::new(),
@@ -1302,6 +1310,16 @@ impl Transcript {
 
     pub(crate) fn rail_enabled(&self) -> bool {
         self.rail_enabled
+    }
+
+    /// Shell-driven: the measured height of the bottom chrome stack the
+    /// transcript scrolls under. Sub-pixel jitter is ignored so steady-state
+    /// frames don't re-notify.
+    pub fn set_bottom_clearance(&mut self, height: f32, cx: &mut Context<Self>) {
+        if (self.bottom_clearance - height).abs() > 0.5 {
+            self.bottom_clearance = height;
+            cx.notify();
+        }
     }
 
     pub(crate) fn rail_hover(&self) -> Option<usize> {
@@ -1573,6 +1591,7 @@ impl Transcript {
         match diff_rows(&self.rows, &new_rows) {
             None => {
                 self.rows = new_rows;
+                self.refresh_protected_attachments(cx);
                 return;
             }
             Some((old_range, count)) => {
@@ -1601,6 +1620,7 @@ impl Transcript {
             }
         }
         self.rows = new_rows;
+        self.refresh_protected_attachments(cx);
         if self.pinned {
             if motion::reduced_motion(cx) || was_empty {
                 // First fill (chat open) lands at the bottom instantly
@@ -1711,6 +1731,25 @@ impl Transcript {
     }
 
     // ---- attachment read-back (user-attachments.tsx + transcript cache) ----
+
+    /// Shield the open transcript's attachments from image-cache eviction —
+    /// rebuilt on every row sync so a chat switch swaps the set. Without it,
+    /// budget pressure evicted thumbnails still on screen (the list caches
+    /// rendered rows, so a visible image's LRU tick goes stale).
+    fn refresh_protected_attachments(&self, cx: &Context<Self>) {
+        let devices = self.attachment_device_ids(cx);
+        let mut keys = std::collections::HashSet::new();
+        for row in &self.rows {
+            if let RowKind::User { attachments, .. } = &row.kind {
+                for att in attachments.iter() {
+                    for dev in &devices {
+                        keys.insert((dev.clone(), att.path.clone()));
+                    }
+                }
+            }
+        }
+        crate::attachments::protect_attachments(keys);
+    }
 
     /// Devices that may own a user message's attachment files: the chat's host
     /// device (uploads targeted it) plus this device (komet's
@@ -1869,13 +1908,19 @@ impl Transcript {
                         .border_color(crate::theme::hairline(0.11))
                         .bg(crate::theme::ink(0.035))
                         .cursor_pointer()
-                        .on_click(cx.listener(move |this, _, _, cx| {
+                        .on_click(cx.listener(move |this, _, window, cx| {
                             this.attachment_preview = Some(preview.clone());
+                            window.focus(&this.attachment_preview_focus, cx);
                             cx.notify();
                         }))
                         .child(
                             img(image.image.clone())
                                 .size_full()
+                                // The IMG needs its own radii: the frame's
+                                // rounding only clips rectangularly, so the
+                                // sprite must round its own corners (7 = the
+                                // frame's 8 minus its 1px border).
+                                .rounded(px(7.0))
                                 .object_fit(ObjectFit::Cover),
                         )
                         .into_any_element()
@@ -1909,24 +1954,91 @@ impl Transcript {
 
     // ---- rendering ----
 
+    /// The working loader, INSIDE the conversation flow: appended under the
+    /// last row while the run is live (moved out of the shell's status strip
+    /// — user request), so it reads as part of the streaming reply and
+    /// scrolls away with it. The spinner drives this entity's frames, which
+    /// keeps the elapsed timer ticking through delta-quiet tool runs.
+    fn render_working_trailer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let chat_id = self.chat_id.clone()?;
+        let now = chrono::Utc::now();
+        let elapsed_secs = {
+            let state = self.state.read(cx);
+            if state.indicator_for(&chat_id, now) != crate::state::Indicator::Working {
+                return None;
+            }
+            // Timer base: the freshest of the session row's turn start and
+            // the in-flight send (the row still carries the PREVIOUS turn's
+            // start during the send→ack window).
+            let started = state
+                .session_for(&chat_id)
+                .and_then(|s| s.started_at)
+                .into_iter()
+                .chain(state.pending_send_started(&chat_id, now))
+                .max();
+            started
+                .map(|t| now.signed_duration_since(t).num_seconds().max(0))
+                .unwrap_or(0)
+        };
+        let word = flavour_word(flavour_seed(&chat_id), elapsed_secs);
+        let theme = Theme::of(cx).clone();
+        Some(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(Theme::SPACE_SM))
+                .pt(px(10.0))
+                .text_size(px(11.0))
+                .child(crate::loaders::gradient_spinner(
+                    "working-indicator",
+                    &theme,
+                    2.5,
+                    cx.entity_id(),
+                    cx,
+                ))
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from(format!("{word}…"))),
+                )
+                .child(
+                    div()
+                        .text_color(theme.text_faint)
+                        .child(SharedString::from(format_elapsed(elapsed_secs))),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn render_row(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(row) = self.rows.get(ix).cloned() else {
             return gpui::Empty.into_any_element();
         };
         let theme = Theme::of(cx).clone();
+        // The viewport spans the full window (under the titlebar): the first
+        // row's gap adds the titlebar's height so a top-scrolled transcript
+        // rests below the chrome it fades under.
         let top_gap = if ix == 0 {
-            GAP_TURN + 10.0
+            Theme::TITLEBAR_HEIGHT + GAP_TURN + 10.0
         } else {
             top_gap_for(ix.checked_sub(1).and_then(|i| self.rows.get(i)), &row)
         };
-        // The last row must clear the shell's bottom fade band, or the
-        // timestamp strip (the row's lowest content) renders half-faded
-        // when the transcript is scrolled to the bottom.
+        // The last row must clear the composer/status stack the transcript
+        // scrolls under PLUS the fade band above it, or the timestamp strip
+        // (the row's lowest content) renders half-faded (or hidden) when the
+        // transcript is pinned to the bottom.
         let bottom_pad = if ix + 1 == self.rows.len() {
-            Theme::TRANSCRIPT_FADE_BAND + 8.0
+            self.bottom_clearance + Theme::TRANSCRIPT_FADE_BAND + 8.0
         } else {
             0.0
         };
+        // Live-run loader rides under the LAST row's content (above its
+        // clearance pad), so it sits right beneath the working reply.
+        let trailer = (ix + 1 == self.rows.len())
+            .then(|| self.render_working_trailer(cx))
+            .flatten();
 
         let inner: AnyElement = match &row.kind {
             RowKind::User {
@@ -1958,7 +2070,7 @@ impl Transcript {
                             div()
                                 .min_w_0()
                                 .max_w(px(MAX_CONTENT_WIDTH * 0.8))
-                                .bg(theme.surface_raised)
+                                .bg(crate::theme::user_bubble_bg())
                                 .rounded(px(Theme::BUBBLE_RADIUS))
                                 .px(px(16.0))
                                 .py(px(10.0))
@@ -2153,7 +2265,8 @@ impl Transcript {
                     .max_w(px(MAX_CONTENT_WIDTH))
                     .min_w_0()
                     .child(inner)
-                    .children(strip),
+                    .children(strip)
+                    .children(trailer),
             )
             .into_any_element()
     }
@@ -3047,6 +3160,7 @@ impl Render for Transcript {
             return root.child(crate::attachments::lightbox(
                 window.viewport_size(),
                 &preview,
+                &self.attachment_preview_focus,
                 move |_, cx| {
                     weak.update(cx, |this, cx| {
                         this.attachment_preview = None;

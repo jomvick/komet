@@ -278,6 +278,10 @@ pub struct ChatStatsSnapshot {
     pub head_seq: u64,
     pub seq_floor: u64,
     pub checkpoint_seq: u64,
+    /// Byte size of the room's stored checkpoint (0 = none). The host's
+    /// bootstrap heal keys off this: a room with rows but NO checkpoint
+    /// cannot cover its rows' causal deps for cold readers.
+    pub checkpoint_size: u64,
     pub row_count: u64,
     pub row_bytes: u64,
     pub pending_pushes: u64,
@@ -505,6 +509,7 @@ impl ChatClient {
             head_seq: server.head_seq,
             seq_floor: server.seq_floor,
             checkpoint_seq: server.checkpoint_seq,
+            checkpoint_size: server.checkpoint_size,
             row_count: server.row_count,
             row_bytes: server.row_bytes,
             pending_pushes: shared.pending.len() as u64,

@@ -3223,6 +3223,8 @@ pub struct Composer {
     state: Entity<AppState>,
     input: Entity<ComposerInput>,
     /// Composer actions row: repo/branch/harness-model/traits (§1.7).
+    /// Shared with the shell's new-session canvas, which renders the
+    /// device/project target selectors ([`Pickers::render_target_selectors`]).
     pickers: Entity<Pickers>,
     /// Draft text per chat key ("" = new-chat canvas), surviving navigation.
     drafts: HashMap<String, String>,
@@ -3231,6 +3233,12 @@ pub struct Composer {
     attachments: HashMap<String, Vec<StagedAttachment>>,
     /// The staged attachment being viewed full-size (click a thumbnail).
     preview: Option<attachments::PreviewImage>,
+    /// Focused while the lightbox is open so Escape reaches it; the input
+    /// gets focus back on close.
+    preview_focus: FocusHandle,
+    /// Focus grab deferred to the next render (open sites don't all have a
+    /// `Window` — the `KOMET_ATTACH_PREVIEW` boot knob opens in `new`).
+    preview_focus_pending: bool,
     /// In-flight file-picker prompt (paperclip).
     picker_task: Option<Task<()>>,
     mention_task: Option<Task<()>>,
@@ -3287,6 +3295,11 @@ pub struct Composer {
 impl EventEmitter<ComposerEvent> for Composer {}
 
 impl Composer {
+    /// The picker entity, for the shell's canvas target selectors.
+    pub fn pickers(&self) -> &Entity<Pickers> {
+        &self.pickers
+    }
+
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let input = cx.new(|cx| {
             let mut input = ComposerInput::new("Do anything…", cx);
@@ -3346,6 +3359,8 @@ impl Composer {
             drafts: HashMap::new(),
             attachments: HashMap::new(),
             preview: None,
+            preview_focus: cx.focus_handle(),
+            preview_focus_pending: false,
             picker_task: None,
             mention_task: None,
             mention: FileMentionState::default(),
@@ -3399,6 +3414,7 @@ impl Composer {
                     name: first.name.clone().into(),
                     image: first.image.clone(),
                 });
+                composer.preview_focus_pending = true;
             }
             if !staged.is_empty() {
                 composer
@@ -3516,15 +3532,22 @@ impl Composer {
                             .cursor_pointer()
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.preview = Some(preview.clone());
+                                this.preview_focus_pending = true;
                                 cx.notify();
                             }))
                             .child(
                                 img(att.image.clone())
                                     .size_full()
+                                    // Own radii — the frame's rounding only
+                                    // clips rectangularly (7 = 8 - border).
+                                    .rounded(px(7.0))
                                     .object_fit(ObjectFit::Cover),
                             ),
                     )
-                    .child(
+                    // Own layer: inside the frosted pill everything shares one
+                    // draw order and images render last, so without it the
+                    // thumbnail paints OVER this button (user report).
+                    .child(crate::frost::layered(
                         div()
                             .id(("composer-att-remove", ix))
                             .absolute()
@@ -3541,6 +3564,10 @@ impl Composer {
                             .opacity(0.0)
                             .group_hover(group, |s| s.opacity(1.0))
                             .on_click(cx.listener(move |this, _, _, cx| {
+                                // The button overhangs the thumbnail, whose
+                                // hitbox is right underneath — don't let the
+                                // same click also open the preview.
+                                cx.stop_propagation();
                                 this.remove_attachment(&remove_id, cx);
                             }))
                             .child(
@@ -3548,7 +3575,7 @@ impl Composer {
                                     .size(px(14.0))
                                     .text_color(theme.text_muted),
                             ),
-                    ),
+                    )),
             );
         }
         Some(strip)
@@ -3868,10 +3895,14 @@ impl Composer {
             .input
             .read(cx)
             .visible_point_for_index(token.range.start)?;
+        // No exit phase: the completion popup tracks the token under the
+        // caret — a fade-out on every keystroke-driven dismissal would read
+        // as input lag, not polish.
         Some(crate::popover::anchored_menu_above_at(
             "file-mention-popup",
             anchor,
             card.into_any_element(),
+            None,
         ))
     }
 
@@ -4161,6 +4192,7 @@ impl Composer {
             "slash-popup",
             anchor,
             card.into_any_element(),
+            None,
         ))
     }
 
@@ -4310,20 +4342,16 @@ impl Composer {
             .read(cx)
             .selected_chat_row()
             .and_then(|c| c.cwd.clone());
-        // The SPACE fixes the new chat's device + base folder — this is the
-        // behavioral core of spaces: sessions are minted onto the space's
-        // device, not necessarily this one.
+        // The PROJECT fixes the new chat's device + base folder — sessions are
+        // minted onto the project's device, not necessarily this one. With no
+        // project ("Don't work in a project") the composer's device pick is
+        // the host and the session runs from `~` there.
         let space = self.state.read(cx).selected_space_row().cloned();
-        if is_new && space.is_none() {
-            self.failure = Some("Add a space first".into());
-            cx.notify();
-            return;
-        }
         let local_device_id = self.state.read(cx).local_device_id.clone();
+        let target_device_id = self.state.read(cx).effective_device_id();
         let device_id = if is_new {
-            space
-                .as_ref()
-                .map(|s| s.device_id.clone())
+            target_device_id
+                .clone()
                 .unwrap_or_else(|| "local".to_string())
         } else {
             self.state
@@ -4334,11 +4362,10 @@ impl Composer {
                 .unwrap_or_else(|| "local".to_string())
         };
         // Uploads/read-backs target the chat's HOST device (forwardable RPCs);
-        // for a new chat that's the space's device (None when it's local).
+        // for a new chat that's the target device (None when it's local).
         let host_device_id = if is_new {
-            space
-                .as_ref()
-                .map(|s| s.device_id.clone())
+            target_device_id
+                .clone()
                 .filter(|id| local_device_id.as_deref() != Some(id.as_str()))
         } else {
             self.state
@@ -4362,13 +4389,26 @@ impl Composer {
         let message_id = uuid::Uuid::new_v4().to_string();
         let created_at = chrono::Utc::now().timestamp_millis();
 
-        // Image-only sends echo the same body `with_attachments` will use, so
-        // the bubble never renders empty (refs are upserted in post-upload).
-        let echo_text = if text.is_empty() && !staged.is_empty() {
-            attachments::ATTACHMENT_ONLY_TEXT.to_string()
-        } else {
-            text.clone()
-        };
+        // The echo carries synthetic attachment refs from the first frame, so
+        // photos render while the send is still pending instead of waiting for
+        // the upload to finish (real paths replace them in the post-upload
+        // refresh). The refs resolve instantly: the staged bytes are seeded
+        // into the transcript cache under every device key the transcript
+        // consults, and the synthetic paths never persist — the queued command
+        // and the doc entry are built from `with_attachments` on real paths.
+        let echo_paths: Vec<String> = staged
+            .iter()
+            .map(|att| format!("pending/{}/{}", att.id, att.name))
+            .collect();
+        let echo_text = attachments::with_attachments(&text, &echo_paths);
+        for (path, att) in echo_paths.iter().zip(&staged) {
+            attachments::seed_attachment(&device_id, path, &att.name, att.image.clone());
+            if let Some(local) = local_device_id.as_deref()
+                && local != device_id
+            {
+                attachments::seed_attachment(local, path, &att.name, att.image.clone());
+            }
+        }
 
         // Optimistic echo (client-minted id doubles as the persisted message id,
         // so the doc frame dedups it away).
@@ -4419,7 +4459,9 @@ impl Composer {
                 // picked base ref (CreateWorktree on send, targeted at the
                 // space's device; the RPC relay-forwards).
                 let mut cwd = if is_new {
-                    space_path.clone()
+                    // Project-less sessions run from the host's home dir —
+                    // "~" is expanded on the host when the run spawns.
+                    space_path.clone().or_else(|| Some("~".to_string()))
                 } else {
                     existing_cwd
                 }
@@ -4469,15 +4511,31 @@ impl Composer {
                 }
 
                 // Best-effort Mutate createChat with the picked config: the
-                // engine resolves device + cwd from the SPACE row (idempotent;
-                // the doc host would materialize the chat on first command
-                // anyway, so failures are non-fatal).
-                if is_new && let Some(space_id) = &space_id {
+                // engine resolves device + cwd from the PROJECT row when one
+                // is picked; project-less chats name the host device outright
+                // (idempotent; the doc host would materialize the chat on
+                // first command anyway, so failures are non-fatal).
+                if is_new {
                     let mut mutate = serde_json::json!({
                         "op": "createChat",
                         "chatId": chat_id,
-                        "spaceId": space_id,
                     });
+                    if let Some(object) = mutate.as_object_mut() {
+                        match &space_id {
+                            Some(space_id) => {
+                                object.insert(
+                                    "spaceId".into(),
+                                    serde_json::Value::String(space_id.clone()),
+                                );
+                            }
+                            None => {
+                                object.insert(
+                                    "deviceId".into(),
+                                    serde_json::Value::String(device_id.clone()),
+                                );
+                            }
+                        }
+                    }
                     if let Some(object) = mutate.as_object_mut() {
                         if let Some(worktree_cwd) = &worktree_cwd {
                             object.insert(
@@ -4895,8 +4953,8 @@ impl Composer {
             .rounded(px(26.0))
             .border_1()
             .border_color(theme.border)
-            .bg(theme.input_bg)
-            .shadow_lg()
+            .bg(theme.input_glass_bg())
+            .when(!theme.is_glass(), |el| el.shadow_lg())
             .flex()
             .flex_col()
             .child(
@@ -5334,13 +5392,16 @@ impl Render for Composer {
         // border-white/[0.08] bg-white/[0.03] shadow-xl` — a floating pill with
         // a hairline over a faint wash, never a solid grey box. Picker chips,
         // attach, and the send circle all live INSIDE the pill.
-        let pill_bg = theme.input_bg;
+        let pill_bg = theme.input_glass_bg();
+        // No drop shadow on glass: it paints BEHIND the translucent fill and
+        // shows through as an inner glow (theme.rs's card_selected_shadows
+        // lesson; user report).
         let pill = div()
             .rounded(px(26.0))
             .bg(pill_bg)
             .border_1()
             .border_color(theme.border)
-            .shadow_lg();
+            .when(!theme.is_glass(), |el| el.shadow_lg());
         // The pill's bottom edge is stationary on screen (the composer sits at
         // the bottom of the shell column; growth moves the TOP edge), so the
         // controls pin to the bottom and only the text glides with the reveal
@@ -5456,7 +5517,13 @@ impl Render for Composer {
         // The file dropzone lives in the shell (the whole conversation column,
         // not just the pill — shell.rs `chat-dropzone`); drops land back here
         // via `add_paths`.
-        let container = container.child(motion::fade_quick("composer-input", body));
+        // Frosted: the pill backdrop-blurs the transcript scrolling under it
+        // (the popover glass treatment; radius matches the pill's rounding).
+        let container = container.child(crate::frost::frosted(
+            26.0,
+            16.0,
+            motion::fade_quick("composer-input", body),
+        ));
         // Branch/worktree toolbar under the pill (t3code BranchToolbar): the
         // checkout-kind selector + ref picker for new sessions, read-only
         // labels once the session exists. Git spaces only.
@@ -5469,16 +5536,24 @@ impl Render for Composer {
         };
         // Full-size preview of a staged thumbnail (AttachmentPreviewDialog).
         if let Some(preview) = self.preview.clone() {
+            if std::mem::take(&mut self.preview_focus_pending) {
+                window.focus(&self.preview_focus, cx);
+            }
             let weak = cx.weak_entity();
             return container.child(attachments::lightbox(
                 window.viewport_size(),
                 &preview,
-                move |_, cx| {
-                    weak.update(cx, |this, cx| {
+                &self.preview_focus,
+                move |window, cx| {
+                    // Hand focus back to the input so typing (and the next
+                    // Escape) lands where it did before the lightbox opened.
+                    if let Ok(input_focus) = weak.update(cx, |this, cx| {
                         this.preview = None;
                         cx.notify();
-                    })
-                    .ok();
+                        this.input.read(cx).focus_handle.clone()
+                    }) {
+                        window.focus(&input_focus, cx);
+                    }
                 },
             ));
         }

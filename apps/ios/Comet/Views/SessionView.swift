@@ -7,17 +7,22 @@ import SwiftUI
 struct SessionView: View {
     @Environment(AppModel.self) private var model
     let chatId: String
-    @State private var showConfig = false
-    @State private var refs: [RepoRef] = []
-    @State private var catalogs: [String: [ModelInfo]] = [:]
 
-    /// Width the nav bar's own controls need either side of the title — the
-    /// back button leading, breathing room trailing.
-    private static let headerChromeInset: CGFloat = 132
+    /// Width the nav bar's own controls need around a LEADING title — the
+    /// back button ahead of it, bar margins, and slack. Generous on purpose:
+    /// a fixed-width item that does NOT fit gets evicted into a trailing "…"
+    /// overflow menu (where a custom text stack renders as nothing) — seen on
+    /// iPhone Air at 110.
+    private static let headerChromeInset: CGFloat = 170
 
     /// The view's own width, the only reliable basis for capping the principal
     /// toolbar item (its container proposes an unbounded width).
     @State private var viewWidth: CGFloat = 0
+
+    /// Shared with TranscriptView; owned here so the composer inset (which
+    /// this view composes) can report its global top edge — the measured
+    /// bottom boundary TranscriptView's correctPin re-pins against.
+    @State private var scroll = ScrollState()
 
 
     private var chat: Chat? { model.chat(id: chatId) }
@@ -45,35 +50,25 @@ struct SessionView: View {
         }
         .navigationTitle(chat?.displayTitle ?? "Session")  // feeds the back menu
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar(removing: .title)  // the leading header owns the bar
         .toolbarBackground(.hidden, for: .navigationBar)
         .toolbar {
             if let chat {
-                ToolbarItem(placement: .principal) {
-                    // Tapping the header reconfigures model/effort mid-chat
-                    // (the old app's header model pill); harness stays locked.
-                    Button {
-                        showConfig = true
-                    } label: {
-                        VStack(spacing: 1) {
-                            HStack(spacing: 6) {
-                                HarnessBadge(harness: chat.config?.harness ?? "claude-code", size: 12)
-                                // The badge and chevron are fixed; only the
-                                // title gives way, so a long name truncates
-                                // instead of pushing the chevron off-screen.
-                                Text(chat.displayTitle)
-                                    .font(Theme.sans(13, weight: .medium))
-                                    .foregroundStyle(Theme.text)
-                                    .lineLimit(1)
-                                    .truncationMode(.tail)
-                                    .layoutPriority(1)
-                                Image(systemName: "chevron.down")
-                                    .font(.system(size: 8, weight: .semibold))
-                                    .foregroundStyle(Theme.textFaint)
-                                    .layoutPriority(2)
-                            }
+                // Static, left-aligned session header — model/effort changes
+                // moved into the composer's picker chips.
+                ToolbarItem(placement: .topBarLeading) {
+                    // Badge OUTSIDE the text stack so the subtitle starts
+                    // under the title's text, not under the harness mark.
+                    HStack(alignment: .top, spacing: 6) {
+                        HarnessBadge(harness: chat.config?.harness ?? "claude-code", size: 12)
+                            .padding(.top, 2)  // optically on the title line
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(chat.displayTitle)
+                                .font(Theme.sans(13, weight: .medium))
+                                .foregroundStyle(Theme.text)
+                                .lineLimit(1)
+                                .truncationMode(.tail)
                             if let subtitle {
-                                // Middle-truncated: the tail (device) identifies
-                                // the session as much as the leading repo does.
                                 Text(subtitle)
                                     .font(Theme.sans(10.5))
                                     .foregroundStyle(Theme.textMuted.opacity(0.6))
@@ -81,62 +76,21 @@ struct SessionView: View {
                                     .truncationMode(.middle)
                             }
                         }
-                        // A principal toolbar item is handed its IDEAL width, so
-                        // an unconstrained header just runs past the bar and off
-                        // the screen. Cap it to the centre region — the back
-                        // button and any trailing item own the rest.
-                        // A principal toolbar item is handed its IDEAL width, so
-                        // an unconstrained header runs past the bar and off the
-                        // screen. Cap it against the view's own width, leaving
-                        // the back button and trailing padding their room.
-                        .frame(maxWidth: max(140, viewWidth - Self.headerChromeInset))
-                        .contentShape(Rectangle())
                     }
-                    .buttonStyle(.plain)
+                    // A FIXED width, not a max: iOS 26 proposes leading items
+                    // almost nothing next to the back button, so a flexible
+                    // frame collapses to its minimum ("S…"). Claiming the
+                    // remainder of the bar outright lays the texts out with
+                    // real room and truncates them properly.
+                    .frame(width: max(140, viewWidth - Self.headerChromeInset),
+                           alignment: .leading)
                 }
-            }
-        }
-        .sheet(isPresented: $showConfig) {
-            if let chat {
-                let harness = chat.config?.harness ?? "claude-code"
-                ModelPickerSheet(
-                    harness: .constant(harness),
-                    modelId: Binding(
-                        get: {
-                            chat.config?.model
-                                ?? HarnessCatalog.defaultModel(for: harness).id
-                        },
-                        set: { newModel in
-                            writeConfig(model: newModel, reasoning: chat.config?.reasoning)
-                        }
-                    ),
-                    reasoning: Binding(
-                        get: { chat.config?.reasoning },
-                        set: { newReasoning in
-                            writeConfig(model: chat.config?.model, reasoning: newReasoning)
-                        }
-                    ),
-                    lockedHarness: true,
-                    catalogs: catalogs,
-                    checkout: checkoutContext(chat: chat)
-                )
-            }
-        }
-        .task(id: chatId) {
-            guard let space = chatSpace else { return }
-            let harness = chat?.config?.harness ?? "claude-code"
-            catalogs[harness] = await model.listModels(space: space, harness: harness)
-            guard space.gitDetected else { return }
-            if let loaded = await model.listRefs(space: space) {
-                refs = loaded
+                // Bare text on the bar, not a glass capsule.
+                .sharedBackgroundVisibility(.hidden)
             }
         }
         .onAppear {
             model.markSeen(chatId: chatId)
-            if model.launchSheet == "config" {
-                model.launchSheet = nil
-                showConfig = true
-            }
         }
         .onDisappear {
             model.markSeen(chatId: chatId)
@@ -144,43 +98,15 @@ struct SessionView: View {
         }
     }
 
-    /// Live-chat checkout context (git spaces only): read-only kind + the
-    /// switchable ref list.
-    private func checkoutContext(chat: Chat) -> SessionCheckoutContext? {
-        guard let space = chatSpace, space.gitDetected, let cwd = chat.cwd else { return nil }
-        return SessionCheckoutContext(
-            isWorktree: cwd != space.path,
-            cwd: cwd,
-            refs: refs,
-            currentBranch: chat.branch,
-            onPick: { ref in
-                let error = await model.switchSessionRef(chat: chat, ref: ref)
-                if error == nil, let reloaded = await model.listRefs(space: space) {
-                    refs = reloaded
-                }
-                return error
-            }
-        )
-    }
-
-    /// Merge a model/effort change into the chat's config row (LWW; the host
-    /// picks it up on the next run dispatch).
-    private func writeConfig(model newModel: String?, reasoning newReasoning: String?) {
-        guard let chat else { return }
-        var config = chat.config ?? ChatConfig(harness: "claude-code", model: nil,
-                                               reasoning: nil, sandbox: "workspace-write")
-        config.model = newModel
-        config.reasoning = newReasoning
-        model.setChatConfig(chatId: chat.id, config: config)
-    }
-
+    /// "space @ device" — short, like the home dropdown's rows. The space
+    /// NAME (not the cwd basename: they differ for renamed spaces and
+    /// worktree sessions), falling back to the cwd when the space row is gone.
     private var subtitle: String? {
         guard let chat else { return nil }
-        var parts: [String] = []
-        if let cwd = chat.cwd { parts.append((cwd as NSString).lastPathComponent) }
-        if let branch = chat.branch, !branch.isEmpty { parts.append(branch) }
-        parts.append(model.deviceName(chat.deviceId))
-        return parts.joined(separator: " · ")
+        let space = model.space(for: chat)?.displayName
+            ?? chat.cwd.map { ($0 as NSString).lastPathComponent }
+            ?? "?"
+        return "\(space) @ \(model.deviceName(chat.deviceId))"
     }
 
     private func content(chat: Chat, store: SessionStore) -> some View {
@@ -191,7 +117,46 @@ struct SessionView: View {
         // keyboard-dismiss (scrollDismissesKeyboard(.interactively) in
         // TranscriptView) track a downward drag — with a sibling composer the
         // scroll view ends above the keyboard and the pan never engages it.
-        return TranscriptView(store: store, chatId: chat.id)
+        return TranscriptView(store: store, chatId: chat.id, scroll: scroll)
+            // The registry row says this session HAS messages; an empty
+            // transcript is therefore still hydrating (no disk snapshot yet,
+            // checkpoint in flight) — show the pulse, not a black void. This
+            // was "the session is blank when I open it" on a phone that had
+            // never cached the doc.
+            .overlay {
+                if store.entries.isEmpty, store.pendingSends.isEmpty,
+                   chat.lastMessageAt != nil {
+                    TranscriptSkeleton()
+                        .background(Theme.bg)
+                }
+            }
+            .motionAnimation(Motion.fadeQuick, value: store.entries.isEmpty)
+            // The keyboard's own transition bounds the transcript's no-correct
+            // window; didShow/didHide land the single measured glide.
+            .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in
+                // Re-arm the pin while the numbers are still honest (the
+                // keyboard inset hasn't applied yet): a few points of
+                // scroll-up breaks the pin though the feed still reads as
+                // at-bottom, and the didShow correction only lifts a PINNED
+                // feed — that near-bottom feed was left parked behind the
+                // keyboard. Same 70pt band as the re-engage rule.
+                if !scroll.userScrolling,
+                   scroll.distanceFromBottom <= TranscriptView.stickThreshold {
+                    scroll.pinned = true
+                }
+                scroll.keyboardTransitioning = true
+            }
+            .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardDidShowNotification)) { _ in
+                scroll.keyboardTransitioning = false
+                scroll.requestCorrection()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
+                scroll.keyboardTransitioning = true
+            }
+            .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardDidHideNotification)) { _ in
+                scroll.keyboardTransitioning = false
+                scroll.requestCorrection()
+            }
             .safeAreaInset(edge: .bottom, spacing: 0) {
                 VStack(spacing: 0) {
                     // The strip reserves its 24pt whether or not a run is
@@ -209,6 +174,14 @@ struct SessionView: View {
                         }
                     }
                     .padding(.bottom, 8)
+                }
+                // Report the inset's global top edge — the visual line the
+                // transcript's bottom pad should meet while pinned. Global
+                // frames stay honest when the keyboard's inset math doesn't
+                // (see TranscriptView.correctPin).
+                .onGeometryChange(for: CGFloat.self) { $0.frame(in: .global).minY } action: { [scroll] new in
+                    scroll.insetTopGlobalY = new
+                    scroll.insetTopChangedAt = Date().timeIntervalSinceReferenceDate
                 }
                 // One continuous dissolve: starts 44pt above the strip and
                 // reaches full bg only at the PHYSICAL bottom edge, so rows

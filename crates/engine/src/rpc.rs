@@ -280,8 +280,14 @@ enum MutateParams {
     #[serde(rename_all = "camelCase")]
     CreateChat {
         chat_id: String,
-        /// The space the chat is created in — fixes host device + base cwd.
-        space_id: String,
+        /// The project the chat is created in — fixes host device + base cwd.
+        /// `None` mints a project-less chat: `deviceId` picks the host and the
+        /// cwd defaults to `~` (expanded on the host at run time).
+        #[serde(default)]
+        space_id: Option<String>,
+        /// Host device for a project-less chat; ignored when `spaceId` is set.
+        #[serde(default)]
+        device_id: Option<String>,
         #[serde(default)]
         config: Option<ChatConfig>,
         /// The picked ref, named on the row from the first frame (the footer
@@ -624,12 +630,13 @@ impl EngineRpc {
             MutateParams::CreateChat {
                 chat_id,
                 space_id,
+                device_id,
                 config,
                 branch,
                 cwd,
             } => {
                 self.workspace
-                    .create_chat(&chat_id, &space_id, config, cwd)
+                    .create_chat(&chat_id, space_id.as_deref(), device_id.as_deref(), config, cwd)
                     .map_err(failed)?;
                 if let Some(branch) = branch.as_deref().filter(|b| !b.is_empty()) {
                     self.workspace

@@ -67,6 +67,17 @@ final class DemoDataset {
                  config: claude, lastMessagePreview: "Hibernation-safe flush timer",
                  lastMessageAt: now - 86_400_000, createdAt: now - 86_400_000 * 2,
                  spaceId: edge.id, lastSeenAt: now - 86_400_000),
+            // Archived — populate the shelf under the active list.
+            Chat(id: "chat-oklch", deviceId: "dev-mac", title: "OKLCH conversion drift",
+                 archived: true, cwd: komet.path, branch: "main", checkoutId: nil,
+                 config: claude, lastMessagePreview: "Gamma encode matches now.",
+                 lastMessageAt: now - 86_400_000 * 3, createdAt: now - 86_400_000 * 4,
+                 spaceId: komet.id, lastSeenAt: now - 86_400_000 * 3),
+            Chat(id: "chat-presence", deviceId: "dev-vps", title: "Presence beat coalescing",
+                 archived: true, cwd: edge.path, branch: nil, checkoutId: nil,
+                 config: codex, lastMessagePreview: "Batched to one beat per 25s.",
+                 lastMessageAt: now - 86_400_000 * 6, createdAt: now - 86_400_000 * 7,
+                 spaceId: edge.id, lastSeenAt: now - 86_400_000 * 6),
         ]
         let sessions: [String: SessionRow] = [
             "chat-veil": SessionRow(chatId: "chat-veil", deviceId: "dev-mac", status: .working,

@@ -474,7 +474,7 @@ async fn non_host_engine_leaves_remote_chats_commands_alone() {
         .create_space("space-remote", "dev-b", "/tmp/remote", None, false)
         .expect("create remote space row");
     a.workspace
-        .create_chat("chat-remote", "space-remote", None, None)
+        .create_chat("chat-remote", Some("space-remote"), None, None, None)
         .expect("create remote-hosted chat row");
     queue_run(&a, "chat-remote", "cmd-remote-1", "m-1");
 
@@ -508,7 +508,8 @@ async fn chat_config_selects_the_run_harness() {
     a.workspace
         .create_chat(
             "chat-cfg",
-            "space-cfg",
+            Some("space-cfg"),
+            None,
             Some(ChatConfig {
                 harness: HarnessId::Cursor,
                 model: None,

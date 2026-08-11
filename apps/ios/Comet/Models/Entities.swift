@@ -36,6 +36,11 @@ struct ChatConfig: Hashable, Codable {
     var harness: String
     var model: String?
     var reasoning: String?
+    /// Harness-specific option picks (option id → choice id, proto
+    /// `ChatConfig.model_options`). Round-tripped so a mobile config edit
+    /// never clobbers options the desktop pickers set — `setChatConfig`
+    /// rewrites the whole `config` field under per-field LWW.
+    var modelOptions: [String: JSONValue] = [:]
     var sandbox: String?
 }
 
@@ -53,6 +58,9 @@ struct Chat: Identifiable, Hashable {
     var createdAt: Int64
     var spaceId: String?
     var lastSeenAt: Int64?
+    /// Sync room generation (docs/chat2-sync.md M2): absent/1 = legacy s2
+    /// (never dialed from mobile), 2 = chat2. The host flips it when seeding.
+    var roomGen: Int? = nil
 
     var displayTitle: String {
         if let title, !title.isEmpty { return title }
@@ -248,7 +256,7 @@ struct RunRequest: Codable {
     var harness: String?
     var model: String?
     var reasoning: String?
-    var modelOptions: [String: String] = [:]
+    var modelOptions: [String: JSONValue] = [:]
     var cwd: String
     var sandbox: String = "workspace-write"
     var autoApprove: Bool = true
