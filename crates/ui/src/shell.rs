@@ -2410,13 +2410,23 @@ impl Shell {
         };
         let failed = matches!(self.update_flow, UpdateFlow::Failed(_));
         let tone = if failed { theme.danger } else { theme.accent };
-        // The chip fill is the sidebar's WHITE wash language, not an accent
-        // tint: an indigo fill over the glass composited into a dark slab that
-        // blocked the blur (user report) — the accent lives in the icon/text.
+        // Dark-purple GLASS tint (user request), not the 400-level accent as
+        // a fill: deep pigment at partial alpha tints the blur showing
+        // through instead of compositing into the slab that a bright indigo
+        // fill produced (earlier user report). Light chrome gets a lavender
+        // accent wash instead — dark purple under indigo-600 text goes muddy.
         let (chip_bg, chip_bg_hover) = if failed {
             (theme.danger.opacity(0.14), theme.danger.opacity(0.22))
         } else {
-            (crate::theme::wash(0.11), crate::theme::wash(0.16))
+            match theme.appearance {
+                crate::theme::Appearance::Dark => {
+                    let purple = crate::theme::oklch(0.35, 0.12, 277.0);
+                    (purple.opacity(0.45), purple.opacity(0.60))
+                }
+                crate::theme::Appearance::Light => {
+                    (theme.accent.opacity(0.10), theme.accent.opacity(0.16))
+                }
+            }
         };
 
         let mut strip = div()
@@ -2431,19 +2441,9 @@ impl Shell {
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(6.0))
             .text_size(px(11.0))
             .font_weight(gpui::FontWeight::MEDIUM)
             .text_color(tone)
-            .child(
-                icon(if failed {
-                    icons::DANGER_TRIANGLE
-                } else {
-                    icons::RESTART
-                })
-                .size(px(14.0))
-                .text_color(tone),
-            )
             .child(div().flex_1().min_w_0().child(label));
         if clickable {
             strip = strip
