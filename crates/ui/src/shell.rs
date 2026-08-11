@@ -647,6 +647,13 @@ pub struct Shell {
     debug_gate: Option<GatePhase>,
     sidebar_tween: Option<WidthTween>,
     right_tween: Option<WidthTween>,
+    /// Changes-panel takeover (the header's expand button): the panel fills
+    /// everything right of the sidebar and the conversation column collapses
+    /// to zero. Session-local view state — never persisted, reset on close.
+    right_pane_expanded: bool,
+    /// Viewport width stamped each frame at render — the expanded panel's
+    /// width target ([`Self::right_target`] has no `Window`).
+    viewport_width: f32,
     terminal_tween: Option<WidthTween>,
     /// Last observed `window.is_fullscreen()` (`None` before first paint) —
     /// flips key the traffic-light inset tween.
@@ -822,6 +829,8 @@ impl Shell {
             debug_gate,
             sidebar_tween: None,
             right_tween: None,
+            right_pane_expanded: false,
+            viewport_width: 1280.0,
             terminal_tween: None,
             fullscreen: None,
             titlebar_tween: None,
@@ -1067,10 +1076,16 @@ impl Shell {
     }
 
     fn right_target(&self, cx: &App) -> f32 {
-        if self.right_pane_open(cx) {
-            self.settings.right_pane_width
-        } else {
+        if !self.right_pane_open(cx) {
             0.0
+        } else if self.right_pane_expanded {
+            // Takeover: everything right of the sidebar; the conversation
+            // column (flex_1) collapses to zero behind it. Rides the sidebar's
+            // width tween so a sidebar toggle mid-takeover stays seamless.
+            let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
+            (self.viewport_width - sidebar_now).max(RIGHT_PANE_MIN)
+        } else {
+            self.settings.right_pane_width
         }
     }
 
@@ -1090,6 +1105,11 @@ impl Shell {
         let from = self.right_target(cx);
         let key = self.panel_key(cx);
         let open = self.panels.toggle_changes(&key);
+        if !open {
+            // Closing always leaves takeover mode — reopening at full bleed
+            // with the conversation gone read as a broken chat.
+            self.right_pane_expanded = false;
+        }
         self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
         if open {
             // Lazy: the Changes entity (and its WatchCheckoutDiffs) exists only
@@ -2698,13 +2718,23 @@ impl Shell {
         };
         let failed = matches!(self.update_flow, UpdateFlow::Failed(_));
         let tone = if failed { theme.danger } else { theme.accent };
-        // The chip fill is the sidebar's WHITE wash language, not an accent
-        // tint: an indigo fill over the glass composited into a dark slab that
-        // blocked the blur (user report) — the accent lives in the icon/text.
+        // Dark-purple GLASS tint (user request), not the 400-level accent as
+        // a fill: deep pigment at partial alpha tints the blur showing
+        // through instead of compositing into the slab that a bright indigo
+        // fill produced (earlier user report). Light chrome gets a lavender
+        // accent wash instead — dark purple under indigo-600 text goes muddy.
         let (chip_bg, chip_bg_hover) = if failed {
             (theme.danger.opacity(0.14), theme.danger.opacity(0.22))
         } else {
-            (crate::theme::wash(0.11), crate::theme::wash(0.16))
+            match theme.appearance {
+                crate::theme::Appearance::Dark => {
+                    let purple = crate::theme::oklch(0.35, 0.12, 277.0);
+                    (purple.opacity(0.45), purple.opacity(0.60))
+                }
+                crate::theme::Appearance::Light => {
+                    (theme.accent.opacity(0.10), theme.accent.opacity(0.16))
+                }
+            }
         };
 
         let mut strip = div()
@@ -2719,19 +2749,9 @@ impl Shell {
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(6.0))
             .text_size(px(11.0))
             .font_weight(gpui::FontWeight::MEDIUM)
             .text_color(tone)
-            .child(
-                icon(if failed {
-                    icons::DANGER_TRIANGLE
-                } else {
-                    icons::RESTART
-                })
-                .size(px(14.0))
-                .text_color(tone),
-            )
             .child(div().flex_1().min_w_0().child(label));
         if clickable {
             strip = strip
@@ -3559,14 +3579,23 @@ impl Shell {
                 // report). The jump pill floats outside the fade scope,
                 // anchored above the measured stack.
                 {
-                    let stack_h = self.bottom_stack.get();
+                    // The terminal dock is NOT glass the transcript may slide
+                    // under: with the dock's translucent fill, transcript text
+                    // ghosted through the grid (user report). The underlay
+                    // ends at the dock's top instead, riding the same height
+                    // tween the dock animates with; `stack_h` below is only
+                    // the chrome that still overlaps the transcript (status
+                    // strip + composer).
+                    let term_h = self.eval_tween(self.terminal_tween, self.terminal_target(cx));
+                    let stack_h = (self.bottom_stack.get() - term_h).max(0.0);
                     // Opaque from the composer PILL's top (the reserved
                     // status strip above it is empty air), zero at the
-                    // window's bottom edge.
+                    // underlay's bottom edge.
                     let bottom_band = (stack_h - Theme::STATUS_STRIP_HEIGHT).max(1.0);
                     div()
                         .absolute()
                         .inset_0()
+                        .bottom(px(term_h))
                         .child(crate::edge_fade::edge_faded(
                             Theme::TRANSCRIPT_FADE_BAND,
                             true,
@@ -3745,14 +3774,18 @@ impl Shell {
             );
 
         // Fixed-height inner clipped by the animated container: content never
-        // reflows mid-transition (same trick as the side panes).
+        // reflows mid-transition (same trick as the side panes). The handle
+        // FLOATS over the panel's top edge (painted after, so it wins hit
+        // testing) instead of stacking above it — stacked, its 5px read as
+        // dead air between the seam and the tab bar (user report).
         let inner = div()
             .h(px(height))
             .w_full()
+            .relative()
             .flex()
             .flex_col()
-            .child(handle)
-            .child(div().flex_1().min_h_0().child(panel));
+            .child(div().flex_1().min_h_0().child(panel))
+            .child(handle.absolute().top_0().left_0().right_0());
 
         div()
             .w_full()
@@ -3853,9 +3886,10 @@ impl Shell {
         } else {
             gpui::Empty.into_any_element()
         };
-        // Its OWN inset card (user request): the conversation card's right
-        // gutter is the gap; padding (not margins) keeps the tweened width
-        // container clean, and the resize grabber floats over the gap.
+        // Flush panel (user request — the inset card is gone): full window
+        // height with a left hairline, glass-friendly like the terminal dock
+        // (translucent over the frost; solid otherwise). The resize grabber
+        // floats over the border seam.
         let handle = self
             .resize_handle(
                 "right-pane-resize",
@@ -3868,31 +3902,37 @@ impl Shell {
             .bottom_0()
             // INSIDE the width-clipped container (a negative inset was
             // clipped into unreachability — user-reported dead resize),
-            // overlapping the card's left border.
+            // overlapping the panel's left border.
             .left(px(0.0));
-        let card = div()
+        let panel_bg = if theme.is_glass() { bg.opacity(0.4) } else { bg };
+        let panel = div()
             .size_full()
-            .rounded(px(12.0))
-            .border_1()
-            .border_color(theme.border)
-            .bg(bg)
+            .flex()
+            .flex_col()
+            // In takeover the panel's left edge IS the sidebar seam, which
+            // already carries the sidebar tone's right hairline — a second
+            // border there doubled up (user report).
+            .when(!self.right_pane_expanded, |el| {
+                el.border_l_1().border_color(theme.border)
+            })
+            .bg(panel_bg)
             .overflow_hidden()
+            // The titlebar is a glass overlay over the full-height content
+            // row; the panel's own chrome starts below it.
+            .pt(px(Theme::TITLEBAR_HEIGHT))
             .child(content);
         let target = self.right_target(cx);
+        // Takeover mode has no drag width — the handle would fight the
+        // viewport-derived target.
+        let handle = (!self.right_pane_expanded).then_some(handle);
         self.pane_container(
             self.right_tween,
             target,
-            // Flush under the titlebar (the full-height content row puts the
-            // chrome overlay above us, so the pad IS the titlebar height),
-            // 8px bottom/right gutters.
             div()
                 .h_full()
                 .relative()
-                .pt(px(Theme::TITLEBAR_HEIGHT))
-                .pb(px(8.0))
-                .pr(px(8.0))
-                .child(card)
-                .child(handle)
+                .child(panel)
+                .children(handle)
                 .into_any_element(),
         )
     }
@@ -3988,6 +4028,17 @@ impl Shell {
                     .child(motion::fade_in("signed-out-restart", card)),
             )
             .into_any_element()
+    }
+
+    /// Toggle the changes-panel takeover (the header's expand button, t3code
+    /// parity): the panel grows to fill everything right of the sidebar,
+    /// hiding the conversation column; toggling back restores the saved
+    /// width. Rides the same width tween as open/close so the jump glides.
+    fn toggle_right_pane_expand(&mut self, cx: &mut Context<Self>) {
+        let from = self.right_target(cx);
+        self.right_pane_expanded = !self.right_pane_expanded;
+        self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
+        cx.notify();
     }
 
     fn render_gate_card(&mut self, phase: &GatePhase, cx: &mut Context<Self>) -> AnyElement {
@@ -4735,8 +4786,16 @@ impl Render for Shell {
                 }
                 // MessageRail width gate: hide below 48rem of main-panel width.
                 let viewport = f32::from(window.viewport_size().width);
-                let main_width = viewport - self.sidebar_target() - self.right_target(cx) - 10.0;
-                let stack_h = self.bottom_stack.get();
+                // Stamped for `right_target` — the expanded changes panel
+                // sizes itself to the viewport.
+                self.viewport_width = viewport;
+                let main_width =
+                    (viewport - self.sidebar_target() - self.right_target(cx) - 10.0).max(0.0);
+                // Clearance excludes the terminal dock: the transcript
+                // viewport ends at the dock's top (see the underlay in
+                // `render_main`), so only the chrome above it overlaps.
+                let term_h = self.eval_tween(self.terminal_tween, self.terminal_target(cx));
+                let stack_h = (self.bottom_stack.get() - term_h).max(0.0);
                 self.transcript.update(cx, |t, cx| {
                     t.set_rail_enabled(rail::rail_visible(main_width), cx);
                     t.set_bottom_clearance(stack_h, cx);
@@ -4761,15 +4820,11 @@ impl Render for Shell {
                     Empty.into_any_element()
                 };
                 let overlays = self.render_overlays(window.viewport_size(), window, cx);
-                // The signature frame: the conversation card and — when the
-                // changes pane is open — a SECOND inset card beside it, both
-                // rounded hairline-bordered floats on the frost shell (the
-                // changes card is built inside `render_right_pane`).
                 // Copied out (not held) — `render_title_bar` needs `cx` mutable.
                 let border_color = Theme::of(cx).border;
-                // No inset card (user request): the conversation column sits
+                // No inset cards (user request): the conversation column sits
                 // flush and unbordered, the transcript directly on the frost
-                // glass — only the changes pane keeps its floating card
+                // glass; the changes pane is a flush left-bordered glass panel
                 // (built inside `render_right_pane`).
                 let card: AnyElement = div()
                     .flex_1()
@@ -4814,7 +4869,7 @@ impl Render for Shell {
                 // The content row spans the FULL window height — the titlebar
                 // overlays it (glass, no fill), so the transcript can scroll
                 // under the header and fade out at its edge. Columns that
-                // must NOT underlap (sidebar content, the changes card,
+                // must NOT underlap (sidebar content, the changes panel,
                 // settings) pad themselves down by the titlebar height.
                 let page = div()
                     .size_full()

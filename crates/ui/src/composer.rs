@@ -4288,6 +4288,15 @@ impl Composer {
         )
     }
 
+    /// New-chat sends need a project: with none picked (empty device, or a
+    /// selection healed away) the send button dims and submit is a no-op —
+    /// project-less `~`-cwd sessions are no longer mintable from the canvas.
+    /// Existing chats carry their own project, so they always send.
+    fn send_blocked(&self, cx: &App) -> bool {
+        let state = self.state.read(cx);
+        state.selected_chat.is_none() && state.selected_space_row().is_none()
+    }
+
     fn button_mode(&self, cx: &App) -> SendButtonMode {
         // A staged image counts as content: image-only sends are legal
         // (the prompt body becomes "See the attached image(s).").
@@ -4309,6 +4318,7 @@ impl Composer {
         match self.button_mode(cx) {
             SendButtonMode::Stop => self.interrupt(cx),
             _ if text.is_empty() && self.staged().is_empty() => {}
+            _ if self.send_blocked(cx) => {}
             SendButtonMode::Send => self.send(text, false, cx),
             SendButtonMode::Steer => self.send(text, true, cx),
         }
@@ -5085,24 +5095,32 @@ impl Composer {
                 .on_click(cx.listener(|this, _, _, cx| this.interrupt(cx)))
                 .child(div().size(px(11.0)).rounded(px(3.0)).bg(theme.bg))
                 .into_any_element(),
-            SendButtonMode::Send | SendButtonMode::Steer => div()
-                .id("composer-send")
-                .size(px(28.0))
-                .flex_none()
-                .rounded_full()
-                .bg(theme.text)
-                .flex()
-                .items_center()
-                .justify_center()
-                .cursor_pointer()
-                .hover(|s| s.opacity(0.85))
-                .on_click(cx.listener(|this, _, _, cx| this.on_submit(cx)))
-                .child(
-                    crate::icons::icon(crate::icons::ARROW_UP)
-                        .size(px(14.0))
-                        .text_color(theme.bg),
-                )
-                .into_any_element(),
+            SendButtonMode::Send | SendButtonMode::Steer => {
+                // Dimmed and inert while no project is picked (`send_blocked`
+                // also gates `on_submit`, so Enter is a no-op too).
+                let blocked = self.send_blocked(cx);
+                div()
+                    .id("composer-send")
+                    .size(px(28.0))
+                    .flex_none()
+                    .rounded_full()
+                    .bg(theme.text)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .when(blocked, |el| el.opacity(0.35))
+                    .when(!blocked, |el| {
+                        el.cursor_pointer()
+                            .hover(|s| s.opacity(0.85))
+                            .on_click(cx.listener(|this, _, _, cx| this.on_submit(cx)))
+                    })
+                    .child(
+                        crate::icons::icon(crate::icons::ARROW_UP)
+                            .size(px(14.0))
+                            .text_color(theme.bg),
+                    )
+                    .into_any_element()
+            }
         }
     }
 }
