@@ -113,18 +113,93 @@ impl Shell {
         // cluster as it collapses.
         let content_left =
             (sidebar_now + Theme::SPACE_LG).max(self.title_bar_content_start() + plus_inset);
+
+        // Trailing titlebar section. With the changes pane open this is the
+        // PANE'S HEADER — a strip exactly as wide as the pane carrying its
+        // controls (scope dropdown, ref selector, fold-all from the Changes
+        // entity; expand + close shell-side). It lives up here because the
+        // titlebar overlay owns this band's hit-testing: controls mounted in
+        // the pane itself would sit under the drag region and never see a
+        // click. Closed, it is just the stable open/close toggle. Hidden on
+        // the new-session canvas (user request) — nothing to diff yet.
+        let takeover =
+            git && !on_canvas && self.right_pane_open(cx) && self.right_pane_expanded;
+        // In takeover the title hides and the strip owns the whole band, so
+        // the row's left inset pulls back to the sidebar seam — the title
+        // inset would push the scope dropdown off the pane's own left gutter
+        // (user report: misaligned dead space).
+        let row_left = if takeover { sidebar_now } else { content_left };
+        let trailing: Option<gpui::AnyElement> = if !git || on_canvas {
+            None
+        } else if self.right_pane_open(cx) {
+            let right_now = self.eval_tween(self.right_tween, self.right_target(cx));
+            let pr = titlebar_right_padding(cfg!(target_os = "windows"), Theme::SPACE_LG);
+            // The row's own left padding is part of its content box: a strip
+            // wider than what's left after it overflows and clips at the right
+            // edge (flex_none never shrinks) — cap to the available width.
+            let avail = self.viewport_width - row_left - pr;
+            let controls = self
+                .changes_pane(cx)
+                .update(cx, |changes, cx| changes.render_header_controls(cx));
+            Some(
+                div()
+                    .flex_none()
+                    .h_full()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(4.0))
+                    .overflow_hidden()
+                    // Right edge already sits at viewport − pr (the row's own
+                    // padding), so this width starts the strip exactly at the
+                    // pane's left border — and rides the open/close tween.
+                    .w(px((right_now - pr).min(avail).max(0.0)))
+                    // 8 + the trigger's own 8px pad = the pane's 16px text
+                    // gutter, so the scope label sits flush over the stats
+                    // strip below.
+                    .pl(px(8.0))
+                    .child(div().flex_1().min_w_0().h_full().child(controls))
+                    .child(header_icon_button(
+                        "expand-changes",
+                        icons::EXPAND_ARROWS,
+                        &theme,
+                        cx.listener(|this, _, _, cx| this.toggle_right_pane_expand(cx)),
+                    ))
+                    .child(header_icon_button(
+                        "toggle-changes",
+                        icons::SIDEBAR_MINIMALISTIC,
+                        &theme,
+                        cx.listener(|this, _, _, cx| this.toggle_right_pane(cx)),
+                    ))
+                    .into_any_element(),
+            )
+        } else {
+            Some(
+                header_icon_button(
+                    "toggle-changes",
+                    icons::SIDEBAR_MINIMALISTIC,
+                    &theme,
+                    cx.listener(|this, _, _, cx| this.toggle_right_pane(cx)),
+                )
+                .into_any_element(),
+            )
+        };
+
         let inner = div()
             .size_full()
             .flex()
             .items_center()
             .pt(px(Theme::TITLEBAR_TOP_PAD))
             .gap(px(8.0))
-            .pl(px(content_left))
+            .pl(px(row_left))
             .pr(px(titlebar_right_padding(
                 cfg!(target_os = "windows"),
                 Theme::SPACE_LG,
             )))
-            .child(
+            // In panel takeover the header strip spans the whole band — the
+            // title would sit UNDER it (both flex_none, the row overflows and
+            // paint order stacks them), so it hides for the duration.
+            .when(!takeover, |el| el.child(
                 div()
                     .min_w_0()
                     .flex()
@@ -164,19 +239,9 @@ impl Shell {
                                 .child(target),
                         )
                     }),
-            )
+            ))
             .child(div().flex_1())
-            // Stable location: the toggle shows whether the pane is open or
-            // not (the pane's own header is gone). Hidden on the new-session
-            // canvas (user request) — there's no session to diff yet.
-            .when(git && !on_canvas, |el| {
-                el.child(header_icon_button(
-                    "toggle-changes",
-                    icons::SIDEBAR_MINIMALISTIC,
-                    &theme,
-                    cx.listener(|this, _, _, cx| this.toggle_right_pane(cx)),
-                ))
-            });
+            .children(trailing);
 
         // The unified window titlebar: full-width on the glass shell, ABOVE
         // the inset card. No bottom border — the card's own hairline is the
