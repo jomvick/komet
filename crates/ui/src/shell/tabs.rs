@@ -127,8 +127,15 @@ impl Shell {
         // In takeover the title hides and the strip owns the whole band, so
         // the row's left inset pulls back to the sidebar seam — the title
         // inset would push the scope dropdown off the pane's own left gutter
-        // (user report: misaligned dead space).
-        let row_left = if takeover { sidebar_now } else { content_left };
+        // (user report: misaligned dead space). With the sidebar COLLAPSED
+        // the seam is the window edge, where the traffic lights + nav
+        // cluster overlay lives — the strip must still clear it or the scope
+        // dropdown renders underneath (user report).
+        let row_left = if takeover {
+            sidebar_now.max(self.title_bar_content_start() + plus_inset)
+        } else {
+            content_left
+        };
         let trailing: Option<gpui::AnyElement> = if !git || on_canvas {
             None
         } else if self.right_pane_open(cx) {
