@@ -67,7 +67,7 @@ impl Shell {
         // The canvas titles as NOTHING (user request — a "New session"
         // header over the empty canvas was noise); the bar keeps its height,
         // drag region, and buttons. A session appends its target as a muted
-        // "/project @ device" tag right of the title (the composer footer no
+        // "project @ device" tag right of the title (the composer footer no
         // longer carries it).
         let (title, target, harness, on_canvas): (
             SharedString,
@@ -91,7 +91,7 @@ impl Shell {
                         SharedString::from(transcript::single_line(
                             &chat.title.clone().unwrap_or_else(|| "New session".into()),
                         )),
-                        Some(SharedString::from(format!("/{folder} @ {device}"))),
+                        Some(SharedString::from(format!("{folder} @ {device}"))),
                         chat.config.as_ref().map(|c| c.harness),
                         false,
                     )

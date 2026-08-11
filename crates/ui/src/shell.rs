@@ -1874,7 +1874,9 @@ impl Shell {
                                 .py(px(6.0))
                                 .text_size(px(13.0))
                                 .when(selected, |el| {
-                                    el.bg(crate::theme::wash(0.17))
+                                    // Same tokens as the main sidebar's session
+                                    // rows — the two sidebars must feel alike.
+                                    el.bg(crate::theme::glass_selected_bg())
                                         .font_weight(gpui::FontWeight::MEDIUM)
                                 })
                                 .text_color(if selected {
@@ -1883,7 +1885,7 @@ impl Shell {
                                     theme.text_muted
                                 })
                                 .cursor_pointer()
-                                .hover(|s| s.bg(crate::theme::wash(0.11)).text_color(theme.text))
+                                .hover(|s| s.bg(theme.glass_hover()).text_color(theme.text))
                                 .on_click(
                                     cx.listener(move |this, _, _, cx| this.open_settings(item, cx)),
                                 )
@@ -1911,7 +1913,7 @@ impl Shell {
                         .text_size(px(13.0))
                         .text_color(theme.text_muted)
                         .cursor_pointer()
-                        .hover(|s| s.bg(crate::theme::wash(0.11)).text_color(theme.text))
+                        .hover(|s| s.bg(theme.glass_hover()).text_color(theme.text))
                         .on_click(cx.listener(|this, _, _, cx| this.close_settings(cx)))
                         .child(
                             // AltArrowLeft chevron (komet settings-sidebar.tsx),

@@ -153,14 +153,15 @@ pub fn option_card(
 }
 
 /// Section card: `mt-6 overflow-hidden rounded-xl border border-border bg-card`
-/// — the opaque raised-card tone (komet `--card`), not a translucent wash.
+/// — the card tone, thinned to a translucent tint over glass so the card
+/// reads as frost instead of a solid slab ([`Theme::card_glass_bg`]).
 pub fn section_card(theme: &Theme) -> gpui::Div {
     div()
         .mt(px(24.0))
         .rounded(px(12.0))
         .border_1()
         .border_color(theme.border)
-        .bg(theme.surface)
+        .bg(theme.card_glass_bg())
         .overflow_hidden()
         .flex()
         .flex_col()

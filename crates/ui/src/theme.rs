@@ -296,7 +296,7 @@ impl Theme {
     /// `under-window` vibrancy MATERIAL, which pre-darkens the blur; our bare
     /// backdrop blur has no material layer, so the scrim runs heavier to land
     /// on the same perceived tone (see [`Theme::glass`]).
-    pub const GLASS_ALPHA: f32 = if cfg!(target_os = "macos") { 0.90 } else { 1.0 };
+    pub const GLASS_ALPHA: f32 = if cfg!(target_os = "macos") { 0.80 } else { 1.0 };
     /// Light-mode frost alpha — glass-forward, like dark mode.
     ///
     /// A light tint controls the blur less than a dark one: the desktop's
@@ -306,7 +306,7 @@ impl Theme {
     /// vibrancy material is mostly white). Floating cards compensate further:
     /// see [`Self::glass_overlay`], where light coverage steps up to keep menu
     /// text legible over an unknown backdrop.
-    pub const GLASS_ALPHA_LIGHT: f32 = if cfg!(target_os = "macos") { 0.90 } else { 1.0 };
+    pub const GLASS_ALPHA_LIGHT: f32 = if cfg!(target_os = "macos") { 0.80 } else { 1.0 };
     /// Main-panel header height (komet `h-11`) — in-card headers (changes pane).
     pub const HEADER_HEIGHT: f32 = 44.0;
     /// The unified window titlebar (traffic lights + cluster + tabs). Content
@@ -373,23 +373,19 @@ impl Theme {
     }
 
     /// Hover wash for chrome that sits ON GLASS (sidebar rows, tabs, titlebar
-    /// buttons). Dark: the standard luminous hover. Light: a white wash below
-    /// [`glass_selected_bg`] — the appearance-neutral `element_hover` is a
-    /// *black* wash in light mode, which put a dark hover next to a white
-    /// selection on the same surface (user report). Hover and selection must
-    /// lift the same way.
+    /// buttons). One recipe, both appearances: the 11% [`wash`], tone-flipped
+    /// by the palette convention (soft-white on dark, soft-black on light).
     ///
-    /// Dark gives hover and selection the SAME fill (selection adds only the
-    /// ring) because the wash is a 14% translucent glow. Light cannot mirror
-    /// that literally — its selected fill is near-opaque white, and fill
-    /// parity would flash a solid card under every pointer pass — so hover
-    /// runs the same direction at roughly half the lift instead. 0.30 was
-    /// invisible against the bright frost: rest→hover has to be as legible a
-    /// step as dark's, or the sidebar feels dead under the pointer.
+    /// Hover and selection share the SAME fill (selection adds only the ring).
+    /// Light previously ran heavy white washes here (hover 0.55, selection
+    /// 0.92) after a black-hover-next-to-white-selection mismatch report; now
+    /// hover and selection are *both* the tone-flipped wash, so they lift the
+    /// same way again. Light's alpha sits under dark's: dark's 11% at the
+    /// light tone read too dark over the bright frost (user report).
     pub fn glass_hover(&self) -> Hsla {
         match self.appearance {
-            Appearance::Dark => self.element_hover,
-            Appearance::Light => hsla(0.0, 0.0, 1.0, 0.55),
+            Appearance::Dark => wash_for(Appearance::Dark, 0.11),
+            Appearance::Light => wash_for(Appearance::Light, 0.06),
         }
     }
 
@@ -408,12 +404,26 @@ impl Theme {
     /// The composer pill / question panel fill. Light's `input_bg` is opaque
     /// white (the elevation ladder on an opaque page) — over glass it read as
     /// a solid slab in front of the frosted blur, so it thins to a
-    /// translucent tint there. Dark's 3% white wash is already glass-native.
+    /// translucent tint there (0.6 and then 0.45 both still read too bright
+    /// over the 0.80 frost — lowered on user request). Dark's 3% white wash
+    /// is already glass-native.
     pub fn input_glass_bg(&self) -> Hsla {
         if self.is_glass() && matches!(self.appearance, Appearance::Light) {
-            self.input_bg.opacity(0.6)
+            self.input_bg.opacity(0.30)
         } else {
             self.input_bg
+        }
+    }
+
+    /// Section-card fill (settings cards and similar in-panel cards). The
+    /// opaque `surface` tone read as a harsh solid slab floating on the
+    /// frosted blur (user report), so glass thins it to a translucent tint;
+    /// opaque platforms keep the true card tone.
+    pub fn card_glass_bg(&self) -> Hsla {
+        if self.is_glass() {
+            self.surface.opacity(0.40)
+        } else {
+            self.surface
         }
     }
 
@@ -453,7 +463,7 @@ impl Theme {
             surface_card: grey(0x0e),
             surface_dialog: grey(0x10),
             surface_overlay: grey(0x16),
-            element_hover: hsla(0.0, 0.0, 0.92, 0.14),
+            element_hover: hsla(0.0, 0.0, 0.92, 0.11),
             element_active: hsla(0.0, 0.0, 0.92, 0.16),
             border: hsla(0.0, 0.0, 1.0, 0.08),
             border_strong: hsla(0.0, 0.0, 1.0, 0.14),
@@ -739,35 +749,39 @@ fn band_for(appearance: Appearance) -> Hsla {
 
 /// Selected-state glass treatment (tabs, session rows, space rows): a
 /// TRANSLUCENT wash the vibrancy reads through — heavier flat washes blocked
-/// the glass (user request).
-///
-/// The wash lifts toward the appearance's *luminous* end. Dark: soft white.
-/// Light: white too, NOT the literal translation to a black wash — 14% black
-/// over light frost reads as a pressed dent and muddies with whatever the
-/// wallpaper puts behind the glass. Thickening the frost toward white pops
-/// the chip forward the way dark's wash glows (the light-Safari active-tab
-/// recipe). Selection *inside floating cards* is different — see
-/// [`card_selected_bg`].
+/// the glass (user request). Dark: the 11% [`wash`]. Light: the tone-flipped
+/// wash at 6% — 11% black read too dark over the bright frost (user report;
+/// light also previously ran a near-opaque white chip, rejected the same
+/// way). Same fill as [`Theme::glass_hover`] — the ring in
+/// [`glass_selected_shadows`] is what distinguishes selection. Selection
+/// *inside floating cards* is different — see [`card_selected_bg`].
 pub fn glass_selected_bg() -> Hsla {
     match current_appearance() {
-        Appearance::Dark => wash(0.14),
-        // Near-opaque: at 0.55 the chip sank into the (bright) frost and the
-        // active tab lost its contrast — the ring and seat shadow in
-        // [`glass_selected_shadows`] carry the edge, the fill carries the pop.
-        Appearance::Light => hsla(0.0, 0.0, 1.0, 0.92),
+        Appearance::Dark => wash(0.11),
+        Appearance::Light => wash(0.06),
+    }
+}
+
+/// The user message bubble's plate: the same translucent wash family as
+/// [`glass_selected_bg`], one step softer — at the selection weight the
+/// bubble read too strong for settled content (user report), and an opaque
+/// plate before that read as a solid slab over glass.
+pub fn user_bubble_bg() -> Hsla {
+    match current_appearance() {
+        Appearance::Dark => wash(0.08),
+        Appearance::Light => wash(0.04),
     }
 }
 
 /// Selected/keyboard-active treatment for rows and chips INSIDE a floating
 /// card (menu rows, the picker rail, segmented chips). The card is already the
 /// bright plane in light mode, so a white lift can't read there — selection is
-/// a grey wash instead, at Primer/Radix "selected" weight (~8% black). The
-/// dark-mode card is translucent dark glass, where the standard luminous wash
-/// still applies.
+/// the tone-flipped grey wash, at 6% (dark's 11% read too dark on the bright
+/// plane, user report).
 pub fn card_selected_bg() -> Hsla {
     match current_appearance() {
-        Appearance::Dark => wash(0.14),
-        Appearance::Light => wash(0.08),
+        Appearance::Dark => wash(0.11),
+        Appearance::Light => wash(0.06),
     }
 }
 
