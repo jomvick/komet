@@ -34,6 +34,9 @@ struct ComposerShell<Chips: View>: View {
     /// Present the photo picker; nil hides the attach button.
     var onAttach: (() -> Void)? = nil
     var onRemoveAttachment: (String) -> Void = { _ in }
+    /// Screenshot rig (-focuscomposer): take keyboard focus shortly after
+    /// appearing, so the keyboard-up transcript states can be driven headless.
+    var autoFocus = false
     @ViewBuilder var chips: Chips
 
     @FocusState private var focused: Bool
@@ -65,6 +68,13 @@ struct ComposerShell<Chips: View>: View {
             .padding(.horizontal, focused ? 10 : 16)
             .motionAnimation(Motion.resize, value: focused)
             .motionAnimation(Motion.collapse, value: expanded)
+            .onAppear {
+                guard autoFocus else { return }
+                Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 1_500_000_000)
+                    focused = true
+                }
+            }
     }
 
     /// The glass surface: collapsed = editor + send in one capsule row;
@@ -236,7 +246,8 @@ struct ComposerView: View {
                 onStop: { store.sendInterrupt() },
                 attachments: attachments,
                 onAttach: { showPicker = true },
-                onRemoveAttachment: { id in attachments.removeAll { $0.id == id } }
+                onRemoveAttachment: { id in attachments.removeAll { $0.id == id } },
+                autoFocus: model.launchFocusComposer
             ) {
                 ComposerChip(label: currentModel.label, badgeHarness: harness) {
                     showModelPicker = true

@@ -19,6 +19,11 @@ struct SessionView: View {
     /// toolbar item (its container proposes an unbounded width).
     @State private var viewWidth: CGFloat = 0
 
+    /// Shared with TranscriptView; owned here so the composer inset (which
+    /// this view composes) can report its global top edge — the measured
+    /// bottom boundary TranscriptView's correctPin re-pins against.
+    @State private var scroll = ScrollState()
+
 
     private var chat: Chat? { model.chat(id: chatId) }
 
@@ -112,7 +117,36 @@ struct SessionView: View {
         // keyboard-dismiss (scrollDismissesKeyboard(.interactively) in
         // TranscriptView) track a downward drag — with a sibling composer the
         // scroll view ends above the keyboard and the pan never engages it.
-        return TranscriptView(store: store, chatId: chat.id)
+        return TranscriptView(store: store, chatId: chat.id, scroll: scroll)
+            // The registry row says this session HAS messages; an empty
+            // transcript is therefore still hydrating (no disk snapshot yet,
+            // checkpoint in flight) — show the pulse, not a black void. This
+            // was "the session is blank when I open it" on a phone that had
+            // never cached the doc.
+            .overlay {
+                if store.entries.isEmpty, store.pendingSends.isEmpty,
+                   chat.lastMessageAt != nil {
+                    TranscriptSkeleton()
+                        .background(Theme.bg)
+                }
+            }
+            .motionAnimation(Motion.fadeQuick, value: store.entries.isEmpty)
+            // The keyboard's own transition bounds the transcript's no-correct
+            // window; didShow/didHide land the single measured glide.
+            .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillShowNotification)) { _ in
+                scroll.keyboardTransitioning = true
+            }
+            .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardDidShowNotification)) { _ in
+                scroll.keyboardTransitioning = false
+                scroll.requestCorrection()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardWillHideNotification)) { _ in
+                scroll.keyboardTransitioning = true
+            }
+            .onReceive(NotificationCenter.default.publisher(for: UIResponder.keyboardDidHideNotification)) { _ in
+                scroll.keyboardTransitioning = false
+                scroll.requestCorrection()
+            }
             .safeAreaInset(edge: .bottom, spacing: 0) {
                 VStack(spacing: 0) {
                     // The strip reserves its 24pt whether or not a run is
@@ -130,6 +164,14 @@ struct SessionView: View {
                         }
                     }
                     .padding(.bottom, 8)
+                }
+                // Report the inset's global top edge — the visual line the
+                // transcript's bottom pad should meet while pinned. Global
+                // frames stay honest when the keyboard's inset math doesn't
+                // (see TranscriptView.correctPin).
+                .onGeometryChange(for: CGFloat.self) { $0.frame(in: .global).minY } action: { [scroll] new in
+                    scroll.insetTopGlobalY = new
+                    scroll.insetTopChangedAt = Date().timeIntervalSinceReferenceDate
                 }
                 // One continuous dissolve: starts 44pt above the strip and
                 // reaches full bg only at the PHYSICAL bottom edge, so rows

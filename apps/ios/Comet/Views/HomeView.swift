@@ -26,6 +26,9 @@ struct HomeView: View {
         NavigationStack(path: $path) {
             List {
                 sessionsSection
+                // The desktop's archived shelf sits under the active list,
+                // scoped by the same space filter.
+                ArchivedSection(spaceId: selectedSpace?.id, path: $path)
             }
             .listStyle(.plain)
             .environment(\.defaultMinListRowHeight, 10)
@@ -238,7 +241,12 @@ struct HomeView: View {
                 .listRowInsets(EdgeInsets(top: 1, leading: 12, bottom: 1, trailing: 12))
                 .swipeActions(edge: .trailing, allowsFullSwipe: true) {
                     Button {
-                        model.archive(chatId: chat.id)
+                        // withAnimation, not a value-keyed .animation: the row
+                        // leaves THIS section and lands in the archived shelf
+                        // — one coordinated List diff, or the hand-off jumps.
+                        withAnimation(Motion.resort) {
+                            model.archive(chatId: chat.id)
+                        }
                     } label: {
                         Label("Archive", systemImage: "archivebox")
                     }
@@ -252,32 +260,28 @@ struct HomeView: View {
 
 // MARK: - Rows
 
-/// The desktop session row (shell.rs `render_chat_row`), line for line: the
-/// status rail leads a muted context line carrying the space name and the
-/// relative time; the title sits on its own line below; harness mark and branch
-/// close it out. Lines 2 and 3 indent by rail + gap so they start exactly under
-/// the context line rather than beside the rail.
+/// The desktop session row (shell.rs `render_chat_row`), line for line: a
+/// muted context line with the status word in the corner (dot + word, muted;
+/// Done keeps its pop with a check; Idle rows carry the time-ago there
+/// instead); the title on its own line; harness mark and branch close it out,
+/// with the mini spinner riding the row's bottom-right while Working.
 ///
 /// The one addition the phone needs: the desktop row names only the space
 /// because its sidebar sits on the machine running the work. Here the Sessions
 /// list interleaves every device, and a session whose host has gone offline
-/// can't be driven at all — so the context line reads "space · device".
+/// can't be driven at all — so the context line reads "space @ device".
 struct ChatRow: View {
     @Environment(AppModel.self) private var model
     let chat: Chat
     var showLocation: Bool
-
-    /// Rail (6) + gap (8) — see `render_chat_row`'s `pl(px(14.0))`.
-    private static let indent: CGFloat = StatusRail.width + 8
 
     private var subline: Color { Theme.textMuted.opacity(0.5) }
 
     var body: some View {
         let indicator = model.indicator(for: chat)
         VStack(alignment: .leading, spacing: 2) {
-            // Line 1: status rail, space · device, time-ago.
+            // Line 1: space @ device, status corner (time-ago when idle).
             HStack(spacing: 8) {
-                StatusRail(indicator: indicator)
                 if showLocation {
                     Text(location)
                         .font(Theme.sans(11))
@@ -288,10 +292,14 @@ struct ChatRow: View {
                 } else {
                     Spacer(minLength: 4)
                 }
-                Text(relativeTime(chat.lastMessageAt ?? chat.createdAt))
-                    .font(Theme.sans(11))
-                    .foregroundStyle(subline)
-                    .fixedSize()
+                if indicator == .idle {
+                    Text(relativeTime(chat.lastMessageAt ?? chat.createdAt))
+                        .font(Theme.sans(10, weight: .medium))
+                        .foregroundStyle(subline)
+                        .fixedSize()
+                } else {
+                    StatusCorner(indicator: indicator)
+                }
             }
 
             // Line 2: the session title.
@@ -300,10 +308,9 @@ struct ChatRow: View {
                 .foregroundStyle(Theme.text)
                 .lineLimit(1)
                 .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(.leading, Self.indent)
 
             // Line 3: harness brand mark, then the branch when the engine
-            // stamped one.
+            // stamped one; the Working spinner rides bottom-right.
             HStack(spacing: 4) {
                 if let harness = chat.config?.harness {
                     HarnessBadge(harness: harness, size: 11, neutral: subline)
@@ -317,8 +324,10 @@ struct ChatRow: View {
                         .truncationMode(.tail)
                 }
                 Spacer(minLength: 0)
+                if indicator == .working {
+                    MiniSpinner()
+                }
             }
-            .padding(.leading, Self.indent)
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 6)
