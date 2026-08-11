@@ -427,19 +427,18 @@ impl Pickers {
             .map(ComposerDefaults::load)
             .unwrap_or_default();
         // Restore the last device/project picks (the canvas's "defaults to
-        // last selected" rule). Vanished rows heal in `apply_spaces`; a
-        // remembered opt-out sticks.
+        // last selected" rule). Vanished rows heal in `apply_spaces`. A
+        // remembered "Don't work in a project" opt-out is deliberately NOT
+        // restored: the menu row is gone, so a stale saved opt-out would
+        // strand the canvas in a state the picker can no longer express.
         {
             let device = defaults.device.clone();
             let project = defaults.project.clone();
-            let no_project = defaults.no_project;
             state.update(cx, |s, _| {
                 if s.selected_device.is_none() {
                     s.selected_device = device;
                 }
-                if no_project {
-                    s.no_project = true;
-                } else if s.selected_space.is_none() {
+                if s.selected_space.is_none() {
                     s.selected_space = project;
                 }
             });
@@ -1416,14 +1415,6 @@ impl Pickers {
         self.close(cx);
     }
 
-    /// "Don't work in a project": the canvas mints project-less sessions
-    /// (cwd `~` on the picked device).
-    fn pick_no_project(&mut self, cx: &mut Context<Self>) {
-        self.state.update(cx, |s, cx| s.select_space(None, cx));
-        self.remember_target(cx);
-        self.close(cx);
-    }
-
     fn pick_device(&mut self, device_id: String, cx: &mut Context<Self>) {
         self.state.update(cx, |s, cx| s.select_device(device_id, cx));
         self.remember_target(cx);
@@ -1566,19 +1557,13 @@ impl Pickers {
     }
 
     /// The project popover: search + one row per project on the picked device
-    /// (check on the current pick), then "New project…" and "Don't work in a
-    /// project" action rows. Rows are device-scoped, so no per-row `@ device`
-    /// tag — the device chip next door names the host.
+    /// (check on the current pick), then a "New project…" action row. Rows
+    /// are device-scoped, so no per-row `@ device` tag — the device chip next
+    /// door names the host.
     fn render_space_popover(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let rows = self.filtered_space_rows(cx);
-        let (selected, no_project): (Option<String>, bool) = {
-            let state = self.state.read(cx);
-            (
-                state.selected_space_row().map(|s| s.id.clone()),
-                state.no_project,
-            )
-        };
+        let selected = self.state.read(cx).selected_space_row().map(|s| s.id.clone());
         let active = self.active;
         let body: AnyElement = if rows.is_empty() {
             // Distinguish "the filter ate everything" from "this device has
@@ -1620,7 +1605,7 @@ impl Pickers {
                 }))
                 .into_any_element()
         };
-        // Action rows under a hairline: mint a project, or opt out of one.
+        // Action row under a hairline: mint a project.
         let new_project = popover::menu_row_nav(&theme, false, false, "project-new".to_string())
             .id("project-new")
             .on_click(cx.listener(|this, _, window, cx| {
@@ -1640,26 +1625,6 @@ impl Pickers {
                     .truncate()
                     .child(SharedString::from("New project…")),
             );
-        // Hidden while the opt-out is active (the chip already says "No
-        // project") — showing it selected read as a second highlighted row.
-        let opt_out = (!no_project).then(|| {
-            popover::menu_row_nav(&theme, false, false, "project-none".to_string())
-                .id("project-none")
-                .on_click(cx.listener(|this, _, _, cx| this.pick_no_project(cx)))
-                .child(
-                    crate::icons::icon(crate::icons::CLOSE)
-                        .size(px(12.0))
-                        .flex_none()
-                        .text_color(theme.text_muted.opacity(0.7)),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .child(SharedString::from("Don't work in a project")),
-                )
-        });
         div()
             .flex()
             .flex_col()
@@ -1679,7 +1644,6 @@ impl Pickers {
                     .bg(theme.border.opacity(0.6)),
             )
             .child(new_project)
-            .children(opt_out)
             .into_any_element()
     }
 
