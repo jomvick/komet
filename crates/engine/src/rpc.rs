@@ -966,6 +966,7 @@ impl RpcService for EngineRpc {
         }
         match method {
             methods::ENGINE_INFO => RpcReply::value(&self.engine_info),
+            methods::ENGINE_READY => RpcReply::value(&serde_json::json!({ "ready": true })),
             methods::LIST_HARNESSES => RpcReply::value(&self.registry.descriptors()),
             methods::SET_HARNESS_ENABLED => {
                 let p: SetHarnessEnabledParams = parse_params(params)?;
@@ -1393,6 +1394,7 @@ mod tests {
     fn local_device_is_not_forwardable() {
         assert!(!forwardable(methods::LOCAL_DEVICE));
         assert!(!forwardable(methods::ENGINE_INFO));
+        assert!(!forwardable(methods::ENGINE_READY));
         assert!(forwardable(methods::QUEUE_COMMAND));
         assert!(forwardable(methods::SEARCH_FILES));
     }
