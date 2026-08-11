@@ -1382,7 +1382,7 @@ impl Changes {
             trigger
         };
 
-        let fold = Self::header_button("changes-fold-all", crate::icons::SORT_VERTICAL, &theme)
+        let fold = Self::header_button("changes-fold-all", crate::icons::FOLD_VERTICAL, &theme)
             .on_click(cx.listener(|this, _, _, cx| {
                 cx.stop_propagation();
                 this.toggle_collapse_all(cx);

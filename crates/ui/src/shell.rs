@@ -3420,8 +3420,12 @@ impl Shell {
             .size_full()
             .flex()
             .flex_col()
-            .border_l_1()
-            .border_color(theme.border)
+            // In takeover the panel's left edge IS the sidebar seam, which
+            // already carries the sidebar tone's right hairline — a second
+            // border there doubled up (user report).
+            .when(!self.right_pane_expanded, |el| {
+                el.border_l_1().border_color(theme.border)
+            })
             .bg(panel_bg)
             .overflow_hidden()
             // The titlebar is a glass overlay over the full-height content

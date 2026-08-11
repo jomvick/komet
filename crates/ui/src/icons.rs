@@ -79,6 +79,9 @@ icon_assets![
     // Hand-drawn expand/maximize arrows in the Solar Linear style (like the
     // terminal/plus/return ports) — the set has no expand glyph.
     (EXPAND_ARROWS, "expand-arrows"),
+    // Hand-drawn fold-all chevrons, drawn as a family with EXPAND_ARROWS
+    // (same stroke, caps, 90° joints) — Solar has no unfold-less either.
+    (FOLD_VERTICAL, "fold-vertical"),
     (ALT_ARROW_LEFT, "alt-arrow-left"),
     (ALT_ARROW_RIGHT, "alt-arrow-right"),
     (SMARTPHONE, "smartphone"),
