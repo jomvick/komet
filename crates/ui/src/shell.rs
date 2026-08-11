@@ -3070,14 +3070,23 @@ impl Shell {
                 // report). The jump pill floats outside the fade scope,
                 // anchored above the measured stack.
                 {
-                    let stack_h = self.bottom_stack.get();
+                    // The terminal dock is NOT glass the transcript may slide
+                    // under: with the dock's translucent fill, transcript text
+                    // ghosted through the grid (user report). The underlay
+                    // ends at the dock's top instead, riding the same height
+                    // tween the dock animates with; `stack_h` below is only
+                    // the chrome that still overlaps the transcript (status
+                    // strip + composer).
+                    let term_h = self.eval_tween(self.terminal_tween, self.terminal_target(cx));
+                    let stack_h = (self.bottom_stack.get() - term_h).max(0.0);
                     // Opaque from the composer PILL's top (the reserved
                     // status strip above it is empty air), zero at the
-                    // window's bottom edge.
+                    // underlay's bottom edge.
                     let bottom_band = (stack_h - Theme::STATUS_STRIP_HEIGHT).max(1.0);
                     div()
                         .absolute()
                         .inset_0()
+                        .bottom(px(term_h))
                         .child(crate::edge_fade::edge_faded(
                             Theme::TRANSCRIPT_FADE_BAND,
                             true,
@@ -3256,14 +3265,18 @@ impl Shell {
             );
 
         // Fixed-height inner clipped by the animated container: content never
-        // reflows mid-transition (same trick as the side panes).
+        // reflows mid-transition (same trick as the side panes). The handle
+        // FLOATS over the panel's top edge (painted after, so it wins hit
+        // testing) instead of stacking above it — stacked, its 5px read as
+        // dead air between the seam and the tab bar (user report).
         let inner = div()
             .h(px(height))
             .w_full()
+            .relative()
             .flex()
             .flex_col()
-            .child(handle)
-            .child(div().flex_1().min_h_0().child(panel));
+            .child(div().flex_1().min_h_0().child(panel))
+            .child(handle.absolute().top_0().left_0().right_0());
 
         div()
             .w_full()
@@ -4136,7 +4149,11 @@ impl Render for Shell {
                 // MessageRail width gate: hide below 48rem of main-panel width.
                 let viewport = f32::from(window.viewport_size().width);
                 let main_width = viewport - self.sidebar_target() - self.right_target(cx) - 10.0;
-                let stack_h = self.bottom_stack.get();
+                // Clearance excludes the terminal dock: the transcript
+                // viewport ends at the dock's top (see the underlay in
+                // `render_main`), so only the chrome above it overlaps.
+                let term_h = self.eval_tween(self.terminal_tween, self.terminal_target(cx));
+                let stack_h = (self.bottom_stack.get() - term_h).max(0.0);
                 self.transcript.update(cx, |t, cx| {
                     t.set_rail_enabled(rail::rail_visible(main_width), cx);
                     t.set_bottom_clearance(stack_h, cx);
