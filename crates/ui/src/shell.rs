@@ -3468,20 +3468,6 @@ impl Shell {
                                 .id("onboarding-add-space")
                                 .mt(px(20.0))
                                 .on_click(cx.listener(|this, _, _, cx| this.open_add_space(cx))),
-                        )
-                        .child(
-                            div()
-                                .id("onboarding-no-project")
-                                .mt(px(10.0))
-                                .text_size(px(12.0))
-                                .text_color(theme.text_muted.opacity(0.6))
-                                .cursor_pointer()
-                                .hover(|s| s.text_color(theme.text_muted))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.state
-                                        .update(cx, |s, cx| s.select_space(None, cx));
-                                }))
-                                .child(SharedString::from("Or start without a project")),
                         ),
                 ))
                 .into_any_element()
