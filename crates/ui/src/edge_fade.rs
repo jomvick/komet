@@ -7,7 +7,7 @@
 
 use gpui::{
     AnyElement, App, Bounds, EdgeFade, Element, GlobalElementId, InspectorElementId, IntoElement,
-    LayoutId, Pixels, Window, px,
+    LayoutId, Pixels, ScrollHandle, Window, px,
 };
 
 /// Fade the child's content at its own edges: `top`/`bottom` select which
@@ -24,6 +24,7 @@ pub fn edge_faded(band: f32, top: bool, bottom: bool, child: impl IntoElement) -
         bottom,
         left: false,
         right: false,
+        scroll_y: None,
         child: child.into_any_element(),
     }
 }
@@ -37,6 +38,7 @@ pub struct EdgeFaded {
     bottom: bool,
     left: bool,
     right: bool,
+    scroll_y: Option<ScrollHandle>,
     child: AnyElement,
 }
 
@@ -62,6 +64,18 @@ impl EdgeFaded {
     /// [`Self::band_top`], for the bottom edge.
     pub fn band_bottom(mut self, px: f32) -> Self {
         self.band_bottom = Some(px);
+        self
+    }
+
+    /// Gate the vertical fades on the handle's overflow, read at PAINT time —
+    /// after the tracked div's prepaint has clamped the offset for this frame.
+    /// Render-time gating rides the LAST frame's offset, which goes stale on
+    /// the final frame of a content shrink (rows removed while scrolled):
+    /// prepaint clamps the offset to fit, nothing re-renders, and a fade with
+    /// no overflow sticks on screen (user report). `top`/`bottom` become
+    /// enables; the handle decides per frame.
+    pub fn fade_overflow_y(mut self, handle: &ScrollHandle) -> Self {
+        self.scroll_y = Some(handle.clone());
         self
     }
 
@@ -119,7 +133,14 @@ impl Element for EdgeFaded {
         window: &mut Window,
         cx: &mut App,
     ) {
-        let fade = (self.top || self.bottom || self.left || self.right).then(|| {
+        let (mut top, mut bottom) = (self.top, self.bottom);
+        if let Some(scroll) = &self.scroll_y {
+            let scrolled = -f32::from(scroll.offset().y);
+            let max_scroll = f32::from(scroll.max_offset().y);
+            top &= scrolled > 1.0;
+            bottom &= scrolled < max_scroll - 1.0;
+        }
+        let fade = (top || bottom || self.left || self.right).then(|| {
             let mut bounds = bounds;
             bounds.origin.y += px(self.inset_top);
             bounds.size.height -= px(self.inset_top);
@@ -128,8 +149,8 @@ impl Element for EdgeFaded {
                 band: px(self.band),
                 band_top: self.band_top.map(px),
                 band_bottom: self.band_bottom.map(px),
-                top: self.top,
-                bottom: self.bottom,
+                top,
+                bottom,
                 left: self.left,
                 right: self.right,
             }

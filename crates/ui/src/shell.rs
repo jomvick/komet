@@ -343,7 +343,7 @@ const CHAT_ROW_HEIGHT: f32 = 61.0;
 /// Flex gap between sidebar list items.
 const SIDEBAR_LIST_GAP: f32 = 2.0;
 
-/// Ramp height of the glass sidebar's scroll-edge fade (the gpui
+/// Ramp height of the sidebar's scroll-edge fade (the gpui
 /// [`gpui::EdgeFade`] scope — per-primitive, so text fades per glyph).
 const SIDEBAR_GLASS_FADE_BAND: f32 = 32.0;
 
@@ -2216,14 +2216,6 @@ impl Shell {
             .into_any_element()
     }
 
-    /// Which sidebar-list edges have hidden overflow (offset from the LAST
-    /// frame — the invisible one-frame lag every fade here rides).
-    pub(super) fn sidebar_fade_zones(&self) -> (bool, bool) {
-        let scrolled = -f32::from(self.sidebar_scroll.offset().y);
-        let max_scroll = f32::from(self.sidebar_scroll.max_offset().y);
-        (scrolled > 1.0, scrolled < max_scroll - 1.0)
-    }
-
     /// Chat-mode sidebar (spaces overhaul): window-control strip, the Spaces
     /// section (folder + device rows, add-space), the global Active sessions
     /// list, the notice strip, and the UserMenu (§1.6).
@@ -2288,18 +2280,6 @@ impl Shell {
         // t3code's archived accordion, below the active list.
         let archived_section = self.render_archived_section(theme, cx);
 
-        // Overflow edge fades for the lists scroll region — the tab strip's
-        // idiom, vertical (offset from the LAST frame; the lag is invisible).
-        let (lists_fade_top, lists_fade_bottom) = self.sidebar_fade_zones();
-        // Opaque platforms melt overflow into the surface tone with painted
-        // gradient overlays. Over GLASS no overlay can work — the backdrop is
-        // see-through blur, so tone stacks into a smudge and black reads as a
-        // shadow (user reports). Instead the ROWS fade themselves: prepaint-
-        // measured bounds drive per-row opacity toward the viewport edges
-        // ([`Shell::sidebar_row_alpha`]), dissolving the edge to pure glass.
-        let glass = theme.is_glass();
-        let sidebar_fade = theme.surface;
-
         let user_line: SharedString = user
             .as_ref()
             .map(|u| u.name.clone().unwrap_or_else(|| u.email.clone()).into())
@@ -2319,13 +2299,19 @@ impl Shell {
             // (No titlebar strip: the unified window titlebar spans the whole
             // window above this column.)
             .child(filter_row)
-            // The (filtered) Sessions list scrolls. On glass the whole region
-            // paints inside an EdgeFade scope — a true per-glyph gradient at
-            // active overflow edges.
+            // The (filtered) Sessions list scrolls inside an EdgeFade scope —
+            // a true per-glyph gradient at active overflow edges. Glass-safe
+            // (no painted overlay can fade content over see-through blur) and
+            // equivalent on opaque themes: alpha→0 reveals the surface tone
+            // underneath, same as the gradient overlays it replaced. Overflow
+            // is read at PAINT time via the scroll handle — render-time gating
+            // rode the previous frame's offset, so the last frame of a content
+            // shrink (row archived while scrolled) left a phantom fade stuck
+            // over an unscrollable list (user report).
             .child(crate::edge_fade::edge_faded(
                 SIDEBAR_GLASS_FADE_BAND,
-                glass && lists_fade_top,
-                glass && lists_fade_bottom,
+                true,
+                true,
                 div()
                     .relative()
                     .flex_1()
@@ -2360,32 +2346,9 @@ impl Shell {
                                     .into_any_element()
                             })
                             .children(archived_section),
-                    )
-                    .when(lists_fade_top && !glass, |el| {
-                        el.child(div().absolute().top_0().left_0().right_0().h(px(24.0)).bg(
-                            gpui::linear_gradient(
-                                180.0,
-                                gpui::linear_color_stop(sidebar_fade, 0.0),
-                                gpui::linear_color_stop(sidebar_fade.opacity(0.0), 1.0),
-                            ),
-                        ))
-                    })
-                    .when(lists_fade_bottom && !glass, |el| {
-                        el.child(
-                            div()
-                                .absolute()
-                                .bottom_0()
-                                .left_0()
-                                .right_0()
-                                .h(px(24.0))
-                                .bg(gpui::linear_gradient(
-                                    0.0,
-                                    gpui::linear_color_stop(sidebar_fade, 0.0),
-                                    gpui::linear_color_stop(sidebar_fade.opacity(0.0), 1.0),
-                                )),
-                        )
-                    }),
-            ))
+                    ),
+            )
+            .fade_overflow_y(&self.sidebar_scroll))
             // Update strip (above the user menu; below the lists).
             .when_some(self.render_update_strip(theme, cx), |el, strip| {
                 el.child(strip)
