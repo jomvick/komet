@@ -341,7 +341,17 @@ impl Render for DevicesPage {
                             .child(widgets::meta_line(&theme, meta)),
                     )
                     .when(is_local, |el| {
-                        el.child(widgets::badge(&theme, "This device"))
+                        el.child(
+                            div()
+                                .flex_none()
+                                .text_size(px(10.5))
+                                .text_color(theme.text_muted)
+                                .child(if workspace_scope == Some(WorkspaceScope::Local) {
+                                    "Local only"
+                                } else {
+                                    "This device"
+                                }),
+                        )
                     })
                     .child(
                         // `opacity-70 hover:opacity-100` (komet: also rises on

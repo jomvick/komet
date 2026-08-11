@@ -657,7 +657,17 @@ impl AppState {
         }
     }
 
-    pub fn apply_devices(&mut self, devices: Vec<Device>) {
+    pub fn apply_devices(&mut self, mut devices: Vec<Device>) {
+        // A local-only workspace has no remote device identity to distinguish.
+        // Keep the engine's legacy sentinel out of the UI while preserving real
+        // hostnames and user-assigned device names.
+        if self.workspace_scope == Some(WorkspaceScope::Local)
+            && let Some(local_id) = self.local_device_id.as_deref()
+            && let Some(device) = devices.iter_mut().find(|device| device.id == local_id)
+            && device.name == "unknown-device"
+        {
+            device.name = "Local".to_string();
+        }
         self.devices = devices;
     }
 
@@ -1937,6 +1947,35 @@ mod tests {
             status: None,
             continuation_of: None,
         }
+    }
+
+    fn device(id: &str, name: &str) -> Device {
+        Device {
+            id: id.into(),
+            name: name.into(),
+            platform: "macos".into(),
+            last_seen_at: None,
+            created_at: None,
+            version: None,
+        }
+    }
+
+    #[test]
+    fn local_workspace_hides_the_unknown_device_sentinel() {
+        let mut state = AppState::new();
+        state.workspace_scope = Some(WorkspaceScope::Local);
+        state.local_device_id = Some("local".into());
+
+        state.apply_devices(vec![
+            device("local", "unknown-device"),
+            device("remote", "unknown-device"),
+        ]);
+
+        assert_eq!(state.device_name("local"), Some("Local"));
+        assert_eq!(state.device_name("remote"), Some("unknown-device"));
+
+        state.apply_devices(vec![device("local", "José's MacBook Pro")]);
+        assert_eq!(state.device_name("local"), Some("José's MacBook Pro"));
     }
 
     #[test]
