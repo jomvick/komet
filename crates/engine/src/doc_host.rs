@@ -1287,6 +1287,124 @@ impl DocHost {
         Ok(())
     }
 
+    /// Boot-time transcript salvage (born-gen2 aftermath, 2026-08-11): a chat
+    /// we host whose chat2 doc has NO message entries while its run journal
+    /// has events lost its transcript to a stuck s2 handle (the retired flag
+    /// suppressed every snapshot save; the post-restart reopen born a blank
+    /// lineage). The full fat doc still exists in the legacy s2 room — the
+    /// stuck engine pushed every op into it until it died — and sometimes in
+    /// a `.pre-chat2` rollback on disk. Re-append its entries (thinned) into
+    /// the LIVE chat2 lineage as ordinary incremental updates: no lineage
+    /// replacement, no checkpoint surgery, every device converges through
+    /// the normal room flow. Idempotent: a doc with any message entry is
+    /// never touched, and the salvage only runs on the hosting device.
+    pub fn spawn_transcript_salvage(&self, journals_dir: std::path::PathBuf) {
+        let host = self.clone();
+        tokio::spawn(async move {
+            // Let boot settle (registry load, room joins) before sweeping.
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            let Some(ws) = host.workspace() else { return };
+            let chats: Vec<komet_proto::Chat> = ws.watch_chats().borrow().clone();
+            for chat in chats {
+                if chat.device_id != host.inner.config.device_id {
+                    continue; // only the host owns its chats' history
+                }
+                if chat.room_gen.unwrap_or(1) < 2 {
+                    continue; // still s2-mode: transcript lives in its room
+                }
+                let journal = journals_dir.join(format!("{}.jsonl", chat.id));
+                let journaled = std::fs::metadata(&journal)
+                    .map(|m| m.len() > 0)
+                    .unwrap_or(false);
+                if !journaled {
+                    continue; // never ran here — an empty doc is just new
+                }
+                if let Err(err) = host.salvage_chat_transcript(&chat.id).await {
+                    tracing::warn!(chat = %chat.id, error = %err, "transcript salvage failed");
+                }
+            }
+        });
+    }
+
+    async fn salvage_chat_transcript(&self, chat_id: &str) -> Result<(), String> {
+        let handle = self.open(chat_id).map_err(|e| e.to_string())?;
+        if !handle.doc().read_entries().map_err(|e| e.to_string())?.is_empty() {
+            return Ok(()); // transcript present — nothing lost
+        }
+        // Fat source 1: the M3 adopt's rollback copy on disk.
+        let rollback_id = format!("{chat_id}.pre-chat2");
+        let mut fat_bytes = self.inner.store.load_snapshot(&rollback_id).ok().flatten();
+        // Fat source 2: the legacy s2 room.
+        if fat_bytes.is_none() {
+            fat_bytes = self.fetch_s2_room_doc(chat_id).await;
+        }
+        let Some(bytes) = fat_bytes else {
+            return Ok(()); // no fat lineage anywhere — genuinely empty chat
+        };
+        let raw = loro::LoroDoc::new();
+        raw.import(&bytes).map_err(|e| e.to_string())?;
+        let fat = SessionDoc::from_doc(raw);
+        // Thin before appending (docs/chat2-sync.md A2): full outputs are
+        // parked, exactly like a seed — they survive in the rollback copy
+        // saved below and the run journal.
+        let rebuilt = komet_doc::rebuild::rebuild_thin_doc(&fat).map_err(|e| e.to_string())?;
+        let entries = rebuilt.doc.read_entries().map_err(|e| e.to_string())?;
+        if entries.is_empty() {
+            return Ok(());
+        }
+        if matches!(self.inner.store.load_snapshot(&rollback_id), Ok(None)) {
+            let _ = self.inner.store.save_snapshot(&rollback_id, &bytes);
+        }
+        // Re-check emptiness at the last instant: a run that started during
+        // the room fetch must not get history interleaved under it.
+        if !handle.doc().read_entries().map_err(|e| e.to_string())?.is_empty() {
+            return Err("doc gained entries mid-salvage; aborted".into());
+        }
+        for entry in &entries {
+            handle.doc().push_message(entry).map_err(|e| e.to_string())?;
+        }
+        tracing::info!(chat = %chat_id, entries = entries.len(),
+            "transcript salvaged into chat2 lineage");
+        Ok(())
+    }
+
+    /// Join the legacy s2 room with a throwaway doc, wait for the backfill to
+    /// quiesce, and export what it holds. `None` = no edge, unreachable, or
+    /// the room is empty.
+    async fn fetch_s2_room_doc(&self, chat_id: &str) -> Option<Vec<u8>> {
+        let edge = self.inner.config.edge.clone()?;
+        let url = edge.room_url(format!("/session/{chat_id}/ws"));
+        let doc = loro::LoroDoc::new();
+        let client = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            RoomClient::connect_via(url, chat_id, doc.clone()),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        let mut last = doc.oplog_vv().encode();
+        let mut quiet = 0u32;
+        for _ in 0..30u32 {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            let vv = doc.oplog_vv().encode();
+            if vv == last {
+                quiet += 1;
+                if quiet >= 3 {
+                    break;
+                }
+            } else {
+                quiet = 0;
+                last = vv;
+            }
+        }
+        drop(client);
+        let fat = SessionDoc::from_doc(doc);
+        if fat.read_entries().ok()?.is_empty() {
+            return None; // empty or never-materialized room
+        }
+        fat.export_snapshot().ok()
+    }
+
     /// chat2 host duties on the doc-quiesce tick (docs/chat2-sync.md C3):
     /// - threshold checkpoint: when the room's row log passes 512KB or 200
     ///   rows, post a full checkpoint so cold readers load one compact blob
