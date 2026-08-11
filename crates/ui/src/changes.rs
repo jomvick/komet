@@ -1505,19 +1505,32 @@ impl Changes {
         popover::popover_card(theme)
             .w(px(180.0))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_scope_menu(cx)))
-            .children(DiffScope::ALL.into_iter().enumerate().map(|(ix, scope)| {
-                popover::menu_row(theme, scope == current, format!("changes-scope-row-{ix}"))
-                    .id(("changes-scope-row", ix))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.set_scope(scope, cx);
-                        this.close_scope_menu(cx);
-                    }))
-                    .child(
-                        div()
-                            .flex_1()
-                            .child(SharedString::from(scope.label())),
-                    )
-            }))
+            .child(
+                // The 2px row gap every other menu carries — rows straight on
+                // the card abutted, adjacent washes read as one slab (user
+                // report).
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .children(DiffScope::ALL.into_iter().enumerate().map(|(ix, scope)| {
+                        popover::menu_row(
+                            theme,
+                            scope == current,
+                            format!("changes-scope-row-{ix}"),
+                        )
+                        .id(("changes-scope-row", ix))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_scope(scope, cx);
+                            this.close_scope_menu(cx);
+                        }))
+                        .child(
+                            div()
+                                .flex_1()
+                                .child(SharedString::from(scope.label())),
+                        )
+                    })),
+            )
             .into_any_element()
     }
 
