@@ -134,7 +134,13 @@ impl Shell {
         // strip doesn't want (it brings its own 8px pad), and doubling up
         // read as a hole after the `+` (user report).
         let row_left = if takeover {
-            let cluster_end = self.title_bar_content_start() - 10.0 + plus_inset;
+            // The scope dropdown should sit at the cluster's own 2px button
+            // rhythm off the `+` — anything more read as a hole in the button
+            // row (user report). Between `row_left` and the trigger box sit
+            // 16px of chrome (the row's 8px child gap + the strip's 8px pad),
+            // and `title_bar_content_start` adds a 10px text margin: land the
+            // box at cluster end + 2 ⇒ −(10 + 16 − 2).
+            let cluster_end = self.title_bar_content_start() - 10.0 + plus_inset - 14.0;
             sidebar_now.max(cluster_end)
         } else {
             content_left
