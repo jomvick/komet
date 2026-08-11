@@ -115,7 +115,14 @@ struct Inner {
     harness_sessions: Mutex<HashMap<String, HarnessSessionRef>>,
     /// Auto-titler for untitled chats (wired at engine assembly; absent in bare tests).
     titles: OnceLock<crate::titles::TitleGenerator>,
+    /// Fired with `(chat_id, cwd)` when a user prompt starts a turn (fresh
+    /// dispatch or accepted steer) — the diff sync snapshots the checkout tree
+    /// for the Changes pane's "Latest turn" scope. Absent in bare tests.
+    turn_listener: OnceLock<TurnListener>,
 }
+
+/// Turn-start hook: called with `(chat_id, cwd)`.
+pub type TurnListener = Arc<dyn Fn(&str, &str) + Send + Sync>;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -146,6 +153,7 @@ impl SessionsEngine {
                 last_requests: Mutex::new(HashMap::new()),
                 harness_sessions: Mutex::new(HashMap::new()),
                 titles: OnceLock::new(),
+                turn_listener: OnceLock::new(),
             }),
         }
     }
@@ -160,6 +168,17 @@ impl SessionsEngine {
     /// completed exchange the run task fires it for still-untitled chats.
     pub fn set_titles(&self, titles: crate::titles::TitleGenerator) {
         let _ = self.inner.titles.set(titles);
+    }
+
+    /// Wire the turn-start listener (called once at engine assembly).
+    pub fn set_turn_listener(&self, listener: TurnListener) {
+        let _ = self.inner.turn_listener.set(listener);
+    }
+
+    fn note_turn_start(&self, chat_id: &str, cwd: &str) {
+        if let Some(listener) = self.inner.turn_listener.get() {
+            listener(chat_id, cwd);
+        }
     }
 
     fn doc_handle(&self, chat_id: &str) -> Result<Arc<ChatDocHandle>, EngineError> {
@@ -263,6 +282,8 @@ impl SessionsEngine {
         // Project-less chats store cwd `~` (the creating device can't know the
         // host's home); expand it here, on the host, where the run spawns.
         request.cwd = expand_home(&request.cwd);
+        // Every dispatched prompt is a turn — routed steer or fresh run alike.
+        self.note_turn_start(chat_id, &request.cwd);
         let routed = lock(&self.inner.runs).get(chat_id).map(|h| {
             (
                 h.run_id.clone(),
@@ -444,6 +465,11 @@ impl SessionsEngine {
         });
         let handle = self.doc_handle(chat_id)?;
         handle.write_user_message(&user_id, prompt, now_ms())?;
+        // A routed steer is a turn too. Fired here (not only on the confirmed
+        // path) — a reclaim falls back to dispatch, which just re-snapshots.
+        if let Some(request) = self.last_request(chat_id) {
+            self.note_turn_start(chat_id, &request.cwd);
+        }
         if self.is_live(chat_id, &run_id) {
             self.set_status(chat_id, SessionStatus::Working, false);
             self.inner.note_message(chat_id, prompt);

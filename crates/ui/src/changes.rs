@@ -12,7 +12,11 @@
 //!   and a 200 ms chevron transition;
 //! - syntax highlight reuses the markdown tokenizer per diff line, computed
 //!   time-sliced on the background executor and applied as paint-only run
-//!   colors (layout never changes).
+//!   colors (layout never changes);
+//! - scopes (t3code parity): *Working tree* rides the watch stream; *Branch
+//!   changes* (vs a selectable base ref, default branch preselected) and
+//!   *Latest turn* fetch one-shot `GetCheckoutDiff` captures, refreshed when
+//!   the watch checksum says the tree moved.
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -30,6 +34,7 @@ use komet_rpc::methods;
 use crate::markdown::highlight::{Lang, LineCarry, Token, lang_for_tag, tokenize_line};
 use crate::markdown::render;
 use crate::motion::{self, AnimationExt as _, CHEVRON, COLLAPSE};
+use crate::popover::{self, Popup};
 use crate::state::{AppState, EngineHandle};
 use crate::theme::Theme;
 
@@ -368,6 +373,86 @@ pub fn uncommitted_label(count: usize) -> String {
     }
 }
 
+/// What the pane diffs against (t3code's scope dropdown).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DiffScope {
+    /// Uncommitted changes vs HEAD — the live watch stream.
+    #[default]
+    WorkingTree,
+    /// Everything this branch adds over `merge-base(base_ref, HEAD)`,
+    /// working tree included.
+    Branch,
+    /// Changes since the current chat's last turn started.
+    LatestTurn,
+}
+
+impl DiffScope {
+    pub const ALL: [DiffScope; 3] = [Self::WorkingTree, Self::Branch, Self::LatestTurn];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::WorkingTree => "Working tree",
+            Self::Branch => "Branch changes",
+            Self::LatestTurn => "Latest turn",
+        }
+    }
+
+    /// Wire value for `GetCheckoutDiff` `mode` (and parse-key discriminant).
+    pub fn mode(self) -> &'static str {
+        match self {
+            Self::WorkingTree => "workingTree",
+            Self::Branch => "branch",
+            Self::LatestTurn => "turn",
+        }
+    }
+}
+
+/// Header-strip label per scope.
+pub fn scope_label(scope: DiffScope, count: usize, base: Option<&str>) -> String {
+    let files = if count == 1 { "file" } else { "files" };
+    match scope {
+        DiffScope::WorkingTree => uncommitted_label(count),
+        DiffScope::Branch => match base {
+            Some(base) => format!("{count} Changed {files} vs {base}"),
+            None => format!("{count} Changed {files}"),
+        },
+        DiffScope::LatestTurn => format!("{count} Changed {files} this turn"),
+    }
+}
+
+/// The comparison ref the branch scope preselects. `branches` comes from
+/// `ListBranches` with the repo's default branch first — but a repo with no
+/// `origin/HEAD` falls back to the *checked-out* branch there, and comparing a
+/// branch with itself is useless; prefer `main`/`master` in that case.
+pub fn default_base_ref(branches: &[String], current: Option<&str>) -> Option<String> {
+    let first = branches.first()?;
+    if current != Some(first.as_str()) {
+        return Some(first.clone());
+    }
+    for candidate in ["main", "master"] {
+        if branches.iter().any(|b| b == candidate) {
+            return Some(candidate.to_string());
+        }
+    }
+    branches
+        .iter()
+        .find(|b| current != Some(b.as_str()))
+        .or(Some(first))
+        .cloned()
+}
+
+/// Empty-state copy per scope.
+pub fn clean_message(scope: DiffScope, base: Option<&str>) -> String {
+    match scope {
+        DiffScope::WorkingTree => "No uncommitted changes".to_string(),
+        DiffScope::Branch => match base {
+            Some(base) => format!("No changes vs {base}"),
+            None => "No branch changes".to_string(),
+        },
+        DiffScope::LatestTurn => "No changes this turn".to_string(),
+    }
+}
+
 /// Fold a `WatchCheckoutDiffs` frame into the diff set. Accepts either a full
 /// list (replace) or a single `CheckoutDiff` (upsert by checkout id) — the
 /// contract streams `CheckoutDiff` items, but list frames cost nothing to
@@ -473,6 +558,12 @@ async fn yield_now() {
     .await
 }
 
+/// Shell-facing events from the pane's toolbar.
+pub enum PaneEvent {
+    /// The expand button: widen/restore the panel (shell owns the width).
+    ToggleExpand,
+}
+
 /// The Changes pane entity. Lazy: no RPC until [`Changes::ensure_watch`] runs
 /// (the shell calls it when the pane first opens).
 pub struct Changes {
@@ -491,8 +582,27 @@ pub struct Changes {
     folds: HashMap<String, FileFold>,
     highlights: HashMap<String, HighlightSlot>,
     list: ListState,
+    /// What the pane diffs against (toolbar dropdown).
+    scope: DiffScope,
+    /// Comparison ref for [`DiffScope::Branch`] — preset to the repo's
+    /// default branch once the branch list lands.
+    base_ref: Option<String>,
+    branches: Vec<String>,
+    /// `device:cwd` the branch list was fetched for.
+    branches_for: Option<String>,
+    branches_task: Option<Task<()>>,
+    /// One-shot scoped capture (Branch / Latest turn) + its fetch key.
+    scoped: Option<CheckoutDiff>,
+    scoped_for: Option<String>,
+    scoped_error: Option<SharedString>,
+    scoped_inflight: Option<String>,
+    scoped_task: Option<Task<()>>,
+    scope_menu: Popup<()>,
+    ref_menu: Popup<()>,
     _observe: Subscription,
 }
+
+impl gpui::EventEmitter<PaneEvent> for Changes {}
 
 impl Changes {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
@@ -509,6 +619,18 @@ impl Changes {
             folds: HashMap::new(),
             highlights: HashMap::new(),
             list: ListState::new(0, ListAlignment::Top, px(320.0)),
+            scope: DiffScope::default(),
+            base_ref: None,
+            branches: Vec::new(),
+            branches_for: None,
+            branches_task: None,
+            scoped: None,
+            scoped_for: None,
+            scoped_error: None,
+            scoped_inflight: None,
+            scoped_task: None,
+            scope_menu: Popup::default(),
+            ref_menu: Popup::default(),
             _observe: observe,
         }
     }
@@ -617,12 +739,228 @@ impl Changes {
         resolve_diff(&self.diffs, chat).cloned()
     }
 
-    /// Reconcile parsed content with the currently-resolved diff.
+    /// The checkout root the scoped RPCs address: the watch-resolved diff's
+    /// canonical cwd when available, else the chat row's own.
+    fn scoped_cwd(&self, cx: &App) -> Option<String> {
+        if let Some(diff) = self.resolved(cx) {
+            return Some(diff.cwd);
+        }
+        self.state.read(cx).selected_chat_row()?.cwd.clone()
+    }
+
+    /// The diff the pane currently displays: the watch stream for the working
+    /// tree, the one-shot scoped capture otherwise.
+    fn active_diff(&self, cx: &App) -> Option<CheckoutDiff> {
+        match self.scope {
+            DiffScope::WorkingTree => self.resolved(cx),
+            _ => self.scoped.clone(),
+        }
+    }
+
+    /// Scope discriminant folded into the parse key, so a scope or base
+    /// switch re-parses even when checksums collide.
+    fn scope_key(&self) -> String {
+        match self.scope {
+            DiffScope::WorkingTree => "wt".to_string(),
+            DiffScope::Branch => format!("br:{}", self.base_ref.as_deref().unwrap_or("")),
+            DiffScope::LatestTurn => "turn".to_string(),
+        }
+    }
+
+    fn parse_key(&self, diff: &CheckoutDiff) -> String {
+        format!(
+            "{}:{}:{}",
+            diff.checkout_id,
+            diff.checksum,
+            self.scope_key()
+        )
+    }
+
+    /// Fetch the branch list for the selected chat's checkout (idempotent per
+    /// device+cwd); the repo's default branch (first entry) becomes the
+    /// comparison base unless the user already picked one that still exists.
+    fn ensure_branches(&mut self, cx: &mut Context<Self>) {
+        let Some(cwd) = self.scoped_cwd(cx) else {
+            return;
+        };
+        let target = self.desired_target(cx);
+        let key = format!("{}:{}", target.as_deref().unwrap_or("local"), cwd);
+        if self.branches_for.as_deref() == Some(key.as_str()) {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        self.branches_for = Some(key.clone());
+        self.branches_task = Some(cx.spawn(async move |this, cx| {
+            let mut params = serde_json::Map::new();
+            params.insert("repoPath".into(), serde_json::Value::String(cwd));
+            if let Some(target) = target {
+                params.insert("targetDeviceId".into(), serde_json::Value::String(target));
+            }
+            let result = engine
+                .client()
+                .call(methods::LIST_BRANCHES, serde_json::Value::Object(params))
+                .await;
+            this.update(cx, |changes, cx| {
+                if changes.branches_for.as_deref() != Some(key.as_str()) {
+                    return; // superseded by a chat/device switch
+                }
+                match result {
+                    Ok(value) => {
+                        changes.branches =
+                            serde_json::from_value::<Vec<String>>(value).unwrap_or_default();
+                        let keep = changes
+                            .base_ref
+                            .as_ref()
+                            .is_some_and(|base| changes.branches.contains(base));
+                        if !keep {
+                            let current = changes
+                                .state
+                                .read(cx)
+                                .selected_chat_row()
+                                .and_then(|chat| chat.branch.clone());
+                            changes.base_ref =
+                                default_base_ref(&changes.branches, current.as_deref());
+                        }
+                        changes.sync(cx);
+                    }
+                    Err(err) => {
+                        tracing::debug!(error = %err, "changes: branch list failed");
+                        // Allow a retry on the next state change.
+                        changes.branches_for = None;
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    /// Keep the one-shot scoped capture fresh. The fetch key folds in the
+    /// watch checksum, so any working-tree change (or commit — HEAD rides the
+    /// checksum) re-captures; a context change (chat/scope/base) clears the
+    /// stale content first so the pane shows the spinner, while a
+    /// checksum-only refresh keeps the old diff visible until the new one
+    /// lands.
+    fn ensure_scoped(&mut self, cx: &mut Context<Self>) {
+        if self.scope == DiffScope::WorkingTree {
+            self.scoped_inflight = None;
+            self.scoped_task = None;
+            return;
+        }
+        let Some(chat_id) = self
+            .state
+            .read(cx)
+            .selected_chat_row()
+            .map(|chat| chat.id.clone())
+        else {
+            return;
+        };
+        let Some(cwd) = self.scoped_cwd(cx) else {
+            return;
+        };
+        let base = match self.scope {
+            DiffScope::Branch => match &self.base_ref {
+                Some(base) => Some(base.clone()),
+                None => return, // branch list still loading
+            },
+            _ => None,
+        };
+        let target = self.desired_target(cx);
+        let context = format!(
+            "{}|{}|{}|{}|{}",
+            target.as_deref().unwrap_or("local"),
+            chat_id,
+            cwd,
+            self.scope.mode(),
+            base.as_deref().unwrap_or("")
+        );
+        let watch_sum = self.resolved(cx).map(|d| d.checksum).unwrap_or_default();
+        let key = format!("{context}|{watch_sum}");
+        if self.scoped_for.as_deref() == Some(key.as_str())
+            || self.scoped_inflight.as_deref() == Some(key.as_str())
+        {
+            return;
+        }
+        if self
+            .scoped_for
+            .as_deref()
+            .is_none_or(|prev| !prev.starts_with(&format!("{context}|")))
+        {
+            self.scoped = None;
+            self.scoped_error = None;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let mode = self.scope.mode();
+        self.scoped_inflight = Some(key.clone());
+        self.scoped_task = Some(cx.spawn(async move |this, cx| {
+            let mut params = serde_json::Map::new();
+            params.insert("cwd".into(), serde_json::Value::String(cwd));
+            params.insert("mode".into(), serde_json::Value::String(mode.to_string()));
+            params.insert("chatId".into(), serde_json::Value::String(chat_id));
+            if let Some(base) = base {
+                params.insert("baseRef".into(), serde_json::Value::String(base));
+            }
+            if let Some(target) = target {
+                params.insert("targetDeviceId".into(), serde_json::Value::String(target));
+            }
+            let result = engine
+                .client()
+                .call(methods::GET_CHECKOUT_DIFF, serde_json::Value::Object(params))
+                .await;
+            this.update(cx, |changes, cx| {
+                if changes.scoped_inflight.as_deref() != Some(key.as_str()) {
+                    return; // superseded
+                }
+                changes.scoped_inflight = None;
+                match result.and_then(|value| {
+                    serde_json::from_value::<CheckoutDiff>(value)
+                        .map_err(|e| komet_rpc::RpcError::Failed(e.to_string()))
+                }) {
+                    Ok(diff) => {
+                        changes.scoped = Some(diff);
+                        changes.scoped_error = None;
+                    }
+                    Err(err) => {
+                        changes.scoped = None;
+                        changes.scoped_error = Some(err.to_string().into());
+                    }
+                }
+                changes.scoped_for = Some(key);
+                changes.sync(cx);
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    fn set_scope(&mut self, scope: DiffScope, cx: &mut Context<Self>) {
+        if self.scope != scope {
+            self.scope = scope;
+            self.sync(cx);
+        }
+        cx.notify();
+    }
+
+    fn set_base_ref(&mut self, base: String, cx: &mut Context<Self>) {
+        if self.base_ref.as_deref() != Some(base.as_str()) {
+            self.base_ref = Some(base);
+            self.sync(cx);
+        }
+        cx.notify();
+    }
+
+    /// Reconcile parsed content with the currently-active diff.
     fn sync(&mut self, cx: &mut Context<Self>) {
         // The watch follows the selected chat's host device (idempotent when
         // the target is unchanged); a boot-deferred attempt retries here too.
         self.ensure_watch(cx);
-        let Some(diff) = self.resolved(cx) else {
+        self.ensure_branches(cx);
+        self.ensure_scoped(cx);
+        let Some(diff) = self.active_diff(cx) else {
             if self.parsed.take().is_some() {
                 self.list.reset(0);
                 self.folds.clear();
@@ -631,7 +969,7 @@ impl Changes {
             }
             return;
         };
-        let key = format!("{}:{}", diff.checkout_id, diff.checksum);
+        let key = self.parse_key(&diff);
         if self.parsed.as_ref().is_some_and(|p| p.key == key) {
             return;
         }
@@ -649,8 +987,8 @@ impl Changes {
             this.update(cx, |changes, cx| {
                 // Late results for a superseded diff are re-checked by key.
                 let current = changes
-                    .resolved(cx)
-                    .map(|d| format!("{}:{}", d.checkout_id, d.checksum));
+                    .active_diff(cx)
+                    .map(|d| changes.parse_key(&d));
                 if current.as_deref() != Some(key.as_str()) {
                     return;
                 }
@@ -692,6 +1030,48 @@ impl Changes {
         fold.collapsed = !currently_collapsed;
         fold.epoch += 1;
         fold.toggled_at = Some(std::time::Instant::now());
+    }
+
+    /// Every parsed file currently folded shut?
+    fn all_collapsed(&self) -> bool {
+        let Some(parsed) = &self.parsed else {
+            return false;
+        };
+        !parsed.files.is_empty()
+            && parsed.files.iter().all(|file| {
+                self.folds
+                    .get(&file.path)
+                    .is_some_and(|fold| fold.collapsed)
+            })
+    }
+
+    /// Collapse every file section, or expand them all when everything is
+    /// already shut (the toolbar's fold button, t3code parity). Steady-state
+    /// writes — no per-row tween arming, the whole list just snaps.
+    fn toggle_collapse_all(&mut self, cx: &mut Context<Self>) {
+        let Some(parsed) = &self.parsed else {
+            return;
+        };
+        let collapse = !self.all_collapsed();
+        let paths: Vec<String> = parsed.files.iter().map(|f| f.path.clone()).collect();
+        for path in paths {
+            let fold = self.folds.entry(path).or_default();
+            fold.collapsed = collapse;
+            fold.toggled_at = None;
+        }
+        cx.notify();
+    }
+
+    fn close_scope_menu(&mut self, cx: &mut Context<Self>) {
+        if self.scope_menu.begin_close() {
+            popover::reap_popup(cx, |changes: &mut Self| &mut changes.scope_menu);
+        }
+    }
+
+    fn close_ref_menu(&mut self, cx: &mut Context<Self>) {
+        if self.ref_menu.begin_close() {
+            popover::reap_popup(cx, |changes: &mut Self| &mut changes.ref_menu);
+        }
     }
 
     /// Tokens for a file's diff lines (paint-only). Kicks a time-sliced
@@ -914,6 +1294,275 @@ impl Changes {
             .into_any_element()
     }
 
+    /// A small hover-washed icon button for the toolbar.
+    fn toolbar_button(
+        id: &'static str,
+        icon_path: &'static str,
+        theme: &Theme,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id(id)
+            .size(px(24.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(6.0))
+            .cursor_pointer()
+            .bg(motion::hover_blend(
+                id,
+                crate::theme::wash(0.0),
+                crate::theme::wash(0.14),
+            ))
+            .on_hover(motion::hover_listener(id))
+            .child(
+                crate::icons::icon(icon_path)
+                    .size(px(14.0))
+                    .text_color(theme.text_muted.opacity(0.7)),
+            )
+    }
+
+    /// Toolbar: the scope dropdown on the left, fold-all + expand on the
+    /// right (t3code parity).
+    fn render_toolbar(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let scope = self.scope;
+        let trigger = div()
+            .id("changes-scope-trigger")
+            .h(px(24.0))
+            .px(px(8.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .rounded(px(6.0))
+            .cursor_pointer()
+            .bg(motion::hover_blend(
+                "changes-scope-trigger",
+                crate::theme::wash(0.05),
+                crate::theme::wash(0.14),
+            ))
+            .on_hover(motion::hover_listener("changes-scope-trigger"))
+            .on_click(cx.listener(|this, _, _, cx| {
+                if this.scope_menu.is_open() {
+                    this.close_scope_menu(cx);
+                } else {
+                    this.scope_menu.open(());
+                }
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(theme.text)
+                    .child(SharedString::from(scope.label())),
+            )
+            .child(
+                crate::icons::icon(crate::icons::ALT_ARROW_DOWN)
+                    .size(px(12.0))
+                    .text_color(theme.text_muted.opacity(0.7)),
+            );
+        let trigger = if self.scope_menu.get().is_some() {
+            let closing = self.scope_menu.closing_since();
+            let menu = self.render_scope_menu(theme, cx);
+            trigger.relative().child(popover::anchored_menu_below(
+                "changes-scope-menu",
+                menu,
+                closing,
+            ))
+        } else {
+            trigger
+        };
+
+        let fold = Self::toolbar_button("changes-fold-all", crate::icons::SORT_VERTICAL, theme)
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_collapse_all(cx)));
+        let expand = Self::toolbar_button(
+            "changes-expand-pane",
+            crate::icons::SIDEBAR_MINIMALISTIC,
+            theme,
+        )
+        .on_click(cx.listener(|_, _, _, cx| cx.emit(PaneEvent::ToggleExpand)));
+
+        div()
+            .flex_none()
+            .h(px(40.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .px(px(Theme::SPACE_MD))
+            .border_b_1()
+            .border_color(crate::theme::hairline(0.06))
+            .child(trigger)
+            .child(div().flex_1())
+            .child(fold)
+            .child(expand)
+            .into_any_element()
+    }
+
+    fn render_scope_menu(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let current = self.scope;
+        popover::popover_card(theme)
+            .w(px(180.0))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_scope_menu(cx)))
+            .children(DiffScope::ALL.into_iter().enumerate().map(|(ix, scope)| {
+                popover::menu_row(theme, scope == current, format!("changes-scope-row-{ix}"))
+                    .id(("changes-scope-row", ix))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_scope(scope, cx);
+                        this.close_scope_menu(cx);
+                    }))
+                    .child(
+                        div()
+                            .flex_1()
+                            .child(SharedString::from(scope.label())),
+                    )
+            }))
+            .into_any_element()
+    }
+
+    /// `{branch} → {base ⌄}` — which ref the branch scope compares against
+    /// (t3code's ref strip). Branch scope only.
+    fn render_ref_strip(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.scope != DiffScope::Branch {
+            return None;
+        }
+        let branch = self
+            .state
+            .read(cx)
+            .selected_chat_row()
+            .and_then(|chat| chat.branch.clone())
+            .unwrap_or_else(|| "HEAD".to_string());
+        let base = self
+            .base_ref
+            .clone()
+            .unwrap_or_else(|| "…".to_string());
+        let trigger = div()
+            .id("changes-ref-trigger")
+            .h(px(22.0))
+            .px(px(6.0))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(4.0))
+            .rounded(px(6.0))
+            .cursor_pointer()
+            .bg(motion::hover_blend(
+                "changes-ref-trigger",
+                crate::theme::wash(0.0),
+                crate::theme::wash(0.12),
+            ))
+            .on_hover(motion::hover_listener("changes-ref-trigger"))
+            .on_click(cx.listener(|this, _, _, cx| {
+                if this.ref_menu.is_open() {
+                    this.close_ref_menu(cx);
+                } else {
+                    this.ref_menu.open(());
+                }
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .font_family(theme.font_mono.clone())
+                    .text_size(px(11.5))
+                    .text_color(theme.text)
+                    .child(SharedString::from(base)),
+            )
+            .child(
+                crate::icons::icon(crate::icons::ALT_ARROW_DOWN)
+                    .size(px(11.0))
+                    .text_color(theme.text_muted.opacity(0.7)),
+            );
+        let trigger = if self.ref_menu.get().is_some() {
+            let closing = self.ref_menu.closing_since();
+            let menu = self.render_ref_menu(theme, cx);
+            trigger.relative().child(popover::anchored_menu_below(
+                "changes-ref-menu",
+                menu,
+                closing,
+            ))
+        } else {
+            trigger
+        };
+        Some(
+            div()
+                .flex_none()
+                .h(px(32.0))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .px(px(Theme::SPACE_MD))
+                .border_b_1()
+                .border_color(crate::theme::hairline(0.06))
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .font_family(theme.font_mono.clone())
+                        .text_size(px(11.5))
+                        .text_color(theme.text_dim)
+                        .child(SharedString::from(branch)),
+                )
+                .child(
+                    crate::icons::icon(crate::icons::ARROW_RIGHT)
+                        .size(px(12.0))
+                        .flex_none()
+                        .text_color(theme.text_faint),
+                )
+                .child(trigger)
+                .into_any_element(),
+        )
+    }
+
+    fn render_ref_menu(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let branches = self.branches.clone();
+        let current = self.base_ref.clone();
+        let card = popover::popover_card(theme)
+            .w(px(220.0))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_ref_menu(cx)));
+        if branches.is_empty() {
+            return card
+                .child(
+                    div()
+                        .px(px(8.0))
+                        .py(px(6.0))
+                        .text_size(px(12.0))
+                        .text_color(theme.text_faint)
+                        .child(SharedString::from("No branches")),
+                )
+                .into_any_element();
+        }
+        card.child(
+            div()
+                .id("changes-ref-list")
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .max_h(px(240.0))
+                .overflow_y_scroll()
+                .children(branches.into_iter().enumerate().map(|(ix, name)| {
+                    let selected = current.as_deref() == Some(name.as_str());
+                    let label = name.clone();
+                    popover::menu_row(theme, selected, format!("changes-ref-row-{ix}"))
+                        .id(("changes-ref-row", ix))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_base_ref(name.clone(), cx);
+                            this.close_ref_menu(cx);
+                        }))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .font_family(theme.font_mono.clone())
+                                .text_size(px(12.0))
+                                .child(SharedString::from(label)),
+                        )
+                })),
+        )
+        .into_any_element()
+    }
+
     fn render_header_strip(&self, theme: &Theme) -> Option<AnyElement> {
         let parsed = self.parsed.as_ref()?;
         Some(
@@ -931,7 +1580,11 @@ impl Changes {
                     div()
                         .text_size(px(12.0))
                         .text_color(theme.text_muted)
-                        .child(SharedString::from(uncommitted_label(parsed.file_count))),
+                        .child(SharedString::from(scope_label(
+                            self.scope,
+                            parsed.file_count,
+                            self.base_ref.as_deref(),
+                        ))),
                 )
                 .child(
                     div()
@@ -1177,84 +1830,124 @@ pub(crate) fn render_file_body(
 impl Render for Changes {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
-        let resolved = self.resolved(cx);
+        let active = self.active_diff(cx);
+        let scope = self.scope;
+        let base = self.base_ref.clone();
         // With no session selected (new-chat canvas) there is nothing to
         // prepare — show the quiet empty state, not an endless spinner.
-        let phase = if self.state.read(cx).selected_chat_row().is_none() {
+        let no_chat = self.state.read(cx).selected_chat_row().is_none();
+        let phase = if no_chat {
             DiffPhase::Clean
         } else {
-            diff_phase(resolved.as_ref())
+            diff_phase(active.as_ref())
         };
         let error = self.error.clone();
-
-        let content: AnyElement = match phase {
-            DiffPhase::Preparing => div()
-                .flex_1()
-                .flex()
-                .flex_col()
-                .items_center()
-                .justify_center()
-                .gap(px(Theme::SPACE_SM))
-                .child(crate::loaders::gradient_spinner(
-                    "changes-preparing",
-                    &theme,
-                    3.0,
-                    cx.entity_id(),
-                    cx,
-                ))
-                .child(
-                    div()
-                        .text_size(px(12.0))
-                        .text_color(theme.text_faint)
-                        .child(SharedString::from("Preparing diff…")),
-                )
-                .into_any_element(),
-            DiffPhase::Clean => div()
-                .flex_1()
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_size(px(12.0))
-                .text_color(theme.text_faint)
-                .child(SharedString::from("No uncommitted changes"))
-                .into_any_element(),
-            DiffPhase::List => {
-                if self.parsed.is_some() {
-                    div()
-                        .flex_1()
-                        .min_h_0()
-                        .flex()
-                        .flex_col()
-                        .children(self.render_header_strip(&theme))
-                        .child(
-                            list(self.list.clone(), cx.processor(Self::render_row))
-                                .flex_1()
-                                .with_sizing_behavior(gpui::ListSizingBehavior::Auto),
-                        )
-                        .into_any_element()
+        // Scoped fetch failures replace the content area. "no turn recorded"
+        // is the expected pre-first-turn state, not an error.
+        let scoped_notice: Option<(SharedString, bool)> = (!no_chat
+            && scope != DiffScope::WorkingTree)
+            .then(|| self.scoped_error.clone())
+            .flatten()
+            .map(|message| {
+                if message.contains("no turn recorded") {
+                    (
+                        SharedString::from("No turn recorded yet — send a message first"),
+                        false,
+                    )
                 } else {
-                    // Diff known, parse still running.
-                    div()
-                        .flex_1()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(crate::loaders::gradient_spinner(
-                            "changes-parsing",
-                            &theme,
-                            3.0,
-                            cx.entity_id(),
-                            cx,
-                        ))
-                        .into_any_element()
+                    (message, true)
+                }
+            });
+
+        let content: AnyElement = if let Some((message, warn)) = scoped_notice {
+            div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .px(px(Theme::SPACE_LG))
+                .text_size(px(12.0))
+                .text_color(if warn {
+                    theme.warning.opacity(0.85)
+                } else {
+                    theme.text_faint
+                })
+                .child(message)
+                .into_any_element()
+        } else {
+            match phase {
+                DiffPhase::Preparing => div()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(Theme::SPACE_SM))
+                    .child(crate::loaders::gradient_spinner(
+                        "changes-preparing",
+                        &theme,
+                        3.0,
+                        cx.entity_id(),
+                        cx,
+                    ))
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(theme.text_faint)
+                            .child(SharedString::from("Preparing diff…")),
+                    )
+                    .into_any_element(),
+                DiffPhase::Clean => div()
+                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(px(12.0))
+                    .text_color(theme.text_faint)
+                    .child(SharedString::from(clean_message(scope, base.as_deref())))
+                    .into_any_element(),
+                    DiffPhase::List => {
+                    if self.parsed.is_some() {
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .flex()
+                            .flex_col()
+                            .children(self.render_header_strip(&theme))
+                            .child(
+                                list(self.list.clone(), cx.processor(Self::render_row))
+                                    .flex_1()
+                                    .with_sizing_behavior(gpui::ListSizingBehavior::Auto),
+                            )
+                            .into_any_element()
+                    } else {
+                        // Diff known, parse still running.
+                        div()
+                            .flex_1()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(crate::loaders::gradient_spinner(
+                                "changes-parsing",
+                                &theme,
+                                3.0,
+                                cx.entity_id(),
+                                cx,
+                            ))
+                            .into_any_element()
+                    }
                 }
             }
         };
 
+        let toolbar = self.render_toolbar(&theme, cx);
+        let ref_strip = self.render_ref_strip(&theme, cx);
         div()
             .size_full()
             .flex()
             .flex_col()
+            .child(toolbar)
+            .children(ref_strip)
             .when_some(error, |el, message| {
                 el.child(
                     div()
@@ -1508,6 +2201,84 @@ rename to new_name.rs
         assert_eq!(uncommitted_label(0), "0 Uncommitted changes");
         assert_eq!(uncommitted_label(1), "1 Uncommitted change");
         assert_eq!(uncommitted_label(4), "4 Uncommitted changes");
+    }
+
+    #[test]
+    fn scope_labels_and_clean_messages() {
+        assert_eq!(
+            scope_label(DiffScope::WorkingTree, 2, None),
+            "2 Uncommitted changes"
+        );
+        assert_eq!(
+            scope_label(DiffScope::Branch, 1, Some("main")),
+            "1 Changed file vs main"
+        );
+        assert_eq!(scope_label(DiffScope::Branch, 3, None), "3 Changed files");
+        assert_eq!(
+            scope_label(DiffScope::LatestTurn, 2, None),
+            "2 Changed files this turn"
+        );
+        assert_eq!(
+            clean_message(DiffScope::WorkingTree, None),
+            "No uncommitted changes"
+        );
+        assert_eq!(
+            clean_message(DiffScope::Branch, Some("develop")),
+            "No changes vs develop"
+        );
+        assert_eq!(
+            clean_message(DiffScope::LatestTurn, None),
+            "No changes this turn"
+        );
+    }
+
+    #[test]
+    fn base_ref_defaults_to_repo_default_then_main() {
+        let branches = |names: &[&str]| -> Vec<String> {
+            names.iter().map(|n| n.to_string()).collect()
+        };
+        // Engine order puts the repo default first — take it when it isn't
+        // the checked-out branch itself.
+        let b = branches(&["main", "feature"]);
+        assert_eq!(
+            default_base_ref(&b, Some("feature")).as_deref(),
+            Some("main")
+        );
+        // No origin/HEAD: engine "default" is the current branch — fall
+        // through to main/master.
+        let b = branches(&["feature", "main"]);
+        assert_eq!(
+            default_base_ref(&b, Some("feature")).as_deref(),
+            Some("main")
+        );
+        let b = branches(&["feature", "master"]);
+        assert_eq!(
+            default_base_ref(&b, Some("feature")).as_deref(),
+            Some("master")
+        );
+        // No main/master: any branch that isn't the current one.
+        let b = branches(&["feature", "develop"]);
+        assert_eq!(
+            default_base_ref(&b, Some("feature")).as_deref(),
+            Some("develop")
+        );
+        // Checked out ON main: comparing main with itself is the honest
+        // default (empty branch diff).
+        let b = branches(&["main", "feature"]);
+        assert_eq!(default_base_ref(&b, Some("main")).as_deref(), Some("main"));
+        // Single-branch repo, and empty list.
+        let b = branches(&["main"]);
+        assert_eq!(default_base_ref(&b, Some("main")).as_deref(), Some("main"));
+        assert_eq!(default_base_ref(&[], Some("main")), None);
+    }
+
+    #[test]
+    fn scope_modes_are_wire_stable() {
+        // `mode` is the GetCheckoutDiff wire contract — engine matches on it.
+        assert_eq!(DiffScope::WorkingTree.mode(), "workingTree");
+        assert_eq!(DiffScope::Branch.mode(), "branch");
+        assert_eq!(DiffScope::LatestTurn.mode(), "turn");
+        assert_eq!(DiffScope::default(), DiffScope::WorkingTree);
     }
 
     #[test]

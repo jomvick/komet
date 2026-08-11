@@ -981,6 +981,11 @@ impl Shell {
             return changes.clone();
         }
         let changes = cx.new(|cx| Changes::new(self.state.clone(), cx));
+        // The pane's expand button changes shell-owned width settings.
+        cx.subscribe(&changes, |this, _, event, cx| match event {
+            crate::changes::PaneEvent::ToggleExpand => this.toggle_right_pane_expand(cx),
+        })
+        .detach();
         self.changes = Some(changes.clone());
         changes
     }
@@ -3377,9 +3382,10 @@ impl Shell {
         } else {
             gpui::Empty.into_any_element()
         };
-        // Its OWN inset card (user request): the conversation card's right
-        // gutter is the gap; padding (not margins) keeps the tweened width
-        // container clean, and the resize grabber floats over the gap.
+        // Flush panel (user request — the inset card is gone): full window
+        // height with a left hairline, glass-friendly like the terminal dock
+        // (translucent over the frost; solid otherwise). The resize grabber
+        // floats over the border seam.
         let handle = self
             .resize_handle(
                 "right-pane-resize",
@@ -3392,33 +3398,48 @@ impl Shell {
             .bottom_0()
             // INSIDE the width-clipped container (a negative inset was
             // clipped into unreachability — user-reported dead resize),
-            // overlapping the card's left border.
+            // overlapping the panel's left border.
             .left(px(0.0));
-        let card = div()
+        let panel_bg = if theme.is_glass() { bg.opacity(0.4) } else { bg };
+        let panel = div()
             .size_full()
-            .rounded(px(12.0))
-            .border_1()
+            .flex()
+            .flex_col()
+            .border_l_1()
             .border_color(theme.border)
-            .bg(bg)
+            .bg(panel_bg)
             .overflow_hidden()
+            // The titlebar is a glass overlay over the full-height content
+            // row; the panel's own chrome starts below it.
+            .pt(px(Theme::TITLEBAR_HEIGHT))
             .child(content);
         let target = self.right_target(cx);
         self.pane_container(
             self.right_tween,
             target,
-            // Flush under the titlebar (the full-height content row puts the
-            // chrome overlay above us, so the pad IS the titlebar height),
-            // 8px bottom/right gutters.
             div()
                 .h_full()
                 .relative()
-                .pt(px(Theme::TITLEBAR_HEIGHT))
-                .pb(px(8.0))
-                .pr(px(8.0))
-                .child(card)
+                .child(panel)
                 .child(handle)
                 .into_any_element(),
         )
+    }
+
+    /// Toggle the changes panel between its saved width and the expanded
+    /// maximum (the Changes toolbar's expand button, t3code parity). Rides the
+    /// same width tween as open/close so the jump glides.
+    fn toggle_right_pane_expand(&mut self, cx: &mut Context<Self>) {
+        let from = self.right_target(cx);
+        let expanded = self.settings.right_pane_width >= RIGHT_PANE_MAX - 1.0;
+        self.settings.right_pane_width = if expanded {
+            RIGHT_PANE_DEFAULT
+        } else {
+            RIGHT_PANE_MAX
+        };
+        self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
+        self.schedule_save(cx);
+        cx.notify();
     }
 
     fn render_gate_card(&mut self, phase: &GatePhase, cx: &mut Context<Self>) -> AnyElement {
@@ -4178,15 +4199,11 @@ impl Render for Shell {
                     Empty.into_any_element()
                 };
                 let overlays = self.render_overlays(window.viewport_size(), window, cx);
-                // The signature frame: the conversation card and — when the
-                // changes pane is open — a SECOND inset card beside it, both
-                // rounded hairline-bordered floats on the frost shell (the
-                // changes card is built inside `render_right_pane`).
                 // Copied out (not held) — `render_title_bar` needs `cx` mutable.
                 let border_color = Theme::of(cx).border;
-                // No inset card (user request): the conversation column sits
+                // No inset cards (user request): the conversation column sits
                 // flush and unbordered, the transcript directly on the frost
-                // glass — only the changes pane keeps its floating card
+                // glass; the changes pane is a flush left-bordered glass panel
                 // (built inside `render_right_pane`).
                 let card: AnyElement = div()
                     .flex_1()
@@ -4231,7 +4248,7 @@ impl Render for Shell {
                 // The content row spans the FULL window height — the titlebar
                 // overlays it (glass, no fill), so the transcript can scroll
                 // under the header and fade out at its edge. Columns that
-                // must NOT underlap (sidebar content, the changes card,
+                // must NOT underlap (sidebar content, the changes panel,
                 // settings) pad themselves down by the titlebar height.
                 let page = div()
                     .size_full()

@@ -31,7 +31,10 @@ pub mod workspace_host;
 
 pub use agent_accounts::{AgentAccounts, AgentAccountsConfig};
 pub use auth::{Auth, AuthConfig, AuthState, AuthUser, OrgMembership};
-pub use diff_sync::{CheckoutDiffSync, DiffSidecar, DiffSnapshot, capture_diff};
+pub use diff_sync::{
+    CheckoutDiffSync, DiffSidecar, DiffSnapshot, TurnSnapshot, capture_diff, capture_diff_against,
+    capture_turn_diff, merge_base, snapshot_tree,
+};
 pub use doc_host::{ChatDocHandle, DocHost, DocHostConfig, EdgeConfig};
 pub use instance_lock::InstanceLock;
 pub use registry::{HarnessDescriptor, HarnessRegistry, default_registry};
@@ -197,6 +200,11 @@ impl EngineCore {
             repos.clone(),
         ));
         let diff_sync = CheckoutDiffSync::start(repos.clone(), workspace.clone(), &device_id, edge);
+        // Turn starts snapshot the checkout tree — the "Latest turn" diff base.
+        let turn_diff = diff_sync.clone();
+        sessions.set_turn_listener(Arc::new(move |chat_id, cwd| {
+            turn_diff.note_turn_start(chat_id, cwd);
+        }));
         let spaces_sync = SpacesSync::start(repos.clone(), workspace.clone(), &device_id);
         Ok(Self {
             sessions,
