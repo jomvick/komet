@@ -213,7 +213,8 @@ impl WorkspaceHost {
         store.delete_snapshot(LEGACY_WORKSPACE_DOC_ID).ok();
 
         // Boot: upsert our own device row. A user-set name (RenameDevice is LWW from
-        // any device) survives restarts — only a missing row gets the hostname.
+        // any device) survives restarts. The old fallback sentinel is repaired with
+        // the platform-resolved name because it was never a user-selected name.
         let now = Utc::now();
         let existing = doc
             .read_devices()?
@@ -221,11 +222,10 @@ impl WorkspaceHost {
             .find(|d| d.id == config.device_id);
         doc.upsert_device(&Device {
             id: config.device_id.clone(),
-            name: existing
-                .as_ref()
-                .map(|d| d.name.clone())
-                .filter(|n| !n.is_empty())
-                .unwrap_or_else(|| config.device_name.clone()),
+            name: device_name_on_boot(
+                existing.as_ref().map(|device| device.name.as_str()),
+                &config.device_name,
+            ),
             platform: config.platform.clone(),
             last_seen_at: Some(now),
             // First registration stamps `createdAt`; restarts keep the original
@@ -1189,9 +1189,35 @@ async fn workspace_task(weak: Weak<WorkspaceHostInner>, mut changed_rx: watch::R
     }
 }
 
+fn device_name_on_boot(existing_name: Option<&str>, detected_name: &str) -> String {
+    existing_name
+        .filter(|name| {
+            let name = name.trim();
+            !name.is_empty() && name != crate::LEGACY_UNKNOWN_DEVICE_NAME
+        })
+        .unwrap_or(detected_name)
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::linked_worktree_root;
+    use super::{device_name_on_boot, linked_worktree_root};
+
+    #[test]
+    fn boot_repairs_the_legacy_unknown_device_sentinel() {
+        assert_eq!(
+            device_name_on_boot(Some("unknown-device"), "MacBook Pro"),
+            "MacBook Pro"
+        );
+    }
+
+    #[test]
+    fn boot_preserves_a_user_selected_device_name() {
+        assert_eq!(
+            device_name_on_boot(Some("Work laptop"), "MacBook Pro"),
+            "Work laptop"
+        );
+    }
 
     #[test]
     fn linked_worktree_resolves_to_the_checkout_root() {
