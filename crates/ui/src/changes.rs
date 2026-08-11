@@ -1545,7 +1545,10 @@ impl Changes {
             .id("changes-ref-trigger")
             .h(px(22.0))
             .px(px(6.0))
-            .flex_none()
+            // Shrinkable, like the branch label beside it — a flex_none
+            // trigger with a long base name plowed over the header buttons
+            // (user report); both sides truncate instead.
+            .min_w_0()
             .flex()
             .flex_row()
             .items_center()
@@ -1573,6 +1576,8 @@ impl Changes {
             }))
             .child(
                 div()
+                    .min_w_0()
+                    .truncate()
                     .font_family(theme.font_mono.clone())
                     .text_size(px(11.5))
                     .text_color(theme.text)
@@ -1581,6 +1586,7 @@ impl Changes {
             .child(
                 crate::icons::icon(crate::icons::ALT_ARROW_DOWN)
                     .size(px(11.0))
+                    .flex_none()
                     .text_color(theme.text_muted.opacity(0.7)),
             );
         let trigger = if self.ref_menu.get().is_some() {
@@ -1722,6 +1728,8 @@ impl Changes {
                 .border_color(crate::theme::hairline(0.06))
                 .child(
                     div()
+                        .min_w_0()
+                        .truncate()
                         .text_size(px(12.0))
                         .text_color(theme.text_muted)
                         .child(SharedString::from(scope_label(
