@@ -477,20 +477,45 @@ impl DocHost {
                 if flipped.is_empty() {
                     continue;
                 }
-                let mut handles = lock(&host.inner.handles);
-                for chat_id in flipped {
-                    let Some(handle) = handles.get(&chat_id) else {
-                        continue;
-                    };
-                    if handle.room_gen >= 2 {
-                        continue; // already chat2-mode
+                let mut dropped: Vec<String> = Vec::new();
+                {
+                    let mut handles = lock(&host.inner.handles);
+                    for chat_id in flipped {
+                        let Some(handle) = handles.get(&chat_id) else {
+                            continue;
+                        };
+                        if handle.room_gen >= 2 {
+                            continue; // already chat2-mode
+                        }
+                        handle.retired.store(true, Ordering::Relaxed);
+                        let live_writer = Arc::strong_count(&handle.doc) > 1;
+                        if !live_writer {
+                            handles.remove(&chat_id);
+                            tracing::info!(chat = %chat_id,
+                                "s2 handle dropped on chat2 cutover; watchers resubscribe onto the new room");
+                            dropped.push(chat_id);
+                        }
                     }
-                    handle.retired.store(true, Ordering::Relaxed);
-                    let live_writer = Arc::strong_count(&handle.doc) > 1;
-                    if !live_writer {
-                        handles.remove(&chat_id);
-                        tracing::info!(chat = %chat_id,
-                            "s2 handle dropped on chat2 cutover; watchers resubscribe onto the new room");
+                }
+                // Watchers resubscribe on their own — but a NUDGE-opened
+                // handle has none, and its s2 room never carried the queued
+                // command anyway (the sender pushed to chat2). On a born-
+                // chat2 chat the nudge beats the registry row by design
+                // (direct HTTP vs room sync), so the first open lands here
+                // and dying silently strands the first message until the
+                // next nudge — every new remote session's first send sat
+                // ~30s+ until the user re-sent (user report). If we host
+                // the chat, reopen NOW: the fresh open dials the chat2
+                // room and the change-driven drain executes the command.
+                for chat_id in dropped {
+                    if !host.is_host(&chat_id) {
+                        continue;
+                    }
+                    match host.open(&chat_id) {
+                        Ok(_) => tracing::info!(chat = %chat_id,
+                            "reopened as chat2 after cutover drop (host, pending work possible)"),
+                        Err(err) => tracing::warn!(chat = %chat_id, error = %err,
+                            "chat2 reopen after cutover drop failed"),
                     }
                 }
             }
