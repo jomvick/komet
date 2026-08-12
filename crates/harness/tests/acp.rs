@@ -279,6 +279,10 @@ async fn claude_and_codex_specs_drive_the_same_wire() {
             AcpHarness::hermes().with_executable(fixture_path()),
         ),
         ("pi", AcpHarness::pi().with_executable(fixture_path())),
+        (
+            "cursor",
+            AcpHarness::cursor().with_executable(fixture_path()),
+        ),
     ] {
         let (controls, _steer, _token) = controls();
         let events = run_to_end(&h, request("scenario:happy"), controls).await;
@@ -400,7 +404,11 @@ async fn steer_racing_the_turn_end_never_emits_steered_after_done() {
     .await
     .expect("run finished in time");
 
-    assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)], "{events:?}");
+    assert_eq!(
+        dones(&events),
+        vec![(DoneStatus::Completed, None)],
+        "{events:?}"
+    );
     let steered = events
         .iter()
         .position(|e| matches!(e, AgentEvent::Steered { .. }))
@@ -409,7 +417,10 @@ async fn steer_racing_the_turn_end_never_emits_steered_after_done() {
         .iter()
         .position(|e| matches!(e, AgentEvent::Done { .. }))
         .expect("checked above");
-    assert!(steered < done, "Steered after Done strands the session: {events:?}");
+    assert!(
+        steered < done,
+        "Steered after Done strands the session: {events:?}"
+    );
 }
 
 #[tokio::test]
@@ -685,6 +696,158 @@ async fn real_claude_adapter_end_to_end() {
     assert_eq!(dones(&events)[0].0, DoneStatus::Completed, "{events:?}");
 }
 
+/// The Cursor slot against the real `cursor-agent acp` server: discovery
+/// (free) plus one tiny prompt. Run explicitly:
+/// `cargo test -p komet-harness --test acp -- --ignored real_cursor`
+#[tokio::test]
+#[ignore = "needs the cursor-agent CLI authenticated + network; costs one tiny prompt"]
+async fn real_cursor_adapter_end_to_end() {
+    // `session/new` is the source of truth for models — the static catalog is
+    // a fallback, so a live account must produce more than it.
+    let models = AcpHarness::cursor().models().await.expect("discovery");
+    assert!(models.len() > 5, "{models:?}");
+    assert!(
+        models
+            .iter()
+            .any(|m| m.id == "composer-2.5" || m.id.starts_with("composer-2.5")),
+        "{models:?}"
+    );
+    // Parameterized picker: base ids, no raw HTML, Mode on every row, Auto
+    // exposes Intelligence / Balance / Cost.
+    assert!(
+        models.iter().all(|m| !m.label.contains('<')),
+        "html leaked into labels: {:?}",
+        models
+            .iter()
+            .filter(|m| m.label.contains('<'))
+            .map(|m| &m.label)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        models
+            .iter()
+            .all(|m| m.options.iter().any(|o| o.id == "mode")),
+        "Mode trait missing"
+    );
+    let auto = models
+        .iter()
+        .find(|m| m.id == "auto-smart")
+        .expect("parameterized Auto id");
+    let optimize = auto
+        .options
+        .iter()
+        .find(|o| o.id == "optimize_for")
+        .expect("Optimize For");
+    let tiers: Vec<&str> = optimize.choices.iter().map(|c| c.id.as_str()).collect();
+    assert!(tiers.contains(&"intelligence"), "{tiers:?}");
+    assert!(tiers.contains(&"balanced"), "{tiers:?}");
+    assert!(tiers.contains(&"cost"), "{tiers:?}");
+
+    let (controls, steer_tx, _token) = controls();
+    let harness = AcpHarness::cursor();
+    let mut req = request("Reply with exactly the word ACP-OK and nothing else.");
+    req.model = models
+        .iter()
+        .find(|m| m.id == "composer-2.5" || m.id.starts_with("composer-2.5"))
+        .map(|m| m.id.clone());
+    req.reasoning = None;
+    req.cwd = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let stream = harness.run(req, controls).await.expect("run starts");
+    let events = tokio::time::timeout(Duration::from_secs(180), async move {
+        let mut stream = stream;
+        let mut steer = Some(steer_tx);
+        let mut events = Vec::new();
+        while let Some(ev) = stream.next().await {
+            let ev = ev.expect("stream event");
+            if matches!(ev, AgentEvent::Done { .. }) {
+                steer = None;
+            }
+            events.push(ev);
+        }
+        drop(steer);
+        events
+    })
+    .await
+    .expect("real run finished in time");
+    let text: String = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::TextDelta { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(text.contains("ACP-OK"), "unexpected reply: {text:?}");
+    assert_eq!(dones(&events).len(), 1, "{events:?}");
+    assert_eq!(dones(&events)[0].0, DoneStatus::Completed, "{events:?}");
+}
+
+/// Cursor's todo extension reaches the stream as a chip, and its tools land
+/// through the standard `session/update` path. Worth pinning live: the docs
+/// call `cursor/update_todos` a fire-and-forget notification, but the CLI
+/// sends it as a REQUEST — an unanswered one would stall the turn. Run:
+/// `cargo test -p komet-harness --test acp -- --ignored real_cursor_todos`
+#[tokio::test]
+#[ignore = "needs the cursor-agent CLI authenticated + network; costs one small prompt"]
+async fn real_cursor_todos_and_tools_reach_the_stream() {
+    let (controls, steer_tx, _token) = controls();
+    let harness = AcpHarness::cursor();
+    let mut req = request(
+        "Use your todo tool to record 3 steps, then run `echo hi` in the shell. \
+         Keep it brief.",
+    );
+    req.reasoning = None;
+    req.cwd = std::env::temp_dir().to_string_lossy().into_owned();
+    let stream = harness.run(req, controls).await.expect("run starts");
+    let events = tokio::time::timeout(Duration::from_secs(240), async move {
+        let mut stream = stream;
+        let mut steer = Some(steer_tx);
+        let mut events = Vec::new();
+        while let Some(ev) = stream.next().await {
+            let ev = ev.expect("stream event");
+            if matches!(ev, AgentEvent::Done { .. }) {
+                steer = None;
+            }
+            events.push(ev);
+        }
+        drop(steer);
+        events
+    })
+    .await
+    .expect("real run finished in time");
+    let todos: Vec<&AgentEvent> = events
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                AgentEvent::ToolCall {
+                    call: komet_proto::ToolCall::Todo { .. },
+                    ..
+                }
+            )
+        })
+        .collect();
+    assert!(!todos.is_empty(), "no todo chip: {events:?}");
+    // Repeated updates refresh one chip rather than stacking new ones.
+    assert!(
+        todos.iter().all(|e| matches!(
+            e,
+            AgentEvent::ToolCall { id, .. } if id == "cursor-todos"
+        )),
+        "todo chips must share the stable id: {todos:?}"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ToolCall {
+                call: komet_proto::ToolCall::Exec { .. },
+                ..
+            }
+        )),
+        "no exec tool call: {events:?}"
+    );
+    assert_eq!(dones(&events)[0].0, DoneStatus::Completed, "{events:?}");
+}
+
 #[test]
 fn descriptor_surface_matches_registry_expectations() {
     let harness = AcpHarness::grok();
@@ -749,6 +912,18 @@ async fn models_fall_back_to_the_static_catalog_when_the_probe_fails() {
     let models = harness.models().await.expect("static fallback");
     let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
     assert_eq!(ids, vec!["default"], "{models:?}");
+}
+
+#[test]
+fn cursor_descriptor_surface_matches_registry_expectations() {
+    let cursor = AcpHarness::cursor();
+    assert_eq!(cursor.id(), HarnessId::Cursor);
+    assert_eq!(cursor.display_name(), "Cursor");
+    assert!(cursor.supports_steering());
+    assert_eq!(cursor.steering_mode(), SteeringMode::TurnBoundary);
+    // Cursor carries effort in the model id's bracket suffix, so there is no
+    // separate ladder for the Reasoning dropdown to drive.
+    assert!(cursor.reasoning_levels().is_empty());
 }
 
 #[test]

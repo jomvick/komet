@@ -56,7 +56,7 @@ not built yet).
 | --- | --- | --- |
 | Claude Code adapter | done | stream-json, model discovery/effort ladders, AskUserQuestion → requestInput, steering via persistent input, init dedup, subagent filtering. **Live-verified against the real `claude` CLI 2.1.215**: doc-queued run → host executor → subprocess → streamed reply landed complete in the doc. |
 | Codex adapter | done | `codex app-server` JSON-RPC (thread/start/resume, sandbox policy). |
-| Cursor adapter | deferred | Parity item scheduled after Codex; no CLI surface settled. |
+| Cursor (ACP) | done | Shared `AcpHarness` spec; `cursor-agent acp` (Cursor's native ACP server), turn-boundary steering, no effort ladder (effort rides the model id's bracket suffix). Cursor's blocking extension methods are answered: `cursor/ask_question` → requestInput, `cursor/create_plan` auto-accepts, `cursor/update_todos` → todo chip. **Live-verified against the real `cursor-agent` CLI**: model discovery, streamed reply, todo chip and exec tool calls. |
 | Grok (ACP) | done | Shared `AcpHarness` spec; `grok agent stdio`, turn-boundary steering. |
 | Hermes (ACP) | done | Shared `AcpHarness` spec; `hermes acp` (Nous Research's native ACP server), turn-boundary steering, no effort ladder yet. |
 | Pi (ACP) | done | Shared `AcpHarness` spec; community `pi-acp` adapter (pinned 0.0.33, npx fallback), turn-boundary steering, minimal→max thinking ladder. |
@@ -99,13 +99,12 @@ not built yet).
 - **Mobile app** — out of scope for the native rewrite so far.
 - **E2EE** — transport is TLS + WorkOS bearers; end-to-end encryption of doc
   contents not designed.
-- **Cursor harness** (§4).
 - **macOS packaging execution** — config + steps in `dist/` only (needs a Mac).
 - **Engine hardening**: single-instance lock, parent-PID watchdog, crash
   shield, idle reaper / stall watchdog, boot warm-open of recent chats.
 
 ## Summary
 
-Table rows above: **39 done · 6 partial · 1 deferred** (Cursor harness), plus
-the cross-cutting deferrals (mobile, E2EE, macOS packaging execution,
-engine hardening) — the last overlaps the named gaps in the partial rows.
+Table rows above: **40 done · 6 partial**, plus the cross-cutting deferrals
+(mobile, E2EE, macOS packaging execution, engine hardening) — the last
+overlaps the named gaps in the partial rows.

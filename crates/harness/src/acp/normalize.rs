@@ -97,9 +97,68 @@ fn first_location(update: &Value) -> Option<String> {
     path.as_str().filter(|p| !p.is_empty()).map(str::to_owned)
 }
 
+/// Cursor (and similar ACP agents) put a human summary in `title` — generic
+/// labels ("Read File", "grep") before args arrive, or a markdown-wrapped
+/// command (`` `ls -la` `` with inner backticks escaped as `\``). Those are
+/// display strings, not typed arguments; using them as path/pattern/command
+/// dumps the label (and its escapes) into the transcript chip.
+fn is_placeholder_title(title: &str) -> bool {
+    matches!(
+        title.trim(),
+        "grep"
+            | "Find"
+            | "Terminal"
+            | "Read File"
+            | "Edit File"
+            | "Delete File"
+            | "Web Search"
+            | "Web Fetch"
+            | "Codebase Search"
+            | "Read TODOs"
+            | "Update TODOs"
+            | "Read Lints"
+            | "Task: Subagent task"
+            | "Subagent task"
+            | "List MCP Resources"
+            | "Fetch MCP Resource"
+    )
+}
+
+/// Unwrap a single markdown code span used as an ACP exec title.
+fn unwrap_command_title(title: &str) -> Option<String> {
+    let inner = title.trim().strip_prefix('`')?.strip_suffix('`')?;
+    let mut out = String::with_capacity(inner.len());
+    let mut chars = inner.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\\' && chars.peek() == Some(&'`') {
+            chars.next();
+            out.push('`');
+        } else {
+            out.push(c);
+        }
+    }
+    let out = out.trim();
+    if out.is_empty() || is_placeholder_title(out) {
+        None
+    } else {
+        Some(out.to_owned())
+    }
+}
+
+fn arg_from_title(title: &str) -> Option<String> {
+    let t = title.trim();
+    if t.is_empty() || is_placeholder_title(t) {
+        None
+    } else {
+        Some(t.to_owned())
+    }
+}
+
 /// Reduce an ACP tool call (kind + title + rawInput + locations + diff
 /// content) to the typed [`ToolCall`] komet renders. Best-effort: agents vary
 /// in how much structure they put in `rawInput`, so every arm has a fallback.
+/// Title is only used when it looks like a real arg — never a placeholder
+/// label or markdown-escaped summary.
 fn typed_call(update: &Value) -> ToolCall {
     let kind = update
         .get("kind")
@@ -115,12 +174,18 @@ fn typed_call(update: &Value) -> ToolCall {
     };
     match kind {
         "execute" => ToolCall::Exec {
-            command: raw_str("command").unwrap_or(title),
+            command: raw_str("command")
+                .or_else(|| unwrap_command_title(&title))
+                .or_else(|| arg_from_title(&title))
+                .unwrap_or_default(),
         },
         "read" => ToolCall::ReadFile {
             path: raw_str("path")
+                .or_else(|| raw_str("file_path"))
+                .or_else(|| raw_str("filePath"))
                 .or_else(|| first_location(update))
-                .unwrap_or(title),
+                .or_else(|| arg_from_title(&title))
+                .unwrap_or_default(),
         },
         "edit" | "delete" | "move" => {
             // A diff pins down the file and shape; otherwise fall back to the
@@ -139,7 +204,11 @@ fn typed_call(update: &Value) -> ToolCall {
                     }
                 }
             } else {
-                match raw_str("path").or_else(|| first_location(update)) {
+                match raw_str("path")
+                    .or_else(|| raw_str("file_path"))
+                    .or_else(|| raw_str("filePath"))
+                    .or_else(|| first_location(update))
+                {
                     Some(path) if kind == "edit" => ToolCall::EditFile {
                         path,
                         old_string: None,
@@ -149,16 +218,29 @@ fn typed_call(update: &Value) -> ToolCall {
                 }
             }
         }
-        "search" => ToolCall::Search {
-            pattern: raw_str("pattern")
-                .or_else(|| raw_str("query"))
-                .unwrap_or(title),
-            path: raw_str("path"),
-        },
+        "search" => {
+            // Cursor web search is kind "search" + rawInput.searchTerm; grep
+            // / glob / codebase search use pattern or query.
+            if let Some(query) = raw_str("searchTerm") {
+                ToolCall::WebSearch { query }
+            } else {
+                ToolCall::Search {
+                    pattern: raw_str("pattern")
+                        .or_else(|| raw_str("globPattern"))
+                        .or_else(|| raw_str("query"))
+                        .or_else(|| arg_from_title(&title))
+                        .unwrap_or_default(),
+                    path: raw_str("path"),
+                }
+            }
+        }
         "fetch" => match raw_str("url") {
             Some(url) => ToolCall::WebFetch { url, prompt: None },
             None => ToolCall::WebSearch {
-                query: raw_str("query").unwrap_or(title),
+                query: raw_str("searchTerm")
+                    .or_else(|| raw_str("query"))
+                    .or_else(|| arg_from_title(&title))
+                    .unwrap_or_default(),
             },
         },
         // Kindless (or unknown-kind) update carrying a diff: an edit in all
@@ -179,6 +261,20 @@ fn typed_call(update: &Value) -> ToolCall {
                 }
             }
         }
+        _ if raw_str("_toolName").as_deref() == Some("task") => ToolCall::Unknown {
+            name: raw_str("description")
+                .filter(|d| d != "Subagent task")
+                .map(|d| format!("Task: {d}"))
+                .or_else(|| arg_from_title(&title))
+                .unwrap_or_else(|| {
+                    if title.is_empty() {
+                        "Task".into()
+                    } else {
+                        title
+                    }
+                }),
+            input: raw.cloned(),
+        },
         _ => ToolCall::Unknown {
             name: if title.is_empty() { kind.into() } else { title },
             input: raw.cloned(),
@@ -317,6 +413,35 @@ pub(crate) fn parse_commands(value: Option<&Value>) -> Vec<SlashCommand> {
             })
         })
         .collect()
+}
+
+/// Cursor's `cursor/update_todos` and `cursor/create_plan` carry a `todos`
+/// array (`{id, content, status}`) instead of ACP's `plan`/`entries`. Both
+/// render as the same kind of chip; the caller picks a stable id so repeated
+/// updates refresh in place rather than stacking.
+pub(crate) fn cursor_todo_events(params: &Value, chip_id: &str) -> Vec<AgentEvent> {
+    let Some(todos) = params.get("todos").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let items = todos
+        .iter()
+        .map(|t| TodoItem {
+            text: str_field(t, "content"),
+            done: t.get("status").and_then(Value::as_str) == Some("completed"),
+        })
+        .collect();
+    vec![
+        AgentEvent::ToolCall {
+            id: chip_id.to_owned(),
+            call: ToolCall::Todo { items },
+        },
+        AgentEvent::ToolResult {
+            id: chip_id.to_owned(),
+            is_error: false,
+            output: None,
+            diff: None,
+        },
+    ]
 }
 
 /// `session/request_permission` options (`{optionId, name, kind}`) → the
@@ -573,5 +698,150 @@ mod tests {
         let only_reject = vec![json!({ "optionId": "no", "kind": "reject_once" })];
         assert_eq!(preferred_allow_option(&only_reject), Some("no".into()));
         assert_eq!(preferred_allow_option(&[]), None);
+    }
+
+    /// Cursor ACP opens tool cards with a display `title` before `rawInput`
+    /// is filled (Search "grep", Read "Read File", Web "Web Fetch"). Those
+    /// labels must not become typed args.
+    #[test]
+    fn cursor_placeholder_titles_are_not_typed_args() {
+        let grep = json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "t1",
+            "title": "grep",
+            "kind": "search",
+            "rawInput": {},
+        });
+        assert_eq!(
+            map_update(&grep),
+            vec![AgentEvent::ToolCall {
+                id: "t1".into(),
+                call: ToolCall::Search {
+                    pattern: String::new(),
+                    path: None,
+                },
+            }]
+        );
+
+        let read = json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "t2",
+            "title": "Read File",
+            "kind": "read",
+            "rawInput": {},
+        });
+        assert_eq!(
+            map_update(&read),
+            vec![AgentEvent::ToolCall {
+                id: "t2".into(),
+                call: ToolCall::ReadFile {
+                    path: String::new(),
+                },
+            }]
+        );
+
+        let fetch = json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "t3",
+            "title": "Web Fetch",
+            "kind": "fetch",
+            "rawInput": {},
+        });
+        assert_eq!(
+            map_update(&fetch),
+            vec![AgentEvent::ToolCall {
+                id: "t3".into(),
+                call: ToolCall::WebSearch {
+                    query: String::new(),
+                },
+            }]
+        );
+
+        let web = json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "t4",
+            "title": "Web Search",
+            "kind": "search",
+            "rawInput": {},
+        });
+        assert_eq!(
+            map_update(&web),
+            vec![AgentEvent::ToolCall {
+                id: "t4".into(),
+                call: ToolCall::Search {
+                    pattern: String::new(),
+                    path: None,
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn cursor_search_term_maps_to_web_search() {
+        let update = json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "t1",
+            "title": "Web Search: \"multitask cli\"",
+            "kind": "search",
+            "rawInput": { "searchTerm": "multitask cli" },
+        });
+        assert_eq!(
+            map_update(&update),
+            vec![AgentEvent::ToolCall {
+                id: "t1".into(),
+                call: ToolCall::WebSearch {
+                    query: "multitask cli".into(),
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn cursor_exec_title_unwraps_markdown_backtick_escapes() {
+        let update = json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "t1",
+            "title": "`echo \\`hi\\``",
+            "kind": "execute",
+            "rawInput": {},
+        });
+        assert_eq!(
+            map_update(&update),
+            vec![AgentEvent::ToolCall {
+                id: "t1".into(),
+                call: ToolCall::Exec {
+                    command: "echo `hi`".into(),
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn cursor_task_uses_description_not_placeholder_title() {
+        let update = json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "t1",
+            "title": "Task: Subagent task",
+            "kind": "other",
+            "rawInput": {
+                "_toolName": "task",
+                "description": "Look up multitask docs",
+                "prompt": "find the reminder",
+            },
+        });
+        assert_eq!(
+            map_update(&update),
+            vec![AgentEvent::ToolCall {
+                id: "t1".into(),
+                call: ToolCall::Unknown {
+                    name: "Task: Look up multitask docs".into(),
+                    input: Some(json!({
+                        "_toolName": "task",
+                        "description": "Look up multitask docs",
+                        "prompt": "find the reminder",
+                    })),
+                },
+            }]
+        );
     }
 }
