@@ -41,6 +41,51 @@ enum DocDisk {
         directory.appendingPathComponent("registry1_\(orgId)_\(userId).json")
     }
 
+    // MARK: chat2 lineage snapshots (docs/chat2-sync.md C2)
+
+    /// `c2_<id>.loro` = 8-byte magic + UInt64 LE room cursor + snapshot,
+    /// written atomically in ONE file so doc content and cursor can never
+    /// diverge (a restored/copied doc that disagreed with its own cursor was
+    /// the root of the s2 redownload-forever class). The un-prefixed
+    /// `<id>.loro` files are the retired s2 lineage — never loaded into a
+    /// chat2 doc (unrelated Loro histories would duplicate every message),
+    /// kept on disk for rollback until LRU pruning ages them out.
+    private static let chat2Magic = Data("C2SNAP01".utf8)
+
+    static func chat2URL(for id: String) -> URL {
+        let safe = id.replacingOccurrences(of: "/", with: "_")
+        return directory.appendingPathComponent("c2_\(safe).loro")
+    }
+
+    static func legacySnapshotExists(id: String) -> Bool {
+        FileManager.default.fileExists(atPath: url(for: id).path)
+    }
+
+    /// Import the chat2 snapshot; returns its cursor, or nil when absent or
+    /// unreadable (caller starts fresh at cursor 0 — the room re-serves).
+    static func loadChat2(into doc: LoroDoc, id: String) -> UInt64? {
+        guard let data = try? Data(contentsOf: chat2URL(for: id)),
+              data.count >= 16, data.prefix(8) == chat2Magic else { return nil }
+        var cursor: UInt64 = 0
+        for (ix, byte) in data.subdata(in: 8..<16).enumerated() {
+            cursor |= UInt64(byte) << (8 * ix)
+        }
+        guard data.count > 16 else { return cursor }
+        guard (try? doc.importWith(bytes: data.subdata(in: 16..<data.count),
+                                   origin: "disk")) != nil else { return nil }
+        return cursor
+    }
+
+    /// Atomically persist the chat2 doc snapshot + its room cursor.
+    static func saveChat2(doc: LoroDoc, id: String, cursor: UInt64) {
+        guard let snapshot = try? doc.export(mode: .snapshot) else { return }
+        var data = chat2Magic
+        var le = cursor.littleEndian
+        withUnsafeBytes(of: &le) { data.append(contentsOf: $0) }
+        data.append(snapshot)
+        try? data.write(to: chat2URL(for: id), options: .atomic)
+    }
+
     /// LRU-prune session snapshots (the workspace registry blob is always
     /// kept; a leftover `ws3_` Loro snapshot is retained for rollback).
     static func prune(keep: Int) {
@@ -69,18 +114,17 @@ enum DocDisk {
 }
 
 /// Debounced snapshot persistence shared by the doc stores: poke on every
-/// change; the snapshot writes ~1.5s after the last poke, and `flush` forces
-/// it (backgrounding, store teardown).
+/// change; `save` runs ~1.5s after the last poke, and `flush` forces it
+/// (backgrounding, store teardown). The closure captures whatever must be
+/// written together (e.g. a chat2 doc AND its cursor — one atomic file).
 @MainActor
 final class DocSaver {
-    private let docId: String
-    private let doc: LoroDoc
+    private let save: () -> Void
     private var generation = 0
     private var dirty = false
 
-    init(docId: String, doc: LoroDoc) {
-        self.docId = docId
-        self.doc = doc
+    init(save: @escaping () -> Void) {
+        self.save = save
     }
 
     func poke() {
@@ -97,7 +141,7 @@ final class DocSaver {
     func flush() {
         guard dirty else { return }
         dirty = false
-        DocDisk.save(doc: doc, id: docId)
+        save()
     }
 }
 

@@ -72,13 +72,6 @@ final class AppConfig: @unchecked Sendable {
         return components.url!
     }
 
-    func workspaceSocketURL() async -> URL? {
-        guard let token = await currentToken() else { return nil }
-        var url = wsBase.appending(path: "workspace/\(orgId)/ws")
-        url.append(queryItems: [URLQueryItem(name: "token", value: token)])
-        return url
-    }
-
     /// The workspace registry room (docs/registry-sync.md) — the row-table
     /// replacement for the old ws Loro workspace doc.
     func registrySocketURL() async -> URL? {
@@ -89,11 +82,24 @@ final class AppConfig: @unchecked Sendable {
         return url
     }
 
-    func sessionSocketURL(chatId: String) async -> URL? {
+    /// The chat2 log-relay room (docs/chat2-sync.md B) — replaces the s2
+    /// session rooms, which mobile no longer dials at all. `device` rides the
+    /// URL so the DO can attribute sockets and honor excludeOwn backfills.
+    func chat2SocketURL(chatId: String) async -> URL? {
         guard let token = await currentToken() else { return nil }
-        var url = wsBase.appending(path: "session/\(chatId)/ws")
-        url.append(queryItems: [URLQueryItem(name: "token", value: token)])
+        var url = wsBase.appending(path: "chat2/\(chatId)/ws")
+        url.append(queryItems: [URLQueryItem(name: "token", value: token),
+                                URLQueryItem(name: "device", value: deviceId)])
         return url
+    }
+
+    /// GET /chat2/{chatId}/checkpoint — the Range-resumable doc snapshot
+    /// (auth via bearer header; the caller adds Range on resume).
+    func chat2CheckpointRequest(chatId: String) async -> URLRequest? {
+        guard let token = await currentToken() else { return nil }
+        var request = URLRequest(url: edgeURL.appending(path: "chat2/\(chatId)/checkpoint"))
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        return request
     }
 
     /// Decode the JWT payload's `exp` (60s early-refresh margin). Unparseable

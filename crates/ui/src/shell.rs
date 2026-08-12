@@ -36,6 +36,7 @@ use crate::settings::appearance::AppearancePage;
 use crate::settings::harnesses::HarnessesPage;
 use crate::settings::archived::ArchivedPage;
 use crate::settings::devices::DevicesPage;
+use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
 use crate::settings::{
     KeymapConfig, RIGHT_PANE_DEFAULT, RIGHT_PANE_MAX, RIGHT_PANE_MIN, SAVE_DEBOUNCE_MS,
@@ -148,16 +149,18 @@ pub enum SettingsSection {
     /// Per-provider CLI accounts (login, usage) — labeled "Accounts".
     Agents,
     Appearance,
+    Notifications,
     Shortcuts,
     Archived,
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 6] = [
+    pub const ALL: [SettingsSection; 7] = [
         SettingsSection::Devices,
         SettingsSection::Harnesses,
         SettingsSection::Agents,
         SettingsSection::Appearance,
+        SettingsSection::Notifications,
         SettingsSection::Shortcuts,
         SettingsSection::Archived,
     ];
@@ -170,6 +173,7 @@ impl SettingsSection {
             SettingsSection::Harnesses => "Agents",
             SettingsSection::Agents => "Accounts",
             SettingsSection::Appearance => "Appearance",
+            SettingsSection::Notifications => "Notifications",
             SettingsSection::Shortcuts => "Shortcuts",
             SettingsSection::Archived => "Archived sessions",
         }
@@ -343,7 +347,7 @@ const CHAT_ROW_HEIGHT: f32 = 61.0;
 /// Flex gap between sidebar list items.
 const SIDEBAR_LIST_GAP: f32 = 2.0;
 
-/// Ramp height of the glass sidebar's scroll-edge fade (the gpui
+/// Ramp height of the sidebar's scroll-edge fade (the gpui
 /// [`gpui::EdgeFade`] scope — per-primitive, so text fades per glyph).
 const SIDEBAR_GLASS_FADE_BAND: f32 = 32.0;
 
@@ -430,6 +434,21 @@ pub struct Shell {
     /// "Drop images to attach" veil over the whole chat area; a drop stages
     /// the files in the composer.
     file_drag_active: bool,
+    /// Measured height of the bottom chrome stack (status strip + composer +
+    /// terminal dock) the full-height transcript scrolls under — written by a
+    /// paint-time canvas each frame, read the NEXT frame for the fade inset,
+    /// the transcript's bottom clearance, and the jump pill's anchor (the
+    /// same one-frame lag every fade here rides).
+    bottom_stack: std::rc::Rc<std::cell::Cell<f32>>,
+    /// The sidebar's archived accordion (t3code Sidebar): OPEN by default
+    /// (user request), session-transient. `archived_shown` pages the
+    /// expanded list ("Show more" reveals another page).
+    pub(super) archived_open: bool,
+    pub(super) archived_shown: usize,
+    /// Archived slim row under the pointer — swaps its time label for the
+    /// Unarchive affordance and restores the dimmed harness mark (t3code's
+    /// settled-row hover).
+    pub(super) archived_hover: Option<String>,
     /// Lazy panes: no entity (and no RPC) until first opened.
     terminal: Option<Entity<TerminalPanel>>,
     changes: Option<Entity<Changes>>,
@@ -440,38 +459,35 @@ pub struct Shell {
     devices_page: Option<Entity<DevicesPage>>,
     archived_page: Option<Entity<ArchivedPage>>,
     appearance_page: Option<Entity<AppearancePage>>,
+    notifications_page: Option<Entity<NotificationsPage>>,
     shortcuts_page: Option<Entity<ShortcutsPage>>,
     accounts_page: Option<Entity<AccountsPage>>,
     harnesses_page: Option<Entity<HarnessesPage>>,
     shortcuts_sub: Option<Subscription>,
+    notifications_sub: Option<Subscription>,
     /// Session-row context menu: (chat id, window position).
-    chat_menu: Option<(String, Point<Pixels>)>,
+    chat_menu: popover::Popup<(String, Point<Pixels>)>,
     rename_dialog: Option<RenameChatDialog>,
     /// Chat id awaiting delete confirmation.
     delete_confirm: Option<String>,
-    /// Space-row context menu: (space id, window position).
-    space_menu: Option<(String, Point<Pixels>)>,
+    /// Space-row context menu (dropdown rows): (space id, window position).
+    space_menu: popover::Popup<(String, Point<Pixels>)>,
     rename_space_dialog: Option<RenameSpaceDialog>,
     /// Space id awaiting delete confirmation (hard delete + session cascade).
     delete_space_confirm: Option<String>,
     /// The add-space palette (⌘K-style; device tabs + folder search), `Some`
     /// while open.
     add_space: Option<AddSpaceFlow>,
-    /// Last selected chat per space (in-memory, like [`SessionPanels`]) — a
-    /// space switch lands back on the tab you left.
-    space_last_chat: std::collections::HashMap<String, String>,
-    /// Session tab currently hovered (close button appears on hover).
-    tab_hover: Option<String>,
-    /// Session-tab drag-reorder in flight (see `tabs::TabDragState`).
-    tab_drag: Option<tabs::TabDragState>,
-    /// Space-row drag-reorder in flight (see `spaces::SpaceDragState`).
-    space_drag: Option<spaces::SpaceDragState>,
-    /// Scroll position of the session tab region (drives the edge fades and
-    /// the drop-index math under horizontal overflow).
-    tabs_scroll: gpui::ScrollHandle,
-    /// Chat id last auto-scrolled into view — scroll-to-selected fires once per
-    /// selection change, not every frame (which would fight manual scrolling).
-    tabs_scrolled_to: Option<String>,
+    /// The sidebar's space-filter dropdown.
+    spaces_menu: popover::Popup<spaces::SpacesMenu>,
+    /// When the dropdown was closed by an outside mouse-down; lets the
+    /// trigger's click tell "toggle closed" apart from "just dismissed by
+    /// this same click" (same guard as `user_menu_dismissed_at`).
+    spaces_menu_dismissed_at: Option<std::time::Instant>,
+    /// Chat id whose STATUS CORNER is under the pointer — just that corner
+    /// swaps to the archive button (t3code's settle-on-hover); hovering the
+    /// row body leaves the status readable.
+    chat_status_hover: Option<String>,
     /// Scroll position of the sidebar lists region (drives its edge fades).
     sidebar_scroll: gpui::ScrollHandle,
     /// `settings.last_space_id` applied once after the first spaces frame.
@@ -479,7 +495,7 @@ pub struct Shell {
     /// Last seen session status per chat — the chime trigger compares against
     /// it (a row's FIRST appearance never chimes, so boot stays silent).
     sound_prev: std::collections::HashMap<String, komet_proto::SessionStatus>,
-    user_menu_open: bool,
+    user_menu: popover::Popup<()>,
     /// Outside-click dismissal instant — suppresses the trigger click that
     /// follows the same mouse-down from instantly reopening the menu.
     user_menu_dismissed_at: Option<std::time::Instant>,
@@ -526,6 +542,13 @@ pub struct Shell {
     debug_gate: Option<GatePhase>,
     sidebar_tween: Option<WidthTween>,
     right_tween: Option<WidthTween>,
+    /// Changes-panel takeover (the header's expand button): the panel fills
+    /// everything right of the sidebar and the conversation column collapses
+    /// to zero. Session-local view state — never persisted, reset on close.
+    right_pane_expanded: bool,
+    /// Viewport width stamped each frame at render — the expanded panel's
+    /// width target ([`Self::right_target`] has no `Window`).
+    viewport_width: f32,
     terminal_tween: Option<WidthTween>,
     /// Last observed `window.is_fullscreen()` (`None` before first paint) —
     /// flips key the traffic-light inset tween.
@@ -612,6 +635,7 @@ impl Shell {
             Some("settings/agents") => Route::Settings(SettingsSection::Agents),
             Some("settings/harnesses") => Route::Settings(SettingsSection::Harnesses),
             Some("settings/appearance") => Route::Settings(SettingsSection::Appearance),
+            Some("settings/notifications") => Route::Settings(SettingsSection::Notifications),
             Some("settings/shortcuts") => Route::Settings(SettingsSection::Shortcuts),
             Some("settings/archived") => Route::Settings(SettingsSection::Archived),
             // `new` pins the new-chat canvas (suppresses boot auto-select).
@@ -644,6 +668,12 @@ impl Shell {
             transcript,
             composer,
             file_drag_active: false,
+            // Seed with the compact composer stack's rough height so the
+            // first frame's clearance isn't zero (the measure corrects it).
+            bottom_stack: std::rc::Rc::new(std::cell::Cell::new(120.0)),
+            archived_open: true,
+            archived_shown: 0,
+            archived_hover: None,
             terminal: None,
             changes: None,
             route,
@@ -651,27 +681,26 @@ impl Shell {
             devices_page: None,
             archived_page: None,
             appearance_page: None,
+            notifications_page: None,
             shortcuts_page: None,
             accounts_page: None,
             harnesses_page: None,
             shortcuts_sub: None,
-            chat_menu: None,
+            notifications_sub: None,
+            chat_menu: popover::Popup::default(),
             rename_dialog: None,
             delete_confirm: None,
-            space_menu: None,
+            space_menu: popover::Popup::default(),
             rename_space_dialog: None,
             delete_space_confirm: None,
             add_space: None,
-            space_last_chat: std::collections::HashMap::new(),
-            tab_hover: None,
-            tab_drag: None,
-            space_drag: None,
-            tabs_scroll: gpui::ScrollHandle::new(),
-            tabs_scrolled_to: None,
+            spaces_menu: popover::Popup::default(),
+            spaces_menu_dismissed_at: None,
+            chat_status_hover: None,
             sidebar_scroll: gpui::ScrollHandle::new(),
             space_boot_applied: false,
             sound_prev: std::collections::HashMap::new(),
-            user_menu_open: false,
+            user_menu: popover::Popup::default(),
             user_menu_dismissed_at: None,
             sidebar_notice: None,
             update_flow: UpdateFlow::Idle,
@@ -695,6 +724,8 @@ impl Shell {
             debug_gate,
             sidebar_tween: None,
             right_tween: None,
+            right_pane_expanded: false,
+            viewport_width: 1280.0,
             terminal_tween: None,
             fullscreen: None,
             titlebar_tween: None,
@@ -738,7 +769,10 @@ impl Shell {
         // question rings whenever a session flips to AwaitingInput, a
         // completion rings on the Working→Idle edge — for ANY session on any
         // device. A row's first appearance only seeds the baseline, so boot
-        // (restored rows) and fresh sends stay silent.
+        // (restored rows) and fresh sends stay silent. Desktop banners
+        // (`notify::post`) ride the SAME edges and gates behind their own
+        // settings flag — one detector, two outputs, so the banner can never
+        // fire where the chime wouldn't.
         //
         // STALENESS-GATED like the dot (`effective_indicator`), for the same
         // reason: raw row statuses include the past. A dead turn's Working row
@@ -759,7 +793,8 @@ impl Shell {
         // still ring.
         {
             let now = Utc::now();
-            let sessions: Vec<(String, komet_proto::SessionStatus, bool)> = {
+            type Ping = (String, komet_proto::SessionStatus, bool, Option<String>);
+            let sessions: Vec<Ping> = {
                 let state = state.read(cx);
                 state
                     .sessions
@@ -773,18 +808,39 @@ impl Shell {
                             Indicator::None => komet_proto::SessionStatus::Idle,
                         };
                         let send_pending = state.send_pending(&s.chat_id, now);
-                        (s.chat_id.clone(), status, send_pending)
+                        let title = state
+                            .chats
+                            .iter()
+                            .find(|c| c.id == s.chat_id)
+                            .and_then(|c| c.title.clone());
+                        (s.chat_id.clone(), status, send_pending, title)
                     })
                     .collect()
             };
-            for (chat_id, status, send_pending) in sessions {
+            // Background-only banners: `active_window()` is app-level (any
+            // Komet window being key), so a ping for a *background chat* in a
+            // focused app still stays a chime — you're already looking at
+            // Komet; the sidebar dot carries the rest.
+            let app_focused = cx.active_window().is_some();
+            for (chat_id, status, send_pending, title) in sessions {
                 let prev = self.sound_prev.insert(chat_id, status);
                 if let Some(prev) = prev
-                    && self.settings.sound_enabled
                     && let Some(sound) = crate::sound::sound_for_transition(prev, status)
                     && !(send_pending && sound == crate::sound::Sound::Done)
                 {
-                    crate::sound::play(sound);
+                    if self.settings.sound_enabled {
+                        crate::sound::play(sound);
+                    }
+                    if self.settings.notifications_enabled
+                        && !(self.settings.notifications_background_only && app_focused)
+                    {
+                        let title = title.unwrap_or_else(|| "New session".into());
+                        let body = match sound {
+                            crate::sound::Sound::Done => "Run finished",
+                            crate::sound::Sound::Request => "Waiting on your input",
+                        };
+                        crate::notify::post(&title, body);
+                    }
                 }
             }
         }
@@ -794,31 +850,44 @@ impl Shell {
         // chat implies its space, which `select_chat` already applied).
         if !self.space_boot_applied && !state.read(cx).spaces.is_empty() {
             self.space_boot_applied = true;
-            if state.read(cx).selected_chat.is_none()
-                && let Some(last) = self.settings.last_space_id.clone()
-                && state.read(cx).space_row(&last).is_some()
-            {
-                state.update(cx, |s, cx| s.select_space(Some(last), cx));
+            if state.read(cx).selected_chat.is_none() {
+                // A set sidebar filter is an explicit standing choice — the
+                // canvas defaults (project AND its device) follow it, even
+                // over a remembered "no project" opt-out. Otherwise the last
+                // selected project stands, unless opted out.
+                let exists = |id: &String| state.read(cx).space_row(id).is_some();
+                let filter = self.settings.space_filter.clone().filter(&exists);
+                let target = match filter {
+                    Some(filter) => Some(filter),
+                    None if !state.read(cx).no_project => {
+                        self.settings.last_space_id.clone().filter(&exists)
+                    }
+                    None => None,
+                };
+                if target.is_some() {
+                    state.update(cx, |s, cx| s.select_space(target, cx));
+                }
             }
         }
-        // Track the per-space last chat + persist the selected space.
+        // Persist the selected space (the new-tab fallback under "All").
         {
-            let (selected_space, selected_chat, chat_space) = {
-                let s = state.read(cx);
-                let chat_space = s.selected_chat_row().and_then(|c| c.space_id.clone());
-                (
-                    s.selected_space.clone(),
-                    s.selected_chat.clone(),
-                    chat_space,
-                )
-            };
-            if let (Some(space), Some(chat)) = (chat_space, selected_chat) {
-                self.space_last_chat.insert(space, chat);
-            }
+            let selected_space = state.read(cx).selected_space.clone();
             if selected_space != self.settings.last_space_id && selected_space.is_some() {
                 self.settings.last_space_id = selected_space;
                 self.schedule_save(cx);
             }
+        }
+        // Boot landing: the most recent session once the first chats frame
+        // syncs (manual selection wins).
+        self.boot_select_chat(cx);
+        // Heal a dangling sidebar filter (space deleted, possibly elsewhere):
+        // fall back to "All" rather than filtering everything out.
+        if state.read(cx).spaces_synced
+            && let Some(filter) = self.settings.space_filter.clone()
+            && state.read(cx).space_row(&filter).is_none()
+        {
+            self.settings.space_filter = None;
+            self.schedule_save(cx);
         }
         // Chat switch: restore THAT chat's panel state (per-session open flags;
         // snap, no tween — the panels belong to the destination chat).
@@ -917,10 +986,16 @@ impl Shell {
     }
 
     fn right_target(&self, cx: &App) -> f32 {
-        if self.right_pane_open(cx) {
-            self.settings.right_pane_width
-        } else {
+        if !self.right_pane_open(cx) {
             0.0
+        } else if self.right_pane_expanded {
+            // Takeover: everything right of the sidebar; the conversation
+            // column (flex_1) collapses to zero behind it. Rides the sidebar's
+            // width tween so a sidebar toggle mid-takeover stays seamless.
+            let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
+            (self.viewport_width - sidebar_now).max(RIGHT_PANE_MIN)
+        } else {
+            self.settings.right_pane_width
         }
     }
 
@@ -940,6 +1015,11 @@ impl Shell {
         let from = self.right_target(cx);
         let key = self.panel_key(cx);
         let open = self.panels.toggle_changes(&key);
+        if !open {
+            // Closing always leaves takeover mode — reopening at full bleed
+            // with the conversation gone read as a broken chat.
+            self.right_pane_expanded = false;
+        }
         self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
         if open {
             // Lazy: the Changes entity (and its WatchCheckoutDiffs) exists only
@@ -1097,6 +1177,22 @@ impl Shell {
 
     // ---- routes / settings ----
 
+    /// Close the user menu through the exit animation (no-op when closed).
+    fn close_user_menu(&mut self, cx: &mut Context<Self>) {
+        if self.user_menu.begin_close() {
+            popover::reap_popup(cx, |shell: &mut Self| &mut shell.user_menu);
+            cx.notify();
+        }
+    }
+
+    /// Close the session-row context menu through the exit animation.
+    fn close_chat_menu(&mut self, cx: &mut Context<Self>) {
+        if self.chat_menu.begin_close() {
+            popover::reap_popup(cx, |shell: &mut Self| &mut shell.chat_menu);
+            cx.notify();
+        }
+    }
+
     fn open_settings(&mut self, section: SettingsSection, cx: &mut Context<Self>) {
         // Recreate per visit: the page's ListHarnesses load re-probes which
         // CLIs are installed, so installing one shows up on the next open.
@@ -1105,8 +1201,8 @@ impl Shell {
         }
         self.route = Route::Settings(section);
         self.nav.push(NavEntry::Settings(section));
-        self.user_menu_open = false;
-        self.chat_menu = None;
+        self.close_user_menu(cx);
+        self.close_chat_menu(cx);
         cx.notify();
     }
 
@@ -1146,8 +1242,8 @@ impl Shell {
                 self.route = Route::Settings(section);
             }
         }
-        self.user_menu_open = false;
-        self.chat_menu = None;
+        self.close_user_menu(cx);
+        self.close_chat_menu(cx);
         cx.notify();
     }
 
@@ -1189,6 +1285,39 @@ impl Shell {
                     self.appearance_page = Some(cx.new(AppearancePage::new));
                 }
                 match &self.appearance_page {
+                    Some(page) => page.clone().into_any_element(),
+                    None => Empty.into_any_element(),
+                }
+            }
+            SettingsSection::Notifications => {
+                if self.notifications_page.is_none() {
+                    let page = cx.new(|cx| {
+                        NotificationsPage::new(
+                            self.settings.sound_enabled,
+                            self.settings.notifications_enabled,
+                            self.settings.notifications_background_only,
+                            cx,
+                        )
+                    });
+                    // Persist the flags whenever the page flips one.
+                    self.notifications_sub = Some(cx.subscribe(
+                        &page,
+                        |this: &mut Shell, _, event: &NotificationsEvent, cx| {
+                            let NotificationsEvent::Changed {
+                                sound,
+                                desktop,
+                                background_only,
+                            } = *event;
+                            this.settings.sound_enabled = sound;
+                            this.settings.notifications_enabled = desktop;
+                            this.settings.notifications_background_only = background_only;
+                            this.schedule_save(cx);
+                            cx.notify();
+                        },
+                    ));
+                    self.notifications_page = Some(page);
+                }
+                match &self.notifications_page {
                     Some(page) => page.clone().into_any_element(),
                     None => Empty.into_any_element(),
                 }
@@ -1250,7 +1379,7 @@ impl Shell {
     }
 
     fn open_rename_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
-        self.chat_menu = None;
+        self.close_chat_menu(cx);
         let current = self
             .state
             .read(cx)
@@ -1290,9 +1419,18 @@ impl Shell {
     }
 
     fn archive_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
-        self.chat_menu = None;
+        self.set_chat_archived(chat_id, true, cx);
+    }
+
+    pub(super) fn set_chat_archived(
+        &mut self,
+        chat_id: String,
+        archived: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.close_chat_menu(cx);
         self.mutate(
-            serde_json::json!({ "op": "setChatArchived", "chatId": chat_id, "archived": true }),
+            serde_json::json!({ "op": "setChatArchived", "chatId": chat_id, "archived": archived }),
             cx,
         );
         cx.notify();
@@ -1313,7 +1451,7 @@ impl Shell {
     }
 
     fn sign_out(&mut self, cx: &mut Context<Self>) {
-        self.user_menu_open = false;
+        self.close_user_menu(cx);
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
@@ -1550,7 +1688,7 @@ impl Shell {
     /// and control cluster overlay its left end.
     fn render_title_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         match self.route {
-            Route::Chat => self.render_session_tab_strip(cx),
+            Route::Chat => self.render_session_title_bar(cx),
             Route::Settings(_) => {
                 let inner = div()
                     .size_full()
@@ -1633,6 +1771,13 @@ impl Shell {
         let theme = Theme::of(cx).clone();
         let can_back = self.nav.can_back();
         let can_forward = self.nav.can_forward();
+        // The new-session + joins the cluster while the sidebar is collapsed
+        // (fading on the sidebar width tween) — INSIDE the cluster row so it
+        // shares the buttons' exact size and 2px rhythm; a separate mount in
+        // the title row sat 10px off the cluster and read misaligned (user
+        // report).
+        let plus_alpha = self.titlebar_plus_alpha();
+        let show_plus = matches!(self.route, Route::Chat) && plus_alpha > 0.01;
         div()
             .absolute()
             .top_0()
@@ -1665,7 +1810,27 @@ impl Shell {
                 &theme,
                 cx.listener(|this, _, _, cx| this.navigate_forward(cx)),
             ))
+            .children(show_plus.then(|| {
+                div()
+                    .flex_none()
+                    .opacity(plus_alpha)
+                    .child(window_control_button(
+                        "titlebar-new-session",
+                        icons::PLUS,
+                        &theme,
+                        cx.listener(|this, _, _, cx| this.open_new_session(cx)),
+                    ))
+            }))
             .into_any_element()
+    }
+
+    /// How present the titlebar's new-session + is: 0 with the sidebar open
+    /// (the + lives in the sidebar header), 1 fully collapsed, riding the
+    /// sidebar width tween in between.
+    pub(super) fn titlebar_plus_alpha(&self) -> f32 {
+        let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
+        let open_width = self.settings.sidebar_width.max(1.0);
+        (1.0 - sidebar_now / open_width).clamp(0.0, 1.0)
     }
 
     /// Native Windows caption controls integrated into Komet's unified
@@ -1726,11 +1891,17 @@ impl Shell {
         };
         let target = self.sidebar_target();
         // Transparent — the sidebar sits directly on the frost shell; the main
-        // card's own border provides the separation.
+        // card's own border provides the separation. The content row spans the
+        // full window height (the titlebar overlays it), so the column pads
+        // itself below the chrome.
         self.pane_container(
             self.sidebar_tween,
             target,
-            div().h_full().child(inner).into_any_element(),
+            div()
+                .h_full()
+                .pt(px(Theme::TITLEBAR_HEIGHT))
+                .child(inner)
+                .into_any_element(),
         )
     }
 
@@ -1748,6 +1919,7 @@ impl Shell {
             SettingsSection::Harnesses => icons::WIDGET,
             SettingsSection::Agents => icons::KEY_MINIMALISTIC,
             SettingsSection::Appearance => icons::TUNING,
+            SettingsSection::Notifications => icons::BELL,
             SettingsSection::Shortcuts => icons::KEYBOARD,
             SettingsSection::Archived => icons::ARCHIVE_MINIMALISTIC,
         };
@@ -1790,7 +1962,9 @@ impl Shell {
                                 .py(px(6.0))
                                 .text_size(px(13.0))
                                 .when(selected, |el| {
-                                    el.bg(crate::theme::wash(0.17))
+                                    // Same tokens as the main sidebar's session
+                                    // rows — the two sidebars must feel alike.
+                                    el.bg(crate::theme::glass_selected_bg())
                                         .font_weight(gpui::FontWeight::MEDIUM)
                                 })
                                 .text_color(if selected {
@@ -1799,7 +1973,7 @@ impl Shell {
                                     theme.text_muted
                                 })
                                 .cursor_pointer()
-                                .hover(|s| s.bg(crate::theme::wash(0.11)).text_color(theme.text))
+                                .hover(|s| s.bg(theme.glass_hover()).text_color(theme.text))
                                 .on_click(
                                     cx.listener(move |this, _, _, cx| this.open_settings(item, cx)),
                                 )
@@ -1827,7 +2001,7 @@ impl Shell {
                         .text_size(px(13.0))
                         .text_color(theme.text_muted)
                         .cursor_pointer()
-                        .hover(|s| s.bg(crate::theme::wash(0.11)).text_color(theme.text))
+                        .hover(|s| s.bg(theme.glass_hover()).text_color(theme.text))
                         .on_click(cx.listener(|this, _, _, cx| this.close_settings(cx)))
                         .child(
                             // AltArrowLeft chevron (komet settings-sidebar.tsx),
@@ -1857,33 +2031,136 @@ impl Shell {
         harness: Option<komet_proto::HarnessId>,
         status: komet_proto::ChatIndicator,
         selected: bool,
+        archived: bool,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        // Status is a rail, not a word (komet session-row.tsx): always present
-        // so rows align and state changes read in place. Working animates (the
-        // composer-strip spinner, miniaturized); every other status is a dot.
-        let dot_color = spaces::status_dot_color(status, theme);
-        let status_rail: AnyElement = if status == komet_proto::ChatIndicator::Working {
+        // Activity, not position (t3code Sidebar): status is a small colored
+        // word + glyph in the row's top-right corner — Working animates the
+        // composer-strip spinner, Done wears a check; Idle rows show the
+        // relative time instead. Hovering the ROW swaps the corner for the
+        // ARCHIVE button (UNARCHIVE on rows in the sidebar's archived
+        // accordion), t3code's settle-on-hover.
+        let corner_hovered = self.chat_status_hover.as_deref() == Some(id.as_str());
+        let status_color = spaces::status_dot_color(status, theme);
+        let status_label: Option<&'static str> = match status {
+            komet_proto::ChatIndicator::Working => Some("Working"),
+            komet_proto::ChatIndicator::AwaitingInput => Some("Input"),
+            komet_proto::ChatIndicator::Errored => Some("Failed"),
+            komet_proto::ChatIndicator::Completed => Some("Done"),
+            komet_proto::ChatIndicator::Idle => None,
+        };
+        let corner_body: AnyElement = if corner_hovered {
             div()
-                .w(px(6.0))
-                .flex_none()
                 .flex()
+                .flex_row()
                 .items_center()
-                .justify_center()
-                .child(loaders::mini_gradient_spinner(
-                    format!("chat-working-{id}"),
-                    2.0,
-                    cx.entity_id(),
-                    cx,
-                ))
+                .gap(px(4.0))
+                .h(px(18.0))
+                // The pill's padding bleeds right into the row's padding so
+                // its TEXT right-aligns exactly where the status word/time
+                // sits — the swap moves pixels around the label, not it.
+                // 4px: what's left of the row's 8px padding then equals the
+                // 4px of air above the pill (18px tall on the 14px line,
+                // 6px row padding minus the 2px overflow).
+                .px(px(4.0))
+                .mr(px(-4.0))
+                .rounded(px(5.0))
+                .bg(crate::theme::wash(0.10))
+                .hover(|s| s.bg(crate::theme::wash(0.18)))
+                .child(
+                    icon(if archived {
+                        icons::ARCHIVE_UP_MINIMALISTIC
+                    } else {
+                        icons::ARCHIVE_MINIMALISTIC
+                    })
+                    .size(px(11.0))
+                    .flex_none()
+                    .text_color(theme.text_muted),
+                )
+                .child(
+                    div()
+                        .text_size(px(10.0))
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from(if archived {
+                            "Unarchive"
+                        } else {
+                            "Archive"
+                        })),
+                )
                 .into_any_element()
         } else {
+            match status_label {
+                Some(label) => {
+                    // Glyph slot: Done wears the check; every other status a
+                    // dot in its color (the Working spinner lives at the
+                    // row's bottom-right, not up here).
+                    let glyph: AnyElement =
+                        if status == komet_proto::ChatIndicator::Completed {
+                            icon(icons::CHECK)
+                                .size(px(11.0))
+                                .flex_none()
+                                .text_color(status_color)
+                                .into_any_element()
+                        } else {
+                            div()
+                                .size(px(6.0))
+                                .flex_none()
+                                .rounded_full()
+                                .bg(status_color)
+                                .into_any_element()
+                        };
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(4.0))
+                        .child(glyph)
+                        .child(
+                            div()
+                                .text_size(px(10.0))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(status_color)
+                                .child(SharedString::from(label)),
+                        )
+                        .into_any_element()
+                }
+                None => div()
+                    .text_size(px(10.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .child(time_ago.clone())
+                    .into_any_element(),
+            }
+        };
+        // One stable wrapper across both states (identity keeps the hover
+        // from flickering as the content swaps); the swap is driven by the
+        // ROW's hover (user request — corner-only felt undiscoverable), but
+        // archiving only clicks on the corner itself, so the row's own click
+        // stays the selector.
+        let corner: AnyElement = {
+            let archive_id = id.clone();
             div()
-                .size(px(6.0))
-                .rounded_full()
+                .id(SharedString::from(format!("chat-corner-{id}")))
                 .flex_none()
-                .bg(dot_color)
+                // Pin the corner to line 1's text height so the archive pill
+                // (taller, padded) overflows vertically instead of growing the
+                // row — the swap must not shift the card's content.
+                // NO occlude: the ROW's hover drives the swap, and an
+                // occluding corner un-hovered the row underneath it —
+                // pill mounts, steals the pointer, row un-hovers, pill
+                // unmounts, repeat (user-reported flicker). The pill's
+                // stop_propagation click is separation enough.
+                .h(px(14.0))
+                .flex()
+                .items_center()
+                .cursor_pointer()
+                .when(corner_hovered, |el| {
+                    el.on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.set_chat_archived(archive_id.clone(), !archived, cx);
+                    }))
+                })
+                .child(corner_body)
                 .into_any_element()
         };
         let (hover, text) = (theme.glass_hover(), theme.text);
@@ -1915,23 +2192,39 @@ impl Shell {
             .py(px(6.0))
             .text_color(motion::hover_blend(&fade_key, rest_text, text))
             .bg(motion::hover_blend(&fade_key, rest_bg, hover_bg))
-            .when(selected, |el| {
-                el.shadow(crate::theme::glass_selected_shadows())
+            // No selection ring (user request) — the wash alone marks the
+            // active row.
+            // Row hover drives BOTH the wash blend and the corner's
+            // status→Archive swap (one listener — gpui allows a single
+            // hover listener per element).
+            .on_hover({
+                let fade_hover = motion::hover_listener(fade_key.clone());
+                let hover_id = id.clone();
+                cx.listener(move |this, hovered: &bool, window, cx| {
+                    fade_hover(hovered, window, cx);
+                    if *hovered {
+                        if this.chat_status_hover.as_deref() != Some(hover_id.as_str()) {
+                            this.chat_status_hover = Some(hover_id.clone());
+                            cx.notify();
+                        }
+                    } else if this.chat_status_hover.as_deref() == Some(hover_id.as_str()) {
+                        this.chat_status_hover = None;
+                        cx.notify();
+                    }
+                })
             })
-            .on_hover(motion::hover_listener(fade_key))
             .cursor_pointer()
             .on_click(cx.listener(move |this, _, _, cx| {
-                let id = select_id.clone();
-                this.state.update(cx, |s, cx| s.select_chat(Some(id), cx));
+                this.open_chat(select_id.clone(), cx);
             }))
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                    this.chat_menu = Some((menu_id.clone(), event.position));
+                    this.chat_menu.open((menu_id.clone(), event.position));
                     cx.notify();
                 }),
             )
-            // Line 1: status rail, space name, time-ago.
+            // Line 1: "project @ device", status word / time-ago right.
             .child(
                 div()
                     .w_full()
@@ -1939,7 +2232,6 @@ impl Shell {
                     .flex_row()
                     .items_center()
                     .gap(px(Theme::SPACE_SM))
-                    .child(status_rail)
                     .child(
                         div()
                             .flex_1()
@@ -1950,20 +2242,12 @@ impl Shell {
                             .text_color(subline)
                             .child(space_name),
                     )
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(px(11.0))
-                            .text_color(subline)
-                            .child(time_ago),
-                    ),
+                    .child(div().text_color(subline).child(corner)),
             )
-            // Line 2: the session title, aligned under the folder icon
-            // (rail 6 + gap 8).
+            // Line 2: the session title, flush left (t3code card line 2).
             .child(
                 div()
                     .w_full()
-                    .pl(px(14.0))
                     .truncate()
                     .text_size(px(13.0))
                     .line_height(px(17.0))
@@ -1974,7 +2258,6 @@ impl Shell {
             .child(
                 div()
                     .w_full()
-                    .pl(px(14.0))
                     .flex()
                     .flex_row()
                     .items_center()
@@ -2006,17 +2289,19 @@ impl Shell {
                                 .text_color(subline)
                                 .child(branch),
                         )
+                    })
+                    // Working rows animate the spinner at the row's
+                    // bottom-right (the status word keeps its dot up top).
+                    .when(status == komet_proto::ChatIndicator::Working, |el| {
+                        el.child(div().flex_1()).child(loaders::mini_gradient_spinner(
+                            format!("chat-working-{id}"),
+                            2.0,
+                            cx.entity_id(),
+                            cx,
+                        ))
                     }),
             )
             .into_any_element()
-    }
-
-    /// Which sidebar-list edges have hidden overflow (offset from the LAST
-    /// frame — the invisible one-frame lag every fade here rides).
-    pub(super) fn sidebar_fade_zones(&self) -> (bool, bool) {
-        let scrolled = -f32::from(self.sidebar_scroll.offset().y);
-        let max_scroll = f32::from(self.sidebar_scroll.max_offset().y);
-        (scrolled > 1.0, scrolled < max_scroll - 1.0)
     }
 
     /// Chat-mode sidebar (spaces overhaul): window-control strip, the Spaces
@@ -2080,17 +2365,8 @@ impl Shell {
             })
             .collect();
 
-        // Overflow edge fades for the lists scroll region — the tab strip's
-        // idiom, vertical (offset from the LAST frame; the lag is invisible).
-        let (lists_fade_top, lists_fade_bottom) = self.sidebar_fade_zones();
-        // Opaque platforms melt overflow into the surface tone with painted
-        // gradient overlays. Over GLASS no overlay can work — the backdrop is
-        // see-through blur, so tone stacks into a smudge and black reads as a
-        // shadow (user reports). Instead the ROWS fade themselves: prepaint-
-        // measured bounds drive per-row opacity toward the viewport edges
-        // ([`Shell::sidebar_row_alpha`]), dissolving the edge to pure glass.
-        let glass = theme.is_glass();
-        let sidebar_fade = theme.surface;
+        // t3code's archived accordion, below the active list.
+        let archived_section = self.render_archived_section(theme, cx);
 
         let user_line: SharedString = user
             .as_ref()
@@ -2099,7 +2375,9 @@ impl Shell {
         let user_email: Option<SharedString> = user.as_ref().map(|u| u.email.clone().into());
         let user_menu = self.render_user_menu(user_line.clone(), user_email.clone(), theme, cx);
 
-        let spaces_section = self.render_spaces_section(theme, cx);
+        // The space filter lives ABOVE the scroll region (fixed) so its
+        // dropdown can float without being clipped by the list's overflow.
+        let filter_row = self.render_spaces_filter(theme, cx);
 
         div()
             .w(px(self.settings.sidebar_width))
@@ -2108,13 +2386,20 @@ impl Shell {
             .flex_col()
             // (No titlebar strip: the unified window titlebar spans the whole
             // window above this column.)
-            // Spaces + the global Active list share one scroll region. On
-            // glass the whole region paints inside an EdgeFade scope — a true
-            // per-glyph gradient at active overflow edges.
+            .child(filter_row)
+            // The (filtered) Sessions list scrolls inside an EdgeFade scope —
+            // a true per-glyph gradient at active overflow edges. Glass-safe
+            // (no painted overlay can fade content over see-through blur) and
+            // equivalent on opaque themes: alpha→0 reveals the surface tone
+            // underneath, same as the gradient overlays it replaced. Overflow
+            // is read at PAINT time via the scroll handle — render-time gating
+            // rode the previous frame's offset, so the last frame of a content
+            // shrink (row archived while scrolled) left a phantom fade stuck
+            // over an unscrollable list (user report).
             .child(crate::edge_fade::edge_faded(
                 SIDEBAR_GLASS_FADE_BAND,
-                glass && lists_fade_top,
-                glass && lists_fade_bottom,
+                true,
+                true,
                 div()
                     .relative()
                     .flex_1()
@@ -2128,17 +2413,9 @@ impl Shell {
                             .px(px(Theme::SPACE_SM))
                             .flex()
                             .flex_col()
-                            .child(spaces_section)
-                            .child(
-                                div()
-                                    .px(px(Theme::SPACE_SM))
-                                    .pt(px(12.0))
-                                    .pb(px(4.0))
-                                    .text_size(px(11.0))
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .text_color(theme.text_muted.opacity(0.6))
-                                    .child(SharedString::from("Sessions")),
-                            )
+                            // No "Sessions" header (user request) — the list
+                            // is the whole column; a little air stands in.
+                            .pt(px(4.0))
                             .child(if !list_items.is_empty() {
                                 div()
                                     .flex()
@@ -2155,33 +2432,11 @@ impl Shell {
                                     .text_color(theme.text_faint)
                                     .child(SharedString::from("No sessions yet"))
                                     .into_any_element()
-                            }),
-                    )
-                    .when(lists_fade_top && !glass, |el| {
-                        el.child(div().absolute().top_0().left_0().right_0().h(px(24.0)).bg(
-                            gpui::linear_gradient(
-                                180.0,
-                                gpui::linear_color_stop(sidebar_fade, 0.0),
-                                gpui::linear_color_stop(sidebar_fade.opacity(0.0), 1.0),
-                            ),
-                        ))
-                    })
-                    .when(lists_fade_bottom && !glass, |el| {
-                        el.child(
-                            div()
-                                .absolute()
-                                .bottom_0()
-                                .left_0()
-                                .right_0()
-                                .h(px(24.0))
-                                .bg(gpui::linear_gradient(
-                                    0.0,
-                                    gpui::linear_color_stop(sidebar_fade, 0.0),
-                                    gpui::linear_color_stop(sidebar_fade.opacity(0.0), 1.0),
-                                )),
-                        )
-                    }),
-            ))
+                            })
+                            .children(archived_section),
+                    ),
+            )
+            .fade_overflow_y(&self.sidebar_scroll))
             // Update strip (above the user menu; below the lists).
             .when_some(self.render_update_strip(theme, cx), |el, strip| {
                 el.child(strip)
@@ -2243,13 +2498,23 @@ impl Shell {
         };
         let failed = matches!(self.update_flow, UpdateFlow::Failed(_));
         let tone = if failed { theme.danger } else { theme.accent };
-        // The chip fill is the sidebar's WHITE wash language, not an accent
-        // tint: an indigo fill over the glass composited into a dark slab that
-        // blocked the blur (user report) — the accent lives in the icon/text.
+        // Dark-purple GLASS tint (user request), not the 400-level accent as
+        // a fill: deep pigment at partial alpha tints the blur showing
+        // through instead of compositing into the slab that a bright indigo
+        // fill produced (earlier user report). Light chrome gets a lavender
+        // accent wash instead — dark purple under indigo-600 text goes muddy.
         let (chip_bg, chip_bg_hover) = if failed {
             (theme.danger.opacity(0.14), theme.danger.opacity(0.22))
         } else {
-            (crate::theme::wash(0.11), crate::theme::wash(0.16))
+            match theme.appearance {
+                crate::theme::Appearance::Dark => {
+                    let purple = crate::theme::oklch(0.35, 0.12, 277.0);
+                    (purple.opacity(0.45), purple.opacity(0.60))
+                }
+                crate::theme::Appearance::Light => {
+                    (theme.accent.opacity(0.10), theme.accent.opacity(0.16))
+                }
+            }
         };
 
         let mut strip = div()
@@ -2264,19 +2529,9 @@ impl Shell {
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(6.0))
             .text_size(px(11.0))
             .font_weight(gpui::FontWeight::MEDIUM)
             .text_color(tone)
-            .child(
-                icon(if failed {
-                    icons::DANGER_TRIANGLE
-                } else {
-                    icons::RESTART
-                })
-                .size(px(14.0))
-                .text_color(tone),
-            )
             .child(div().flex_1().min_w_0().child(label));
         if clickable {
             strip = strip
@@ -2367,7 +2622,7 @@ impl Shell {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let open = self.user_menu_open;
+        let open = self.user_menu.is_open();
         // Bottom-of-sidebar identity (komet user-menu.tsx): avatar circle +
         // name with the plan label underneath, Alpha badge chip on the right.
         let initial: SharedString = user_line
@@ -2406,8 +2661,12 @@ impl Shell {
                 let just_dismissed = this
                     .user_menu_dismissed_at
                     .is_some_and(|at| at.elapsed() < Duration::from_millis(400));
-                this.user_menu_open = !this.user_menu_open && !just_dismissed;
                 this.user_menu_dismissed_at = None;
+                if this.user_menu.is_open() {
+                    this.close_user_menu(cx);
+                } else if !just_dismissed {
+                    this.user_menu.open(());
+                }
                 cx.notify();
             }))
             .child(
@@ -2449,7 +2708,8 @@ impl Shell {
                             .child(SharedString::from("Alpha")),
                     ),
             );
-        if open {
+        if self.user_menu.get().is_some() {
+            let closing = self.user_menu.closing_since();
             // user-menu.tsx content: `w-[--radix-dropdown-menu-trigger-width]`
             // (exactly as wide as the trigger row — sidebar minus its p-2
             // gutters), `flex-col gap-0.5`, then: one small muted email line
@@ -2460,9 +2720,8 @@ impl Shell {
             let menu = popover::popover_card(theme)
                 .w(px(self.settings.sidebar_width - 2.0 * Theme::SPACE_SM))
                 .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                    this.user_menu_open = false;
                     this.user_menu_dismissed_at = Some(std::time::Instant::now());
-                    cx.notify();
+                    this.close_user_menu(cx);
                 }))
                 .flex()
                 .flex_col()
@@ -2503,7 +2762,8 @@ impl Shell {
                         .child(SharedString::from("Sign out")),
                 )
                 .into_any_element();
-            trigger = trigger.child(popover::anchored_menu_above("user-menu-popover", menu));
+            trigger =
+                trigger.child(popover::anchored_menu_above("user-menu-popover", menu, closing));
         }
         trigger.into_any_element()
     }
@@ -2519,15 +2779,15 @@ impl Shell {
         let theme = Theme::of(cx).clone();
         let mut overlays: Vec<AnyElement> = Vec::new();
 
-        if let Some((chat_id, position)) = self.chat_menu.clone() {
+        if let Some((chat_id, position)) = self.chat_menu.get().cloned() {
+            let chat_menu_closing = self.chat_menu.closing_since();
             let rename_id = chat_id.clone();
             let archive_id = chat_id.clone();
             let delete_id = chat_id.clone();
             let menu = popover::popover_card(&theme)
                 .w(px(170.0))
                 .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                    this.chat_menu = None;
-                    cx.notify();
+                    this.close_chat_menu(cx);
                 }))
                 .flex()
                 .flex_col()
@@ -2559,7 +2819,7 @@ impl Shell {
                         .id("chat-menu-delete")
                         .text_color(theme.danger)
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.chat_menu = None;
+                            this.close_chat_menu(cx);
                             this.delete_confirm = Some(delete_id.clone());
                             cx.notify();
                         }))
@@ -2571,7 +2831,12 @@ impl Shell {
                         .child(SharedString::from("Delete…")),
                 )
                 .into_any_element();
-            overlays.push(popover::menu_at("chat-context-menu", position, menu));
+            overlays.push(popover::menu_at(
+                "chat-context-menu",
+                position,
+                menu,
+                chat_menu_closing,
+            ));
         }
 
         if let Some(dialog) = &mut self.rename_dialog {
@@ -2708,17 +2973,18 @@ impl Shell {
     fn render_main(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme_owned = Theme::of(cx).clone();
         let theme = &theme_owned;
-        let theme_bg = theme.bg;
         let (border, text, faint) = (theme.border, theme.text, theme.text_faint);
 
         // Settings route: just the section outlet — the section label lives in
-        // the unified window titlebar now (render_title_bar).
+        // the unified window titlebar now (render_title_bar). Settings never
+        // underlaps: pad below the overlaid titlebar.
         if let Route::Settings(section) = self.route {
             let outlet = self.settings_outlet(section, cx);
             return div()
                 .flex_1()
                 .min_w_0()
                 .h_full()
+                .pt(px(Theme::TITLEBAR_HEIGHT))
                 .flex()
                 .flex_col()
                 .child(div().flex_1().min_h_0().child(outlet))
@@ -2728,6 +2994,7 @@ impl Shell {
         let _ = (text, border);
         let has_selection = self.state.read(cx).selected_chat.is_some();
         let has_spaces = !self.state.read(cx).spaces.is_empty();
+        let no_project = self.state.read(cx).no_project;
         let space_name: SharedString = self
             .state
             .read(cx)
@@ -2742,7 +3009,7 @@ impl Shell {
         // (new-chat mode mints the chat id on first send).
         let outlet: AnyElement = if has_selection {
             self.transcript.clone().into_any_element()
-        } else if !has_spaces {
+        } else if !has_spaces && !no_project {
             // Onboarding (first boot / after the destructive wipe): no folders
             // to work in yet — one clear affordance.
             let _ = faint;
@@ -2770,7 +3037,7 @@ impl Shell {
                                 .text_size(px(16.0))
                                 .font_weight(gpui::FontWeight::MEDIUM)
                                 .text_color(theme.text)
-                                .child(SharedString::from("Add a space to get started")),
+                                .child(SharedString::from("Add a project to get started")),
                         )
                         .child(
                             div()
@@ -2778,26 +3045,42 @@ impl Shell {
                                 .text_size(px(13.0))
                                 .text_color(theme.text_muted.opacity(0.7))
                                 .child(SharedString::from(
-                                    "A space is a folder on one of your devices.",
+                                    "A project is a folder on one of your devices.",
                                 )),
                         )
                         .child(
-                            popover::btn_primary(&theme_owned, "Add a space")
+                            popover::btn_primary(&theme_owned, "Add a project")
                                 .id("onboarding-add-space")
                                 .mt(px(20.0))
                                 .on_click(cx.listener(|this, _, _, cx| this.open_add_space(cx))),
+                        )
+                        .child(
+                            div()
+                                .id("onboarding-no-project")
+                                .mt(px(10.0))
+                                .text_size(px(12.0))
+                                .text_color(theme.text_muted.opacity(0.6))
+                                .cursor_pointer()
+                                .hover(|s| s.text_color(theme.text_muted))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.state
+                                        .update(cx, |s, cx| s.select_space(None, cx));
+                                }))
+                                .child(SharedString::from("Or start without a project")),
                         ),
                 ))
                 .into_any_element()
         } else {
-            // New-chat canvas (komet index.tsx): the dim komet mark watermark
-            // (`h-12 text-foreground/[0.09]`) over the centered helper line —
-            // now naming the space the session will start in.
+            // New-chat canvas (komet index.tsx): the komet mark over the
+            // TARGET selectors (device + project — moved up from the
+            // composer footer, user request) and the helper line.
             let helper: SharedString = if space_name.is_empty() {
                 "Send a message to start a new session.".into()
             } else {
                 format!("Send a message to start a session in {space_name}.").into()
             };
+            let pickers = self.composer.read(cx).pickers().clone();
+            let selectors = pickers.update(cx, |p, cx| p.render_target_selectors(cx));
             div()
                 .size_full()
                 .flex()
@@ -2814,11 +3097,14 @@ impl Shell {
                             icon(icons::KOMET_LOGO)
                                 .w(px(41.9))
                                 .h(px(48.0))
-                                .text_color(theme.text.opacity(0.09)),
+                                // 0.09 read as barely-there on the glass
+                                // backdrop (user report).
+                                .text_color(theme.text.opacity(0.2)),
                         )
+                        .child(div().mt(px(16.0)).child(selectors))
                         .child(
                             div()
-                                .mt(px(24.0))
+                                .mt(px(12.0))
                                 .text_size(px(14.0))
                                 .text_color(theme.text_muted.opacity(0.6))
                                 .child(helper),
@@ -2859,36 +3145,77 @@ impl Shell {
                 cx.notify();
             }))
             .child(
-                // The conversation fades out at its bottom edge instead of
-                // hard-cutting against the composer — a gradient overlay from
-                // transparent into the panel background.
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .relative()
-                    .child(outlet)
-                    .child(
-                        div()
-                            .absolute()
-                            .bottom_0()
-                            .left_0()
-                            .right(px(10.0))
-                            .h(px(Theme::TRANSCRIPT_FADE_BAND))
-                            .bg(gpui::linear_gradient(
-                                0.0,
-                                gpui::linear_color_stop(theme_bg, 0.0),
-                                gpui::linear_color_stop(theme_bg.opacity(0.0), 1.0),
-                            )),
-                    )
-                    .children(self.render_jump_to_bottom(cx)),
+                // Full-height underlay: the transcript viewport spans the
+                // whole column, scrolling UNDER the titlebar above and the
+                // composer stack below. The per-glyph EdgeFade (glass-safe,
+                // same as the sidebar's) spans the full column with
+                // ASYMMETRIC bands sized to the chrome: content is opaque at
+                // the chrome's inner edge and fades to zero at the window
+                // edge — visible mid-fade through the glass chrome it slides
+                // under. Always on (the resting paddings keep pinned content
+                // out of the bands, and gating on measured scroll state left
+                // the top unfaded for one frame on session switch — user
+                // report). The jump pill floats outside the fade scope,
+                // anchored above the measured stack.
+                {
+                    // The terminal dock is NOT glass the transcript may slide
+                    // under: with the dock's translucent fill, transcript text
+                    // ghosted through the grid (user report). The underlay
+                    // ends at the dock's top instead, riding the same height
+                    // tween the dock animates with; `stack_h` below is only
+                    // the chrome that still overlaps the transcript (status
+                    // strip + composer).
+                    let term_h = self.eval_tween(self.terminal_tween, self.terminal_target(cx));
+                    let stack_h = (self.bottom_stack.get() - term_h).max(0.0);
+                    // Opaque from the composer PILL's top (the reserved
+                    // status strip above it is empty air), zero at the
+                    // underlay's bottom edge.
+                    let bottom_band = (stack_h - Theme::STATUS_STRIP_HEIGHT).max(1.0);
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .bottom(px(term_h))
+                        .child(crate::edge_fade::edge_faded(
+                            Theme::TRANSCRIPT_FADE_BAND,
+                            true,
+                            true,
+                            div().size_full().child(outlet),
+                        )
+                        // Fully faded BY the titlebar's bottom edge (the
+                        // title text is opaque — overlap read as collision),
+                        // ramping in the band just below it.
+                        .inset_top(Theme::TITLEBAR_HEIGHT)
+                        .band_top(Theme::TRANSCRIPT_FADE_BAND)
+                        .band_bottom(bottom_band))
+                        .children(self.render_jump_to_bottom(stack_h, cx))
+                },
             )
-            // Reserved status strip (h-6) — the WorkingIndicator lives here so
-            // the composer below never shifts. Both live INSIDE the
-            // conversation region, ABOVE the terminal dock (komet __root.tsx:
-            // the terminal panel sits below the whole conversation column).
-            .child(status)
-            .when(has_spaces, |el| el.child(self.composer.clone()))
-            .child(self.render_terminal_container(cx))
+            // The glass chrome stack, floating over the transcript's bottom:
+            // reserved status strip (h-6, the WorkingIndicator — the composer
+            // below never shifts), composer, terminal dock. A paint-time
+            // canvas measures the stack for next frame's fade inset and
+            // transcript clearance. The flex_1 spacer has no id/listeners, so
+            // pointer + wheel events over it fall through to the list below.
+            .child(div().flex_1().min_h_0())
+            .child({
+                let measured = self.bottom_stack.clone();
+                div()
+                    .flex_none()
+                    .relative()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        gpui::canvas(
+                            move |bounds, _, _| measured.set(f32::from(bounds.size.height)),
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .inset_0(),
+                    )
+                    .child(status)
+                    .when(has_spaces, |el| el.child(self.composer.clone()))
+                    .child(self.render_terminal_container(cx))
+            })
             .when(file_drag_active, |el| {
                 el.child(
                     div()
@@ -2913,7 +3240,10 @@ impl Shell {
     /// conversation region (through the reserved h-6 status strip, whose
     /// content is left-aligned) so its bottom edge sits ~10px above the pill.
     /// Shown past the transcript's 320px threshold; 180ms fade + 2px rise in.
-    fn render_jump_to_bottom(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    /// `stack_h` is the measured bottom chrome stack the full-height
+    /// transcript scrolls under — the pill anchors just above it (the -14
+    /// carries the old status-strip overlap).
+    fn render_jump_to_bottom(&mut self, stack_h: f32, cx: &mut Context<Self>) -> Option<AnyElement> {
         if !self.transcript.read(cx).jump_button_shown() {
             return None;
         }
@@ -2921,7 +3251,7 @@ impl Shell {
         Some(
             div()
                 .absolute()
-                .bottom(px(-14.0))
+                .bottom(px(stack_h - 14.0))
                 .left_0()
                 .right(px(10.0))
                 .flex()
@@ -3023,14 +3353,18 @@ impl Shell {
             );
 
         // Fixed-height inner clipped by the animated container: content never
-        // reflows mid-transition (same trick as the side panes).
+        // reflows mid-transition (same trick as the side panes). The handle
+        // FLOATS over the panel's top edge (painted after, so it wins hit
+        // testing) instead of stacking above it — stacked, its 5px read as
+        // dead air between the seam and the tab bar (user report).
         let inner = div()
             .h(px(height))
             .w_full()
+            .relative()
             .flex()
             .flex_col()
-            .child(handle)
-            .child(div().flex_1().min_h_0().child(panel));
+            .child(div().flex_1().min_h_0().child(panel))
+            .child(handle.absolute().top_0().left_0().right_0());
 
         div()
             .w_full()
@@ -3084,31 +3418,14 @@ impl Shell {
             .unwrap_or(0);
         let sending = self.composer.read(cx).is_sending();
 
+        // Unused here since the Working loader moved into the transcript
+        // (its trailer computes its own elapsed).
+        let _ = elapsed_secs;
         match indicator {
-            Indicator::Working => {
-                let word =
-                    transcript::flavour_word(transcript::flavour_seed(&chat_id), elapsed_secs);
-                strip
-                    .child(loaders::gradient_spinner(
-                        "working-indicator",
-                        &theme,
-                        2.5,
-                        cx.entity_id(),
-                        cx,
-                    ))
-                    .child(
-                        div()
-                            .text_size(px(12.0))
-                            .text_color(theme.text_muted)
-                            .child(SharedString::from(format!("{word}…"))),
-                    )
-                    .child(
-                        div()
-                            .text_color(theme.text_faint)
-                            .child(SharedString::from(transcript::format_elapsed(elapsed_secs))),
-                    )
-                    .into_any_element()
-            }
+            // The working loader lives in the TRANSCRIPT now, under the
+            // streaming reply (user request) — the strip stays empty (its
+            // reserved height still steadies the composer).
+            Indicator::Working => strip.into_any_element(),
             // No label: the QuestionPanel right below IS the awaiting-input
             // surface — a strip caption above it was redundant (user request).
             Indicator::AwaitingInput => strip.into_any_element(),
@@ -3148,9 +3465,10 @@ impl Shell {
         } else {
             gpui::Empty.into_any_element()
         };
-        // Its OWN inset card (user request): the conversation card's right
-        // gutter is the gap; padding (not margins) keeps the tweened width
-        // container clean, and the resize grabber floats over the gap.
+        // Flush panel (user request — the inset card is gone): full window
+        // height with a left hairline, glass-friendly like the terminal dock
+        // (translucent over the frost; solid otherwise). The resize grabber
+        // floats over the border seam.
         let handle = self
             .resize_handle(
                 "right-pane-resize",
@@ -3163,33 +3481,50 @@ impl Shell {
             .bottom_0()
             // INSIDE the width-clipped container (a negative inset was
             // clipped into unreachability — user-reported dead resize),
-            // overlapping the card's left border.
+            // overlapping the panel's left border.
             .left(px(0.0));
-        let card = div()
+        let panel_bg = if theme.is_glass() { bg.opacity(0.4) } else { bg };
+        let panel = div()
             .size_full()
-            .rounded(px(12.0))
-            .border_1()
-            .border_color(theme.border)
-            .bg(bg)
+            .flex()
+            .flex_col()
+            // In takeover the panel's left edge IS the sidebar seam, which
+            // already carries the sidebar tone's right hairline — a second
+            // border there doubled up (user report).
+            .when(!self.right_pane_expanded, |el| {
+                el.border_l_1().border_color(theme.border)
+            })
+            .bg(panel_bg)
             .overflow_hidden()
+            // The titlebar is a glass overlay over the full-height content
+            // row; the panel's own chrome starts below it.
+            .pt(px(Theme::TITLEBAR_HEIGHT))
             .child(content);
         let target = self.right_target(cx);
+        // Takeover mode has no drag width — the handle would fight the
+        // viewport-derived target.
+        let handle = (!self.right_pane_expanded).then_some(handle);
         self.pane_container(
             self.right_tween,
             target,
-            // Mirrors the conversation card's box exactly: flush under the
-            // titlebar (no top pad), 8px bottom/right gutters — the
-            // conversation card's own right margin is the 8px gap between the
-            // two insets (user-reported height/gap mismatch).
             div()
                 .h_full()
                 .relative()
-                .pb(px(8.0))
-                .pr(px(8.0))
-                .child(card)
-                .child(handle)
+                .child(panel)
+                .children(handle)
                 .into_any_element(),
         )
+    }
+
+    /// Toggle the changes-panel takeover (the header's expand button, t3code
+    /// parity): the panel grows to fill everything right of the sidebar,
+    /// hiding the conversation column; toggling back restores the saved
+    /// width. Rides the same width tween as open/close so the jump glides.
+    fn toggle_right_pane_expand(&mut self, cx: &mut Context<Self>) {
+        let from = self.right_target(cx);
+        self.right_pane_expanded = !self.right_pane_expanded;
+        self.right_tween = Some(WidthTween::new(from, self.right_target(cx)));
+        cx.notify();
     }
 
     fn render_gate_card(&mut self, phase: &GatePhase, cx: &mut Context<Self>) -> AnyElement {
@@ -3919,9 +4254,19 @@ impl Render for Shell {
                 }
                 // MessageRail width gate: hide below 48rem of main-panel width.
                 let viewport = f32::from(window.viewport_size().width);
-                let main_width = viewport - self.sidebar_target() - self.right_target(cx) - 10.0;
+                // Stamped for `right_target` — the expanded changes panel
+                // sizes itself to the viewport.
+                self.viewport_width = viewport;
+                let main_width =
+                    (viewport - self.sidebar_target() - self.right_target(cx) - 10.0).max(0.0);
+                // Clearance excludes the terminal dock: the transcript
+                // viewport ends at the dock's top (see the underlay in
+                // `render_main`), so only the chrome above it overlaps.
+                let term_h = self.eval_tween(self.terminal_tween, self.terminal_target(cx));
+                let stack_h = (self.bottom_stack.get() - term_h).max(0.0);
                 self.transcript.update(cx, |t, cx| {
-                    t.set_rail_enabled(rail::rail_visible(main_width), cx)
+                    t.set_rail_enabled(rail::rail_visible(main_width), cx);
+                    t.set_bottom_clearance(stack_h, cx);
                 });
 
                 let sidebar = self.render_sidebar(cx);
@@ -3943,57 +4288,19 @@ impl Render for Shell {
                     Empty.into_any_element()
                 };
                 let overlays = self.render_overlays(window.viewport_size(), window, cx);
-                // The signature frame: the conversation card and — when the
-                // changes pane is open — a SECOND inset card beside it, both
-                // rounded hairline-bordered floats on the frost shell (the
-                // changes card is built inside `render_right_pane`).
-                let theme = Theme::of(cx);
-                // Margins, radius, and border-color MELT over the same 200ms
-                // ease-out as the sidebar width (komet __root.tsx `<main>`
-                // `transition-[margin,border-radius,border-color]`; collapsed
-                // is `m-0 rounded-none border-transparent` — the border WIDTH
-                // stays, only its color fades, so layout never jumps by the
-                // hairline).
-                let border_color = theme.border;
-                let card = div()
+                // Copied out (not held) — `render_title_bar` needs `cx` mutable.
+                let border_color = Theme::of(cx).border;
+                // No inset cards (user request): the conversation column sits
+                // flush and unbordered, the transcript directly on the frost
+                // glass; the changes pane is a flush left-bordered glass panel
+                // (built inside `render_right_pane`).
+                let card: AnyElement = div()
                     .flex_1()
                     .min_w_0()
                     .flex()
                     .flex_row()
                     .overflow_hidden()
-                    .bg(theme.bg)
-                    .border_1()
-                    .child(main);
-                // Manual drive on the SAME clock as the sidebar width tween.
-                // Crucially there is no `with_animation` wrapper here: the
-                // wrapper's epoch-keyed id used to change every card
-                // descendant's global element-id path on each toggle, which
-                // reset gpui's per-element animation state and REPLAYED any
-                // stale pane/terminal tween from t=0 (the changes pane slid
-                // ~100px under the clip mid-toggle — round-6 §2/§3).
-                //
-                // The inset card persists in EVERY state (user request): top
-                // gutter under the unified titlebar, constant left/right/
-                // bottom gutters, constant radius + hairline — the 8px left
-                // gap holds whether it borders the sidebar or the window edge.
-                // No top margin: the titlebar's own internal air (44px bar,
-                // 28px tabs) is the gap — an extra gutter read as a hole
-                // between the header and the app (user report).
-                // The right margin is the window gutter when the changes
-                // pane is closed, but the SEAM between the two inset cards
-                // when it's open — a full gutter there read double-wide next
-                // to the two borders it separates (user report).
-                let right_gap = if on_chat && self.right_pane_open(cx) {
-                    4.0
-                } else {
-                    8.0
-                };
-                let card: AnyElement = card
-                    .mb(px(8.0))
-                    .mr(px(right_gap))
-                    .ml(px(8.0))
-                    .rounded(px(12.0))
-                    .border_color(border_color)
+                    .child(main)
                     .into_any_element();
                 // The whole app page is one keyed `animate-in` entrance (komet
                 // App.tsx `<div key={phase} className="animate-in h-full">`):
@@ -4027,21 +4334,31 @@ impl Render for Shell {
                     .bg(crate::theme::wash(0.05))
                     .border_r_1()
                     .border_color(border_color);
+                // The content row spans the FULL window height — the titlebar
+                // overlays it (glass, no fill), so the transcript can scroll
+                // under the header and fade out at its edge. Columns that
+                // must NOT underlap (sidebar content, the changes panel,
+                // settings) pad themselves down by the titlebar height.
                 let page = div()
                     .size_full()
-                    .flex()
-                    .flex_col()
-                    .child(title_bar)
+                    .relative()
                     .child(
                         div()
-                            .flex_1()
-                            .min_h_0()
+                            .size_full()
                             .flex()
                             .flex_row()
                             .child(sidebar)
                             .child(sidebar_seam)
                             .child(card)
                             .child(right),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .right_0()
+                            .child(title_bar),
                     )
                     .child(self.render_titlebar_cluster(cx))
                     .children(overlays);

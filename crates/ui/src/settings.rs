@@ -16,6 +16,7 @@ pub mod archived;
 pub mod composer;
 pub mod devices;
 pub mod harnesses;
+pub mod notifications;
 pub mod shortcuts;
 pub mod widgets;
 
@@ -50,20 +51,37 @@ pub struct UiSettings {
     /// Legacy: the grouped-by-project toggle predates spaces (which group by
     /// folder inherently). Kept for file compatibility; no longer read.
     pub sidebar_grouped: bool,
-    /// The last selected space — restored on boot when the row still exists.
+    /// The last selected space — restored on boot when the row still exists;
+    /// also the new-tab default when the sidebar filter is "All".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_space_id: Option<String>,
-    /// Manual session-tab order per space (drag-reorder; device-local).
-    /// Missing chats are skipped; new chats append in creation order.
+    /// Open session tabs in visual order (drag-reorder edits in place).
+    /// Device-local: a tab is a local viewport onto the synced session list —
+    /// closing one never archives the session. Ids of archived/deleted chats
+    /// are pruned against the doc ([`Shell::sync_open_tabs`]). `None` = file
+    /// written by a pre-tabs build; seeded once from the last space's sessions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub open_tabs: Option<Vec<String>>,
+    /// Sidebar session filter: a space id, or `None` for "All spaces".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub space_filter: Option<String>,
+    /// Legacy: per-space tab order, from when tabs were the selected space's
+    /// non-archived sessions. Kept for file compatibility; no longer read.
     #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub tab_order: std::collections::HashMap<String, Vec<String>>,
-    /// Manual sidebar space order (drag-reorder; device-local). Missing spaces
-    /// are skipped; new spaces append in creation order.
+    /// Legacy: manual sidebar space order, from when spaces were a sidebar
+    /// list. Kept for file compatibility; no longer read.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub space_order: Vec<String>,
     /// Session notification chimes (done / awaiting-input). `KOMET_DISABLE_SOUND`
     /// overrides.
     pub sound_enabled: bool,
+    /// Desktop banner notifications on the same transitions.
+    /// `KOMET_DISABLE_NOTIFICATIONS` overrides.
+    pub notifications_enabled: bool,
+    /// Suppress the banner while a Komet window is focused (the chime covers
+    /// the foreground case).
+    pub notifications_background_only: bool,
     pub right_pane_width: f32,
     /// Legacy: panel *open* flags are session-scoped in-memory state now
     /// (`shell::SessionPanels`, komet `sessionPanels` parity). Kept for file
@@ -85,9 +103,13 @@ impl Default for UiSettings {
             sidebar_collapsed: false,
             sidebar_grouped: false,
             last_space_id: None,
+            open_tabs: None,
+            space_filter: None,
             tab_order: std::collections::HashMap::new(),
             space_order: Vec::new(),
             sound_enabled: true,
+            notifications_enabled: true,
+            notifications_background_only: true,
             right_pane_width: RIGHT_PANE_DEFAULT,
             right_pane_open: false,
             terminal_height: TERMINAL_DEFAULT_HEIGHT,
@@ -338,12 +360,16 @@ mod tests {
             sidebar_collapsed: true,
             sidebar_grouped: true,
             last_space_id: Some("space-1".into()),
+            open_tabs: Some(vec!["b".to_string(), "a".to_string()]),
+            space_filter: Some("space-1".into()),
             tab_order: std::collections::HashMap::from([(
                 "space-1".to_string(),
                 vec!["b".to_string(), "a".to_string()],
             )]),
             space_order: vec!["space-2".to_string(), "space-1".to_string()],
             sound_enabled: false,
+            notifications_enabled: false,
+            notifications_background_only: false,
             right_pane_width: 700.0,
             right_pane_open: true,
             terminal_height: 320.0,
@@ -373,6 +399,14 @@ mod tests {
         assert_eq!(loaded.appearance, crate::appearance::AppearanceMode::System);
         assert_eq!(loaded.sidebar_width, 300.0);
         assert!(!loaded.sound_enabled, "other keys still parse");
+        assert!(
+            loaded.notifications_enabled,
+            "pre-banner files default banners on"
+        );
+        assert!(
+            loaded.notifications_background_only,
+            "pre-banner files default background-only on"
+        );
     }
 
     #[test]

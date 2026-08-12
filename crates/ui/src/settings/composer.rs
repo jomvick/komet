@@ -42,6 +42,13 @@ pub struct ComposerDefaults {
     /// session whose configured model differs from the remembered pick
     /// would otherwise flash the raw id on switch.
     pub model_labels: HashMap<String, String>,
+    /// Last device picked for new sessions (the composer's device selector).
+    pub device: Option<String>,
+    /// Last project picked for new sessions; `None` + `no_project` = the
+    /// remembered "Don't work in a project" state.
+    pub project: Option<String>,
+    /// Remembered "Don't work in a project" opt-out.
+    pub no_project: bool,
 }
 
 impl ComposerDefaults {

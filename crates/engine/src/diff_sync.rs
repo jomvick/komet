@@ -18,6 +18,12 @@
 //! Fast recursive `notify` watchers (debounced [`WATCH_DEBOUNCE`]) are backed by a
 //! slow 2-minute repair tick because native watchers may coalesce or drop events.
 //! Snapshots carry a sha256 checksum; an unchanged checksum publishes nothing.
+//!
+//! Beyond the working-tree watch, the service also answers one-shot
+//! `GetCheckoutDiff` captures for the Changes pane's scopes: *branch changes*
+//! (vs `merge-base(baseRef, HEAD)`, same capture path with the base overridden)
+//! and *latest turn* (vs a temp-index `write-tree` snapshot taken when a turn
+//! dispatches — see [`CheckoutDiffSync::note_turn_start`]).
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -96,6 +102,18 @@ struct CheckoutEntry {
     _watchers: Vec<notify::RecommendedWatcher>,
 }
 
+/// Working-tree snapshot recorded when a chat's turn dispatches — the diff
+/// base for the Changes pane's "Latest turn" scope. In-memory only: after an
+/// engine restart the scope is unavailable until the next turn.
+#[derive(Debug, Clone)]
+pub struct TurnSnapshot {
+    /// Canonical checkout root the tree was captured in.
+    pub root: PathBuf,
+    /// `git write-tree` sha of the tracked + untracked (unignored) tree.
+    pub tree: String,
+    pub at: chrono::DateTime<chrono::Utc>,
+}
+
 struct DiffSyncInner {
     repos: Repos,
     workspace: WorkspaceHost,
@@ -104,6 +122,8 @@ struct DiffSyncInner {
     http: reqwest::Client,
     entries: Mutex<HashMap<String, Arc<CheckoutEntry>>>,
     diffs_tx: watch::Sender<Vec<CheckoutDiff>>,
+    /// chat_id → turn-start tree (see [`TurnSnapshot`]).
+    turn_trees: Mutex<HashMap<String, TurnSnapshot>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -134,6 +154,7 @@ impl CheckoutDiffSync {
                 http: reqwest::Client::new(),
                 entries: Mutex::new(HashMap::new()),
                 diffs_tx,
+                turn_trees: Mutex::new(HashMap::new()),
             }),
         };
         tokio::spawn(diff_sync_task(
@@ -160,6 +181,44 @@ impl CheckoutDiffSync {
         for entry in lock(&self.inner.entries).values() {
             let _ = entry.kick_tx.send(());
         }
+    }
+
+    /// A turn is starting for `chat_id` in `cwd`: snapshot the checkout's tree
+    /// in the background so "Latest turn" has a base. Best-effort — failures
+    /// only log; a chat outside a checkout simply records nothing.
+    pub fn note_turn_start(&self, chat_id: &str, cwd: &str) {
+        let inner = Arc::downgrade(&self.inner);
+        let chat_id = chat_id.to_string();
+        let cwd = PathBuf::from(cwd);
+        tokio::spawn(async move {
+            let Some(inner) = inner.upgrade() else { return };
+            let identity = match inner.repos.checkout_identity(&cwd).await {
+                Ok(identity) => identity,
+                Err(_) => return, // not a checkout
+            };
+            match snapshot_tree(&identity.root).await {
+                Ok(tree) => {
+                    lock(&inner.turn_trees).insert(
+                        chat_id,
+                        TurnSnapshot {
+                            root: identity.root,
+                            tree,
+                            at: chrono::Utc::now(),
+                        },
+                    );
+                }
+                Err(err) => {
+                    tracing::debug!(chat = %chat_id, error = %err,
+                        "diff-sync: turn snapshot failed");
+                }
+            }
+        });
+    }
+
+    /// The recorded turn-start snapshot for a chat, if any turn dispatched
+    /// since boot.
+    pub fn turn_snapshot(&self, chat_id: &str) -> Option<TurnSnapshot> {
+        lock(&self.inner.turn_trees).get(chat_id).cloned()
     }
 }
 
@@ -264,33 +323,49 @@ fn exceeds_watch_budget(root: &Path) -> bool {
     false
 }
 
+/// Which paths a checkout's entry live-watches.
+///
+/// A recursive `notify` watch installs one OS watch per subdirectory and has
+/// no way to prune subtrees. On a checkout carrying big dependency trees
+/// (node_modules, target/, vendored deps) that is tens of thousands of
+/// watches: the watcher thread pegs a core just maintaining them — even with
+/// the tree completely idle — which starved a real device's whole async
+/// runtime (presence heartbeats and IPC stalled; it showed permanently
+/// offline). So the worktree root is only watched when it fits
+/// [`MAX_WATCH_DIRS`].
+///
+/// An over-budget root still gets its GIT DIR watched (a bounded tree —
+/// objects fanout + refs): commits, index moves, and branch switches then
+/// refresh the diff instantly, and only raw working-tree edits wait for the
+/// repair tick. Without this, a commit right after an edit left the pane
+/// showing the pre-commit diff for up to two minutes (user report — the
+/// dev checkout's target/ alone blows the budget). Linked worktrees keep
+/// their git dir outside the root, so it rides along whenever the root's
+/// watch doesn't already cover it.
+fn watch_targets(identity: &CheckoutIdentity) -> Vec<PathBuf> {
+    let mut targets = Vec::new();
+    let root_fits = !exceeds_watch_budget(&identity.root);
+    if root_fits {
+        targets.push(identity.root.clone());
+    } else {
+        tracing::info!(path = %identity.root.display(),
+            "diff-sync: tree too large to watch live; watching the git dir, edits ride the repair tick");
+    }
+    let git_covered = root_fits && identity.git_dir.starts_with(&identity.root);
+    if !git_covered && !exceeds_watch_budget(&identity.git_dir) {
+        targets.push(identity.git_dir.clone());
+    }
+    targets
+}
+
 fn add_entry(inner: &Arc<DiffSyncInner>, identity: CheckoutIdentity, chats: Vec<Chat>) {
     let (kick_tx, kick_rx) = mpsc::unbounded_channel();
 
-    // Recursive watchers on the worktree root and (for linked worktrees) the git
+    // Recursive watchers on the worktree root (budget permitting) and the git
     // dir — HEAD/index churn and file edits both land here. Failures are fine:
     // the initial + repair sync still keep the snapshot correct.
     let mut watchers = Vec::new();
-    let mut targets: Vec<&PathBuf> = vec![&identity.root];
-    if !identity.git_dir.starts_with(&identity.root) {
-        targets.push(&identity.git_dir);
-    }
-    for target in targets {
-        // A recursive `notify` watch installs one OS watch per subdirectory and
-        // has no way to prune subtrees. On a checkout carrying big dependency
-        // trees (node_modules, vendored deps) that is tens of thousands of
-        // watches: the watcher thread pegs a core just maintaining them — even
-        // with the tree completely idle — which starved a real device's whole
-        // async runtime (presence heartbeats and IPC stalled; it showed
-        // permanently offline). If the tree blows the budget, skip the live
-        // watch entirely; the 2-minute repair tick still keeps the diff
-        // correct, just not instantly. Bounded so the probe itself stays cheap
-        // on a pathological tree.
-        if exceeds_watch_budget(target) {
-            tracing::info!(path = %target.display(),
-                "diff-sync: tree too large to watch live; relying on the repair tick");
-            continue;
-        }
+    for target in watch_targets(&identity) {
         let tx = kick_tx.clone();
         let watcher =
             notify::recommended_watcher(move |event: Result<notify::Event, notify::Error>| {
@@ -301,7 +376,7 @@ fn add_entry(inner: &Arc<DiffSyncInner>, identity: CheckoutIdentity, chats: Vec<
         match watcher {
             Ok(mut watcher) => {
                 use notify::Watcher as _;
-                match watcher.watch(target, notify::RecursiveMode::Recursive) {
+                match watcher.watch(&target, notify::RecursiveMode::Recursive) {
                     Ok(()) => watchers.push(watcher),
                     Err(err) => {
                         tracing::debug!(path = %target.display(), error = %err, "diff-sync: watch failed")
@@ -675,14 +750,27 @@ fn untracked_patch(path: &str, content: &str) -> String {
 /// as synthesized new-file hunks. 3MiB patch cap with a `truncated` flag; sha256
 /// checksum over branch ‖ head ‖ patch ‖ files ‖ truncated.
 pub async fn capture_diff(repos: &Repos, root: &Path) -> Result<DiffSnapshot, EngineError> {
+    capture_diff_against(repos, root, None).await
+}
+
+/// [`capture_diff`] with the diff base overridable: `None` keeps the
+/// working-tree behavior (vs HEAD / the empty tree); `Some(committish)` diffs
+/// the working tree against that base instead ("Branch changes" passes the
+/// merge-base with the comparison ref). Untracked files synthesize as new
+/// either way — they are new relative to any committed base.
+pub async fn capture_diff_against(
+    repos: &Repos,
+    root: &Path,
+    base_override: Option<&str>,
+) -> Result<DiffSnapshot, EngineError> {
     let head = capture_git(root, &["rev-parse", "--verify", "HEAD"], 256)
         .await
         .map(|c| String::from_utf8_lossy(&c.stdout).trim().to_string())
         .unwrap_or_default();
-    let base: &str = if head.is_empty() {
-        EMPTY_TREE_SHA
-    } else {
-        &head
+    let base: &str = match base_override {
+        Some(base) => base,
+        None if head.is_empty() => EMPTY_TREE_SHA,
+        None => &head,
     };
     let branch = repos
         .current_branch(root)
@@ -828,9 +916,166 @@ pub async fn capture_diff(repos: &Repos, root: &Path) -> Result<DiffSnapshot, En
     })
 }
 
+/// `git merge-base <base_ref> HEAD` — the diff base for "Branch changes".
+/// Errors when the ref is unknown or the histories are unrelated.
+pub async fn merge_base(root: &Path, base_ref: &str) -> Result<String, EngineError> {
+    let capture = capture_git(root, &["merge-base", base_ref, "HEAD"], 256).await?;
+    let sha = String::from_utf8_lossy(&capture.stdout).trim().to_string();
+    if sha.is_empty() {
+        return Err(EngineError::Other(format!(
+            "no merge base with {base_ref}"
+        )));
+    }
+    Ok(sha)
+}
+
+/// Write the checkout's current tracked + untracked (unignored) tree into the
+/// object db via a throwaway index: `git add -A` under `GIT_INDEX_FILE`, then
+/// `git write-tree`. The real index is never touched. Costs one full hash pass
+/// over the working tree (no stat cache in a fresh index) — run once per turn
+/// dispatch, that is the same cost class as the untracked-file reads the watch
+/// capture already does.
+pub async fn snapshot_tree(root: &Path) -> Result<String, EngineError> {
+    let index = std::env::temp_dir().join(format!(
+        "komet-turn-index-{}-{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_micros()
+    ));
+    let run = |args: &[&str]| {
+        let mut cmd = tokio::process::Command::new("git");
+        cmd.arg("-C").arg(root).args(args);
+        cmd.env("GIT_INDEX_FILE", &index);
+        cmd.stdin(std::process::Stdio::null());
+        cmd.output()
+    };
+    let added = run(&["add", "-A", "--ignore-errors", "."])
+        .await
+        .map_err(|e| EngineError::Other(format!("git add failed: {e}")))?;
+    if !added.status.success() {
+        let _ = tokio::fs::remove_file(&index).await;
+        return Err(EngineError::Other(format!(
+            "git add: {}",
+            String::from_utf8_lossy(&added.stderr).trim()
+        )));
+    }
+    let written = run(&["write-tree"])
+        .await
+        .map_err(|e| EngineError::Other(format!("git write-tree failed: {e}")));
+    let _ = tokio::fs::remove_file(&index).await;
+    let written = written?;
+    if !written.status.success() {
+        return Err(EngineError::Other(format!(
+            "git write-tree: {}",
+            String::from_utf8_lossy(&written.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&written.stdout).trim().to_string())
+}
+
+/// "Latest turn" capture: tree-to-tree diff from the turn-start snapshot to a
+/// fresh [`snapshot_tree`] of the current state. Both trees carry untracked
+/// (unignored) files, so no synthesis is needed and a file that was already
+/// untracked at turn start diffs correctly (the watch capture's synthesis
+/// would misreport it as entirely new).
+pub async fn capture_turn_diff(
+    repos: &Repos,
+    root: &Path,
+    turn_tree: &str,
+) -> Result<DiffSnapshot, EngineError> {
+    let current = snapshot_tree(root).await?;
+    let head = capture_git(root, &["rev-parse", "--verify", "HEAD"], 256)
+        .await
+        .map(|c| String::from_utf8_lossy(&c.stdout).trim().to_string())
+        .unwrap_or_default();
+    let branch = repos
+        .current_branch(root)
+        .await
+        .unwrap_or_else(|_| "HEAD".into());
+
+    let names = capture_git(
+        root,
+        &[
+            "diff",
+            "--name-status",
+            "-z",
+            "--find-renames",
+            turn_tree,
+            &current,
+            "--",
+        ],
+        2 * 1024 * 1024,
+    )
+    .await?;
+    let nums = capture_git(
+        root,
+        &[
+            "diff",
+            "--numstat",
+            "-z",
+            "--find-renames",
+            turn_tree,
+            &current,
+            "--",
+        ],
+        2 * 1024 * 1024,
+    )
+    .await?;
+    let tracked = capture_git(
+        root,
+        &[
+            "diff",
+            "--no-ext-diff",
+            "--no-color",
+            "--find-renames",
+            "--unified=3",
+            turn_tree,
+            &current,
+            "--",
+        ],
+        MAX_PATCH_BYTES,
+    )
+    .await?;
+
+    let mut files = parse_name_status(&names.stdout);
+    apply_numstat(&mut files, &nums.stdout);
+    let mut patch = String::from_utf8_lossy(&tracked.stdout).to_string();
+    let truncated = tracked.truncated || names.truncated || nums.truncated;
+    if tracked.truncated {
+        let boundary = patch.rfind('\n').unwrap_or(0);
+        patch.truncate(boundary);
+        patch.push_str("\n# Komet diff truncated\n");
+    }
+
+    let additions: u32 = files.iter().map(|f| f.additions).sum();
+    let deletions: u32 = files.iter().map(|f| f.deletions).sum();
+    let files_json = serde_json::to_string(&files)
+        .map_err(|e| EngineError::Other(format!("diff files serialize: {e}")))?;
+    let mut hasher = Sha256::new();
+    hasher.update(branch.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(head.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(patch.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(files_json.as_bytes());
+    hasher.update(if truncated { b"1" } else { b"0" });
+    let checksum = crate::repos::hex(&hasher.finalize());
+
+    Ok(DiffSnapshot {
+        branch,
+        head_sha: (!head.is_empty()).then_some(head),
+        patch,
+        files,
+        additions,
+        deletions,
+        truncated,
+        checksum,
+    })
+}
+
 #[cfg(test)]
 mod watch_budget_tests {
-    use super::{MAX_WATCH_DIRS, exceeds_watch_budget};
+    use super::{CheckoutIdentity, MAX_WATCH_DIRS, exceeds_watch_budget, watch_targets};
 
     #[test]
     fn small_tree_is_watchable() {
@@ -852,6 +1097,56 @@ mod watch_budget_tests {
             std::fs::create_dir(root.join(format!("d{i}"))).unwrap();
         }
         assert!(exceeds_watch_budget(root));
+    }
+
+    fn identity(root: &std::path::Path, git_dir: &std::path::Path) -> CheckoutIdentity {
+        CheckoutIdentity {
+            id: "test".into(),
+            root: root.to_path_buf(),
+            git_dir: git_dir.to_path_buf(),
+        }
+    }
+
+    #[test]
+    fn small_checkout_watches_root_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".git/refs")).unwrap();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        // The root watch covers the inline .git — no second watcher.
+        assert_eq!(
+            watch_targets(&identity(root, &root.join(".git"))),
+            vec![root.to_path_buf()]
+        );
+    }
+
+    #[test]
+    fn linked_worktree_watches_root_and_git_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("wt");
+        let git_dir = tmp.path().join("main/.git/worktrees/wt");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(&git_dir).unwrap();
+        assert_eq!(
+            watch_targets(&identity(&root, &git_dir)),
+            vec![root.clone(), git_dir]
+        );
+    }
+
+    #[test]
+    fn over_budget_root_falls_back_to_the_git_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".git/refs")).unwrap();
+        // Blow the budget with a flat dependency-tree stand-in.
+        for i in 0..(MAX_WATCH_DIRS + 50) {
+            std::fs::create_dir(root.join(format!("d{i}"))).unwrap();
+        }
+        // Commits/index churn must still watch live even though edits can't.
+        assert_eq!(
+            watch_targets(&identity(root, &root.join(".git"))),
+            vec![root.join(".git")]
+        );
     }
 
     #[cfg(unix)]

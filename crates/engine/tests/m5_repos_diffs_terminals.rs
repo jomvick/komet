@@ -8,7 +8,10 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
-use komet_engine::{EngineCore, HarnessRegistry, Repos, Terminals, capture_diff};
+use komet_engine::{
+    EngineCore, HarnessRegistry, Repos, Terminals, capture_diff, capture_diff_against,
+    capture_turn_diff, merge_base, snapshot_tree,
+};
 use komet_proto::TerminalEvent;
 use komet_rpc::methods;
 
@@ -347,6 +350,81 @@ async fn diff_capture_tracked_untracked_and_checksum() {
 }
 
 #[tokio::test]
+async fn diff_capture_against_merge_base_shows_branch_changes() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo_dir = tmp.path().join("repo");
+    init_repo(&repo_dir).await;
+    let repos = test_repos(&tmp.path().join("data"));
+
+    // Branch off, commit a change, then edit the working tree on top.
+    git(&repo_dir, &["checkout", "-b", "feature"]).await;
+    std::fs::write(repo_dir.join("c.txt"), "committed on feature\n").expect("write c.txt");
+    git(&repo_dir, &["add", "."]).await;
+    git(&repo_dir, &["commit", "-m", "feature work"]).await;
+    std::fs::write(repo_dir.join("a.txt"), "one\ntwo\nuncommitted\n").expect("edit a.txt");
+
+    // Working-tree capture sees only the uncommitted edit.
+    let working = capture_diff(&repos, &repo_dir).await.expect("working");
+    assert!(working.patch.contains("+uncommitted"));
+    assert!(!working.patch.contains("committed on feature"));
+
+    // Branch capture (vs merge-base with main) sees the commit AND the edit.
+    let base = merge_base(&repo_dir, "main").await.expect("merge base");
+    let branch = capture_diff_against(&repos, &repo_dir, Some(&base))
+        .await
+        .expect("branch capture");
+    assert!(branch.patch.contains("+committed on feature"));
+    assert!(branch.patch.contains("+uncommitted"));
+    assert!(branch.files.iter().any(|f| f.path == "c.txt"));
+
+    // Unknown ref errors instead of silently falling back.
+    assert!(merge_base(&repo_dir, "no-such-ref").await.is_err());
+}
+
+#[tokio::test]
+async fn turn_diff_captures_only_changes_since_snapshot() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo_dir = tmp.path().join("repo");
+    init_repo(&repo_dir).await;
+    let repos = test_repos(&tmp.path().join("data"));
+
+    // Pre-turn state: a tracked edit and an untracked file already exist.
+    std::fs::write(repo_dir.join("a.txt"), "one\ntwo\npre-turn\n").expect("edit a.txt");
+    std::fs::write(repo_dir.join("pre.txt"), "before the turn\n").expect("pre.txt");
+    let turn_tree = snapshot_tree(&repo_dir).await.expect("snapshot");
+
+    // Nothing changed yet: the turn diff is empty (pre-existing untracked
+    // files must NOT reappear as new).
+    let clean = capture_turn_diff(&repos, &repo_dir, &turn_tree)
+        .await
+        .expect("clean turn diff");
+    assert!(clean.patch.is_empty(), "unexpected: {}", clean.patch);
+    assert!(clean.files.is_empty());
+
+    // The "turn" edits one file and adds another.
+    std::fs::write(repo_dir.join("pre.txt"), "before the turn\nedited in turn\n")
+        .expect("edit pre.txt");
+    std::fs::write(repo_dir.join("turn.txt"), "made this turn\n").expect("turn.txt");
+    let turn = capture_turn_diff(&repos, &repo_dir, &turn_tree)
+        .await
+        .expect("turn diff");
+    assert!(turn.patch.contains("+edited in turn"));
+    assert!(turn.patch.contains("+made this turn"));
+    assert!(
+        !turn.patch.contains("pre-turn"),
+        "pre-turn tracked edit leaked into the turn diff"
+    );
+    assert!(turn.files.iter().any(|f| f.path == "turn.txt"));
+    let pre = turn
+        .files
+        .iter()
+        .find(|f| f.path == "pre.txt")
+        .expect("pre.txt summary");
+    assert_eq!(pre.status, "modified");
+    assert_eq!(pre.additions, 1);
+}
+
+#[tokio::test]
 async fn diff_capture_truncates_at_patch_cap() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let repo_dir = tmp.path().join("repo");
@@ -446,7 +524,7 @@ async fn delete_space_cascades_chats_and_sessions() {
         )
         .expect("space row");
     core.workspace
-        .create_chat("chat-1", "space-1", None, None)
+        .create_chat("chat-1", Some("space-1"), None, None, None)
         .expect("chat row");
     let chat = core
         .workspace
@@ -487,7 +565,7 @@ async fn diff_sync_publishes_and_updates_chat_branch() {
         )
         .expect("space row");
     core.workspace
-        .create_chat("chat-diff", "space-diff", None, None)
+        .create_chat("chat-diff", Some("space-diff"), None, None, None)
         .expect("chat row");
     core.diff_sync.reconcile_now().await;
 
@@ -711,7 +789,7 @@ async fn rpc_dispatch_for_m5_methods() {
         .create_space("space-term", &core.device_id, &repo_path, None, true)
         .expect("search space");
     core.workspace
-        .create_chat("search-chat", "space-term", None, None)
+        .create_chat("search-chat", Some("space-term"), None, None, None)
         .expect("search chat");
     let space_matches = client
         .call(
@@ -748,7 +826,8 @@ async fn rpc_dispatch_for_m5_methods() {
     core.workspace
         .create_chat(
             "outside-chat",
-            "space-term",
+            Some("space-term"),
+            None,
             None,
             Some(outside.to_string_lossy().into_owned()),
         )

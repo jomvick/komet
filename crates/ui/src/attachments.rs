@@ -500,11 +500,12 @@ impl ImageCache {
             self.pending_free.push(image.image);
         }
         self.loaded_bytes += bytes;
+        let shielded = protected().lock().unwrap().clone();
         while self.loaded_bytes > IMAGE_CACHE_BUDGET_BYTES {
             let oldest = self
                 .map
                 .iter()
-                .filter(|(k, _)| **k != key)
+                .filter(|(k, _)| **k != key && !shielded.contains(*k))
                 .filter_map(|(k, e)| match e {
                     CacheEntry::Loaded { last_used, .. } => Some((*last_used, k.clone())),
                     _ => None,
@@ -522,6 +523,23 @@ impl ImageCache {
 fn cache() -> &'static Mutex<ImageCache> {
     static CACHE: OnceLock<Mutex<ImageCache>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(ImageCache::default()))
+}
+
+/// Keys shielded from LRU eviction — the open transcript's attachments. The
+/// gpui list caches rendered rows across frames, so a VISIBLE thumbnail's
+/// `last_used` tick can go stale and budget pressure evicted images still on
+/// screen (user report: "images unload before they are scrolled out of
+/// view"). The transcript replaces this set on every row sync; other chats'
+/// images stay evictable, so the budget still bounds the cache overall.
+fn protected() -> &'static Mutex<std::collections::HashSet<(String, String)>> {
+    static PROTECTED: OnceLock<Mutex<std::collections::HashSet<(String, String)>>> =
+        OnceLock::new();
+    PROTECTED.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Replace the eviction shield with the given keys (see [`protected`]).
+pub fn protect_attachments(keys: std::collections::HashSet<(String, String)>) {
+    *protected().lock().unwrap() = keys;
 }
 
 fn key(device_id: &str, path: &str) -> (String, String) {
@@ -626,14 +644,18 @@ pub struct PreviewImage {
 
 /// The bare lightbox: dim scrim, the image at ≤85vh/90vw, the file name under
 /// it. Any click closes (the whole dialog is the close button, as in the
-/// original's `cursor-zoom-out` figure).
+/// original's `cursor-zoom-out` figure), and so does Escape — `focus` must be
+/// focused by the caller when the preview opens so the key reaches us.
 pub fn lightbox(
     viewport: Size<gpui::Pixels>,
     preview: &PreviewImage,
+    focus: &gpui::FocusHandle,
     on_close: impl Fn(&mut gpui::Window, &mut gpui::App) + 'static,
 ) -> AnyElement {
     let max_h = px(f32::from(viewport.height) * 0.85);
     let max_w = px(f32::from(viewport.width) * 0.9);
+    let on_close = std::rc::Rc::new(on_close);
+    let close_on_key = on_close.clone();
     gpui::deferred(
         gpui::anchored()
             .position(gpui::point(px(0.0), px(0.0)))
@@ -641,6 +663,7 @@ pub fn lightbox(
                 div()
                     .id("attachment-lightbox")
                     .occlude()
+                    .track_focus(focus)
                     .w(viewport.width)
                     .h(viewport.height)
                     .bg(crate::popover::scrim_alpha(0.7))
@@ -650,6 +673,12 @@ pub fn lightbox(
                     .justify_center()
                     .gap(px(12.0))
                     .cursor_pointer()
+                    .on_key_down(move |event: &gpui::KeyDownEvent, window, cx| {
+                        if event.keystroke.key == "escape" {
+                            cx.stop_propagation();
+                            close_on_key(window, cx);
+                        }
+                    })
                     .on_click(move |_, window, cx| on_close(window, cx))
                     .child(
                         img(preview.image.clone())

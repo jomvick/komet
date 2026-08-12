@@ -12,15 +12,24 @@ import SwiftUI
 struct TranscriptView: View {
     let store: SessionStore
     let chatId: String
+    /// Owned by SessionView so IT can report the composer inset's global
+    /// frame into `insetTopGlobalY` — the measured truth `correctPin`
+    /// re-pins against.
+    let scroll: ScrollState
 
-    init(store: SessionStore, chatId: String) {
+    init(store: SessionStore, chatId: String, scroll: ScrollState) {
         self.store = store
         self.chatId = chatId
-        // Seeded, not defaulted to false: a transcript that has already been
-        // revealed must come back visible on the FIRST frame after any view
-        // re-creation, or it blinks out mid-typing when the composer resizes.
-        _settled = State(initialValue: store.hasRevealed)
-        _hydrated = State(initialValue: store.hasRevealed)
+        self.scroll = scroll
+        // NOT seeded from store.hasRevealed anymore. That seed (meant to stop
+        // a blink on mid-typing view re-creation) un-gated every warm RE-OPEN:
+        // a new view lays the whole LazyVStack out from scratch — estimates,
+        // churn, mis-anchor — and the user watched it, or worse, was left in
+        // the blank over-estimate region ("cached session opens blank every
+        // time"). Every new view identity now earns its reveal through
+        // settleToBottom, which converges on the MEASURED pin error and is
+        // ~1 frame for content that lays out where the anchor put it.
+        _hydrated = State(initialValue: !store.entries.isEmpty || !store.pendingSends.isEmpty)
     }
 
     static let gapTurn: CGFloat = 14
@@ -35,12 +44,6 @@ struct TranscriptView: View {
     @State private var hydrated = false
     /// Gates the reveal: false until the transcript has landed at the bottom.
     @State private var settled = false
-    /// Per-frame scroll tracking. A reference type, NOT view @State: writing
-    /// @State on every scroll frame re-evaluated this whole body (a ForEach
-    /// over every row) per frame — the further up the user had scrolled, the
-    /// more realized rows each pass had to diff, which is exactly the
-    /// "scrolling gets laggier the deeper I go" jank.
-    @State private var scroll = ScrollState()
     @State private var scrollPosition = ScrollPosition(edge: .bottom)
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -57,6 +60,12 @@ struct TranscriptView: View {
                     rowView(row).id(row.id)
                 }
                 Color.clear.frame(height: 44)  // bottom pad clears the fade + floating status strip
+                    // The pad's on-screen frame is the one bottom-position
+                    // reading the keyboard can't distort (see correctPin).
+                    .onGeometryChange(for: CGFloat.self) { $0.frame(in: .global).maxY } action: { [scroll] new in
+                        scroll.padGlobalMaxY = new
+                        correctPin()
+                    }
             }
             .frame(maxWidth: Self.maxContentWidth)
             .frame(maxWidth: .infinity)
@@ -66,14 +75,33 @@ struct TranscriptView: View {
         // Drag past the composer and the keyboard follows the finger down —
         // the Messages-style interactive dismissal.
         .scrollDismissesKeyboard(.interactively)
+        // Tap anywhere in the transcript to put the keyboard away (t3's
+        // tap-to-blur; TapGesture already cancels on drag-sized movement).
+        // Simultaneous so fold toggles and row buttons still receive theirs.
+        .simultaneousGesture(TapGesture().onEnded {
+            UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder),
+                                            to: nil, from: nil, for: nil)
+        })
         // Held invisible until it has settled at the bottom, then faded in.
         // The settling itself is unavoidable (see settleToBottom) — what is
         // avoidable is WATCHING it: painting mid-settle is what read as the
         // transcript sliding on load.
         .opacity(settled ? 1 : 0)
+        // While a big transcript is finding its bottom, show the skeleton — a
+        // black void here read as "the session is broken" (and on a slow
+        // settle it WAS multiple seconds of void).
+        .overlay {
+            if !settled {
+                TranscriptSkeleton()
+                    .background(Theme.bg)
+            }
+        }
         .motionAnimation(Motion.fadeQuick, value: settled)
         .background(Theme.bg)
         .task {
+            // SessionView calls this on keyboard didShow/didHide — the one
+            // forced correction that ends each keyboard transition.
+            scroll.requestCorrection = { correctPin(force: true) }
             // Warm sessions already have rows at first layout, and `onChange`
             // never fires for an initial value — this is the only hook for them.
             await settleToBottom()
@@ -82,22 +110,70 @@ struct TranscriptView: View {
             // Projection is off-main, so a cached transcript usually lands after
             // the pass above ran on an empty list. Only ever hides a transcript
             // that has never been shown — re-hiding a visible one is what made
-            // it blink out mid-typing.
-            guard !isEmpty, !hydrated, !store.hasRevealed else { return }
+            // it blink out mid-typing. `hydrated` is the one-shot: it seeds
+            // true for stores that have already revealed content, so this
+            // fires exactly once, on a fresh store's first non-empty rows.
+            guard !isEmpty, !hydrated else { return }
             hydrated = true
             settled = false
             Task { await settleToBottom() }
         }
-        .onScrollGeometryChange(for: CGFloat.self) { $0.contentSize.height } action: { [scroll] _, new in
+        .onScrollGeometryChange(for: CGFloat.self) { $0.contentSize.height } action: { [scroll] old, new in
             scroll.contentHeight = new
+            // Estimated row heights keep resolving after the settle, and a
+            // SHRINK leaves the held offset past the content — a black
+            // viewport until the user's scroll clamps it (t3 re-pins on
+            // itemLayout for exactly this). Keep a pinned feed glued through
+            // reflows; never touch a user's in-flight drag.
+            if scroll.pinned, !scroll.userScrolling, new < old - 1 {
+                correctPin()
+            }
+        }
+        .onScrollGeometryChange(for: CGFloat.self) { $0.contentOffset.y } action: { [scroll] _, new in
+            scroll.contentOffsetY = new
+        }
+        .onScrollGeometryChange(for: CGFloat.self) { $0.containerSize.height + $0.contentInsets.bottom } action: { _, _ in
+            // The viewport resized under the content — keyboard up/down, the
+            // composer's capsule↔card morph, the question-panel swap. t3's
+            // rule for exactly this ("keyboardLiftBehavior=whenAtEnd" +
+            // inset re-report on remount): a feed pinned at the end follows
+            // the new bottom IMMEDIATELY; an unpinned reader stays put —
+            // unless the resize stranded the offset past the content (blank
+            // viewport), which is clamped back to the bottom. Without this,
+            // focusing the composer could leave the transcript scrolled out
+            // of range (blank until touched) or resting a viewport short
+            // (content "appears" only when the next resize brought it back).
+            guard !scroll.userScrolling else { return }  // their drag wins
+            if scroll.pinned || scroll.distanceFromBottom < -1 {
+                // t3's keyboardLiftBehavior=whenAtEnd: no per-frame chasing
+                // while the boundary animates (that fight was the stutter,
+                // and the edge math lies by the keyboard inset anyway) —
+                // correctPin trails the transition and lands one measured,
+                // animated lift when the boundary goes quiet.
+                correctPin()
+            }
         }
         .onScrollPhaseChange { [scroll] _, newPhase in
             // Desktop rule: the pin breaks only on USER input (wheel-up/drag),
             // never on streaming growth. Phases track the gesture.
             scroll.userScrolling = newPhase == .interacting || newPhase == .decelerating
+            // A gesture can END stranded past the content (a shrink landed
+            // mid-drag; the in-flight clamps all yield to the user). Once the
+            // scroll view goes quiet there is no later geometry event to
+            // catch it — clamp here or the viewport stays blank.
+            if !scroll.userScrolling {
+                correctPin()  // self-gates: pinned re-glue or stranded clamp
+            }
         }
         .onScrollGeometryChange(for: CGFloat.self) { geo in
-            max(0, geo.contentSize.height + geo.contentInsets.bottom - geo.containerSize.height - geo.contentOffset.y)
+            // Inset-proof distance: visibleRect is already contentInsets-
+            // adjusted, so this is 0 at the VISUAL bottom whether or not the
+            // keyboard is up. The old offset+insets formula double-counted
+            // the keyboard inset (~keyboard-height at the bottom), which
+            // both pinned the jump button on and put the 70pt re-stick band
+            // permanently out of reach while typing. Unclamped on purpose:
+            // negative = stranded past the content (the resize clamp's cue).
+            geo.contentSize.height - geo.visibleRect.maxY
         } action: { [scroll] old, new in
             scroll.distanceFromBottom = new
             if scroll.userScrolling, new > old + 1, new > 2 {
@@ -106,10 +182,30 @@ struct TranscriptView: View {
                 // Re-stick only when moving TOWARD the bottom inside the 70pt
                 // band, else the pin would be unbreakable.
                 scroll.pinned = true
+            } else if !scroll.userScrolling {
+                if new < -1 {
+                    // Stranded past the content end (blank viewport). The
+                    // measured corrector resolves it — and self-defers while
+                    // the composer boundary is mid-transition, so it never
+                    // fights a keyboard animation the way raw edge-scrolls
+                    // here used to.
+                    correctPin()
+                } else if scroll.pinned, new > old + 1, new > Self.stickThreshold {
+                    // The bottom moved out from under a pinned feed with no
+                    // user input — estimated heights resolving AFTER the
+                    // settle loop exited. Growth-only (`new > old`), so the
+                    // streamed-append spring, which closes the distance frame
+                    // by frame, is never fought.
+                    correctPin()
+                }
             }
             // The only observable write, and only at the threshold crossing —
-            // it re-renders the tiny jump button, never this body.
-            let show = new > Self.jumpThreshold
+            // it re-renders the tiny jump button, never this body. Gated on
+            // the PIN, not just distance: with the keyboard up, UIKit
+            // double-counts the bottom inset (t3's "nativeInsetOvercount"),
+            // so distance reads ~keyboard-height at the visual bottom and the
+            // raw threshold kept the button up for a pinned feed.
+            let show = !scroll.pinned && new > Self.jumpThreshold
             if scroll.showJump != show { scroll.showJump = show }
         }
         .onChange(of: contentSignature(rows)) {
@@ -117,6 +213,8 @@ struct TranscriptView: View {
             if reduceMotion {
                 scrollPosition.scrollTo(edge: .bottom)
             } else {
+                // correctPin must not snap-cancel this spring mid-flight.
+                scroll.animatingUntil = Date().timeIntervalSinceReferenceDate + 0.35
                 withAnimation(.spring(duration: 0.3)) {
                     scrollPosition.scrollTo(edge: .bottom)
                 }
@@ -147,6 +245,7 @@ struct TranscriptView: View {
             // per-frame scroll path.
             JumpToBottomButton(scroll: scroll) {
                 scroll.pinned = true
+                scroll.animatingUntil = Date().timeIntervalSinceReferenceDate + 0.4
                 withAnimation(.spring(duration: 0.35)) {
                     scrollPosition.scrollTo(edge: .bottom)
                 }
@@ -159,31 +258,114 @@ struct TranscriptView: View {
         }
     }
 
-    /// Hold the bottom until layout stops moving, then reveal.
+    /// Measured re-pin. The scroll-geometry numbers LIE while the keyboard is
+    /// up: UIKit's interactive-dismiss avoidance and the SwiftUI safe area
+    /// each count the keyboard inset once (the jump-button comment's
+    /// "nativeInsetOvercount"), so `scrollTo(edge: .bottom)` overshoots by
+    /// ~keyboard height — the transcript parks with a blank band under it, or
+    /// wholly off-viewport on a tall keyboard (the "blank screen when I open
+    /// the composer"). And because `distanceFromBottom` is derived from the
+    /// same lying insets, it reads ≈0 there, which is why clamps built on it
+    /// never caught this. On-screen GLOBAL frames don't lie: when pinned,
+    /// nudge the offset by the measured gap between the bottom pad and the
+    /// composer boundary. Falls back to the edge scroll until both frames
+    /// have reported (first layout), and stays out of the way of user drags
+    /// and in-flight programmatic springs.
+    private func correctPin(force: Bool = false) {
+        guard !scroll.userScrolling else { return }
+        // The keyboard's whole transition is one no-correct window (UIKit
+        // will/did notifications, flipped by SessionView) — the focus
+        // sequence runs TWO boundary animations (composer morph, then the
+        // keyboard) with a gap between them, and a quiet-gap glide firing
+        // between the two was the double-adjust stutter. SessionView requests
+        // exactly one forced correction on didShow/didHide.
+        guard force || !scroll.keyboardTransitioning else { return }
+        let now = Date().timeIntervalSinceReferenceDate
+        guard now >= scroll.animatingUntil else { return }
+        // While the composer boundary is mid-flight (card morph, panel swap)
+        // nothing corrects — chasing a moving target was the stutter.
+        // Trail instead: skip now, re-check after the boundary goes quiet.
+        if !force, now - scroll.insetTopChangedAt < 0.12 {
+            if !scroll.correctionScheduled {
+                scroll.correctionScheduled = true
+                Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 150_000_000)
+                    scroll.correctionScheduled = false
+                    correctPin()
+                }
+            }
+            return
+        }
+        guard scroll.padGlobalMaxY > 0, scroll.insetTopGlobalY > 0 else {
+            if scroll.pinned { scrollPosition.scrollTo(edge: .bottom) }
+            return
+        }
+        // < 0: overshot past the end — a blank band below the content, never
+        //      a legitimate state, corrected whether or not we're pinned.
+        // > 0: tail parked short of the boundary — only wrong for a PINNED
+        //      feed (an unpinned reader mid-history always measures > 0).
+        let error = scroll.padGlobalMaxY - scroll.insetTopGlobalY
+        guard error < -2 || (scroll.pinned && error > 2) else { return }
+        if abs(error) > 48 {
+            // A keyboard-sized lift reads as motion — glide it. Tiny nudges
+            // (late row measurements) stay instant and invisible.
+            scroll.animatingUntil = now + 0.35
+            withAnimation(.spring(duration: 0.3)) {
+                scrollPosition.scrollTo(y: scroll.contentOffsetY + error)
+            }
+        } else {
+            scrollPosition.scrollTo(y: scroll.contentOffsetY + error)
+        }
+    }
+
+    /// Hold the bottom until the MEASURED pin is right, then reveal.
     ///
     /// A lazy stack only measures the rows near the viewport; the rest carry
-    /// ESTIMATED heights that resolve over the next frames, growing the content
-    /// and moving the real bottom. One snap at any single instant lands short —
-    /// measured, up to ~37 turns short on a 120-turn transcript. SwiftUI's own
-    /// `.defaultScrollAnchor(.bottom, for: .sizeChanges)` does not help: it
-    /// PRESERVES the initial estimated position rather than correcting to the
-    /// true bottom, which lands short every time instead of sometimes.
+    /// ESTIMATED heights that resolve over the next frames, moving the real
+    /// bottom. The old loop compared content heights across 30ms polls (16
+    /// max) — on a big transcript the height was still churning when it gave
+    /// up, revealing wherever the churn was: sometimes mid-transcript,
+    /// sometimes in the blank over-estimate region past the content.
     ///
-    /// So: re-anchor each frame until the height repeats. Bounded (~480ms worst
-    /// case) so a pathological reflow can't spin, and it yields the moment the
-    /// user takes the scroll view — their drag wins. `settled` flips either way,
-    /// so the transcript can never be left invisible.
+    /// Convergence is now the same truth correctPin uses: the bottom pad's
+    /// on-screen frame meeting the composer boundary. Edge-jumps chase the
+    /// estimated bottom until the pad realizes and reports; measured nudges
+    /// close the remainder; two consecutive in-tolerance reads reveal.
+    /// Bounded (~2s worst case), and it yields the moment the user takes the
+    /// scroll view. `settled` flips either way — never left invisible.
     private func settleToBottom() async {
-        var lastHeight: CGFloat = -1
-        for _ in 0..<16 {
+        scroll.padGlobalMaxY = 0  // stale pad frames must not fake convergence
+        for _ in 0..<60 {
             guard scroll.pinned, !scroll.userScrolling else { break }
-            scrollPosition.scrollTo(edge: .bottom)
-            if scroll.contentHeight == lastHeight { break }
-            lastHeight = scroll.contentHeight
-            try? await Task.sleep(nanoseconds: 30_000_000)
+            // Don't chase targets through a keyboard transition — the edge
+            // math lies there and the budget burns on garbage jumps. The
+            // didShow correction handles that endpoint; just wait it out.
+            if scroll.keyboardTransitioning {
+                try? await Task.sleep(nanoseconds: 60_000_000)
+                continue
+            }
+            if scroll.padGlobalMaxY > 0, scroll.insetTopGlobalY > 0 {
+                let error = scroll.padGlobalMaxY - scroll.insetTopGlobalY
+                // Near-pinned is good enough to reveal — correctPin's trailing
+                // nudges close the last few points invisibly, while every
+                // 50ms spent here is the user staring at the loader.
+                if abs(error) < 24 { break }
+                scrollPosition.scrollTo(y: scroll.contentOffsetY + error)
+            } else {
+                scrollPosition.scrollTo(edge: .bottom)
+            }
+            try? await Task.sleep(nanoseconds: 50_000_000)
         }
         settled = true
-        store.hasRevealed = true
+        // Revealed-with-CONTENT only: a settle that ran against a still-empty
+        // projection must not latch, or the rows landing a beat later find
+        // `hasRevealed` true, seed `hydrated`/`settled` from it on the next
+        // view identity, and skip their own settle — the transcript then
+        // rests wherever the empty pass left it (out of view until a resize
+        // — focusing the composer — happened to drag it back).
+        if !store.entries.isEmpty || !store.pendingSends.isEmpty {
+            store.hasRevealed = true
+        }
     }
 
     // Streamed growth signature: last row id + version + count. Any append or
@@ -237,8 +419,25 @@ final class ScrollState {
     var showJump = false
     @ObservationIgnored var distanceFromBottom: CGFloat = 0
     @ObservationIgnored var contentHeight: CGFloat = 0
+    @ObservationIgnored var contentOffsetY: CGFloat = 0
     @ObservationIgnored var pinned = true
     @ObservationIgnored var userScrolling = false
+    /// Programmatic spring deadline — correctPin stays quiet until it passes.
+    @ObservationIgnored var animatingUntil: TimeInterval = 0
+    /// Measured on-screen frames for correctPin: the transcript's bottom pad
+    /// (written here) and the composer inset's top edge (written by
+    /// SessionView, which owns the inset).
+    @ObservationIgnored var padGlobalMaxY: CGFloat = 0
+    @ObservationIgnored var insetTopGlobalY: CGFloat = 0
+    /// When the boundary last moved — correctPin trails transitions.
+    @ObservationIgnored var insetTopChangedAt: TimeInterval = 0
+    /// True between UIKit's keyboardWillShow/Hide and didShow/Hide — the
+    /// no-correct window (flipped by SessionView, which owns the notifications).
+    @ObservationIgnored var keyboardTransitioning = false
+    /// Trailing re-check dedupe: one scheduled correction at a time.
+    @ObservationIgnored var correctionScheduled = false
+    /// Set by TranscriptView; SessionView invokes it on didShow/didHide.
+    @ObservationIgnored var requestCorrection: () -> Void = {}
 }
 
 private struct JumpToBottomButton: View {

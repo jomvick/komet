@@ -20,10 +20,30 @@ struct ModelInfo: Identifiable, Hashable {
 }
 
 enum HarnessCatalog {
+    /// Static fallback = the engine's `default_enabled()` pair. The ACP
+    /// agents (grok/hermes/pi) appear only through a device's live
+    /// `ListHarnesses` catalog — they're opt-in per device via
+    /// Settings → Agents on the desktop.
     static let harnesses: [HarnessInfo] = [
         HarnessInfo(id: "claude-code", label: "Claude Code"),
         HarnessInfo(id: "codex", label: "Codex"),
     ]
+
+    /// Display names for every harness id the fleet can produce, including
+    /// ones this device's static list doesn't offer (acp/mod.rs specs).
+    static let knownLabels: [String: String] = [
+        "claude-code": "Claude Code",
+        "codex": "Codex",
+        "grok": "Grok",
+        "hermes": "Hermes",
+        "pi": "Pi",
+        "cursor": "Cursor",
+        "mock": "Mock",
+    ]
+
+    static func label(for harness: String) -> String {
+        knownLabels[harness] ?? harness
+    }
 
     private static let fullLadder = ["low", "medium", "high", "xhigh", "max", "ultracode", "ultrathink"]
     private static let claudeXhighLadder = ["low", "medium", "high", "xhigh", "max", "ultrathink"]
@@ -33,6 +53,25 @@ enum HarnessCatalog {
 
     static func models(for harness: String) -> [ModelInfo] {
         switch harness {
+        case "grok":
+            return [
+                ModelInfo(id: "grok-4.5", label: "Grok 4.5",
+                          description: "xAI's coding model — 500k context",
+                          reasoningLevels: ["low", "medium", "high"]),
+            ]
+        case "hermes":
+            return [
+                ModelInfo(id: "hermes-4-405b", label: "Hermes 4 405B",
+                          description: "Nous Research's hybrid-reasoning flagship", reasoningLevels: []),
+                ModelInfo(id: "hermes-4-70b", label: "Hermes 4 70B",
+                          description: "Faster Hermes 4 — same post-training, 70B", reasoningLevels: []),
+            ]
+        case "pi":
+            return [
+                ModelInfo(id: "default", label: "pi default",
+                          description: "Runs the model configured in pi (`pi` settings)",
+                          reasoningLevels: ["minimal", "low", "medium", "high", "xhigh", "max"]),
+            ]
         case "codex":
             return [
                 ModelInfo(id: "gpt-5.6-sol", label: "GPT-5.6-Sol",
@@ -80,6 +119,7 @@ enum HarnessCatalog {
 
     static func reasoningLabel(_ level: String) -> String {
         switch level {
+        case "minimal": return "Minimal"
         case "low": return "Low"
         case "medium": return "Medium"
         case "high": return "High"

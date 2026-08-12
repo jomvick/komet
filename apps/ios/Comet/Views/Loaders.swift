@@ -122,42 +122,128 @@ struct KometPulse: View {
     }
 }
 
+// MARK: - Transcript skeleton
+
+/// Loading/settling placeholder in the transcript's own geometry — paragraph
+/// clusters, a trailing user bubble, a tool chip — bottom-weighted like a real
+/// conversation tail. Blocks breathe with a slight stagger; static under
+/// reduced motion.
+struct TranscriptSkeleton: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        GeometryReader { geo in
+            let w = min(geo.size.width - 32, TranscriptView.maxContentWidth)
+            TimelineView(.animation(paused: reduceMotion)) { timeline in
+                let t = timeline.date.timeIntervalSinceReferenceDate
+                VStack(alignment: .leading, spacing: 26) {
+                    Spacer(minLength: 0)
+                    paragraph(w, fractions: [0.92, 0.8, 0.55]).opacity(breathe(t, 0))
+                    bubble(min(w * 0.6, 230)).opacity(breathe(t, 1))
+                    paragraph(w, fractions: [0.85, 0.62]).opacity(breathe(t, 2))
+                    chip(w * 0.7).opacity(breathe(t, 3))
+                    paragraph(w, fractions: [0.9, 0.78, 0.42]).opacity(breathe(t, 4))
+                }
+                .padding(.horizontal, 16)
+                // Clears the status strip + composer fade, like the real rows.
+                .padding(.bottom, 56)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+    }
+
+    /// 0.45→1 sine, 2s period, trailing blocks lag — reads as a soft wave
+    /// rolling up the ghost conversation.
+    private func breathe(_ t: TimeInterval, _ ix: Int) -> Double {
+        guard !reduceMotion else { return 0.7 }
+        let phase = t / 2 - Double(ix) * 0.12
+        return 0.45 + 0.275 * (1 + sin(phase * 2 * .pi))
+    }
+
+    private func paragraph(_ width: CGFloat, fractions: [CGFloat]) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            ForEach(Array(fractions.enumerated()), id: \.offset) { _, frac in
+                RoundedRectangle(cornerRadius: 4)
+                    .fill(whiteAlpha(0.06))
+                    .frame(width: width * frac, height: 12)
+            }
+        }
+    }
+
+    private func bubble(_ width: CGFloat) -> some View {
+        RoundedRectangle(cornerRadius: Theme.bubbleRadius)
+            .fill(whiteAlpha(0.07))
+            .frame(width: width, height: 42)
+            .frame(maxWidth: .infinity, alignment: .trailing)
+    }
+
+    private func chip(_ width: CGFloat) -> some View {
+        HStack(spacing: 8) {
+            RoundedRectangle(cornerRadius: 5)
+                .fill(whiteAlpha(0.07))
+                .frame(width: 18, height: 18)
+            RoundedRectangle(cornerRadius: 4)
+                .fill(whiteAlpha(0.05))
+                .frame(height: 10)
+        }
+        .padding(.horizontal, 8)
+        .frame(width: width, height: 30)
+        .background(whiteAlpha(0.03), in: RoundedRectangle(cornerRadius: 9))
+    }
+}
+
 // MARK: - Status dot
 
 extension ChatIndicator {
-    /// shell/spaces.rs status_dot_color.
+    /// shell/spaces.rs status_dot_color — non-done states are muted (running
+    /// is routine); only Done keeps its pop.
     var dotColor: Color {
         switch self {
-        case .working: return Theme.statusWorking.opacity(0.85)     // pink-400
-        case .awaitingInput: return Theme.accent.opacity(0.9)       // indigo
-        case .errored: return Theme.danger
+        case .working: return Theme.statusWorking.opacity(0.55)     // pink-400
+        case .awaitingInput: return Theme.accent.opacity(0.6)       // indigo
+        case .errored: return Theme.danger.opacity(0.65)
         case .completed: return Theme.statusCompleted.opacity(0.9)  // emerald-400
         case .idle: return whiteAlpha(0.14)
         }
     }
+
+    /// shell.rs status word; nil (Idle) renders the time-ago instead.
+    var label: String? {
+        switch self {
+        case .working: return "Working"
+        case .awaitingInput: return "Input"
+        case .errored: return "Failed"
+        case .completed: return "Done"
+        case .idle: return nil
+        }
+    }
 }
 
-/// The 6pt leading dot (leads so its position is stable); Working swaps in the
-/// mini spinner. Exactly 6 wide, like the desktop rail (shell.rs
-/// `render_chat_row`) — the session row's lower lines indent by rail + gap, so
-/// a wider rail here would push them out of line with the row's first line.
-struct StatusRail: View {
+/// The session row's top-right status glyph (shell.rs `render_chat_row`
+/// corner slot): a 6pt dot with the status word beside it in the same color;
+/// Done trades the dot for a check. Idle rows render time-ago instead — the
+/// caller handles that branch, since only it knows the timestamp.
+struct StatusCorner: View {
     let indicator: ChatIndicator
 
     var body: some View {
-        Group {
-            if indicator == .working {
-                MiniSpinner()
+        HStack(spacing: 4) {
+            if indicator == .completed {
+                Image(systemName: "checkmark")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundStyle(indicator.dotColor)
             } else {
                 Circle()
                     .fill(indicator.dotColor)
                     .frame(width: 6, height: 6)
             }
+            if let label = indicator.label {
+                Text(label)
+                    .font(Theme.sans(10, weight: .medium))
+                    .foregroundStyle(indicator.dotColor)
+            }
         }
-        .frame(width: StatusRail.width, height: 10)
     }
-
-    static let width: CGFloat = 6
 }
 
 /// Harness brand mark (pickers.rs harness_brand_icon) — the desktop's actual
@@ -172,8 +258,10 @@ struct HarnessBadge: View {
     var neutral: Color = Theme.text
 
     var body: some View {
-        BrandMarkShape(mark: BrandMark.forHarness(harness))
-            .fill((BrandMark.brandTint(for: harness) ?? neutral).opacity(dimmed ? 0.6 : 0.9))
+        let mark = BrandMark.forHarness(harness)
+        BrandMarkShape(mark: mark)
+            .fill((BrandMark.brandTint(for: harness) ?? neutral).opacity(dimmed ? 0.6 : 0.9),
+                  style: FillStyle(eoFill: mark.evenOddFill))
             .frame(width: size, height: size)
     }
 }

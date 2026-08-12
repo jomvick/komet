@@ -167,6 +167,10 @@ struct DocHostInner {
     /// chat2 seeds in flight (one per chat — reopen storms must not race
     /// duplicate rebuild+checkpoint POSTs; benign server-side, wasteful).
     seeding: Mutex<HashSet<String>>,
+    /// chat2 quiet-waiters armed (one per chat): the cutover watcher re-arms
+    /// on every registry change, and a long run would stack a tick loop per
+    /// change without this.
+    seed_waiting: Mutex<HashSet<String>>,
     /// Shared client for sidecar blob PUT/GET (30s timeout, uploads.rs
     /// discipline — diff_sync's untimed client hung on dead links).
     http: reqwest::Client,
@@ -207,7 +211,9 @@ pub struct ChatDocHandle {
     checkpointing: Arc<AtomicBool>,
     /// Set when a chat2 seed replaced this handle's lineage on disk: every
     /// further snapshot save from this handle is a stale FAT doc that would
-    /// clobber the thin one — retired handles never persist again.
+    /// clobber the thin one — retired handles never persist again (unless no
+    /// thin lineage exists on disk at all; `save_snapshot` double-checks, so
+    /// a doc that was never seeded can't lose its only copy).
     retired: AtomicBool,
     /// chat2 relay client (docs/chat2-sync.md C3) — populated instead of
     /// `room` when the registry names roomGen 2 for this chat.
@@ -369,6 +375,7 @@ impl DocHost {
                 workspace: OnceLock::new(),
                 handles: Mutex::new(HashMap::new()),
                 seeding: Mutex::new(HashSet::new()),
+                seed_waiting: Mutex::new(HashSet::new()),
                 http: reqwest::Client::builder()
                     .timeout(std::time::Duration::from_secs(30))
                     .build()
@@ -477,20 +484,65 @@ impl DocHost {
                 if flipped.is_empty() {
                     continue;
                 }
-                let mut handles = lock(&host.inner.handles);
-                for chat_id in flipped {
-                    let Some(handle) = handles.get(&chat_id) else {
-                        continue;
-                    };
-                    if handle.room_gen >= 2 {
-                        continue; // already chat2-mode
-                    }
-                    handle.retired.store(true, Ordering::Relaxed);
-                    let live_writer = Arc::strong_count(&handle.doc) > 1;
-                    if !live_writer {
+                let mut dropped: Vec<String> = Vec::new();
+                let mut stuck_live: Vec<(String, Arc<ChatDocHandle>)> = Vec::new();
+                {
+                    let mut handles = lock(&host.inner.handles);
+                    for chat_id in flipped {
+                        let Some(handle) = handles.get(&chat_id) else {
+                            continue;
+                        };
+                        if handle.room_gen >= 2 {
+                            continue; // already chat2-mode
+                        }
+                        let live_writer = Arc::strong_count(&handle.doc) > 1;
+                        if live_writer {
+                            // A run is writing into this s2 doc while the
+                            // registry already says chat2 — the born-gen2
+                            // race (this open beat its own CreateChat mint,
+                            // 2026-08-11: transcript never reached any other
+                            // device). No thin lineage exists on disk yet,
+                            // so retiring here would suppress the doc's only
+                            // persistence and abort the quiet-seed. Leave it
+                            // live; seed once the run quiesces — the seed
+                            // posts the chat2 checkpoint, persists the thin
+                            // lineage, and retires the handle itself.
+                            stuck_live.push((chat_id, handle.clone()));
+                            continue;
+                        }
+                        handle.retired.store(true, Ordering::Relaxed);
                         handles.remove(&chat_id);
                         tracing::info!(chat = %chat_id,
                             "s2 handle dropped on chat2 cutover; watchers resubscribe onto the new room");
+                        dropped.push(chat_id);
+                    }
+                }
+                for (chat_id, handle) in stuck_live {
+                    if host.is_host(&chat_id)
+                        && let Some(edge) = host.inner.config.edge.clone()
+                    {
+                        host.spawn_chat2_seed_when_quiet(edge, &chat_id, &handle);
+                    }
+                }
+                // Watchers resubscribe on their own — but a NUDGE-opened
+                // handle has none, and its s2 room never carried the queued
+                // command anyway (the sender pushed to chat2). On a born-
+                // chat2 chat the nudge beats the registry row by design
+                // (direct HTTP vs room sync), so the first open lands here
+                // and dying silently strands the first message until the
+                // next nudge — every new remote session's first send sat
+                // ~30s+ until the user re-sent (user report). If we host
+                // the chat, reopen NOW: the fresh open dials the chat2
+                // room and the change-driven drain executes the command.
+                for chat_id in dropped {
+                    if !host.is_host(&chat_id) {
+                        continue;
+                    }
+                    match host.open(&chat_id) {
+                        Ok(_) => tracing::info!(chat = %chat_id,
+                            "reopened as chat2 after cutover drop (host, pending work possible)"),
+                        Err(err) => tracing::warn!(chat = %chat_id, error = %err,
+                            "chat2 reopen after cutover drop failed"),
                     }
                 }
             }
@@ -518,18 +570,34 @@ impl DocHost {
         let chat_row = self
             .workspace()
             .and_then(|w| w.chat(chat_id).ok().flatten());
-        let registry_gen = chat_row.as_ref().and_then(|c| c.room_gen).unwrap_or(1);
+        // A row that EXISTS without `roomGen` is a pre-cutover legacy chat
+        // (gen 1). A MISSING row is a chat being born right now: its
+        // CreateChat mint (which stamps roomGen 2) is racing this open —
+        // the composer attaches the transcript watch before its own mutate
+        // lands, and a nudge beats registry sync by design. Defaulting the
+        // absent row to 1 minted brand-new s2 rooms post-cutover: the host
+        // ran the whole session against a room no other device reads (they
+        // follow the row's gen 2 to an empty chat2 room), the run's live doc
+        // ref blocked every heal, and the transcript never synced anywhere
+        // (2026-08-11).
+        let registry_gen = match chat_row.as_ref() {
+            Some(row) => row.room_gen.unwrap_or(1),
+            None => 2,
+        };
         {
             let mut handles = lock(&self.inner.handles);
             if let Some(handle) = handles.get(chat_id) {
-                if registry_gen >= 2 && handle.room_gen < 2 {
-                    // Built for the legacy room; the chat has since cut over.
-                    handle.retired.store(true, Ordering::Relaxed);
-                }
-                if handle.retired.load(Ordering::Relaxed) && !self.pinned(handle) {
+                let stale = registry_gen >= 2 && handle.room_gen < 2;
+                if (stale || handle.retired.load(Ordering::Relaxed)) && !self.pinned(handle) {
                     // A seed flipped this chat under a cached fat handle
                     // (review B1): drop it so this open converges onto the
-                    // thin lineage + chat2 room.
+                    // thin lineage + chat2 room. Retire only at the drop:
+                    // marking a PINNED stale handle retired while it kept
+                    // serving suppressed the only persistence a stuck-live
+                    // doc had and aborted its quiet-seed (born-gen2 race,
+                    // 2026-08-11) — the cutover watcher and the seed itself
+                    // own converging pinned handles.
+                    handle.retired.store(true, Ordering::Relaxed);
                     handles.remove(chat_id);
                 } else {
                     handle.touch();
@@ -915,6 +983,37 @@ impl DocHost {
                             *client_slot = Some(client);
                         }
                         tracing::info!(chat = %chat, "chat2 room joined (converged)");
+                        // Bootstrap heal: a room with NO checkpoint can't
+                        // cover its rows' causal deps for cold readers — a
+                        // pre-0.1.34 first contact whose init batch never
+                        // went up (every reader parks every row on missing
+                        // deps, transcript invisible forever), or a host
+                        // whose WS pushes strand. The checkpoint is the
+                        // universal patch: full doc over plain HTTP. Checked
+                        // once, shortly after join (an idle chat never hits
+                        // the quiesce tick, so the tick can't be the only
+                        // trigger).
+                        if host.is_host(&chat) {
+                            let host = host.clone();
+                            let weak = weak.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                                let Some(handle) = weak.upgrade() else { return };
+                                let no_checkpoint = lock(&handle.chat2)
+                                    .as_ref()
+                                    .is_some_and(|c| c.stats().checkpoint_size == 0);
+                                let has_content = handle
+                                    .doc
+                                    .read_entries()
+                                    .map(|e| !e.is_empty())
+                                    .unwrap_or(false);
+                                if no_checkpoint && has_content {
+                                    tracing::info!(chat = %handle.chat_id,
+                                        "chat2 room has rows but no checkpoint; posting bootstrap checkpoint");
+                                    host.spawn_chat2_checkpoint(&handle, "bootstrap");
+                                }
+                            });
+                        }
                         // Host recovery duties (C3): a wiped room needs a
                         // seed checkpoint or fresh readers see only
                         // post-reset rows; rejected pushes reach peers only
@@ -988,50 +1087,59 @@ impl DocHost {
         const TICK: std::time::Duration = std::time::Duration::from_millis(500);
         const JOIN_WAIT_TICKS: u32 = 120; // ≤60s for the room; offline stays s2
         const QUIET_TICKS: u32 = 4; // 2s of frontier silence
+        if !lock(&self.inner.seed_waiting).insert(chat_id.to_string()) {
+            return; // a quiet-waiter is already armed for this chat
+        }
         let host = self.clone();
         let chat = chat_id.to_string();
         let weak = Arc::downgrade(handle);
         tokio::spawn(async move {
-            let mut ticks = 0u32;
-            loop {
-                {
-                    let Some(handle) = weak.upgrade() else { return };
-                    if handle.retired.load(Ordering::Relaxed) {
-                        return; // another path already seeded
+            async {
+                let mut ticks = 0u32;
+                loop {
+                    {
+                        let Some(handle) = weak.upgrade() else { return };
+                        if handle.retired.load(Ordering::Relaxed) {
+                            return; // another path already seeded
+                        }
+                        if lock(&handle.room).is_some() {
+                            break;
+                        }
                     }
-                    if lock(&handle.room).is_some() {
-                        break;
-                    }
-                }
-                ticks += 1;
-                if ticks >= JOIN_WAIT_TICKS {
-                    tracing::debug!(chat = %chat, "chat2 seed skipped: s2 room never joined");
-                    return;
-                }
-                tokio::time::sleep(TICK).await;
-            }
-            let mut quiet = 0u32;
-            let mut last_vv: Option<Vec<u8>> = None;
-            loop {
-                tokio::time::sleep(TICK).await;
-                let Some(handle) = weak.upgrade() else { return };
-                if handle.retired.load(Ordering::Relaxed) {
-                    return;
-                }
-                let vv = handle.doc.doc().oplog_vv().encode();
-                if last_vv.as_ref() == Some(&vv) {
-                    quiet += 1;
-                    if quiet >= QUIET_TICKS {
-                        let doc = handle.doc.clone();
-                        drop(handle);
-                        host.spawn_chat2_seed(edge, &chat, doc);
+                    ticks += 1;
+                    if ticks >= JOIN_WAIT_TICKS {
+                        tracing::debug!(chat = %chat, "chat2 seed skipped: s2 room never joined");
                         return;
                     }
-                } else {
-                    quiet = 0;
-                    last_vv = Some(vv);
+                    tokio::time::sleep(TICK).await;
+                }
+                let mut quiet = 0u32;
+                let mut last_vv: Option<Vec<u8>> = None;
+                loop {
+                    tokio::time::sleep(TICK).await;
+                    let Some(handle) = weak.upgrade() else { return };
+                    if handle.retired.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let vv = handle.doc.doc().oplog_vv().encode();
+                    if last_vv.as_ref() == Some(&vv) {
+                        quiet += 1;
+                        if quiet >= QUIET_TICKS {
+                            let doc = handle.doc.clone();
+                            drop(handle);
+                            host.spawn_chat2_seed(edge, &chat, doc);
+                            return;
+                        }
+                    } else {
+                        quiet = 0;
+                        last_vv = Some(vv);
+                    }
                 }
             }
+            .await;
+            // Cleared on EVERY exit path so an aborted wait (evicted handle,
+            // room never joined, seed handed off) can re-arm later.
+            lock(&host.inner.seed_waiting).remove(&chat);
         });
     }
 
@@ -1177,6 +1285,124 @@ impl DocHost {
         };
         tracing::info!(chat = %chat_id, handle_dropped = dropped, "chat2 seed complete");
         Ok(())
+    }
+
+    /// Boot-time transcript salvage (born-gen2 aftermath, 2026-08-11): a chat
+    /// we host whose chat2 doc has NO message entries while its run journal
+    /// has events lost its transcript to a stuck s2 handle (the retired flag
+    /// suppressed every snapshot save; the post-restart reopen born a blank
+    /// lineage). The full fat doc still exists in the legacy s2 room — the
+    /// stuck engine pushed every op into it until it died — and sometimes in
+    /// a `.pre-chat2` rollback on disk. Re-append its entries (thinned) into
+    /// the LIVE chat2 lineage as ordinary incremental updates: no lineage
+    /// replacement, no checkpoint surgery, every device converges through
+    /// the normal room flow. Idempotent: a doc with any message entry is
+    /// never touched, and the salvage only runs on the hosting device.
+    pub fn spawn_transcript_salvage(&self, journals_dir: std::path::PathBuf) {
+        let host = self.clone();
+        tokio::spawn(async move {
+            // Let boot settle (registry load, room joins) before sweeping.
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            let Some(ws) = host.workspace() else { return };
+            let chats: Vec<komet_proto::Chat> = ws.watch_chats().borrow().clone();
+            for chat in chats {
+                if chat.device_id != host.inner.config.device_id {
+                    continue; // only the host owns its chats' history
+                }
+                if chat.room_gen.unwrap_or(1) < 2 {
+                    continue; // still s2-mode: transcript lives in its room
+                }
+                let journal = journals_dir.join(format!("{}.jsonl", chat.id));
+                let journaled = std::fs::metadata(&journal)
+                    .map(|m| m.len() > 0)
+                    .unwrap_or(false);
+                if !journaled {
+                    continue; // never ran here — an empty doc is just new
+                }
+                if let Err(err) = host.salvage_chat_transcript(&chat.id).await {
+                    tracing::warn!(chat = %chat.id, error = %err, "transcript salvage failed");
+                }
+            }
+        });
+    }
+
+    async fn salvage_chat_transcript(&self, chat_id: &str) -> Result<(), String> {
+        let handle = self.open(chat_id).map_err(|e| e.to_string())?;
+        if !handle.doc().read_entries().map_err(|e| e.to_string())?.is_empty() {
+            return Ok(()); // transcript present — nothing lost
+        }
+        // Fat source 1: the M3 adopt's rollback copy on disk.
+        let rollback_id = format!("{chat_id}.pre-chat2");
+        let mut fat_bytes = self.inner.store.load_snapshot(&rollback_id).ok().flatten();
+        // Fat source 2: the legacy s2 room.
+        if fat_bytes.is_none() {
+            fat_bytes = self.fetch_s2_room_doc(chat_id).await;
+        }
+        let Some(bytes) = fat_bytes else {
+            return Ok(()); // no fat lineage anywhere — genuinely empty chat
+        };
+        let raw = loro::LoroDoc::new();
+        raw.import(&bytes).map_err(|e| e.to_string())?;
+        let fat = SessionDoc::from_doc(raw);
+        // Thin before appending (docs/chat2-sync.md A2): full outputs are
+        // parked, exactly like a seed — they survive in the rollback copy
+        // saved below and the run journal.
+        let rebuilt = komet_doc::rebuild::rebuild_thin_doc(&fat).map_err(|e| e.to_string())?;
+        let entries = rebuilt.doc.read_entries().map_err(|e| e.to_string())?;
+        if entries.is_empty() {
+            return Ok(());
+        }
+        if matches!(self.inner.store.load_snapshot(&rollback_id), Ok(None)) {
+            let _ = self.inner.store.save_snapshot(&rollback_id, &bytes);
+        }
+        // Re-check emptiness at the last instant: a run that started during
+        // the room fetch must not get history interleaved under it.
+        if !handle.doc().read_entries().map_err(|e| e.to_string())?.is_empty() {
+            return Err("doc gained entries mid-salvage; aborted".into());
+        }
+        for entry in &entries {
+            handle.doc().push_message(entry).map_err(|e| e.to_string())?;
+        }
+        tracing::info!(chat = %chat_id, entries = entries.len(),
+            "transcript salvaged into chat2 lineage");
+        Ok(())
+    }
+
+    /// Join the legacy s2 room with a throwaway doc, wait for the backfill to
+    /// quiesce, and export what it holds. `None` = no edge, unreachable, or
+    /// the room is empty.
+    async fn fetch_s2_room_doc(&self, chat_id: &str) -> Option<Vec<u8>> {
+        let edge = self.inner.config.edge.clone()?;
+        let url = edge.room_url(format!("/session/{chat_id}/ws"));
+        let doc = loro::LoroDoc::new();
+        let client = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            RoomClient::connect_via(url, chat_id, doc.clone()),
+        )
+        .await
+        .ok()?
+        .ok()?;
+        let mut last = doc.oplog_vv().encode();
+        let mut quiet = 0u32;
+        for _ in 0..30u32 {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            let vv = doc.oplog_vv().encode();
+            if vv == last {
+                quiet += 1;
+                if quiet >= 3 {
+                    break;
+                }
+            } else {
+                quiet = 0;
+                last = vv;
+            }
+        }
+        drop(client);
+        let fat = SessionDoc::from_doc(doc);
+        if fat.read_entries().ok()?.is_empty() {
+            return None; // empty or never-materialized room
+        }
+        fat.export_snapshot().ok()
     }
 
     /// chat2 host duties on the doc-quiesce tick (docs/chat2-sync.md C3):
@@ -1467,6 +1693,10 @@ impl DocHost {
             turn_id: Some(m.id.clone()),
             frontier: None,
         });
+        let is_message = matches!(
+            payload,
+            SessionCommandPayload::Run { .. } | SessionCommandPayload::Steer { .. }
+        );
         handle.doc.queue_command(&SessionCommandEntry {
             id: id.clone(),
             payload,
@@ -1477,6 +1707,21 @@ impl DocHost {
             status: SessionCommandStatus::Pending,
             resolution: None,
         })?;
+        // Sending a message revives an archived chat: the user is acting in it
+        // again, so the LWW row flips back to active on every device. Best-
+        // effort — the command itself is durable regardless.
+        if is_message {
+            if let Some(workspace) = self.workspace() {
+                match workspace.chat(chat_id) {
+                    Ok(Some(chat)) if chat.archived => {
+                        if let Err(err) = workspace.set_chat_archived(chat_id, false) {
+                            tracing::warn!(chat = %chat_id, error = %err, "unarchive on send failed");
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
         // §7 durable delivery: when another device hosts this chat, nudge its device
         // room so a cold host opens the doc and drains the queue. Fire-and-forget —
         // the command is durable in the doc either way (a host that opens the chat
@@ -1961,8 +2206,18 @@ impl DocHost {
     fn save_snapshot(&self, handle: &ChatDocHandle) {
         if handle.retired.load(Ordering::Relaxed) {
             // A chat2 seed replaced this lineage on disk; persisting this
-            // handle's fat doc would clobber the thin one.
-            return;
+            // handle's fat doc would clobber the thin one. But retired with
+            // NO thin lineage on disk (a stuck handle from the born-gen2
+            // race) means this doc is its transcript's only copy — skipping
+            // the save turned an app quit into total loss (2026-08-11);
+            // persist it, and let the adopt path convert it on reopen.
+            let thin_on_disk = matches!(
+                self.inner.store.load_snapshot_with_cursor(&handle.chat_id),
+                Ok(Some((_, _, epoch))) if epoch >= crate::chat2_host::CHAT2_DOC_EPOCH
+            );
+            if thin_on_disk {
+                return;
+            }
         }
         match handle.doc.export_snapshot() {
             Ok(bytes) => {

@@ -315,7 +315,7 @@ impl HarnessesPage {
                         ))
                 }))
                 .into_any_element();
-            trigger = trigger.child(popover::anchored_menu("harnesses-device-menu", menu));
+            trigger = trigger.child(popover::anchored_menu("harnesses-device-menu", menu, None));
         }
         trigger.into_any_element()
     }
