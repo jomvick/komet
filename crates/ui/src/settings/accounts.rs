@@ -176,9 +176,6 @@ pub struct AccountsPage {
     /// accounts RPCs are relay-forwardable, CLI logins are per-device).
     target_device: Option<String>,
     device_menu: popover::Popup<()>,
-    /// Outside-click dismissal instant — suppresses the trigger click that
-    /// follows the same mouse-down from instantly reopening the menu.
-    device_menu_dismissed_at: Option<std::time::Instant>,
     snapshot: Loadable<AgentAccountsSnapshot>,
     /// Account id with an in-flight Switch/Forget.
     busy_account: Option<String>,
@@ -205,7 +202,6 @@ impl AccountsPage {
             state,
             target_device: None,
             device_menu: popover::Popup::default(),
-            device_menu_dismissed_at: None,
             snapshot: Loadable::Idle,
             busy_account: None,
             login: None,
@@ -318,14 +314,16 @@ impl AccountsPage {
                     gpui::transparent_black()
                 })
                 .when(!open, |el| el.hover(|s| s.bg(crate::theme::ink(0.04))))
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(|this, _, _, _| this.device_menu.note_trigger_press()),
+                )
                 .on_click(cx.listener(|this, _, _, cx| {
-                    let just_dismissed = this
-                        .device_menu_dismissed_at
-                        .is_some_and(|at| at.elapsed() < Duration::from_millis(400));
-                    this.device_menu_dismissed_at = None;
-                    if this.device_menu.is_open() {
+                    // A press that found the menu open closes it (the card's
+                    // mouse-down-out already began the close) — never reopen.
+                    if this.device_menu.take_press_was_open() {
                         this.close_device_menu(cx);
-                    } else if !just_dismissed {
+                    } else {
                         this.device_menu.open(());
                     }
                     cx.notify();
@@ -364,7 +362,6 @@ impl AccountsPage {
             let menu = popover::popover_card(theme)
                 .w(px(220.0))
                 .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                    this.device_menu_dismissed_at = Some(std::time::Instant::now());
                     this.close_device_menu(cx);
                 }))
                 .flex()
