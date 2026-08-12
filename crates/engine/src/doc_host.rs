@@ -869,6 +869,7 @@ impl DocHost {
             let room_doc = doc.doc().clone();
             let chat = chat_id.to_string();
             let weak = Arc::downgrade(handle);
+            let edge = edge.clone();
             let mut token_changes = edge.token_changes();
             tokio::spawn(async move {
                 let mut wake = komet_sync::wake::subscribe();
@@ -890,12 +891,37 @@ impl DocHost {
                     .await;
                     match dial {
                         Ok(Ok(client)) => {
+                            if edge.bearer().await.is_none() {
+                                return;
+                            }
+                            let mut events = client.events();
                             let Some(handle) = weak.upgrade() else {
                                 return; // evicted mid-dial: drop leaves the room
                             };
                             *lock(&handle.room) = Some(client);
                             tracing::info!(chat = %chat, "session room joined");
-                            return;
+                            drop(handle);
+                            if token_changes.is_none() {
+                                return;
+                            }
+                            loop {
+                                tokio::select! {
+                                    event = events.recv() => match event {
+                                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                                    },
+                                    _ = crate::workspace_host::token_changed(&mut token_changes) => {
+                                        if edge.bearer().await.is_none() {
+                                            if let Some(handle) = weak.upgrade() {
+                                                lock(&handle.room).take();
+                                            }
+                                            tracing::info!(chat = %chat,
+                                                "session credentials removed; leaving room");
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
                         }
                         Ok(Err(err)) => {
                             tracing::warn!(
@@ -973,10 +999,14 @@ impl DocHost {
                 .await;
                 match dial {
                     Ok(Ok(client)) => {
+                        if edge.bearer().await.is_none() {
+                            return;
+                        }
                         let Some(handle) = weak.upgrade() else {
                             return; // evicted mid-dial: drop leaves the room
                         };
                         let mut events = client.events();
+                        let mut lifecycle_events = client.events();
                         {
                             // Store + drain under ONE client-lock critical
                             // section: the subscription pushes to the buffer
@@ -1052,7 +1082,29 @@ impl DocHost {
                                 }
                             });
                         }
-                        return;
+                        drop(handle);
+                        if token_changes.is_none() {
+                            return;
+                        }
+                        loop {
+                            tokio::select! {
+                                event = lifecycle_events.recv() => match event {
+                                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                                },
+                                _ = crate::workspace_host::token_changed(&mut token_changes) => {
+                                    if edge.bearer().await.is_none() {
+                                        if let Some(handle) = weak.upgrade() {
+                                            lock(&handle.chat2).take();
+                                            lock(&handle.chat2_local_sub).take();
+                                        }
+                                        tracing::info!(chat = %chat,
+                                            "chat2 credentials removed; leaving room");
+                                        return;
+                                    }
+                                }
+                            }
+                        }
                     }
                     Ok(Err(err)) => {
                         tracing::warn!(chat = %chat, error = %err,
@@ -2249,6 +2301,17 @@ impl DocHost {
         let handles: Vec<_> = lock(&self.inner.handles).values().cloned().collect();
         for handle in handles {
             self.save_snapshot(&handle);
+        }
+    }
+
+    /// Close all account-scoped room memberships before graceful engine
+    /// draining. Auth-aware join supervisors will not install a late client.
+    pub fn disconnect_edge(&self) {
+        let handles: Vec<_> = lock(&self.inner.handles).values().cloned().collect();
+        for handle in handles {
+            lock(&handle.room).take();
+            lock(&handle.chat2).take();
+            lock(&handle.chat2_local_sub).take();
         }
     }
 }

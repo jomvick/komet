@@ -366,6 +366,17 @@ impl EngineCore {
         Arc::new(rpc)
     }
 
+    /// Revoke every account-scoped transport before any slower graceful
+    /// draining. Connected sockets remain authorized by their handshake, so
+    /// clearing credentials alone is not a security boundary.
+    pub fn disconnect_edge(&self) {
+        if let Some(links) = self.links() {
+            links.disconnect_all();
+        }
+        self.doc_host.disconnect_edge();
+        self.workspace.disconnect_edge();
+    }
+
     /// Graceful teardown: settle live runs (streaming entries stamped `aborted`),
     /// kill live PTYs, stamp our workspace `lastSeenAt`, and flush every open doc
     /// snapshot.
@@ -425,7 +436,7 @@ impl EngineRuntime {
         self.core.workspace_scope()
     }
 
-    pub async fn shutdown(&self) {
+    pub fn disconnect_edge(&self) {
         // Revoke remote reachability before graceful draining. Sessions may
         // need time to settle; no authenticated relay RPC may enter during
         // that window after sign-out.
@@ -433,6 +444,11 @@ impl EngineRuntime {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
+        self.core.disconnect_edge();
+    }
+
+    pub async fn shutdown(&self) {
+        self.disconnect_edge();
         self.core.shutdown().await;
     }
 }
@@ -634,6 +650,7 @@ impl Engine {
 
         std::fs::create_dir_all(&config.data_dir)?;
         let auth = Self::build_auth(&config).await;
+        let mut auth_state = auth.watch_state();
         let workspace_scope = Self::initial_workspace_scope(&auth);
         let mut profile = Self::resolve_profile(&config, &auth, workspace_scope)?;
         let _refresh_loop = auth.spawn_refresh_loop();
@@ -667,11 +684,30 @@ impl Engine {
                     tracing::info!("headless shutdown requested over IPC");
                 }
             }
+            _ = wait_for_signed_out(&mut auth_state), if workspace_scope == WorkspaceScope::Synced => {
+                // Edge transports observe the same auth signal and close at
+                // once. Leave a brief reply window for a SignOut RPC before
+                // the localhost server itself is aborted.
+                runtime.disconnect_edge();
+                tracing::info!("headless authentication revoked; stopping synced runtime");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
         }
         tracing::info!("shutting down");
         server.abort();
         runtime.shutdown().await;
         Ok(())
+    }
+}
+
+async fn wait_for_signed_out(state: &mut tokio::sync::watch::Receiver<AuthState>) {
+    loop {
+        if matches!(&*state.borrow(), AuthState::SignedOut) {
+            return;
+        }
+        if state.changed().await.is_err() {
+            return;
+        }
     }
 }
 

@@ -76,6 +76,14 @@ pub(crate) async fn token_changed(changes: &mut Option<tokio::sync::watch::Recei
     }
 }
 
+async fn token_revoked(token: &Option<Arc<dyn komet_rpc::TokenSource>>) -> bool {
+    match token {
+        Some(token) => token.token().await.is_none(),
+        // Fixed test/dev URLs have no revocable credential source.
+        None => false,
+    }
+}
+
 /// Quiet-probe cadence for the registry room: fixed at 15 minutes. One room
 /// per engine, so the fixed cadence costs ~100 DO wakes/day total, and the
 /// probe is deadline-checked — a mute room is detected within
@@ -289,7 +297,7 @@ impl WorkspaceHost {
         let org_id = self.inner.config.org_id.clone();
         // Per-dial URL provider: the bearer is re-read on every (re)connect.
         let url = edge.room_url(format!("/registry/{org_id}/ws"));
-        self.spawn_join(url, edge.token_changes());
+        self.spawn_join(url, edge.token_changes(), Some(edge.token.clone()));
     }
 
     /// Test seam: join a registry room at a fixed WebSocket URL without an
@@ -297,13 +305,18 @@ impl WorkspaceHost {
     /// server through this. Production always goes through [`Self::join_room`].
     #[doc(hidden)]
     pub fn connect_registry_url(&self, url: &str) {
-        self.spawn_join(Arc::new(komet_sync::StaticUrl(url.to_string())), None);
+        self.spawn_join(
+            Arc::new(komet_sync::StaticUrl(url.to_string())),
+            None,
+            None,
+        );
     }
 
     fn spawn_join(
         &self,
         url: Arc<dyn komet_sync::UrlProvider>,
         mut token_changes: Option<tokio::sync::watch::Receiver<u64>>,
+        token: Option<Arc<dyn komet_rpc::TokenSource>>,
     ) {
         let org_id = self.inner.config.org_id.clone();
         let reg = self.inner.reg.clone();
@@ -336,28 +349,43 @@ impl WorkspaceHost {
                         let client = Arc::new(client);
                         client.set_presence(now_ms());
                         let mut events = client.events();
+                        if token_revoked(&token).await {
+                            return;
+                        }
                         let Some(inner) = weak.upgrade() else { return };
-                        *lock(&inner.room) = Some(client);
+                        *lock(&inner.room) = Some(client.clone());
                         inner.bump_changed();
                         tracing::info!(org = %org_id, "registry room joined");
                         drop(inner);
+                        // The slot is the sole owner. This lets engine-level
+                        // revocation close the socket synchronously by taking it.
+                        drop(client);
                         // The event pump lives for the client's whole life
                         // (across its self-reconnects); it ends only when the
                         // client is dropped at host teardown.
                         loop {
-                            match events.recv().await {
-                                Ok(komet_sync::RegistryEvent::Applied)
-                                | Ok(komet_sync::RegistryEvent::Connected) => {
-                                    let Some(inner) = weak.upgrade() else { return };
-                                    inner.bump_changed();
+                            tokio::select! {
+                                event = events.recv() => match event {
+                                    Ok(komet_sync::RegistryEvent::Applied)
+                                    | Ok(komet_sync::RegistryEvent::Connected) => {
+                                        let Some(inner) = weak.upgrade() else { return };
+                                        inner.bump_changed();
+                                    }
+                                    Ok(komet_sync::RegistryEvent::Presence) => {
+                                        let Some(inner) = weak.upgrade() else { return };
+                                        inner.publish();
+                                    }
+                                    Ok(komet_sync::RegistryEvent::Disconnected) => {}
+                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                                },
+                                _ = token_changed(&mut token_changes) => {
+                                    if token_revoked(&token).await {
+                                        tracing::info!(org = %org_id,
+                                            "registry credentials removed; leaving room");
+                                        break;
+                                    }
                                 }
-                                Ok(komet_sync::RegistryEvent::Presence) => {
-                                    let Some(inner) = weak.upgrade() else { return };
-                                    inner.publish();
-                                }
-                                Ok(komet_sync::RegistryEvent::Disconnected) => {}
-                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                             }
                         }
                         if let Some(inner) = weak.upgrade() {
@@ -378,11 +406,20 @@ impl WorkspaceHost {
                         backoff = JOIN_RETRY_BASE;
                     }
                     _ = token_changed(&mut token_changes) => {
+                        if token_revoked(&token).await {
+                            return;
+                        }
                         backoff = JOIN_RETRY_BASE;
                     }
                 }
             }
         });
+    }
+
+    /// Close the current registry membership before account-scoped state is
+    /// drained. The auth signal prevents an in-flight join from replacing it.
+    pub fn disconnect_edge(&self) {
+        lock(&self.inner.room).take();
     }
 
     /// Wire the "peer is alive" signal (fresh presence heartbeat) to a callback —

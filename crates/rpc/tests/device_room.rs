@@ -423,6 +423,46 @@ async fn token_rotation_does_not_interrupt_a_live_peer_link() {
 }
 
 #[tokio::test]
+async fn sign_out_closes_cached_peer_links() {
+    let relay = FakeRelay::start().await;
+    let _host = HostRelay::spawn(
+        relay_config(&relay.edge_url(), 100),
+        TestService::new("host-a"),
+        noop_nudge(),
+    );
+    relay.wait_host_connected().await;
+
+    let token = Arc::new(RecoveringToken::new(Some("test-user")));
+    let links = LinkCache::new(LinkCacheConfig::new(relay.edge_url(), token.clone()));
+    let client = links.client("dev-a").await.expect("client dials");
+    client
+        .call("Echo", serde_json::json!({ "before": "sign-out" }))
+        .await
+        .expect("link is live before sign-out");
+
+    token.clear();
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if client
+                .call("Echo", serde_json::json!({ "after": "sign-out" }))
+                .await
+                .is_err()
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cached peer link survived sign-out");
+    assert!(
+        links.client("dev-a").await.is_err(),
+        "signed-out cache must not redial"
+    );
+}
+
+#[tokio::test]
 async fn relay_serves_multiple_clients_end_to_end() {
     let relay = FakeRelay::start().await;
     let service = TestService::new("host-a");
