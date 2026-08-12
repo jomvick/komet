@@ -543,28 +543,65 @@ impl GitHistory {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         if index >= self.commits.len() {
+            let theme = Theme::of(cx).clone();
+            let has_error = self.error.is_some();
             let label = if self.loading {
-                "Loading older commits…"
-            } else if self.error.is_some() {
-                "Retry loading older commits"
+                "Loading…"
+            } else if has_error {
+                "Retry"
             } else {
-                "Load older commits"
+                "Load more"
             };
-            return div()
+            let button = div()
                 .id("history-load-older")
-                .h(px(48.0))
+                .h(px(28.0))
+                .px(px(11.0))
                 .flex()
                 .items_center()
                 .justify_center()
+                .gap(px(6.0))
+                .rounded(px(7.0))
+                .border_1()
+                .border_color(theme.border.opacity(0.85))
+                .bg(theme.surface_raised.opacity(0.72))
                 .text_size(px(11.0))
-                .text_color(Theme::of(cx).text_muted)
+                .text_color(if self.loading {
+                    theme.text_faint
+                } else {
+                    theme.text_muted
+                })
                 .when(!self.loading, |element| {
                     element
                         .cursor_pointer()
-                        .hover(|style| style.bg(crate::theme::ink(0.04)))
+                        .hover(|style| {
+                            style
+                                .bg(theme.element_hover)
+                                .border_color(theme.border_strong.opacity(0.75))
+                                .text_color(theme.text)
+                        })
                         .on_click(cx.listener(|this, _, _, cx| this.load_older(cx)))
                 })
-                .child(SharedString::from(label))
+                .when(!self.loading, |element| {
+                    element.child(
+                        crate::icons::icon(if has_error {
+                            crate::icons::REFRESH
+                        } else {
+                            crate::icons::ALT_ARROW_DOWN
+                        })
+                        .size(px(11.0))
+                        .flex_none()
+                        .text_color(theme.text_faint),
+                    )
+                })
+                .child(SharedString::from(label));
+            return div()
+                .w_full()
+                .h(px(48.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(button)
                 .into_any_element();
         }
         let Some(commit) = self.commits.get(index).cloned() else {
