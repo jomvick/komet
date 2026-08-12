@@ -38,6 +38,7 @@ use crate::settings::appearance::AppearancePage;
 use crate::settings::archived::ArchivedPage;
 use crate::settings::devices::DevicesPage;
 use crate::settings::harnesses::HarnessesPage;
+use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
 use crate::settings::{
     KeymapConfig, RIGHT_PANE_DEFAULT, RIGHT_PANE_MAX, RIGHT_PANE_MIN, SAVE_DEBOUNCE_MS,
@@ -150,16 +151,18 @@ pub enum SettingsSection {
     /// Per-provider CLI accounts (login, usage) — labeled "Accounts".
     Agents,
     Appearance,
+    Notifications,
     Shortcuts,
     Archived,
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 6] = [
+    pub const ALL: [SettingsSection; 7] = [
         SettingsSection::Devices,
         SettingsSection::Harnesses,
         SettingsSection::Agents,
         SettingsSection::Appearance,
+        SettingsSection::Notifications,
         SettingsSection::Shortcuts,
         SettingsSection::Archived,
     ];
@@ -172,6 +175,7 @@ impl SettingsSection {
             SettingsSection::Harnesses => "Agents",
             SettingsSection::Agents => "Accounts",
             SettingsSection::Appearance => "Appearance",
+            SettingsSection::Notifications => "Notifications",
             SettingsSection::Shortcuts => "Shortcuts",
             SettingsSection::Archived => "Archived sessions",
         }
@@ -563,10 +567,12 @@ pub struct Shell {
     devices_page: Option<Entity<DevicesPage>>,
     archived_page: Option<Entity<ArchivedPage>>,
     appearance_page: Option<Entity<AppearancePage>>,
+    notifications_page: Option<Entity<NotificationsPage>>,
     shortcuts_page: Option<Entity<ShortcutsPage>>,
     accounts_page: Option<Entity<AccountsPage>>,
     harnesses_page: Option<Entity<HarnessesPage>>,
     shortcuts_sub: Option<Subscription>,
+    notifications_sub: Option<Subscription>,
     /// Session-row context menu: (chat id, window position).
     chat_menu: popover::Popup<(String, Point<Pixels>)>,
     rename_dialog: Option<RenameChatDialog>,
@@ -696,12 +702,24 @@ impl Shell {
         });
         let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
         let composer = cx.new(|cx| Composer::new(state.clone(), cx));
-        // Own-send re-engages the stick-to-bottom pin with a smooth scroll.
+        // The first send stages prompt-at-top → follow-tail; later sends keep
+        // the transcript's original follow-tail behavior.
         let composer_events = cx.subscribe(&composer, {
             let transcript = transcript.clone();
             move |_this: &mut Shell, _, event: &ComposerEvent, cx| match event {
-                ComposerEvent::Sent { .. } => {
-                    transcript.update(cx, |t, cx| t.on_own_send(cx));
+                ComposerEvent::Sent {
+                    chat_id,
+                    message_id,
+                    started_empty,
+                } => {
+                    transcript.update(cx, |t, cx| {
+                        t.on_own_send(
+                            chat_id.clone(),
+                            message_id.clone(),
+                            *started_empty,
+                            cx,
+                        )
+                    });
                 }
             }
         });
@@ -740,6 +758,7 @@ impl Shell {
             Some("settings/agents") => Route::Settings(SettingsSection::Agents),
             Some("settings/harnesses") => Route::Settings(SettingsSection::Harnesses),
             Some("settings/appearance") => Route::Settings(SettingsSection::Appearance),
+            Some("settings/notifications") => Route::Settings(SettingsSection::Notifications),
             Some("settings/shortcuts") => Route::Settings(SettingsSection::Shortcuts),
             Some("settings/archived") => Route::Settings(SettingsSection::Archived),
             // `new` pins the new-chat canvas (suppresses boot auto-select).
@@ -785,10 +804,12 @@ impl Shell {
             devices_page: None,
             archived_page: None,
             appearance_page: None,
+            notifications_page: None,
             shortcuts_page: None,
             accounts_page: None,
             harnesses_page: None,
             shortcuts_sub: None,
+            notifications_sub: None,
             chat_menu: popover::Popup::default(),
             rename_dialog: None,
             delete_confirm: None,
@@ -884,7 +905,10 @@ impl Shell {
         // question rings whenever a session flips to AwaitingInput, a
         // completion rings on the Working→Idle edge — for ANY session on any
         // device. A row's first appearance only seeds the baseline, so boot
-        // (restored rows) and fresh sends stay silent.
+        // (restored rows) and fresh sends stay silent. Desktop banners
+        // (`notify::post`) ride the SAME edges and gates behind their own
+        // settings flag — one detector, two outputs, so the banner can never
+        // fire where the chime wouldn't.
         //
         // STALENESS-GATED like the dot (`effective_indicator`), for the same
         // reason: raw row statuses include the past. A dead turn's Working row
@@ -905,7 +929,8 @@ impl Shell {
         // still ring.
         {
             let now = Utc::now();
-            let sessions: Vec<(String, komet_proto::SessionStatus, bool)> = {
+            type Ping = (String, komet_proto::SessionStatus, bool, Option<String>);
+            let sessions: Vec<Ping> = {
                 let state = state.read(cx);
                 state
                     .sessions
@@ -919,18 +944,39 @@ impl Shell {
                             Indicator::None => komet_proto::SessionStatus::Idle,
                         };
                         let send_pending = state.send_pending(&s.chat_id, now);
-                        (s.chat_id.clone(), status, send_pending)
+                        let title = state
+                            .chats
+                            .iter()
+                            .find(|c| c.id == s.chat_id)
+                            .and_then(|c| c.title.clone());
+                        (s.chat_id.clone(), status, send_pending, title)
                     })
                     .collect()
             };
-            for (chat_id, status, send_pending) in sessions {
+            // Background-only banners: `active_window()` is app-level (any
+            // Komet window being key), so a ping for a *background chat* in a
+            // focused app still stays a chime — you're already looking at
+            // Komet; the sidebar dot carries the rest.
+            let app_focused = cx.active_window().is_some();
+            for (chat_id, status, send_pending, title) in sessions {
                 let prev = self.sound_prev.insert(chat_id, status);
                 if let Some(prev) = prev
-                    && self.settings.sound_enabled
                     && let Some(sound) = crate::sound::sound_for_transition(prev, status)
                     && !(send_pending && sound == crate::sound::Sound::Done)
                 {
-                    crate::sound::play(sound);
+                    if self.settings.sound_enabled {
+                        crate::sound::play(sound);
+                    }
+                    if self.settings.notifications_enabled
+                        && !(self.settings.notifications_background_only && app_focused)
+                    {
+                        let title = title.unwrap_or_else(|| "New session".into());
+                        let body = match sound {
+                            crate::sound::Sound::Done => "Run finished",
+                            crate::sound::Sound::Request => "Waiting on your input",
+                        };
+                        crate::notify::post(&title, body);
+                    }
                 }
             }
         }
@@ -1375,6 +1421,39 @@ impl Shell {
                     self.appearance_page = Some(cx.new(AppearancePage::new));
                 }
                 match &self.appearance_page {
+                    Some(page) => page.clone().into_any_element(),
+                    None => Empty.into_any_element(),
+                }
+            }
+            SettingsSection::Notifications => {
+                if self.notifications_page.is_none() {
+                    let page = cx.new(|cx| {
+                        NotificationsPage::new(
+                            self.settings.sound_enabled,
+                            self.settings.notifications_enabled,
+                            self.settings.notifications_background_only,
+                            cx,
+                        )
+                    });
+                    // Persist the flags whenever the page flips one.
+                    self.notifications_sub = Some(cx.subscribe(
+                        &page,
+                        |this: &mut Shell, _, event: &NotificationsEvent, cx| {
+                            let NotificationsEvent::Changed {
+                                sound,
+                                desktop,
+                                background_only,
+                            } = *event;
+                            this.settings.sound_enabled = sound;
+                            this.settings.notifications_enabled = desktop;
+                            this.settings.notifications_background_only = background_only;
+                            this.schedule_save(cx);
+                            cx.notify();
+                        },
+                    ));
+                    self.notifications_page = Some(page);
+                }
+                match &self.notifications_page {
                     Some(page) => page.clone().into_any_element(),
                     None => Empty.into_any_element(),
                 }
@@ -2111,6 +2190,7 @@ impl Shell {
             SettingsSection::Harnesses => icons::WIDGET,
             SettingsSection::Agents => icons::KEY_MINIMALISTIC,
             SettingsSection::Appearance => icons::TUNING,
+            SettingsSection::Notifications => icons::BELL,
             SettingsSection::Shortcuts => icons::KEYBOARD,
             SettingsSection::Archived => icons::ARCHIVE_MINIMALISTIC,
         };

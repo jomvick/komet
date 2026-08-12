@@ -1,6 +1,6 @@
 # Komet
 
-Control your coding agents (Claude Code, Codex, Grok, Hermes, Pi) locally by default, with optional multi-device sync.
+Control your coding agents (Claude Code, Codex, Cursor, Grok, Hermes, Pi) locally by default, with optional multi-device sync.
 
 ![Komet running a Claude Code session](docs/screenshot.png)
 
@@ -49,6 +49,6 @@ On macOS: use the desktop release, or build `komet` from source and run `komet d
 
 ---
 
-Developing or curious how it works? See [ARCHITECTURE.md](ARCHITECTURE.md).
+Developing or curious how it works? [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/komet/komet) or check out [ARCHITECTURE.md](ARCHITECTURE.md).
 
 Licensed under the [MIT License](LICENSE).

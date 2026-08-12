@@ -188,9 +188,12 @@ pub fn reasoning_label(level: ReasoningLevel) -> &'static str {
     }
 }
 
-/// The TraitsPicker trigger summary: non-default reasoning + non-default model
-/// option choices, joined with " · " (komet: "High · 1M · Fast"). `None` when
-/// everything is at its default.
+/// The TraitsPicker trigger summary: the effective reasoning level plus every
+/// model option's effective choice — the explicit pick when one is saved and
+/// still offered, else the option's default — joined with " · " ("High · 1M ·
+/// Fast", Cursor's "Agent · Balance"). Defaults are spelled out rather than
+/// hidden so the run's configuration reads without opening the popover; `None`
+/// only when the model has nothing to describe (no ladder, no options).
 pub fn traits_summary(
     model: Option<&Model>,
     reasoning: Option<ReasoningLevel>,
@@ -202,12 +205,11 @@ pub fn traits_summary(
     }
     if let Some(model) = model {
         for option in &model.options {
-            let Some(choice_id) = selections.get(&option.id).and_then(|v| v.as_str()) else {
-                continue;
-            };
-            if choice_id == option.default_choice {
-                continue;
-            }
+            let choice_id = selections
+                .get(&option.id)
+                .and_then(|v| v.as_str())
+                .filter(|id| option.choices.iter().any(|c| c.id == *id))
+                .unwrap_or(&option.default_choice);
             if let Some(choice) = option.choices.iter().find(|c| c.id == choice_id) {
                 parts.push(choice.label.clone());
             }
@@ -218,6 +220,30 @@ pub fn traits_summary(
     } else {
         Some(parts.join(" · "))
     }
+}
+
+/// Whether any trait departs from its default — the trigger brightens only
+/// then, so a customized run still stands out now that the summary always
+/// names the effective choices.
+pub fn traits_customized(
+    model: Option<&Model>,
+    reasoning: Option<ReasoningLevel>,
+    ladder: &[ReasoningLevel],
+    selections: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    if reasoning != default_reasoning(ladder) {
+        return true;
+    }
+    model.is_some_and(|model| {
+        model.options.iter().any(|option| {
+            selections
+                .get(&option.id)
+                .and_then(|v| v.as_str())
+                .is_some_and(|id| {
+                    id != option.default_choice && option.choices.iter().any(|c| c.id == id)
+                })
+        })
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -244,6 +270,45 @@ pub fn child_path(base: &str, name: &str) -> String {
     } else {
         format!("{base}/{name}")
     }
+}
+
+/// Byte length of `name`'s prefix matching `query`, compared char-for-char
+/// case-insensitively; `None` when `query` isn't a prefix of `name`. The
+/// length indexes into `name` (not `query`) so the completion suffix keeps
+/// the folder's real casing: `("Documents", "doc") → Some(3)` → `"uments"`.
+pub fn completion_prefix_len(name: &str, query: &str) -> Option<usize> {
+    let mut len = 0;
+    let mut name_chars = name.chars();
+    for qc in query.chars() {
+        let nc = name_chars.next()?;
+        if !nc.to_lowercase().eq(qc.to_lowercase()) {
+            return None;
+        }
+        len += nc.len_utf8();
+    }
+    Some(len)
+}
+
+/// Resolve a typed path segment against folder `names` (slash-descend):
+/// exact match first — case-SENSITIVE before case-insensitive, so `GitHub/`
+/// picks a `GitHub` sibling over `github` — then a unique case-insensitive
+/// prefix. Ambiguity resolves to `None`: the slash stays in the query.
+pub fn segment_target(names: &[&str], query: &str) -> Option<usize> {
+    if let Some(ix) = names.iter().position(|n| *n == query) {
+        return Some(ix);
+    }
+    if let Some(ix) = names
+        .iter()
+        .position(|n| completion_prefix_len(n, query) == Some(n.len()))
+    {
+        return Some(ix);
+    }
+    let mut hits = names
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| completion_prefix_len(n, query).is_some());
+    let (ix, _) = hits.next()?;
+    hits.next().is_none().then_some(ix)
 }
 
 /// Breadcrumb segments for a path: `(label, full path)`, root first.
@@ -2975,6 +3040,12 @@ impl Render for Pickers {
             self.effective_reasoning(cx),
             &explicit_options,
         );
+        let traits_active = traits_customized(
+            self.selected_model(cx),
+            self.effective_reasoning(cx),
+            &self.trait_ladder(cx),
+            &explicit_options,
+        );
         let traits_label: SharedString = traits_set
             .clone()
             .map(SharedString::from)
@@ -3023,9 +3094,11 @@ impl Render for Pickers {
             .gap(px(4.0));
         // Model chip (brand icon + model name) beside a separate Traits chip
         // (t3code TraitsPicker arrangement): the trigger label is the joined
-        // non-default summary ("High · 1M · Fast"), falling back to "Traits".
-        // No chip at all when the model has neither a ladder nor options
-        // (e.g. Hermes today) — a dead trigger reads as broken.
+        // effective summary ("High · 1M · Fast", "Agent · Balance") so the
+        // run's traits read without opening; it brightens only when something
+        // departs from its default. No chip at all when the model has neither
+        // a ladder nor options (e.g. Hermes today) — a dead trigger reads as
+        // broken.
         let model_chip = self.trigger_chip(
             PickerKind::HarnessModel,
             model_label,
@@ -3043,7 +3116,7 @@ impl Render for Pickers {
             self.trigger_chip(
                 PickerKind::Traits,
                 traits_label,
-                traits_set.is_some(),
+                traits_active,
                 None,
                 None,
                 &theme,
@@ -3139,15 +3212,19 @@ mod tests {
             traits_summary(Some(&model), Some(ReasoningLevel::High), &selections),
             Some("High · 1M · Fast".to_string())
         );
-        // All defaults → no summary.
+        // All defaults: the effective choices still read on the trigger.
         assert_eq!(
             traits_summary(Some(&model), None, &serde_json::Map::new()),
-            None
+            Some("Standard · Normal".to_string())
         );
-        // Default-choice selections don't count as non-default.
-        let mut defaults = serde_json::Map::new();
-        defaults.insert("speed".into(), serde_json::Value::String("normal".into()));
-        assert_eq!(traits_summary(Some(&model), None, &defaults), None);
+        // A saved choice the option no longer offers falls back to the default
+        // label rather than vanishing or echoing a stale id.
+        let mut stale = serde_json::Map::new();
+        stale.insert("speed".into(), serde_json::Value::String("ludicrous".into()));
+        assert_eq!(
+            traits_summary(Some(&model), None, &stale),
+            Some("Standard · Normal".to_string())
+        );
         // Reasoning shows without a model too.
         assert_eq!(
             traits_summary(
@@ -3157,6 +3234,45 @@ mod tests {
             ),
             Some("Ultrathink".to_string())
         );
+        // Nothing to describe → "Traits" fallback upstream.
+        assert_eq!(traits_summary(None, None, &serde_json::Map::new()), None);
+
+        // Customized (bright trigger) only when something departs from its
+        // default: default-choice selections and the default reasoning level
+        // don't count; stale ids don't either.
+        let ladder = model.reasoning_levels.clone();
+        assert!(traits_customized(
+            Some(&model),
+            Some(ReasoningLevel::High),
+            &ladder,
+            &selections
+        ));
+        assert!(!traits_customized(
+            Some(&model),
+            default_reasoning(&ladder),
+            &ladder,
+            &serde_json::Map::new()
+        ));
+        let mut defaults = serde_json::Map::new();
+        defaults.insert("speed".into(), serde_json::Value::String("normal".into()));
+        assert!(!traits_customized(
+            Some(&model),
+            default_reasoning(&ladder),
+            &ladder,
+            &defaults
+        ));
+        assert!(!traits_customized(
+            Some(&model),
+            default_reasoning(&ladder),
+            &ladder,
+            &stale
+        ));
+        assert!(traits_customized(
+            Some(&model),
+            Some(ReasoningLevel::Medium),
+            &ladder,
+            &serde_json::Map::new()
+        ));
     }
 
     #[test]
@@ -3173,6 +3289,35 @@ mod tests {
         assert_eq!(labels, ["/", "home", "w", "dev"]);
         assert_eq!(crumbs[2].1, "/home/w");
         assert_eq!(breadcrumbs("/").len(), 1);
+    }
+
+    #[test]
+    fn completion_prefix_lengths() {
+        // Case-insensitive; the length indexes into the NAME's bytes.
+        assert_eq!(completion_prefix_len("Documents", "doc"), Some(3));
+        assert_eq!(&"Documents"[3..], "uments");
+        assert_eq!(completion_prefix_len("komet", "komet"), Some(5));
+        assert_eq!(completion_prefix_len("komet", ""), Some(0));
+        assert_eq!(completion_prefix_len("komet", "dev"), None);
+        // Longer than the name → not a prefix.
+        assert_eq!(completion_prefix_len("dev", "devel"), None);
+        // Multibyte names slice on a char boundary.
+        assert_eq!(completion_prefix_len("héllo", "hé"), Some(3));
+        assert_eq!(&"héllo"[3..], "llo");
+    }
+
+    #[test]
+    fn segment_target_resolution() {
+        let names = ["github", "GitHub", "worktree"];
+        // Exact casing beats the earlier case-insensitive sibling…
+        assert_eq!(segment_target(&names, "GitHub"), Some(1));
+        assert_eq!(segment_target(&names, "github"), Some(0));
+        // …but with no exact-cased hit, case-insensitive exact still lands.
+        assert_eq!(segment_target(&names, "WORKTREE"), Some(2));
+        // Unique prefix descends; an ambiguous one keeps the slash honest.
+        assert_eq!(segment_target(&names, "work"), Some(2));
+        assert_eq!(segment_target(&names, "g"), None);
+        assert_eq!(segment_target(&names, "x"), None);
     }
 
     #[test]

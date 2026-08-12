@@ -378,6 +378,20 @@ pub fn send_button_mode(run_live: bool, has_text: bool) -> SendButtonMode {
     }
 }
 
+/// The prompt-at-top treatment belongs only to a chat's first send. The
+/// loaded transcript alone can't prove that: selecting a chat clears it
+/// synchronously and the watch task refills it later, so a fast send into a
+/// just-selected chat would read a history-laden transcript as empty. The
+/// chat row's own activity — bumped on every dispatch, `None` on a fresh row
+/// — closes that window.
+fn send_starts_empty_chat(
+    transcript_len: usize,
+    pending_echoes_len: usize,
+    chat_never_messaged: bool,
+) -> bool {
+    transcript_len == 0 && pending_echoes_len == 0 && chat_never_messaged
+}
+
 /// Find the unresolved input request the panel should serve, if any: an
 /// unresolved input part on the LAST assistant entry — regardless of the
 /// entry's run status. The question stays answerable until the user actually
@@ -1267,6 +1281,11 @@ pub struct ComposerInput {
     last_width: f32,
     /// Raw Markdown → chip display projection from the last layout pass.
     projection: TextProjection,
+    /// Inline completion preview: painted in faint ink after the text while
+    /// the caret sits at the end (palette tab-completion). Owned by the
+    /// wrapper — it recomputes and re-sets this on every render pass, so the
+    /// input never has to know what the completion means.
+    ghost: Option<SharedString>,
     /// File mentions are a composer feature, not a behavior of generic inputs
     /// (picker searches and rename fields also use this type).
     mentions_enabled: bool,
@@ -1337,6 +1356,7 @@ impl ComposerInput {
             max_line_width: 0.0,
             last_width: 0.0,
             projection: TextProjection::default(),
+            ghost: None,
             mentions_enabled: false,
             layout_epoch: 0,
             display_is_placeholder: true,
@@ -1483,6 +1503,16 @@ impl ComposerInput {
 
     pub fn is_empty(&self) -> bool {
         self.content.is_empty()
+    }
+
+    /// Set (or clear) the inline completion preview. Only paints while the
+    /// caret sits at the end of a non-empty draft — see the prepaint gate.
+    pub fn set_ghost(&mut self, ghost: Option<SharedString>, cx: &mut Context<Self>) {
+        if self.ghost == ghost {
+            return;
+        }
+        self.ghost = ghost;
+        cx.notify();
     }
 
     pub fn has_newline(&self) -> bool {
@@ -2741,6 +2771,10 @@ struct ComposerTextPrepaint {
     mention_quads: Vec<PaintQuad>,
     mention_hits: Vec<MentionHit>,
     selection_quads: Vec<PaintQuad>,
+    /// Completion preview: window-space origin of the end-of-text caret plus
+    /// the suffix to paint there (shaped at paint time — it never joins the
+    /// content's own layout, so hit-testing and the caret ignore it).
+    ghost: Option<(Point<Pixels>, SharedString)>,
 }
 
 impl IntoElement for ComposerTextElement {
@@ -2932,11 +2966,29 @@ impl gpui::Element for ComposerTextElement {
                 }),
             });
         }
+        // The ghost only shows where accepting it would insert: a collapsed
+        // caret at the end of real (non-placeholder, non-IME) text.
+        let ghost = input
+            .ghost
+            .clone()
+            .filter(|g| {
+                !g.is_empty()
+                    && !input.display_is_placeholder
+                    && input.marked_range.is_none()
+                    && input.selected_range.is_empty()
+                    && input.cursor_offset() == input.content.len()
+            })
+            .and_then(|g| {
+                input
+                    .point_for_index(input.content.len())
+                    .map(|p| (point(origin.x + p.x, origin.y + p.y), g))
+            });
         ComposerTextPrepaint {
             cursor,
             mention_quads,
             mention_hits,
             selection_quads,
+            ghost,
         }
     }
 
@@ -2995,6 +3047,30 @@ impl gpui::Element for ComposerTextElement {
                     cx,
                 );
                 y += height;
+            }
+            if let Some((ghost_origin, ghost)) = prepaint.ghost.take() {
+                let style = window.text_style();
+                let font_size = style.font_size.to_pixels(window.rem_size());
+                let run = TextRun {
+                    len: ghost.len(),
+                    font: style.font(),
+                    color: Theme::of(cx).text_faint,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                let line = window
+                    .text_system()
+                    .shape_line(ghost, font_size, &[run], None);
+                // (Clipping comes from the surrounding content mask.)
+                let _ = line.paint(
+                    ghost_origin,
+                    line_height,
+                    gpui::TextAlign::Left,
+                    None,
+                    window,
+                    cx,
+                );
             }
             // Caret only when this input is actually focused in an active
             // window (Electron hides it on window deactivation too), and only
@@ -3086,8 +3162,13 @@ impl Render for ComposerInput {
 /// Events the shell listens for.
 #[derive(Debug, Clone)]
 pub enum ComposerEvent {
-    /// A prompt was sent (optimistically) — re-engage the transcript pin.
-    Sent { chat_id: String },
+    /// A prompt was sent optimistically — give the transcript its exact row
+    /// identity so it can stage the top-anchor-to-follow-tail handoff.
+    Sent {
+        chat_id: String,
+        message_id: String,
+        started_empty: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4334,6 +4415,26 @@ impl Composer {
             cx.notify();
             return;
         };
+        // Only the very first prompt gets the top-of-viewport treatment. Once
+        // a chat has any persisted row or optimistic echo, sends retain the
+        // original follow-tail behavior.
+        let started_empty = {
+            let state = self.state.read(cx);
+            let chat_never_messaged = match state.selected_chat.as_deref() {
+                // New-chat canvas: the chat doesn't exist yet, so no history.
+                None => true,
+                Some(id) => state
+                    .chats
+                    .iter()
+                    .find(|c| c.id == id)
+                    .is_none_or(|c| c.last_message_at.is_none()),
+            };
+            send_starts_empty_chat(
+                state.transcript.len(),
+                state.pending_echoes().len(),
+                chat_never_messaged,
+            )
+        };
         // Chat id: existing selection, or client-minted for the new-chat canvas
         // (the chat then appears from the doc host once the doc materializes).
         let (chat_id, is_new) = match self.state.read(cx).selected_chat.clone() {
@@ -4452,6 +4553,8 @@ impl Composer {
         self.sending = true;
         cx.emit(ComposerEvent::Sent {
             chat_id: chat_id.clone(),
+            message_id: message_id.clone(),
+            started_empty,
         });
         cx.notify();
 
@@ -6169,6 +6272,17 @@ mod tests {
         assert_eq!(send_button_mode(false, true), SendButtonMode::Send);
         assert_eq!(send_button_mode(true, true), SendButtonMode::Steer);
         assert_eq!(send_button_mode(true, false), SendButtonMode::Stop);
+    }
+
+    #[test]
+    fn only_the_first_send_starts_an_empty_chat() {
+        assert!(send_starts_empty_chat(0, 0, true));
+        assert!(!send_starts_empty_chat(1, 0, true));
+        assert!(!send_starts_empty_chat(0, 1, true));
+        assert!(!send_starts_empty_chat(2, 1, true));
+        // A transcript that merely hasn't LOADED yet reads len 0 — the chat
+        // row's activity is what says "this chat really has no history".
+        assert!(!send_starts_empty_chat(0, 0, false));
     }
 
     #[test]

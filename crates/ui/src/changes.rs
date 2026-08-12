@@ -24,13 +24,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    AnyElement, App, Context, Entity, ListAlignment, ListState, SharedString, Subscription, Task,
-    Window, div, font, list, prelude::*, px,
+    AnyElement, App, Context, Entity, FocusHandle, Focusable as _, ListAlignment, ListState,
+    SharedString, Subscription, Task, Window, div, font, list, prelude::*, px,
 };
 
 use komet_proto::{Chat, CheckoutDiff};
 use komet_rpc::methods;
 
+use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::markdown::highlight::{Lang, LineCarry, Token, lang_for_tag, tokenize_line};
 use crate::markdown::render;
 use crate::motion::{self, AnimationExt as _, CHEVRON, COLLAPSE};
@@ -544,6 +545,21 @@ struct HighlightSlot {
     _task: Option<Task<()>>,
 }
 
+/// The open base-ref dropdown — the same searchable-menu recipe as the
+/// composer's ref picker and the spaces filter: a filter input on top
+/// (`PaletteSearch` context so ↑↓/⏎ bubble to the card's key handler),
+/// ranked substring rows below.
+struct RefMenu {
+    search: Entity<ComposerInput>,
+    /// Keyboard highlight within the filtered rows.
+    active: usize,
+    /// Tracked on the card — puts it on the keyboard dispatch path while the
+    /// search input holds focus (the structure every working picker uses).
+    focus: FocusHandle,
+    list_scroll: gpui::ScrollHandle,
+    _search_events: Subscription,
+}
+
 async fn yield_now() {
     let mut yielded = false;
     futures::future::poll_fn(move |cx| {
@@ -592,7 +608,7 @@ pub struct Changes {
     scoped_inflight: Option<String>,
     scoped_task: Option<Task<()>>,
     scope_menu: Popup<()>,
-    ref_menu: Popup<()>,
+    ref_menu: Popup<RefMenu>,
     _observe: Subscription,
 }
 
@@ -1066,6 +1082,88 @@ impl Changes {
         }
     }
 
+    fn open_ref_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // "PaletteSearch" context: ↑↓/⏎ stay unbound in the input and bubble
+        // to the card's key handler.
+        let search =
+            cx.new(|cx| ComposerInput::with_context("Search branches…", "PaletteSearch", cx));
+        let search_events = cx.subscribe(&search, |this: &mut Self, _, event, cx| {
+            if matches!(event, ComposerInputEvent::Edited) {
+                if let Some(menu) = this.ref_menu.open_mut() {
+                    menu.active = 0;
+                }
+                cx.notify();
+            }
+        });
+        let handle = search.read(cx).focus_handle(cx);
+        // The highlight starts ON the current base (query is empty, so the
+        // filtered rows are just the branch list).
+        let active = self
+            .base_ref
+            .as_ref()
+            .and_then(|base| self.branches.iter().position(|b| b == base))
+            .unwrap_or(0);
+        self.ref_menu.open(RefMenu {
+            search,
+            active,
+            focus: cx.focus_handle(),
+            list_scroll: gpui::ScrollHandle::new(),
+            _search_events: search_events,
+        });
+        // Focusable before first paint (the add-space palette's proven order).
+        window.focus(&handle, cx);
+        cx.notify();
+    }
+
+    /// Filtered branch indices for the open ref menu (ranked substring match).
+    fn ref_menu_rows(&self, cx: &App) -> Vec<usize> {
+        let query = self
+            .ref_menu
+            .get()
+            .map(|menu| menu.search.read(cx).text().to_string())
+            .unwrap_or_default();
+        popover::filter_indices(&query, &self.branches)
+    }
+
+    /// Dropdown keys (bubbling from the focused search input): ↑↓ navigate,
+    /// ⏎ picks the highlighted branch, Esc closes.
+    fn ref_menu_key(&mut self, event: &gpui::KeyDownEvent, cx: &mut Context<Self>) {
+        // The card stays mounted (and focused) through the exit animation —
+        // keys must not drive a dying menu.
+        if !self.ref_menu.is_open() {
+            return;
+        }
+        let key = popover::classify_key(
+            event.keystroke.key.as_str(),
+            event.keystroke.modifiers.platform,
+            event.keystroke.modifiers.control,
+        );
+        match key {
+            popover::MenuKey::Escape => self.close_ref_menu(cx),
+            popover::MenuKey::Up | popover::MenuKey::Down => {
+                let count = self.ref_menu_rows(cx).len();
+                let delta = if key == popover::MenuKey::Up { -1 } else { 1 };
+                if let Some(menu) = self.ref_menu.open_mut() {
+                    menu.active = popover::menu_step(Some(menu.active), count, delta).unwrap_or(0);
+                    menu.list_scroll.scroll_to_item(menu.active);
+                    cx.notify();
+                }
+            }
+            popover::MenuKey::Enter | popover::MenuKey::ModEnter => {
+                let active = self.ref_menu.get().map(|m| m.active).unwrap_or(0);
+                let pick = self
+                    .ref_menu_rows(cx)
+                    .get(active)
+                    .and_then(|ix| self.branches.get(*ix).cloned());
+                if let Some(branch) = pick {
+                    self.set_base_ref(branch, cx);
+                    self.close_ref_menu(cx);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Tokens for a file's diff lines (paint-only). Kicks a time-sliced
     /// background tokenize when missing; returns the current best.
     fn request_highlight(
@@ -1373,10 +1471,11 @@ impl Changes {
         let trigger = if self.scope_menu.get().is_some() {
             let closing = self.scope_menu.closing_since();
             let menu = self.render_scope_menu(&theme, cx);
-            trigger.relative().child(popover::anchored_menu_below(
+            trigger.relative().child(popover::anchored_menu_below_gap(
                 "changes-scope-menu",
                 menu,
                 closing,
+                10.0,
             ))
         } else {
             trigger
@@ -1406,19 +1505,32 @@ impl Changes {
         popover::popover_card(theme)
             .w(px(180.0))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_scope_menu(cx)))
-            .children(DiffScope::ALL.into_iter().enumerate().map(|(ix, scope)| {
-                popover::menu_row(theme, scope == current, format!("changes-scope-row-{ix}"))
-                    .id(("changes-scope-row", ix))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.set_scope(scope, cx);
-                        this.close_scope_menu(cx);
-                    }))
-                    .child(
-                        div()
-                            .flex_1()
-                            .child(SharedString::from(scope.label())),
-                    )
-            }))
+            .child(
+                // The 2px row gap every other menu carries — rows straight on
+                // the card abutted, adjacent washes read as one slab (user
+                // report).
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .children(DiffScope::ALL.into_iter().enumerate().map(|(ix, scope)| {
+                        popover::menu_row(
+                            theme,
+                            scope == current,
+                            format!("changes-scope-row-{ix}"),
+                        )
+                        .id(("changes-scope-row", ix))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_scope(scope, cx);
+                            this.close_scope_menu(cx);
+                        }))
+                        .child(
+                            div()
+                                .flex_1()
+                                .child(SharedString::from(scope.label())),
+                        )
+                    })),
+            )
             .into_any_element()
     }
 
@@ -1446,7 +1558,10 @@ impl Changes {
             .id("changes-ref-trigger")
             .h(px(22.0))
             .px(px(6.0))
-            .flex_none()
+            // Shrinkable, like the branch label beside it — a flex_none
+            // trigger with a long base name plowed over the header buttons
+            // (user report); both sides truncate instead.
+            .min_w_0()
             .flex()
             .flex_row()
             .items_center()
@@ -1463,17 +1578,19 @@ impl Changes {
             .on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
                 window.prevent_default()
             })
-            .on_click(cx.listener(|this, _, _, cx| {
+            .on_click(cx.listener(|this, _, window, cx| {
                 cx.stop_propagation();
                 if this.ref_menu.is_open() {
                     this.close_ref_menu(cx);
+                    cx.notify();
                 } else {
-                    this.ref_menu.open(());
+                    this.open_ref_menu(window, cx);
                 }
-                cx.notify();
             }))
             .child(
                 div()
+                    .min_w_0()
+                    .truncate()
                     .font_family(theme.font_mono.clone())
                     .text_size(px(11.5))
                     .text_color(theme.text)
@@ -1482,15 +1599,17 @@ impl Changes {
             .child(
                 crate::icons::icon(crate::icons::ALT_ARROW_DOWN)
                     .size(px(11.0))
+                    .flex_none()
                     .text_color(theme.text_muted.opacity(0.7)),
             );
         let trigger = if self.ref_menu.get().is_some() {
             let closing = self.ref_menu.closing_since();
             let menu = self.render_ref_menu(theme, cx);
-            trigger.relative().child(popover::anchored_menu_below(
+            trigger.relative().child(popover::anchored_menu_below_gap(
                 "changes-ref-menu",
                 menu,
                 closing,
+                10.0,
             ))
         } else {
             trigger
@@ -1502,6 +1621,9 @@ impl Changes {
                 .flex_row()
                 .items_center()
                 .gap(px(6.0))
+                // Extra room off the scope dropdown (row gap alone read
+                // cramped — user report).
+                .ml(px(6.0))
                 .child(
                     div()
                         .min_w_0()
@@ -1523,24 +1645,34 @@ impl Changes {
     }
 
     fn render_ref_menu(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let branches = self.branches.clone();
+        let (search, active, focus, list_scroll) = {
+            let Some(menu) = self.ref_menu.get() else {
+                return div().into_any_element();
+            };
+            (
+                menu.search.clone(),
+                menu.active,
+                menu.focus.clone(),
+                menu.list_scroll.clone(),
+            )
+        };
+        let rows = self.ref_menu_rows(cx);
         let current = self.base_ref.clone();
-        let card = popover::popover_card(theme)
-            .w(px(220.0))
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_ref_menu(cx)));
-        if branches.is_empty() {
-            return card
-                .child(
-                    div()
-                        .px(px(8.0))
-                        .py(px(6.0))
-                        .text_size(px(12.0))
-                        .text_color(theme.text_faint)
-                        .child(SharedString::from("No branches")),
-                )
-                .into_any_element();
-        }
-        card.child(
+        let branches = self.branches.clone();
+
+        let list: AnyElement = if rows.is_empty() {
+            div()
+                .px(px(8.0))
+                .py(px(6.0))
+                .text_size(px(12.0))
+                .text_color(theme.text_faint)
+                .child(SharedString::from(if branches.is_empty() {
+                    "No branches"
+                } else {
+                    "No matching branches"
+                }))
+                .into_any_element()
+        } else {
             div()
                 .id("changes-ref-list")
                 .flex()
@@ -1548,27 +1680,50 @@ impl Changes {
                 .gap(px(2.0))
                 .max_h(px(240.0))
                 .overflow_y_scroll()
-                .children(branches.into_iter().enumerate().map(|(ix, name)| {
+                .track_scroll(&list_scroll)
+                .children(rows.into_iter().enumerate().map(|(row_ix, branch_ix)| {
+                    let name = branches[branch_ix].clone();
                     let selected = current.as_deref() == Some(name.as_str());
                     let label = name.clone();
-                    popover::menu_row(theme, selected, format!("changes-ref-row-{ix}"))
-                        .id(("changes-ref-row", ix))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.set_base_ref(name.clone(), cx);
-                            this.close_ref_menu(cx);
-                        }))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .font_family(theme.font_mono.clone())
-                                .text_size(px(12.0))
-                                .child(SharedString::from(label)),
-                        )
-                })),
-        )
-        .into_any_element()
+                    popover::menu_row_nav(
+                        theme,
+                        selected,
+                        row_ix == active,
+                        format!("changes-ref-row-{row_ix}"),
+                    )
+                    .id(("changes-ref-row", row_ix))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.set_base_ref(name.clone(), cx);
+                        this.close_ref_menu(cx);
+                    }))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .font_family(theme.font_mono.clone())
+                            .text_size(px(12.0))
+                            .child(SharedString::from(label)),
+                    )
+                }))
+                .into_any_element()
+        };
+
+        popover::popover_card(theme)
+            .w(px(240.0))
+            .track_focus(&focus)
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                this.ref_menu_key(event, cx)
+            }))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_ref_menu(cx)))
+            .flex()
+            .flex_col()
+            .child(popover::search_input_frame(
+                theme,
+                search.into_any_element(),
+            ))
+            .child(list)
+            .into_any_element()
     }
 
     fn render_header_strip(&self, theme: &Theme) -> Option<AnyElement> {
@@ -1586,6 +1741,8 @@ impl Changes {
                 .border_color(crate::theme::hairline(0.06))
                 .child(
                     div()
+                        .min_w_0()
+                        .truncate()
                         .text_size(px(12.0))
                         .text_color(theme.text_muted)
                         .child(SharedString::from(scope_label(
@@ -1851,7 +2008,11 @@ impl Render for Changes {
         };
         let error = self.error.clone();
         // Scoped fetch failures replace the content area. "no turn recorded"
-        // is the expected pre-first-turn state, not an error.
+        // is the expected pre-first-turn state, not an error; "unknown
+        // method" is version skew — the chat's host engine predates
+        // GetCheckoutDiff (a still-running daemon after an app update, or a
+        // remote device behind on releases) — say that instead of leaking
+        // the raw RPC error (user report).
         let scoped_notice: Option<(SharedString, bool)> = (!no_chat
             && scope != DiffScope::WorkingTree)
             .then(|| self.scoped_error.clone())
@@ -1860,6 +2021,13 @@ impl Render for Changes {
                 if message.contains("no turn recorded") {
                     (
                         SharedString::from("No turn recorded yet — send a message first"),
+                        false,
+                    )
+                } else if message.contains("unknown method") {
+                    (
+                        SharedString::from(
+                            "This chat's device is running an older Komet — update it to view branch and turn diffs",
+                        ),
                         false,
                     )
                 } else {

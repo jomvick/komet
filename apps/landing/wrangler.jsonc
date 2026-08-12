@@ -1,0 +1,14 @@
+{
+  // Landing page: pure static assets, no worker script. The install surface
+  // (/install.sh, /releases/*) is served by komet-edge via path routes on the
+  // same hostname — path routes beat this custom domain, so this worker only
+  // ever sees page traffic. Deploy with `npx wrangler deploy` from this dir.
+  "$schema": "https://unpkg.com/wrangler/config-schema.json",
+  "name": "komet-landing",
+  "compatibility_date": "2026-07-01",
+  "routes": [{ "pattern": "komet.komet.sh", "custom_domain": true }],
+  "workers_dev": true,
+  "assets": {
+    "directory": "public"
+  }
+}

@@ -199,9 +199,7 @@ impl HarnessRegistry {
             }
         };
         let tmp = path.with_extension("json.tmp");
-        if let Err(err) =
-            std::fs::write(&tmp, json).and_then(|()| std::fs::rename(&tmp, &path))
-        {
+        if let Err(err) = std::fs::write(&tmp, json).and_then(|()| std::fs::rename(&tmp, &path)) {
             tracing::warn!(error = %err, "harness-prefs save failed");
         }
     }
@@ -378,6 +376,23 @@ pub fn default_registry() -> HarnessRegistry {
         Box::new(|| komet_harness::AcpHarness::codex().installed()),
         Box::new(|| Ok(Arc::new(komet_harness::AcpHarness::codex()) as Arc<dyn Harness>)),
     );
+    // Cursor Agent over ACP (`cursor-agent acp`), same lazy pattern: the
+    // static descriptor mirrors AcpHarness::cursor() exactly. No steering
+    // extension (turn boundaries) and no effort ladder — Cursor bakes effort
+    // into the model id's bracket suffix instead of a `thought_level` option.
+    registry.register_lazy(
+        HarnessDescriptor {
+            id: HarnessId::Cursor,
+            name: "Cursor".into(),
+            supports_steering: true,
+            steering_mode: SteeringMode::TurnBoundary,
+            reasoning_levels: Vec::new(),
+            installed: true,
+            enabled: None,
+        },
+        Box::new(|| komet_harness::AcpHarness::cursor().installed()),
+        Box::new(|| Ok(Arc::new(komet_harness::AcpHarness::cursor()) as Arc<dyn Harness>)),
+    );
     // Grok Build over ACP, same lazy pattern: the static descriptor mirrors
     // AcpHarness::grok() exactly. No `_session/steering` extension yet, so
     // steers deliver at turn boundaries; the effort ladder applies per
@@ -492,6 +507,7 @@ mod tests {
                 HarnessId::Mock,
                 HarnessId::ClaudeCode,
                 HarnessId::Codex,
+                HarnessId::Cursor,
                 HarnessId::Grok,
                 HarnessId::Hermes,
                 HarnessId::Pi
@@ -517,7 +533,12 @@ mod tests {
                 ReasoningLevel::High
             ]
         );
-        // Hermes and Pi mirror their specs the same way.
+        // Cursor, Hermes and Pi mirror their specs the same way.
+        let cursor = registry.resolve(HarnessId::Cursor).unwrap();
+        assert_eq!(cursor.id(), HarnessId::Cursor);
+        assert_eq!(cursor.display_name(), "Cursor");
+        assert_eq!(cursor.steering_mode(), SteeringMode::TurnBoundary);
+        assert!(cursor.reasoning_levels().is_empty());
         let hermes = registry.resolve(HarnessId::Hermes).unwrap();
         assert_eq!(hermes.id(), HarnessId::Hermes);
         assert_eq!(hermes.display_name(), "Hermes");

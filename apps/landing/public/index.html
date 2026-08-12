@@ -1,0 +1,722 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Komet — control your coding agents from any device</title>
+<meta name="description" content="Komet runs Claude Code, Codex, Grok, Hermes and Pi on your machines. Control them from any device, live." />
+<meta property="og:title" content="Komet" />
+<meta property="og:description" content="Control your coding agents from any of your devices." />
+<meta property="og:image" content="/assets/app-screenshot.jpg" />
+<link rel="icon" href="/favicon.svg" type="image/svg+xml" />
+<style>
+  @font-face {
+    font-family: "Geist";
+    src: url("/assets/geist-latin.woff2") format("woff2");
+    font-weight: 100 900;
+    font-display: swap;
+  }
+  @font-face {
+    font-family: "Geist Mono";
+    src: url("/assets/geist-mono-latin.woff2") format("woff2");
+    font-weight: 100 900;
+    font-display: swap;
+  }
+  :root {
+    --bg: #06040a;
+    --bg-raise: #0c0913;
+    --ink: #ece7f7;
+    --dim: #9c92b5;
+    --faint: #5d5178;
+    --line: #241c36;
+    --line-soft: #1a1428;
+    --purple: #8b5cf6;
+    --purple-hi: #b79df9;
+    --purple-deep: #5b34b8;
+    --sans: "Geist", system-ui, -apple-system, sans-serif;
+    --mono: "Geist Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html {
+    background: var(--bg);
+    scroll-behavior: smooth;
+    /* Always reserve the gutter so content never shifts; the styled
+       transparent track makes the bar read as an overlay on black. */
+    overflow-y: scroll;
+    /* clip x here, NOT on body: overflow on body would make it a second
+       scroll container and draw a second scrollbar next to this one */
+    overflow-x: hidden;
+    scrollbar-width: thin;
+    scrollbar-color: #2a2140 transparent;
+  }
+  ::-webkit-scrollbar { width: 10px; background: transparent; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb {
+    background: #2a2140;
+    border-radius: 5px;
+    border: 2px solid transparent;
+    background-clip: content-box;
+  }
+  ::-webkit-scrollbar-thumb:hover { background-color: #3d3060; }
+  body {
+    font-family: var(--sans);
+    color: var(--ink);
+    background: var(--bg);
+    -webkit-font-smoothing: antialiased;
+  }
+  ::selection { background: var(--purple-deep); color: #fff; }
+  a { color: inherit; text-decoration: none; }
+  .wrap { max-width: 1140px; margin: 0 auto; padding: 0 32px; }
+
+  /* ── nav ─────────────────────────────────────────────── */
+  nav { position: relative; z-index: 50; }
+  .nav-inner {
+    display: flex;
+    align-items: center;
+    gap: 24px;
+    height: 64px;
+  }
+  .logo {
+    display: flex;
+    align-items: center;
+    font-size: 16px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+  }
+  nav .links {
+    margin-left: auto;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    font-size: 13px;
+  }
+  .navlink { color: var(--dim); padding: 6px 10px; transition: color .15s; }
+  .navlink:hover { color: var(--ink); }
+  .gh-icon {
+    display: inline-flex;
+    align-items: center;
+    padding: 6px 0;
+    color: var(--dim);
+    transition: color .15s;
+  }
+  .gh-icon:hover { color: var(--ink); }
+  .gh-icon svg { width: 18px; height: 18px; fill: currentColor; }
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 9px;
+    font-size: 13.5px;
+    font-weight: 500;
+    padding: 10px 18px;
+    background: var(--purple);
+    color: #fff;
+    border: 0;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: background .15s;
+  }
+  .btn:hover { background: var(--purple-hi); }
+  .btn.ghost {
+    background: transparent;
+    color: var(--dim);
+    border: 1px solid var(--line);
+  }
+  .btn.ghost:hover { color: var(--ink); border-color: var(--faint); background: transparent; }
+  .btn.small { padding: 7px 13px; font-size: 11.5px; }
+
+  /* ── hero ────────────────────────────────────────────── */
+  .hero { position: relative; overflow: hidden; }
+  .hero-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1.05fr) minmax(0, 0.95fr);
+    align-items: center;
+    gap: 40px;
+    padding: 72px 32px 40px;
+  }
+  h1 {
+    font-size: clamp(38px, 4.8vw, 58px);
+    font-weight: 600;
+    letter-spacing: -0.035em;
+    line-height: 1.05;
+    text-wrap: balance;
+  }
+  .hero p.sub {
+    margin-top: 22px;
+    max-width: 460px;
+    font-size: 16px;
+    line-height: 1.65;
+    color: var(--dim);
+    text-wrap: pretty;
+  }
+  .hero .cta-row {
+    margin-top: 36px;
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    flex-wrap: wrap;
+  }
+  .cta-ver {
+    font-family: var(--mono);
+    font-size: 12.5px;
+    color: var(--faint);
+  }
+  .hero-ascii {
+    justify-self: end;
+    font-family: var(--mono);
+    font-size: 7.6px;
+    font-weight: 400;
+    line-height: 1.25;
+    font-variant-ligatures: none;
+    font-feature-settings: "liga" 0, "calt" 0, "dlig" 0;
+    white-space: pre;
+    user-select: none;
+    pointer-events: none;
+    background: linear-gradient(165deg, #a986ff 0%, #8b5cf6 40%, #4b2b96 80%, #241548 100%);
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+    -webkit-mask-image: radial-gradient(85% 85% at 55% 45%, #000 55%, transparent 96%);
+    mask-image: radial-gradient(85% 85% at 55% 45%, #000 55%, transparent 96%);
+  }
+  @media (max-width: 900px) {
+    .hero-grid { grid-template-columns: 1fr; padding-top: 48px; }
+    .hero-ascii { display: none; }
+  }
+
+  /* ── shot ────────────────────────────────────────────── */
+  .shot { padding: 48px 0 0; position: relative; }
+  .shot::before {
+    content: "";
+    position: absolute;
+    inset: 30% 0 0;
+    background: radial-gradient(55% 55% at 50% 60%, rgba(91,52,184,0.18), transparent 72%);
+    pointer-events: none;
+  }
+  .shot .wrap { max-width: 1240px; position: relative; }
+  .shot img {
+    display: block;
+    width: 100%;
+    height: auto;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    box-shadow:
+      0 30px 100px -30px rgba(0,0,0,0.8),
+      0 0 90px -30px rgba(139,92,246,0.35);
+  }
+
+  /* ── agents ──────────────────────────────────────────── */
+  .agents {
+    display: flex;
+    align-items: center;
+    gap: 26px;
+    margin-top: 40px;
+    flex-wrap: wrap;
+  }
+  .agent-icon {
+    width: 22px;
+    height: 22px;
+    background-color: var(--faint);
+    transition: background-color .2s;
+    -webkit-mask: var(--icon) no-repeat center / contain;
+    mask: var(--icon) no-repeat center / contain;
+  }
+  .agent-icon:hover { background-color: var(--purple-hi); }
+
+  /* ── features ────────────────────────────────────────── */
+  .features {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 48px 40px;
+    padding: 96px 32px 0;
+  }
+  .cell .idx {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.14em;
+    color: var(--purple-hi);
+    margin-bottom: 16px;
+  }
+  .cell h3 {
+    font-size: 16px;
+    font-weight: 600;
+    letter-spacing: -0.015em;
+    margin-bottom: 10px;
+  }
+  .cell p { font-size: 13.5px; line-height: 1.65; color: var(--dim); }
+  @media (max-width: 980px) { .features { grid-template-columns: repeat(2, 1fr); } }
+  @media (max-width: 560px) { .features { grid-template-columns: 1fr; gap: 36px; } }
+
+  /* ── closing ─────────────────────────────────────────── */
+  .closing {
+    margin: 140px 0 80px;
+    position: relative;
+  }
+  .closing .wrap { position: relative; z-index: 1; }
+  /* ascii hands: rendered like the edge railing — same cell grid, glyph
+     ramp, colour and top/bottom fade; the hand image is the density map */
+  .hand-ascii {
+    position: absolute;
+    z-index: 0;
+    pointer-events: none;
+    -webkit-mask-image: linear-gradient(to bottom, transparent 0%, #000 20%, #000 80%, transparent 100%);
+    mask-image: linear-gradient(to bottom, transparent 0%, #000 20%, #000 80%, transparent 100%);
+  }
+  .hand-ascii.hand-down { top: -320px; left: 0; }
+  .hand-ascii.hand-up { bottom: 0; right: 0; }
+  @media (max-width: 900px) { .hand-ascii { display: none; } }
+  .closing h2 {
+    font-size: clamp(28px, 3.8vw, 40px);
+    font-weight: 600;
+    letter-spacing: -0.03em;
+    text-wrap: balance;
+  }
+  .closing p { margin: 16px 0 0; max-width: 440px; font-size: 15px; line-height: 1.65; color: var(--dim); }
+  .closing .cta-row { margin-top: 34px; display: flex; gap: 14px; flex-wrap: wrap; }
+
+  footer { padding: 28px 0 40px; position: relative; }
+  .footer-inner {
+    position: relative; /* keeps footer text above the ascii hand */
+    display: flex;
+    align-items: center;
+    gap: 20px;
+    font-size: 12.5px;
+    color: var(--faint);
+    flex-wrap: wrap;
+  }
+  .footer-inner .right { margin-left: auto; display: flex; align-items: center; gap: 20px; }
+  .footer-inner .gh-icon { padding: 0; }
+  footer a:hover { color: var(--dim); }
+
+  /* ── edge ascii (app preview only) ───────────────────── */
+  .shot .wrap { z-index: 1; }
+  .dither {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 140px;
+    z-index: 0;
+    pointer-events: none;
+    -webkit-mask-image: linear-gradient(to bottom, transparent 0%, #000 20%, #000 80%, transparent 100%);
+    mask-image: linear-gradient(to bottom, transparent 0%, #000 20%, #000 80%, transparent 100%);
+  }
+  .dither-left { left: 0; }
+  .dither-right { right: 0; }
+  .dither canvas { width: 100%; height: 100%; display: block; }
+  @media (max-width: 1440px) { .dither { display: none; } }
+
+  /* ── mobile ──────────────────────────────────────────── */
+  @media (max-width: 640px) {
+    .wrap { padding: 0 20px; }
+    .nav-inner { height: 56px; }
+    .hero-grid { padding: 36px 20px 32px; gap: 44px; }
+    h1 { font-size: clamp(32px, 9vw, 38px); }
+    .hero p.sub { font-size: 15px; }
+    .hero .cta-row { margin-top: 28px; }
+    .agents { gap: 22px; margin-top: 30px; }
+    .agent-icon { width: 20px; height: 20px; }
+    .shot { padding: 28px 0 0; }
+    .shot img { border-radius: 4px; }
+    .features { padding: 64px 20px 0; gap: 36px; }
+    .closing { margin: 80px 0 56px; }
+    .closing p { font-size: 14px; }
+    .closing .cta-row { margin-top: 28px; }
+    footer { padding: 20px 0 32px; }
+    .footer-inner { row-gap: 8px; }
+  }
+  @media (max-width: 460px) {
+    .cta-row .btn { flex: 0 0 auto; }
+  }
+</style>
+</head>
+<body>
+
+  <nav>
+    <div class="wrap nav-inner">
+      <a class="logo" href="/" aria-label="Komet home">Komet</a>
+      <div class="links">
+        <a class="gh-icon" href="https://discord.gg/rnynTdgZ24" aria-label="Discord">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20.317 4.3698a19.7913 19.7913 0 0 0-4.8851-1.5152.0741.0741 0 0 0-.0785.0371c-.211.3753-.4447.8648-.6083 1.2495-1.8447-.2762-3.68-.2762-5.4868 0-.1636-.3933-.4058-.8742-.6177-1.2495a.077.077 0 0 0-.0785-.037 19.7363 19.7363 0 0 0-4.8852 1.515.0699.0699 0 0 0-.0321.0277C.5334 9.0458-.319 13.5799.0992 18.0578a.0824.0824 0 0 0 .0312.0561c2.0528 1.5076 4.0413 2.4228 5.9929 3.0294a.0777.0777 0 0 0 .0842-.0276c.4616-.6304.8731-1.2952 1.226-1.9942a.076.076 0 0 0-.0416-.1057c-.6528-.2476-1.2743-.5495-1.8722-.8923a.077.077 0 0 1-.0076-.1277c.1258-.0943.2517-.1923.3718-.2914a.0743.0743 0 0 1 .0776-.0105c3.9278 1.7933 8.18 1.7933 12.0614 0a.0739.0739 0 0 1 .0785.0095c.1202.099.246.1981.3728.2924a.077.077 0 0 1-.0066.1276 12.2986 12.2986 0 0 1-1.873.8914.0766.0766 0 0 0-.0407.1067c.3604.698.7719 1.3628 1.225 1.9932a.076.076 0 0 0 .0842.0286c1.961-.6067 3.9495-1.5219 6.0023-3.0294a.077.077 0 0 0 .0313-.0552c.5004-5.177-.8382-9.6739-3.5485-13.6604a.061.061 0 0 0-.0312-.0286zM8.02 15.3312c-1.1825 0-2.1569-1.0857-2.1569-2.419 0-1.3332.9555-2.4189 2.157-2.4189 1.2108 0 2.1757 1.0952 2.1568 2.419 0 1.3332-.9555 2.4189-2.1569 2.4189zm7.9748 0c-1.1825 0-2.1569-1.0857-2.1569-2.419 0-1.3332.9554-2.4189 2.1569-2.4189 1.2108 0 2.1757 1.0952 2.1568 2.419 0 1.3332-.946 2.4189-2.1568 2.4189z"/></svg>
+        </a>
+        <a class="gh-icon" href="https://github.com/komet/komet-native" aria-label="GitHub">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        </a>
+        <a class="btn small" id="nav-download" href="https://komet.komet.sh/releases/komet-0.1.47-macos-arm64.dmg">Download</a>
+      </div>
+    </div>
+  </nav>
+
+  <header class="hero">
+    <div class="wrap hero-grid">
+      <div>
+        <h1>Access your agents from any device.</h1>
+        <p class="sub">
+          Komet runs Claude Code, Codex, Grok, Hermes and Pi on your
+          machines. You steer them from one window, on any device, live.
+        </p>
+        <div class="cta-row">
+          <a class="btn" id="hero-download" href="https://komet.komet.sh/releases/komet-0.1.47-macos-arm64.dmg">Download</a>
+          <span class="cta-ver" id="ver">v0.1.47</span>
+        </div>
+        <div class="agents" aria-label="Supported agents">
+          <span class="agent-icon" title="Claude Code" style="--icon: url('/assets/icons/claude-mark.svg')"></span>
+          <span class="agent-icon" title="Codex" style="--icon: url('/assets/icons/openai-mark.svg')"></span>
+          <span class="agent-icon" title="Cursor" style="--icon: url('/assets/icons/cursor-mark.svg')"></span>
+          <span class="agent-icon" title="Grok" style="--icon: url('/assets/icons/grok-mark.svg')"></span>
+          <span class="agent-icon" title="Hermes" style="--icon: url('/assets/icons/hermes-mark.svg')"></span>
+          <span class="agent-icon" title="Pi" style="--icon: url('/assets/icons/pi-mark.svg')"></span>
+        </div>
+      </div>
+      <pre class="hero-ascii" aria-hidden="true">++=========+=====+++++++++++******+++++++++++++++++++++*****#############%%######***#######*#%#######****#####
+..=+=====+=======++++++++++++++*****+++++++++++++++++*++****#############%####%%%@@@%%#*%#########***######***
++===++++====++++++++++++++++++++********+++++++++***++*+*****###########%%%%%@@@@@@@@@@%#*####*##########*#**#
+***+++++++==+++++++++++++++**++++**#**##*+*+++++++*+++********#*#####%%%%@@@@@@@@@@@%%%%%%###*#%*=+#*****++###
+*****+++++++==++++++++**************#####*****************#*****##%%%%@%@@@@@%%%%%##%###%%##*++++*****######*#
+*********++++++++++++*************#######******%%###*******########%%%%%%@@%%%######%%#*+++++******###%%%%%##*
+**********++++++++***********#***###%@%*+#%###*%*:.-%##*##*#########%%%%%%###%%%%%%%#+++++++++****##%%%%%%####
+**********+++++***********###***###%@@@#**@@@*=+:  -**#@@@%#######%##########%%%%#%*++***++++++++*#%%%########
+****####***********###**##***###@+--*@#==#%#%@@%#:::=+#*++-:=+=###########%%%%%%#=*******+++++++++##%#########
+#**####***********#########%##%%@==::=.   :--=*@%%%%@@@@%#- .:+%%%######%%##******+****+**+++*******#######%##
+*####****#*********#####**+#%@@@@#*++=-=-- .-:=#%@@@@@@@@@#=.  .:-######****++*********************+**########
+-+##+*###*#********####*%*=#@@#=++*%@%%##**%%##@@@@@@@@@@@@@%= .. =*#######*+******************#******##**####
++===-=**###**#****##%%%#*..-*#-  :------*+-=*%@@@%*+==+***#@@@* .:.+*######**+++++******#***#####********###**
++++++++++*#######%#***##++**#*-.     ..:-+=*##*-::::.     .=*%%*:-+***###****++++++++*****#*######****++******
++++++**+=+##*#####+.=+*+==-:::+*- .::=. :+%%*-.  .-=:     .#%=.==+#**#####*****++++++*+*****#####*************
+++********###%#*#+- -..:-   .=*::+==+-.-*@@@%%##**+-=- .:=*#%@+  ::=+#######***+++++++*****++********#####****
+******###########= =.      ...-=+*=++-=#%%#%@@@@@@@%%%#%@@@@%@@*::  .=######***++********++++*****=+++#+*%####
+****++#%#########*--==+-::.    .:::   :=--+++***#%@@@@@@###*=--::.. :+*#####************++++*+++**++++=-=**+#%
+#++####%%%####*#+=+=-==-::..        .:...:=--:--+#%@@%%*#-       .-=+++**####***********++++***++++++++**++==*
+##*#####%%###*#+---.:                 :+**+=--=+*##%%@@@@%*+-  :::=+*+++***#**#######**********+++++*****+****
+*###*#########*=.       .. ...      .:=++***+*****#%@%+-==-:   +#..--++++++++*##########******+***************
+***###########+.      ..=::... .:--::=++####***++++**+++==+=-: :+- .=+++***+++****##########****************##
+#***#####*#####*:     ..       ..:. :--+**+++++++==--=##+:.  :.-+.:-+++*****++****###%%%#%#*****#######*#####*
+#**#*###########-                    :=+=--==++++=++*%%@@@@#+-.-=-==+++++*******#######%%%******#############%
+###**#######*****-..                 .:.  ..:..::------=----+%*+=+++=+++*****#***####%%%%%@%%%####%%%%###%%@@@
+######*##*#*++****- .             :::                       ..:==+++====++**+***#%@@%%@@@@@@@@%%%@*-+*#@@@@@@@
+*#*###*****+++++-....            .:-=:                         =+++=-=====++**#@@@@@@@@@%%%####%#+-*%%@@@@@@@@
++*+**+###*++++++-:     ....      :=++=:                        -======+*###%@@@@@@@@@@@@@@@%@@*=*%**%%%@%@%##*
++++++++*++*++++++-    ...       .-=+**=:                     :-----=+*#*#**#%#%%%%@%@@@@@@@@@@##%*-+##%%#+++=-
++++++++-:-======= .:   .        .-=+*#*=:.:---==:            :--=====+=-==::::...:---++#%@@@@@@@%#*#%#+===-...
++++++=+==--=----:               .-++*##*++===+===:          .:.:==*=+*#%@@%%%@%#*****+*+=+%%%@@@@%%%%%*=:.
++++=+=+=-===------:.            .:===*##*==--::..          .:     .  .:---=+*#%@%@@@@@@@%##%@%%@@@@%%%%#=.
++++++=====--::-----::.          .:---=+**+--:::    ... .:--::.:.      .-=::. ..:--*%@@@@@@@%@%##+#@@@%#**+:
++++++++===--::--------          ::-----+**+--=-::::::-==+*+**=+*+=-=+-.:#@%*+*-:.::--=#%#*##**##*=+*#@@%#*+-
+=+++=+=--=------:::---:::       :-==----=++=::::...-***#%%%@%%%@@@@@@%%#**@@@@@*+-: ...-+=:-*#*++*=-:=+*%#*++:
+==-===---------:::::.::--:..::. :-=----:-+*=.  ..-=+**#@@@%@@@@@@@@@@@@@@@@@@@@@%%+.    .-=-:=**-:=- :--=**+=+
+=-::------:---:::::::::---:::...-==*=::--:+*:.:-***%*%@@@@@@@@@@@%@@@@@@@@=+**=-=+-.       --. -++---. ::-+**+
+===-::-:::::::::::::--=-.     ::-=*#+:-+=--+*-*%%%%%@@@@@@@@@@@@@@@@@@@@@@*:.     -..        .: .=*=--   .::+*
+:::---:.:::::::::=#++*-...::..-=-*%%++%@@#*#%@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@%#*=:   :-        :---*#+-.     ..
+:-:.....:::-*#**=*@#+-.-=+++=+#*#%@@%@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@%*=:            .    -*=.
+-==-::-:::::*@@@%*=+#=*####%%%@@@%%%%@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@%%*-                  --.
+------=+#++=:-+***###%%%%#%%%%%%%@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@%#*+:                  .-:.
+--:----+*++*##++*##%%@%%%@@%##%%@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@%%@%#*+=:                    ..:.
+-=*##%@@@@@@#+%@%#**#%@@@%%%%%%%%%@@@@@@@@@@@@@@@@@%%@%%@@@@@@@@@@@@@@@@@@@@%%##**=-:                        .
+@@@@@@@@@@@@%#++%@##**%++%#%%%%%%@@@@@@@@@@@@@@@@%%#@@@@@@@@@@@@@@@@@@@@%%@%%#**++=-:
+%@@@@@@@@@@@@#+--=++::.-*##%%%@@@@@@@@@@@@@@@@@@@@@@%#%%@@@@@@@%%%%%%%###**---=+=---.                       ..</pre>
+    </div>
+  </header>
+
+  <section class="shot">
+    <div class="dither dither-left" aria-hidden="true"><canvas></canvas></div>
+    <div class="dither dither-right" aria-hidden="true"><canvas></canvas></div>
+    <div class="wrap">
+      <img src="/assets/app-screenshot.jpg" alt="Komet driving a Claude Code session with a live branch diff sidebar" />
+    </div>
+  </section>
+
+  <section class="wrap features">
+    <div class="cell">
+      <div class="idx">Cross-device</div>
+      <h3>Every session, on every device</h3>
+      <p>Start an agent on one machine. Open the same session on another
+         device and continue. Transcripts, diffs and approvals sync live.</p>
+    </div>
+    <div class="cell">
+      <div class="idx">Your harnesses</div>
+      <h3>The tools you use, streamlined</h3>
+      <p>Komet is not a new harness. It runs the harnesses you already use
+         each day — Claude Code, Codex and more — in one fast window.</p>
+    </div>
+    <div class="cell">
+      <div class="idx">Lightweight</div>
+      <h3>Quick on slow networks</h3>
+      <p>Komet sends only small sync updates over the wire. Remote sessions
+         stay quick on weak connections — even on plane Wi-Fi.</p>
+    </div>
+    <div class="cell">
+      <div class="idx">Native</div>
+      <h3>A fast, native client</h3>
+      <p>The engine is pure Rust. The app is GPU-rendered, with no browser
+         wrapper. It is a quick window over every agent you run.</p>
+    </div>
+  </section>
+
+  <section class="closing">
+    <canvas class="hand-ascii hand-down" aria-hidden="true"></canvas>
+    <div class="wrap">
+      <h2>Bring your agents together.</h2>
+      <p>One window for every machine you own. Komet is open source and MIT licensed.</p>
+      <div class="cta-row">
+        <a class="btn" id="closing-download" href="https://komet.komet.sh/releases/komet-0.1.47-macos-arm64.dmg">Download</a>
+        <a class="btn ghost" href="https://github.com/komet/komet-native">Star on GitHub ↗</a>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <canvas class="hand-ascii hand-up" aria-hidden="true"></canvas>
+    <div class="wrap footer-inner">
+      <span>Komet</span>
+      <div class="right">
+        <a class="gh-icon" href="https://discord.gg/rnynTdgZ24" aria-label="Discord">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20.317 4.3698a19.7913 19.7913 0 0 0-4.8851-1.5152.0741.0741 0 0 0-.0785.0371c-.211.3753-.4447.8648-.6083 1.2495-1.8447-.2762-3.68-.2762-5.4868 0-.1636-.3933-.4058-.8742-.6177-1.2495a.077.077 0 0 0-.0785-.037 19.7363 19.7363 0 0 0-4.8852 1.515.0699.0699 0 0 0-.0321.0277C.5334 9.0458-.319 13.5799.0992 18.0578a.0824.0824 0 0 0 .0312.0561c2.0528 1.5076 4.0413 2.4228 5.9929 3.0294a.0777.0777 0 0 0 .0842-.0276c.4616-.6304.8731-1.2952 1.226-1.9942a.076.076 0 0 0-.0416-.1057c-.6528-.2476-1.2743-.5495-1.8722-.8923a.077.077 0 0 1-.0076-.1277c.1258-.0943.2517-.1923.3718-.2914a.0743.0743 0 0 1 .0776-.0105c3.9278 1.7933 8.18 1.7933 12.0614 0a.0739.0739 0 0 1 .0785.0095c.1202.099.246.1981.3728.2924a.077.077 0 0 1-.0066.1276 12.2986 12.2986 0 0 1-1.873.8914.0766.0766 0 0 0-.0407.1067c.3604.698.7719 1.3628 1.225 1.9932a.076.076 0 0 0 .0842.0286c1.961-.6067 3.9495-1.5219 6.0023-3.0294a.077.077 0 0 0 .0313-.0552c.5004-5.177-.8382-9.6739-3.5485-13.6604a.061.061 0 0 0-.0312-.0286zM8.02 15.3312c-1.1825 0-2.1569-1.0857-2.1569-2.419 0-1.3332.9555-2.4189 2.157-2.4189 1.2108 0 2.1757 1.0952 2.1568 2.419 0 1.3332-.9555 2.4189-2.1569 2.4189zm7.9748 0c-1.1825 0-2.1569-1.0857-2.1569-2.419 0-1.3332.9554-2.4189 2.1569-2.4189 1.2108 0 2.1757 1.0952 2.1568 2.419 0 1.3332-.946 2.4189-2.1568 2.4189z"/></svg>
+        </a>
+        <a class="gh-icon" href="https://github.com/komet/komet-native" aria-label="GitHub">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        </a>
+        <span>MIT © 2026</span>
+      </div>
+    </div>
+  </footer>
+
+<script>
+  // Keep the dmg links on the latest release (same-origin in prod; the
+  // pinned fallback href still works if this fetch fails, e.g. local dev).
+  fetch("https://komet.komet.sh/releases/latest.txt")
+    .then((r) => (r.ok ? r.text() : Promise.reject()))
+    .then((v) => {
+      const ver = v.trim();
+      if (!/^\d+\.\d+\.\d+$/.test(ver)) return;
+      const href = `https://komet.komet.sh/releases/komet-${ver}-macos-arm64.dmg`;
+      for (const id of ["nav-download", "hero-download", "closing-download"])
+        document.getElementById(id).href = href;
+      document.getElementById("ver").textContent = `v${ver}`;
+    })
+    .catch(() => {});
+
+  // Edge ascii: a slow-warping noise field mapped through a glyph density
+  // ramp — organic clusters of characters hugging each page edge, dense at
+  // the outside and thinning toward the content. Freezes on reduced motion.
+  (() => {
+    const CW = 12, CH = 14; // glyph cell
+    const RAMP = [" ", " ", " ", ".", ":", ">", "~", "×", "*", "#"];
+    const panes = [...document.querySelectorAll(".dither")].map((el, i) => ({
+      el,
+      cv: el.querySelector("canvas"),
+      ctx: el.querySelector("canvas").getContext("2d"),
+      right: el.classList.contains("dither-right"),
+      ox: i * 397, // decorrelate the two sides
+      cols: 0,
+      rows: 0,
+    }));
+    const dpr = Math.min(devicePixelRatio || 1, 2);
+    const resize = () => {
+      for (const p of panes) {
+        const w = p.el.clientWidth, h = p.el.clientHeight;
+        p.cv.width = w * dpr;
+        p.cv.height = h * dpr;
+        p.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        p.ctx.font = '10px "Geist Mono", monospace';
+        p.ctx.textBaseline = "top";
+        p.cols = Math.ceil(w / CW);
+        p.rows = Math.ceil(h / CH);
+      }
+    };
+    const field = (x, y, t) => {
+      const a = x * 0.55, b = y * 0.35;
+      const v =
+        Math.sin(a + 2.1 * Math.sin(b * 0.9 + t) + t * 0.7) *
+        Math.cos(b - 1.7 * Math.sin(a * 0.6 - t * 0.8));
+      return 0.5 + 0.5 * v;
+    };
+    const draw = (t) => {
+      for (const p of panes) {
+        if (p.el.offsetWidth === 0) continue;
+        p.ctx.clearRect(0, 0, p.cv.width, p.cv.height);
+        for (let y = 0; y < p.rows; y++) {
+          for (let x = 0; x < p.cols; x++) {
+            // distance from the outer edge, 0 = outermost column
+            const edge = p.right ? p.cols - 1 - x : x;
+            const falloff = 1 - edge / p.cols;
+            const v = field(x + p.ox, y, t) * falloff * 1.6;
+            const g = RAMP[Math.min(RAMP.length - 1, (v * RAMP.length) | 0)];
+            if (g === " ") continue;
+            p.ctx.fillStyle = `rgba(139, 92, 246, ${(0.16 + v * 0.5).toFixed(2)})`;
+            p.ctx.fillText(g, x * CW + 2, y * CH + 2);
+          }
+        }
+      }
+    };
+    resize();
+    let last = 0;
+    addEventListener("resize", () => { resize(); draw(last); });
+    // The panes stretch to the app-screenshot section, whose height isn't
+    // final until the image loads — re-measure whenever their box changes,
+    // or the canvases end up CSS-stretched into streaks.
+    if (typeof ResizeObserver !== "undefined") {
+      const ro = new ResizeObserver(() => { resize(); draw(last); });
+      for (const p of panes) ro.observe(p.el);
+    }
+    document.fonts.ready.then(() => { resize(); draw(last); });
+    if (matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      document.fonts.ready.then(() => draw(0));
+    } else {
+      let prev = 0;
+      const tick = (ms) => {
+        if (ms - prev > 66) { // ~15fps: the reference drifts slowly
+          prev = ms;
+          last = ms * 0.00022;
+          draw(last);
+        }
+        requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+    }
+  })();
+
+  // Ascii hands: rendered exactly like the edge railing — same cell grid,
+  // glyph ramp, colour, drift rate and fade — but shaped by a baked density
+  // map of each photo, so the characters keep flipping organically while
+  // the hand form holds steady.
+  (() => {
+    const CW = 12, CH = 14; // glyph cell, matches the edge ascii
+    const RAMP = [" ", " ", " ", ".", ":", ">", "~", "×", "*", "#"];
+    const HANDS = [
+      { sel: ".hand-down", ox: 101, data: `70635533333633333633666666306605333200222100100000000000
+78873333333336333333666363366653333032220001001000000000
+00899777763333333333336333333605333330222000011000000000
+78999999999963363333333333333663333530222021101000000000
+66777889999998633333333333333333633333322220011101000000
+63336667899999983333333333333333333333320022200101000000
+78333336789999998633333333333333333300302220210010000000
+69863336778999999973333333333333333333032222211100100000
+79986333366778999997333333333333333333333022200101100000
+77777333333678999999963333333333333333330222000000100000
+33333333336777899999998636333333333333033222021001110000
+33377663333366677899999986333333333333333222220101000000
+33333333333333333367899999763333333333333002221111000000
+33333333333333333337778999888633333333300222021001000000
+33333333333333333333367999988733333333333222220000010000
+33333333333333333333368999998883333333333202201010100000
+33333333333333333333668888898777333333303222222010000000
+33333333333333333333887368999888733330333222000011000000
+33333333333333333333876689999989873333330020220011000000
+33333333333333333333677778888999977333330222220010000000
+33333333333333333336677333336789987733302200211001100000
+33333333333333333333787333333367766606332220010000000000
+33333333333333333337897333333336787633322222010110000000
+33333333333333333337333333333333337803322002110100000000
+33333333333333333333333333333333333007022000000100000000
+33333333333333333333336333333333333336642220011100000000
+33333333333333333333367333333330333332064020010110000000
+03333333333333333333337733333030333222034210100000000000
+33333333333333333333336633333333002202202020100000000000
+02303333333333333333333333333303022222000000010000000000
+22033030333333333333333363333333222202211001100000000000
+20202333033333330333303353333322222000011101000000000000
+02022220333333333333333773000222220201010001000000000000
+22222022223333333333333332022220022010010010000000000000
+02020022222222233333322222022020010100000000000000000000
+10020202002222020202222200022000101100000000000000000000
+10001022202222022202222220020111000000010000000000000000
+10010100220200202002002020201001000000000000000000000000
+11000110100012200202200100100001111000000000000000000000
+10001110110110101111011001000011000000000000000000000000
+00001001100111001101000010011000000000000000000000000000
+00000110000100110010101110010000000000000000000000000000
+00000000000000000100110000000000000000000000000000000000` },
+      { sel: ".hand-up", ox: 811, data: `000000000011011000020000000000003230000202000000
+000000000010000200333300030303330030332200020000
+000000000002202333033444044044044430002000000220
+000001002020033334000440040404005044402040122020
+000110002003300004400505055555055404044422300322
+001000022330034044555555555500505555544000443002
+000012230300344555555056660875665505004022204300
+110000302304040650606660768833666555350553244443
+010000000404420656666670679933666635555530334044
+000020330040550555366776689933666633333555530000
+022200300440706666666766688733666633330665330540
+112000304555233666666666667833366633336635533304
+020300005675333366666666668836336333366666633333
+022033442200633336666666667638863666666666330330
+000334405230773333786366666789967666666663333533
+000030445533333333798666337999973366666633336633
+020034455553333333338999999999983366663333363335
+223330005503333373337899998999976333633333333333
+003334005566333366783367888999763336633363333333
+203400440566633333886336789987633333366633333333
+233304455566633333766679999766333333333333333333
+033044555556663333333777998873333333333333333333
+033445555566666333337999999973333333333333333333
+033402405556666633333789988733333333333333333333
+003444455505336663333333333333636333333633330333
+200300005555633663333333333333766633333333333333
+003034055555566366663333333333386763633333333333
+003004542500666336633333333333878676763333333333
+002030045555336633363333333333377766663333333330
+000000304053333366336333333333377877663333330333
+000000304523333336333333333333678877666333333332
+000003340202333303333633333333377877666333333022
+010122002222203333533663333333336777770633333222
+001100002222220333335333333333333670767650332020
+000000123332222233353333333333333367076665040022
+000100000020200202035533003330033036777055404222` },
+    ]
+      .map((h) => {
+        const cv = document.querySelector(h.sel);
+        if (!cv) return null;
+        const grid = h.data.split("\n");
+        return { ...h, cv, ctx: cv.getContext("2d"), grid, cols: grid[0].length, rows: grid.length };
+      })
+      .filter(Boolean);
+    if (!HANDS.length) return;
+    const dpr = Math.min(devicePixelRatio || 1, 2);
+    for (const h of HANDS) {
+      h.cv.width = h.cols * CW * dpr;
+      h.cv.height = h.rows * CH * dpr;
+      h.cv.style.width = h.cols * CW + "px";
+      h.cv.style.height = h.rows * CH + "px";
+      h.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      h.ctx.font = '10px "Geist Mono", monospace';
+      h.ctx.textBaseline = "top";
+    }
+    const field = (x, y, t) => {
+      const a = x * 0.55, b = y * 0.35;
+      const v =
+        Math.sin(a + 2.1 * Math.sin(b * 0.9 + t) + t * 0.7) *
+        Math.cos(b - 1.7 * Math.sin(a * 0.6 - t * 0.8));
+      return 0.5 + 0.5 * v;
+    };
+    const draw = (t) => {
+      for (const h of HANDS) {
+        if (h.cv.offsetWidth === 0) continue;
+        h.ctx.clearRect(0, 0, h.cols * CW, h.rows * CH);
+        for (let y = 0; y < h.rows; y++) {
+          for (let x = 0; x < h.cols; x++) {
+            const base = +h.grid[y][x] / 9;
+            if (!base) continue;
+            const v = base * (0.72 + 0.58 * field(x + h.ox, y, t));
+            const g = RAMP[Math.min(RAMP.length - 1, (v * RAMP.length) | 0)];
+            if (g === " ") continue;
+            h.ctx.fillStyle = `rgba(139, 92, 246, ${(0.16 + v * 0.5).toFixed(2)})`;
+            h.ctx.fillText(g, x * CW + 2, y * CH + 2);
+          }
+        }
+      }
+    };
+    if (matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      document.fonts.ready.then(() => draw(0));
+    } else {
+      let prev = 0;
+      const tick = (ms) => {
+        if (ms - prev > 66) { // ~15fps, same drift as the edge ascii
+          prev = ms;
+          draw(ms * 0.00022);
+        }
+        requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+    }
+  })();
+</script>
+</body>
+</html>
