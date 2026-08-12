@@ -246,6 +246,23 @@ pub fn child_path(base: &str, name: &str) -> String {
     }
 }
 
+/// Byte length of `name`'s prefix matching `query`, compared char-for-char
+/// case-insensitively; `None` when `query` isn't a prefix of `name`. The
+/// length indexes into `name` (not `query`) so the completion suffix keeps
+/// the folder's real casing: `("Documents", "doc") → Some(3)` → `"uments"`.
+pub fn completion_prefix_len(name: &str, query: &str) -> Option<usize> {
+    let mut len = 0;
+    let mut name_chars = name.chars();
+    for qc in query.chars() {
+        let nc = name_chars.next()?;
+        if !nc.to_lowercase().eq(qc.to_lowercase()) {
+            return None;
+        }
+        len += nc.len_utf8();
+    }
+    Some(len)
+}
+
 /// Breadcrumb segments for a path: `(label, full path)`, root first.
 pub fn breadcrumbs(path: &str) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = vec![("/".to_string(), "/".to_string())];
@@ -3173,6 +3190,21 @@ mod tests {
         assert_eq!(labels, ["/", "home", "w", "dev"]);
         assert_eq!(crumbs[2].1, "/home/w");
         assert_eq!(breadcrumbs("/").len(), 1);
+    }
+
+    #[test]
+    fn completion_prefix_lengths() {
+        // Case-insensitive; the length indexes into the NAME's bytes.
+        assert_eq!(completion_prefix_len("Documents", "doc"), Some(3));
+        assert_eq!(&"Documents"[3..], "uments");
+        assert_eq!(completion_prefix_len("komet", "komet"), Some(5));
+        assert_eq!(completion_prefix_len("komet", ""), Some(0));
+        assert_eq!(completion_prefix_len("komet", "dev"), None);
+        // Longer than the name → not a prefix.
+        assert_eq!(completion_prefix_len("dev", "devel"), None);
+        // Multibyte names slice on a char boundary.
+        assert_eq!(completion_prefix_len("héllo", "hé"), Some(3));
+        assert_eq!(&"héllo"[3..], "llo");
     }
 
     #[test]

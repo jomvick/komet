@@ -1267,6 +1267,11 @@ pub struct ComposerInput {
     last_width: f32,
     /// Raw Markdown → chip display projection from the last layout pass.
     projection: TextProjection,
+    /// Inline completion preview: painted in faint ink after the text while
+    /// the caret sits at the end (palette tab-completion). Owned by the
+    /// wrapper — it recomputes and re-sets this on every render pass, so the
+    /// input never has to know what the completion means.
+    ghost: Option<SharedString>,
     /// File mentions are a composer feature, not a behavior of generic inputs
     /// (picker searches and rename fields also use this type).
     mentions_enabled: bool,
@@ -1337,6 +1342,7 @@ impl ComposerInput {
             max_line_width: 0.0,
             last_width: 0.0,
             projection: TextProjection::default(),
+            ghost: None,
             mentions_enabled: false,
             layout_epoch: 0,
             display_is_placeholder: true,
@@ -1483,6 +1489,16 @@ impl ComposerInput {
 
     pub fn is_empty(&self) -> bool {
         self.content.is_empty()
+    }
+
+    /// Set (or clear) the inline completion preview. Only paints while the
+    /// caret sits at the end of a non-empty draft — see the prepaint gate.
+    pub fn set_ghost(&mut self, ghost: Option<SharedString>, cx: &mut Context<Self>) {
+        if self.ghost == ghost {
+            return;
+        }
+        self.ghost = ghost;
+        cx.notify();
     }
 
     pub fn has_newline(&self) -> bool {
@@ -2741,6 +2757,10 @@ struct ComposerTextPrepaint {
     mention_quads: Vec<PaintQuad>,
     mention_hits: Vec<MentionHit>,
     selection_quads: Vec<PaintQuad>,
+    /// Completion preview: window-space origin of the end-of-text caret plus
+    /// the suffix to paint there (shaped at paint time — it never joins the
+    /// content's own layout, so hit-testing and the caret ignore it).
+    ghost: Option<(Point<Pixels>, SharedString)>,
 }
 
 impl IntoElement for ComposerTextElement {
@@ -2932,11 +2952,29 @@ impl gpui::Element for ComposerTextElement {
                 }),
             });
         }
+        // The ghost only shows where accepting it would insert: a collapsed
+        // caret at the end of real (non-placeholder, non-IME) text.
+        let ghost = input
+            .ghost
+            .clone()
+            .filter(|g| {
+                !g.is_empty()
+                    && !input.display_is_placeholder
+                    && input.marked_range.is_none()
+                    && input.selected_range.is_empty()
+                    && input.cursor_offset() == input.content.len()
+            })
+            .and_then(|g| {
+                input
+                    .point_for_index(input.content.len())
+                    .map(|p| (point(origin.x + p.x, origin.y + p.y), g))
+            });
         ComposerTextPrepaint {
             cursor,
             mention_quads,
             mention_hits,
             selection_quads,
+            ghost,
         }
     }
 
@@ -2995,6 +3033,30 @@ impl gpui::Element for ComposerTextElement {
                     cx,
                 );
                 y += height;
+            }
+            if let Some((ghost_origin, ghost)) = prepaint.ghost.take() {
+                let style = window.text_style();
+                let font_size = style.font_size.to_pixels(window.rem_size());
+                let run = TextRun {
+                    len: ghost.len(),
+                    font: style.font(),
+                    color: Theme::of(cx).text_faint,
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                let line = window
+                    .text_system()
+                    .shape_line(ghost, font_size, &[run], None);
+                // (Clipping comes from the surrounding content mask.)
+                let _ = line.paint(
+                    ghost_origin,
+                    line_height,
+                    gpui::TextAlign::Left,
+                    None,
+                    window,
+                    cx,
+                );
             }
             // Caret only when this input is actually focused in an active
             // window (Electron hides it on window deactivation too), and only
