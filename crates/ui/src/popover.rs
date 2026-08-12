@@ -243,6 +243,11 @@ pub fn classify_key(key: &str, cmd: bool, ctrl: bool) -> MenuKey {
     match key {
         "up" => MenuKey::Up,
         "down" => MenuKey::Down,
+        // Readline/emacs motion: ctrl-n/ctrl-p mirror ↓/↑ in every picker.
+        // Safe to claim frame-wide — neither chord is a text-editing binding
+        // in the palette keymaps, so they always bubble here unconsumed.
+        "n" if ctrl => MenuKey::Down,
+        "p" if ctrl => MenuKey::Up,
         "enter" if cmd || ctrl => MenuKey::ModEnter,
         "enter" => MenuKey::Enter,
         "escape" => MenuKey::Escape,
@@ -712,6 +717,24 @@ pub fn key_hint(theme: &Theme, icon_path: &'static str, label: &'static str) -> 
         .child(key_hint_label(theme, label))
 }
 
+/// A footer legend whose cap holds a WORD ("tab", "esc") instead of a glyph
+/// — for keys with no icon in the set.
+pub fn key_hint_text(theme: &Theme, cap: &'static str, label: &'static str) -> gpui::Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(5.0))
+        .child(
+            key_cap(theme)
+                .text_size(px(11.0))
+                .font_family(theme.font_mono.clone())
+                .text_color(theme.text_muted.opacity(0.7))
+                .child(SharedString::from(cap)),
+        )
+        .child(key_hint_label(theme, label))
+}
+
 /// A footer legend whose cap holds TWO glyphs split by a hairline
 /// ("[ ↑ | ↓ ] Navigate") sharing one verb.
 pub fn key_hint_pair(
@@ -982,6 +1005,11 @@ mod tests {
         assert_eq!(classify_key("escape", false, false), MenuKey::Escape);
         assert_eq!(classify_key("backspace", false, false), MenuKey::Backspace);
         assert_eq!(classify_key("a", false, false), MenuKey::Other);
+        // Readline motion — only with ctrl held.
+        assert_eq!(classify_key("n", false, true), MenuKey::Down);
+        assert_eq!(classify_key("p", false, true), MenuKey::Up);
+        assert_eq!(classify_key("n", false, false), MenuKey::Other);
+        assert_eq!(classify_key("p", true, false), MenuKey::Other);
     }
 
     #[test]
