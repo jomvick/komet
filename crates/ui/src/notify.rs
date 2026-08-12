@@ -224,18 +224,24 @@ mod identity {
 }
 
 /// Escape a string for interpolation inside a double-quoted AppleScript
-/// literal (backslash and double-quote are the only metacharacters).
+/// literal: backslash and double-quote are the metacharacters, and a raw
+/// newline ends the statement (which would silently drop the banner) — those
+/// flatten to spaces.
 #[cfg(any(target_os = "macos", test))]
 fn applescript_escape(text: &str) -> String {
-    text.replace('\\', "\\\\").replace('"', "\\\"")
+    text.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace(['\n', '\r'], " ")
 }
 
 #[cfg(target_os = "linux")]
 fn post_impl(title: &str, body: &str) {
     let (title, body) = (title.to_string(), body.to_string());
     std::thread::spawn(move || {
+        // `--` ends option parsing: session titles are model-generated, so a
+        // `-`-leading one must land as the summary, not as a flag.
         let result = std::process::Command::new("notify-send")
-            .args(["--app-name=Komet", &title, &body])
+            .args(["--app-name=Komet", "--", &title, &body])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();
@@ -261,5 +267,7 @@ mod tests {
             applescript_escape(r#"say "hi" \ bye"#),
             r#"say \"hi\" \\ bye"#
         );
+        // Raw newlines would end the AppleScript statement mid-literal.
+        assert_eq!(applescript_escape("two\nlines\r\n"), "two lines  ");
     }
 }
