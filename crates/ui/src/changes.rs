@@ -130,11 +130,13 @@ impl FileDiff {
 }
 
 /// Width of one line-number gutter column, fitted to the file's largest
-/// line number (11px mono ≈ 6.6px per digit + 8px right pad), never
-/// narrower than the classic 36px column (4 digits).
+/// line number: 11px mono ≈ 6.6px per digit, the 8px right pad, and a 6px
+/// left gap so the number never abuts the accent bar (at 4 digits the old
+/// formula left 1.6px — visually touching; user report). Never narrower
+/// than the classic 36px column.
 pub fn gutter_width(file: &FileDiff) -> f32 {
     let digits = file.max_line.max(1).ilog10() + 1;
-    (digits as f32 * 6.6 + 9.6).max(GUTTER_WIDTH)
+    (digits as f32 * 6.6 + 8.0 + 6.0).max(GUTTER_WIDTH)
 }
 
 fn strip_git_prefix(path: &str) -> &str {
@@ -2724,17 +2726,30 @@ rename to new_name.rs
         assert_eq!(files[0].max_line, 12);
         assert_eq!(gutter_width(&files[0]), GUTTER_WIDTH);
 
-        // 4 digits still fit the classic column; 5+ digits widen it enough
-        // for digits + the 8px right pad.
+        // Every digit count keeps ≥6px clear of the accent bar on the left
+        // of the number (digits×6.6 + 8px right pad + 6px gap), and the
+        // column never shrinks below the classic 36px.
         let mut file = files[0].clone();
+        for digits in 1..=7u32 {
+            file.max_line = 10u32.pow(digits) - 1;
+            let w = gutter_width(&file);
+            assert!(w >= GUTTER_WIDTH);
+            let left_gap = w - (digits as f32 * 6.6 + 8.0);
+            assert!(
+                left_gap >= 6.0,
+                "{digits} digits: left gap {left_gap} < 6px"
+            );
+        }
+        // 4 digits outgrow the classic column now (the old formula left
+        // them 1.6px off the bar — visually touching).
         file.max_line = 9999;
-        assert_eq!(gutter_width(&file), GUTTER_WIDTH);
+        assert!(gutter_width(&file) > GUTTER_WIDTH);
         file.max_line = 27404;
-        let w = gutter_width(&file);
-        assert!(w > GUTTER_WIDTH, "5 digits must widen the gutter");
-        assert!(w >= 5.0 * 6.6 + 8.0);
-        file.max_line = 123456;
-        assert!(gutter_width(&file) > w);
+        assert!(gutter_width(&file) > gutter_width(&{
+            let mut f = file.clone();
+            f.max_line = 9999;
+            f
+        }));
 
         // Truncation refits the gutter to what actually renders: the first
         // 3 lines are ctx(1,1) / del(2,·) / add(·,2) — max line 2.
