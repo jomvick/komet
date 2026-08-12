@@ -263,6 +263,28 @@ pub fn completion_prefix_len(name: &str, query: &str) -> Option<usize> {
     Some(len)
 }
 
+/// Resolve a typed path segment against folder `names` (slash-descend):
+/// exact match first — case-SENSITIVE before case-insensitive, so `GitHub/`
+/// picks a `GitHub` sibling over `github` — then a unique case-insensitive
+/// prefix. Ambiguity resolves to `None`: the slash stays in the query.
+pub fn segment_target(names: &[&str], query: &str) -> Option<usize> {
+    if let Some(ix) = names.iter().position(|n| *n == query) {
+        return Some(ix);
+    }
+    if let Some(ix) = names
+        .iter()
+        .position(|n| completion_prefix_len(n, query) == Some(n.len()))
+    {
+        return Some(ix);
+    }
+    let mut hits = names
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| completion_prefix_len(n, query).is_some());
+    let (ix, _) = hits.next()?;
+    hits.next().is_none().then_some(ix)
+}
+
 /// Breadcrumb segments for a path: `(label, full path)`, root first.
 pub fn breadcrumbs(path: &str) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = vec![("/".to_string(), "/".to_string())];
@@ -3205,6 +3227,20 @@ mod tests {
         // Multibyte names slice on a char boundary.
         assert_eq!(completion_prefix_len("héllo", "hé"), Some(3));
         assert_eq!(&"héllo"[3..], "llo");
+    }
+
+    #[test]
+    fn segment_target_resolution() {
+        let names = ["github", "GitHub", "worktree"];
+        // Exact casing beats the earlier case-insensitive sibling…
+        assert_eq!(segment_target(&names, "GitHub"), Some(1));
+        assert_eq!(segment_target(&names, "github"), Some(0));
+        // …but with no exact-cased hit, case-insensitive exact still lands.
+        assert_eq!(segment_target(&names, "WORKTREE"), Some(2));
+        // Unique prefix descends; an ambiguous one keeps the slash honest.
+        assert_eq!(segment_target(&names, "work"), Some(2));
+        assert_eq!(segment_target(&names, "g"), None);
+        assert_eq!(segment_target(&names, "x"), None);
     }
 
     #[test]

@@ -1010,8 +1010,9 @@ impl Shell {
     }
 
     /// Slash-descend: when the query ends in `/` and the part before it names
-    /// a folder of the current listing (exact name, else a unique prefix),
-    /// descend into it as though it were picked. Returns whether it fired —
+    /// a folder of the current listing (exact name — matching casing wins
+    /// over a case-colliding sibling — else a unique prefix), descend into it
+    /// as though it were picked. Returns whether it fired —
     /// descending clears the query, so the caller must not keep acting on the
     /// old text.
     fn add_space_slash_descend(&mut self, cx: &mut Context<Self>) -> bool {
@@ -1030,22 +1031,13 @@ impl Shell {
                 return false;
             };
             let dirs = browser_rows(listing);
-            dirs.iter()
-                .find(|e| completion_prefix_len(&e.name, query) == Some(e.name.len()))
-                .copied()
-                .or_else(|| {
-                    let mut hits = dirs
-                        .iter()
-                        .filter(|e| completion_prefix_len(&e.name, query).is_some());
-                    let first = hits.next()?;
-                    hits.next().is_none().then_some(*first)
-                })
-                .map(|entry| {
-                    (
-                        crate::pickers::child_path(&listing.path, &entry.name),
-                        entry.is_repo,
-                    )
-                })
+            let names: Vec<&str> = dirs.iter().map(|e| e.name.as_str()).collect();
+            crate::pickers::segment_target(&names, query).map(|ix| {
+                (
+                    crate::pickers::child_path(&listing.path, &dirs[ix].name),
+                    dirs[ix].is_repo,
+                )
+            })
         };
         let Some((full, is_repo)) = target else {
             return false;
