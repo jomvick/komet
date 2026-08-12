@@ -227,7 +227,7 @@ fn render_systemd_unit(exe: &Path, env: &[(String, String)]) -> String {
     // fail-fast exit (5 × RestartSec=5 lands inside the 60s window) — otherwise
     // a signed-out daemon restart-loops forever.
     let mut unit = String::from(
-        "[Unit]\nDescription=Komet native headless engine\nAfter=network-online.target\n\
+        "[Unit]\nDescription=Komet headless engine\nAfter=network-online.target\n\
          StartLimitIntervalSec=60\nStartLimitBurst=5\n\n[Service]\n",
     );
     for (key, value) in env {

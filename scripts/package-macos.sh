@@ -26,8 +26,7 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 install -m 755 "$ROOT/target/release/komet" "$APP/Contents/MacOS/komet"
 sed "s/__VERSION__/$VERSION/" "$ROOT/dist/macos/Info.plist" >"$APP/Contents/Info.plist"
 
-# Icon: iconset from dist/komet.png — the komet mark from the original app
-# (apps/desktop/resources/icon.png in the komet repo; source dist/komet.svg).
+# Icon: iconset from the shared 1024×1024 Komet artwork in dist/komet.png.
 ICONSET="$OUT_DIR/komet.iconset"
 rm -rf "$ICONSET" && mkdir -p "$ICONSET"
 for size in 16 32 128 256 512; do
@@ -46,10 +45,10 @@ else
   codesign --deep --force --sign - "$APP"
 fi
 
-# The auto-updater artifact: the signed bundle as a plain tarball (the in-app
-# updater downloads + extracts it, then swaps /Applications/Komet.app —
-# crates/update stage_mac_app/apply_mac_app).
-tar -czf "$APP_TARBALL" -C "$OUT_DIR" Komet.app
+# The auto-updater artifact: keep the historical Komet.app path inside the
+# tarball so already-installed Komet builds can consume the first Komet
+# release. The DMG still presents Komet.app to new installs.
+tar -czf "$APP_TARBALL" -s '/^Komet\.app/Komet.app/' -C "$OUT_DIR" Komet.app
 echo "packaged: $APP_TARBALL"
 
 hdiutil create -volname Komet -srcfolder "$APP" -ov -format UDZO "$DMG"

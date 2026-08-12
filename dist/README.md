@@ -11,8 +11,7 @@ Produces `target/package/komet-<version>-linux-<arch>.tar.gz` containing:
 
 - `komet` — the binary (headed by default; `komet headless` runs the engine alone)
 - `komet.desktop` — XDG desktop entry
-- `komet.png` — 1024×1024 app icon (the komet mark from the original app;
-  vector source `komet.svg`)
+- `komet.png` — 1024×1024 Komet app icon
 - `install.sh` — installs into `~/.local/{bin,share/applications,share/icons}`
 
 The release profile in the root `Cargo.toml` sets `lto = "thin"` and
@@ -26,9 +25,10 @@ scripts/package-macos.sh    # → target/package/komet-<version>-macos-<arch>.dm
 
 Builds the release binary, assembles `Komet.app` (Info.plist + icns), ad-hoc
 signs it (set `CODESIGN_IDENTITY` for a real Developer ID), and wraps it in a
-dmg. CI runs this on tags (`.github/workflows/release.yml`). The manual steps
-it automates, for reference (run on a macOS host — gpui needs Metal; no
-cross-build from Linux):
+dmg. The auto-update tarball retains an internal `Komet.app` path so older
+installed builds can update into Komet. CI runs this on tags
+(`.github/workflows/release.yml`). The manual steps it automates, for reference
+(run on a macOS host — gpui needs Metal; no cross-build from Linux):
 
 1. Build the universal (or per-arch) binary:
    ```sh

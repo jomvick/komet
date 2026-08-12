@@ -13,7 +13,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.50"
+version = "0.1.51"
 edition = "2024"
 license = "MIT"
 publish = false
@@ -111,6 +111,5 @@ opt-level = 0
 
 [profile.dev.package."*"]
 opt-level = 2
-
 
 
