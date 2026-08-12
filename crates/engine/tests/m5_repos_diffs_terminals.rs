@@ -12,7 +12,7 @@ use komet_engine::{
     EngineCore, HarnessRegistry, Repos, Terminals, capture_diff, capture_diff_against,
     capture_turn_diff, merge_base, snapshot_tree,
 };
-use komet_proto::TerminalEvent;
+use komet_proto::{GitHistoryRefKind, TerminalEvent};
 use komet_rpc::methods;
 
 // ---------------------------------------------------------------------------
@@ -205,6 +205,59 @@ async fn repos_round_trip_add_branches_worktrees() {
         repos.create("demo repo!").await.is_err(),
         "duplicate create rejected"
     );
+}
+
+#[tokio::test]
+async fn git_history_is_topological_paged_and_carries_public_refs() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo_dir = tmp.path().join("history-repo");
+    init_repo(&repo_dir).await;
+    git(&repo_dir, &["checkout", "-b", "feature"]).await;
+    std::fs::write(repo_dir.join("feature.txt"), "feature\n").expect("feature file");
+    git(&repo_dir, &["add", "."]).await;
+    git(&repo_dir, &["commit", "-m", "feature commit"]).await;
+    git(&repo_dir, &["checkout", "main"]).await;
+    std::fs::write(repo_dir.join("main.txt"), "main\n").expect("main file");
+    git(&repo_dir, &["add", "."]).await;
+    git(&repo_dir, &["commit", "-m", "main commit"]).await;
+    git(
+        &repo_dir,
+        &["merge", "--no-ff", "feature", "-m", "merge feature"],
+    )
+    .await;
+    git(&repo_dir, &["tag", "v1"]).await;
+    git(
+        &repo_dir,
+        &["update-ref", "refs/remotes/origin/main", "HEAD"],
+    )
+    .await;
+
+    let repos = test_repos(&tmp.path().join("data"));
+    let first = repos.history(&repo_dir, 0, 2).await.expect("first page");
+    assert_eq!(first.commits.len(), 2);
+    assert_eq!(first.total_count, Some(4));
+    assert_eq!(first.next_cursor, Some(2));
+    assert_eq!(
+        first.head_sha.as_deref(),
+        Some(first.commits[0].sha.as_str())
+    );
+    assert_eq!(first.commits[0].parent_shas.len(), 2);
+    assert!(first.commits[0].refs.iter().any(|reference| {
+        reference.kind == GitHistoryRefKind::Branch && reference.label == "main"
+    }));
+    assert!(first.commits[0].refs.iter().any(|reference| {
+        reference.kind == GitHistoryRefKind::Remote && reference.label == "origin/main"
+    }));
+    assert!(
+        first.commits[0].refs.iter().any(|reference| {
+            reference.kind == GitHistoryRefKind::Tag && reference.label == "v1"
+        })
+    );
+
+    let second = repos.history(&repo_dir, 2, 2).await.expect("second page");
+    assert_eq!(second.commits.len(), 2);
+    assert_eq!(second.next_cursor, None);
+    assert_eq!(second.total_count, None);
 }
 
 // ---------------------------------------------------------------------------

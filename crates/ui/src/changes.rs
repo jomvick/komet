@@ -36,6 +36,7 @@ use komet_proto::{Chat, CheckoutDiff};
 use komet_rpc::methods;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
+use crate::history::GitHistory;
 use crate::markdown::highlight::{Lang, LineCarry, Token, lang_for_tag, tokenize_line};
 use crate::markdown::render;
 use crate::motion::{self, AnimationExt as _, CHEVRON, COLLAPSE};
@@ -441,16 +442,24 @@ pub enum DiffScope {
     Branch,
     /// Changes since the current chat's last turn started.
     LatestTurn,
+    /// Repository commit graph. Hosted here until the right pane becomes tabs.
+    History,
 }
 
 impl DiffScope {
-    pub const ALL: [DiffScope; 3] = [Self::WorkingTree, Self::Branch, Self::LatestTurn];
+    pub const ALL: [DiffScope; 4] = [
+        Self::WorkingTree,
+        Self::Branch,
+        Self::LatestTurn,
+        Self::History,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Self::WorkingTree => "Working tree",
             Self::Branch => "Branch changes",
             Self::LatestTurn => "Latest turn",
+            Self::History => "History",
         }
     }
 
@@ -460,6 +469,7 @@ impl DiffScope {
             Self::WorkingTree => "workingTree",
             Self::Branch => "branch",
             Self::LatestTurn => "turn",
+            Self::History => "history",
         }
     }
 }
@@ -474,6 +484,7 @@ pub fn scope_label(scope: DiffScope, count: usize, base: Option<&str>) -> String
             None => format!("{count} Changed {files}"),
         },
         DiffScope::LatestTurn => format!("{count} Changed {files} this turn"),
+        DiffScope::History => "History".to_string(),
     }
 }
 
@@ -507,6 +518,7 @@ pub fn clean_message(scope: DiffScope, base: Option<&str>) -> String {
             None => "No branch changes".to_string(),
         },
         DiffScope::LatestTurn => "No changes this turn".to_string(),
+        DiffScope::History => "No commits found".to_string(),
     }
 }
 
@@ -774,6 +786,7 @@ pub struct Changes {
     scoped_task: Option<Task<()>>,
     scope_menu: Popup<()>,
     ref_menu: Popup<RefMenu>,
+    history: Option<Entity<GitHistory>>,
     _observe: Subscription,
 }
 
@@ -809,6 +822,7 @@ impl Changes {
             scoped_task: None,
             scope_menu: Popup::default(),
             ref_menu: Popup::default(),
+            history: None,
             _observe: observe,
         }
     }
@@ -931,7 +945,8 @@ impl Changes {
     fn active_diff(&self, cx: &App) -> Option<CheckoutDiff> {
         match self.scope {
             DiffScope::WorkingTree => self.resolved(cx),
-            _ => self.scoped.clone(),
+            DiffScope::Branch | DiffScope::LatestTurn => self.scoped.clone(),
+            DiffScope::History => None,
         }
     }
 
@@ -942,6 +957,7 @@ impl Changes {
             DiffScope::WorkingTree => "wt".to_string(),
             DiffScope::Branch => format!("br:{}", self.base_ref.as_deref().unwrap_or("")),
             DiffScope::LatestTurn => "turn".to_string(),
+            DiffScope::History => "history".to_string(),
         }
     }
 
@@ -1022,7 +1038,7 @@ impl Changes {
     /// checksum-only refresh keeps the old diff visible until the new one
     /// lands.
     fn ensure_scoped(&mut self, cx: &mut Context<Self>) {
-        if self.scope == DiffScope::WorkingTree {
+        if matches!(self.scope, DiffScope::WorkingTree | DiffScope::History) {
             self.scoped_inflight = None;
             self.scoped_task = None;
             return;
@@ -1118,9 +1134,22 @@ impl Changes {
     fn set_scope(&mut self, scope: DiffScope, cx: &mut Context<Self>) {
         if self.scope != scope {
             self.scope = scope;
+            if scope == DiffScope::History {
+                self.history_pane(cx)
+                    .update(cx, |history, cx| history.ensure_loaded(cx));
+            }
             self.sync(cx);
         }
         cx.notify();
+    }
+
+    fn history_pane(&mut self, cx: &mut Context<Self>) -> Entity<GitHistory> {
+        if let Some(history) = &self.history {
+            return history.clone();
+        }
+        let history = cx.new(|cx| GitHistory::new(self.state.clone(), cx));
+        self.history = Some(history.clone());
+        history
     }
 
     fn set_base_ref(&mut self, base: String, cx: &mut Context<Self>) {
@@ -1136,6 +1165,11 @@ impl Changes {
         // The watch follows the selected chat's host device (idempotent when
         // the target is unchanged); a boot-deferred attempt retries here too.
         self.ensure_watch(cx);
+        if self.scope == DiffScope::History {
+            self.history_pane(cx)
+                .update(cx, |history, cx| history.ensure_loaded(cx));
+            return;
+        }
         self.ensure_branches(cx);
         self.ensure_scoped(cx);
         let Some(diff) = self.active_diff(cx) else {
@@ -1826,11 +1860,22 @@ impl Changes {
             trigger
         };
 
-        let fold = Self::header_button("changes-fold-all", crate::icons::FOLD_VERTICAL, &theme)
-            .on_click(cx.listener(|this, _, _, cx| {
-                cx.stop_propagation();
-                this.toggle_collapse_all(cx);
-            }));
+        let trailing: AnyElement = if scope == DiffScope::History {
+            Self::header_button("history-refresh", crate::icons::REFRESH, &theme)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.history_pane(cx)
+                        .update(cx, |history, cx| history.refresh(cx));
+                }))
+                .into_any_element()
+        } else {
+            Self::header_button("changes-fold-all", crate::icons::FOLD_VERTICAL, &theme)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.toggle_collapse_all(cx);
+                }))
+                .into_any_element()
+        };
 
         div()
             .size_full()
@@ -1841,7 +1886,7 @@ impl Changes {
             .child(trigger)
             .children(self.render_ref_selector(&theme, cx))
             .child(div().flex_1())
-            .child(fold)
+            .child(trailing)
             .into_any_element()
     }
 
@@ -2377,6 +2422,11 @@ fn render_file_body_upto(
 
 impl Render for Changes {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.scope == DiffScope::History {
+            let history = self.history_pane(cx);
+            history.update(cx, |history, cx| history.ensure_loaded(cx));
+            return div().size_full().child(history).into_any_element();
+        }
         let theme = Theme::of(cx).clone();
         let active = self.active_diff(cx);
         let scope = self.scope;
@@ -2517,6 +2567,7 @@ impl Render for Changes {
                 )
             })
             .child(content)
+            .into_any_element()
     }
 }
 
