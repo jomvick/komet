@@ -110,6 +110,10 @@ icon_assets![
     (INFO_CIRCLE, "info-circle"),
     (DANGER_TRIANGLE, "danger-triangle"),
     (CHAT_ROUND_LINE, "chat-round-line"),
+    // Hand-drawn bell + speaker in the Solar Linear style (like the terminal/
+    // plus/return ports) — the embedded set has neither.
+    (BELL, "bell"),
+    (VOLUME_LOUD, "volume-loud"),
     // Hand-drawn komet glyphs (terminal-panel.tsx / composer-actions.tsx /
     // menu-check.tsx / logo.tsx).
     (TERMINAL, "terminal"),
