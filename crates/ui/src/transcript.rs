@@ -234,6 +234,11 @@ pub enum ToolDetail {
 /// Max verbatim output lines per chip before the counted tail row.
 pub const OUTPUT_DETAIL_MAX_LINES: usize = 24;
 
+/// Max diff lines an inline tool-diff detail renders — the detail is one
+/// stacked element inside its transcript row, so it must stay bounded
+/// (~600 lines ≈ 12.6k px, several screens of context before the cut).
+pub const DIFF_DETAIL_MAX_LINES: usize = 600;
+
 /// Per-line height of an output detail block (diff blocks use the changes
 /// pane's own [`crate::changes::DIFF_LINE_HEIGHT`]).
 pub const OUTPUT_LINE_HEIGHT: f32 = 18.0;
@@ -253,10 +258,15 @@ pub fn tool_detail(
     diff_stats: Option<&[komet_doc::ToolDiffStat]>,
 ) -> Option<ToolDetail> {
     if let Some(diff) = diff {
-        let file = diff_to_file(diff);
+        let mut file = diff_to_file(diff);
         if file.hunks.is_empty() {
             return None;
         }
+        // A transcript diff renders as one stacked element inside its row —
+        // cap it so a whole-file rewrite (or fetched full-diff blob) can't
+        // build tens of thousands of elements per frame. The changes pane
+        // has no such cap; it virtualizes per line.
+        crate::changes::truncate_file_lines(&mut file, DIFF_DETAIL_MAX_LINES);
         let highlight = highlight_file(&file);
         return Some(ToolDetail::Diff {
             file: Arc::new(file),

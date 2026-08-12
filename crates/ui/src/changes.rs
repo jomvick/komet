@@ -7,9 +7,13 @@
 //!   first, then by device+cwd, then cwd alone;
 //! - states: *preparing* (no diff yet), *clean* (empty patch), *list*; a watch
 //!   error shows a banner while the last content stays;
-//! - virtualized with gpui `list()` — one row per file section; each section
-//!   collapses with a 180 ms height tween (analytic heights, no measurement)
-//!   and a 200 ms chevron transition;
+//! - virtualized with gpui `list()` at LINE granularity — every file header,
+//!   hunk header, and diff line is its own row (the flat model Zed's editor
+//!   uses for its project diff: only the visible slice materializes, and a
+//!   collapsed file's body rows are removed from the list outright, not
+//!   hidden); each section collapses with a 180 ms height tween on a
+//!   clipped stand-in row (analytic heights, capped to what the clip can
+//!   reveal) and a 200 ms chevron transition;
 //! - syntax highlight reuses the markdown tokenizer per diff line, computed
 //!   time-sliced on the background executor and applied as paint-only run
 //!   colors (layout never changes);
@@ -320,6 +324,32 @@ pub fn file_notices(file: &FileDiff) -> Vec<String> {
     notices
 }
 
+/// Cap a file's hunks at `max_lines` total diff lines, appending a notice
+/// when lines were dropped. The transcript renders a tool diff as ONE
+/// stacked element inside its row, so an unbounded diff (a fetched
+/// full-diff blob, a whole-file rewrite) would otherwise build tens of
+/// thousands of elements every frame it is visible.
+pub fn truncate_file_lines(file: &mut FileDiff, max_lines: usize) {
+    let total: usize = file.hunks.iter().map(|h| h.lines.len()).sum();
+    if total <= max_lines {
+        return;
+    }
+    let mut budget = max_lines;
+    file.hunks.retain_mut(|hunk| {
+        if budget == 0 {
+            return false;
+        }
+        if hunk.lines.len() > budget {
+            hunk.lines.truncate(budget);
+        }
+        budget -= hunk.lines.len();
+        true
+    });
+    file.notices.push(format!(
+        "Diff truncated — showing first {max_lines} of {total} lines"
+    ));
+}
+
 /// Analytic expanded-body height — drives the 180 ms fold tween without
 /// measurement.
 pub fn body_height(file: &FileDiff) -> f32 {
@@ -513,6 +543,102 @@ struct ParsedDiff {
     files: Arc<Vec<FileDiff>>,
 }
 
+// ---------------------------------------------------------------------------
+// Row model — the diff flattened to line granularity (pure)
+// ---------------------------------------------------------------------------
+
+/// One virtualized list row. The diff is flattened so each visible LINE is
+/// its own row (Zed's editor draws exactly the visible line range the same
+/// way): scrolling a 10k-line file materializes ~50 line rows per frame, not
+/// one 10k-line element, and a collapsed file contributes no body rows at
+/// all. Heights are the analytic constants above — no measurement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiffRow {
+    FileHeader {
+        file: u32,
+    },
+    Notice {
+        file: u32,
+        notice: u32,
+    },
+    HunkHeader {
+        file: u32,
+        hunk: u32,
+    },
+    Line {
+        file: u32,
+        hunk: u32,
+        line: u32,
+        /// Flat index across the file's hunks — keys into the highlight slot.
+        flat: u32,
+    },
+    /// Trailing pad closing an expanded body ([`BODY_BOTTOM_PAD`]).
+    BodyPad {
+        file: u32,
+    },
+    /// A body mid-fold-tween: one height-animated, clipped row standing in
+    /// for the whole body. Only the slice that can be revealed is built —
+    /// the tween never pays for off-screen lines.
+    FoldingBody {
+        file: u32,
+    },
+}
+
+/// Rows an expanded body contributes (notices + hunk headers + lines + pad).
+pub fn body_row_count(file: &FileDiff) -> usize {
+    let lines: usize = file.hunks.iter().map(|h| h.lines.len()).sum();
+    file_notices(file).len() + file.hunks.len() + lines + 1
+}
+
+/// The steady-state body rows of one expanded file.
+pub fn body_rows(file_ix: u32, file: &FileDiff) -> Vec<DiffRow> {
+    let mut rows = Vec::with_capacity(body_row_count(file));
+    for notice in 0..file_notices(file).len() {
+        rows.push(DiffRow::Notice {
+            file: file_ix,
+            notice: notice as u32,
+        });
+    }
+    let mut flat = 0u32;
+    for (hunk_ix, hunk) in file.hunks.iter().enumerate() {
+        rows.push(DiffRow::HunkHeader {
+            file: file_ix,
+            hunk: hunk_ix as u32,
+        });
+        for line_ix in 0..hunk.lines.len() {
+            rows.push(DiffRow::Line {
+                file: file_ix,
+                hunk: hunk_ix as u32,
+                line: line_ix as u32,
+                flat,
+            });
+            flat += 1;
+        }
+    }
+    rows.push(DiffRow::BodyPad { file: file_ix });
+    rows
+}
+
+/// Flatten all files into rows + each file's row span (header at
+/// `range.start`, body rows after it). `collapsed(ix)` folds a file to just
+/// its header.
+pub fn flatten_rows(
+    files: &[FileDiff],
+    mut collapsed: impl FnMut(usize) -> bool,
+) -> (Vec<DiffRow>, Vec<std::ops::Range<usize>>) {
+    let mut rows = Vec::new();
+    let mut ranges = Vec::with_capacity(files.len());
+    for (ix, file) in files.iter().enumerate() {
+        let start = rows.len();
+        rows.push(DiffRow::FileHeader { file: ix as u32 });
+        if !collapsed(ix) {
+            rows.extend(body_rows(ix as u32, file));
+        }
+        ranges.push(start..rows.len());
+    }
+    (rows, ranges)
+}
+
 #[derive(Default, Clone, Copy)]
 struct FileFold {
     collapsed: bool,
@@ -529,6 +655,12 @@ struct FileFold {
 
 /// Tween arming window after a fold toggle (COLLAPSE's 180ms plus margin).
 const FOLD_TWEEN_WINDOW: Duration = Duration::from_millis(400);
+
+/// Ceiling on how much body a fold tween's stand-in row materializes. A
+/// tween always starts from a clicked (on-screen) header, so the revealable
+/// slice is at most one viewport tall — everything past this is clipped or
+/// below the fold either way.
+const FOLD_TWEEN_MAX_PX: f32 = 2400.0;
 
 impl FileFold {
     fn animating(&self) -> bool {
@@ -591,6 +723,13 @@ pub struct Changes {
     parse_task: Option<Task<()>>,
     folds: HashMap<String, FileFold>,
     highlights: HashMap<String, HighlightSlot>,
+    /// The flattened row model the list virtualizes over (line granularity;
+    /// collapsed bodies excluded) + each file's row span within it.
+    rows: Vec<DiffRow>,
+    row_ranges: Vec<std::ops::Range<usize>>,
+    /// Sweeps [`DiffRow::FoldingBody`] stand-ins back to steady-state rows
+    /// once their tween window elapses.
+    fold_settle: Option<Task<()>>,
     list: ListState,
     /// What the pane diffs against (toolbar dropdown).
     scope: DiffScope,
@@ -626,7 +765,12 @@ impl Changes {
             parse_task: None,
             folds: HashMap::new(),
             highlights: HashMap::new(),
-            list: ListState::new(0, ListAlignment::Top, px(320.0)),
+            rows: Vec::new(),
+            row_ranges: Vec::new(),
+            fold_settle: None,
+            // Rows are single lines now — a deep overdraw is cheap and keeps
+            // fast wheel flicks from outrunning measurement.
+            list: ListState::new(0, ListAlignment::Top, px(1024.0)),
             scope: DiffScope::default(),
             base_ref: None,
             branches: Vec::new(),
@@ -970,6 +1114,8 @@ impl Changes {
         self.ensure_scoped(cx);
         let Some(diff) = self.active_diff(cx) else {
             if self.parsed.take().is_some() {
+                self.rows.clear();
+                self.row_ranges.clear();
                 self.list.reset(0);
                 self.folds.clear();
                 self.highlights.clear();
@@ -1005,9 +1151,17 @@ impl Changes {
                 } else {
                     files.len()
                 };
-                changes.list.reset(files.len());
                 changes.folds.clear();
                 changes.highlights.clear();
+                let (rows, ranges) = flatten_rows(&files, |_| false);
+                // The uniform hint keeps offsets for never-rendered rows
+                // sane (most rows ARE lines); real heights land as rows
+                // render.
+                changes
+                    .list
+                    .reset_with_uniform_height(rows.len(), px(DIFF_LINE_HEIGHT));
+                changes.rows = rows;
+                changes.row_ranges = ranges;
                 changes.parsed = Some(ParsedDiff {
                     key,
                     truncated,
@@ -1022,8 +1176,33 @@ impl Changes {
         }));
     }
 
-    fn toggle_fold(&mut self, path: &str, expanded_height: f32) {
-        let fold = self.folds.entry(path.to_string()).or_default();
+    /// Swap one file's body rows (everything after its header) for
+    /// `new_body`, splicing both the row model and the list state. gpui's
+    /// `splice` shifts the logical scroll anchor by the count delta, so
+    /// content below the fold stays put.
+    fn replace_file_body(&mut self, file_ix: usize, new_body: Vec<DiffRow>) {
+        let Some(range) = self.row_ranges.get(file_ix).cloned() else {
+            return;
+        };
+        let body = range.start + 1..range.end;
+        let delta = new_body.len() as isize - body.len() as isize;
+        self.list.splice(body.clone(), new_body.len());
+        self.rows.splice(body, new_body);
+        self.row_ranges[file_ix] = range.start..(range.end as isize + delta) as usize;
+        for r in &mut self.row_ranges[file_ix + 1..] {
+            *r = (r.start as isize + delta) as usize..(r.end as isize + delta) as usize;
+        }
+    }
+
+    fn toggle_fold(&mut self, file_ix: usize, cx: &mut Context<Self>) {
+        let Some(parsed) = &self.parsed else {
+            return;
+        };
+        let Some(file) = parsed.files.get(file_ix) else {
+            return;
+        };
+        let expanded_height = body_height(file);
+        let fold = self.folds.entry(file.path.clone()).or_default();
         let currently_collapsed = fold.collapsed;
         fold.from = if currently_collapsed {
             0.0
@@ -1038,6 +1217,73 @@ impl Changes {
         fold.collapsed = !currently_collapsed;
         fold.epoch += 1;
         fold.toggled_at = Some(std::time::Instant::now());
+        // The body tweens as ONE clipped stand-in row; the settle sweep
+        // swaps it for steady rows (all lines, or none) once the window
+        // elapses.
+        self.replace_file_body(
+            file_ix,
+            vec![DiffRow::FoldingBody {
+                file: file_ix as u32,
+            }],
+        );
+        self.ensure_fold_settle(cx);
+    }
+
+    /// Keep a sweep alive while any [`DiffRow::FoldingBody`] stand-ins
+    /// remain; each tick settles the ones whose tween window has elapsed.
+    fn ensure_fold_settle(&mut self, cx: &mut Context<Self>) {
+        if self.fold_settle.is_some() {
+            return;
+        }
+        self.fold_settle = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(FOLD_TWEEN_WINDOW).await;
+                let more = this
+                    .update(cx, |changes, cx| changes.settle_folds(cx))
+                    .unwrap_or(false);
+                if !more {
+                    break;
+                }
+            }
+            this.update(cx, |changes, _| changes.fold_settle = None)
+                .ok();
+        }));
+    }
+
+    /// Replace every settled folding stand-in with its steady-state rows.
+    /// Returns whether any stand-ins are still mid-tween.
+    fn settle_folds(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(parsed) = &self.parsed else {
+            return false;
+        };
+        let files = parsed.files.clone();
+        let mut pending = false;
+        for file_ix in (0..self.row_ranges.len()).rev() {
+            let range = &self.row_ranges[file_ix];
+            let folding = self.rows.get(range.start + 1)
+                == Some(&DiffRow::FoldingBody {
+                    file: file_ix as u32,
+                });
+            if !folding {
+                continue;
+            }
+            let Some(file) = files.get(file_ix) else {
+                continue;
+            };
+            let fold = self.folds.get(&file.path).copied().unwrap_or_default();
+            if fold.animating() {
+                pending = true;
+                continue;
+            }
+            let body = if fold.collapsed {
+                Vec::new()
+            } else {
+                body_rows(file_ix as u32, file)
+            };
+            self.replace_file_body(file_ix, body);
+        }
+        cx.notify();
+        pending
     }
 
     /// Every parsed file currently folded shut?
@@ -1055,18 +1301,36 @@ impl Changes {
 
     /// Collapse every file section, or expand them all when everything is
     /// already shut (the toolbar's fold button, t3code parity). Steady-state
-    /// writes — no per-row tween arming, the whole list just snaps.
+    /// writes — no per-row tween arming, the whole list just snaps. List
+    /// splices run bottom-up over the OLD ranges (each is O(log n)), then
+    /// the row model rebuilds wholesale; the scroll anchor rides the
+    /// splices, landing on the nearest file header when its body vanishes.
     fn toggle_collapse_all(&mut self, cx: &mut Context<Self>) {
         let Some(parsed) = &self.parsed else {
             return;
         };
         let collapse = !self.all_collapsed();
-        let paths: Vec<String> = parsed.files.iter().map(|f| f.path.clone()).collect();
-        for path in paths {
-            let fold = self.folds.entry(path).or_default();
+        let files = parsed.files.clone();
+        for file in files.iter() {
+            let fold = self.folds.entry(file.path.clone()).or_default();
             fold.collapsed = collapse;
             fold.toggled_at = None;
         }
+        for file_ix in (0..self.row_ranges.len().min(files.len())).rev() {
+            let range = &self.row_ranges[file_ix];
+            let body = range.start + 1..range.end;
+            let new_len = if collapse {
+                0
+            } else {
+                body_row_count(&files[file_ix])
+            };
+            if body.len() != new_len {
+                self.list.splice(body, new_len);
+            }
+        }
+        let (rows, ranges) = flatten_rows(&files, |_| collapse);
+        self.rows = rows;
+        self.row_ranges = ranges;
         cx.notify();
     }
 
@@ -1238,50 +1502,96 @@ impl Changes {
         };
         let files = parsed.files.clone();
         let parsed_key = parsed.key.clone();
-        let Some(file) = files.get(ix) else {
+        let Some(row) = self.rows.get(ix).copied() else {
             return gpui::Empty.into_any_element();
         };
         let theme = Theme::of(cx).clone();
-        let expanded_height = body_height(file);
-        let fold = self.folds.get(&file.path).copied().unwrap_or_default();
-        let highlight = self.request_highlight(file, &parsed_key, cx);
-        let path = file.path.clone();
-
-        let header = self.render_file_header(ix, file, &fold, expanded_height, &theme, cx);
-        let body = render_file_body(file, highlight, &theme);
-
-        // Collapse: 180 ms committed-height tween on toggle (windowed — see
-        // FileFold::animating); steady states paint at the target height
-        // directly.
-        let body: AnyElement = if fold.animating() {
-            let (from, to) = (fold.from, fold.to);
-            div()
-                .overflow_hidden()
-                .child(body)
-                .with_animation(
-                    SharedString::from(format!("fold-{path}-{}", fold.epoch)),
-                    COLLAPSE.animation(),
-                    move |el, t| el.h(px(motion::lerp(from, to, t))),
-                )
-                .into_any_element()
-        } else {
-            let target = if fold.collapsed { 0.0 } else { expanded_height };
-            div()
-                .overflow_hidden()
-                .h(px(target))
-                .child(body)
-                .into_any_element()
-        };
-
-        div()
-            .w_full()
-            .flex()
-            .flex_col()
-            .border_b_1()
-            .border_color(crate::theme::hairline(0.04))
-            .child(header)
-            .child(body)
-            .into_any_element()
+        match row {
+            DiffRow::FileHeader { file } => {
+                let Some(file_diff) = files.get(file as usize) else {
+                    return gpui::Empty.into_any_element();
+                };
+                let fold = self
+                    .folds
+                    .get(&file_diff.path)
+                    .copied()
+                    .unwrap_or_default();
+                self.render_file_header(file as usize, file_diff, &fold, &theme, cx)
+            }
+            DiffRow::Notice { file, notice } => files
+                .get(file as usize)
+                .and_then(|f| file_notices(f).into_iter().nth(notice as usize))
+                .map(|text| notice_row(text, &theme))
+                .unwrap_or_else(|| gpui::Empty.into_any_element()),
+            DiffRow::HunkHeader { file, hunk } => files
+                .get(file as usize)
+                .and_then(|f| f.hunks.get(hunk as usize))
+                .map(|h| hunk_header_row(&h.header, &theme))
+                .unwrap_or_else(|| gpui::Empty.into_any_element()),
+            DiffRow::Line {
+                file,
+                hunk,
+                line,
+                flat,
+            } => {
+                let Some(file_diff) = files.get(file as usize) else {
+                    return gpui::Empty.into_any_element();
+                };
+                let highlight = self.request_highlight(file_diff, &parsed_key, cx);
+                let Some(line) = file_diff
+                    .hunks
+                    .get(hunk as usize)
+                    .and_then(|h| h.lines.get(line as usize))
+                else {
+                    return gpui::Empty.into_any_element();
+                };
+                let tokens = highlight
+                    .as_ref()
+                    .and_then(|lines| lines.get(flat as usize))
+                    .map(|t| t.as_slice())
+                    .unwrap_or(&[]);
+                diff_line_row(line, tokens, &theme)
+            }
+            DiffRow::BodyPad { .. } => div()
+                .w_full()
+                .h(px(BODY_BOTTOM_PAD))
+                .into_any_element(),
+            DiffRow::FoldingBody { file } => {
+                let Some(file_diff) = files.get(file as usize) else {
+                    return gpui::Empty.into_any_element();
+                };
+                let fold = self
+                    .folds
+                    .get(&file_diff.path)
+                    .copied()
+                    .unwrap_or_default();
+                let highlight = self.request_highlight(file_diff, &parsed_key, cx);
+                let (from, to) = (fold.from, fold.to);
+                // Only the revealable slice is built — the tween never pays
+                // for lines it cannot show.
+                let cap = from.max(to).min(FOLD_TWEEN_MAX_PX);
+                let body = render_file_body_upto(file_diff, highlight, &theme, cap);
+                let clipped = div().w_full().overflow_hidden().child(body);
+                if fold.animating() {
+                    clipped
+                        .with_animation(
+                            SharedString::from(format!(
+                                "fold-{}-{}",
+                                file_diff.path, fold.epoch
+                            )),
+                            COLLAPSE.animation(),
+                            move |el, t| el.h(px(motion::lerp(from, to, t))),
+                        )
+                        .into_any_element()
+                } else {
+                    // Post-tween, pre-settle: hold the full target height so
+                    // the settle splice swaps rows without any reflow (the
+                    // capped slice always covers what the viewport can see —
+                    // tweens start from a clicked, on-screen header).
+                    clipped.h(px(to)).into_any_element()
+                }
+            }
+        }
     }
 
     fn render_file_header(
@@ -1289,7 +1599,6 @@ impl Changes {
         ix: usize,
         file: &FileDiff,
         fold: &FileFold,
-        expanded_height: f32,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -1324,10 +1633,16 @@ impl Changes {
         };
 
         // Header row: chevron + mono path (one quiet tone) + right-aligned
-        // +N / −N counts on a slightly raised wash.
+        // +N / −N counts on a slightly raised wash. The header carries the
+        // section separator (the per-file wrapper it used to hang on is
+        // gone — rows are flat now).
         div()
             .id(SharedString::from(format!("file-hdr-{ix}")))
+            .w_full()
             .h(px(FILE_HEADER_HEIGHT))
+            .when(ix > 0, |el| {
+                el.border_t_1().border_color(crate::theme::hairline(0.04))
+            })
             .flex_none()
             .flex()
             .flex_row()
@@ -1338,7 +1653,7 @@ impl Changes {
             .cursor_pointer()
             .hover(|s| s.bg(crate::theme::ink(0.05)))
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.toggle_fold(&path, expanded_height);
+                this.toggle_fold(ix, cx);
                 cx.notify();
             }))
             .child(chevron)
@@ -1800,33 +2115,54 @@ fn diff_token_color(class: crate::markdown::highlight::TokenClass, theme: &Theme
     render::token_color(class, theme)
 }
 
-/// The expanded body of one file section: notices, hunk headers, +/-/context
-/// lines with a coloured accent bar, dual line-number gutters, a marker
-/// column, and paint-only syntax runs (komet checkout-diff-sidebar).
-/// Shared with the transcript's tool-diff detail blocks — the same component
-/// renders a checkout diff section and an inline ACP tool diff.
-pub(crate) fn render_file_body(
-    file: &FileDiff,
-    highlight: Option<Arc<Vec<Vec<Token>>>>,
-    theme: &Theme,
-) -> AnyElement {
-    let mono = font(theme.font_mono.clone());
-    let mut line_ix = 0usize;
-    let mut children: Vec<AnyElement> = Vec::new();
+/// One notice row ("New file", "Binary file — contents not shown", …).
+fn notice_row(notice: String, theme: &Theme) -> AnyElement {
+    div()
+        .h(px(NOTICE_HEIGHT))
+        .w_full()
+        .flex_none()
+        .flex()
+        .items_center()
+        .px(px(Theme::SPACE_LG))
+        .text_size(px(11.0))
+        .text_color(theme.text_faint)
+        .child(SharedString::from(notice))
+        .into_any_element()
+}
 
-    for notice in file_notices(file) {
-        children.push(
-            div()
-                .h(px(NOTICE_HEIGHT))
-                .flex_none()
-                .flex()
-                .items_center()
-                .px(px(Theme::SPACE_LG))
-                .text_size(px(11.0))
-                .text_color(theme.text_faint)
-                .child(SharedString::from(notice))
-                .into_any_element(),
-        );
+/// One `@@ … @@` hunk-header row on the bluish-grey wash.
+fn hunk_header_row(header: &str, theme: &Theme) -> AnyElement {
+    div()
+        .h(px(HUNK_HEADER_HEIGHT))
+        .w_full()
+        .flex_none()
+        .flex()
+        .items_center()
+        .px(px(Theme::SPACE_LG))
+        .bg(theme.diff_hunk_bg)
+        .font_family(theme.font_mono.clone())
+        .text_size(px(11.0))
+        .text_color(theme.text_faint)
+        .child(SharedString::from(header.to_string()))
+        .into_any_element()
+}
+
+/// One +/−/context/meta diff line: coloured accent bar, dual line-number
+/// gutters, marker column, and paint-only syntax runs.
+fn diff_line_row(line: &DiffLine, tokens: &[Token], theme: &Theme) -> AnyElement {
+    if line.kind == LineKind::Meta {
+        return div()
+            .h(px(DIFF_LINE_HEIGHT))
+            .w_full()
+            .flex_none()
+            .flex()
+            .items_center()
+            .pl(px(ACCENT_BAR_WIDTH + 2.0 * GUTTER_WIDTH + MARKER_WIDTH + 12.0))
+            .text_size(px(10.5))
+            .text_color(theme.text_faint)
+            .italic()
+            .child(SharedString::from(line.text.clone()))
+            .into_any_element();
     }
 
     // Row tints sampled from the reference: ~5–6% washes over the pane tone.
@@ -1834,153 +2170,164 @@ pub(crate) fn render_file_body(
     add_bg.a = 0.055;
     let mut del_bg = del_color(theme);
     del_bg.a = 0.055;
-    // Bluish-grey hunk-header wash.
-    let hunk_bg = theme.diff_hunk_bg;
 
-    for hunk in &file.hunks {
-        children.push(
+    let (marker, marker_color, row_bg, accent, number_color) = match line.kind {
+        LineKind::Add => (
+            "+",
+            add_color(theme),
+            Some(add_bg),
+            Some(add_color(theme).opacity(0.55)),
+            add_color(theme).opacity(0.9),
+        ),
+        LineKind::Del => (
+            "−",
+            del_color(theme),
+            Some(del_bg),
+            Some(del_color(theme).opacity(0.55)),
+            del_color(theme).opacity(0.9),
+        ),
+        _ => (
+            "·",
+            theme.text_faint.opacity(0.5),
+            None,
+            None,
+            theme.text_faint.opacity(0.8),
+        ),
+    };
+    let gutter = |no: Option<u32>, color: gpui::Hsla| {
+        div()
+            .w(px(GUTTER_WIDTH))
+            .flex_none()
+            .font_family(theme.font_mono.clone())
+            .text_size(px(11.0))
+            .text_color(color)
+            .flex()
+            .justify_end()
+            .pr(px(8.0))
+            .child(SharedString::from(
+                no.map(|n| n.to_string()).unwrap_or_default(),
+            ))
+    };
+    let mono = font(theme.font_mono.clone());
+    let runs = render::runs_with_palette(
+        &line.text,
+        tokens,
+        &mono,
+        theme.text.opacity(0.92),
+        |class| diff_token_color(class, theme),
+    );
+    div()
+        .h(px(DIFF_LINE_HEIGHT))
+        .w_full()
+        .flex_none()
+        .flex()
+        .flex_row()
+        .items_center()
+        .when_some(row_bg, |el, bg| el.bg(bg))
+        // Accent bar: solid colour on +/− rows, invisible spacer on
+        // context rows so columns always align.
+        .child(
             div()
-                .h(px(HUNK_HEADER_HEIGHT))
+                .w(px(ACCENT_BAR_WIDTH))
+                .h_full()
+                .flex_none()
+                .when_some(accent, |el, color| el.bg(color)),
+        )
+        .child(gutter(
+            line.old_no,
+            if line.kind == LineKind::Del {
+                number_color
+            } else {
+                theme.text_faint.opacity(0.8)
+            },
+        ))
+        .child(gutter(
+            line.new_no,
+            if line.kind == LineKind::Add {
+                number_color
+            } else {
+                theme.text_faint.opacity(0.8)
+            },
+        ))
+        .child(
+            div()
+                .w(px(MARKER_WIDTH))
                 .flex_none()
                 .flex()
-                .items_center()
-                .px(px(Theme::SPACE_LG))
-                .bg(hunk_bg)
+                .justify_center()
+                .text_size(px(DIFF_TEXT_SIZE))
+                .text_color(marker_color)
                 .font_family(theme.font_mono.clone())
-                .text_size(px(11.0))
-                .text_color(theme.text_faint)
-                .child(SharedString::from(hunk.header.clone()))
-                .into_any_element(),
-        );
-        for line in &hunk.lines {
-            let tokens = highlight
-                .as_ref()
-                .and_then(|lines| lines.get(line_ix))
-                .map(|t| t.as_slice())
-                .unwrap_or(&[]);
-            line_ix += 1;
+                .child(SharedString::from(marker)),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .overflow_hidden()
+                .pl(px(12.0))
+                .font_family(theme.font_mono.clone())
+                .text_size(px(DIFF_TEXT_SIZE))
+                .whitespace_nowrap()
+                .child(gpui::StyledText::new(line.text.clone()).with_runs(runs)),
+        )
+        .into_any_element()
+}
 
-            if line.kind == LineKind::Meta {
-                children.push(
-                    div()
-                        .h(px(DIFF_LINE_HEIGHT))
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .pl(px(ACCENT_BAR_WIDTH
-                            + 2.0 * GUTTER_WIDTH
-                            + MARKER_WIDTH
-                            + 12.0))
-                        .text_size(px(10.5))
-                        .text_color(theme.text_faint)
-                        .italic()
-                        .child(SharedString::from(line.text.clone()))
-                        .into_any_element(),
-                );
-                continue;
+/// The expanded body of one file section: notices, hunk headers, +/-/context
+/// lines with a coloured accent bar, dual line-number gutters, a marker
+/// column, and paint-only syntax runs (komet checkout-diff-sidebar).
+/// Shared with the transcript's tool-diff detail blocks — the same component
+/// renders a checkout diff section and an inline ACP tool diff. (The changes
+/// pane itself virtualizes these rows individually; this stacked form serves
+/// the transcript and the fold tween's clipped stand-in.)
+pub(crate) fn render_file_body(
+    file: &FileDiff,
+    highlight: Option<Arc<Vec<Vec<Token>>>>,
+    theme: &Theme,
+) -> AnyElement {
+    render_file_body_upto(file, highlight, theme, f32::INFINITY)
+}
+
+/// [`render_file_body`], building only rows that start above `max_px` — the
+/// fold tween's stand-in never materializes lines its clip cannot reveal.
+fn render_file_body_upto(
+    file: &FileDiff,
+    highlight: Option<Arc<Vec<Vec<Token>>>>,
+    theme: &Theme,
+    max_px: f32,
+) -> AnyElement {
+    let mut children: Vec<AnyElement> = Vec::new();
+    let mut y = 0.0f32;
+    let mut line_ix = 0usize;
+
+    'build: {
+        for notice in file_notices(file) {
+            if y >= max_px {
+                break 'build;
             }
-
-            let (marker, marker_color, row_bg, accent, number_color) = match line.kind {
-                LineKind::Add => (
-                    "+",
-                    add_color(theme),
-                    Some(add_bg),
-                    Some(add_color(theme).opacity(0.55)),
-                    add_color(theme).opacity(0.9),
-                ),
-                LineKind::Del => (
-                    "−",
-                    del_color(theme),
-                    Some(del_bg),
-                    Some(del_color(theme).opacity(0.55)),
-                    del_color(theme).opacity(0.9),
-                ),
-                _ => (
-                    "·",
-                    theme.text_faint.opacity(0.5),
-                    None,
-                    None,
-                    theme.text_faint.opacity(0.8),
-                ),
-            };
-            let gutter = |no: Option<u32>, color: gpui::Hsla| {
-                div()
-                    .w(px(GUTTER_WIDTH))
-                    .flex_none()
-                    .font_family(theme.font_mono.clone())
-                    .text_size(px(11.0))
-                    .text_color(color)
-                    .flex()
-                    .justify_end()
-                    .pr(px(8.0))
-                    .child(SharedString::from(
-                        no.map(|n| n.to_string()).unwrap_or_default(),
-                    ))
-            };
-            let runs = render::runs_with_palette(
-                &line.text,
-                tokens,
-                &mono,
-                theme.text.opacity(0.92),
-                |class| diff_token_color(class, theme),
-            );
-            children.push(
-                div()
-                    .h(px(DIFF_LINE_HEIGHT))
-                    .flex_none()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .when_some(row_bg, |el, bg| el.bg(bg))
-                    // Accent bar: solid colour on +/− rows, invisible spacer on
-                    // context rows so columns always align.
-                    .child(
-                        div()
-                            .w(px(ACCENT_BAR_WIDTH))
-                            .h_full()
-                            .flex_none()
-                            .when_some(accent, |el, color| el.bg(color)),
-                    )
-                    .child(gutter(
-                        line.old_no,
-                        if line.kind == LineKind::Del {
-                            number_color
-                        } else {
-                            theme.text_faint.opacity(0.8)
-                        },
-                    ))
-                    .child(gutter(
-                        line.new_no,
-                        if line.kind == LineKind::Add {
-                            number_color
-                        } else {
-                            theme.text_faint.opacity(0.8)
-                        },
-                    ))
-                    .child(
-                        div()
-                            .w(px(MARKER_WIDTH))
-                            .flex_none()
-                            .flex()
-                            .justify_center()
-                            .text_size(px(DIFF_TEXT_SIZE))
-                            .text_color(marker_color)
-                            .font_family(theme.font_mono.clone())
-                            .child(SharedString::from(marker)),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .pl(px(12.0))
-                            .font_family(theme.font_mono.clone())
-                            .text_size(px(DIFF_TEXT_SIZE))
-                            .whitespace_nowrap()
-                            .child(gpui::StyledText::new(line.text.clone()).with_runs(runs)),
-                    )
-                    .into_any_element(),
-            );
+            children.push(notice_row(notice, theme));
+            y += NOTICE_HEIGHT;
+        }
+        for hunk in &file.hunks {
+            if y >= max_px {
+                break 'build;
+            }
+            children.push(hunk_header_row(&hunk.header, theme));
+            y += HUNK_HEADER_HEIGHT;
+            for line in &hunk.lines {
+                if y >= max_px {
+                    break 'build;
+                }
+                let tokens = highlight
+                    .as_ref()
+                    .and_then(|lines| lines.get(line_ix))
+                    .map(|t| t.as_slice())
+                    .unwrap_or(&[]);
+                children.push(diff_line_row(line, tokens, theme));
+                y += DIFF_LINE_HEIGHT;
+                line_ix += 1;
+            }
         }
     }
 
@@ -2271,6 +2618,77 @@ rename to new_name.rs
         assert_eq!(parse_hunk_header("@@ -1,4 +2,5 @@"), Some((1, 2)));
         assert_eq!(parse_hunk_header("@@ -7 +9 @@ fn ctx"), Some((7, 9)));
         assert_eq!(parse_hunk_header("@@ garbage"), None);
+    }
+
+    #[test]
+    fn rows_flatten_to_line_granularity() {
+        let files = parse_patch(PATCH);
+        let (rows, ranges) = flatten_rows(&files, |_| false);
+        assert_eq!(ranges.len(), files.len());
+        // Every file's span starts with its header…
+        for (ix, range) in ranges.iter().enumerate() {
+            assert_eq!(rows[range.start], DiffRow::FileHeader { file: ix as u32 });
+            // …and spans exactly header + analytic body rows.
+            assert_eq!(range.len(), 1 + body_row_count(&files[ix]));
+        }
+        // Spans tile the whole row vec.
+        assert_eq!(ranges.last().unwrap().end, rows.len());
+
+        // src/main.rs: header, 2 hunk headers, 8 lines, pad.
+        let main_rows = &rows[ranges[0].clone()];
+        assert_eq!(main_rows.len(), 1 + 2 + 8 + 1);
+        assert_eq!(main_rows[1], DiffRow::HunkHeader { file: 0, hunk: 0 });
+        // Flat line indices run across hunks (they key the highlight slot).
+        let flats: Vec<u32> = main_rows
+            .iter()
+            .filter_map(|r| match r {
+                DiffRow::Line { flat, .. } => Some(*flat),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(flats, (0..8).collect::<Vec<u32>>());
+        assert_eq!(*main_rows.last().unwrap(), DiffRow::BodyPad { file: 0 });
+
+        // A collapsed file contributes its header row only.
+        let (rows, ranges) = flatten_rows(&files, |ix| ix == 0);
+        assert_eq!(ranges[0].len(), 1);
+        assert_eq!(rows[ranges[1].start], DiffRow::FileHeader { file: 1 });
+
+        // Notices lead the body: the added file carries "New file".
+        let added_rows = &rows[ranges[1].clone()];
+        assert_eq!(added_rows[1], DiffRow::Notice { file: 1, notice: 0 });
+    }
+
+    #[test]
+    fn truncate_caps_lines_and_appends_notice() {
+        let mut file = parse_patch(PATCH).remove(0); // 2 hunks, 8 lines
+        let untouched = file.clone();
+        truncate_file_lines(&mut file, 10);
+        assert_eq!(file, untouched, "under the cap: untouched");
+
+        truncate_file_lines(&mut file, 6);
+        let lines: usize = file.hunks.iter().map(|h| h.lines.len()).sum();
+        assert_eq!(lines, 6);
+        assert_eq!(file.hunks.len(), 2);
+        assert!(
+            file_notices(&file)
+                .iter()
+                .any(|n| n.contains("first 6 of 8 lines"))
+        );
+        // body_height stays consistent with what actually renders.
+        assert_eq!(
+            body_height(&file),
+            NOTICE_HEIGHT
+                + 2.0 * HUNK_HEADER_HEIGHT
+                + 6.0 * DIFF_LINE_HEIGHT
+                + BODY_BOTTOM_PAD
+        );
+
+        // A cap below the first hunk's length drops later hunks entirely.
+        let mut file = parse_patch(PATCH).remove(0);
+        truncate_file_lines(&mut file, 3);
+        assert_eq!(file.hunks.len(), 1);
+        assert_eq!(file.hunks[0].lines.len(), 3);
     }
 
     #[test]
