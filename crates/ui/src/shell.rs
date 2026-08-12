@@ -480,10 +480,6 @@ pub struct Shell {
     add_space: Option<AddSpaceFlow>,
     /// The sidebar's space-filter dropdown.
     spaces_menu: popover::Popup<spaces::SpacesMenu>,
-    /// When the dropdown was closed by an outside mouse-down; lets the
-    /// trigger's click tell "toggle closed" apart from "just dismissed by
-    /// this same click" (same guard as `user_menu_dismissed_at`).
-    spaces_menu_dismissed_at: Option<std::time::Instant>,
     /// Chat id whose STATUS CORNER is under the pointer — just that corner
     /// swaps to the archive button (t3code's settle-on-hover); hovering the
     /// row body leaves the status readable.
@@ -496,9 +492,6 @@ pub struct Shell {
     /// it (a row's FIRST appearance never chimes, so boot stays silent).
     sound_prev: std::collections::HashMap<String, komet_proto::SessionStatus>,
     user_menu: popover::Popup<()>,
-    /// Outside-click dismissal instant — suppresses the trigger click that
-    /// follows the same mouse-down from instantly reopening the menu.
-    user_menu_dismissed_at: Option<std::time::Instant>,
     /// Inline sidebar error strip (mutation failures); click dismisses.
     sidebar_notice: Option<SharedString>,
     /// Local lifecycle of an in-app update (macOS bundle swap) — the engine's
@@ -707,13 +700,11 @@ impl Shell {
             delete_space_confirm: None,
             add_space: None,
             spaces_menu: popover::Popup::default(),
-            spaces_menu_dismissed_at: None,
             chat_status_hover: None,
             sidebar_scroll: gpui::ScrollHandle::new(),
             space_boot_applied: false,
             sound_prev: std::collections::HashMap::new(),
             user_menu: popover::Popup::default(),
-            user_menu_dismissed_at: None,
             sidebar_notice: None,
             update_flow: UpdateFlow::Idle,
             update_task: None,
@@ -2667,16 +2658,16 @@ impl Shell {
                 )
             })
             .on_hover(motion::hover_listener("user-menu-trigger"))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| this.user_menu.note_trigger_press()),
+            )
             .on_click(cx.listener(|this, _, _, cx| {
-                // A click that just dismissed the menu (outside-click on the
-                // trigger) must not instantly reopen it.
-                let just_dismissed = this
-                    .user_menu_dismissed_at
-                    .is_some_and(|at| at.elapsed() < Duration::from_millis(400));
-                this.user_menu_dismissed_at = None;
-                if this.user_menu.is_open() {
+                // A press that found the menu open closes it (the card's
+                // mouse-down-out already began the close) — never reopen.
+                if this.user_menu.take_press_was_open() {
                     this.close_user_menu(cx);
-                } else if !just_dismissed {
+                } else {
                     this.user_menu.open(());
                 }
                 cx.notify();
@@ -2732,7 +2723,6 @@ impl Shell {
             let menu = popover::popover_card(theme)
                 .w(px(self.settings.sidebar_width - 2.0 * Theme::SPACE_SM))
                 .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                    this.user_menu_dismissed_at = Some(std::time::Instant::now());
                     this.close_user_menu(cx);
                 }))
                 .flex()

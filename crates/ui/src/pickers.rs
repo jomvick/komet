@@ -13,7 +13,6 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
 
 use gpui::{
     AnyElement, App, Context, Entity, FocusHandle, Focusable as _, KeyDownEvent, SharedString,
@@ -383,9 +382,6 @@ pub struct Pickers {
     /// Shared search / URL / name input, reused across popovers.
     search: Entity<ComposerInput>,
     focus: FocusHandle,
-    /// Re-open suppression after outside-click dismissal (the dismiss and the
-    /// trigger click would otherwise toggle twice).
-    suppressed: Option<(PickerKind, Instant)>,
     /// `KOMET_OPEN_PICKER` boot: keep claiming focus until it sticks, so
     /// keyboard nav drives the data-side-opened popover (headless rigs have
     /// no synthetic pointer, but synthetic keys do arrive).
@@ -526,7 +522,6 @@ impl Pickers {
             model_scroll: gpui::ScrollHandle::new(),
             search,
             focus: cx.focus_handle(),
-            suppressed: None,
             boot_focus_pending: boot_open.is_some(),
             load_task: None,
             refs_task: None,
@@ -707,8 +702,7 @@ impl Pickers {
         self.open.get().copied()
     }
 
-    /// Begin the exit animation without arming re-open suppression (the
-    /// toggle-close path — the next trigger click should reopen normally).
+    /// Begin the exit animation (shared by every close path).
     fn animate_close(&mut self, cx: &mut Context<Self>) {
         if self.open.begin_close() {
             popover::reap_popup(cx, |pickers: &mut Self| &mut pickers.open);
@@ -716,9 +710,6 @@ impl Pickers {
     }
 
     fn close(&mut self, cx: &mut Context<Self>) {
-        if let Some(kind) = self.open_kind() {
-            self.suppressed = Some((kind, Instant::now()));
-        }
         self.animate_close(cx);
         cx.notify();
     }
@@ -732,16 +723,14 @@ impl Pickers {
     }
 
     fn toggle(&mut self, kind: PickerKind, window: &mut Window, cx: &mut Context<Self>) {
-        if self.open_kind() == Some(kind) {
+        // A press that found this picker open closes it — the card's
+        // `on_mouse_down_out` already began the close on that same press,
+        // so by click time the popup reads as closed and a plain toggle
+        // would reopen it. A press while a DIFFERENT picker is open doesn't
+        // count (see note_trigger_press_matching): that click switches.
+        let pressed_open = self.open.take_press_was_open();
+        if self.open_kind() == Some(kind) || pressed_open {
             self.animate_close(cx);
-            cx.notify();
-            return;
-        }
-        // A just-dismissed popover's trigger click must not instantly reopen.
-        if let Some((suppressed, at)) = self.suppressed.take()
-            && suppressed == kind
-            && at.elapsed() < Duration::from_millis(400)
-        {
             cx.notify();
             return;
         }
@@ -1849,6 +1838,12 @@ impl Pickers {
             })
             .on_hover(motion::hover_listener(id))
             .cursor_pointer()
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(move |this, _, _, _| {
+                    this.open.note_trigger_press_matching(|open| *open == kind)
+                }),
+            )
             .on_click(cx.listener(move |this, _, window, cx| this.toggle(kind, window, cx)))
             .when_some(chip_icon, |el, (path, tint)| {
                 el.child(
@@ -1908,6 +1903,12 @@ impl Pickers {
             })
             .on_hover(motion::hover_listener(id))
             .cursor_pointer()
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(move |this, _, _, _| {
+                    this.open.note_trigger_press_matching(|open| *open == kind)
+                }),
+            )
             .on_click(cx.listener(move |this, _, window, cx| this.toggle(kind, window, cx)))
             .child(
                 crate::icons::icon(icon_path)

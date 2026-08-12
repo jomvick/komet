@@ -1786,12 +1786,16 @@ impl Changes {
             ))
             .on_hover(motion::hover_listener("changes-scope-trigger"))
             .occlude()
-            .on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
-                window.prevent_default()
-            })
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, window, _| {
+                    window.prevent_default();
+                    this.scope_menu.note_trigger_press();
+                }),
+            )
             .on_click(cx.listener(|this, _, _, cx| {
                 cx.stop_propagation();
-                if this.scope_menu.is_open() {
+                if this.scope_menu.take_press_was_open() {
                     this.close_scope_menu(cx);
                 } else {
                     this.scope_menu.open(());
@@ -1916,12 +1920,16 @@ impl Changes {
             ))
             .on_hover(motion::hover_listener("changes-ref-trigger"))
             .occlude()
-            .on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
-                window.prevent_default()
-            })
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, window, _| {
+                    window.prevent_default();
+                    this.ref_menu.note_trigger_press();
+                }),
+            )
             .on_click(cx.listener(|this, _, window, cx| {
                 cx.stop_propagation();
-                if this.ref_menu.is_open() {
+                if this.ref_menu.take_press_was_open() {
                     this.close_ref_menu(cx);
                     cx.notify();
                 } else {

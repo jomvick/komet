@@ -68,11 +68,17 @@ pub struct Popup<T> {
     /// `Some((state, closing_since))` while mounted; `closing_since` is the
     /// exit-phase start.
     inner: Option<(T, Option<std::time::Instant>)>,
+    /// Whether the popup was still mounted when the current trigger press
+    /// began — see [`Self::note_trigger_press`].
+    pressed_while_open: bool,
 }
 
 impl<T> Default for Popup<T> {
     fn default() -> Self {
-        Self { inner: None }
+        Self {
+            inner: None,
+            pressed_while_open: false,
+        }
     }
 }
 
@@ -132,6 +138,33 @@ impl<T> Popup<T> {
             }
             _ => false,
         }
+    }
+
+    /// Record, from the trigger's `on_mouse_down`, whether this popup is
+    /// still mounted. The anchored card's `on_mouse_down_out` fires on that
+    /// same press and begins the close, so by click (mouse-up) time the
+    /// popup already reads as closed — the click handler alone cannot tell
+    /// "this press dismissed it; stay closed" from "open fresh", and a
+    /// plain toggle closes-and-reopens (user report). Both handler orders
+    /// work: open and mid-exit each count as mounted. Every trigger click
+    /// is preceded by a trigger mouse-down, so the note is never stale.
+    pub fn note_trigger_press(&mut self) {
+        self.note_trigger_press_matching(|_| true);
+    }
+
+    /// [`Self::note_trigger_press`] for popups whose state distinguishes
+    /// which trigger owns them (e.g. one `Popup<PickerKind>` shared by
+    /// several triggers): only a press on the OWNING trigger counts, so
+    /// clicking a different trigger switches menus instead of swallowing.
+    pub fn note_trigger_press_matching(&mut self, owns: impl FnOnce(&T) -> bool) {
+        self.pressed_while_open = self.inner.as_ref().is_some_and(|(value, _)| owns(value));
+    }
+
+    /// Consume the press note: `true` when the press that produced the
+    /// current click found the popup mounted — the click should leave it
+    /// closed rather than reopen it.
+    pub fn take_press_was_open(&mut self) -> bool {
+        std::mem::take(&mut self.pressed_while_open)
     }
 
     /// Drop the state if the exit phase has run its course. A popup reopened
@@ -958,6 +991,40 @@ pub fn error_row(theme: &Theme, message: &str) -> gpui::Div {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trigger_press_note_distinguishes_dismiss_from_open() {
+        let mut popup: Popup<u8> = Popup::default();
+
+        // Fresh open: press finds nothing mounted → click opens.
+        popup.note_trigger_press();
+        assert!(!popup.take_press_was_open());
+        popup.open(1);
+
+        // Trigger click while open: the card's mouse-down-out begins the
+        // close on the press (either handler order) — the note still reads
+        // mounted, so the click must NOT reopen.
+        popup.note_trigger_press();
+        popup.begin_close();
+        assert!(popup.take_press_was_open());
+        // Out-handler first, trigger note second: mid-exit still counts.
+        popup.open(1);
+        popup.begin_close();
+        popup.note_trigger_press();
+        assert!(popup.take_press_was_open());
+
+        // The note is consumed — a later click starts clean.
+        assert!(!popup.take_press_was_open());
+
+        // Kind-keyed popups: a press on a DIFFERENT trigger doesn't count,
+        // so that click switches menus instead of swallowing.
+        let mut popup: Popup<u8> = Popup::default();
+        popup.open(1);
+        popup.note_trigger_press_matching(|kind| *kind == 2);
+        assert!(!popup.take_press_was_open());
+        popup.note_trigger_press_matching(|kind| *kind == 1);
+        assert!(popup.take_press_was_open());
+    }
 
     #[test]
     fn menu_step_wraps_and_enters() {

@@ -14,7 +14,6 @@
 //! gate (plus "can't disable the last enabled harness") where the state
 //! lives, so a raced or stale toggle self-corrects from the RPC reply.
 
-use std::time::Duration;
 
 use gpui::{
     AnyElement, Context, Entity, IntoElement, Render, SharedString, Task, Window, div, prelude::*,
@@ -65,8 +64,11 @@ pub struct HarnessesPage {
     /// passthrough). Retargeted by the page-header device switcher.
     target_device: Option<String>,
     device_menu_open: bool,
-    /// Outside-click dismissal vs trigger-click race (the Accounts pattern).
-    device_menu_dismissed_at: Option<std::time::Instant>,
+    /// Whether the menu was open when the trigger press began — the menu's
+    /// `on_mouse_down_out` closes it on that same press, so by click time a
+    /// plain toggle would reopen (the [`popover::Popup`] press note, for
+    /// this page's bool-state menu).
+    device_menu_pressed_open: bool,
     /// Last refused/failed toggle (engine guards), shown in the error strip.
     error: Option<String>,
     load_task: Option<Task<()>>,
@@ -80,7 +82,7 @@ impl HarnessesPage {
             harnesses: Loadable::Idle,
             target_device: None,
             device_menu_open: false,
-            device_menu_dismissed_at: None,
+            device_menu_pressed_open: false,
             error: None,
             load_task: None,
             toggle_task: None,
@@ -227,12 +229,17 @@ impl HarnessesPage {
                     gpui::transparent_black()
                 })
                 .when(!open, |el| el.hover(|s| s.bg(crate::theme::ink(0.04))))
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(|this, _, _, _| {
+                        this.device_menu_pressed_open = this.device_menu_open;
+                    }),
+                )
                 .on_click(cx.listener(|this, _, _, cx| {
-                    let just_dismissed = this
-                        .device_menu_dismissed_at
-                        .is_some_and(|at| at.elapsed() < Duration::from_millis(400));
-                    this.device_menu_open = !this.device_menu_open && !just_dismissed;
-                    this.device_menu_dismissed_at = None;
+                    // A press that found the menu open closes it — never
+                    // reopen on the same gesture.
+                    let pressed_open = std::mem::take(&mut this.device_menu_pressed_open);
+                    this.device_menu_open = !pressed_open && !this.device_menu_open;
                     cx.notify();
                 }))
                 .child(
@@ -269,7 +276,6 @@ impl HarnessesPage {
                 .w(px(220.0))
                 .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                     this.device_menu_open = false;
-                    this.device_menu_dismissed_at = Some(std::time::Instant::now());
                     cx.notify();
                 }))
                 .flex()
