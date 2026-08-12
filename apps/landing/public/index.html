@@ -37,7 +37,24 @@
     --mono: "Geist Mono", ui-monospace, "SF Mono", Menlo, monospace;
   }
   * { margin: 0; padding: 0; box-sizing: border-box; }
-  html { background: var(--bg); scroll-behavior: smooth; }
+  html {
+    background: var(--bg);
+    scroll-behavior: smooth;
+    /* Always reserve the gutter so content never shifts; the styled
+       transparent track makes the bar read as an overlay on black. */
+    overflow-y: scroll;
+    scrollbar-width: thin;
+    scrollbar-color: #2a2140 transparent;
+  }
+  ::-webkit-scrollbar { width: 10px; background: transparent; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb {
+    background: #2a2140;
+    border-radius: 5px;
+    border: 2px solid transparent;
+    background-clip: content-box;
+  }
+  ::-webkit-scrollbar-thumb:hover { background-color: #3d3060; }
   body {
     font-family: var(--sans);
     color: var(--ink);
@@ -161,7 +178,7 @@
   }
   @media (max-width: 900px) {
     .hero-grid { grid-template-columns: 1fr; padding-top: 48px; }
-    .hero-ascii { justify-self: center; font-size: 6px; order: 2; }
+    .hero-ascii { display: none; }
   }
 
   /* ── shot ────────────────────────────────────────────── */
@@ -215,8 +232,6 @@
     font-weight: 600;
     letter-spacing: 0.14em;
     color: var(--purple-hi);
-    border-top: 1px dashed var(--line);
-    padding-top: 18px;
     margin-bottom: 16px;
   }
   .cell h3 {
@@ -230,34 +245,15 @@
   @media (max-width: 560px) { .features { grid-template-columns: 1fr; gap: 36px; } }
 
   /* ── closing ─────────────────────────────────────────── */
-  .closing {
-    position: relative;
-    margin-top: 140px;
-    padding: 110px 32px;
-    text-align: center;
-    overflow: hidden;
-  }
-  .closing-bg {
-    position: absolute;
-    inset: 0;
-    background-image: url("/assets/statue.jpg");
-    background-size: cover;
-    background-position: center 30%;
-    opacity: 0.13;
-    filter: saturate(1.15) brightness(0.85);
-    -webkit-mask-image: linear-gradient(180deg, transparent, #000 35%, #000 65%, transparent);
-    mask-image: linear-gradient(180deg, transparent, #000 35%, #000 65%, transparent);
-    pointer-events: none;
-  }
-  .closing-inner { position: relative; z-index: 1; }
+  .closing { margin: 140px 0 80px; }
   .closing h2 {
     font-size: clamp(28px, 3.8vw, 40px);
     font-weight: 600;
     letter-spacing: -0.03em;
     text-wrap: balance;
   }
-  .closing p { margin: 16px auto 0; max-width: 440px; font-size: 15px; line-height: 1.65; color: var(--dim); }
-  .closing .cta-row { margin-top: 34px; display: flex; justify-content: center; gap: 14px; flex-wrap: wrap; }
+  .closing p { margin: 16px 0 0; max-width: 440px; font-size: 15px; line-height: 1.65; color: var(--dim); }
+  .closing .cta-row { margin-top: 34px; display: flex; gap: 14px; flex-wrap: wrap; }
 
   footer { padding: 28px 0 40px; }
   .footer-inner {
@@ -271,6 +267,46 @@
   .footer-inner .right { margin-left: auto; display: flex; align-items: center; gap: 20px; }
   .footer-inner .gh-icon { padding: 0; }
   footer a:hover { color: var(--dim); }
+
+  /* ── edge ascii (app preview only) ───────────────────── */
+  .shot .wrap { z-index: 1; }
+  .dither {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 140px;
+    z-index: 0;
+    pointer-events: none;
+    -webkit-mask-image: linear-gradient(to bottom, transparent 0%, #000 20%, #000 80%, transparent 100%);
+    mask-image: linear-gradient(to bottom, transparent 0%, #000 20%, #000 80%, transparent 100%);
+  }
+  .dither-left { left: 0; }
+  .dither-right { right: 0; }
+  .dither canvas { width: 100%; height: 100%; display: block; }
+  @media (max-width: 1440px) { .dither { display: none; } }
+
+  /* ── mobile ──────────────────────────────────────────── */
+  @media (max-width: 640px) {
+    .wrap { padding: 0 20px; }
+    .nav-inner { height: 56px; }
+    .hero-grid { padding: 36px 20px 32px; gap: 44px; }
+    h1 { font-size: clamp(32px, 9vw, 38px); }
+    .hero p.sub { font-size: 15px; }
+    .hero .cta-row { margin-top: 28px; }
+    .agents { gap: 22px; margin-top: 30px; }
+    .agent-icon { width: 20px; height: 20px; }
+    .shot { padding: 28px 0 0; }
+    .shot img { border-radius: 4px; }
+    .features { padding: 64px 20px 0; gap: 36px; }
+    .closing { margin: 80px 0 56px; }
+    .closing p { font-size: 14px; }
+    .closing .cta-row { margin-top: 28px; }
+    footer { padding: 20px 0 32px; }
+    .footer-inner { row-gap: 8px; }
+  }
+  @media (max-width: 460px) {
+    .cta-row .btn { flex: 0 0 auto; }
+  }
 </style>
 </head>
 <body>
@@ -357,6 +393,8 @@
   </header>
 
   <section class="shot">
+    <div class="dither dither-left" aria-hidden="true"><canvas></canvas></div>
+    <div class="dither dither-right" aria-hidden="true"><canvas></canvas></div>
     <div class="wrap">
       <img src="/assets/app-screenshot.jpg" alt="Komet driving a Claude Code session with a live branch diff sidebar" />
     </div>
@@ -390,8 +428,7 @@
   </section>
 
   <section class="closing">
-    <div class="closing-bg" aria-hidden="true"></div>
-    <div class="closing-inner">
+    <div class="wrap">
       <h2>Bring your agents together.</h2>
       <p>One window over every machine you own. Open source and MIT licensed.</p>
       <div class="cta-row">
@@ -427,6 +464,78 @@
       document.getElementById("ver").textContent = `v${ver}`;
     })
     .catch(() => {});
+
+  // Edge ascii: a slow-warping noise field mapped through a glyph density
+  // ramp — organic clusters of characters hugging each page edge, dense at
+  // the outside and thinning toward the content. Freezes on reduced motion.
+  (() => {
+    const CW = 12, CH = 14; // glyph cell
+    const RAMP = [" ", " ", " ", ".", ":", ">", "~", "×", "*", "#"];
+    const panes = [...document.querySelectorAll(".dither")].map((el, i) => ({
+      el,
+      cv: el.querySelector("canvas"),
+      ctx: el.querySelector("canvas").getContext("2d"),
+      right: el.classList.contains("dither-right"),
+      ox: i * 397, // decorrelate the two sides
+      cols: 0,
+      rows: 0,
+    }));
+    const dpr = Math.min(devicePixelRatio || 1, 2);
+    const resize = () => {
+      for (const p of panes) {
+        const w = p.el.clientWidth, h = p.el.clientHeight;
+        p.cv.width = w * dpr;
+        p.cv.height = h * dpr;
+        p.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        p.ctx.font = '10px "Geist Mono", monospace';
+        p.ctx.textBaseline = "top";
+        p.cols = Math.ceil(w / CW);
+        p.rows = Math.ceil(h / CH);
+      }
+    };
+    const field = (x, y, t) => {
+      const a = x * 0.55, b = y * 0.35;
+      const v =
+        Math.sin(a + 2.1 * Math.sin(b * 0.9 + t) + t * 0.7) *
+        Math.cos(b - 1.7 * Math.sin(a * 0.6 - t * 0.8));
+      return 0.5 + 0.5 * v;
+    };
+    const draw = (t) => {
+      for (const p of panes) {
+        if (p.el.offsetWidth === 0) continue;
+        p.ctx.clearRect(0, 0, p.cv.width, p.cv.height);
+        for (let y = 0; y < p.rows; y++) {
+          for (let x = 0; x < p.cols; x++) {
+            // distance from the outer edge, 0 = outermost column
+            const edge = p.right ? p.cols - 1 - x : x;
+            const falloff = 1 - edge / p.cols;
+            const v = field(x + p.ox, y, t) * falloff * 1.35;
+            const g = RAMP[Math.min(RAMP.length - 1, (v * RAMP.length) | 0)];
+            if (g === " ") continue;
+            p.ctx.fillStyle = `rgba(139, 92, 246, ${(0.16 + v * 0.5).toFixed(2)})`;
+            p.ctx.fillText(g, x * CW + 2, y * CH + 2);
+          }
+        }
+      }
+    };
+    resize();
+    let last = 0;
+    addEventListener("resize", () => { resize(); draw(last); });
+    if (matchMedia("(prefers-reduced-motion: reduce)").matches) {
+      document.fonts.ready.then(() => draw(0));
+    } else {
+      let prev = 0;
+      const tick = (ms) => {
+        if (ms - prev > 66) { // ~15fps: the reference drifts slowly
+          prev = ms;
+          last = ms * 0.00022;
+          draw(last);
+        }
+        requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+    }
+  })();
 </script>
 </body>
 </html>
