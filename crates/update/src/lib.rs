@@ -511,6 +511,7 @@ pub type QuiescentCheck = Arc<dyn Fn() -> bool + Send + Sync>;
 pub struct Updater {
     edge_url: String,
     status_tx: Arc<watch::Sender<UpdateStatus>>,
+    check_tx: Arc<watch::Sender<u64>>,
     quiescent: Option<QuiescentCheck>,
 }
 
@@ -518,9 +519,11 @@ impl Updater {
     /// Spawn the check loop (must run on a tokio runtime).
     pub fn spawn(edge_url: String, quiescent: Option<QuiescentCheck>) -> Self {
         let (status_tx, _) = watch::channel(UpdateStatus::initial());
+        let (check_tx, _) = watch::channel(0);
         let updater = Self {
             edge_url,
             status_tx: Arc::new(status_tx),
+            check_tx: Arc::new(check_tx),
             quiescent,
         };
         let for_loop = updater.clone();
@@ -532,20 +535,36 @@ impl Updater {
         self.status_tx.subscribe()
     }
 
+    /// Wake the release checker immediately, for example when authentication
+    /// recovers after the process started offline.
+    pub fn check_now(&self) {
+        self.check_tx
+            .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+    }
+
     fn quiescent_now(&self) -> bool {
         self.quiescent.as_ref().is_none_or(|check| check())
     }
 
     async fn check_loop(&self) {
-        tokio::time::sleep(CHECK_INITIAL_DELAY).await;
+        let mut checks = self.check_tx.subscribe();
+        tokio::select! {
+            _ = tokio::time::sleep(CHECK_INITIAL_DELAY) => {}
+            _ = checks.changed() => {}
+        }
         loop {
             let ok = self.check_once().await;
-            if ok && self.status_tx.borrow().update_available && auto_update_enabled() {
-                if let InstallKind::Managed { .. } = detect_install() {
-                    self.auto_apply_when_idle().await;
-                }
+            if ok
+                && self.status_tx.borrow().update_available
+                && auto_update_enabled()
+                && let InstallKind::Managed { .. } = detect_install()
+            {
+                self.auto_apply_when_idle().await;
             }
-            tokio::time::sleep(if ok { CHECK_INTERVAL } else { CHECK_RETRY }).await;
+            tokio::select! {
+                _ = tokio::time::sleep(if ok { CHECK_INTERVAL } else { CHECK_RETRY }) => {}
+                _ = checks.changed() => {}
+            }
         }
     }
 

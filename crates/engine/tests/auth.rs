@@ -10,6 +10,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
 use komet_engine::{Auth, AuthConfig, AuthState};
+use komet_rpc::TokenSource;
 
 // ---------------------------------------------------------------------------
 // Fake JWTs
@@ -342,10 +343,16 @@ async fn headless_flow_exchanges_pasted_code_and_gates_on_org() {
     let orgs = auth.list_orgs().await.expect("list orgs");
     assert_eq!(orgs.len(), 1);
     assert_eq!(orgs[0].organization_id, "org_1");
+    let mut token_changes = auth.subscribe().expect("auth token signal");
     auth.select_org("org_1").await.expect("select org");
+    token_changes
+        .changed()
+        .await
+        .expect("org-scoped token should wake transport supervisors");
     assert!(
         matches!(auth.state(), AuthState::SignedIn { org_id: Some(org), .. } if org == "org_1")
     );
+    assert!(auth.token().await.is_some());
     assert_eq!(
         edge.state
             .refresh_tokens

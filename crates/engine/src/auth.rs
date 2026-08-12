@@ -213,6 +213,7 @@ struct AuthInner {
     loaded_workos_session: bool,
     http: reqwest::Client,
     state_tx: watch::Sender<AuthState>,
+    token_tx: watch::Sender<u64>,
     stored: Mutex<Option<StoredSession>>,
     access: Mutex<Option<AccessEntry>>,
     /// Pending OAuth states plus the cancellation generation that fences code
@@ -266,6 +267,7 @@ impl Auth {
         };
         let loaded_workos_session = workos.is_some() && stored.is_some();
         let (state_tx, _) = watch::channel(initial);
+        let (token_tx, _) = watch::channel(0);
         let http = reqwest::Client::builder()
             .timeout(HTTP_TIMEOUT)
             .build()
@@ -277,6 +279,7 @@ impl Auth {
                 loaded_workos_session,
                 http,
                 state_tx,
+                token_tx,
                 stored: Mutex::new(stored),
                 access: Mutex::new(None),
                 sign_in: Mutex::new(SignInLifecycle::default()),
@@ -473,6 +476,9 @@ impl Auth {
         *lock(&self.inner.access) = None;
         self.persist::<&StoredSession>(None);
         self.inner.state_tx.send_replace(AuthState::SignedOut);
+        self.inner
+            .token_tx
+            .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
     }
 
     // -- organizations ------------------------------------------------------
@@ -647,6 +653,9 @@ impl Auth {
         self.inner
             .state_tx
             .send_replace(state_for(result.user, org_id));
+        self.inner
+            .token_tx
+            .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
         Ok(())
     }
 
@@ -745,6 +754,9 @@ impl Auth {
         if org_changed {
             self.inner.state_tx.send_replace(state_for(user, org_id));
         }
+        self.inner
+            .token_tx
+            .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
         Ok(Some(tokens.access_token))
     }
 
@@ -855,6 +867,10 @@ impl komet_rpc::TokenSource for Auth {
             return None;
         }
         self.access_token().await
+    }
+
+    fn subscribe(&self) -> Option<watch::Receiver<u64>> {
+        Some(self.inner.token_tx.subscribe())
     }
 }
 

@@ -66,6 +66,16 @@ const SNAPSHOT_DEBOUNCE_MS: u64 = 1_000;
 /// their retries into a thundering herd on the cold DO.
 pub(crate) const JOIN_RETRY_BASE: std::time::Duration = std::time::Duration::from_millis(500);
 pub(crate) const JOIN_RETRY_CAP: std::time::Duration = std::time::Duration::from_secs(30);
+
+pub(crate) async fn token_changed(changes: &mut Option<tokio::sync::watch::Receiver<u64>>) {
+    match changes {
+        Some(changes) => {
+            let _ = changes.changed().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
 /// Quiet-probe cadence for the registry room: fixed at 15 minutes. One room
 /// per engine, so the fixed cadence costs ~100 DO wakes/day total, and the
 /// probe is deadline-checked — a mute room is detected within
@@ -279,7 +289,7 @@ impl WorkspaceHost {
         let org_id = self.inner.config.org_id.clone();
         // Per-dial URL provider: the bearer is re-read on every (re)connect.
         let url = edge.room_url(format!("/registry/{org_id}/ws"));
-        self.spawn_join(url);
+        self.spawn_join(url, edge.token_changes());
     }
 
     /// Test seam: join a registry room at a fixed WebSocket URL without an
@@ -287,15 +297,20 @@ impl WorkspaceHost {
     /// server through this. Production always goes through [`Self::join_room`].
     #[doc(hidden)]
     pub fn connect_registry_url(&self, url: &str) {
-        self.spawn_join(Arc::new(komet_sync::StaticUrl(url.to_string())));
+        self.spawn_join(Arc::new(komet_sync::StaticUrl(url.to_string())), None);
     }
 
-    fn spawn_join(&self, url: Arc<dyn komet_sync::UrlProvider>) {
+    fn spawn_join(
+        &self,
+        url: Arc<dyn komet_sync::UrlProvider>,
+        mut token_changes: Option<tokio::sync::watch::Receiver<u64>>,
+    ) {
         let org_id = self.inner.config.org_id.clone();
         let reg = self.inner.reg.clone();
         let device_id = self.inner.config.device_id.clone();
         let weak = Arc::downgrade(&self.inner);
         tokio::spawn(async move {
+            let mut wake = komet_sync::wake::subscribe();
             // `RegistryClient` only self-reconnects AFTER a first successful
             // join; an INITIAL failure (a 500 from an overloaded DO, a token
             // racing a refresh, an edge deploy) must not end this task and
@@ -355,8 +370,17 @@ impl WorkspaceHost {
                             "registry room join failed; retrying");
                     }
                 }
-                tokio::time::sleep(backoff + join_retry_jitter()).await;
-                backoff = (backoff * 2).min(JOIN_RETRY_CAP);
+                tokio::select! {
+                    _ = tokio::time::sleep(backoff + join_retry_jitter()) => {
+                        backoff = (backoff * 2).min(JOIN_RETRY_CAP);
+                    }
+                    _ = wake.recv() => {
+                        backoff = JOIN_RETRY_BASE;
+                    }
+                    _ = token_changed(&mut token_changes) => {
+                        backoff = JOIN_RETRY_BASE;
+                    }
+                }
             }
         });
     }

@@ -111,6 +111,10 @@ impl EdgeConfig {
         self.token.token().await
     }
 
+    pub fn token_changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        self.token.subscribe()
+    }
+
     /// A per-dial room URL provider for `path` (e.g. `/session/{chatId}/ws`):
     /// the bearer is re-fetched before every connect, so reconnects after a
     /// token expiry present a fresh `?token=` instead of the boot-time one.
@@ -865,6 +869,7 @@ impl DocHost {
             let room_doc = doc.doc().clone();
             let chat = chat_id.to_string();
             let weak = Arc::downgrade(handle);
+            let mut token_changes = edge.token_changes();
             tokio::spawn(async move {
                 let mut wake = komet_sync::wake::subscribe();
                 let mut backoff = crate::workspace_host::JOIN_RETRY_BASE;
@@ -915,6 +920,9 @@ impl DocHost {
                         _ = wake.recv() => {
                             backoff = crate::workspace_host::JOIN_RETRY_BASE;
                         }
+                        _ = crate::workspace_host::token_changed(&mut token_changes) => {
+                            backoff = crate::workspace_host::JOIN_RETRY_BASE;
+                        }
                     }
                 }
             });
@@ -933,6 +941,7 @@ impl DocHost {
         let device = self.inner.config.device_id.clone();
         let weak = Arc::downgrade(handle);
         let host = self.clone();
+        let mut token_changes = edge.token_changes();
         tokio::spawn(async move {
             let sink = Arc::new(crate::chat2_host::EngineChatSink::new(&doc, store, chat.clone()));
             // The sink holds only a Weak doc ref (a strong one made every
@@ -1061,6 +1070,9 @@ impl DocHost {
                         backoff = (backoff * 2).min(crate::workspace_host::JOIN_RETRY_CAP);
                     }
                     _ = wake.recv() => {
+                        backoff = crate::workspace_host::JOIN_RETRY_BASE;
+                    }
+                    _ = crate::workspace_host::token_changed(&mut token_changes) => {
                         backoff = crate::workspace_host::JOIN_RETRY_BASE;
                     }
                 }

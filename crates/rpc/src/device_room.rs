@@ -186,6 +186,21 @@ pub fn device_room_ws_url(
 #[async_trait]
 pub trait TokenSource: Send + Sync + 'static {
     async fn token(&self) -> Option<String>;
+
+    /// Changes whenever credentials become available or are replaced. Long-lived
+    /// supervisors use this to retry immediately instead of waiting for backoff.
+    fn subscribe(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        None
+    }
+}
+
+async fn token_changed(changes: &mut Option<tokio::sync::watch::Receiver<u64>>) {
+    match changes {
+        Some(changes) => {
+            let _ = changes.changed().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
 }
 
 /// A fixed token (dev mode / tests).
@@ -247,6 +262,7 @@ impl HostRelay {
     ) -> Self {
         let task = tokio::spawn(async move {
             let mut wake = komet_sync::wake::subscribe();
+            let mut token_changes = config.token.subscribe();
             // Fast-rejoin bookkeeping: the edge DO periodically ends healthy
             // host sessions (hibernation/deploys). Every second the host is
             // away, client dials bounce with "readiness check failed" (user
@@ -288,6 +304,7 @@ impl HostRelay {
                     _ = tokio::time::sleep(delay + jitter()) => {}
                     // Wake = redial NOW (the old socket died with the suspend).
                     _ = wake.recv() => { delay = HOST_REJOIN_MIN; }
+                    _ = token_changed(&mut token_changes) => { delay = HOST_REJOIN_MIN; }
                 }
             }
         });
@@ -668,11 +685,27 @@ impl LinkCache {
             let weak = Arc::downgrade(&cache);
             tokio::spawn(async move {
                 let mut wake = komet_sync::wake::subscribe();
-                while wake.recv().await.is_ok() {
-                    let Some(cache) = weak.upgrade() else { return };
-                    lock(&cache.links).clear();
-                    lock(&cache.dial_state).clear();
-                    tracing::info!("peer: links + cooldowns cleared after wake");
+                let mut token_changes = weak
+                    .upgrade()
+                    .and_then(|cache| cache.config.token.subscribe());
+                loop {
+                    tokio::select! {
+                        result = wake.recv() => {
+                            if result.is_err() { return; }
+                            let Some(cache) = weak.upgrade() else { return };
+                            lock(&cache.links).clear();
+                            lock(&cache.dial_state).clear();
+                            tracing::info!("peer: links + cooldowns cleared after wake");
+                        }
+                        _ = token_changed(&mut token_changes) => {
+                            let Some(cache) = weak.upgrade() else { return };
+                            // A refreshed bearer makes failed future dials viable,
+                            // but existing sockets remain valid and must not be
+                            // interrupted underneath active remote streams.
+                            lock(&cache.dial_state).clear();
+                            tracing::info!("peer: dial cooldowns cleared after token change");
+                        }
+                    }
                 }
             });
         }

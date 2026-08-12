@@ -529,16 +529,23 @@ impl Engine {
         })
     }
 
-    /// Open one already-resolved profile and enable online transports only for
-    /// synced runtimes with live auth or development with an explicit bearer.
+    /// Open one already-resolved profile. Synced profiles always keep their
+    /// Edge supervisors alive; temporary token or network failures are runtime
+    /// states, not a reason to permanently assemble an offline engine.
     pub async fn assemble_runtime(
         config: &EngineConfig,
         auth: Auth,
         profile: EngineProfile,
     ) -> anyhow::Result<EngineRuntime> {
-        let online = match profile.scope() {
+        let edge_enabled = match profile.scope() {
             WorkspaceScope::Local => false,
-            WorkspaceScope::Synced => auth.access_token().await.is_some(),
+            WorkspaceScope::Synced => {
+                // Validate a persisted session once so definitive revocation
+                // still transitions auth to SignedOut. A transient failure
+                // must not gate construction of the recovery supervisors.
+                let _ = auth.access_token().await;
+                true
+            }
             // Dev Auth always exposes `dev_user_id` as its synthetic access
             // token, including when WorkOS was merely disabled with
             // KOMET_WORKOS_CLIENT_ID="". Only an explicitly configured,
@@ -549,7 +556,7 @@ impl Engine {
                 .is_some_and(|token| !token.trim().is_empty()),
         };
         let device_id = load_or_create_device_id(profile.device_root())?;
-        let edge = online.then(|| {
+        let edge = edge_enabled.then(|| {
             EdgeConfig::new(config.edge_url.clone(), Arc::new(auth.clone())).with_device(device_id)
         });
 
@@ -560,7 +567,7 @@ impl Engine {
             edge.clone(),
         )?;
         core.set_auth(auth.clone());
-        if online {
+        if edge_enabled {
             // Release checker: polls {edge}/releases on a 6h cadence; headless
             // installs with KOMET_AUTO_UPDATE=1 apply + restart themselves — gated
             // on quiescence so a restart never lands under a live run or open PTY.
@@ -569,10 +576,16 @@ impl Engine {
                 let terminals = core.terminals.clone();
                 Arc::new(move || !sessions.any_active() && !terminals.any_open())
             };
-            core.set_updater(komet_update::Updater::spawn(
-                config.edge_url.clone(),
-                Some(quiescent),
-            ));
+            let updater = komet_update::Updater::spawn(config.edge_url.clone(), Some(quiescent));
+            if let Some(mut token_changes) = edge.as_ref().and_then(EdgeConfig::token_changes) {
+                let updater_for_tokens = updater.clone();
+                tokio::spawn(async move {
+                    while token_changes.changed().await.is_ok() {
+                        updater_for_tokens.check_now();
+                    }
+                });
+            }
+            core.set_updater(updater);
         }
         tracing::info!(device_id = %core.device_id, "engine core assembled");
 

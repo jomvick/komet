@@ -166,6 +166,46 @@ async fn revoked_captured_session_stays_on_its_synced_cache() {
 }
 
 #[tokio::test]
+async fn transient_refresh_failure_keeps_synced_recovery_supervisors_alive() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("session.json"),
+        r#"{"refreshToken":"still-valid","user":{"id":"user_1","email":"u@example.com"},"orgId":"org_1"}"#,
+    )
+    .unwrap();
+    let config = config(
+        dir.path(),
+        "http://127.0.0.1:1".into(),
+        Some("client_test"),
+        None,
+    );
+    let auth = Engine::build_auth(&config).await;
+    let scope = Engine::initial_workspace_scope(&auth);
+    let profile = Engine::resolve_profile(&config, &auth, scope)
+        .unwrap()
+        .expect("persisted org resolves while Edge is unavailable");
+
+    let runtime = Engine::assemble_runtime(&config, auth.clone(), profile)
+        .await
+        .unwrap();
+
+    assert_eq!(scope, WorkspaceScope::Synced);
+    assert!(
+        auth.state().is_signed_in(),
+        "network errors are not revocation"
+    );
+    assert!(
+        runtime.core().links().is_some(),
+        "peer routing must recover without restarting the app"
+    );
+    assert!(
+        runtime.core().updater().is_some(),
+        "the Edge updater supervisor must survive an offline boot"
+    );
+    runtime.shutdown().await;
+}
+
+#[tokio::test]
 async fn development_without_an_explicit_bearer_stays_offline() {
     let dir = tempfile::tempdir().unwrap();
     let (edge_url, requests, edge_task) = rejecting_edge().await;

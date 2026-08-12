@@ -30,8 +30,8 @@ use komet_rpc::device_room::{
 };
 use komet_rpc::{
     DeviceFrameHeader, DeviceLink, HostRelay, HostRelayConfig, LinkCache, LinkCacheConfig,
-    RpcError, RpcReply, RpcService, StaticToken, decode_device_frame, device_room_ws_url,
-    encode_device_frame, methods,
+    RpcError, RpcReply, RpcService, StaticToken, TokenSource, decode_device_frame,
+    device_room_ws_url, encode_device_frame, methods,
 };
 
 // ---------------------------------------------------------------------------
@@ -326,9 +326,80 @@ fn noop_nudge() -> komet_rpc::NudgeHandler {
     Arc::new(|_| {})
 }
 
+struct RecoveringToken {
+    value: Mutex<Option<String>>,
+    changes: tokio::sync::watch::Sender<u64>,
+}
+
+impl RecoveringToken {
+    fn new(value: Option<&str>) -> Self {
+        let (changes, _) = tokio::sync::watch::channel(0);
+        Self {
+            value: Mutex::new(value.map(str::to_string)),
+            changes,
+        }
+    }
+
+    fn replace(&self, value: &str) {
+        *self.value.lock().expect("lock") = Some(value.into());
+        self.changes
+            .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+    }
+}
+
+#[async_trait]
+impl TokenSource for RecoveringToken {
+    async fn token(&self) -> Option<String> {
+        self.value.lock().expect("lock").clone()
+    }
+
+    fn subscribe(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        Some(self.changes.subscribe())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn token_recovery_wakes_a_signed_out_host_relay_immediately() {
+    let relay = FakeRelay::start().await;
+    let token = Arc::new(RecoveringToken::new(None));
+    let mut config = HostRelayConfig::new(relay.edge_url(), "dev-a", token.clone());
+    // Without the token signal this test would remain asleep for two minutes.
+    config.retry = Duration::from_secs(120);
+    let _host = HostRelay::spawn(config, TestService::new("host-a"), noop_nudge());
+    tokio::task::yield_now().await;
+    assert!(!relay.host_connected());
+
+    token.replace("test-user");
+
+    relay.wait_host_connected().await;
+}
+
+#[tokio::test]
+async fn token_rotation_does_not_interrupt_a_live_peer_link() {
+    let relay = FakeRelay::start().await;
+    let _host = HostRelay::spawn(
+        relay_config(&relay.edge_url(), 100),
+        TestService::new("host-a"),
+        noop_nudge(),
+    );
+    relay.wait_host_connected().await;
+
+    let token = Arc::new(RecoveringToken::new(Some("old-token")));
+    let links = LinkCache::new(LinkCacheConfig::new(relay.edge_url(), token.clone()));
+    let client = links.client("dev-a").await.expect("client dials");
+    token.replace("new-token");
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let echoed = client
+        .call("Echo", serde_json::json!({ "after": "refresh" }))
+        .await
+        .expect("live link survives token rotation");
+    assert_eq!(echoed["params"]["after"], "refresh");
+}
 
 #[tokio::test]
 async fn relay_serves_multiple_clients_end_to_end() {
