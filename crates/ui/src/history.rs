@@ -22,7 +22,9 @@ const HISTORY_ROW_HEIGHT: f32 = 36.0;
 const HISTORY_LANE_SPACING: f32 = 12.0;
 const HISTORY_NODE_RADIUS: f32 = 3.25;
 const HISTORY_STROKE_WIDTH: f32 = 1.5;
+const HISTORY_GRAPH_SATURATION: f32 = 0.72;
 const HISTORY_GRAPH_SIDE_PADDING: f32 = 5.0;
+const HISTORY_GRAPH_TRAILING_PADDING: f32 = 10.0;
 const HISTORY_GRAPH_ROW_OVERLAP: f32 = 0.75;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -194,7 +196,8 @@ fn lane_x(lane: usize) -> f32 {
 
 fn graph_width(lane_count: usize) -> f32 {
     let count = lane_count.max(1);
-    HISTORY_GRAPH_SIDE_PADDING * 2.0
+    HISTORY_GRAPH_SIDE_PADDING
+        + HISTORY_GRAPH_TRAILING_PADDING
         + HISTORY_NODE_RADIUS * 2.0
         + (count - 1) as f32 * HISTORY_LANE_SPACING
 }
@@ -211,6 +214,11 @@ fn ref_color(reference: &GitHistoryRef, theme: &Theme) -> gpui::Hsla {
         GitHistoryRefKind::Remote => theme.busy,
         GitHistoryRefKind::Tag => theme.warning,
     }
+}
+
+fn graph_color(mut color: gpui::Hsla) -> gpui::Hsla {
+    color.s *= HISTORY_GRAPH_SATURATION;
+    color
 }
 
 pub struct GitHistory {
@@ -417,12 +425,12 @@ impl GitHistory {
     fn graph_cell(row: GraphRow, lane_count: usize, theme: &Theme) -> AnyElement {
         let width = graph_width(lane_count);
         let palette = [
-            theme.accent,
-            theme.busy,
-            theme.success,
-            theme.warning,
-            theme.danger,
-            theme.text_muted,
+            graph_color(theme.accent),
+            graph_color(theme.busy),
+            graph_color(theme.success),
+            graph_color(theme.warning),
+            graph_color(theme.danger),
+            graph_color(theme.text_muted),
         ];
         let segments = row.segments.clone();
         let paths = canvas(
@@ -896,5 +904,15 @@ mod tests {
         all.push(commit("root", &[]));
         let after = layout_graph(&all, Some("tip"));
         assert_eq!(before.rows, after.rows[..before.rows.len()]);
+    }
+
+    #[test]
+    fn graph_palette_only_reduces_saturation() {
+        let source = gpui::hsla(0.62, 0.8, 0.55, 0.9);
+        let muted = graph_color(source);
+        assert_eq!(muted.h, source.h);
+        assert_eq!(muted.l, source.l);
+        assert_eq!(muted.a, source.a);
+        assert!((muted.s - source.s * HISTORY_GRAPH_SATURATION).abs() < f32::EPSILON);
     }
 }
