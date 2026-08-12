@@ -307,6 +307,7 @@ pub fn diff_to_file(diff: &komet_proto::ToolDiff) -> crate::changes::FileDiff {
     let text_diff = similar::TextDiff::from_lines(old, &diff.new_text);
     let mut hunks = Vec::new();
     let (mut additions, mut deletions) = (0u32, 0u32);
+    let mut max_line = 0u32;
     for group in text_diff.grouped_ops(3) {
         let (Some(first), Some(last)) = (group.first(), group.last()) else {
             continue;
@@ -334,10 +335,15 @@ pub fn diff_to_file(diff: &komet_proto::ToolDiff) -> crate::changes::FileDiff {
                     }
                     similar::ChangeTag::Equal => LineKind::Context,
                 };
+                let old_no = change.old_index().map(|n| n as u32 + 1);
+                let new_no = change.new_index().map(|n| n as u32 + 1);
+                max_line = max_line
+                    .max(old_no.unwrap_or(0))
+                    .max(new_no.unwrap_or(0));
                 lines.push(DiffLine {
                     kind,
-                    old_no: change.old_index().map(|n| n as u32 + 1),
-                    new_no: change.new_index().map(|n| n as u32 + 1),
+                    old_no,
+                    new_no,
                     text: change.value().trim_end_matches('\n').to_owned(),
                 });
             }
@@ -357,6 +363,7 @@ pub fn diff_to_file(diff: &komet_proto::ToolDiff) -> crate::changes::FileDiff {
         hunks,
         additions,
         deletions,
+        max_line,
     }
 }
 

@@ -108,6 +108,9 @@ pub struct FileDiff {
     pub hunks: Vec<Hunk>,
     pub additions: u32,
     pub deletions: u32,
+    /// Largest line number on either side — sizes the gutters analytically
+    /// (a fixed column overflowed past 4 digits; user report).
+    pub max_line: u32,
 }
 
 impl FileDiff {
@@ -121,8 +124,17 @@ impl FileDiff {
             hunks: Vec::new(),
             additions: 0,
             deletions: 0,
+            max_line: 0,
         }
     }
+}
+
+/// Width of one line-number gutter column, fitted to the file's largest
+/// line number (11px mono ≈ 6.6px per digit + 8px right pad), never
+/// narrower than the classic 36px column (4 digits).
+pub fn gutter_width(file: &FileDiff) -> f32 {
+    let digits = file.max_line.max(1).ilog10() + 1;
+    (digits as f32 * 6.6 + 9.6).max(GUTTER_WIDTH)
 }
 
 fn strip_git_prefix(path: &str) -> &str {
@@ -264,6 +276,10 @@ pub fn parse_patch(patch: &str) -> Vec<FileDiff> {
             if let Some(line) = line
                 && let Some(hunk) = file.hunks.last_mut()
             {
+                file.max_line = file
+                    .max_line
+                    .max(line.old_no.unwrap_or(0))
+                    .max(line.new_no.unwrap_or(0));
                 hunk.lines.push(line);
                 continue;
             }
@@ -348,6 +364,14 @@ pub fn truncate_file_lines(file: &mut FileDiff, max_lines: usize) {
     file.notices.push(format!(
         "Diff truncated — showing first {max_lines} of {total} lines"
     ));
+    // The gutter fits what actually renders.
+    file.max_line = file
+        .hunks
+        .iter()
+        .flat_map(|h| &h.lines)
+        .map(|l| l.old_no.unwrap_or(0).max(l.new_no.unwrap_or(0)))
+        .max()
+        .unwrap_or(0);
 }
 
 /// Analytic expanded-body height — drives the 180 ms fold tween without
@@ -1550,7 +1574,7 @@ impl Changes {
                     .and_then(|lines| lines.get(flat as usize))
                     .map(|t| t.as_slice())
                     .unwrap_or(&[]);
-                diff_line_row(line, tokens, &theme)
+                diff_line_row(line, tokens, &theme, gutter_width(file_diff))
             }
             DiffRow::BodyPad { .. } => div()
                 .w_full()
@@ -2148,8 +2172,9 @@ fn hunk_header_row(header: &str, theme: &Theme) -> AnyElement {
 }
 
 /// One +/−/context/meta diff line: coloured accent bar, dual line-number
-/// gutters, marker column, and paint-only syntax runs.
-fn diff_line_row(line: &DiffLine, tokens: &[Token], theme: &Theme) -> AnyElement {
+/// gutters (`gutter_px` wide — see [`gutter_width`]), marker column, and
+/// paint-only syntax runs.
+fn diff_line_row(line: &DiffLine, tokens: &[Token], theme: &Theme, gutter_px: f32) -> AnyElement {
     if line.kind == LineKind::Meta {
         return div()
             .h(px(DIFF_LINE_HEIGHT))
@@ -2157,7 +2182,7 @@ fn diff_line_row(line: &DiffLine, tokens: &[Token], theme: &Theme) -> AnyElement
             .flex_none()
             .flex()
             .items_center()
-            .pl(px(ACCENT_BAR_WIDTH + 2.0 * GUTTER_WIDTH + MARKER_WIDTH + 12.0))
+            .pl(px(ACCENT_BAR_WIDTH + 2.0 * gutter_px + MARKER_WIDTH + 12.0))
             .text_size(px(10.5))
             .text_color(theme.text_faint)
             .italic()
@@ -2196,7 +2221,7 @@ fn diff_line_row(line: &DiffLine, tokens: &[Token], theme: &Theme) -> AnyElement
     };
     let gutter = |no: Option<u32>, color: gpui::Hsla| {
         div()
-            .w(px(GUTTER_WIDTH))
+            .w(px(gutter_px))
             .flex_none()
             .font_family(theme.font_mono.clone())
             .text_size(px(11.0))
@@ -2300,6 +2325,7 @@ fn render_file_body_upto(
     let mut children: Vec<AnyElement> = Vec::new();
     let mut y = 0.0f32;
     let mut line_ix = 0usize;
+    let gutter_px = gutter_width(file);
 
     'build: {
         for notice in file_notices(file) {
@@ -2324,7 +2350,7 @@ fn render_file_body_upto(
                     .and_then(|lines| lines.get(line_ix))
                     .map(|t| t.as_slice())
                     .unwrap_or(&[]);
-                children.push(diff_line_row(line, tokens, theme));
+                children.push(diff_line_row(line, tokens, theme, gutter_px));
                 y += DIFF_LINE_HEIGHT;
                 line_ix += 1;
             }
@@ -2689,6 +2715,32 @@ rename to new_name.rs
         truncate_file_lines(&mut file, 3);
         assert_eq!(file.hunks.len(), 1);
         assert_eq!(file.hunks[0].lines.len(), 3);
+    }
+
+    #[test]
+    fn gutters_fit_the_largest_line_number() {
+        let files = parse_patch(PATCH);
+        // src/main.rs second hunk ends at old 11 / new 12.
+        assert_eq!(files[0].max_line, 12);
+        assert_eq!(gutter_width(&files[0]), GUTTER_WIDTH);
+
+        // 4 digits still fit the classic column; 5+ digits widen it enough
+        // for digits + the 8px right pad.
+        let mut file = files[0].clone();
+        file.max_line = 9999;
+        assert_eq!(gutter_width(&file), GUTTER_WIDTH);
+        file.max_line = 27404;
+        let w = gutter_width(&file);
+        assert!(w > GUTTER_WIDTH, "5 digits must widen the gutter");
+        assert!(w >= 5.0 * 6.6 + 8.0);
+        file.max_line = 123456;
+        assert!(gutter_width(&file) > w);
+
+        // Truncation refits the gutter to what actually renders: the first
+        // 3 lines are ctx(1,1) / del(2,·) / add(·,2) — max line 2.
+        let mut file = files[0].clone();
+        truncate_file_lines(&mut file, 3);
+        assert_eq!(file.max_line, 2);
     }
 
     #[test]
