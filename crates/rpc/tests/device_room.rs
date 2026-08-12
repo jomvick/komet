@@ -345,6 +345,12 @@ impl RecoveringToken {
         self.changes
             .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
     }
+
+    fn clear(&self) {
+        *self.value.lock().expect("lock") = None;
+        self.changes
+            .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
+    }
 }
 
 #[async_trait]
@@ -376,6 +382,21 @@ async fn token_recovery_wakes_a_signed_out_host_relay_immediately() {
     token.replace("test-user");
 
     relay.wait_host_connected().await;
+}
+
+#[tokio::test]
+async fn sign_out_closes_a_live_host_relay_immediately() {
+    let relay = FakeRelay::start().await;
+    let token = Arc::new(RecoveringToken::new(Some("test-user")));
+    let mut config = HostRelayConfig::new(relay.edge_url(), "dev-a", token.clone());
+    // A sign-out signal must close the authenticated socket, not wait for retry.
+    config.retry = Duration::from_secs(120);
+    let _host = HostRelay::spawn(config, TestService::new("host-a"), noop_nudge());
+    relay.wait_host_connected().await;
+
+    token.clear();
+
+    wait_until(|| !relay.host_connected()).await;
 }
 
 #[tokio::test]

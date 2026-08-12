@@ -988,6 +988,35 @@ impl AppState {
         self.engine.as_ref()
     }
 
+    /// Drop every account-scoped view and subscription after its runtime has
+    /// stopped. The next bootstrap must never render rows from the previous
+    /// account while the local profile is opening.
+    pub fn prepare_runtime_replacement(&mut self, cx: &mut Context<Self>) {
+        self.engine = None;
+        self.watch_tasks.clear();
+        self.transcript_task = None;
+        self.connection = ConnectionStatus::Connecting;
+        self.workspace_scope = None;
+        self.auth = None;
+        self.devices.clear();
+        self.spaces.clear();
+        self.chats.clear();
+        self.sessions.clear();
+        self.selected_space = None;
+        self.no_project = false;
+        self.selected_device = None;
+        self.selected_chat = None;
+        self.auto_selected = false;
+        self.chats_synced = false;
+        self.spaces_synced = false;
+        self.transcript.clear();
+        self.echoes.clear();
+        self.pending_sends.clear();
+        self.local_device_id = None;
+        self.update = None;
+        cx.notify();
+    }
+
     // ---- gpui glue ----
 
     /// Kick off (or retry) the engine bootstrap: probe → connect-or-embed on

@@ -280,7 +280,26 @@ impl HostRelay {
                         &token,
                     );
                     let started = tokio::time::Instant::now();
-                    let outcome = host_session(&url, &service, &on_nudge).await;
+                    let outcome = {
+                        let session = host_session(&url, &service, &on_nudge);
+                        tokio::pin!(session);
+                        loop {
+                            tokio::select! {
+                                outcome = &mut session => break outcome,
+                                _ = token_changed(&mut token_changes) => {
+                                    // Token rotations keep a healthy socket alive. Sign-out is
+                                    // different: dropping the session closes the authenticated
+                                    // socket and every virtual RPC connection immediately.
+                                    if config.token.token().await.is_none() {
+                                        tracing::info!(
+                                            "device-room: credentials removed; closing host session"
+                                        );
+                                        break Ok(());
+                                    }
+                                }
+                            }
+                        }
+                    };
                     let healthy = started.elapsed() >= HOST_HEALTHY_SESSION;
                     match outcome {
                         Ok(()) => {

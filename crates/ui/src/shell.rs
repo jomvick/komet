@@ -472,6 +472,33 @@ async fn wait_for_remote_engine_shutdown(
     }
 }
 
+/// Stop the engine that owns the synced profile and wait until a local runtime
+/// can safely acquire both its IPC port and data-directory lock.
+async fn stop_synced_runtime(
+    engine: crate::state::EngineHandle,
+    ipc_port: u16,
+    data_dir: &std::path::Path,
+) -> Result<(), String> {
+    let stop_error = if matches!(engine.mode(), EngineMode::Remote { .. }) {
+        engine
+            .client()
+            .call(methods::STOP_ENGINE, serde_json::json!({}))
+            .await
+            .err()
+            .map(|error| error.to_string())
+    } else {
+        None
+    };
+    engine.shutdown().await;
+    match wait_for_remote_engine_shutdown(ipc_port, data_dir, RUNTIME_CHANGE_TIMEOUT).await {
+        Ok(()) => Ok(()),
+        Err(error) => match stop_error {
+            Some(stop_error) => Err(format!("{stop_error}; {error}")),
+            None => Err(error),
+        },
+    }
+}
+
 fn account_menu_action(scope: Option<WorkspaceScope>, flow: SyncFlow) -> Option<AccountMenuAction> {
     match scope {
         Some(WorkspaceScope::Local) => match flow {
@@ -882,6 +909,17 @@ impl Shell {
             if matches!(self.sync_flow, SyncFlow::RestartPending { .. }) {
                 self.org = None;
             }
+        }
+        let signed_out_synced = {
+            let state = state.read(cx);
+            state.workspace_scope == Some(WorkspaceScope::Synced)
+                && matches!(state.auth, Some(AuthState::SignedOut))
+        };
+        // AuthStatus is shared by every viewport. Whichever viewport owns the
+        // embedded runtime drains it; remote viewports request daemon shutdown
+        // and all of them independently reattach to the new local runtime.
+        if signed_out_synced && self.runtime_change_task.is_none() {
+            self.start_local_runtime_transition(false, cx);
         }
         // Capture knob: the add-space palette needs only the device registry.
         if self.debug_dialog.as_deref() == Some("add-space") && !state.read(cx).devices.is_empty() {
@@ -1596,24 +1634,59 @@ impl Shell {
     }
 
     fn confirm_sign_out(&mut self, cx: &mut Context<Self>) {
+        self.start_local_runtime_transition(true, cx);
+    }
+
+    fn start_local_runtime_transition(&mut self, sign_out: bool, cx: &mut Context<Self>) {
+        if self.runtime_change_task.is_some() {
+            return;
+        }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.runtime_change_error = Some("Engine not connected".into());
+            self.sync_flow = SyncFlow::SignedOutRestartRequired;
+            cx.notify();
             return;
         };
         self.sync_flow = SyncFlow::SigningOut;
-        self.auth_task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(methods::SIGN_OUT, serde_json::json!({}))
-                .await;
+        self.runtime_change_error = None;
+        let ipc_port = self.boot.ipc_port;
+        let data_dir = self.data_dir.clone();
+        let shutdown_dir = data_dir.clone();
+        let transition = Tokio::spawn(cx, async move {
+            if sign_out {
+                engine
+                    .client()
+                    .call(methods::SIGN_OUT, serde_json::json!({}))
+                    .await
+                    .map_err(|error| format!("Sign out failed: {error}"))?;
+            }
+            stop_synced_runtime(engine, ipc_port, &shutdown_dir).await
+        });
+        let state = self.state.clone();
+        let boot = self.boot.clone();
+        self.runtime_change_task = Some(cx.spawn(async move |this, cx| {
+            let result = match transition.await {
+                Ok(result) => result,
+                Err(error) => Err(error.to_string()),
+            };
             this.update(cx, |shell, cx| {
+                shell.runtime_change_task = None;
                 match result {
-                    Ok(_) => shell.sync_flow = SyncFlow::SignedOutRestartRequired,
-                    Err(err) => {
-                        shell.sync_flow = SyncFlow::SignOutConfirm;
-                        shell.sidebar_notice = Some(format!("Sign out failed: {err}").into());
+                    Ok(()) => {
+                        shell.sync_flow = SyncFlow::Idle;
+                        shell.runtime_change_error = None;
+                        shell.org = None;
+                        shell.route = Route::Chat;
+                        shell.space_boot_applied = false;
+                        state.update(cx, |state, cx| state.prepare_runtime_replacement(cx));
+                        AppState::bootstrap(state.clone(), boot, cx);
+                    }
+                    Err(error) => {
+                        shell.sync_flow = SyncFlow::SignedOutRestartRequired;
+                        shell.runtime_change_error = Some(error.into());
+                        cx.notify();
                     }
                 }
-                cx.notify();
             })
             .ok();
         }));
@@ -3235,7 +3308,7 @@ impl Shell {
                 .child(
                     div().mt(px(6.0)).child(popover::dialog_body(
                         &theme,
-                        "Komet must close after removing your credentials so this synced workspace cannot continue with stale account data.",
+                        "Komet will remove your credentials, close the synced workspace, and continue in local mode.",
                     )),
                 )
                 .child(
@@ -3267,7 +3340,7 @@ impl Shell {
                 .child(
                     div().mt(px(6.0)).child(popover::dialog_body(
                         &theme,
-                        "Removing account credentials from this device.",
+                        "Removing account credentials and closing the synced workspace.",
                     )),
                 )
                 .into_any_element(),
@@ -4019,17 +4092,10 @@ impl Shell {
 
     fn render_signed_out_restart(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
-        let remote_engine = self
-            .state
-            .read(cx)
-            .engine()
-            .is_some_and(|engine| matches!(engine.mode(), EngineMode::Remote { .. }));
         let runtime_change_label = if self.runtime_change_task.is_some() {
             "Stopping engine…"
-        } else if remote_engine {
-            "Stop daemon and quit"
         } else {
-            "Quit Komet"
+            "Retry local mode"
         };
         let card = div()
             .w(px(380.0))
@@ -4066,11 +4132,7 @@ impl Shell {
                     .line_height(px(19.0))
                     .text_color(theme.text_muted)
                     .child(SharedString::from(
-                        if remote_engine {
-                            "Komet is using a background daemon. Stop it and quit Komet before reopening so the previous synced workspace cannot keep running without its credentials."
-                        } else {
-                            "Quit and reopen Komet before continuing. This prevents the previous synced workspace from running without its credentials."
-                        },
+                        "Komet removed your credentials but could not finish closing the previous synced workspace. Retry before continuing in local mode.",
                     )),
             )
             .when_some(self.runtime_change_error.clone(), |card, error| {
@@ -4089,7 +4151,9 @@ impl Shell {
                     .when(self.runtime_change_task.is_some(), |button| {
                         button.opacity(0.6)
                     })
-                    .on_click(cx.listener(|this, _, _, cx| this.quit_for_runtime_change(cx))),
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.start_local_runtime_transition(false, cx)
+                    })),
             );
 
         div()
@@ -5058,6 +5122,51 @@ mod tests {
             .await
             .unwrap();
         release.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn signed_out_synced_runtime_stops_and_reboots_local() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("session.json"),
+            r#"{"refreshToken":"still-valid","user":{"id":"user_1","email":"u@example.com"},"orgId":"org_1"}"#,
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let boot = EngineBootConfig {
+            data_dir: dir.path().to_path_buf(),
+            ipc_port: port,
+            edge_url: "http://127.0.0.1:1".into(),
+            edge_token: None,
+            org_id: None,
+            workos_client_id: Some("client_test".into()),
+            default_harness: komet_proto::HarnessId::Mock,
+        };
+        let synced = crate::state::EngineHandle::bootstrap(boot.clone())
+            .await
+            .expect("saved session opens its synced profile");
+        assert_eq!(
+            synced.engine_info().workspace_scope,
+            WorkspaceScope::Synced
+        );
+
+        synced
+            .client()
+            .call(methods::SIGN_OUT, serde_json::json!({}))
+            .await
+            .expect("sign out clears credentials");
+        stop_synced_runtime(synced, port, dir.path())
+            .await
+            .expect("synced runtime drains and releases ownership");
+
+        assert!(!dir.path().join("session.json").exists());
+        let local = crate::state::EngineHandle::bootstrap(boot)
+            .await
+            .expect("same process can continue locally");
+        assert_eq!(local.engine_info().workspace_scope, WorkspaceScope::Local);
+        local.shutdown().await;
     }
 
     #[cfg(unix)]

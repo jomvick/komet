@@ -387,7 +387,7 @@ pub struct Engine {
 /// in-process engine so their production authentication paths cannot diverge.
 pub struct EngineRuntime {
     core: EngineCore,
-    _host_relay: Option<komet_rpc::HostRelay>,
+    host_relay: std::sync::Mutex<Option<komet_rpc::HostRelay>>,
 }
 
 /// IPC-only lifecycle control owned by `komet headless`. The regular
@@ -426,7 +426,23 @@ impl EngineRuntime {
     }
 
     pub async fn shutdown(&self) {
+        // Revoke remote reachability before graceful draining. Sessions may
+        // need time to settle; no authenticated relay RPC may enter during
+        // that window after sign-out.
+        self.host_relay
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
         self.core.shutdown().await;
+    }
+}
+
+impl Drop for EngineRuntime {
+    fn drop(&mut self) {
+        self.host_relay
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
     }
 }
 
@@ -605,7 +621,7 @@ impl Engine {
 
         Ok(EngineRuntime {
             core,
-            _host_relay: host_relay,
+            host_relay: std::sync::Mutex::new(host_relay),
         })
     }
 
