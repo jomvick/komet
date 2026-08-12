@@ -20,7 +20,10 @@
 //! smoothed target growth, so 120ms doc commits read as a continuous glide
 //! instead of per-commit snaps. The pin breaks only on user input (the list's
 //! scroll handler fires exclusively from its wheel/touch path) and re-engages
-//! inside the 70px band; own-send re-engages with the same glide.
+//! inside the 70px band; the first send in an empty chat anchors the prompt at
+//! the viewport top and hands off to the same glide when the reply overflows.
+//! While that anchor holds, wheel/touch is clamped rather than obeyed — the
+//! whole turn is already visible, so there is nothing to scroll to.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -30,9 +33,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, BorderStyle, ClipboardItem, Context, Entity, ListAlignment, ListScrollEvent,
-    ListState, ObjectFit, SharedString, StyledImage as _, StyledText, Subscription, Task, TextRun,
-    Window, canvas, div, img, list, prelude::*, px, quad,
+    AnyElement, BorderStyle, ClipboardItem, Context, Entity, ListAlignment, ListOffset,
+    ListScrollEvent, ListState, ObjectFit, SharedString, StyledImage as _, StyledText,
+    Subscription, Task, TextRun, Window, canvas, div, img, list, prelude::*, px, quad,
 };
 
 use komet_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
@@ -107,6 +110,16 @@ pub const AT_BOTTOM_PX: f32 = 2.0;
 pub const SPRING_SETTLE_GRACE_MS: u64 = 500;
 /// Teleport when farther than this many viewports from the end; glide the rest.
 pub const GLIDE_MAX_VIEWPORTS: f32 = 2.5;
+/// A freshly-sent prompt rests this far below the transcript viewport's top.
+/// The titlebar overlays the full-height list, so its height is part of the
+/// inset; the extra 10px matches the first row's breathing room.
+const OWN_SEND_TOP_INSET_PX: f32 = Theme::TITLEBAR_HEIGHT + 10.0;
+
+/// The trailing runway has done its job once the last row would reach the
+/// viewport bottom without it. Both values are in window coordinates.
+fn own_turn_has_overflow(last_row_bottom: f32, viewport_bottom: f32, runway: f32) -> bool {
+    last_row_bottom - runway >= viewport_bottom - 0.5
+}
 
 /// Pure stick-to-bottom spring stepper — the mugen `tick()` integration:
 /// velocity relaxes toward `(damping·v + stiffness·diff)/mass` per 60fps
@@ -1140,6 +1153,17 @@ struct FoldState {
     toggled_at: Option<Instant>,
 }
 
+/// Temporary layout state for a locally-sent turn. A viewport-high trailing
+/// runway lets the final user row sit at the top even before an assistant
+/// reply exists. Once real content fills the visible area, the runway is
+/// removed and the ordinary stick-to-bottom spring takes over.
+struct OwnTurnAnchor {
+    chat_id: String,
+    message_id: SharedString,
+    runway: f32,
+    positioned: bool,
+}
+
 pub struct Transcript {
     state: Entity<AppState>,
     list: ListState,
@@ -1180,8 +1204,19 @@ pub struct Transcript {
     /// (see [`Transcript::should_restick`]).
     last_scroll_distance: f32,
     /// The stick-to-bottom pin. Broken only by user input (wheel/touch up);
-    /// re-engaged inside the 70px band, on own-send, and on the jump button.
+    /// re-engaged inside the 70px band, after an own-send first overflows, and
+    /// on the jump button.
     pinned: bool,
+    /// A locally-sent prompt currently held near the viewport top while its
+    /// reply grows into the empty space below it.
+    own_turn: Option<OwnTurnAnchor>,
+    /// A layout-affecting change needs one post-layout own-turn measurement.
+    own_turn_kick: bool,
+    /// One own-turn `on_next_frame` callback in flight at most.
+    own_turn_scheduled: bool,
+    /// The runway was removed on the previous frame; engage the bottom spring
+    /// only after layout has incorporated that removal.
+    own_turn_release_pending: bool,
     spring: StickSpring,
     /// Wall-clock of the previous spring tick (`None` = parked).
     spring_last_tick: Option<Instant>,
@@ -1273,6 +1308,10 @@ impl Transcript {
             show_jump_button: false,
             last_scroll_distance: 0.0,
             pinned: true,
+            own_turn: None,
+            own_turn_kick: false,
+            own_turn_scheduled: false,
+            own_turn_release_pending: false,
             spring: StickSpring::new(),
             spring_last_tick: None,
             spring_settled_at: None,
@@ -1318,6 +1357,10 @@ impl Transcript {
     pub fn set_bottom_clearance(&mut self, height: f32, cx: &mut Context<Self>) {
         if (self.bottom_clearance - height).abs() > 0.5 {
             self.bottom_clearance = height;
+            if self.own_turn.is_some() {
+                self.remeasure_last_row();
+                self.own_turn_kick = true;
+            }
             cx.notify();
         }
     }
@@ -1344,8 +1387,25 @@ impl Transcript {
 
     /// Replace the transcript's scroll animation task (rail click / jump).
     pub(crate) fn set_scroll_task(&mut self, task: Task<()>) {
+        self.remove_own_turn_runway();
         self.pinned = false;
         self.scroll_anim = Some(task);
+    }
+
+    fn remeasure_last_row(&self) {
+        if let Some(last) = self.rows.len().checked_sub(1) {
+            self.list.remeasure_items(last..last + 1);
+        }
+    }
+
+    /// Drop the temporary send runway without enabling follow-tail. Used when
+    /// explicit user navigation supersedes the automatic own-turn behavior.
+    fn remove_own_turn_runway(&mut self) {
+        if self.own_turn.take().is_some() {
+            self.remeasure_last_row();
+        }
+        self.own_turn_kick = false;
+        self.own_turn_release_pending = false;
     }
 
     pub(crate) fn distance_from_bottom(&self) -> f32 {
@@ -1371,6 +1431,28 @@ impl Transcript {
         let this = cx.weak_entity();
         cx.defer(move |cx| {
             this.update(cx, |this: &mut Transcript, cx| {
+                // While the first-turn anchor holds, everything already fits
+                // on screen — the prompt at the top, the whole reply below,
+                // and under that only synthetic runway. Wheel/touch has
+                // nothing to reveal in either direction, so clamp back to the
+                // anchor instead of handing over the viewport (cancelling
+                // here collapses the runway and teleports the layout by up to
+                // a viewport). The runway retires through the overflow
+                // handoff; explicit navigation (jump pill, rail clicks, chat
+                // switches) still cancels it.
+                if this.own_turn.is_some() {
+                    if let Some(ix) = this.own_turn_anchor_ix() {
+                        this.list.scroll_to(ListOffset {
+                            item_ix: ix,
+                            offset_in_item: px(0.0),
+                        });
+                        this.list.scroll_by(px(-OWN_SEND_TOP_INSET_PX));
+                    }
+                    this.last_scroll_distance = this.distance_from_bottom();
+                    return;
+                }
+                // User input supersedes a pending post-handoff re-pin.
+                this.own_turn_release_pending = false;
                 let distance = this.distance_from_bottom();
                 let previous = this.last_scroll_distance;
                 this.last_scroll_distance = distance;
@@ -1400,9 +1482,166 @@ impl Transcript {
         });
     }
 
-    /// Own-send re-engage: glide to the end, then stay pinned.
-    pub fn on_own_send(&mut self, cx: &mut Context<Self>) {
-        self.engage_pin(cx);
+    /// Hold a locally-sent prompt near the viewport top. A viewport-high
+    /// trailing runway makes that position scrollable while the reply is
+    /// still short; [`Self::step_own_turn`] hands off to the bottom spring at
+    /// the first real overflow.
+    pub fn on_own_send(
+        &mut self,
+        chat_id: String,
+        message_id: String,
+        started_empty: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if !started_empty {
+            if self.own_turn.take().is_some() {
+                // A short first reply may still own a runway. Remove it and
+                // wait one layout frame before following the new send, or the
+                // old synthetic height would scroll the viewport into blank
+                // space.
+                self.remeasure_last_row();
+                self.pinned = false;
+                self.show_jump_button = false;
+                self.own_turn_release_pending = true;
+                self.own_turn_kick = true;
+                cx.notify();
+            } else {
+                // Every send after the first keeps the original behavior.
+                self.engage_pin(cx);
+            }
+            return;
+        }
+
+        self.pinned = false;
+        self.show_jump_button = false;
+        self.spring.reset();
+        self.spring_last_tick = None;
+        self.spring_settled_at = None;
+        self.spring_kick = false;
+        self.scroll_anim = None;
+        self.own_turn = Some(OwnTurnAnchor {
+            chat_id,
+            message_id: SharedString::from(message_id),
+            runway: 0.0,
+            positioned: false,
+        });
+        self.own_turn_release_pending = false;
+        self.own_turn_kick = true;
+        self.remeasure_last_row();
+        cx.notify();
+    }
+
+    fn own_turn_anchor_ix(&self) -> Option<usize> {
+        let anchor = self.own_turn.as_ref()?;
+        self.rows
+            .iter()
+            .position(|row| row.turn_start && row.entry_id == anchor.message_id)
+    }
+
+    /// One post-layout own-turn step: install the runway, position the prompt,
+    /// then watch the real content bottom until it consumes the visible room.
+    fn step_own_turn(&mut self, cx: &mut Context<Self>) {
+        self.own_turn_kick = false;
+
+        if self.own_turn_release_pending {
+            self.own_turn_release_pending = false;
+            self.engage_pin(cx);
+            return;
+        }
+
+        let Some(anchor_ix) = self.own_turn_anchor_ix() else {
+            // The optimistic echo may arrive on the next state notification.
+            return;
+        };
+        let viewport = self.list.viewport_bounds();
+        let viewport_height = f32::from(viewport.size.height);
+        if viewport_height <= 0.0 {
+            self.own_turn_kick = true;
+            cx.notify();
+            return;
+        }
+
+        let runway_changed = self
+            .own_turn
+            .as_ref()
+            .is_some_and(|anchor| (anchor.runway - viewport_height).abs() > 0.5);
+        if runway_changed {
+            if let Some(anchor) = self.own_turn.as_mut() {
+                anchor.runway = viewport_height;
+            }
+            self.remeasure_last_row();
+            self.own_turn_kick = true;
+            cx.notify();
+            return;
+        }
+
+        let positioned = self
+            .own_turn
+            .as_ref()
+            .is_some_and(|anchor| anchor.positioned);
+        if !positioned {
+            self.list.scroll_to(ListOffset {
+                item_ix: anchor_ix,
+                offset_in_item: px(0.0),
+            });
+            // The list occupies the full-height outlet underneath the titlebar.
+            // Pull back slightly so the prompt itself rests below that chrome.
+            self.list.scroll_by(px(-OWN_SEND_TOP_INSET_PX));
+            if let Some(anchor) = self.own_turn.as_mut() {
+                anchor.positioned = true;
+            }
+            self.own_turn_kick = true;
+            cx.notify();
+            return;
+        }
+
+        let Some(last_ix) = self.rows.len().checked_sub(1) else {
+            return;
+        };
+        let runway = self.own_turn.as_ref().map_or(0.0, |a| a.runway);
+        let viewport_bottom = f32::from(viewport.bottom());
+        let usable_bottom = viewport_bottom
+            - (self.bottom_clearance + Theme::TRANSCRIPT_FADE_BAND + 8.0);
+        let mut overflowed = false;
+        for ix in anchor_ix..=last_ix {
+            match self.list.bounds_for_item(ix) {
+                Some(bounds) if ix == last_ix => {
+                    overflowed = own_turn_has_overflow(
+                        f32::from(bounds.bottom()),
+                        viewport_bottom,
+                        runway,
+                    );
+                }
+                Some(bounds) => {
+                    if f32::from(bounds.bottom()) >= usable_bottom - 0.5 {
+                        overflowed = true;
+                    }
+                }
+                None if ix > anchor_ix => {
+                    // After positioning, a later row outside the virtualizer's
+                    // measured tail is necessarily beyond the visible runway.
+                    overflowed = true;
+                }
+                None => {
+                    self.own_turn_kick = true;
+                    cx.notify();
+                    return;
+                }
+            }
+            if overflowed {
+                break;
+            }
+        }
+        if overflowed {
+            // Remove the synthetic height first. On the next layout frame the
+            // natural max offset meets the held anchor, so engaging the spring
+            // is continuous rather than a one-viewport jump.
+            self.own_turn = None;
+            self.remeasure_last_row();
+            self.own_turn_release_pending = true;
+            self.own_turn_kick = true;
+            cx.notify();
+        }
     }
 
     /// Whether the transcript is currently pinned to the bottom.
@@ -1418,6 +1657,7 @@ impl Transcript {
 
     /// The scroll-to-bottom pill's click: glide back to the end and re-pin.
     pub fn jump_to_bottom(&mut self, cx: &mut Context<Self>) {
+        self.remove_own_turn_runway();
         self.engage_pin(cx);
     }
 
@@ -1528,6 +1768,15 @@ impl Transcript {
 
         let attached = selected != self.chat_id;
         if attached {
+            let keep_own_turn = self
+                .own_turn
+                .as_ref()
+                .is_some_and(|anchor| selected.as_deref() == Some(anchor.chat_id.as_str()));
+            if !keep_own_turn {
+                self.own_turn = None;
+                self.own_turn_kick = false;
+                self.own_turn_release_pending = false;
+            }
             self.chat_id = selected;
             self.rows.clear();
             self.row_cache.clear();
@@ -1538,7 +1787,7 @@ impl Transcript {
             self.render_cache.borrow_mut().clear();
             self.highlights.entries.clear();
             self.list.reset(0);
-            self.pinned = true;
+            self.pinned = self.own_turn.is_none();
             self.spring.reset();
             self.spring_last_tick = None;
             self.spring_settled_at = None;
@@ -1588,6 +1837,7 @@ impl Transcript {
         });
 
         let was_empty = self.rows.is_empty();
+        let old_last = self.rows.len().checked_sub(1);
         match diff_rows(&self.rows, &new_rows) {
             None => {
                 self.rows = new_rows;
@@ -1621,6 +1871,16 @@ impl Transcript {
         }
         self.rows = new_rows;
         self.refresh_protected_attachments(cx);
+        if self.own_turn.is_some() {
+            // Appending a reply moves the runway from the previous last row to
+            // the new one. Both measurements must be invalidated because the
+            // row diff itself only knows that rows were appended at the tail.
+            if let Some(old_last) = old_last.filter(|&ix| ix < self.rows.len()) {
+                self.list.remeasure_items(old_last..old_last + 1);
+            }
+            self.remeasure_last_row();
+            self.own_turn_kick = true;
+        }
         if self.pinned {
             if motion::reduced_motion(cx) || was_empty {
                 // First fill (chat open) lands at the bottom instantly
@@ -2030,7 +2290,16 @@ impl Transcript {
         // (the row's lowest content) renders half-faded (or hidden) when the
         // transcript is pinned to the bottom.
         let bottom_pad = if ix + 1 == self.rows.len() {
-            self.bottom_clearance + Theme::TRANSCRIPT_FADE_BAND + 8.0
+            let runway = self
+                .own_turn
+                .as_ref()
+                .filter(|anchor| {
+                    self.rows
+                        .iter()
+                        .any(|candidate| candidate.entry_id == anchor.message_id)
+                })
+                .map_or(0.0, |anchor| anchor.runway);
+            self.bottom_clearance + Theme::TRANSCRIPT_FADE_BAND + 8.0 + runway
         } else {
             0.0
         };
@@ -3119,6 +3388,21 @@ impl Render for Transcript {
         // Release gpui-side decoded copies of any images the attachment LRU
         // evicted since the last frame (no-op when nothing was evicted).
         crate::attachments::flush_evicted(Some(window), cx);
+        // Own-turn driver: measurements are only authoritative after layout,
+        // so runway installation, prompt positioning, and overflow handoff
+        // each advance at most once per requested frame.
+        if self.own_turn_kick && !self.own_turn_scheduled {
+            self.own_turn_scheduled = true;
+            let entity = cx.weak_entity();
+            window.on_next_frame(move |_, cx| {
+                entity
+                    .update(cx, |this: &mut Transcript, cx| {
+                        this.own_turn_scheduled = false;
+                        this.step_own_turn(cx);
+                    })
+                    .ok();
+            });
+        }
         // Spring driver: one on_next_frame callback at a time; each tick
         // notifies, which re-enters render and schedules the next frame until
         // the spring parks. Reduced motion never schedules (sync snaps).
@@ -3368,6 +3652,19 @@ mod tests {
         assert!(!Transcript::should_restick(200.0, 300.0));
         // No movement — leave the pin alone.
         assert!(!Transcript::should_restick(50.0, 50.0));
+    }
+
+    #[test]
+    fn own_turn_runway_hands_off_only_at_real_overflow() {
+        let viewport_bottom = 800.0;
+        let runway = 600.0;
+
+        // Bounds include the synthetic runway. Removing it leaves the real
+        // turn short of the viewport, so the prompt must stay top-anchored.
+        assert!(!own_turn_has_overflow(1_350.0, viewport_bottom, runway));
+        // The exact crossing hands off; subsequent growth stays overflowed.
+        assert!(own_turn_has_overflow(1_400.0, viewport_bottom, runway));
+        assert!(own_turn_has_overflow(1_525.0, viewport_bottom, runway));
     }
 
     fn parse(_: &str, text: &str) -> Arc<BlockTree> {
