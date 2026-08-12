@@ -22,6 +22,8 @@
 //! scroll handler fires exclusively from its wheel/touch path) and re-engages
 //! inside the 70px band; the first send in an empty chat anchors the prompt at
 //! the viewport top and hands off to the same glide when the reply overflows.
+//! While that anchor holds, wheel/touch is clamped rather than obeyed — the
+//! whole turn is already visible, so there is nothing to scroll to.
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -1429,10 +1431,28 @@ impl Transcript {
         let this = cx.weak_entity();
         cx.defer(move |cx| {
             this.update(cx, |this: &mut Transcript, cx| {
-                // Any direct wheel/touch input owns the viewport from here.
-                // Remove the synthetic runway before applying the ordinary
-                // pin/restick rules below.
-                this.remove_own_turn_runway();
+                // While the first-turn anchor holds, everything already fits
+                // on screen — the prompt at the top, the whole reply below,
+                // and under that only synthetic runway. Wheel/touch has
+                // nothing to reveal in either direction, so clamp back to the
+                // anchor instead of handing over the viewport (cancelling
+                // here collapses the runway and teleports the layout by up to
+                // a viewport). The runway retires through the overflow
+                // handoff; explicit navigation (jump pill, rail clicks, chat
+                // switches) still cancels it.
+                if this.own_turn.is_some() {
+                    if let Some(ix) = this.own_turn_anchor_ix() {
+                        this.list.scroll_to(ListOffset {
+                            item_ix: ix,
+                            offset_in_item: px(0.0),
+                        });
+                        this.list.scroll_by(px(-OWN_SEND_TOP_INSET_PX));
+                    }
+                    this.last_scroll_distance = this.distance_from_bottom();
+                    return;
+                }
+                // User input supersedes a pending post-handoff re-pin.
+                this.own_turn_release_pending = false;
                 let distance = this.distance_from_bottom();
                 let previous = this.last_scroll_distance;
                 this.last_scroll_distance = distance;
