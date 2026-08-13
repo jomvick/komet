@@ -242,7 +242,8 @@ pub enum ToolDetail {
     /// tokens — rendered by `changes::render_file_body`.
     Diff {
         file: Arc<crate::changes::FileDiff>,
-        highlight: Option<Arc<Vec<Vec<crate::markdown::highlight::Token>>>>,
+        old_text: Option<Arc<str>>,
+        new_text: Option<Arc<str>>,
     },
     /// Per-file `+N −N` stat rows — what the thin doc keeps of an edit
     /// (chat2-sync A1). The full diff upgrades this to [`ToolDetail::Diff`]
@@ -288,10 +289,10 @@ pub fn tool_detail(
         // build tens of thousands of elements per frame. The changes pane
         // has no such cap; it virtualizes per line.
         crate::changes::truncate_file_lines(&mut file, DIFF_DETAIL_MAX_LINES);
-        let highlight = highlight_file(&file);
         return Some(ToolDetail::Diff {
             file: Arc::new(file),
-            highlight,
+            old_text: diff.old_text.as_deref().map(Arc::from),
+            new_text: Some(Arc::from(diff.new_text.as_str())),
         });
     }
     if let Some(stats) = diff_stats.filter(|s| !s.is_empty()) {
@@ -384,24 +385,6 @@ pub fn diff_to_file(diff: &komet_proto::ToolDiff) -> crate::changes::FileDiff {
         deletions,
         max_line,
     }
-}
-
-/// Synchronous syntax tokens for a tool diff — the payload is doc-capped, so
-/// unlike the changes pane's time-sliced background pass this can run inline
-/// at row-build time (rows are fingerprint-cached, not per-frame).
-fn highlight_file(
-    file: &crate::changes::FileDiff,
-) -> Option<Arc<Vec<Vec<crate::markdown::highlight::Token>>>> {
-    use crate::markdown::highlight::{LineCarry, tokenize_line};
-    let lang = crate::changes::lang_for_path(&file.path)?;
-    let lines: Vec<Vec<crate::markdown::highlight::Token>> = file
-        .hunks
-        .iter()
-        .flat_map(|h| h.lines.iter())
-        // Diff lines are fragments — no carry across lines (changes.rs).
-        .map(|l| tokenize_line(lang, &l.text, LineCarry::None).0)
-        .collect();
-    Some(Arc::new(lines))
 }
 
 #[derive(Clone)]
@@ -2709,6 +2692,43 @@ impl Transcript {
         out
     }
 
+    fn tool_diff_highlight_for(
+        &mut self,
+        row_id: &SharedString,
+        tool_ix: usize,
+        detail: &ToolDetail,
+        cx: &mut Context<Self>,
+    ) -> Option<Arc<crate::changes::DiffHighlights>> {
+        let ToolDetail::Diff {
+            file,
+            old_text,
+            new_text,
+        } = detail
+        else {
+            return None;
+        };
+        let cache_row: SharedString = format!("{row_id}#tool-diff-{tool_ix}").into();
+        let old = match old_text {
+            Some(source) => {
+                let path = file.old_path.as_deref().unwrap_or(&file.path);
+                let lang = crate::changes::lang_for_path(path)?;
+                Some(
+                    self.highlights
+                        .request(cache_row.clone(), 0, lang, source, cx)?,
+                )
+            }
+            None => None,
+        };
+        let new = match new_text {
+            Some(source) => {
+                let lang = crate::changes::lang_for_path(&file.path)?;
+                Some(self.highlights.request(cache_row, 1, lang, source, cx)?)
+            }
+            None => None,
+        };
+        Some(Arc::new(crate::changes::DiffHighlights { old, new }))
+    }
+
     fn render_tool_group(
         &mut self,
         row_id: &SharedString,
@@ -2810,6 +2830,16 @@ impl Transcript {
             .iter()
             .zip(&detail_folds)
             .map(|(detail, fold)| detail.is_some() && fold.open.unwrap_or(false))
+            .collect();
+        let detail_highlights: Vec<Option<Arc<crate::changes::DiffHighlights>>> = details
+            .iter()
+            .enumerate()
+            .map(|(ix, detail)| {
+                detail
+                    .as_deref()
+                    .filter(|_| detail_opens[ix])
+                    .and_then(|detail| self.tool_diff_highlight_for(row_id, ix, detail, cx))
+            })
             .collect();
         let open_height = chips_height(tools.len())
             + details
@@ -2947,7 +2977,7 @@ impl Transcript {
                                 .flex_none()
                                 .bg(crate::theme::hairline(0.06)),
                         )
-                        .child(detail_body(&detail, theme));
+                        .child(detail_body(&detail, detail_highlights[ix].clone(), theme));
                     if let Some((blob_ref, label)) = affordance {
                         let loading = matches!(
                             self.blob_details.get(&blob_ref),
@@ -3274,13 +3304,17 @@ fn tool_icon_path(call: &ToolCall) -> &'static str {
 /// syntax runs — so an inline tool diff is indistinguishable from the
 /// checkout diff sidebar. Output renders as a code block: verbatim mono
 /// lines, indentation intact, counted-tail truncation.
-fn detail_body(detail: &ToolDetail, theme: &Theme) -> AnyElement {
+fn detail_body(
+    detail: &ToolDetail,
+    diff_highlights: Option<Arc<crate::changes::DiffHighlights>>,
+    theme: &Theme,
+) -> AnyElement {
     let body = div().w_full().min_w_0().flex().flex_col().overflow_hidden();
     match detail {
-        ToolDetail::Diff { file, highlight } => body
-            .child(crate::changes::render_file_body(
+        ToolDetail::Diff { file, .. } => body
+            .child(crate::changes::render_file_body_with_syntax(
                 file,
-                highlight.clone(),
+                diff_highlights,
                 theme,
             ))
             .into_any_element(),
@@ -4095,7 +4129,11 @@ mod tests {
             old_text: Some(old.join("\n") + "\n"),
             new_text: new.join("\n") + "\n",
         };
-        let Some(ToolDetail::Diff { file, highlight }) = tool_detail(None, Some(&diff), None)
+        let Some(ToolDetail::Diff {
+            file,
+            old_text,
+            new_text,
+        }) = tool_detail(None, Some(&diff), None)
         else {
             panic!("expected diff detail");
         };
@@ -4120,21 +4158,25 @@ mod tests {
         assert_eq!(add.new_no, Some(10));
         assert_eq!(add.text, "LINE 10");
         assert_eq!((file.additions, file.deletions), (1, 1));
-        // .rs path → syntax tokens computed, one entry per hunk line.
-        let highlight = highlight.expect("rust highlights");
-        assert_eq!(highlight.len(), hunk.lines.len());
+        assert_eq!(old_text.as_deref(), diff.old_text.as_deref());
+        assert_eq!(new_text.as_deref(), Some(diff.new_text.as_str()));
         // New files carry Added status (and no old numbers).
         let created = komet_proto::ToolDiff {
             path: "/w/new.txt".into(),
             old_text: None,
             new_text: "only\n".into(),
         };
-        let Some(ToolDetail::Diff { file, highlight }) = tool_detail(None, Some(&created), None)
+        let Some(ToolDetail::Diff {
+            file,
+            old_text,
+            new_text,
+        }) = tool_detail(None, Some(&created), None)
         else {
             panic!("expected diff detail");
         };
         assert_eq!(file.status, crate::changes::FileStatus::Added);
-        assert!(highlight.is_none(), ".txt has no language");
+        assert!(old_text.is_none());
+        assert_eq!(new_text.as_deref(), Some("only\n"));
 
         // Output: verbatim lines (indentation intact), counted-tail cap.
         let output = (0..40)

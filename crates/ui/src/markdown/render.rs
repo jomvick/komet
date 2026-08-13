@@ -1181,10 +1181,20 @@ pub fn runs_for_syntax_line(
     mono: &gpui::Font,
     theme: &Theme,
 ) -> Vec<TextRun> {
+    runs_for_syntax_line_with_plain(line, spans, mono, theme.text, theme)
+}
+
+pub fn runs_for_syntax_line_with_plain(
+    line: &str,
+    spans: &[HighlightSpan],
+    mono: &gpui::Font,
+    plain_color: Hsla,
+    theme: &Theme,
+) -> Vec<TextRun> {
     let plain = |len: usize| TextRun {
         len,
         font: mono.clone(),
-        color: theme.text,
+        color: plain_color,
         background_color: None,
         underline: None,
         strikethrough: None,

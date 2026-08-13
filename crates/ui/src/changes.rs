@@ -37,7 +37,7 @@ use komet_rpc::methods;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::history::{GitHistory, GitHistoryCount, GitHistoryEvent, GitHistoryFetchButton};
-use crate::markdown::highlight::{Lang, LineCarry, Token, tokenize_line};
+use crate::markdown::highlight::{Lang, LineCarry, tokenize_line};
 use crate::markdown::render;
 use crate::motion::{self, AnimationExt as _, CHEVRON, COLLAPSE};
 use crate::popover::{self, Popup};
@@ -80,6 +80,68 @@ pub struct DiffLine {
     pub old_no: Option<u32>,
     pub new_no: Option<u32>,
     pub text: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SourceSide {
+    Old,
+    New,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SourceLineRef {
+    pub side: SourceSide,
+    /// One-based source line number.
+    pub line_number: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DiffHighlights {
+    pub old: Option<Arc<komet_syntax::HighlightedDocument>>,
+    pub new: Option<Arc<komet_syntax::HighlightedDocument>>,
+}
+
+impl DiffHighlights {
+    pub fn source_ref(&self, line: &DiffLine) -> Option<SourceLineRef> {
+        match line.kind {
+            LineKind::Del => line.old_no.map(|line_number| SourceLineRef {
+                side: SourceSide::Old,
+                line_number,
+            }),
+            LineKind::Add => line.new_no.map(|line_number| SourceLineRef {
+                side: SourceSide::New,
+                line_number,
+            }),
+            LineKind::Context => line
+                .new_no
+                .filter(|_| self.new.is_some())
+                .map(|line_number| SourceLineRef {
+                    side: SourceSide::New,
+                    line_number,
+                })
+                .or_else(|| {
+                    line.old_no.map(|line_number| SourceLineRef {
+                        side: SourceSide::Old,
+                        line_number,
+                    })
+                }),
+            LineKind::Meta => None,
+        }
+    }
+
+    pub fn spans(&self, line: &DiffLine) -> &[komet_syntax::HighlightSpan] {
+        let Some(source_ref) = self.source_ref(line) else {
+            return &[];
+        };
+        let document = match source_ref.side {
+            SourceSide::Old => self.old.as_deref(),
+            SourceSide::New => self.new.as_deref(),
+        };
+        document
+            .and_then(|document| document.lines.get(source_ref.line_number as usize - 1))
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -710,7 +772,7 @@ impl FileFold {
 
 struct HighlightSlot {
     fingerprint: u64,
-    lines: Option<Arc<Vec<Vec<Token>>>>,
+    lines: Option<Arc<Vec<Vec<komet_syntax::HighlightSpan>>>>,
     _task: Option<Task<()>>,
 }
 
@@ -1540,7 +1602,7 @@ impl Changes {
         file: &FileDiff,
         parsed_key: &str,
         cx: &mut Context<Self>,
-    ) -> Option<Arc<Vec<Vec<Token>>>> {
+    ) -> Option<Arc<Vec<Vec<komet_syntax::HighlightSpan>>>> {
         let lang = lang_for_path(&file.path)?;
         let fingerprint = hash64(&[parsed_key, &file.path]);
         if let Some(slot) = self.highlights.get(&file.path)
@@ -1565,7 +1627,15 @@ impl Changes {
                             LineKind::Meta => Vec::new(),
                             _ => tokenize_line(lang, text, LineCarry::None).0,
                         };
-                        out.push(tokens);
+                        out.push(
+                            tokens
+                                .into_iter()
+                                .map(|token| komet_syntax::HighlightSpan {
+                                    range: token.range,
+                                    kind: token.class.into(),
+                                })
+                                .collect(),
+                        );
                         if ix % 128 == 127 {
                             yield_now().await;
                         }
@@ -2235,12 +2305,6 @@ fn del_color(theme: &Theme) -> gpui::Hsla {
     theme.diff_del // red-400
 }
 
-/// Diff syntax palette — since round 9 the transcript's code blocks share the
-/// same soft hues, so this simply delegates to [`render::token_color`].
-fn diff_token_color(kind: komet_syntax::HighlightKind, theme: &Theme) -> gpui::Hsla {
-    render::token_color(kind, theme)
-}
-
 /// One notice row ("New file", "Binary file — contents not shown", …).
 fn notice_row(notice: String, theme: &Theme) -> AnyElement {
     div()
@@ -2276,7 +2340,12 @@ fn hunk_header_row(header: &str, theme: &Theme) -> AnyElement {
 /// One +/−/context/meta diff line: coloured accent bar, dual line-number
 /// gutters (`gutter_px` wide — see [`gutter_width`]), marker column, and
 /// paint-only syntax runs.
-fn diff_line_row(line: &DiffLine, tokens: &[Token], theme: &Theme, gutter_px: f32) -> AnyElement {
+fn diff_line_row(
+    line: &DiffLine,
+    spans: &[komet_syntax::HighlightSpan],
+    theme: &Theme,
+    gutter_px: f32,
+) -> AnyElement {
     if line.kind == LineKind::Meta {
         return div()
             .h(px(DIFF_LINE_HEIGHT))
@@ -2336,12 +2405,12 @@ fn diff_line_row(line: &DiffLine, tokens: &[Token], theme: &Theme, gutter_px: f3
             ))
     };
     let mono = font(theme.font_mono.clone());
-    let runs = render::runs_with_palette(
+    let runs = render::runs_for_syntax_line_with_plain(
         &line.text,
-        tokens,
+        spans,
         &mono,
         theme.text.opacity(0.92),
-        |class| diff_token_color(class, theme),
+        theme,
     );
     div()
         .h(px(DIFF_LINE_HEIGHT))
@@ -2408,19 +2477,40 @@ fn diff_line_row(line: &DiffLine, tokens: &[Token], theme: &Theme, gutter_px: f3
 /// renders a checkout diff section and an inline ACP tool diff. (The changes
 /// pane itself virtualizes these rows individually; this stacked form serves
 /// the transcript and the fold tween's clipped stand-in.)
-pub(crate) fn render_file_body(
+/// Full-document old/new highlighting for tool and checkout diffs.
+pub(crate) fn render_file_body_with_syntax(
     file: &FileDiff,
-    highlight: Option<Arc<Vec<Vec<Token>>>>,
+    highlights: Option<Arc<DiffHighlights>>,
     theme: &Theme,
 ) -> AnyElement {
-    render_file_body_upto(file, highlight, theme, f32::INFINITY)
+    let mut children: Vec<AnyElement> = Vec::new();
+    let gutter_px = gutter_width(file);
+    for notice in file_notices(file) {
+        children.push(notice_row(notice, theme));
+    }
+    for hunk in &file.hunks {
+        children.push(hunk_header_row(&hunk.header, theme));
+        for line in &hunk.lines {
+            let spans = highlights
+                .as_deref()
+                .map(|highlights| highlights.spans(line))
+                .unwrap_or(&[]);
+            children.push(diff_line_row(line, spans, theme, gutter_px));
+        }
+    }
+    div()
+        .flex()
+        .flex_col()
+        .pb(px(BODY_BOTTOM_PAD))
+        .children(children)
+        .into_any_element()
 }
 
-/// [`render_file_body`], building only rows that start above `max_px` — the
-/// fold tween's stand-in never materializes lines its clip cannot reveal.
+/// Build only rows that start above `max_px` so the fold tween's stand-in
+/// never materializes lines its clip cannot reveal.
 fn render_file_body_upto(
     file: &FileDiff,
-    highlight: Option<Arc<Vec<Vec<Token>>>>,
+    highlight: Option<Arc<Vec<Vec<komet_syntax::HighlightSpan>>>>,
     theme: &Theme,
     max_px: f32,
 ) -> AnyElement {
@@ -3091,5 +3181,76 @@ rename to new_name.rs
         assert_eq!(lang_for_path("script.sh"), Some(Lang::Bash));
         assert_eq!(lang_for_path("README"), None);
         assert_eq!(lang_for_path("img.png"), None);
+    }
+
+    #[test]
+    fn full_diff_highlights_map_old_new_and_context_by_source_line() {
+        let old_source = "fn old() {\n    let value = 1;\n}\n";
+        let new_source = "fn new() {\n    let value = 2;\n}\n";
+        let parse = |source| {
+            Arc::new(
+                komet_syntax::highlight(komet_syntax::HighlightRequest {
+                    source,
+                    path: Some("src/lib.rs"),
+                    fence_tag: None,
+                })
+                .unwrap(),
+            )
+        };
+        let highlights = DiffHighlights {
+            old: Some(parse(old_source)),
+            new: Some(parse(new_source)),
+        };
+        let deleted = DiffLine {
+            kind: LineKind::Del,
+            old_no: Some(1),
+            new_no: None,
+            text: "fn old() {".into(),
+        };
+        let added = DiffLine {
+            kind: LineKind::Add,
+            old_no: None,
+            new_no: Some(1),
+            text: "fn new() {".into(),
+        };
+        let context = DiffLine {
+            kind: LineKind::Context,
+            old_no: Some(2),
+            new_no: Some(2),
+            text: "    let value = 2;".into(),
+        };
+        assert_eq!(
+            highlights.source_ref(&deleted),
+            Some(SourceLineRef {
+                side: SourceSide::Old,
+                line_number: 1
+            })
+        );
+        assert_eq!(
+            highlights.source_ref(&added),
+            Some(SourceLineRef {
+                side: SourceSide::New,
+                line_number: 1
+            })
+        );
+        assert_eq!(
+            highlights.source_ref(&context),
+            Some(SourceLineRef {
+                side: SourceSide::New,
+                line_number: 2
+            })
+        );
+        assert!(
+            highlights
+                .spans(&deleted)
+                .iter()
+                .any(|span| span.kind == komet_syntax::HighlightKind::Function)
+        );
+        assert!(
+            highlights
+                .spans(&added)
+                .iter()
+                .any(|span| span.kind == komet_syntax::HighlightKind::Function)
+        );
     }
 }
