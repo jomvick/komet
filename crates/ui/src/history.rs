@@ -232,9 +232,57 @@ fn ref_icon(kind: GitHistoryRefKind) -> &'static str {
     }
 }
 
+fn ref_description(reference: &GitHistoryRef) -> SharedString {
+    let kind = match reference.kind {
+        GitHistoryRefKind::Branch => "Branch",
+        GitHistoryRefKind::Remote => "Remote branch",
+        GitHistoryRefKind::Tag => "Tag",
+    };
+    format!("{kind}: {}", reference.label).into()
+}
+
 fn graph_color(mut color: gpui::Hsla) -> gpui::Hsla {
     color.s *= HISTORY_GRAPH_SATURATION;
     color
+}
+
+struct HistoryRefTooltip {
+    descriptions: Vec<SharedString>,
+}
+
+impl Render for HistoryRefTooltip {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::of(cx);
+        let longest = self
+            .descriptions
+            .iter()
+            .map(|description| description.chars().count())
+            .max()
+            .unwrap_or_default();
+        let width = (longest as f32 * 6.6 + 16.0).clamp(140.0, 360.0);
+        div()
+            .w(px(width))
+            .px(px(8.0))
+            .py(px(6.0))
+            .flex()
+            .flex_col()
+            .gap(px(3.0))
+            .rounded(px(5.0))
+            .border_1()
+            .border_color(theme.border_strong)
+            .bg(theme.surface_raised)
+            .shadow_md()
+            .text_size(px(11.0))
+            .text_color(theme.text_muted)
+            .children(self.descriptions.iter().cloned().map(|description| {
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .whitespace_nowrap()
+                    .font_family(theme.font_mono.clone())
+                    .child(description)
+            }))
+    }
 }
 
 pub struct GitHistory {
@@ -538,10 +586,12 @@ impl GitHistory {
             .into_any_element()
     }
 
-    fn render_ref(reference: GitHistoryRef, theme: &Theme) -> AnyElement {
+    fn render_ref(reference: GitHistoryRef, row_index: usize, theme: &Theme) -> AnyElement {
         let color = ref_color(&reference, theme);
         let icon = ref_icon(reference.kind);
+        let description = ref_description(&reference);
         div()
+            .id(("history-ref", row_index))
             .h(px(16.0))
             .max_w(px(112.0))
             .px(px(5.0))
@@ -567,6 +617,13 @@ impl GitHistory {
                     .truncate()
                     .child(SharedString::from(reference.label)),
             )
+            .tooltip(move |_, cx| {
+                cx.new(|_| HistoryRefTooltip {
+                    descriptions: vec![description.clone()],
+                })
+                .into()
+            })
+            .tooltip_show_delay(Duration::from_millis(350))
             .into_any_element()
     }
 
@@ -647,13 +704,21 @@ impl GitHistory {
         let theme = Theme::of(cx).clone();
         let sha = commit.sha.clone();
         let copied = self.copied_sha.as_deref() == Some(sha.as_str());
-        let (visible_ref_count, hidden_refs) = ref_display_counts(commit.refs.len());
+        let (visible_ref_count, _) = ref_display_counts(commit.refs.len());
         let visible_refs: Vec<_> = commit
             .refs
             .iter()
             .take(visible_ref_count)
             .cloned()
             .collect();
+        let hidden_refs: Vec<_> = commit
+            .refs
+            .iter()
+            .skip(visible_ref_count)
+            .cloned()
+            .collect();
+        let hidden_ref_count = hidden_refs.len();
+        let hidden_ref_descriptions: Vec<_> = hidden_refs.iter().map(ref_description).collect();
 
         div()
             .h(px(HISTORY_ROW_HEIGHT))
@@ -704,15 +769,24 @@ impl GitHistory {
                             .children(
                                 visible_refs
                                     .into_iter()
-                                    .map(|reference| Self::render_ref(reference, &theme)),
+                                    .map(|reference| Self::render_ref(reference, index, &theme)),
                             )
-                            .when(hidden_refs > 0, |element| {
+                            .when(hidden_ref_count > 0, |element| {
+                                let descriptions = hidden_ref_descriptions.clone();
                                 element.child(
                                     div()
+                                        .id(("history-ref-overflow", index))
                                         .flex_none()
                                         .text_size(px(10.0))
                                         .text_color(theme.text_faint)
-                                        .child(SharedString::from(format!("+{hidden_refs}"))),
+                                        .child(SharedString::from(format!("+{hidden_ref_count}")))
+                                        .tooltip(move |_, cx| {
+                                            cx.new(|_| HistoryRefTooltip {
+                                                descriptions: descriptions.clone(),
+                                            })
+                                            .into()
+                                        })
+                                        .tooltip_show_delay(Duration::from_millis(350)),
                                 )
                             }),
                     ),
@@ -963,5 +1037,25 @@ mod tests {
         assert_eq!(ref_display_counts(1), (1, 0));
         assert_eq!(ref_display_counts(2), (1, 1));
         assert_eq!(ref_display_counts(4), (1, 3));
+    }
+
+    #[test]
+    fn ref_tooltip_describes_each_reference_kind() {
+        let reference = |kind: GitHistoryRefKind, label: &str| GitHistoryRef {
+            kind,
+            label: label.into(),
+        };
+        assert_eq!(
+            ref_description(&reference(GitHistoryRefKind::Branch, "main")),
+            "Branch: main"
+        );
+        assert_eq!(
+            ref_description(&reference(GitHistoryRefKind::Remote, "origin/main")),
+            "Remote branch: origin/main"
+        );
+        assert_eq!(
+            ref_description(&reference(GitHistoryRefKind::Tag, "v0.1.52")),
+            "Tag: v0.1.52"
+        );
     }
 }
