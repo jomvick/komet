@@ -1720,6 +1720,18 @@ fn prompt_like_request(
     Box::pin(async move { client.request(method, params).await })
 }
 
+/// True for the session's terminal accounting frame: a `usage_update`
+/// carrying `cost`, which claude-agent-acp derives once per turn from the
+/// CLI's result message — the turn-is-over tell that survives even when the
+/// prompt response itself is dropped (the starved-turn bug).
+fn is_turn_end_cost_update(params: &Value, session_id: &str) -> bool {
+    params.get("sessionId").and_then(Value::as_str) == Some(session_id)
+        && params.get("update").is_some_and(|u| {
+            u.get("sessionUpdate").and_then(Value::as_str) == Some("usage_update")
+                && u.get("cost").is_some()
+        })
+}
+
 /// A mid-turn `_session/steering` call. `idleBehavior: promptRequired`
 /// covers the turn-ended race: the agent hands the text back instead of
 /// firing an untracked turn.
@@ -1995,6 +2007,19 @@ async fn run_session(session: Session) {
     // the queued steer is promoted to a fresh turn.
     const STARVE_GRACE: Duration = Duration::from_secs(2);
     let mut starve_deadline: Option<tokio::time::Instant> = None;
+    // Deterministic turn-end hint (claude-agent-acp, verified against
+    // 0.66.0): the adapter derives exactly one cost-bearing `usage_update`
+    // per turn from the CLI's terminal result — INCLUDING turns whose
+    // prompt response it then drops (the starve above; the cost frame and
+    // the response share a timestamp in every healthy trace). While our
+    // prompt is outstanding, that update means the turn is already over:
+    // give the real response a short head start (it lands within
+    // milliseconds when it lands at all), then settle via the recovery arm.
+    // This is what keeps a dropped reply's stuck-Working window near zero
+    // instead of watchdog-length. Gated to Claude — the one adapter whose
+    // cost semantics are verified end-of-turn-only.
+    const COST_HINT_GRACE: Duration = Duration::from_secs(1);
+    let cost_hint_enabled = harness == HarnessId::ClaudeCode;
 
     'main: loop {
         tokio::select! {
@@ -2155,6 +2180,24 @@ async fn run_session(session: Session) {
 
             inc = incoming.recv() => match inc {
                 Some(Incoming::Notification { method, params }) => {
+                    // Turn-end cost hint (see COST_HINT_GRACE above): arm the
+                    // fast settle when the turn's terminal accounting frame
+                    // arrives with our prompt still unsettled.
+                    if cost_hint_enabled
+                        && turn.is_some()
+                        && !interrupted
+                        && starve_deadline.is_none()
+                        && method == "session/update"
+                        && is_turn_end_cost_update(&params, &session_id)
+                    {
+                        tracing::debug!(
+                            target: "komet_harness::acp",
+                            "turn-end cost update observed with the prompt \
+                             unsettled; arming fast settle"
+                        );
+                        starve_deadline =
+                            Some(tokio::time::Instant::now() + COST_HINT_GRACE);
+                    }
                     // Other notifications (other sessions, agent noise) are
                     // tolerated by design.
                     let events = if method == "session/update" {
@@ -2362,21 +2405,23 @@ async fn run_session(session: Session) {
                 }
             },
 
-            // Starved-turn recovery (see STARVE_GRACE above): the grace
-            // elapsed with the prompt still unsettled after the adapter
-            // reported noRunningTurn. Close the dead turn out with a Done —
-            // its output already streamed as session/updates and its text
-            // was delivered via the CLI's own queue — then promote the
-            // queued steer to a fresh prompt, which settles normally on a
-            // now-idle agent (verified against the real adapter).
+            // Starved-turn recovery: the grace elapsed with the prompt still
+            // unsettled after turn-end evidence — either the turn's terminal
+            // cost frame (COST_HINT_GRACE, ~immediate) or a steering call
+            // answered noRunningTurn (STARVE_GRACE). Close the dead turn out
+            // with a Done — its output already streamed as session/updates
+            // and its text was delivered via the CLI's own queue — then
+            // promote any queued steer to a fresh prompt, which settles
+            // normally on a now-idle agent (verified against the real
+            // adapter).
             _ = tokio::time::sleep_until(
                 starve_deadline.unwrap_or_else(tokio::time::Instant::now)
             ), if starve_deadline.is_some() && turn.is_some() && !interrupted => {
                 starve_deadline = None;
                 tracing::warn!(
                     target: "komet_harness::acp",
-                    "prompt starved (noRunningTurn evidence outlived the grace); \
-                     settling the dead turn and promoting the queued steer"
+                    "prompt response missing past turn-end evidence; settling \
+                     the dead turn (and promoting any queued steer)"
                 );
                 // Drop the dead future: a response that somehow arrives later
                 // resolves a closed channel harmlessly.

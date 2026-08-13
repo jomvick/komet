@@ -217,6 +217,18 @@ case "$promptline" in
   fi
   ;;
 
+*scenario:cost-starve*)
+  # The dropped-reply turn end, no steer involved: the turn's terminal
+  # cost frame arrives but the prompt response never does. The harness
+  # (claude spec) must settle the turn ~1s after the cost frame instead of
+  # stranding Working. Script exits shortly after so the stream ends.
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"working"}}'
+  update '{"sessionUpdate":"usage_update","used":22457,"size":1000000,"cost":{"amount":0.01,"currency":"USD"}}'
+  # No response to $pid, ever.
+  sleep 6
+  exit 0
+  ;;
+
 *scenario:interrupt*)
   update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"working"}}'
   read -r intline || exit 1

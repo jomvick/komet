@@ -1011,3 +1011,49 @@ async fn starved_prompt_recovers_via_no_running_turn_evidence() {
         "the dead turn settles before the promoted boundary: {events:?}"
     );
 }
+
+/// The dropped-reply turn end with no steer involved: the adapter emits the
+/// turn's terminal cost frame (`usage_update` with `cost`) but never the
+/// prompt response. The claude spec must settle the turn off that evidence
+/// within its 1s grace — Working clears in about a second, not never (and
+/// not only after a watchdog window).
+#[tokio::test]
+async fn dropped_reply_settles_fast_off_the_turn_end_cost_frame() {
+    let (controls, _steer, _token) = controls();
+    let harness = AcpHarness::claude().with_executable(fixture_path());
+    let started = std::time::Instant::now();
+    let stream = harness
+        .run(request("scenario:cost-starve"), controls)
+        .await
+        .expect("run starts");
+    let (events, done_at) = tokio::time::timeout(Duration::from_secs(10), async move {
+        let mut events = Vec::new();
+        let mut done_at = None;
+        let mut stream = stream;
+        while let Some(ev) = stream.next().await {
+            let ev = ev.expect("stream event");
+            if matches!(ev, AgentEvent::Done { .. }) && done_at.is_none() {
+                done_at = Some(started.elapsed());
+            }
+            events.push(ev);
+        }
+        (events, done_at)
+    })
+    .await
+    .expect("run finished in time");
+
+    assert_eq!(
+        dones(&events),
+        vec![(DoneStatus::Completed, None)],
+        "{events:?}"
+    );
+    // The fixture holds its stream open for 6s after the cost frame; the
+    // Done must come from the 1s cost-hint grace, not stream EOF (margin
+    // sized for parallel-suite load).
+    let done_at = done_at.expect("dones asserted above");
+    assert!(
+        done_at < Duration::from_secs(4),
+        "Done at {done_at:?} — should be ~1s after the cost frame, well \
+         before the fixture's 6s exit"
+    );
+}
