@@ -747,6 +747,114 @@ impl GitHistory {
         }));
     }
 
+    fn graph_paths(&self, theme: &Theme) -> AnyElement {
+        let palette = [
+            graph_color(theme.accent),
+            graph_color(theme.busy),
+            graph_color(theme.success),
+            graph_color(theme.warning),
+            graph_color(theme.danger),
+            graph_color(theme.text_muted),
+        ];
+        let rows = self.graph.rows.clone();
+        let list = self.list.clone();
+        canvas(
+            |_, _, _| (),
+            move |viewport_bounds, _, window, _| {
+                let middle = HISTORY_ROW_HEIGHT / 2.0;
+                for (color_index, color) in palette.iter().enumerate() {
+                    let mut builder = PathBuilder::stroke(px(HISTORY_STROKE_WIDTH));
+                    let mut has_segments = false;
+
+                    for (index, row) in rows.iter().enumerate() {
+                        let Some(row_bounds) = list.bounds_for_item(index) else {
+                            continue;
+                        };
+                        if row_bounds.bottom() < viewport_bounds.top()
+                            || row_bounds.top() > viewport_bounds.bottom()
+                        {
+                            continue;
+                        }
+                        for segment in row
+                            .segments
+                            .iter()
+                            .filter(|segment| segment.color_id % palette.len() == color_index)
+                        {
+                            has_segments = true;
+                            let from_x = lane_x(segment.from_lane);
+                            let to_x = lane_x(segment.to_lane);
+                            let origin = row_bounds.origin;
+                            match segment.shape {
+                                SegmentShape::Incoming => {
+                                    builder.move_to(point(
+                                        origin.x + px(from_x),
+                                        origin.y - px(HISTORY_GRAPH_ROW_OVERLAP),
+                                    ));
+                                    builder.cubic_bezier_to(
+                                        point(origin.x + px(to_x), origin.y + px(middle)),
+                                        point(origin.x + px(from_x), origin.y + px(middle * 0.55)),
+                                        point(origin.x + px(to_x), origin.y + px(middle * 0.55)),
+                                    );
+                                }
+                                SegmentShape::Outgoing => {
+                                    builder.move_to(point(
+                                        origin.x + px(from_x),
+                                        origin.y + px(middle),
+                                    ));
+                                    builder.cubic_bezier_to(
+                                        point(
+                                            origin.x + px(to_x),
+                                            origin.y
+                                                + px(
+                                                    HISTORY_ROW_HEIGHT
+                                                        + HISTORY_GRAPH_ROW_OVERLAP,
+                                                ),
+                                        ),
+                                        point(
+                                            origin.x + px(from_x),
+                                            origin.y + px(middle * 1.45),
+                                        ),
+                                        point(
+                                            origin.x + px(to_x),
+                                            origin.y + px(middle * 1.45),
+                                        ),
+                                    );
+                                }
+                                SegmentShape::Through => {
+                                    builder.move_to(point(
+                                        origin.x + px(from_x),
+                                        origin.y - px(HISTORY_GRAPH_ROW_OVERLAP),
+                                    ));
+                                    let end = point(
+                                        origin.x + px(to_x),
+                                        origin.y
+                                            + px(HISTORY_ROW_HEIGHT + HISTORY_GRAPH_ROW_OVERLAP),
+                                    );
+                                    if segment.from_lane == segment.to_lane {
+                                        builder.line_to(end);
+                                    } else {
+                                        builder.cubic_bezier_to(
+                                            end,
+                                            point(origin.x + px(from_x), origin.y + px(middle)),
+                                            point(origin.x + px(to_x), origin.y + px(middle)),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if has_segments && let Ok(path) = builder.build() {
+                        window.paint_path(path, *color);
+                    }
+                }
+            },
+        )
+        .absolute()
+        .inset_0()
+        .into_any_element()
+    }
+
     fn graph_cell(row: GraphRow, lane_count: usize, theme: &Theme) -> AnyElement {
         let width = graph_width(lane_count);
         let palette = [
@@ -757,62 +865,6 @@ impl GitHistory {
             graph_color(theme.danger),
             graph_color(theme.text_muted),
         ];
-        let segments = row.segments.clone();
-        let paths = canvas(
-            |_, _, _| (),
-            move |bounds, _, window, _| {
-                let middle = HISTORY_ROW_HEIGHT / 2.0;
-                for segment in &segments {
-                    let from_x = lane_x(segment.from_lane);
-                    let to_x = lane_x(segment.to_lane);
-                    let mut builder = PathBuilder::stroke(px(HISTORY_STROKE_WIDTH));
-                    let origin = bounds.origin;
-                    match segment.shape {
-                        SegmentShape::Incoming => {
-                            builder.move_to(point(
-                                origin.x + px(from_x),
-                                origin.y - px(HISTORY_GRAPH_ROW_OVERLAP),
-                            ));
-                            builder.cubic_bezier_to(
-                                point(origin.x + px(to_x), origin.y + px(middle)),
-                                point(origin.x + px(from_x), origin.y + px(middle * 0.55)),
-                                point(origin.x + px(to_x), origin.y + px(middle * 0.55)),
-                            );
-                        }
-                        SegmentShape::Outgoing => {
-                            builder.move_to(point(origin.x + px(from_x), origin.y + px(middle)));
-                            builder.cubic_bezier_to(
-                                point(
-                                    origin.x + px(to_x),
-                                    origin.y + px(HISTORY_ROW_HEIGHT + HISTORY_GRAPH_ROW_OVERLAP),
-                                ),
-                                point(origin.x + px(from_x), origin.y + px(middle * 1.45)),
-                                point(origin.x + px(to_x), origin.y + px(middle * 1.45)),
-                            );
-                        }
-                        SegmentShape::Through => {
-                            builder.move_to(point(
-                                origin.x + px(from_x),
-                                origin.y - px(HISTORY_GRAPH_ROW_OVERLAP),
-                            ));
-                            builder.cubic_bezier_to(
-                                point(
-                                    origin.x + px(to_x),
-                                    origin.y + px(HISTORY_ROW_HEIGHT + HISTORY_GRAPH_ROW_OVERLAP),
-                                ),
-                                point(origin.x + px(from_x), origin.y + px(middle)),
-                                point(origin.x + px(to_x), origin.y + px(middle)),
-                            );
-                        }
-                    }
-                    if let Ok(path) = builder.build() {
-                        window.paint_path(path, palette[segment.color_id % palette.len()]);
-                    }
-                }
-            },
-        )
-        .absolute()
-        .inset_0();
         let color = palette[row.node_color_id % palette.len()];
         let node_x = lane_x(row.node_lane);
         let node = div()
@@ -827,7 +879,6 @@ impl GitHistory {
             .w(px(width))
             .h(px(HISTORY_ROW_HEIGHT))
             .flex_none()
-            .child(paths)
             .when(row.is_head, |element| {
                 element.child(
                     div()
@@ -1180,9 +1231,16 @@ impl Render for GitHistory {
                 .child(message)
                 .into_any_element()
         } else {
-            list(self.list.clone(), cx.processor(Self::render_row))
+            div()
+                .relative()
                 .flex_1()
-                .with_sizing_behavior(gpui::ListSizingBehavior::Auto)
+                .min_h_0()
+                .child(self.graph_paths(&theme))
+                .child(
+                    list(self.list.clone(), cx.processor(Self::render_row))
+                        .size_full()
+                        .with_sizing_behavior(gpui::ListSizingBehavior::Auto),
+                )
                 .into_any_element()
         };
 
