@@ -273,15 +273,33 @@ pub fn highlight_with_limits(
         return Err(HighlightError::GrammarUnavailable(language));
     }
 
-    let mut configuration = configuration(language)?;
-    configuration.configure(CAPTURE_NAMES);
+    let mut primary_configuration = configuration(language)?;
+    primary_configuration.configure(CAPTURE_NAMES);
+    let injected = if matches!(language, LanguageId::Html | LanguageId::Markdown) {
+        [LanguageId::JavaScript, LanguageId::Css, LanguageId::Json]
+            .into_iter()
+            .filter_map(|language| {
+                let mut config = configuration(language).ok()?;
+                config.configure(CAPTURE_NAMES);
+                Some((language, config))
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     let mut highlighter = Highlighter::new();
     let events = highlighter
         .highlight(
-            &configuration,
+            &primary_configuration,
             request.source.as_bytes(),
             cancellation_flag,
-            |_| None,
+            |name| {
+                let language = language_for_alias(name)?;
+                injected
+                    .iter()
+                    .find(|(candidate, _)| *candidate == language)
+                    .map(|(_, config)| config)
+            },
         )
         .map_err(|error| HighlightError::Parser(error.to_string()))?;
 
@@ -354,7 +372,7 @@ fn configuration(language: LanguageId) -> Result<HighlightConfiguration, Highlig
             tree_sitter_javascript::LANGUAGE.into(),
             "javascript",
             tree_sitter_javascript::HIGHLIGHT_QUERY,
-            "",
+            tree_sitter_javascript::INJECTIONS_QUERY,
             tree_sitter_javascript::LOCALS_QUERY,
         ),
         Jsx => make_configuration(
@@ -365,7 +383,7 @@ fn configuration(language: LanguageId) -> Result<HighlightConfiguration, Highlig
                 tree_sitter_javascript::HIGHLIGHT_QUERY,
                 tree_sitter_javascript::JSX_HIGHLIGHT_QUERY
             ),
-            "",
+            tree_sitter_javascript::INJECTIONS_QUERY,
             tree_sitter_javascript::LOCALS_QUERY,
         ),
         TypeScript => make_configuration(
@@ -421,14 +439,14 @@ fn configuration(language: LanguageId) -> Result<HighlightConfiguration, Highlig
             tree_sitter_md::LANGUAGE.into(),
             "markdown",
             tree_sitter_md::HIGHLIGHT_QUERY_BLOCK,
-            "",
+            tree_sitter_md::INJECTION_QUERY_BLOCK,
             "",
         ),
         Html => make_configuration(
             tree_sitter_html::LANGUAGE.into(),
             "html",
             tree_sitter_html::HIGHLIGHTS_QUERY,
-            "",
+            tree_sitter_html::INJECTIONS_QUERY,
             "",
         ),
         Css => make_configuration(
@@ -961,5 +979,41 @@ fn build(value: usize) -> Widget {
                 "{language:?} fixture has no structural spans"
             );
         }
+    }
+
+    #[test]
+    fn html_injects_javascript_and_css_with_a_bounded_registry() {
+        let source = r#"<main id="app">
+<style>.item { color: red; }</style>
+<script>const answer = call(42);</script>
+</main>"#;
+        let document = highlight(HighlightRequest {
+            source,
+            path: Some("index.html"),
+            fence_tag: None,
+        })
+        .unwrap();
+        let kinds = document
+            .lines
+            .iter()
+            .flatten()
+            .map(|span| span.kind)
+            .collect::<Vec<_>>();
+        assert!(kinds.contains(&HighlightKind::Tag));
+        assert!(kinds.contains(&HighlightKind::Attribute));
+        assert!(kinds.contains(&HighlightKind::Keyword));
+        assert!(kinds.contains(&HighlightKind::Number));
+    }
+
+    #[test]
+    fn unknown_markdown_fence_does_not_break_parent_highlighting() {
+        let source = "# Title\n\n```unknown-language\nopaque\n```\n";
+        let document = highlight(HighlightRequest {
+            source,
+            path: Some("README.md"),
+            fence_tag: None,
+        })
+        .unwrap();
+        assert_eq!(document.language, LanguageId::Markdown);
     }
 }
