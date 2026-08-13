@@ -114,13 +114,6 @@ pub const GLIDE_MAX_VIEWPORTS: f32 = 2.5;
 /// The titlebar overlays the full-height list, so its height is part of the
 /// inset; the extra 10px matches the first row's breathing room.
 const OWN_SEND_TOP_INSET_PX: f32 = Theme::TITLEBAR_HEIGHT + 10.0;
-/// Turn-height allowance baked into the PROVISIONAL reservation (sized before
-/// the sent rows have measured). Deliberately an UNDERSHOOT: too small a pad
-/// parks the prompt a bit below its inset until the refinement lands — still
-/// visible, so its bounds exist and the refinement can land. Too large a pad
-/// overscrolls the prompt off the top, where an unmeasured anchor row can
-/// never refine — the view sticks in blank runway (rig-caught).
-const OWN_SEND_PROMPT_ALLOWANCE_PX: f32 = 160.0;
 /// Per-60fps-frame fraction of the remaining entry glide retained (~90%
 /// covered in ~230ms, ease-out).
 const OWN_SEND_GLIDE_RETAIN: f32 = 0.85;
@@ -1661,13 +1654,19 @@ impl Transcript {
         // bounds: the just-sent rows sit below the fold, unmeasured, and
         // without the pad there is no scroll room to bring them into the
         // measured window (gating the pad on their bounds deadlocked — the
-        // clamped scroll kept them unmeasured forever). Sized for a turn of
-        // [`OWN_SEND_PROMPT_ALLOWANCE_PX`] so the entry glide UNDERSHOOTS
-        // (see the constant), keeping the anchor row on-screen for the
-        // refinement below to finish the job.
+        // clamped scroll kept them unmeasured forever). Sized at FULL
+        // `usable` — a deliberate overshoot by the turn's own height, safe
+        // under the absolute hold (scroll_to pins the prompt regardless) and
+        // REQUIRED for short chats: gpui's bottom-aligned list reports no
+        // item bounds while its content is shorter than the viewport
+        // (rig-traced: a new session's first send sat ~150px below the
+        // inset forever — the old undershot pad left the content short, the
+        // bounds-free scroll_to clamped, and the bounds-gated refinement
+        // could never rescue it). Overshooting guarantees the scroll room;
+        // the surplus sits below the fold until the refinement trues it.
         if current <= 0.0 {
             if let Some(anchor) = self.own_turn.as_mut() {
-                anchor.runway = (usable - OWN_SEND_PROMPT_ALLOWANCE_PX).max(0.0);
+                anchor.runway = usable.max(0.0);
             }
             self.remeasure_last_row();
             cx.notify();
