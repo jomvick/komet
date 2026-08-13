@@ -952,3 +952,535 @@ fn hermes_and_pi_descriptor_surfaces_match_registry_expectations() {
         ]
     );
 }
+
+/// The 2026-08-12 stuck-Working wedge, end to end: a prompt whose turn was
+/// consumed by CLI-side self-continuation never gets its response. A steer's
+/// `noRunningTurn` steering outcome is the protocol evidence the pending
+/// prompt can never settle; after the grace the harness closes the dead turn
+/// (Done — never a stranded Working) and promotes the steer to a fresh
+/// prompt, which settles normally.
+#[tokio::test]
+async fn starved_prompt_recovers_via_no_running_turn_evidence() {
+    let (controls, steer, _token) = controls();
+    let harness = harness();
+    let stream = harness
+        .run(request("scenario:starve"), controls)
+        .await
+        .expect("run starts");
+    let events = tokio::time::timeout(Duration::from_secs(15), async move {
+        let mut events = Vec::new();
+        let mut stream = stream;
+        while let Some(ev) = stream.next().await {
+            let ev = ev.expect("stream event");
+            if matches!(ev, AgentEvent::TextDelta { ref text } if text == "working") {
+                steer
+                    .send(SteerMessage {
+                        prompt: "what about now".into(),
+                        message_id: None,
+                    })
+                    .await
+                    .expect("steer sent");
+            }
+            events.push(ev);
+        }
+        events
+    })
+    .await
+    .expect("run finished in time");
+
+    // Two settled turns: the synthesized close of the starved prompt, then
+    // the promoted steer's real turn.
+    assert_eq!(
+        dones(&events),
+        vec![(DoneStatus::Completed, None), (DoneStatus::Completed, None)],
+        "{events:?}"
+    );
+    assert!(events.contains(&AgentEvent::TextDelta {
+        text: "promoted".into()
+    }));
+    let steered = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::Steered { .. }))
+        .expect("the queued steer must be promoted through a Steered boundary");
+    let first_done = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::Done { .. }))
+        .expect("dones asserted above");
+    assert!(
+        first_done < steered,
+        "the dead turn settles before the promoted boundary: {events:?}"
+    );
+}
+
+/// The dropped-reply turn end with no steer involved: the adapter emits the
+/// turn's terminal cost frame (`usage_update` with `cost`) but never the
+/// prompt response. The claude spec must settle the turn off that evidence
+/// within its 1s grace — Working clears in about a second, not never (and
+/// not only after a watchdog window).
+#[tokio::test]
+async fn dropped_reply_settles_fast_off_the_turn_end_cost_frame() {
+    let (controls, _steer, _token) = controls();
+    let harness = AcpHarness::claude().with_executable(fixture_path());
+    let started = std::time::Instant::now();
+    let stream = harness
+        .run(request("scenario:cost-starve"), controls)
+        .await
+        .expect("run starts");
+    let (events, done_at) = tokio::time::timeout(Duration::from_secs(10), async move {
+        let mut events = Vec::new();
+        let mut done_at = None;
+        let mut stream = stream;
+        while let Some(ev) = stream.next().await {
+            let ev = ev.expect("stream event");
+            if matches!(ev, AgentEvent::Done { .. }) && done_at.is_none() {
+                done_at = Some(started.elapsed());
+            }
+            events.push(ev);
+        }
+        (events, done_at)
+    })
+    .await
+    .expect("run finished in time");
+
+    assert_eq!(
+        dones(&events),
+        vec![(DoneStatus::Completed, None)],
+        "{events:?}"
+    );
+    // The fixture holds its stream open for 6s after the cost frame; the
+    // Done must come from the 1s cost-hint grace, not stream EOF (margin
+    // sized for parallel-suite load).
+    let done_at = done_at.expect("dones asserted above");
+    assert!(
+        done_at < Duration::from_secs(4),
+        "Done at {done_at:?} — should be ~1s after the cost frame, well \
+         before the fixture's 6s exit"
+    );
+}
+
+/// Full-stack verification of the 2026-08-12 starve fix against the REAL
+/// adapter + CLI: prompt#1 backgrounds a task and ends; the CLI
+/// self-continues on its notification and runs a 20s foreground command; a
+/// steer lands mid-way. With prevention in place the harness cancels the
+/// unowned turn and prompts fresh (no starve to recover from); the turn
+/// must settle promptly either way — never strand, never wait for a
+/// watchdog. Costs a few small prompts. Run explicitly:
+/// `cargo test -p komet-harness --test acp -- --ignored real_claude_starve`
+#[tokio::test]
+#[ignore = "needs the claude CLI authenticated + network; costs a few small prompts"]
+async fn real_claude_starve_settles_off_the_cost_frame() {
+    let (controls, steer_tx, _token) = controls();
+    let harness = AcpHarness::claude();
+    let mut req = request(
+        "Use the Bash tool exactly twice, then stop.\n\
+         First call: run the command `sleep 8; echo task-finished` with \
+         run_in_background set to true.\n\
+         Then reply with exactly the word: started\n\
+         IMPORTANT: later, when a task notification about that background \
+         task arrives, make one FOREGROUND Bash call: `sleep 20; echo waited` \
+         (no run_in_background), then reply with exactly: done waiting",
+    );
+    req.model = None;
+    req.reasoning = None;
+    req.cwd = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let stream = harness.run(req, controls).await.expect("run starts");
+
+    let collected = tokio::time::timeout(Duration::from_secs(240), async move {
+        let mut stream = stream;
+        let mut events: Vec<(std::time::Instant, AgentEvent)> = Vec::new();
+        let mut dones_seen = 0usize;
+        let mut steer = Some(steer_tx);
+        let mut steer_sent_at: Option<std::time::Instant> = None;
+        let mut steer_task: Option<tokio::task::JoinHandle<std::time::Instant>> = None;
+        while let Some(ev) = stream.next().await {
+            let ev = ev.expect("stream event");
+            let now = std::time::Instant::now();
+            if matches!(ev, AgentEvent::Done { .. }) {
+                dones_seen += 1;
+                if dones_seen == 1 {
+                    // Steer 16s after the first turn settles: the background
+                    // task (8s) has exited and the CLI is inside its
+                    // self-continued turn's 20s foreground command.
+                    let tx = steer.take().expect("one steer");
+                    steer_task = Some(tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_secs(16)).await;
+                        let at = std::time::Instant::now();
+                        let _ = tx
+                            .send(SteerMessage {
+                                prompt: "what about now".into(),
+                                message_id: None,
+                            })
+                            .await;
+                        at
+                    }));
+                }
+            }
+            events.push((now, ev));
+            if dones_seen == 2 {
+                if let Some(task) = steer_task.take() {
+                    steer_sent_at = task.await.ok();
+                }
+                break;
+            }
+        }
+        (events, steer_sent_at)
+    })
+    .await
+    .expect("run should settle without any watchdog — before the fix this timed out");
+
+    let (events, steer_sent_at) = collected;
+    let evs: Vec<&AgentEvent> = events.iter().map(|(_, e)| e).collect();
+    let done_times: Vec<std::time::Instant> = events
+        .iter()
+        .filter(|(_, e)| matches!(e, AgentEvent::Done { .. }))
+        .map(|(t, _)| *t)
+        .collect();
+    assert_eq!(done_times.len(), 2, "{evs:?}");
+    for (_, e) in events.iter() {
+        if let AgentEvent::Done { status, .. } = e {
+            assert_eq!(*status, DoneStatus::Completed, "{evs:?}");
+        }
+    }
+    // Prevention path: the steer landed mid self-continued turn, was
+    // preceded by a cancel, and its fresh prompt settled promptly — well
+    // under the quiet/watchdog windows it used to need.
+    let steer_sent_at = steer_sent_at.expect("steer timer ran");
+    let steer_turn = done_times[1].duration_since(steer_sent_at);
+    assert!(
+        steer_turn < Duration::from_secs(25),
+        "steer took {steer_turn:?} to settle — prevention should cancel the \
+         unowned turn and prompt fresh, not starve into a settle window"
+    );
+    // And the settle tracked the agent's actual finish (last streamed text),
+    // not a watchdog window: cost-frame grace is 1s, allow scheduling slack.
+    let last_text_at = events
+        .iter()
+        .filter(|(_, e)| matches!(e, AgentEvent::TextDelta { .. }))
+        .map(|(t, _)| *t)
+        .next_back()
+        .expect("streamed text exists");
+    let settle_gap = done_times[1].duration_since(last_text_at);
+    assert!(
+        settle_gap < Duration::from_secs(5),
+        "final Done lagged the last content by {settle_gap:?} — the settle \
+         should ride the turn-end cost frame (~1s)"
+    );
+}
+
+/// Prevention for the interactive starve: a steer arriving while the agent
+/// is mid SELF-CONTINUED turn (open tool call, no prompt outstanding) must
+/// not become a session/prompt — the adapter drops that reply. The harness
+/// cancels the unowned turn first (the fixture asserts session/cancel is on
+/// the wire before any prompt), then dispatches the steer as a fresh prompt
+/// after the flush window.
+#[tokio::test]
+async fn steer_into_self_continuation_cancels_before_prompting() {
+    let (controls, steer, _token) = controls();
+    let harness = harness();
+    let stream = harness
+        .run(request("scenario:busy-steer"), controls)
+        .await
+        .expect("run starts");
+    let events = tokio::time::timeout(Duration::from_secs(15), async move {
+        let mut events = Vec::new();
+        let mut stream = stream;
+        let mut steer = Some(steer);
+        while let Some(ev) = stream.next().await {
+            let ev = ev.expect("stream event");
+            // The self-continued tool call is the busy signal: steer now.
+            if matches!(&ev, AgentEvent::ToolCall { id, .. } if id == "sc-1")
+                && let Some(tx) = steer.take()
+            {
+                tx.send(SteerMessage {
+                    prompt: "what about now".into(),
+                    message_id: None,
+                })
+                .await
+                .expect("steer sent");
+                // Sender dropped here; the mailbox closes so the run can end.
+            }
+            events.push(ev);
+        }
+        events
+    })
+    .await
+    .expect("run finished in time");
+
+    // Two clean turns: the first prompt's, then the promoted steer's —
+    // and the fixture exits with `refusal` if a prompt ever arrives
+    // without the preceding session/cancel.
+    assert_eq!(
+        dones(&events),
+        vec![(DoneStatus::Completed, None), (DoneStatus::Completed, None)],
+        "{events:?}"
+    );
+    assert!(events.contains(&AgentEvent::TextDelta {
+        text: "fresh answer".into()
+    }));
+    let steered = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::Steered { .. }))
+        .expect("promoted steer must carry a boundary");
+    let first_done = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::Done { .. }))
+        .expect("dones asserted above");
+    assert!(first_done < steered, "{events:?}");
+}
+
+/// Claude's native busy-steer path: a steer into a self-continued turn goes
+/// out as a PLAIN prompt (the fixture hard-fails on any session/cancel —
+/// cancelling would kill the agent's in-flight work). The CLI folds the
+/// message into the running turn natively; the adapter drops the prompt's
+/// reply; the cost-frame settle closes the turn ~1s after the merged turn
+/// really ends — well before the fixture's held-open stream EOF.
+#[tokio::test]
+async fn claude_busy_steer_rides_native_queueing_and_the_cost_frame() {
+    let (controls, steer, _token) = controls();
+    let harness = AcpHarness::claude().with_executable(fixture_path());
+    let started = std::time::Instant::now();
+    let stream = harness
+        .run(request("scenario:native-busy-steer"), controls)
+        .await
+        .expect("run starts");
+    let (events, done2_at) = tokio::time::timeout(Duration::from_secs(15), async move {
+        let mut events = Vec::new();
+        let mut done2_at = None;
+        let mut dones_seen = 0usize;
+        let mut stream = stream;
+        let mut steer = Some(steer);
+        while let Some(ev) = stream.next().await {
+            let ev = ev.expect("stream event");
+            if matches!(&ev, AgentEvent::ToolCall { id, .. } if id == "sc-2")
+                && let Some(tx) = steer.take()
+            {
+                tx.send(SteerMessage {
+                    prompt: "what about now".into(),
+                    message_id: None,
+                })
+                .await
+                .expect("steer sent");
+            }
+            if matches!(ev, AgentEvent::Done { .. }) {
+                dones_seen += 1;
+                if dones_seen == 2 {
+                    done2_at = Some(started.elapsed());
+                }
+            }
+            events.push(ev);
+        }
+        (events, done2_at)
+    })
+    .await
+    .expect("run finished in time");
+
+    assert_eq!(
+        dones(&events),
+        vec![(DoneStatus::Completed, None), (DoneStatus::Completed, None)],
+        "{events:?}"
+    );
+    // The merged turn's folded output streamed through (nothing cancelled)…
+    assert!(events.contains(&AgentEvent::TextDelta {
+        text: "merged reply".into()
+    }));
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TextDelta { text } if text.contains("CANCELLED"))),
+        "the native path must never cancel self-continued work: {events:?}"
+    );
+    // …and the settle rode the cost frame, not the 6s stream EOF.
+    let done2_at = done2_at.expect("second done asserted above");
+    assert!(
+        done2_at < Duration::from_secs(5),
+        "settle at {done2_at:?} — should ride the cost frame (~1s), not EOF"
+    );
+}
+
+/// Every installed real agent, through the one shared loop all the
+/// starve/settle changes live in: a short live turn with a mid-turn steer —
+/// injection on StepBoundary agents, boundary delivery on TurnBoundary ones,
+/// busy-path handling where it applies. Contract per agent that starts:
+/// every Done is Completed and the stream ENDS (no stranding) inside the
+/// budget. Agents that fail auth/startup are reported and skipped. Run:
+/// `cargo test -p komet-harness --test acp -- --ignored --nocapture real_all_harnesses`
+#[tokio::test]
+#[ignore = "runs every installed+authenticated agent CLI; costs a few small prompts"]
+async fn real_all_harnesses_settle_with_a_mid_turn_steer() {
+    let agents: Vec<(&str, AcpHarness)> = vec![
+        ("claude", AcpHarness::claude()),
+        ("codex", AcpHarness::codex()),
+        ("cursor", AcpHarness::cursor()),
+        ("grok", AcpHarness::grok()),
+        ("pi", AcpHarness::pi()),
+    ];
+    let mut failures: Vec<String> = Vec::new();
+    for (name, h) in agents {
+        let (controls, steer_tx, _token) = controls();
+        let mut req = request(
+            "Write the numbers 1 2 3 4 5, one per line, then stop. \
+             If another instruction arrives, follow it too.",
+        );
+        req.model = None;
+        req.reasoning = None;
+        req.cwd = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        let stream = match h.run(req, controls).await {
+            Ok(s) => s,
+            Err(e) => {
+                println!("[{name}] SKIP — did not start: {e}");
+                continue;
+            }
+        };
+        let outcome = tokio::time::timeout(Duration::from_secs(120), async move {
+            let mut stream = stream;
+            let mut events = Vec::new();
+            let mut steer = Some(steer_tx);
+            while let Some(ev) = stream.next().await {
+                let ev = ev.expect("stream event");
+                if matches!(ev, AgentEvent::TextDelta { .. })
+                    && let Some(tx) = steer.take()
+                {
+                    let _ = tx
+                        .send(SteerMessage {
+                            prompt: "Also write the word EXTRA on its own line.".into(),
+                            message_id: None,
+                        })
+                        .await;
+                    // Sender drops: the mailbox closes, so once every turn
+                    // settles the stream must end — stranding shows as the
+                    // 120s timeout.
+                }
+                events.push(ev);
+            }
+            events
+        })
+        .await;
+        match outcome {
+            Err(_) => failures.push(format!("[{name}] STRANDED: stream still open after 120s")),
+            Ok(events) => {
+                let ds = dones(&events);
+                let auth_failure = ds.iter().any(|(s, e)| {
+                    *s == DoneStatus::Errored
+                        && e.as_deref().is_some_and(|e| {
+                            let e = e.to_lowercase();
+                            e.contains("auth") || e.contains("login") || e.contains("not installed")
+                        })
+                });
+                if auth_failure {
+                    println!("[{name}] SKIP — needs auth: {ds:?}");
+                } else if ds.is_empty() || ds.iter().any(|(s, _)| *s != DoneStatus::Completed) {
+                    failures.push(format!("[{name}] BAD DONES: {ds:?}"));
+                } else {
+                    let texts = events
+                        .iter()
+                        .filter(|e| matches!(e, AgentEvent::TextDelta { .. }))
+                        .count();
+                    println!(
+                        "[{name}] OK — {} turn(s) settled, {texts} text deltas",
+                        ds.len()
+                    );
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// Debug variant of the multi-harness sweep, claude only, printing every
+/// event with a timestamp — for diagnosing strands the sweep can only name.
+/// `cargo test -p komet-harness --test acp -- --ignored --nocapture real_claude_debug`
+#[tokio::test]
+#[ignore = "debug harness; needs the claude CLI; costs one small prompt"]
+async fn real_claude_debug_steer_trace() {
+    let (controls, steer_tx, _token) = controls();
+    let h = AcpHarness::claude();
+    let mut req = request(
+        "Write the numbers 1 2 3 4 5, one per line, then stop. \
+         If another instruction arrives, follow it too.",
+    );
+    req.model = None;
+    req.reasoning = None;
+    req.cwd = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let started = std::time::Instant::now();
+    let stream = h.run(req, controls).await.expect("run starts");
+    let _ = tokio::time::timeout(Duration::from_secs(60), async move {
+        let mut stream = stream;
+        let mut steer = Some(steer_tx);
+        while let Some(ev) = stream.next().await {
+            let ev = ev.expect("stream event");
+            let t = started.elapsed();
+            match &ev {
+                AgentEvent::TextDelta { text } => println!("{t:?} TEXT {:?}", &text[..text.len().min(40)]),
+                other => println!("{t:?} {other:?}"),
+            }
+            if matches!(ev, AgentEvent::TextDelta { .. })
+                && let Some(tx) = steer.take()
+            {
+                println!("{:?} >>> sending steer", started.elapsed());
+                let _ = tx
+                    .send(SteerMessage {
+                        prompt: "Also write the word EXTRA on its own line.".into(),
+                        message_id: None,
+                    })
+                    .await;
+            }
+        }
+        println!("{:?} <<< stream ended", started.elapsed());
+    })
+    .await;
+    println!("{:?} === test done (timeout means strand)", started.elapsed());
+}
+
+/// The injection cost frame must never settle a steered turn: the fixture
+/// stamps a mid-turn cost frame right after the injection (real adapter
+/// behavior, indistinguishable in shape from the terminal frame), holds the
+/// turn open past the 1s cost grace + 2s slack, then finishes normally.
+/// Exactly one Done; the post-injection text folds into the same turn.
+#[tokio::test]
+async fn injection_cost_frame_never_settles_a_steered_turn() {
+    let (controls, steer, _token) = controls();
+    let harness = AcpHarness::claude().with_executable(fixture_path());
+    let stream = harness
+        .run(request("scenario:steer-cost-noise"), controls)
+        .await
+        .expect("run starts");
+    let events = tokio::time::timeout(Duration::from_secs(15), async move {
+        let mut events = Vec::new();
+        let mut stream = stream;
+        let mut steer = Some(steer);
+        while let Some(ev) = stream.next().await {
+            let ev = ev.expect("stream event");
+            if matches!(ev, AgentEvent::TextDelta { ref text } if text == "first")
+                && let Some(tx) = steer.take()
+            {
+                tx.send(SteerMessage {
+                    prompt: "redirect please".into(),
+                    message_id: None,
+                })
+                .await
+                .expect("steer sent");
+            }
+            events.push(ev);
+        }
+        events
+    })
+    .await
+    .expect("run finished in time");
+
+    assert_eq!(
+        dones(&events),
+        vec![(DoneStatus::Completed, None)],
+        "a premature cost-frame settle would double-Done: {events:?}"
+    );
+    // The post-injection text arrives BEFORE the single Done — a false
+    // settle would flip that order.
+    let tail = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::TextDelta { text } if text == "steered tail"))
+        .expect("steered tail must fold into the live turn: {events:?}");
+    let done = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::Done { .. }))
+        .expect("done asserted above");
+    assert!(tail < done, "{events:?}");
+}

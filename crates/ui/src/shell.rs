@@ -2565,7 +2565,7 @@ impl Shell {
         }
     }
 
-    /// Fetch the manifest and stage the new `Komet.app` under the data dir
+    /// Fetch the manifest and stage the new Komet desktop bundle under the data dir
     /// (tokio — reqwest); the strip flips to "restart to apply" when done.
     fn begin_update_download(&mut self, cx: &mut Context<Self>) {
         let edge_url = self.boot.edge_url.clone();

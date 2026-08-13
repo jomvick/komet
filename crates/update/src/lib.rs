@@ -13,7 +13,7 @@
 //!   installer): download the headless tarball into a new versioned dir, flip
 //!   the symlink, restart the service. Same flow the installer script performs,
 //!   natively.
-//! - **MacApp** (running out of `Komet.app`): download the app tarball, swap the
+//! - **MacApp** (running out of an app bundle): download the app tarball, swap the
 //!   bundle directory, relaunch. Driven by the UI.
 //! - **Unmanaged** (source builds, hand-copied binaries): report only.
 
@@ -84,7 +84,7 @@ pub fn headless_artifact(version: &str) -> String {
     format!("komet-{version}-{os}-{arch}.tar.gz")
 }
 
-/// `komet-<ver>-macos-<arch>-app.tar.gz` — the packaged `Komet.app` bundle.
+/// `komet-<ver>-macos-<arch>-app.tar.gz` — the macOS app update payload.
 pub fn mac_app_artifact(version: &str) -> String {
     let (_, arch) = platform_key();
     format!("komet-{version}-macos-{arch}-app.tar.gz")
@@ -369,7 +369,9 @@ pub fn restart_service() -> anyhow::Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Download + unpack the app tarball into `{data_dir}/updates/<ver>/Komet.app`
-/// (idempotent). Returns the staged bundle path.
+/// (idempotent). The payload keeps this legacy internal name so installed
+/// Komet builds can update into Komet without a bootstrap release. Returns the
+/// staged bundle path.
 pub async fn stage_mac_app(
     edge_url: &str,
     manifest: &Manifest,

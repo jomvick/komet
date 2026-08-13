@@ -3,7 +3,7 @@
 Control your coding agents (Claude Code, Codex, Cursor, Grok, Hermes, Pi) from
 any of your devices.
 
-![Komet running a Claude Code session](docs/screenshot.png)
+![Komet driving a Claude Code session with a live branch diff sidebar](apps/landing/public/assets/app-screenshot.jpg)
 
 Every device runs a small engine that keeps your sessions in sync: start an
 agent on one machine, follow and drive it from another. Install the engine as
