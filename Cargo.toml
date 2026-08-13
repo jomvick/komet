@@ -49,15 +49,17 @@ loro-protocol = "0.3"
 # f596cde fixes destination alpha on transparent windows (Porter-Duff OVER,
 # not additive); 53518c0 merges the edge-fade line: per-edge fade bands +
 # per-pixel EdgeFade for quads/images (true fade-into-glass), and
-# object-fit Cover cropping via atlas-tile UVs so image corner radii hold.
-gpui = { git = "https://github.com/wingleeio/zed", rev = "53518c0b883fcefcb456fba1942405216df133ba" }
-gpui_platform = { git = "https://github.com/wingleeio/zed", rev = "53518c0b883fcefcb456fba1942405216df133ba", features = [
+# object-fit Cover cropping via atlas-tile UVs so image corner radii hold;
+# 8a8954c switches the macOS blurred view to UnderWindowBackground (macOS 26
+# stopped vending CABackdropLayer for Selection — window blur went dead).
+gpui = { git = "https://github.com/wingleeio/zed", rev = "8a8954c7234f2261d13b72568ff09e4a5136d39f" }
+gpui_platform = { git = "https://github.com/wingleeio/zed", rev = "8a8954c7234f2261d13b72568ff09e4a5136d39f", features = [
     "wayland",
     "x11",
     "font-kit",
     "runtime_shaders",
 ] }
-gpui_tokio = { git = "https://github.com/wingleeio/zed", rev = "53518c0b883fcefcb456fba1942405216df133ba" }
+gpui_tokio = { git = "https://github.com/wingleeio/zed", rev = "8a8954c7234f2261d13b72568ff09e4a5136d39f" }
 
 # diffs
 similar = "2"
