@@ -245,7 +245,8 @@ fn line_starts(source: &str) -> Vec<usize> {
 
 /// Whether this build contains a parser and compatible highlight queries.
 pub const fn supports_language(language: LanguageId) -> bool {
-    matches!(language, LanguageId::Rust)
+    let _ = language;
+    true
 }
 
 /// Highlight a complete document with the default resource limits.
@@ -272,7 +273,7 @@ pub fn highlight_with_limits(
         return Err(HighlightError::GrammarUnavailable(language));
     }
 
-    let mut configuration = rust_configuration()?;
+    let mut configuration = configuration(language)?;
     configuration.configure(CAPTURE_NAMES);
     let mut highlighter = Highlighter::new();
     let events = highlighter
@@ -332,6 +333,214 @@ fn rust_configuration() -> Result<HighlightConfiguration, HighlightError> {
         "",
     )
     .map_err(|error| HighlightError::Parser(error.to_string()))
+}
+
+fn make_configuration(
+    language: tree_sitter::Language,
+    name: &str,
+    highlights: &str,
+    injections: &str,
+    locals: &str,
+) -> Result<HighlightConfiguration, HighlightError> {
+    HighlightConfiguration::new(language, name, highlights, injections, locals)
+        .map_err(|error| HighlightError::Parser(error.to_string()))
+}
+
+fn configuration(language: LanguageId) -> Result<HighlightConfiguration, HighlightError> {
+    use LanguageId::*;
+    match language {
+        Rust => rust_configuration(),
+        JavaScript => make_configuration(
+            tree_sitter_javascript::LANGUAGE.into(),
+            "javascript",
+            tree_sitter_javascript::HIGHLIGHT_QUERY,
+            "",
+            tree_sitter_javascript::LOCALS_QUERY,
+        ),
+        Jsx => make_configuration(
+            tree_sitter_javascript::LANGUAGE.into(),
+            "jsx",
+            &format!(
+                "{}\n{}",
+                tree_sitter_javascript::HIGHLIGHT_QUERY,
+                tree_sitter_javascript::JSX_HIGHLIGHT_QUERY
+            ),
+            "",
+            tree_sitter_javascript::LOCALS_QUERY,
+        ),
+        TypeScript => make_configuration(
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            "typescript",
+            tree_sitter_typescript::HIGHLIGHTS_QUERY,
+            "",
+            tree_sitter_typescript::LOCALS_QUERY,
+        ),
+        Tsx => make_configuration(
+            tree_sitter_typescript::LANGUAGE_TSX.into(),
+            "tsx",
+            tree_sitter_typescript::HIGHLIGHTS_QUERY,
+            "",
+            tree_sitter_typescript::LOCALS_QUERY,
+        ),
+        Python => make_configuration(
+            tree_sitter_python::LANGUAGE.into(),
+            "python",
+            tree_sitter_python::HIGHLIGHTS_QUERY,
+            "",
+            "",
+        ),
+        Go => make_configuration(
+            tree_sitter_go::LANGUAGE.into(),
+            "go",
+            tree_sitter_go::HIGHLIGHTS_QUERY,
+            "",
+            "",
+        ),
+        Json | Jsonc => make_configuration(
+            tree_sitter_json::LANGUAGE.into(),
+            "json",
+            tree_sitter_json::HIGHLIGHTS_QUERY,
+            "",
+            "",
+        ),
+        Bash => make_configuration(
+            tree_sitter_bash::LANGUAGE.into(),
+            "bash",
+            tree_sitter_bash::HIGHLIGHT_QUERY,
+            "",
+            "",
+        ),
+        Toml => make_configuration(
+            tree_sitter_toml_ng::LANGUAGE.into(),
+            "toml",
+            tree_sitter_toml_ng::HIGHLIGHTS_QUERY,
+            "",
+            "",
+        ),
+        Markdown => make_configuration(
+            tree_sitter_md::LANGUAGE.into(),
+            "markdown",
+            tree_sitter_md::HIGHLIGHT_QUERY_BLOCK,
+            "",
+            "",
+        ),
+        Html => make_configuration(
+            tree_sitter_html::LANGUAGE.into(),
+            "html",
+            tree_sitter_html::HIGHLIGHTS_QUERY,
+            "",
+            "",
+        ),
+        Css => make_configuration(
+            tree_sitter_css::LANGUAGE.into(),
+            "css",
+            tree_sitter_css::HIGHLIGHTS_QUERY,
+            "",
+            "",
+        ),
+        Yaml => make_configuration(
+            tree_sitter_yaml::LANGUAGE.into(),
+            "yaml",
+            tree_sitter_yaml::HIGHLIGHTS_QUERY,
+            "",
+            "",
+        ),
+        C => make_configuration(
+            tree_sitter_c::LANGUAGE.into(),
+            "c",
+            tree_sitter_c::HIGHLIGHT_QUERY,
+            "",
+            "",
+        ),
+        Cpp => make_configuration(
+            tree_sitter_cpp::LANGUAGE.into(),
+            "cpp",
+            &format!(
+                "{}\n{}",
+                tree_sitter_c::HIGHLIGHT_QUERY,
+                tree_sitter_cpp::HIGHLIGHT_QUERY
+            ),
+            "",
+            "",
+        ),
+        CSharp => make_configuration(
+            tree_sitter_c_sharp::LANGUAGE.into(),
+            "csharp",
+            tree_sitter_c_sharp::HIGHLIGHTS_QUERY,
+            "",
+            "",
+        ),
+        Java => make_configuration(
+            tree_sitter_java::LANGUAGE.into(),
+            "java",
+            tree_sitter_java::HIGHLIGHTS_QUERY,
+            "",
+            "",
+        ),
+        Kotlin => make_configuration(
+            tree_sitter_kotlin_ng::LANGUAGE.into(),
+            "kotlin",
+            "[(line_comment) (block_comment)] @comment [(string_literal) (multiline_string_literal)] @string [(number_literal) (float_literal)] @number",
+            "",
+            "",
+        ),
+        Swift => make_configuration(
+            tree_sitter_swift::LANGUAGE.into(),
+            "swift",
+            tree_sitter_swift::HIGHLIGHTS_QUERY,
+            "",
+            tree_sitter_swift::LOCALS_QUERY,
+        ),
+        Ruby => make_configuration(
+            tree_sitter_ruby::LANGUAGE.into(),
+            "ruby",
+            tree_sitter_ruby::HIGHLIGHTS_QUERY,
+            "",
+            tree_sitter_ruby::LOCALS_QUERY,
+        ),
+        Php => make_configuration(
+            tree_sitter_php::LANGUAGE_PHP.into(),
+            "php",
+            tree_sitter_php::HIGHLIGHTS_QUERY,
+            "",
+            "",
+        ),
+        Sql => make_configuration(
+            tree_sitter_sequel::LANGUAGE.into(),
+            "sql",
+            tree_sitter_sequel::HIGHLIGHTS_QUERY,
+            "",
+            "",
+        ),
+        Lua => make_configuration(
+            tree_sitter_lua::LANGUAGE.into(),
+            "lua",
+            tree_sitter_lua::HIGHLIGHTS_QUERY,
+            "",
+            tree_sitter_lua::LOCALS_QUERY,
+        ),
+        Nix => make_configuration(
+            tree_sitter_nix::LANGUAGE.into(),
+            "nix",
+            tree_sitter_nix::HIGHLIGHTS_QUERY,
+            "",
+            "",
+        ),
+        Make => make_configuration(
+            tree_sitter_make::LANGUAGE.into(),
+            "make",
+            tree_sitter_make::HIGHLIGHTS_QUERY,
+            "",
+            "",
+        ),
+        Dockerfile => make_configuration(
+            tree_sitter_containerfile::LANGUAGE.into(),
+            "dockerfile",
+            tree_sitter_containerfile::HIGHLIGHTS_QUERY,
+            "",
+            "",
+        ),
+    }
 }
 
 // Ordered from generic to specific. `HighlightConfiguration::configure`
@@ -664,11 +873,11 @@ fn build(value: usize) -> Widget {
         );
         assert_eq!(
             highlight(HighlightRequest {
-                source: "const x = 1;",
-                path: Some("app.ts"),
+                source: "plain",
+                path: Some("unknown.extension"),
                 fence_tag: None,
             }),
-            Err(HighlightError::GrammarUnavailable(LanguageId::TypeScript))
+            Err(HighlightError::UnknownLanguage)
         );
     }
 
@@ -676,5 +885,81 @@ fn build(value: usize) -> Widget {
     fn rust_queries_load_for_the_bundled_abi() {
         assert!(rust_configuration().is_ok());
         assert!(tree_sitter::LANGUAGE_VERSION >= tree_sitter::MIN_COMPATIBLE_LANGUAGE_VERSION);
+    }
+
+    #[test]
+    fn every_registered_grammar_loads_and_highlights_a_fixture() {
+        let fixtures = [
+            (LanguageId::JavaScript, "app.js", "const value = call(42);"),
+            (
+                LanguageId::Jsx,
+                "app.jsx",
+                "const view = <main id=\"x\" />;",
+            ),
+            (
+                LanguageId::TypeScript,
+                "app.ts",
+                "const value: number = 42;",
+            ),
+            (
+                LanguageId::Tsx,
+                "app.tsx",
+                "const view: JSX.Element = <main />;",
+            ),
+            (
+                LanguageId::Python,
+                "app.py",
+                "def call(value):\n    return value",
+            ),
+            (LanguageId::Go, "main.go", "package main\nfunc main() {}"),
+            (LanguageId::Json, "a.json", "{\"value\": 42}"),
+            (LanguageId::Jsonc, "a.jsonc", "{\"value\": 42}"),
+            (LanguageId::Bash, "run.sh", "echo \"hello\""),
+            (LanguageId::Toml, "Cargo.toml", "name = \"komet\""),
+            (LanguageId::Markdown, "README.md", "# Heading\n\n`code`"),
+            (LanguageId::Html, "index.html", "<main id=\"app\"></main>"),
+            (LanguageId::Css, "app.css", ".app { color: red; }"),
+            (LanguageId::Yaml, "app.yml", "name: komet"),
+            (LanguageId::C, "main.c", "int main(void) { return 0; }"),
+            (LanguageId::Cpp, "main.cpp", "int main() { return 0; }"),
+            (LanguageId::CSharp, "App.cs", "class App { int Value = 1; }"),
+            (LanguageId::Java, "App.java", "class App { int value = 1; }"),
+            (LanguageId::Kotlin, "App.kt", "val value = 1"),
+            (LanguageId::Swift, "App.swift", "let value: Int = 1"),
+            (LanguageId::Ruby, "app.rb", "def call(value)\n value\nend"),
+            (
+                LanguageId::Php,
+                "app.php",
+                "<?php function call() { return 1; }",
+            ),
+            (LanguageId::Sql, "query.sql", "SELECT name FROM users;"),
+            (LanguageId::Lua, "app.lua", "local value = 1"),
+            (LanguageId::Nix, "flake.nix", "{ pkgs }: pkgs.hello"),
+            (LanguageId::Make, "Makefile", "all:\n\techo hello"),
+            (
+                LanguageId::Dockerfile,
+                "Dockerfile",
+                "FROM alpine\nRUN echo hello",
+            ),
+        ];
+        for (language, path, source) in fixtures {
+            let config =
+                configuration(language).unwrap_or_else(|error| panic!("{language:?}: {error}"));
+            assert!(
+                !config.names().is_empty(),
+                "{language:?} query has no captures"
+            );
+            let document = highlight(HighlightRequest {
+                source,
+                path: Some(path),
+                fence_tag: None,
+            })
+            .unwrap_or_else(|error| panic!("{language:?}: {error}"));
+            assert_eq!(document.language, language);
+            assert!(
+                document.lines.iter().flatten().next().is_some(),
+                "{language:?} fixture has no structural spans"
+            );
+        }
     }
 }
