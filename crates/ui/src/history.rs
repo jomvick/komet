@@ -228,7 +228,9 @@ fn visible_ref_count(refs: &[GitHistoryRef], available_width: f32) -> usize {
         return 0;
     }
 
-    let mut visible = 1;
+    // Start with no visible badges so the overflow target remains available
+    // when even the first badge plus `+N` would exceed the ref area.
+    let mut visible = 0;
     for count in 1..=refs.len() {
         let hidden = refs.len() - count;
         let item_count = count + usize::from(hidden > 0);
@@ -1371,6 +1373,24 @@ mod tests {
         assert_eq!(visible_ref_count(&refs, 70.0), 1);
         assert_eq!(visible_ref_count(&refs, 115.0), 2);
         assert_eq!(visible_ref_count(&refs, 200.0), 3);
+    }
+
+    #[test]
+    fn ref_badges_preserve_overflow_when_the_first_badge_is_too_wide() {
+        let reference = |label: &str| GitHistoryRef {
+            kind: GitHistoryRefKind::Branch,
+            label: label.into(),
+        };
+        let refs = vec![
+            reference("feature/accessibility-polish"),
+            reference("main"),
+            reference("origin/main"),
+            reference("upstream/main"),
+            reference("v0.1.53"),
+            reference("HEAD"),
+        ];
+
+        assert_eq!(visible_ref_count(&refs, 120.0), 0);
     }
 
     #[test]
