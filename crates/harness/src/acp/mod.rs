@@ -1462,9 +1462,10 @@ fn handle_server_request_live(
     method: &str,
     params: &Value,
     request_input: &std::sync::Arc<RequestInputFn>,
+    open_questions: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
 ) -> Vec<AgentEvent> {
     if method == CURSOR_ASK_QUESTION {
-        ask_cursor_questions(client, id, params, request_input);
+        ask_cursor_questions(client, id, params, request_input, open_questions);
         return Vec::new();
     }
     if method != "session/request_permission" {
@@ -1501,6 +1502,10 @@ fn handle_server_request_live(
     };
     let client = client.clone();
     let request_input = std::sync::Arc::clone(request_input);
+    // Pending questions block the agent — the quiet-settle must not read
+    // that silence as a finished turn.
+    let open_questions = std::sync::Arc::clone(open_questions);
+    open_questions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     tokio::spawn(async move {
         let answers = (request_input)(vec![question.clone()])
             .await
@@ -1522,6 +1527,7 @@ fn handle_server_request_live(
             ),
             None => client.respond(&id, json!({ "outcome": { "outcome": "cancelled" } })),
         }
+        open_questions.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     });
     Vec::new()
 }
@@ -1562,6 +1568,7 @@ fn ask_cursor_questions(
     id: Value,
     params: &Value,
     request_input: &std::sync::Arc<RequestInputFn>,
+    open_questions: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
 ) {
     let asked = cursor_questions(params);
     if asked.is_empty() {
@@ -1573,11 +1580,14 @@ fn ask_cursor_questions(
     }
     let client = client.clone();
     let request_input = std::sync::Arc::clone(request_input);
+    let open_questions = std::sync::Arc::clone(open_questions);
+    open_questions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     tokio::spawn(async move {
         let answers = (request_input)(asked.iter().map(|q| q.question.clone()).collect())
             .await
             .unwrap_or_default();
         client.respond(&id, cursor_answer_outcome(&asked, &answers));
+        open_questions.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     });
 }
 
@@ -1718,6 +1728,27 @@ fn prompt_like_request(
     params: Value,
 ) -> BoxFuture<'static, Result<Value, HarnessError>> {
     Box::pin(async move { client.request(method, params).await })
+}
+
+/// Track the liveness signals the blanket quiet-settle keys on: content
+/// proves the turn produced something; an open tool call or a pending
+/// question proves silence is legitimate.
+fn track_turn_signals(
+    ev: &AgentEvent,
+    content_seen: &mut bool,
+    open_tools: &mut std::collections::HashSet<String>,
+) {
+    match ev {
+        AgentEvent::TextDelta { text } if !text.is_empty() => *content_seen = true,
+        AgentEvent::ToolCall { id, .. } => {
+            *content_seen = true;
+            open_tools.insert(id.clone());
+        }
+        AgentEvent::ToolResult { id, .. } => {
+            open_tools.remove(id);
+        }
+        _ => {}
+    }
 }
 
 /// True for the session's terminal accounting frame: a `usage_update`
@@ -2020,6 +2051,29 @@ async fn run_session(session: Session) {
     // cost semantics are verified end-of-turn-only.
     const COST_HINT_GRACE: Duration = Duration::from_secs(1);
     let cost_hint_enabled = harness == HarnessId::ClaudeCode;
+    // BLANKET dropped-reply settle, adapter-agnostic: any ACP agent whose
+    // prompt response goes missing must not strand the turn. Signals that
+    // exist in core ACP stand in for the adapter-specific cost frame: once
+    // the turn has streamed content, every tool call it opened has resolved,
+    // no permission/question round-trip is pending, and the stream has been
+    // quiet past the window, the turn is settled through the same recovery
+    // arm. A false settle is recoverable by design (the engine folds any
+    // later output as a self-continued segment and re-arms Working; a late
+    // response resolves a dropped channel), which is what makes a tight
+    // window safe where a hard per-turn timeout was rejected.
+    // `KOMET_ACP_QUIET_SETTLE_MS` overrides; 0 disables.
+    let quiet_settle: Option<Duration> = match std::env::var("KOMET_ACP_QUIET_SETTLE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        Some(0) => None,
+        Some(ms) => Some(Duration::from_millis(ms)),
+        None => Some(Duration::from_secs(30)),
+    };
+    let mut last_update_at = tokio::time::Instant::now();
+    let mut turn_content_seen = false;
+    let mut open_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let open_questions = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     'main: loop {
         tokio::select! {
@@ -2102,6 +2156,7 @@ async fn run_session(session: Session) {
                                 &method,
                                 &params,
                                 &request_input,
+                                &open_questions,
                             ) {
                                 if !send(&event_tx, ev).await {
                                     consumer_gone = true;
@@ -2172,6 +2227,9 @@ async fn run_session(session: Session) {
                         break 'main;
                     }
                     done_current = false;
+                    turn_content_seen = false;
+                    open_tools.clear();
+                    last_update_at = tokio::time::Instant::now();
                     turn = Some(prompt_turn(client.clone(), session_id.clone(), text));
                 } else if !steering_open {
                     break 'main;
@@ -2180,6 +2238,7 @@ async fn run_session(session: Session) {
 
             inc = incoming.recv() => match inc {
                 Some(Incoming::Notification { method, params }) => {
+                    last_update_at = tokio::time::Instant::now();
                     // Turn-end cost hint (see COST_HINT_GRACE above): arm the
                     // fast settle when the turn's terminal accounting frame
                     // arrives with our prompt still unsettled.
@@ -2206,15 +2265,21 @@ async fn run_session(session: Session) {
                         cursor_notification_events(&method, &params)
                     };
                     for ev in events {
+                        track_turn_signals(&ev, &mut turn_content_seen, &mut open_tools);
                         if !send(&event_tx, ev).await {
                             break 'main;
                         }
                     }
                 }
                 Some(Incoming::Request { id, method, params }) => {
-                    for ev in
-                        handle_server_request_live(&client, id, &method, &params, &request_input)
-                    {
+                    for ev in handle_server_request_live(
+                        &client,
+                        id,
+                        &method,
+                        &params,
+                        &request_input,
+                        &open_questions,
+                    ) {
                         if !send(&event_tx, ev).await {
                             break 'main;
                         }
@@ -2322,6 +2387,7 @@ async fn run_session(session: Session) {
                                         &method,
                                         &params,
                                         &request_input,
+                                        &open_questions,
                                     ) {
                                         if !send(&event_tx, ev).await {
                                             consumer_gone = true;
@@ -2392,6 +2458,9 @@ async fn run_session(session: Session) {
                         break 'main;
                     }
                     done_current = false;
+                    turn_content_seen = false;
+                    open_tools.clear();
+                    last_update_at = tokio::time::Instant::now();
                     turn = Some(prompt_turn(client.clone(), session_id.clone(), text));
                 }
                 while let Some(next_text) = steer_backlog.pop_front() {
@@ -2405,10 +2474,35 @@ async fn run_session(session: Session) {
                 }
             },
 
+            // BLANKET quiet settle (see `quiet_settle` above), adapter-
+            // agnostic: content streamed, every tool resolved, no question
+            // pending, stream quiet past the window with the prompt still
+            // unsettled. Feeds the recovery arm below by expiring its
+            // deadline — one settle path for all three evidence sources.
+            _ = tokio::time::sleep_until(
+                last_update_at + quiet_settle.unwrap_or_default()
+            ), if quiet_settle.is_some()
+                && starve_deadline.is_none()
+                && turn.is_some()
+                && !interrupted
+                && turn_content_seen
+                && open_tools.is_empty()
+                && open_questions.load(std::sync::atomic::Ordering::SeqCst) == 0 =>
+            {
+                tracing::warn!(
+                    target: "komet_harness::acp",
+                    quiet_ms = quiet_settle.unwrap_or_default().as_millis() as u64,
+                    "turn quiet past the settle window with completed output; \
+                     treating the prompt response as dropped"
+                );
+                starve_deadline = Some(tokio::time::Instant::now());
+            },
+
             // Starved-turn recovery: the grace elapsed with the prompt still
-            // unsettled after turn-end evidence — either the turn's terminal
-            // cost frame (COST_HINT_GRACE, ~immediate) or a steering call
-            // answered noRunningTurn (STARVE_GRACE). Close the dead turn out
+            // unsettled after turn-end evidence — the turn's terminal cost
+            // frame (COST_HINT_GRACE, ~immediate), a steering call answered
+            // noRunningTurn (STARVE_GRACE), or the blanket quiet settle
+            // above. Close the dead turn out
             // with a Done — its output already streamed as session/updates
             // and its text was delivered via the CLI's own queue — then
             // promote any queued steer to a fresh prompt, which settles
@@ -2463,6 +2557,9 @@ async fn run_session(session: Session) {
                         break 'main;
                     }
                     done_current = false;
+                    turn_content_seen = false;
+                    open_tools.clear();
+                    last_update_at = tokio::time::Instant::now();
                     turn = Some(prompt_turn(client.clone(), session_id.clone(), text));
                 }
             },
@@ -2487,6 +2584,9 @@ async fn run_session(session: Session) {
                             break 'main;
                         }
                         done_current = false;
+                        turn_content_seen = false;
+                        open_tools.clear();
+                        last_update_at = tokio::time::Instant::now();
                         turn = Some(prompt_turn(client.clone(), session_id.clone(), text));
                     } else if steer_ext {
                         // Mid-turn injection via the `_session/steering`

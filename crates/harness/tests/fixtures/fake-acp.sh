@@ -229,6 +229,28 @@ case "$promptline" in
   exit 0
   ;;
 
+*scenario:quiet-starve*)
+  # Blanket dropped-reply settle, no adapter-specific evidence: content
+  # streamed, no open tool, then silence — the response never comes. The
+  # harness must settle off the generic quiet window (tests set
+  # KOMET_ACP_QUIET_SETTLE_MS small), well before this stream's 8s EOF.
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"working"}}'
+  sleep 8
+  exit 0
+  ;;
+
+*scenario:quiet-tool-guard*)
+  # The guard: an OPEN tool call makes silence legitimate. Quiet stretch is
+  # far past the test's settle window, but the pending tool must hold the
+  # settle off; the turn then ends normally — exactly one Done.
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"working"}}'
+  update '{"sessionUpdate":"tool_call","toolCallId":"slow-1","title":"slow build","kind":"execute","status":"pending","rawInput":{"command":"make"}}'
+  sleep 4
+  update '{"sessionUpdate":"tool_call_update","toolCallId":"slow-1","status":"completed","content":[]}'
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"finished"}}'
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  ;;
+
 *scenario:interrupt*)
   update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"working"}}'
   read -r intline || exit 1
