@@ -37,7 +37,7 @@ use komet_rpc::methods;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::history::{GitHistory, GitHistoryCount, GitHistoryEvent, GitHistoryFetchButton};
-use crate::markdown::highlight::{Lang, LineCarry, tokenize_line};
+use crate::markdown::highlight::Lang;
 use crate::markdown::render;
 use crate::motion::{self, AnimationExt as _, CHEVRON, COLLAPSE};
 use crate::popover::{self, Popup};
@@ -628,6 +628,154 @@ fn hash64(parts: &[&str]) -> u64 {
     hasher.finish()
 }
 
+const MAX_EXCERPT_SOURCE_LINES: usize = 200_000;
+
+fn excerpt_side(
+    file: &FileDiff,
+    side: SourceSide,
+    language: Lang,
+    path: &str,
+) -> Option<Arc<komet_syntax::HighlightedDocument>> {
+    let max_line = file
+        .hunks
+        .iter()
+        .flat_map(|hunk| &hunk.lines)
+        .filter_map(|line| match side {
+            SourceSide::Old => line.old_no,
+            SourceSide::New => line.new_no,
+        })
+        .max()
+        .unwrap_or(0) as usize;
+    if max_line > MAX_EXCERPT_SOURCE_LINES {
+        return None;
+    }
+    let mut lines = vec![Vec::new(); max_line];
+    for hunk in &file.hunks {
+        let visible = hunk
+            .lines
+            .iter()
+            .filter_map(|line| {
+                let number = match side {
+                    SourceSide::Old => line.old_no,
+                    SourceSide::New => line.new_no,
+                }?;
+                (line.kind != LineKind::Meta).then_some((number, line.text.as_str()))
+            })
+            .collect::<Vec<_>>();
+        if visible.is_empty() {
+            continue;
+        }
+        let source = visible
+            .iter()
+            .map(|(_, text)| *text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let document = komet_syntax::highlight(komet_syntax::HighlightRequest {
+            source: &source,
+            path: Some(path),
+            fence_tag: None,
+        })
+        .ok()?;
+        for ((number, _), spans) in visible.into_iter().zip(document.lines) {
+            lines[number as usize - 1] = spans;
+        }
+    }
+    Some(Arc::new(komet_syntax::HighlightedDocument {
+        language,
+        lines,
+    }))
+}
+
+fn excerpt_highlights(file: &FileDiff, language: Lang) -> Option<DiffHighlights> {
+    if !komet_syntax::supports_language(language) {
+        return None;
+    }
+    let old = if file.status == FileStatus::Added {
+        None
+    } else {
+        Some(excerpt_side(
+            file,
+            SourceSide::Old,
+            language,
+            file.old_path.as_deref().unwrap_or(&file.path),
+        )?)
+    };
+    let new = if file.status == FileStatus::Deleted {
+        None
+    } else {
+        Some(excerpt_side(file, SourceSide::New, language, &file.path)?)
+    };
+    Some(DiffHighlights { old, new })
+}
+
+fn sources_match_patch(file: &FileDiff, response: &komet_proto::CheckoutFileDiffText) -> bool {
+    let old = response
+        .old_text
+        .as_deref()
+        .map(|source| source.lines().collect::<Vec<_>>());
+    let new = response
+        .new_text
+        .as_deref()
+        .map(|source| source.lines().collect::<Vec<_>>());
+    file.hunks.iter().flat_map(|hunk| &hunk.lines).all(|line| {
+        let actual = match line.kind {
+            LineKind::Del => line
+                .old_no
+                .and_then(|number| old.as_ref()?.get(number as usize - 1).copied()),
+            LineKind::Add => line
+                .new_no
+                .and_then(|number| new.as_ref()?.get(number as usize - 1).copied()),
+            LineKind::Context => line
+                .new_no
+                .and_then(|number| new.as_ref()?.get(number as usize - 1).copied())
+                .or_else(|| {
+                    line.old_no
+                        .and_then(|number| old.as_ref()?.get(number as usize - 1).copied())
+                }),
+            LineKind::Meta => return true,
+        };
+        actual == Some(line.text.as_str())
+    })
+}
+
+fn full_highlights(
+    file: &FileDiff,
+    language: Lang,
+    response: &komet_proto::CheckoutFileDiffText,
+) -> Option<DiffHighlights> {
+    if response.stale
+        || response.binary
+        || response.truncated
+        || !sources_match_patch(file, response)
+    {
+        return None;
+    }
+    let parse = |source: &str, path: &str| {
+        komet_syntax::highlight(komet_syntax::HighlightRequest {
+            source,
+            path: Some(path),
+            fence_tag: None,
+        })
+        .ok()
+        .map(Arc::new)
+    };
+    let old = match response.old_text.as_deref() {
+        Some(source) => Some(parse(
+            source,
+            file.old_path.as_deref().unwrap_or(&file.path),
+        )?),
+        None => None,
+    };
+    let new = match response.new_text.as_deref() {
+        Some(source) => Some(parse(source, &file.path)?),
+        None => None,
+    };
+    if old.is_none() && new.is_none() && komet_syntax::supports_language(language) {
+        return None;
+    }
+    Some(DiffHighlights { old, new })
+}
+
 // ---------------------------------------------------------------------------
 // Entity
 // ---------------------------------------------------------------------------
@@ -772,8 +920,16 @@ impl FileFold {
 
 struct HighlightSlot {
     fingerprint: u64,
-    lines: Option<Arc<Vec<Vec<komet_syntax::HighlightSpan>>>>,
-    _task: Option<Task<()>>,
+    state: DiffHighlightState,
+    _excerpt_task: Option<Task<()>>,
+    _fetch_task: Option<Task<()>>,
+}
+
+enum DiffHighlightState {
+    Pending,
+    Ready(Arc<DiffHighlights>),
+    Excerpt(Arc<DiffHighlights>),
+    Plain,
 }
 
 /// The open base-ref dropdown — the same searchable-menu recipe as the
@@ -789,20 +945,6 @@ struct RefMenu {
     focus: FocusHandle,
     list_scroll: gpui::ScrollHandle,
     _search_events: Subscription,
-}
-
-async fn yield_now() {
-    let mut yielded = false;
-    futures::future::poll_fn(move |cx| {
-        if yielded {
-            std::task::Poll::Ready(())
-        } else {
-            yielded = true;
-            cx.waker().wake_by_ref();
-            std::task::Poll::Pending
-        }
-    })
-    .await
 }
 
 /// The Changes pane entity. Lazy: no RPC until [`Changes::ensure_watch`] runs
@@ -1595,70 +1737,131 @@ impl Changes {
         }
     }
 
-    /// Tokens for a file's diff lines (paint-only). Kicks a time-sliced
-    /// background tokenize when missing; returns the current best.
+    /// Start excerpt parsing and a lazy full-source fetch for an expanded file.
     fn request_highlight(
         &mut self,
         file: &FileDiff,
         parsed_key: &str,
         cx: &mut Context<Self>,
-    ) -> Option<Arc<Vec<Vec<komet_syntax::HighlightSpan>>>> {
+    ) -> Option<Arc<DiffHighlights>> {
         let lang = lang_for_path(&file.path)?;
         let fingerprint = hash64(&[parsed_key, &file.path]);
         if let Some(slot) = self.highlights.get(&file.path)
             && slot.fingerprint == fingerprint
         {
-            return slot.lines.clone();
+            return match &slot.state {
+                DiffHighlightState::Ready(highlights) | DiffHighlightState::Excerpt(highlights) => {
+                    Some(highlights.clone())
+                }
+                DiffHighlightState::Pending | DiffHighlightState::Plain => None,
+            };
         }
-        let texts: Vec<(LineKind, String)> = file
-            .hunks
-            .iter()
-            .flat_map(|h| h.lines.iter().map(|l| (l.kind, l.text.clone())))
-            .collect();
+        if !komet_syntax::supports_language(lang) {
+            self.highlights.insert(
+                file.path.clone(),
+                HighlightSlot {
+                    fingerprint,
+                    state: DiffHighlightState::Plain,
+                    _excerpt_task: None,
+                    _fetch_task: None,
+                },
+            );
+            return None;
+        }
         let path = file.path.clone();
-        let task = cx.spawn(async move |this, cx| {
-            let lines = cx
+        let excerpt_file = file.clone();
+        let excerpt_path = path.clone();
+        let excerpt_task = cx.spawn(async move |this, cx| {
+            let highlights = cx
                 .background_executor()
-                .spawn(async move {
-                    let mut out = Vec::with_capacity(texts.len());
-                    for (ix, (kind, text)) in texts.iter().enumerate() {
-                        // Diff lines are fragments — no carry across lines.
-                        let tokens = match kind {
-                            LineKind::Meta => Vec::new(),
-                            _ => tokenize_line(lang, text, LineCarry::None).0,
-                        };
-                        out.push(
-                            tokens
-                                .into_iter()
-                                .map(|token| komet_syntax::HighlightSpan {
-                                    range: token.range,
-                                    kind: token.class.into(),
-                                })
-                                .collect(),
-                        );
-                        if ix % 128 == 127 {
-                            yield_now().await;
-                        }
-                    }
-                    out
-                })
+                .spawn(async move { excerpt_highlights(&excerpt_file, lang).map(Arc::new) })
                 .await;
             this.update(cx, |changes, cx| {
-                if let Some(slot) = changes.highlights.get_mut(&path)
+                if let Some(slot) = changes.highlights.get_mut(&excerpt_path)
                     && slot.fingerprint == fingerprint
+                    && matches!(slot.state, DiffHighlightState::Pending)
                 {
-                    slot.lines = Some(Arc::new(lines));
+                    slot.state = match highlights {
+                        Some(highlights) => DiffHighlightState::Excerpt(highlights),
+                        None => DiffHighlightState::Plain,
+                    };
                     cx.notify();
                 }
             })
             .ok();
         });
+
+        let active = self.active_diff(cx);
+        let engine = self.state.read(cx).engine().cloned();
+        let target = self.desired_target(cx);
+        let chat_id = self
+            .state
+            .read(cx)
+            .selected_chat_row()
+            .map(|chat| chat.id.clone());
+        let mode = self.scope.mode().to_string();
+        let base_ref = self.base_ref.clone();
+        let fetch_file = file.clone();
+        let fetch_path = path.clone();
+        let fetch_task = match (active, engine) {
+            (Some(diff), Some(engine)) => Some(cx.spawn(async move |this, cx| {
+                let request = komet_proto::GetCheckoutFileDiffTextRequest {
+                    checkout_id: diff.checkout_id,
+                    cwd: diff.cwd,
+                    path: fetch_path.clone(),
+                    mode,
+                    base_ref,
+                    chat_id,
+                    diff_checksum: diff.checksum,
+                };
+                let mut params = serde_json::to_value(request)
+                    .ok()
+                    .and_then(|value| value.as_object().cloned())
+                    .unwrap_or_default();
+                if let Some(target) = target {
+                    params.insert("targetDeviceId".into(), serde_json::Value::String(target));
+                }
+                let response = engine
+                    .client()
+                    .call(
+                        methods::GET_CHECKOUT_FILE_DIFF_TEXT,
+                        serde_json::Value::Object(params),
+                    )
+                    .await
+                    .ok()
+                    .and_then(|value| {
+                        serde_json::from_value::<komet_proto::CheckoutFileDiffText>(value).ok()
+                    });
+                let highlights = match response {
+                    Some(response) => {
+                        cx.background_executor()
+                            .spawn(async move {
+                                full_highlights(&fetch_file, lang, &response).map(Arc::new)
+                            })
+                            .await
+                    }
+                    None => None,
+                };
+                this.update(cx, |changes, cx| {
+                    if let Some(slot) = changes.highlights.get_mut(&fetch_path)
+                        && slot.fingerprint == fingerprint
+                        && let Some(highlights) = highlights
+                    {
+                        slot.state = DiffHighlightState::Ready(highlights);
+                        cx.notify();
+                    }
+                })
+                .ok();
+            })),
+            _ => None,
+        };
         self.highlights.insert(
             file.path.clone(),
             HighlightSlot {
                 fingerprint,
-                lines: None,
-                _task: Some(task),
+                state: DiffHighlightState::Pending,
+                _excerpt_task: Some(excerpt_task),
+                _fetch_task: fetch_task,
             },
         );
         None
@@ -1703,7 +1906,7 @@ impl Changes {
                 file,
                 hunk,
                 line,
-                flat,
+                flat: _,
             } => {
                 let Some(file_diff) = files.get(file as usize) else {
                     return gpui::Empty.into_any_element();
@@ -1716,12 +1919,11 @@ impl Changes {
                 else {
                     return gpui::Empty.into_any_element();
                 };
-                let tokens = highlight
-                    .as_ref()
-                    .and_then(|lines| lines.get(flat as usize))
-                    .map(|t| t.as_slice())
+                let spans = highlight
+                    .as_deref()
+                    .map(|highlights| highlights.spans(line))
                     .unwrap_or(&[]);
-                diff_line_row(line, tokens, &theme, gutter_width(file_diff))
+                diff_line_row(line, spans, &theme, gutter_width(file_diff))
             }
             DiffRow::BodyPad { .. } => div().w_full().h(px(BODY_BOTTOM_PAD)).into_any_element(),
             DiffRow::FoldingBody { file } => {
@@ -2510,13 +2712,12 @@ pub(crate) fn render_file_body_with_syntax(
 /// never materializes lines its clip cannot reveal.
 fn render_file_body_upto(
     file: &FileDiff,
-    highlight: Option<Arc<Vec<Vec<komet_syntax::HighlightSpan>>>>,
+    highlight: Option<Arc<DiffHighlights>>,
     theme: &Theme,
     max_px: f32,
 ) -> AnyElement {
     let mut children: Vec<AnyElement> = Vec::new();
     let mut y = 0.0f32;
-    let mut line_ix = 0usize;
     let gutter_px = gutter_width(file);
 
     'build: {
@@ -2537,14 +2738,12 @@ fn render_file_body_upto(
                 if y >= max_px {
                     break 'build;
                 }
-                let tokens = highlight
-                    .as_ref()
-                    .and_then(|lines| lines.get(line_ix))
-                    .map(|t| t.as_slice())
+                let spans = highlight
+                    .as_deref()
+                    .map(|highlights| highlights.spans(line))
                     .unwrap_or(&[]);
-                children.push(diff_line_row(line, tokens, theme, gutter_px));
+                children.push(diff_line_row(line, spans, theme, gutter_px));
                 y += DIFF_LINE_HEIGHT;
-                line_ix += 1;
             }
         }
     }
@@ -3252,5 +3451,106 @@ rename to new_name.rs
                 .iter()
                 .any(|span| span.kind == komet_syntax::HighlightKind::Function)
         );
+    }
+
+    #[test]
+    fn excerpt_parses_old_and_new_hunks_as_separate_documents() {
+        let file = FileDiff {
+            path: "src/lib.rs".into(),
+            old_path: None,
+            status: FileStatus::Modified,
+            binary: false,
+            notices: vec![],
+            hunks: vec![Hunk {
+                header: "@@ -1,3 +1,3 @@".into(),
+                lines: vec![
+                    DiffLine {
+                        kind: LineKind::Context,
+                        old_no: Some(1),
+                        new_no: Some(1),
+                        text: "/* start".into(),
+                    },
+                    DiffLine {
+                        kind: LineKind::Del,
+                        old_no: Some(2),
+                        new_no: None,
+                        text: "old body".into(),
+                    },
+                    DiffLine {
+                        kind: LineKind::Add,
+                        old_no: None,
+                        new_no: Some(2),
+                        text: "new body".into(),
+                    },
+                    DiffLine {
+                        kind: LineKind::Context,
+                        old_no: Some(3),
+                        new_no: Some(3),
+                        text: "end */".into(),
+                    },
+                ],
+            }],
+            additions: 1,
+            deletions: 1,
+            max_line: 3,
+        };
+        let highlights = excerpt_highlights(&file, Lang::Rust).expect("excerpt");
+        let deleted = &file.hunks[0].lines[1];
+        let added = &file.hunks[0].lines[2];
+        assert!(
+            highlights
+                .spans(deleted)
+                .iter()
+                .any(|span| span.kind == komet_syntax::HighlightKind::Comment)
+        );
+        assert!(
+            highlights
+                .spans(added)
+                .iter()
+                .any(|span| span.kind == komet_syntax::HighlightKind::Comment)
+        );
+    }
+
+    #[test]
+    fn mismatched_full_sources_are_rejected_atomically() {
+        let file = FileDiff {
+            path: "src/lib.rs".into(),
+            old_path: None,
+            status: FileStatus::Modified,
+            binary: false,
+            notices: vec![],
+            hunks: vec![Hunk {
+                header: "@@ -1 +1 @@".into(),
+                lines: vec![
+                    DiffLine {
+                        kind: LineKind::Del,
+                        old_no: Some(1),
+                        new_no: None,
+                        text: "let old = 1;".into(),
+                    },
+                    DiffLine {
+                        kind: LineKind::Add,
+                        old_no: None,
+                        new_no: Some(1),
+                        text: "let new = 2;".into(),
+                    },
+                ],
+            }],
+            additions: 1,
+            deletions: 1,
+            max_line: 1,
+        };
+        let response = komet_proto::CheckoutFileDiffText {
+            diff_checksum: "sum".into(),
+            old_text: Some("let old = 1;\n".into()),
+            new_text: Some("different snapshot\n".into()),
+            old_content_hash: None,
+            new_content_hash: None,
+            binary: false,
+            truncated: false,
+            stale: false,
+        };
+        assert!(!sources_match_patch(&file, &response));
+        assert!(full_highlights(&file, Lang::Rust, &response).is_none());
     }
 }
