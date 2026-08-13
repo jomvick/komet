@@ -34,6 +34,7 @@
 
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
+use komet_syntax::HighlightKind;
 use gpui::{App, Global, Hsla, SharedString, hsla};
 
 /// Which appearance the app is painting.
@@ -141,6 +142,138 @@ pub const INK_FILL_SCALE: f32 = 1.0;
 /// and the dark palette's white hairlines are deliberately faint. Scaling up
 /// keeps separators legible instead of dissolving into the panel.
 pub const INK_HAIRLINE_SCALE: f32 = 1.35;
+
+/// Paint-only syntax colors. The parser retains richer categories than the
+/// palette needs, while this single mapping keeps every UI surface coherent.
+#[derive(Debug, Clone)]
+pub struct SyntaxPalette {
+    pub comment: Hsla,
+    pub keyword: Hsla,
+    pub string: Hsla,
+    pub string_special: Hsla,
+    pub escape: Hsla,
+    pub number: Hsla,
+    pub boolean: Hsla,
+    pub type_name: Hsla,
+    pub type_builtin: Hsla,
+    pub constructor: Hsla,
+    pub function: Hsla,
+    pub function_builtin: Hsla,
+    pub macro_name: Hsla,
+    pub property: Hsla,
+    pub constant: Hsla,
+    pub variable: Hsla,
+    pub variable_special: Hsla,
+    pub parameter: Hsla,
+    pub operator: Hsla,
+    pub punctuation: Hsla,
+    pub tag: Hsla,
+    pub attribute: Hsla,
+    pub label: Hsla,
+    pub invalid: Hsla,
+}
+
+impl SyntaxPalette {
+    pub fn color(&self, kind: HighlightKind) -> Hsla {
+        match kind {
+            HighlightKind::Comment => self.comment,
+            HighlightKind::Keyword => self.keyword,
+            HighlightKind::String => self.string,
+            HighlightKind::StringSpecial => self.string_special,
+            HighlightKind::Escape => self.escape,
+            HighlightKind::Number => self.number,
+            HighlightKind::Boolean => self.boolean,
+            HighlightKind::Type => self.type_name,
+            HighlightKind::TypeBuiltin => self.type_builtin,
+            HighlightKind::Constructor => self.constructor,
+            HighlightKind::Function => self.function,
+            HighlightKind::FunctionBuiltin => self.function_builtin,
+            HighlightKind::Macro => self.macro_name,
+            HighlightKind::Property => self.property,
+            HighlightKind::Constant => self.constant,
+            HighlightKind::Variable => self.variable,
+            HighlightKind::VariableSpecial => self.variable_special,
+            HighlightKind::Parameter => self.parameter,
+            HighlightKind::Operator => self.operator,
+            HighlightKind::Punctuation | HighlightKind::Embedded => self.punctuation,
+            HighlightKind::Tag => self.tag,
+            HighlightKind::Attribute => self.attribute,
+            HighlightKind::Label => self.label,
+            HighlightKind::Invalid => self.invalid,
+        }
+    }
+
+    fn dark(text: Hsla, comment: Hsla, danger: Hsla) -> Self {
+        let rose = oklch(0.709, 0.129, 20.0);
+        let violet = oklch(0.75, 0.13, 293.0);
+        let blue = oklch(0.76, 0.11, 255.0);
+        let green = oklch(0.77, 0.11, 168.0);
+        let teal = oklch(0.79, 0.10, 190.0);
+        let amber = oklch(0.78, 0.12, 80.0);
+        let orange = oklch(0.76, 0.12, 55.0);
+        Self {
+            comment,
+            keyword: rose,
+            string: green,
+            string_special: teal,
+            escape: teal,
+            number: amber,
+            boolean: amber,
+            type_name: amber,
+            type_builtin: teal,
+            constructor: amber,
+            function: blue,
+            function_builtin: violet,
+            macro_name: violet,
+            property: orange,
+            constant: teal,
+            variable: text,
+            variable_special: teal,
+            parameter: text,
+            operator: text,
+            punctuation: text,
+            tag: rose,
+            attribute: orange,
+            label: amber,
+            invalid: danger,
+        }
+    }
+
+    fn light(text: Hsla, comment: Hsla, danger: Hsla) -> Self {
+        let violet = oklch(0.47, 0.20, 293.0);
+        let blue = oklch(0.48, 0.16, 255.0);
+        let green = oklch(0.46, 0.11, 168.0);
+        let teal = oklch(0.46, 0.10, 190.0);
+        let amber = oklch(0.49, 0.12, 70.0);
+        let orange = oklch(0.50, 0.14, 50.0);
+        Self {
+            comment,
+            keyword: violet,
+            string: green,
+            string_special: teal,
+            escape: teal,
+            number: amber,
+            boolean: amber,
+            type_name: amber,
+            type_builtin: teal,
+            constructor: amber,
+            function: blue,
+            function_builtin: violet,
+            macro_name: violet,
+            property: orange,
+            constant: teal,
+            variable: text,
+            variable_special: teal,
+            parameter: text,
+            operator: text,
+            punctuation: text,
+            tag: violet,
+            attribute: orange,
+            label: amber,
+            invalid: danger,
+        }
+    }
+}
 
 /// The app theme. Two concrete instances — [`Theme::dark`] and [`Theme::light`].
 #[derive(Debug, Clone)]
@@ -262,12 +395,8 @@ pub struct Theme {
     pub code_text: Hsla,
     /// Inline-code wash behind [`Self::code_text`].
     pub code_wash: Hsla,
-    /// Syntax: keywords (soft rose).
-    pub syntax_keyword: Hsla,
-    /// Syntax: string literals (soft green).
-    pub syntax_string: Hsla,
-    /// Syntax: numeric literals (soft amber).
-    pub syntax_number: Hsla,
+    /// Shared paint-only syntax palette.
+    pub syntax: SyntaxPalette,
     /// Diff: added lines.
     pub diff_add: Hsla,
     /// Diff: deleted lines.
@@ -492,11 +621,9 @@ impl Theme {
             danger_strong: oklch(0.58, 0.16, 25.0),
             code_text: oklch(0.811, 0.111, 293.571), // violet-300
             code_wash: oklch(0.702, 0.183, 293.541).opacity(0.12), // violet-400/12
-            syntax_keyword: oklch(0.709, 0.129, 20.0), // soft rose
-            syntax_string: oklch(0.77, 0.11, 168.0), // soft green
-            syntax_number: oklch(0.78, 0.12, 80.0),  // soft amber
-            diff_add: oklch(0.765, 0.177, 163.223),  // emerald-400
-            diff_del: oklch(0.704, 0.191, 22.216),   // red-400
+            syntax: SyntaxPalette::dark(neutral(0.922), neutral(0.60), oklch(0.704, 0.191, 22.216)),
+            diff_add: oklch(0.765, 0.177, 163.223), // emerald-400
+            diff_del: oklch(0.704, 0.191, 22.216),  // red-400
             diff_hunk_bg: hsla(0.6, 0.35, 0.6, 0.05),
             font_sans: "Geist".into(),
             font_mono: "Geist Mono".into(),
@@ -570,9 +697,7 @@ impl Theme {
             danger_strong: oklch(0.51, 0.20, 25.0),
             code_text: oklch(0.491, 0.27, 292.581), // violet-700
             code_wash: oklch(0.541, 0.281, 293.009).opacity(0.10), // violet-600/10
-            syntax_keyword: oklch(0.52, 0.19, 20.0),
-            syntax_string: oklch(0.46, 0.11, 168.0),
-            syntax_number: oklch(0.52, 0.13, 70.0),
+            syntax: SyntaxPalette::light(neutral(0.25), neutral(0.48), oklch(0.505, 0.213, 27.518)),
             diff_add: oklch(0.596, 0.145, 163.225), // emerald-600
             diff_del: oklch(0.577, 0.245, 27.325),  // red-600
             diff_hunk_bg: hsla(0.6, 0.35, 0.35, 0.07),
@@ -1132,9 +1257,9 @@ mod tests {
         for t in [Theme::dark(), Theme::light()] {
             for (name, fg) in [
                 ("code_text", t.code_text),
-                ("syntax_keyword", t.syntax_keyword),
-                ("syntax_string", t.syntax_string),
-                ("syntax_number", t.syntax_number),
+                ("syntax_keyword", t.syntax.keyword),
+                ("syntax_string", t.syntax.string),
+                ("syntax_number", t.syntax.number),
             ] {
                 let r = contrast_ratio(fg, t.bg);
                 assert!(r >= 4.5, "{:?} {name} is {r:.2}:1 on bg", t.appearance);
@@ -1143,6 +1268,63 @@ mod tests {
             for (name, fg) in [("diff_add", t.diff_add), ("diff_del", t.diff_del)] {
                 let r = contrast_ratio(fg, t.bg);
                 assert!(r >= 3.0, "{:?} {name} is {r:.2}:1 on bg", t.appearance);
+            }
+        }
+    }
+
+    #[test]
+    fn syntax_palette_resolves_every_kind_on_code_and_diff_backgrounds() {
+        let kinds = [
+            HighlightKind::Comment,
+            HighlightKind::Keyword,
+            HighlightKind::String,
+            HighlightKind::StringSpecial,
+            HighlightKind::Escape,
+            HighlightKind::Number,
+            HighlightKind::Boolean,
+            HighlightKind::Type,
+            HighlightKind::TypeBuiltin,
+            HighlightKind::Constructor,
+            HighlightKind::Function,
+            HighlightKind::FunctionBuiltin,
+            HighlightKind::Macro,
+            HighlightKind::Property,
+            HighlightKind::Constant,
+            HighlightKind::Variable,
+            HighlightKind::VariableSpecial,
+            HighlightKind::Parameter,
+            HighlightKind::Operator,
+            HighlightKind::Punctuation,
+            HighlightKind::Tag,
+            HighlightKind::Attribute,
+            HighlightKind::Label,
+            HighlightKind::Embedded,
+            HighlightKind::Invalid,
+        ];
+        for theme in [Theme::dark(), Theme::light()] {
+            let add_bg = flatten(theme.diff_add.opacity(0.055), theme.bg);
+            let del_bg = flatten(theme.diff_del.opacity(0.055), theme.bg);
+            for kind in kinds {
+                let color = theme.syntax.color(kind);
+                let floor = if matches!(
+                    kind,
+                    HighlightKind::Comment
+                        | HighlightKind::Operator
+                        | HighlightKind::Punctuation
+                        | HighlightKind::Embedded
+                ) {
+                    3.0
+                } else {
+                    4.5
+                };
+                for (name, background) in [("code", theme.bg), ("add", add_bg), ("del", del_bg)] {
+                    let ratio = contrast_ratio(color, background);
+                    assert!(
+                        ratio >= floor,
+                        "{:?} {kind:?} is {ratio:.2}:1 on {name}",
+                        theme.appearance
+                    );
+                }
             }
         }
     }

@@ -22,6 +22,17 @@ pub enum TokenClass {
     Number,
 }
 
+impl From<TokenClass> for komet_syntax::HighlightKind {
+    fn from(value: TokenClass) -> Self {
+        match value {
+            TokenClass::Keyword => Self::Keyword,
+            TokenClass::StringLit => Self::String,
+            TokenClass::Comment => Self::Comment,
+            TokenClass::Number => Self::Number,
+        }
+    }
+}
+
 /// One highlighted span within a line (byte offsets into that line).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Token {

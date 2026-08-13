@@ -14,6 +14,7 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::time::Instant;
 
+use komet_syntax::HighlightKind;
 use gpui::{
     AnyElement, BorderStyle, Bounds, FontStyle, FontWeight, Hsla, InteractiveText, SharedString,
     StyledText, TextRun, UnderlineStyle, Window, canvas, div, font, point, prelude::*, px, quad,
@@ -1154,13 +1155,8 @@ fn render_code_block(
 /// Paint color for a token class — the soft syntax palette (round 9: the
 /// original's mdTheme code blocks are monochrome `#e7e7e7`, but the user
 /// asked for color; these are the diff pane's hues, now shared by both).
-pub fn token_color(class: TokenClass, theme: &Theme) -> Hsla {
-    match class {
-        TokenClass::Keyword => theme.syntax_keyword, // soft rose
-        TokenClass::StringLit => theme.syntax_string, // soft green
-        TokenClass::Number => theme.syntax_number,   // soft amber
-        TokenClass::Comment => theme.text_faint,
-    }
+pub fn token_color(kind: HighlightKind, theme: &Theme) -> Hsla {
+    theme.syntax.color(kind)
 }
 
 /// Build the exact-cover `TextRun` list for one code line from its tokens.
@@ -1183,7 +1179,7 @@ pub fn runs_with_palette(
     tokens: &[Token],
     mono: &gpui::Font,
     plain_color: Hsla,
-    color_for: impl Fn(TokenClass) -> Hsla,
+    color_for: impl Fn(HighlightKind) -> Hsla,
 ) -> Vec<TextRun> {
     let plain = |len: usize| TextRun {
         len,
@@ -1200,7 +1196,7 @@ pub fn runs_with_palette(
             runs.push(plain(token.range.start - at));
         }
         let mut run = plain(token.range.len());
-        run.color = color_for(token.class);
+        run.color = color_for(token.class.into());
         runs.push(run);
         at = token.range.end;
     }
@@ -1282,12 +1278,12 @@ mod tests {
         // Round 9: transcript code blocks paint the soft hues (rose keyword,
         // green string, amber number); comments stay faint neutral.
         let theme = Theme::dark();
-        assert_ne!(token_color(TokenClass::Keyword, &theme), theme.text);
+        assert_ne!(token_color(TokenClass::Keyword.into(), &theme), theme.text);
         assert_ne!(
-            token_color(TokenClass::StringLit, &theme),
-            token_color(TokenClass::Keyword, &theme)
+            token_color(TokenClass::StringLit.into(), &theme),
+            token_color(TokenClass::Keyword.into(), &theme)
         );
-        assert_eq!(token_color(TokenClass::Comment, &theme), theme.text_faint);
+        assert_ne!(token_color(TokenClass::Comment.into(), &theme), theme.text);
     }
 
     #[test]

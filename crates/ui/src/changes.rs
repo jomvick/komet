@@ -2237,8 +2237,8 @@ fn del_color(theme: &Theme) -> gpui::Hsla {
 
 /// Diff syntax palette — since round 9 the transcript's code blocks share the
 /// same soft hues, so this simply delegates to [`render::token_color`].
-fn diff_token_color(class: crate::markdown::highlight::TokenClass, theme: &Theme) -> gpui::Hsla {
-    render::token_color(class, theme)
+fn diff_token_color(kind: komet_syntax::HighlightKind, theme: &Theme) -> gpui::Hsla {
+    render::token_color(kind, theme)
 }
 
 /// One notice row ("New file", "Binary file — contents not shown", …).
