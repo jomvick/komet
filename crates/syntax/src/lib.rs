@@ -3,7 +3,27 @@
 //! This crate intentionally has no UI, RPC, or engine dependencies. Public
 //! ranges are byte offsets relative to one UTF-8 source line.
 
-use std::{ops::Range, path::Path};
+use std::{ops::Range, path::Path, sync::atomic::AtomicUsize};
+
+use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent, Highlighter};
+
+pub const DEFAULT_MAX_SOURCE_BYTES: usize = 1024 * 1024;
+pub const DEFAULT_MAX_SPANS: usize = 200_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HighlightLimits {
+    pub max_source_bytes: usize,
+    pub max_spans: usize,
+}
+
+impl Default for HighlightLimits {
+    fn default() -> Self {
+        Self {
+            max_source_bytes: DEFAULT_MAX_SOURCE_BYTES,
+            max_spans: DEFAULT_MAX_SPANS,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LanguageId {
@@ -121,6 +141,8 @@ pub enum HighlightError {
     TooManySpans,
     #[error("parser failed: {0}")]
     Parser(String),
+    #[error("the {0:?} grammar is not bundled")]
+    GrammarUnavailable(LanguageId),
 }
 
 impl HighlightedDocument {
@@ -212,9 +234,163 @@ fn normalize_line(spans: Vec<HighlightSpan>) -> Vec<HighlightSpan> {
 
 fn line_starts(source: &str) -> Vec<usize> {
     let mut starts = vec![0];
-    starts.extend(source.match_indices('\n').map(|(index, _)| index + 1));
+    starts.extend(
+        source
+            .match_indices('\n')
+            .map(|(index, _)| index + 1)
+            .filter(|start| *start < source.len()),
+    );
     starts
 }
+
+/// Whether this build contains a parser and compatible highlight queries.
+pub const fn supports_language(language: LanguageId) -> bool {
+    matches!(language, LanguageId::Rust)
+}
+
+/// Highlight a complete document with the default resource limits.
+pub fn highlight(request: HighlightRequest<'_>) -> Result<HighlightedDocument, HighlightError> {
+    highlight_with_limits(request, HighlightLimits::default(), None)
+}
+
+/// Highlight a complete document with explicit limits and cooperative cancellation.
+pub fn highlight_with_limits(
+    request: HighlightRequest<'_>,
+    limits: HighlightLimits,
+    cancellation_flag: Option<&AtomicUsize>,
+) -> Result<HighlightedDocument, HighlightError> {
+    if request.source.len() > limits.max_source_bytes {
+        return Err(HighlightError::SourceTooLarge);
+    }
+    let language = detect_language(
+        request.path,
+        request.fence_tag,
+        request.source.lines().next(),
+    )
+    .ok_or(HighlightError::UnknownLanguage)?;
+    if !supports_language(language) {
+        return Err(HighlightError::GrammarUnavailable(language));
+    }
+
+    let mut configuration = rust_configuration()?;
+    configuration.configure(CAPTURE_NAMES);
+    let mut highlighter = Highlighter::new();
+    let events = highlighter
+        .highlight(
+            &configuration,
+            request.source.as_bytes(),
+            cancellation_flag,
+            |_| None,
+        )
+        .map_err(|error| HighlightError::Parser(error.to_string()))?;
+
+    let mut active = Vec::new();
+    let mut spans = Vec::new();
+    for event in events {
+        match event.map_err(|error| HighlightError::Parser(error.to_string()))? {
+            HighlightEvent::HighlightStart(highlight) => active.push(CAPTURE_KINDS[highlight.0]),
+            HighlightEvent::HighlightEnd => {
+                active.pop();
+            }
+            HighlightEvent::Source { start, end } => {
+                if let Some(kind) = active.iter().copied().max_by_key(|kind| kind.precedence()) {
+                    spans.push(HighlightSpan {
+                        range: start..end,
+                        kind,
+                    });
+                    if spans.len() > limits.max_spans {
+                        return Err(HighlightError::TooManySpans);
+                    }
+                }
+            }
+        }
+    }
+    HighlightedDocument::from_absolute_spans(language, request.source, spans)
+}
+
+fn rust_configuration() -> Result<HighlightConfiguration, HighlightError> {
+    // The upstream Rust query groups numbers and booleans as
+    // `constant.builtin`. Komet preserves those structural roles separately.
+    let highlights = tree_sitter_rust::HIGHLIGHTS_QUERY
+        .replace(
+            "(boolean_literal) @constant.builtin",
+            "(boolean_literal) @boolean",
+        )
+        .replace(
+            "(integer_literal) @constant.builtin",
+            "(integer_literal) @number",
+        )
+        .replace(
+            "(float_literal) @constant.builtin",
+            "(float_literal) @number",
+        );
+    HighlightConfiguration::new(
+        tree_sitter_rust::LANGUAGE.into(),
+        "rust",
+        &highlights,
+        tree_sitter_rust::INJECTIONS_QUERY,
+        "",
+    )
+    .map_err(|error| HighlightError::Parser(error.to_string()))
+}
+
+// Ordered from generic to specific. `HighlightConfiguration::configure`
+// resolves dotted captures to the best recognized name in this table.
+const CAPTURE_NAMES: &[&str] = &[
+    "comment",
+    "keyword",
+    "string",
+    "string.special",
+    "string.escape",
+    "number",
+    "boolean",
+    "type",
+    "type.builtin",
+    "constructor",
+    "function",
+    "function.builtin",
+    "function.macro",
+    "property",
+    "constant",
+    "variable",
+    "variable.builtin",
+    "variable.parameter",
+    "operator",
+    "punctuation",
+    "tag",
+    "attribute",
+    "label",
+    "embedded",
+    "error",
+];
+
+const CAPTURE_KINDS: &[HighlightKind] = &[
+    HighlightKind::Comment,
+    HighlightKind::Keyword,
+    HighlightKind::String,
+    HighlightKind::StringSpecial,
+    HighlightKind::Escape,
+    HighlightKind::Number,
+    HighlightKind::Boolean,
+    HighlightKind::Type,
+    HighlightKind::TypeBuiltin,
+    HighlightKind::Constructor,
+    HighlightKind::Function,
+    HighlightKind::FunctionBuiltin,
+    HighlightKind::Macro,
+    HighlightKind::Property,
+    HighlightKind::Constant,
+    HighlightKind::Variable,
+    HighlightKind::VariableSpecial,
+    HighlightKind::Parameter,
+    HighlightKind::Operator,
+    HighlightKind::Punctuation,
+    HighlightKind::Tag,
+    HighlightKind::Attribute,
+    HighlightKind::Label,
+    HighlightKind::Embedded,
+    HighlightKind::Invalid,
+];
 
 pub fn detect_language(
     path: Option<&str>,
@@ -393,5 +569,112 @@ mod tests {
             ),
             Err(HighlightError::InvalidUtf8Boundary { start: 8, end: 9 })
         );
+    }
+
+    fn highlighted_fragments(source: &str) -> Vec<(&str, HighlightKind)> {
+        let document = highlight(HighlightRequest {
+            source,
+            path: Some("src/lib.rs"),
+            fence_tag: None,
+        })
+        .unwrap();
+        source
+            .lines()
+            .zip(document.lines)
+            .flat_map(|(line, spans)| {
+                spans
+                    .into_iter()
+                    .map(move |span| (&line[span.range], span.kind))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rust_highlighting_distinguishes_structural_categories() {
+        let source = r#"pub struct Widget { field: usize }
+fn build(value: usize) -> Widget {
+    let name = format!("item-{value}");
+    Widget { field: 42 }
+}"#;
+        let fragments = highlighted_fragments(source);
+        for (text, expected) in [
+            ("pub", HighlightKind::Keyword),
+            ("Widget", HighlightKind::Type),
+            ("build", HighlightKind::Function),
+            ("format!", HighlightKind::Macro),
+            ("42", HighlightKind::Number),
+        ] {
+            assert!(
+                fragments.iter().any(|item| *item == (text, expected)),
+                "missing {text:?} as {expected:?}: {fragments:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rust_multiline_raw_unicode_and_incomplete_code_remain_valid() {
+        let source = "/* café\ncomment */\nlet raw = r#\"héllo\nworld\"#;\nlet before = 7;\nfn incomplete( {";
+        let document = highlight(HighlightRequest {
+            source,
+            path: None,
+            fence_tag: Some("rust"),
+        })
+        .unwrap();
+        assert!(
+            document.lines[1]
+                .iter()
+                .any(|span| span.kind == HighlightKind::Comment)
+        );
+        assert!(
+            document.lines[3]
+                .iter()
+                .any(|span| span.kind == HighlightKind::String)
+        );
+        assert!(
+            document
+                .lines
+                .iter()
+                .flatten()
+                .any(|span| span.kind == HighlightKind::Number)
+        );
+        for (line, spans) in source.lines().zip(&document.lines) {
+            for span in spans {
+                assert!(line.is_char_boundary(span.range.start));
+                assert!(line.is_char_boundary(span.range.end));
+            }
+        }
+    }
+
+    #[test]
+    fn limits_and_unbundled_languages_degrade_with_typed_errors() {
+        assert_eq!(
+            highlight_with_limits(
+                HighlightRequest {
+                    source: "fn main() {}",
+                    path: Some("main.rs"),
+                    fence_tag: None,
+                },
+                HighlightLimits {
+                    max_source_bytes: 2,
+                    max_spans: 10
+                },
+                None,
+            ),
+            Err(HighlightError::SourceTooLarge)
+        );
+        assert_eq!(
+            highlight(HighlightRequest {
+                source: "const x = 1;",
+                path: Some("app.ts"),
+                fence_tag: None,
+            }),
+            Err(HighlightError::GrammarUnavailable(LanguageId::TypeScript))
+        );
+    }
+
+    #[test]
+    fn rust_queries_load_for_the_bundled_abi() {
+        assert!(rust_configuration().is_ok());
+        assert!(tree_sitter::LANGUAGE_VERSION >= tree_sitter::MIN_COMPATIBLE_LANGUAGE_VERSION);
     }
 }

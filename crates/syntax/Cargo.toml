@@ -7,3 +7,6 @@ publish.workspace = true
 
 [dependencies]
 thiserror.workspace = true
+tree-sitter = "=0.26.11"
+tree-sitter-highlight = "=0.26.11"
+tree-sitter-rust = "=0.24.2"
