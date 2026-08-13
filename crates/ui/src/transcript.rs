@@ -1024,6 +1024,21 @@ pub fn flavour_seed(chat_id: &str) -> u64 {
     fnv1a(chat_id.as_bytes())
 }
 
+/// The working trailer's "Sending…" bridge: true while an in-flight send is
+/// fresher than the session row's turn start — the row still carries the
+/// PREVIOUS turn (or none), so a timer would count the send round-trip and
+/// restart when the turn actually begins.
+pub fn sending_bridge(
+    send_started: Option<chrono::DateTime<chrono::Utc>>,
+    turn_started: Option<chrono::DateTime<chrono::Utc>>,
+) -> bool {
+    match (send_started, turn_started) {
+        (Some(send), Some(turn)) => turn <= send,
+        (Some(_), None) => true,
+        (None, _) => false,
+    }
+}
+
 /// "1m 32s"-style elapsed formatting.
 pub fn format_elapsed(secs: i64) -> String {
     let secs = secs.max(0);
@@ -2222,25 +2237,28 @@ impl Transcript {
     fn render_working_trailer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let chat_id = self.chat_id.clone()?;
         let now = chrono::Utc::now();
-        let elapsed_secs = {
+        let (sending, elapsed_secs) = {
             let state = self.state.read(cx);
             if state.indicator_for(&chat_id, now) != crate::state::Indicator::Working {
                 return None;
             }
-            // Timer base: the freshest of the session row's turn start and
-            // the in-flight send (the row still carries the PREVIOUS turn's
-            // start during the send→ack window).
-            let started = state
-                .session_for(&chat_id)
-                .and_then(|s| s.started_at)
-                .into_iter()
-                .chain(state.pending_send_started(&chat_id, now))
-                .max();
-            started
+            // During the send→turn window the session row's `started_at`
+            // still belongs to the PREVIOUS turn — a timer based on the send
+            // counted the round-trip and then restarted when the turn
+            // actually began (user report). Bridge it as "Sending…" with no
+            // timer instead; the word + timer start with the turn.
+            let turn_started = state.session_for(&chat_id).and_then(|s| s.started_at);
+            let sending = sending_bridge(state.pending_send_started(&chat_id, now), turn_started);
+            let elapsed = turn_started
                 .map(|t| now.signed_duration_since(t).num_seconds().max(0))
-                .unwrap_or(0)
+                .unwrap_or(0);
+            (sending, elapsed)
         };
-        let word = flavour_word(flavour_seed(&chat_id), elapsed_secs);
+        let word = if sending {
+            "Sending"
+        } else {
+            flavour_word(flavour_seed(&chat_id), elapsed_secs)
+        };
         let theme = Theme::of(cx).clone();
         Some(
             div()
@@ -2263,11 +2281,13 @@ impl Transcript {
                         .text_color(theme.text_muted)
                         .child(SharedString::from(format!("{word}…"))),
                 )
-                .child(
-                    div()
-                        .text_color(theme.text_faint)
-                        .child(SharedString::from(format_elapsed(elapsed_secs))),
-                )
+                .when(!sending, |el| {
+                    el.child(
+                        div()
+                            .text_color(theme.text_faint)
+                            .child(SharedString::from(format_elapsed(elapsed_secs))),
+                    )
+                })
                 .into_any_element(),
         )
     }
@@ -4258,6 +4278,23 @@ mod tests {
         assert_eq!(format_elapsed(59), "59s");
         assert_eq!(format_elapsed(92), "1m 32s");
         assert_eq!(format_elapsed(-5), "0s");
+    }
+
+    #[test]
+    fn sending_bridge_holds_until_the_turn_outdates_the_send() {
+        let send = chrono::DateTime::parse_from_rfc3339("2026-08-13T10:00:00Z")
+            .unwrap()
+            .to_utc();
+        let before = send - chrono::Duration::seconds(90);
+        let after = send + chrono::Duration::seconds(2);
+        // In flight, row still on the previous turn (or no row yet).
+        assert!(sending_bridge(Some(send), Some(before)));
+        assert!(sending_bridge(Some(send), None));
+        // The turn started after the send fired — timer takes over.
+        assert!(!sending_bridge(Some(send), Some(after)));
+        // No send in flight: never a bridge, whatever the row says.
+        assert!(!sending_bridge(None, Some(before)));
+        assert!(!sending_bridge(None, None));
     }
 
     #[test]
