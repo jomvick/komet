@@ -1493,15 +1493,52 @@ impl Transcript {
         let this = cx.weak_entity();
         cx.defer(move |cx| {
             this.update(cx, |this: &mut Transcript, cx| {
-                // Wheel/touch input RELEASES an own-turn hold (clamping it
-                // locked scrolling for as long as the reservation held —
-                // user report). The reservation stays behind as plain
-                // scrollable space; normal escape/restick applies below.
-                if let Some(anchor) = this.own_turn.as_mut()
-                    && anchor.held
-                {
-                    anchor.held = false;
-                    this.own_turn_last_tick = None;
+                // Wheel/touch while a runway lives: input owns the viewport,
+                // and the BOTTOM PIN must stay out of it entirely. Escaping
+                // releases the hold (the reservation stays behind as plain
+                // scrollable space); returning toward the bottom re-arms the
+                // HOLD, never `pinned` — a restick pin glued the view to the
+                // bottom of the reservation pad, where streaming reads as
+                // text stuck at the viewport top with the runway never
+                // filling (user report; the pad can't resize there either,
+                // its anchor being off-screen). macOS trackpad momentum can
+                // even release-and-restick within one gesture right after a
+                // send, so under the old rules the prompt never landed at
+                // the top at all.
+                if this.own_turn.is_some() {
+                    let distance = this.distance_from_bottom();
+                    let previous = this.last_scroll_distance;
+                    this.last_scroll_distance = distance;
+                    let held = this.own_turn.as_ref().is_some_and(|a| a.held);
+                    if distance > previous + 1.0 && distance > AT_BOTTOM_PX {
+                        // Input moving away from the bottom breaks the hold.
+                        if let Some(anchor) = this.own_turn.as_mut() {
+                            anchor.held = false;
+                        }
+                        this.own_turn_last_tick = None;
+                        this.pinned = false;
+                        this.spring.reset();
+                        this.spring_last_tick = None;
+                    } else if !held
+                        && (distance <= AT_BOTTOM_PX
+                            || Self::should_restick(distance, previous))
+                    {
+                        // Returning to the bottom returns to the RUNWAY: the
+                        // glide re-lands the prompt at its inset.
+                        if let Some(anchor) = this.own_turn.as_mut() {
+                            anchor.held = true;
+                            anchor.positioned = false;
+                        }
+                        this.own_turn_last_tick = None;
+                        this.own_turn_kick = true;
+                    }
+                    let show = distance > SCROLL_BUTTON_THRESHOLD_PX
+                        && !this.own_turn.as_ref().is_some_and(|a| a.held);
+                    if show != this.show_jump_button {
+                        this.show_jump_button = show;
+                    }
+                    cx.notify();
+                    return;
                 }
                 let distance = this.distance_from_bottom();
                 let previous = this.last_scroll_distance;
