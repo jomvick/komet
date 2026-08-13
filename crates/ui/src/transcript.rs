@@ -41,7 +41,6 @@ use gpui::{
 use komet_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
 use komet_proto::ToolCall;
 
-use crate::markdown::highlight::{Lang, LineCarry, lang_for_tag, tokenize_line};
 use crate::markdown::parser::{Block, BlockTree, IncrementalParser, parse_full};
 use crate::markdown::render::{self, RenderCache, RenderOptions};
 use crate::markdown::veil::RowVeil;
@@ -49,6 +48,7 @@ use crate::motion::{self, AnimationExt as _, RESIZE};
 use crate::state::AppState;
 use crate::syntax_cache::{DocumentHighlightKey, SyntaxHighlightCache};
 use crate::theme::Theme;
+use komet_syntax::LanguageId as Lang;
 
 // ---------------------------------------------------------------------------
 // Constants (mugen ports)
@@ -1109,33 +1109,41 @@ impl HighlightStore {
             let document = cx
                 .background_executor()
                 .spawn(async move {
-                    if komet_syntax::supports_language(lang) {
-                        return komet_syntax::highlight(komet_syntax::HighlightRequest {
-                            source: &code,
-                            path: None,
-                            fence_tag: Some("rust"),
-                        })
-                        .ok();
-                    }
-                    let mut carry = LineCarry::None;
-                    let lines = code
-                        .split('\n')
-                        .map(|line| {
-                            let (tokens, next) = tokenize_line(lang, line, carry);
-                            carry = next;
-                            tokens
-                                .into_iter()
-                                .map(|token| komet_syntax::HighlightSpan {
-                                    range: token.range,
-                                    kind: token.class.into(),
-                                })
-                                .collect()
-                        })
-                        .collect();
-                    Some(komet_syntax::HighlightedDocument {
-                        language: lang,
-                        lines,
+                    komet_syntax::highlight(komet_syntax::HighlightRequest {
+                        source: &code,
+                        path: None,
+                        fence_tag: Some(match lang {
+                            Lang::Rust => "rust",
+                            Lang::JavaScript => "javascript",
+                            Lang::Jsx => "jsx",
+                            Lang::TypeScript => "typescript",
+                            Lang::Tsx => "tsx",
+                            Lang::Python => "python",
+                            Lang::Go => "go",
+                            Lang::Json => "json",
+                            Lang::Jsonc => "jsonc",
+                            Lang::Bash => "bash",
+                            Lang::Toml => "toml",
+                            Lang::Markdown => "markdown",
+                            Lang::Html => "html",
+                            Lang::Css => "css",
+                            Lang::Yaml => "yaml",
+                            Lang::C => "c",
+                            Lang::Cpp => "cpp",
+                            Lang::CSharp => "csharp",
+                            Lang::Java => "java",
+                            Lang::Kotlin => "kotlin",
+                            Lang::Swift => "swift",
+                            Lang::Ruby => "ruby",
+                            Lang::Php => "php",
+                            Lang::Sql => "sql",
+                            Lang::Lua => "lua",
+                            Lang::Dockerfile => "dockerfile",
+                            Lang::Nix => "nix",
+                            Lang::Make => "make",
+                        }),
                     })
+                    .ok()
                 })
                 .await;
             this.update(cx, |transcript, cx| {
@@ -2681,7 +2689,9 @@ impl Transcript {
                 continue;
             }
             if let Block::CodeBlock { language, code } = &top.block
-                && let Some(lang) = language.as_deref().and_then(lang_for_tag)
+                && let Some(lang) = language
+                    .as_deref()
+                    .and_then(komet_syntax::language_for_alias)
             {
                 out.insert(
                     ix,
@@ -2711,7 +2721,7 @@ impl Transcript {
         let old = match old_text {
             Some(source) => {
                 let path = file.old_path.as_deref().unwrap_or(&file.path);
-                let lang = crate::changes::lang_for_path(path)?;
+                let lang = komet_syntax::language_for_path(path)?;
                 Some(
                     self.highlights
                         .request(cache_row.clone(), 0, lang, source, cx)?,
@@ -2721,7 +2731,7 @@ impl Transcript {
         };
         let new = match new_text {
             Some(source) => {
-                let lang = crate::changes::lang_for_path(&file.path)?;
+                let lang = komet_syntax::language_for_path(&file.path)?;
                 Some(self.highlights.request(cache_row, 1, lang, source, cx)?)
             }
             None => None,

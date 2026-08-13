@@ -37,12 +37,12 @@ use komet_rpc::methods;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::history::{GitHistory, GitHistoryCount, GitHistoryEvent, GitHistoryFetchButton};
-use crate::markdown::highlight::Lang;
 use crate::markdown::render;
 use crate::motion::{self, AnimationExt as _, CHEVRON, COLLAPSE};
 use crate::popover::{self, Popup};
 use crate::state::{AppState, EngineHandle};
 use crate::theme::Theme;
+use komet_syntax::LanguageId as Lang;
 
 // ---------------------------------------------------------------------------
 // Layout numbers (analytic — they drive the fold tween)
@@ -613,11 +613,6 @@ pub fn apply_diff_frame(diffs: &mut Vec<CheckoutDiff>, value: serde_json::Value)
             false
         }
     }
-}
-
-/// Language for a file path's extension (drives per-line highlighting).
-pub fn lang_for_path(path: &str) -> Option<Lang> {
-    komet_syntax::language_for_path(path)
 }
 
 fn hash64(parts: &[&str]) -> u64 {
@@ -1744,7 +1739,7 @@ impl Changes {
         parsed_key: &str,
         cx: &mut Context<Self>,
     ) -> Option<Arc<DiffHighlights>> {
-        let lang = lang_for_path(&file.path)?;
+        let lang = komet_syntax::language_for_path(&file.path)?;
         let fingerprint = hash64(&[parsed_key, &file.path]);
         if let Some(slot) = self.highlights.get(&file.path)
             && slot.fingerprint == fingerprint
@@ -3373,15 +3368,6 @@ rename to new_name.rs
     }
 
     #[test]
-    fn langs_resolve_from_paths() {
-        assert_eq!(lang_for_path("src/main.rs"), Some(Lang::Rust));
-        assert_eq!(lang_for_path("a/b/app.tsx"), Some(Lang::Tsx));
-        assert_eq!(lang_for_path("Cargo.toml"), Some(Lang::Toml));
-        assert_eq!(lang_for_path("script.sh"), Some(Lang::Bash));
-        assert_eq!(lang_for_path("README"), None);
-        assert_eq!(lang_for_path("img.png"), None);
-    }
-
     #[test]
     fn full_diff_highlights_map_old_new_and_context_by_source_line() {
         let old_source = "fn old() {\n    let value = 1;\n}\n";

@@ -23,7 +23,6 @@ use gpui::{
 
 use crate::theme::Theme;
 
-use super::highlight::{Token, TokenClass};
 use super::parser::{Block, BlockTree, InlineRun, TableAlign};
 use super::veil::{RowVeil, apply_veil, slice_spans};
 
@@ -1163,17 +1162,6 @@ pub fn token_color(kind: HighlightKind, theme: &Theme) -> Hsla {
 
 /// Build the exact-cover `TextRun` list for one code line from its tokens.
 /// Same font everywhere — recoloring can never change layout.
-pub fn runs_for_code_line(
-    line: &str,
-    tokens: &[Token],
-    mono: &gpui::Font,
-    theme: &Theme,
-) -> Vec<TextRun> {
-    runs_with_palette(line, tokens, mono, theme.text, |class| {
-        token_color(class, theme)
-    })
-}
-
 /// Build paint-only runs from the neutral Tree-sitter contract.
 pub fn runs_for_syntax_line(
     line: &str,
@@ -1217,45 +1205,9 @@ pub fn runs_for_syntax_line_with_plain(
     runs
 }
 
-/// [`runs_for_code_line`] with a caller-supplied palette (the diff pane keys
-/// its plain color differently; the hues are shared via [`token_color`]).
-pub fn runs_with_palette(
-    line: &str,
-    tokens: &[Token],
-    mono: &gpui::Font,
-    plain_color: Hsla,
-    color_for: impl Fn(HighlightKind) -> Hsla,
-) -> Vec<TextRun> {
-    let plain = |len: usize| TextRun {
-        len,
-        font: mono.clone(),
-        color: plain_color,
-        background_color: None,
-        underline: None,
-        strikethrough: None,
-    };
-    let mut runs = Vec::new();
-    let mut at = 0usize;
-    for token in tokens {
-        if token.range.start > at {
-            runs.push(plain(token.range.start - at));
-        }
-        let mut run = plain(token.range.len());
-        run.color = color_for(token.class.into());
-        runs.push(run);
-        at = token.range.end;
-    }
-    if at < line.len() {
-        runs.push(plain(line.len() - at));
-    }
-    runs.retain(|r| r.len > 0);
-    runs
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::markdown::highlight::{Lang, tokenize_line};
     use crate::markdown::parser::InlineStyle;
 
     #[test]
@@ -1263,8 +1215,13 @@ mod tests {
         let theme = Theme::dark();
         let mono = font(theme.font_mono.clone());
         let line = r#"let x = "hi"; // done"#;
-        let (tokens, _) = tokenize_line(Lang::Rust, line, Default::default());
-        let runs = runs_for_code_line(line, &tokens, &mono, &theme);
+        let document = komet_syntax::highlight(komet_syntax::HighlightRequest {
+            source: line,
+            path: None,
+            fence_tag: Some("rust"),
+        })
+        .unwrap();
+        let runs = runs_for_syntax_line(line, &document.lines[0], &mono, &theme);
         let total: usize = runs.iter().map(|r| r.len).sum();
         assert_eq!(total, line.len());
         assert!(
@@ -1299,7 +1256,7 @@ mod tests {
     fn code_line_runs_with_no_tokens_are_one_plain_run() {
         let theme = Theme::dark();
         let mono = font(theme.font_mono.clone());
-        let runs = runs_for_code_line("plain text", &[], &mono, &theme);
+        let runs = runs_for_syntax_line("plain text", &[], &mono, &theme);
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].len, 10);
     }
@@ -1343,12 +1300,12 @@ mod tests {
         // Round 9: transcript code blocks paint the soft hues (rose keyword,
         // green string, amber number); comments stay faint neutral.
         let theme = Theme::dark();
-        assert_ne!(token_color(TokenClass::Keyword.into(), &theme), theme.text);
+        assert_ne!(token_color(HighlightKind::Keyword, &theme), theme.text);
         assert_ne!(
-            token_color(TokenClass::StringLit.into(), &theme),
-            token_color(TokenClass::Keyword.into(), &theme)
+            token_color(HighlightKind::String, &theme),
+            token_color(HighlightKind::Keyword, &theme)
         );
-        assert_ne!(token_color(TokenClass::Comment.into(), &theme), theme.text);
+        assert_ne!(token_color(HighlightKind::Comment, &theme), theme.text);
     }
 
     #[test]
