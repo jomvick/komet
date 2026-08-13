@@ -259,7 +259,7 @@ impl Render for HistoryRefTooltip {
             .map(|description| description.chars().count())
             .max()
             .unwrap_or_default();
-        let width = (longest as f32 * 6.6 + 16.0).clamp(140.0, 360.0);
+        let width = (longest as f32 * 6.4 + 16.0).clamp(72.0, 360.0);
         div()
             .w(px(width))
             .px(px(8.0))
