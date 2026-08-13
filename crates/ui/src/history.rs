@@ -330,6 +330,7 @@ pub struct GitHistory {
     head_sha: Option<String>,
     next_cursor: Option<usize>,
     total_count: Option<usize>,
+    head_commit_count: Option<usize>,
     loading: bool,
     error: Option<SharedString>,
     graph: GraphLayout,
@@ -338,6 +339,60 @@ pub struct GitHistory {
     request_task: Option<Task<()>>,
     copy_task: Option<Task<()>>,
     _observe: Subscription,
+}
+
+pub struct GitHistoryCount {
+    history: Entity<GitHistory>,
+    _observe: Subscription,
+}
+
+impl GitHistoryCount {
+    pub fn new(history: Entity<GitHistory>, cx: &mut Context<Self>) -> Self {
+        let observe = cx.observe(&history, |_, _, cx| cx.notify());
+        Self {
+            history,
+            _observe: observe,
+        }
+    }
+}
+
+impl Render for GitHistoryCount {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::of(cx);
+        let history = self.history.read(cx);
+        let count = history.commit_count();
+        let branch = history.current_branch(cx);
+        div()
+            .h_full()
+            .min_w_0()
+            .flex()
+            .items_center()
+            .gap(px(10.0))
+            .when_some(count, |element, count| {
+                element.child(
+                    div()
+                        .flex_none()
+                        .whitespace_nowrap()
+                        .text_size(px(11.0))
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from(format!(
+                            "{count} commit{}",
+                            if count == 1 { "" } else { "s" }
+                        ))),
+                )
+            })
+            .when_some(branch, |element, branch| {
+                element.child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .font_family(theme.font_mono.clone())
+                        .text_size(px(11.5))
+                        .text_color(theme.text_dim)
+                        .child(SharedString::from(branch)),
+                )
+            })
+    }
 }
 
 impl GitHistory {
@@ -355,6 +410,7 @@ impl GitHistory {
             head_sha: None,
             next_cursor: None,
             total_count: None,
+            head_commit_count: None,
             loading: false,
             error: None,
             graph: GraphLayout::default(),
@@ -381,6 +437,8 @@ impl GitHistory {
         let Some((key, cwd, target)) = self.context(cx) else {
             self.target_key = None;
             self.commits.clear();
+            self.total_count = None;
+            self.head_commit_count = None;
             self.graph = GraphLayout::default();
             self.list.reset(0);
             self.loading = false;
@@ -399,6 +457,7 @@ impl GitHistory {
         self.head_sha = None;
         self.next_cursor = None;
         self.total_count = None;
+        self.head_commit_count = None;
         self.error = None;
         self.graph = GraphLayout::default();
         self.list.reset(0);
@@ -411,6 +470,17 @@ impl GitHistory {
         };
         self.target_key = Some(key.clone());
         self.fetch_page(key, cwd, target, 0, true, cx);
+    }
+
+    pub fn commit_count(&self) -> Option<usize> {
+        self.head_commit_count
+    }
+
+    fn current_branch(&self, cx: &App) -> Option<String> {
+        self.state
+            .read(cx)
+            .selected_chat_row()
+            .and_then(|chat| chat.branch.clone())
     }
 
     fn load_older(&mut self, cx: &mut Context<Self>) {
@@ -469,6 +539,7 @@ impl GitHistory {
                         if reset {
                             history.commits = page.commits;
                             history.total_count = page.total_count;
+                            history.head_commit_count = page.head_commit_count;
                         } else {
                             let mut seen: HashSet<String> = history
                                 .commits
@@ -482,6 +553,9 @@ impl GitHistory {
                             );
                             if page.total_count.is_some() {
                                 history.total_count = page.total_count;
+                            }
+                            if page.head_commit_count.is_some() {
+                                history.head_commit_count = page.head_commit_count;
                             }
                         }
                         history.head_sha = page.head_sha;
@@ -902,8 +976,6 @@ impl Render for GitHistory {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_loaded(cx);
         let theme = Theme::of(cx).clone();
-        let count = self.total_count.unwrap_or(self.commits.len());
-        let count_label = format!("{count} commit{}", if count == 1 { "" } else { "s" });
         let graph_column = graph_width(self.graph.max_lane_count);
 
         let body: AnyElement = if self.target_key.is_none() {
@@ -968,28 +1040,6 @@ impl Render for GitHistory {
             .size_full()
             .flex()
             .flex_col()
-            .child(
-                div()
-                    .h(px(32.0))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .px(px(8.0))
-                    .border_b_1()
-                    .border_color(crate::theme::hairline(0.06))
-                    .text_size(px(11.0))
-                    .text_color(theme.text_muted)
-                    .child(SharedString::from(count_label))
-                    .when(self.loading && !self.commits.is_empty(), |element| {
-                        element.child(
-                            div()
-                                .ml(px(8.0))
-                                .text_size(px(10.0))
-                                .text_color(theme.text_faint)
-                                .child("Reloading…"),
-                        )
-                    }),
-            )
             .when_some(
                 self.error.clone().filter(|_| !self.commits.is_empty()),
                 |element, error| {

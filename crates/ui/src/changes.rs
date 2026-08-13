@@ -36,7 +36,7 @@ use komet_proto::{Chat, CheckoutDiff};
 use komet_rpc::methods;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
-use crate::history::GitHistory;
+use crate::history::{GitHistory, GitHistoryCount};
 use crate::markdown::highlight::{Lang, LineCarry, Token, lang_for_tag, tokenize_line};
 use crate::markdown::render;
 use crate::motion::{self, AnimationExt as _, CHEVRON, COLLAPSE};
@@ -787,6 +787,7 @@ pub struct Changes {
     scope_menu: Popup<()>,
     ref_menu: Popup<RefMenu>,
     history: Option<Entity<GitHistory>>,
+    history_count: Option<Entity<GitHistoryCount>>,
     _observe: Subscription,
 }
 
@@ -823,6 +824,7 @@ impl Changes {
             scope_menu: Popup::default(),
             ref_menu: Popup::default(),
             history: None,
+            history_count: None,
             _observe: observe,
         }
     }
@@ -1150,6 +1152,16 @@ impl Changes {
         let history = cx.new(|cx| GitHistory::new(self.state.clone(), cx));
         self.history = Some(history.clone());
         history
+    }
+
+    fn history_count(&mut self, cx: &mut Context<Self>) -> Entity<GitHistoryCount> {
+        if let Some(count) = &self.history_count {
+            return count.clone();
+        }
+        let history = self.history_pane(cx);
+        let count = cx.new(|cx| GitHistoryCount::new(history, cx));
+        self.history_count = Some(count.clone());
+        count
     }
 
     fn set_base_ref(&mut self, base: String, cx: &mut Context<Self>) {
@@ -1802,6 +1814,7 @@ impl Changes {
     pub fn render_header_controls(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let scope = self.scope;
+        let history_count = (scope == DiffScope::History).then(|| self.history_count(cx));
         let trigger = div()
             .id("changes-scope-trigger")
             .h(px(24.0))
@@ -1884,8 +1897,13 @@ impl Changes {
             .items_center()
             .gap(px(6.0))
             .child(trigger)
+            .when_some(history_count, |element, count| {
+                element.child(div().flex_1().min_w_0().h_full().child(count))
+            })
             .children(self.render_ref_selector(&theme, cx))
-            .child(div().flex_1())
+            .when(scope != DiffScope::History, |element| {
+                element.child(div().flex_1())
+            })
             .child(trailing)
             .into_any_element()
     }

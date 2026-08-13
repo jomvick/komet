@@ -474,6 +474,7 @@ impl Repos {
                 head_sha: None,
                 next_cursor: None,
                 total_count: Some(0),
+                head_commit_count: Some(0),
             });
         }
 
@@ -512,12 +513,21 @@ impl Repos {
         } else {
             None
         };
+        let head_commit_count = if cursor == 0 && head_sha.is_some() {
+            self.git(&["rev-list", "--count", "HEAD"], Some(repo_path))
+                .await
+                .ok()
+                .and_then(|count| count.parse().ok())
+        } else {
+            None
+        };
 
         Ok(GitHistoryPage {
             next_cursor: has_next.then_some(cursor + commits.len()),
             commits,
             head_sha,
             total_count,
+            head_commit_count,
         })
     }
 

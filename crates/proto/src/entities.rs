@@ -254,6 +254,9 @@ pub struct GitHistoryPage {
     pub head_sha: Option<String>,
     pub next_cursor: Option<usize>,
     pub total_count: Option<usize>,
+    /// Number of commits reachable from the active checkout's HEAD.
+    #[serde(default)]
+    pub head_commit_count: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
