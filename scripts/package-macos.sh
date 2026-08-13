@@ -6,6 +6,9 @@
 #
 # Usage: scripts/package-macos.sh
 # Env:   CODESIGN_IDENTITY="Developer ID Application: …" to sign the bundle.
+#        NOTARY_KEY_PATH + NOTARY_KEY_ID + NOTARY_ISSUER_ID — App Store Connect
+#        API key (.p8) for notarization; all three set → notarize + staple the
+#        app and the dmg, which removes the Gatekeeper warning entirely.
 
 set -euo pipefail
 
@@ -38,11 +41,36 @@ iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/komet.icns"
 rm -rf "$ICONSET"
 
 if [[ -n "${CODESIGN_IDENTITY:-}" ]]; then
-  codesign --deep --force --options runtime --sign "$CODESIGN_IDENTITY" "$APP"
+  # Hardened runtime + secure timestamp are both notarization requirements.
+  # (No --deep: Apple deprecated it; the bundle is a single Mach-O anyway.)
+  codesign --force --options runtime --timestamp --sign "$CODESIGN_IDENTITY" "$APP"
 else
   # Ad-hoc signature so the app launches on Apple silicon (Gatekeeper still
   # requires right-click → Open on first launch without notarization).
   codesign --deep --force --sign - "$APP"
+fi
+
+# notarize <path>: submit to Apple and wait for the verdict. A rejection may
+# still exit 0 depending on the notarytool version — the `stapler staple` that
+# follows each call has no ticket to attach then, and fails the build for us.
+notarize() {
+  xcrun notarytool submit "$1" \
+    --key "$NOTARY_KEY_PATH" --key-id "$NOTARY_KEY_ID" \
+    --issuer "$NOTARY_ISSUER_ID" --wait
+}
+NOTARIZE=false
+[[ -n "${NOTARY_KEY_PATH:-}" && -n "${NOTARY_KEY_ID:-}" && -n "${NOTARY_ISSUER_ID:-}" ]] && NOTARIZE=true
+
+if $NOTARIZE; then
+  # Staple the bundle BEFORE tarring it: the auto-updater swaps the .app with
+  # no dmg involved, so the tarball copy must carry its own ticket to pass
+  # Gatekeeper offline. The ticket lives inside the bundle, so the tarball's
+  # Komet.app → Komet.app rename below doesn't disturb it.
+  ZIP="$OUT_DIR/komet-notarize.zip"
+  ditto -c -k --keepParent "$APP" "$ZIP"
+  notarize "$ZIP"
+  rm -f "$ZIP"
+  xcrun stapler staple "$APP"
 fi
 
 # The auto-updater artifact: keep the historical Komet.app path inside the
@@ -52,4 +80,8 @@ tar -czf "$APP_TARBALL" -s '/^Komet\.app/Komet.app/' -C "$OUT_DIR" Komet.app
 echo "packaged: $APP_TARBALL"
 
 hdiutil create -volname Komet -srcfolder "$APP" -ov -format UDZO "$DMG"
+if $NOTARIZE; then
+  notarize "$DMG"
+  xcrun stapler staple "$DMG"
+fi
 echo "packaged: $DMG"
