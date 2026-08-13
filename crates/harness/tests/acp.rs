@@ -1057,3 +1057,110 @@ async fn dropped_reply_settles_fast_off_the_turn_end_cost_frame() {
          before the fixture's 6s exit"
     );
 }
+
+/// Full-stack verification of the 2026-08-12 starve fix against the REAL
+/// adapter + CLI: prompt#1 backgrounds a task and ends; the CLI
+/// self-continues on its notification and runs a 20s foreground command; a
+/// steer lands mid-way (becoming a session/prompt the adapter drops the
+/// reply for); the harness must settle off the turn-end cost frame within
+/// seconds of the agent finishing. Costs a few small prompts. Run explicitly:
+/// `cargo test -p komet-harness --test acp -- --ignored real_claude_starve`
+#[tokio::test]
+#[ignore = "needs the claude CLI authenticated + network; costs a few small prompts"]
+async fn real_claude_starve_settles_off_the_cost_frame() {
+    let (controls, steer_tx, _token) = controls();
+    let harness = AcpHarness::claude();
+    let mut req = request(
+        "Use the Bash tool exactly twice, then stop.\n\
+         First call: run the command `sleep 8; echo task-finished` with \
+         run_in_background set to true.\n\
+         Then reply with exactly the word: started\n\
+         IMPORTANT: later, when a task notification about that background \
+         task arrives, make one FOREGROUND Bash call: `sleep 20; echo waited` \
+         (no run_in_background), then reply with exactly: done waiting",
+    );
+    req.model = None;
+    req.reasoning = None;
+    req.cwd = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let stream = harness.run(req, controls).await.expect("run starts");
+
+    let collected = tokio::time::timeout(Duration::from_secs(240), async move {
+        let mut stream = stream;
+        let mut events: Vec<(std::time::Instant, AgentEvent)> = Vec::new();
+        let mut dones_seen = 0usize;
+        let mut steer = Some(steer_tx);
+        let mut steer_sent_at: Option<std::time::Instant> = None;
+        let mut steer_task: Option<tokio::task::JoinHandle<std::time::Instant>> = None;
+        while let Some(ev) = stream.next().await {
+            let ev = ev.expect("stream event");
+            let now = std::time::Instant::now();
+            if matches!(ev, AgentEvent::Done { .. }) {
+                dones_seen += 1;
+                if dones_seen == 1 {
+                    // Steer 16s after the first turn settles: the background
+                    // task (8s) has exited and the CLI is inside its
+                    // self-continued turn's 20s foreground command.
+                    let tx = steer.take().expect("one steer");
+                    steer_task = Some(tokio::spawn(async move {
+                        tokio::time::sleep(Duration::from_secs(16)).await;
+                        let at = std::time::Instant::now();
+                        let _ = tx
+                            .send(SteerMessage {
+                                prompt: "what about now".into(),
+                                message_id: None,
+                            })
+                            .await;
+                        at
+                    }));
+                }
+            }
+            events.push((now, ev));
+            if dones_seen == 2 {
+                if let Some(task) = steer_task.take() {
+                    steer_sent_at = task.await.ok();
+                }
+                break;
+            }
+        }
+        (events, steer_sent_at)
+    })
+    .await
+    .expect("run should settle without any watchdog — before the fix this timed out");
+
+    let (events, steer_sent_at) = collected;
+    let evs: Vec<&AgentEvent> = events.iter().map(|(_, e)| e).collect();
+    let done_times: Vec<std::time::Instant> = events
+        .iter()
+        .filter(|(_, e)| matches!(e, AgentEvent::Done { .. }))
+        .map(|(t, _)| *t)
+        .collect();
+    assert_eq!(done_times.len(), 2, "{evs:?}");
+    for (_, e) in events.iter() {
+        if let AgentEvent::Done { status, .. } = e {
+            assert_eq!(*status, DoneStatus::Completed, "{evs:?}");
+        }
+    }
+    // The steer landed mid-merged-turn: its "turn" (starved, settled by the
+    // cost frame) took at least the foreground command's remaining runtime.
+    let steer_sent_at = steer_sent_at.expect("steer timer ran");
+    let starved_turn = done_times[1].duration_since(steer_sent_at);
+    assert!(
+        starved_turn > Duration::from_secs(8),
+        "steer settled in {starved_turn:?} — too fast to have landed inside \
+         the self-continued turn; the starve shape did not reproduce"
+    );
+    // And the settle tracked the agent's actual finish (last streamed text),
+    // not a watchdog window: cost-frame grace is 1s, allow scheduling slack.
+    let last_text_at = events
+        .iter()
+        .filter(|(_, e)| matches!(e, AgentEvent::TextDelta { .. }))
+        .map(|(t, _)| *t)
+        .next_back()
+        .expect("streamed text exists");
+    let settle_gap = done_times[1].duration_since(last_text_at);
+    assert!(
+        settle_gap < Duration::from_secs(5),
+        "final Done lagged the last content by {settle_gap:?} — the settle \
+         should ride the turn-end cost frame (~1s)"
+    );
+}
