@@ -229,6 +229,28 @@ case "$promptline" in
   exit 0
   ;;
 
+*scenario:busy-steer*)
+  # Prevention: the turn settles, then the agent SELF-CONTINUES (a turn no
+  # prompt started, visible as an open tool call). A steer arriving now
+  # must NOT become a session/prompt (the adapter drops that reply — the
+  # verified starve): the harness cancels the unowned turn first, then
+  # prompts after the flush window.
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"first"}}'
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  update '{"sessionUpdate":"tool_call","toolCallId":"sc-1","title":"self-continued work","kind":"execute","status":"pending","rawInput":{"command":"make"}}'
+  read -r cancelline || exit 1
+  has "$cancelline" '"method":"session/cancel"' || exit 1
+  update '{"sessionUpdate":"tool_call_update","toolCallId":"sc-1","status":"completed","content":[]}'
+  read -r followline || exit 1
+  fid=$(rid "$followline")
+  if has "$followline" '"method":"session/prompt"' && has "$followline" 'what about now'; then
+    update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"fresh answer"}}'
+    emit "{\"id\":$fid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  else
+    emit "{\"id\":$fid,\"result\":{\"stopReason\":\"refusal\"}}"
+  fi
+  ;;
+
 *scenario:quiet-starve*)
   # Blanket dropped-reply settle, no adapter-specific evidence: content
   # streamed, no open tool, then silence — the response never comes. The

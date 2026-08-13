@@ -2074,6 +2074,18 @@ async fn run_session(session: Session) {
     let mut turn_content_seen = false;
     let mut open_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
     let open_questions = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // PREVENTION, ahead of all the recovery above: never send a
+    // `session/prompt` into a session that is visibly mid SELF-CONTINUED
+    // turn — that prompt's reply is what the adapter drops (the verified
+    // starve). Visibly busy = an open tool call, or stream traffic within
+    // BUSY_RECENT, with no prompt of ours outstanding. The discipline is
+    // Zed's, verified against the real adapter: `session/cancel` the
+    // unowned turn, give it CANCEL_FLUSH to die and drain, then prompt.
+    // This makes the interactive path starve-free; the settle layers below
+    // remain for the notification race a client cannot see coming.
+    const BUSY_RECENT: Duration = Duration::from_secs(3);
+    const CANCEL_FLUSH: Duration = Duration::from_secs(2);
+    let mut cancel_flush_deadline: Option<tokio::time::Instant> = None;
 
     'main: loop {
         tokio::select! {
@@ -2474,6 +2486,37 @@ async fn run_session(session: Session) {
                 }
             },
 
+            // Busy-session cancel flushed (see BUSY_RECENT/CANCEL_FLUSH
+            // above): the unowned self-continued turn had its cancel and a
+            // drain window; the queued steer becomes a fresh prompt on a
+            // now-idle agent.
+            _ = tokio::time::sleep_until(
+                cancel_flush_deadline.unwrap_or_else(tokio::time::Instant::now)
+            ), if cancel_flush_deadline.is_some() && !interrupted => {
+                cancel_flush_deadline = None;
+                if turn.is_none()
+                    && let Some(text) = queued_steers.pop_front()
+                {
+                    let (prev, next) = rotate(&mut assistant_message_id);
+                    if !send(
+                        &event_tx,
+                        AgentEvent::Steered {
+                            assistant_message_id: Some(prev),
+                            next_assistant_message_id: Some(next),
+                        },
+                    )
+                    .await
+                    {
+                        break 'main;
+                    }
+                    done_current = false;
+                    turn_content_seen = false;
+                    open_tools.clear();
+                    last_update_at = tokio::time::Instant::now();
+                    turn = Some(prompt_turn(client.clone(), session_id.clone(), text));
+                }
+            },
+
             // BLANKET quiet settle (see `quiet_settle` above), adapter-
             // agnostic: content streamed, every tool resolved, no question
             // pending, stream quiet past the window with the prompt still
@@ -2569,7 +2612,29 @@ async fn run_session(session: Session) {
                     // Same transform as the initial prompt: Claude's
                     // Ultrathink prefix rides every steer too.
                     let text = prompt_transform(request.reasoning, &msg.prompt);
-                    if turn.is_none() {
+                    if turn.is_none() && cancel_flush_deadline.is_some() {
+                        // A busy-session cancel is already in flight: this
+                        // steer lines up behind it and dispatches at flush.
+                        queued_steers.push_back(text);
+                    } else if turn.is_none()
+                        && (!open_tools.is_empty()
+                            || last_update_at.elapsed() < BUSY_RECENT)
+                    {
+                        // Mid self-continued turn (see BUSY_RECENT above):
+                        // cancel it rather than prompt into the starve.
+                        tracing::info!(
+                            target: "komet_harness::acp",
+                            "steer into a self-continuing session; cancelling \
+                             the unowned turn before prompting"
+                        );
+                        client.notify(
+                            "session/cancel",
+                            Some(json!({ "sessionId": session_id })),
+                        );
+                        queued_steers.push_back(text);
+                        cancel_flush_deadline =
+                            Some(tokio::time::Instant::now() + CANCEL_FLUSH);
+                    } else if turn.is_none() {
                         // Idle between turns: a steer is simply the next turn.
                         let (prev, next) = rotate(&mut assistant_message_id);
                         if !send(

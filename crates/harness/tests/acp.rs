@@ -1061,9 +1061,10 @@ async fn dropped_reply_settles_fast_off_the_turn_end_cost_frame() {
 /// Full-stack verification of the 2026-08-12 starve fix against the REAL
 /// adapter + CLI: prompt#1 backgrounds a task and ends; the CLI
 /// self-continues on its notification and runs a 20s foreground command; a
-/// steer lands mid-way (becoming a session/prompt the adapter drops the
-/// reply for); the harness must settle off the turn-end cost frame within
-/// seconds of the agent finishing. Costs a few small prompts. Run explicitly:
+/// steer lands mid-way. With prevention in place the harness cancels the
+/// unowned turn and prompts fresh (no starve to recover from); the turn
+/// must settle promptly either way — never strand, never wait for a
+/// watchdog. Costs a few small prompts. Run explicitly:
 /// `cargo test -p komet-harness --test acp -- --ignored real_claude_starve`
 #[tokio::test]
 #[ignore = "needs the claude CLI authenticated + network; costs a few small prompts"]
@@ -1140,14 +1141,15 @@ async fn real_claude_starve_settles_off_the_cost_frame() {
             assert_eq!(*status, DoneStatus::Completed, "{evs:?}");
         }
     }
-    // The steer landed mid-merged-turn: its "turn" (starved, settled by the
-    // cost frame) took at least the foreground command's remaining runtime.
+    // Prevention path: the steer landed mid self-continued turn, was
+    // preceded by a cancel, and its fresh prompt settled promptly — well
+    // under the quiet/watchdog windows it used to need.
     let steer_sent_at = steer_sent_at.expect("steer timer ran");
-    let starved_turn = done_times[1].duration_since(steer_sent_at);
+    let steer_turn = done_times[1].duration_since(steer_sent_at);
     assert!(
-        starved_turn > Duration::from_secs(8),
-        "steer settled in {starved_turn:?} — too fast to have landed inside \
-         the self-continued turn; the starve shape did not reproduce"
+        steer_turn < Duration::from_secs(25),
+        "steer took {steer_turn:?} to settle — prevention should cancel the \
+         unowned turn and prompt fresh, not starve into a settle window"
     );
     // And the settle tracked the agent's actual finish (last streamed text),
     // not a watchdog window: cost-frame grace is 1s, allow scheduling slack.
@@ -1163,4 +1165,65 @@ async fn real_claude_starve_settles_off_the_cost_frame() {
         "final Done lagged the last content by {settle_gap:?} — the settle \
          should ride the turn-end cost frame (~1s)"
     );
+}
+
+/// Prevention for the interactive starve: a steer arriving while the agent
+/// is mid SELF-CONTINUED turn (open tool call, no prompt outstanding) must
+/// not become a session/prompt — the adapter drops that reply. The harness
+/// cancels the unowned turn first (the fixture asserts session/cancel is on
+/// the wire before any prompt), then dispatches the steer as a fresh prompt
+/// after the flush window.
+#[tokio::test]
+async fn steer_into_self_continuation_cancels_before_prompting() {
+    let (controls, steer, _token) = controls();
+    let harness = harness();
+    let stream = harness
+        .run(request("scenario:busy-steer"), controls)
+        .await
+        .expect("run starts");
+    let events = tokio::time::timeout(Duration::from_secs(15), async move {
+        let mut events = Vec::new();
+        let mut stream = stream;
+        let mut steer = Some(steer);
+        while let Some(ev) = stream.next().await {
+            let ev = ev.expect("stream event");
+            // The self-continued tool call is the busy signal: steer now.
+            if matches!(&ev, AgentEvent::ToolCall { id, .. } if id == "sc-1")
+                && let Some(tx) = steer.take()
+            {
+                tx.send(SteerMessage {
+                    prompt: "what about now".into(),
+                    message_id: None,
+                })
+                .await
+                .expect("steer sent");
+                // Sender dropped here; the mailbox closes so the run can end.
+            }
+            events.push(ev);
+        }
+        events
+    })
+    .await
+    .expect("run finished in time");
+
+    // Two clean turns: the first prompt's, then the promoted steer's —
+    // and the fixture exits with `refusal` if a prompt ever arrives
+    // without the preceding session/cancel.
+    assert_eq!(
+        dones(&events),
+        vec![(DoneStatus::Completed, None), (DoneStatus::Completed, None)],
+        "{events:?}"
+    );
+    assert!(events.contains(&AgentEvent::TextDelta {
+        text: "fresh answer".into()
+    }));
+    let steered = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::Steered { .. }))
+        .expect("promoted steer must carry a boundary");
+    let first_done = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::Done { .. }))
+        .expect("dones asserted above");
+    assert!(first_done < steered, "{events:?}");
 }
