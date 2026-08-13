@@ -1283,7 +1283,7 @@ dependencies = [
 
 [[package]]
 name = "komet-syntax"
-version = "0.1.54"
+version = "0.1.57"
 dependencies = [
  "thiserror 2.0.19",
  "tree-sitter",
