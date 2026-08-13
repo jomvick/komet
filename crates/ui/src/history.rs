@@ -27,6 +27,8 @@ const HISTORY_GRAPH_SATURATION: f32 = 0.72;
 const HISTORY_GRAPH_SIDE_PADDING: f32 = 5.0;
 const HISTORY_GRAPH_TRAILING_PADDING: f32 = 10.0;
 const HISTORY_GRAPH_ROW_OVERLAP: f32 = 0.75;
+const HISTORY_REF_AREA_MAX_WIDTH: f32 = 132.0;
+const HISTORY_VISIBLE_REF_COUNT: usize = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SegmentShape {
@@ -201,6 +203,11 @@ fn graph_width(lane_count: usize) -> f32 {
         + HISTORY_GRAPH_TRAILING_PADDING
         + HISTORY_NODE_RADIUS * 2.0
         + (count - 1) as f32 * HISTORY_LANE_SPACING
+}
+
+fn ref_display_counts(total: usize) -> (usize, usize) {
+    let visible = total.min(HISTORY_VISIBLE_REF_COUNT);
+    (visible, total.saturating_sub(visible))
 }
 
 fn format_date(value: &str) -> String {
@@ -624,8 +631,13 @@ impl GitHistory {
         let theme = Theme::of(cx).clone();
         let sha = commit.sha.clone();
         let copied = self.copied_sha.as_deref() == Some(sha.as_str());
-        let visible_refs: Vec<_> = commit.refs.iter().take(2).cloned().collect();
-        let hidden_refs = commit.refs.len().saturating_sub(visible_refs.len());
+        let (visible_ref_count, hidden_refs) = ref_display_counts(commit.refs.len());
+        let visible_refs: Vec<_> = commit
+            .refs
+            .iter()
+            .take(visible_ref_count)
+            .cloned()
+            .collect();
 
         div()
             .h(px(HISTORY_ROW_HEIGHT))
@@ -647,6 +659,7 @@ impl GitHistory {
                 div()
                     .flex_1()
                     .min_w(px(80.0))
+                    .overflow_hidden()
                     .flex()
                     .items_center()
                     .gap(px(5.0))
@@ -664,20 +677,29 @@ impl GitHistory {
                                 commit.subject
                             })),
                     )
-                    .children(
-                        visible_refs
-                            .into_iter()
-                            .map(|reference| Self::render_ref(reference, &theme)),
-                    )
-                    .when(hidden_refs > 0, |element| {
-                        element.child(
-                            div()
-                                .flex_none()
-                                .text_size(px(10.0))
-                                .text_color(theme.text_faint)
-                                .child(SharedString::from(format!("+{hidden_refs}"))),
-                        )
-                    }),
+                    .child(
+                        div()
+                            .max_w(px(HISTORY_REF_AREA_MAX_WIDTH))
+                            .min_w_0()
+                            .overflow_hidden()
+                            .flex()
+                            .items_center()
+                            .gap(px(5.0))
+                            .children(
+                                visible_refs
+                                    .into_iter()
+                                    .map(|reference| Self::render_ref(reference, &theme)),
+                            )
+                            .when(hidden_refs > 0, |element| {
+                                element.child(
+                                    div()
+                                        .flex_none()
+                                        .text_size(px(10.0))
+                                        .text_color(theme.text_faint)
+                                        .child(SharedString::from(format!("+{hidden_refs}"))),
+                                )
+                            }),
+                    ),
             )
             .child(
                 div()
@@ -917,5 +939,13 @@ mod tests {
         assert_eq!(muted.l, source.l);
         assert_eq!(muted.a, source.a);
         assert!((muted.s - source.s * HISTORY_GRAPH_SATURATION).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn ref_badges_show_one_reference_and_count_the_rest() {
+        assert_eq!(ref_display_counts(0), (0, 0));
+        assert_eq!(ref_display_counts(1), (1, 0));
+        assert_eq!(ref_display_counts(2), (1, 1));
+        assert_eq!(ref_display_counts(4), (1, 3));
     }
 }
