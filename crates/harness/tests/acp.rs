@@ -952,3 +952,62 @@ fn hermes_and_pi_descriptor_surfaces_match_registry_expectations() {
         ]
     );
 }
+
+/// The 2026-08-12 stuck-Working wedge, end to end: a prompt whose turn was
+/// consumed by CLI-side self-continuation never gets its response. A steer's
+/// `noRunningTurn` steering outcome is the protocol evidence the pending
+/// prompt can never settle; after the grace the harness closes the dead turn
+/// (Done — never a stranded Working) and promotes the steer to a fresh
+/// prompt, which settles normally.
+#[tokio::test]
+async fn starved_prompt_recovers_via_no_running_turn_evidence() {
+    let (controls, steer, _token) = controls();
+    let harness = harness();
+    let stream = harness
+        .run(request("scenario:starve"), controls)
+        .await
+        .expect("run starts");
+    let events = tokio::time::timeout(Duration::from_secs(15), async move {
+        let mut events = Vec::new();
+        let mut stream = stream;
+        while let Some(ev) = stream.next().await {
+            let ev = ev.expect("stream event");
+            if matches!(ev, AgentEvent::TextDelta { ref text } if text == "working") {
+                steer
+                    .send(SteerMessage {
+                        prompt: "what about now".into(),
+                        message_id: None,
+                    })
+                    .await
+                    .expect("steer sent");
+            }
+            events.push(ev);
+        }
+        events
+    })
+    .await
+    .expect("run finished in time");
+
+    // Two settled turns: the synthesized close of the starved prompt, then
+    // the promoted steer's real turn.
+    assert_eq!(
+        dones(&events),
+        vec![(DoneStatus::Completed, None), (DoneStatus::Completed, None)],
+        "{events:?}"
+    );
+    assert!(events.contains(&AgentEvent::TextDelta {
+        text: "promoted".into()
+    }));
+    let steered = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::Steered { .. }))
+        .expect("the queued steer must be promoted through a Steered boundary");
+    let first_done = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::Done { .. }))
+        .expect("dones asserted above");
+    assert!(
+        first_done < steered,
+        "the dead turn settles before the promoted boundary: {events:?}"
+    );
+}

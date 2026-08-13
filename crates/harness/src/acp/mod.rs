@@ -1981,11 +1981,26 @@ async fn run_session(session: Session) {
     let mut done_current = false;
     let mut done_after_interrupt = false;
     let mut escalation: Option<tokio::task::JoinHandle<()>> = None;
+    // Starved-turn recovery (2026-08-12 stuck-Working incident): a
+    // `session/prompt` sent while the agent runs a SELF-CONTINUED turn (a
+    // background-task re-invocation no prompt started) starves —
+    // claude-agent-acp does not track turns it did not start, so the merged
+    // turn's result is never attributed to the pending prompt (reproduced
+    // against 0.66.0; the prompt's TEXT still reaches the model, queued by
+    // the CLI). The tell is protocol evidence, not timing: a steering call
+    // answered `promptRequired`/`noRunningTurn` while OUR prompt is
+    // outstanding means the adapter has no turn that could ever settle it.
+    // A short grace covers the true turn-end race (its response lands within
+    // milliseconds); past it, the dead prompt is closed out with a Done and
+    // the queued steer is promoted to a fresh turn.
+    const STARVE_GRACE: Duration = Duration::from_secs(2);
+    let mut starve_deadline: Option<tokio::time::Instant> = None;
 
     'main: loop {
         tokio::select! {
             res = async { turn.as_mut().expect("guarded by if").await }, if turn.is_some() => {
                 turn = None;
+                starve_deadline = None;
                 // Settle an in-flight `_session/steering` call BEFORE closing
                 // the turn: its response rides the same stdout as the prompt
                 // response, so by now it is (nearly always) already parsed —
@@ -2295,7 +2310,27 @@ async fn run_session(session: Session) {
                     }
                 } else if turn.is_some() {
                     // Raced the turn end: redeliver at the boundary the
-                    // loop is about to hit.
+                    // loop is about to hit. `noRunningTurn` is stronger —
+                    // the adapter says nothing is running while our prompt
+                    // is still outstanding: the starved-turn signature. Arm
+                    // the grace deadline; if the prompt's response does not
+                    // land first, the recovery arm below settles the dead
+                    // turn and promotes this steer.
+                    if res
+                        .as_ref()
+                        .ok()
+                        .and_then(|r| r.get("reason"))
+                        .and_then(Value::as_str)
+                        == Some("noRunningTurn")
+                    {
+                        tracing::warn!(
+                            target: "komet_harness::acp",
+                            "steering answered noRunningTurn with a prompt \
+                             outstanding; arming starved-turn recovery"
+                        );
+                        starve_deadline =
+                            Some(tokio::time::Instant::now() + STARVE_GRACE);
+                    }
                     queued_steers.push_back(text);
                 } else {
                     // The turn ended while the call was in flight and its
@@ -2324,6 +2359,66 @@ async fn run_session(session: Session) {
                     }
                     // No live turn to inject into: boundary delivery.
                     queued_steers.push_back(next_text);
+                }
+            },
+
+            // Starved-turn recovery (see STARVE_GRACE above): the grace
+            // elapsed with the prompt still unsettled after the adapter
+            // reported noRunningTurn. Close the dead turn out with a Done —
+            // its output already streamed as session/updates and its text
+            // was delivered via the CLI's own queue — then promote the
+            // queued steer to a fresh prompt, which settles normally on a
+            // now-idle agent (verified against the real adapter).
+            _ = tokio::time::sleep_until(
+                starve_deadline.unwrap_or_else(tokio::time::Instant::now)
+            ), if starve_deadline.is_some() && turn.is_some() && !interrupted => {
+                starve_deadline = None;
+                tracing::warn!(
+                    target: "komet_harness::acp",
+                    "prompt starved (noRunningTurn evidence outlived the grace); \
+                     settling the dead turn and promoting the queued steer"
+                );
+                // Drop the dead future: a response that somehow arrives later
+                // resolves a closed channel harmlessly.
+                turn = None;
+                let (prev, _next) = rotate(&mut assistant_message_id);
+                if !send(
+                    &event_tx,
+                    AgentEvent::AssistantMessageCompleted { assistant_message_id: prev },
+                )
+                .await
+                {
+                    break 'main;
+                }
+                done_current = true;
+                if !send(
+                    &event_tx,
+                    AgentEvent::Done {
+                        status: DoneStatus::Completed,
+                        result: None,
+                        error: None,
+                        session_id: Some(session_id.clone()),
+                    },
+                )
+                .await
+                {
+                    break 'main;
+                }
+                if let Some(text) = queued_steers.pop_front() {
+                    let (prev, next) = rotate(&mut assistant_message_id);
+                    if !send(
+                        &event_tx,
+                        AgentEvent::Steered {
+                            assistant_message_id: Some(prev),
+                            next_assistant_message_id: Some(next),
+                        },
+                    )
+                    .await
+                    {
+                        break 'main;
+                    }
+                    done_current = false;
+                    turn = Some(prompt_turn(client.clone(), session_id.clone(), text));
                 }
             },
 

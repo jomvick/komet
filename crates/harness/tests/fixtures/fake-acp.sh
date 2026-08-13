@@ -196,6 +196,27 @@ case "$promptline" in
   fi
   ;;
 
+*scenario:starve*)
+  # The 2026-08-12 wedge: the prompt's turn was consumed by CLI-side
+  # self-continuation and its response NEVER comes. Steering then answers
+  # noRunningTurn — the harness must settle the dead turn after its grace
+  # and promote the queued steer to a fresh session/prompt.
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"working"}}'
+  read -r steerline || exit 1
+  sid=$(rid "$steerline")
+  has "$steerline" '"method":"_session/steering"' || exit 1
+  emit "{\"id\":$sid,\"result\":{\"outcome\":\"promptRequired\",\"reason\":\"noRunningTurn\"}}"
+  # No response to $pid, ever. The next line must be the promoted prompt.
+  read -r followline || exit 1
+  fid=$(rid "$followline")
+  if has "$followline" '"method":"session/prompt"' && has "$followline" 'what about now'; then
+    update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"promoted"}}'
+    emit "{\"id\":$fid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  else
+    emit "{\"id\":$fid,\"result\":{\"stopReason\":\"refusal\"}}"
+  fi
+  ;;
+
 *scenario:interrupt*)
   update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"working"}}'
   read -r intline || exit 1
