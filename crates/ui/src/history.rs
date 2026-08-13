@@ -798,6 +798,7 @@ impl GitHistory {
         let commit_theme = theme.clone();
 
         div()
+            .id(("history-row", index))
             .h(px(HISTORY_ROW_HEIGHT))
             .w_full()
             .flex_none()
