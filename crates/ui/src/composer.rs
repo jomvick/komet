@@ -378,20 +378,6 @@ pub fn send_button_mode(run_live: bool, has_text: bool) -> SendButtonMode {
     }
 }
 
-/// The prompt-at-top treatment belongs only to a chat's first send. The
-/// loaded transcript alone can't prove that: selecting a chat clears it
-/// synchronously and the watch task refills it later, so a fast send into a
-/// just-selected chat would read a history-laden transcript as empty. The
-/// chat row's own activity — bumped on every dispatch, `None` on a fresh row
-/// — closes that window.
-fn send_starts_empty_chat(
-    transcript_len: usize,
-    pending_echoes_len: usize,
-    chat_never_messaged: bool,
-) -> bool {
-    transcript_len == 0 && pending_echoes_len == 0 && chat_never_messaged
-}
-
 /// Find the unresolved input request the panel should serve, if any: an
 /// unresolved input part on the LAST assistant entry — regardless of the
 /// entry's run status. The question stays answerable until the user actually
@@ -3163,11 +3149,11 @@ impl Render for ComposerInput {
 #[derive(Debug, Clone)]
 pub enum ComposerEvent {
     /// A prompt was sent optimistically — give the transcript its exact row
-    /// identity so it can stage the top-anchor-to-follow-tail handoff.
+    /// identity so it can anchor the prompt at the top with the reply's
+    /// reserved space below it.
     Sent {
         chat_id: String,
         message_id: String,
-        started_empty: bool,
     },
 }
 
@@ -4415,26 +4401,6 @@ impl Composer {
             cx.notify();
             return;
         };
-        // Only the very first prompt gets the top-of-viewport treatment. Once
-        // a chat has any persisted row or optimistic echo, sends retain the
-        // original follow-tail behavior.
-        let started_empty = {
-            let state = self.state.read(cx);
-            let chat_never_messaged = match state.selected_chat.as_deref() {
-                // New-chat canvas: the chat doesn't exist yet, so no history.
-                None => true,
-                Some(id) => state
-                    .chats
-                    .iter()
-                    .find(|c| c.id == id)
-                    .is_none_or(|c| c.last_message_at.is_none()),
-            };
-            send_starts_empty_chat(
-                state.transcript.len(),
-                state.pending_echoes().len(),
-                chat_never_messaged,
-            )
-        };
         // Chat id: existing selection, or client-minted for the new-chat canvas
         // (the chat then appears from the doc host once the doc materializes).
         let (chat_id, is_new) = match self.state.read(cx).selected_chat.clone() {
@@ -4554,7 +4520,6 @@ impl Composer {
         cx.emit(ComposerEvent::Sent {
             chat_id: chat_id.clone(),
             message_id: message_id.clone(),
-            started_empty,
         });
         cx.notify();
 
@@ -6272,17 +6237,6 @@ mod tests {
         assert_eq!(send_button_mode(false, true), SendButtonMode::Send);
         assert_eq!(send_button_mode(true, true), SendButtonMode::Steer);
         assert_eq!(send_button_mode(true, false), SendButtonMode::Stop);
-    }
-
-    #[test]
-    fn only_the_first_send_starts_an_empty_chat() {
-        assert!(send_starts_empty_chat(0, 0, true));
-        assert!(!send_starts_empty_chat(1, 0, true));
-        assert!(!send_starts_empty_chat(0, 1, true));
-        assert!(!send_starts_empty_chat(2, 1, true));
-        // A transcript that merely hasn't LOADED yet reads len 0 — the chat
-        // row's activity is what says "this chat really has no history".
-        assert!(!send_starts_empty_chat(0, 0, false));
     }
 
     #[test]

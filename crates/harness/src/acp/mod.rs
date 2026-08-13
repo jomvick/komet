@@ -1945,11 +1945,29 @@ async fn run_session(session: Session) {
         res = setup => match res {
             Ok(v) => v,
             Err(e) => {
+                // A child that dies before the handshake used to surface only
+                // the RPC-side symptom ("transport closed") — its exit status
+                // and stderr, both already in hand, were dropped, leaving
+                // startup crashes undiagnosable (user report). When the child
+                // is already gone, give the reader task a beat to drain the
+                // pipe, then append the crash text; the Done carrying it is
+                // journaled, so the cause survives for later inspection.
+                let error = match child.try_wait() {
+                    Ok(Some(status)) => {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        format!(
+                            "{e}; {}",
+                            crate::crash_message(agent_name, Some(status), &stderr_tail)
+                        )
+                    }
+                    _ => e.to_string(),
+                };
+                tracing::warn!(target: "komet_harness::acp", %error, "agent setup failed");
                 let _ = event_tx
                     .send(Ok(AgentEvent::Done {
                         status: DoneStatus::Errored,
                         result: None,
-                        error: Some(e.to_string()),
+                        error: Some(error),
                         session_id: None,
                     }))
                     .await;

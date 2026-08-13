@@ -152,8 +152,13 @@ impl Shell {
             let pr = titlebar_right_padding(cfg!(target_os = "windows"), Theme::SPACE_LG);
             // The row's own left padding is part of its content box: a strip
             // wider than what's left after it overflows and clips at the right
-            // edge (flex_none never shrinks) — cap to the available width.
-            let avail = self.viewport_width - row_left - pr;
+            // edge (flex_none never shrinks) — cap to the available width. The
+            // row's 8px child gaps sit OUTSIDE the strip's width (one before
+            // the strip in takeover, two with the title row present): without
+            // budgeting them the capped strip overflows by exactly one gap and
+            // the buttons slide right on expand (user report).
+            let gap_budget = if takeover { 8.0 } else { 16.0 };
+            let avail = self.viewport_width - row_left - pr - gap_budget;
             let controls = self
                 .changes_pane(cx)
                 .update(cx, |changes, cx| changes.render_header_controls(cx));
