@@ -1139,6 +1139,28 @@ async fn drive_run(
         None => Some(std::time::Duration::from_secs(120)),
     };
     let mut last_stream_activity = tokio::time::Instant::now();
+    // SELF-CONTINUED turns get a much SHORTER quiesce window. A turn the
+    // agent starts on its own (background-task wake) can never receive a
+    // harness Done: the adapter has no `session/prompt` outstanding to
+    // settle — verified in claude-agent-acp's autonomous-result lane, which
+    // consumes the SDK's turn-end without emitting anything; codex shows
+    // the same shape. The watchdog is that turn shape's ONLY settle path,
+    // so the default 120s window read as 2min of stuck-Working after every
+    // background notification (user report 2026-08-13). The in-flight
+    // fold gate below still protects running tools; reasoning heartbeats
+    // push the window during real thinking. `KOMET_SELF_TURN_QUIESCE_MS`
+    // overrides; 0 falls back to the normal window. An explicit
+    // `KOMET_TURN_QUIESCE_MS=0` still disables the watchdog entirely.
+    let self_quiesce_after: Option<std::time::Duration> =
+        match std::env::var("KOMET_SELF_TURN_QUIESCE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            Some(0) => None,
+            Some(ms) => Some(std::time::Duration::from_millis(ms)),
+            None => Some(std::time::Duration::from_secs(20)),
+        };
+    let mut self_continued_turn = false;
 
     let final_status = loop {
         let event: AgentEvent = tokio::select! {
@@ -1232,9 +1254,13 @@ async fn drive_run(
             // fold still arms — a Steered boundary that no output ever
             // follows is one of the wedge shapes — it just parks without
             // writing a segment (an empty finalize would leave a stub entry).
-            _ = tokio::time::sleep_until(
-                last_stream_activity + quiesce_after.unwrap_or_default()
-            ), if quiesce_after.is_some()
+            _ = tokio::time::sleep_until({
+                let mut window = quiesce_after.unwrap_or_default();
+                if self_continued_turn && let Some(short) = self_quiesce_after {
+                    window = window.min(short);
+                }
+                last_stream_activity + window
+            }), if quiesce_after.is_some()
                 && idle_since.is_none()
                 && !interrupted
                 && steerable
@@ -1271,6 +1297,7 @@ async fn drive_run(
                 entry_id = new_id();
                 segment_started = now_ms();
                 idle_since = Some(tokio::time::Instant::now());
+                self_continued_turn = false;
                 inner.set_status(&chat_id, SessionStatus::Idle, false);
                 continue;
             }
@@ -1346,6 +1373,7 @@ async fn drive_run(
                     "parked session resumed by self-continued agent output"
                 );
                 idle_since = None;
+                self_continued_turn = true;
                 // The park cleared the fold; rotate to a fresh entry and
                 // fall through — this event is the new segment's first part.
                 entry_id = new_id();
@@ -1482,6 +1510,9 @@ async fn drive_run(
         } = &event
         {
             inner.publish(&chat_id, &event);
+            // A steer boundary means a real prompt owns the turn again — its
+            // Done will come; the short self-continued window stands down.
+            self_continued_turn = false;
             if let Err(err) = finish_segment(
                 doc_ref,
                 writer.take(),
@@ -1624,6 +1655,7 @@ async fn drive_run(
                 // Resume-retry is strictly a first-turn concern.
                 saw_session_started = true;
                 idle_since = Some(tokio::time::Instant::now());
+                self_continued_turn = false;
                 inner.set_status(&chat_id, SessionStatus::Idle, false);
                 continue;
             }
