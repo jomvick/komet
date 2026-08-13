@@ -3368,7 +3368,6 @@ rename to new_name.rs
     }
 
     #[test]
-    #[test]
     fn full_diff_highlights_map_old_new_and_context_by_source_line() {
         let old_source = "fn old() {\n    let value = 1;\n}\n";
         let new_source = "fn new() {\n    let value = 2;\n}\n";
