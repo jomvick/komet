@@ -11,7 +11,8 @@ use komet_proto::{GitHistoryCommit, GitHistoryPage, GitHistoryRef, GitHistoryRef
 use komet_rpc::methods;
 use gpui::{
     AnyElement, App, ClipboardItem, Context, Entity, ListAlignment, ListState, PathBuilder, Render,
-    SharedString, Subscription, Task, Window, canvas, div, list, point, prelude::*, px,
+    SharedString, Subscription, Task, Window, canvas, container_query, div, list, point,
+    prelude::*, px,
 };
 
 use crate::state::AppState;
@@ -27,8 +28,10 @@ const HISTORY_GRAPH_SATURATION: f32 = 0.72;
 const HISTORY_GRAPH_SIDE_PADDING: f32 = 5.0;
 const HISTORY_GRAPH_TRAILING_PADDING: f32 = 10.0;
 const HISTORY_GRAPH_ROW_OVERLAP: f32 = 0.75;
-const HISTORY_REF_AREA_MAX_WIDTH: f32 = 132.0;
-const HISTORY_VISIBLE_REF_COUNT: usize = 1;
+const HISTORY_COMMIT_SUBJECT_MIN_WIDTH: f32 = 80.0;
+const HISTORY_REF_AREA_RATIO: f32 = 0.45;
+const HISTORY_REF_BADGE_MAX_WIDTH: f32 = 112.0;
+const HISTORY_REF_GAP: f32 = 5.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SegmentShape {
@@ -205,9 +208,43 @@ fn graph_width(lane_count: usize) -> f32 {
         + (count - 1) as f32 * HISTORY_LANE_SPACING
 }
 
-fn ref_display_counts(total: usize) -> (usize, usize) {
-    let visible = total.min(HISTORY_VISIBLE_REF_COUNT);
-    (visible, total.saturating_sub(visible))
+fn estimated_ref_badge_width(reference: &GitHistoryRef) -> f32 {
+    // 10 px icon + 2 px gap + 10 px horizontal padding + the 10 px label.
+    (22.0 + reference.label.chars().count() as f32 * 5.7).min(HISTORY_REF_BADGE_MAX_WIDTH)
+}
+
+fn estimated_ref_overflow_width(hidden: usize) -> f32 {
+    format!("+{hidden}").chars().count() as f32 * 5.7
+}
+
+fn ref_area_width(commit_column_width: f32) -> f32 {
+    let inner = (commit_column_width - 8.0).max(0.0);
+    (inner * HISTORY_REF_AREA_RATIO)
+        .min((inner - HISTORY_COMMIT_SUBJECT_MIN_WIDTH - HISTORY_REF_GAP).max(0.0))
+}
+
+fn visible_ref_count(refs: &[GitHistoryRef], available_width: f32) -> usize {
+    if refs.is_empty() {
+        return 0;
+    }
+
+    let mut visible = 1;
+    for count in 1..=refs.len() {
+        let hidden = refs.len() - count;
+        let item_count = count + usize::from(hidden > 0);
+        let badges = refs[..count]
+            .iter()
+            .map(estimated_ref_badge_width)
+            .sum::<f32>();
+        let overflow = (hidden > 0)
+            .then(|| estimated_ref_overflow_width(hidden))
+            .unwrap_or_default();
+        let gaps = item_count.saturating_sub(1) as f32 * HISTORY_REF_GAP;
+        if badges + overflow + gaps <= available_width {
+            visible = count;
+        }
+    }
+    visible
 }
 
 fn format_date(value: &str) -> String {
@@ -586,12 +623,19 @@ impl GitHistory {
             .into_any_element()
     }
 
-    fn render_ref(reference: GitHistoryRef, row_index: usize, theme: &Theme) -> AnyElement {
+    fn render_ref(
+        reference: GitHistoryRef,
+        row_index: usize,
+        ref_index: usize,
+        theme: &Theme,
+    ) -> AnyElement {
         let color = ref_color(&reference, theme);
         let icon = ref_icon(reference.kind);
         let description = ref_description(&reference);
         div()
-            .id(("history-ref", row_index))
+            .id(SharedString::from(format!(
+                "history-ref-{row_index}-{ref_index}"
+            )))
             .h(px(16.0))
             .max_w(px(112.0))
             .px(px(5.0))
@@ -624,6 +668,47 @@ impl GitHistory {
                 .into()
             })
             .tooltip_show_delay(Duration::from_millis(350))
+            .into_any_element()
+    }
+
+    fn render_ref_area(
+        refs: Vec<GitHistoryRef>,
+        row_index: usize,
+        available_width: f32,
+        theme: &Theme,
+    ) -> AnyElement {
+        let visible_count = visible_ref_count(&refs, available_width);
+        let hidden_refs: Vec<_> = refs.iter().skip(visible_count).cloned().collect();
+        let hidden_count = hidden_refs.len();
+        let hidden_descriptions: Vec<_> = hidden_refs.iter().map(ref_description).collect();
+
+        div()
+            .max_w(px(available_width))
+            .min_w_0()
+            .overflow_hidden()
+            .flex()
+            .items_center()
+            .gap(px(HISTORY_REF_GAP))
+            .children(refs.into_iter().take(visible_count).enumerate().map(
+                |(ref_index, reference)| Self::render_ref(reference, row_index, ref_index, theme),
+            ))
+            .when(hidden_count > 0, |element| {
+                element.child(
+                    div()
+                        .id(("history-ref-overflow", row_index))
+                        .flex_none()
+                        .text_size(px(10.0))
+                        .text_color(theme.text_faint)
+                        .child(SharedString::from(format!("+{hidden_count}")))
+                        .tooltip(move |_, cx| {
+                            cx.new(|_| HistoryRefTooltip {
+                                descriptions: hidden_descriptions.clone(),
+                            })
+                            .into()
+                        })
+                        .tooltip_show_delay(Duration::from_millis(350)),
+                )
+            })
             .into_any_element()
     }
 
@@ -704,21 +789,13 @@ impl GitHistory {
         let theme = Theme::of(cx).clone();
         let sha = commit.sha.clone();
         let copied = self.copied_sha.as_deref() == Some(sha.as_str());
-        let (visible_ref_count, _) = ref_display_counts(commit.refs.len());
-        let visible_refs: Vec<_> = commit
-            .refs
-            .iter()
-            .take(visible_ref_count)
-            .cloned()
-            .collect();
-        let hidden_refs: Vec<_> = commit
-            .refs
-            .iter()
-            .skip(visible_ref_count)
-            .cloned()
-            .collect();
-        let hidden_ref_count = hidden_refs.len();
-        let hidden_ref_descriptions: Vec<_> = hidden_refs.iter().map(ref_description).collect();
+        let commit_subject = if commit.subject.is_empty() {
+            "(no subject)".to_string()
+        } else {
+            commit.subject
+        };
+        let commit_refs = commit.refs;
+        let commit_theme = theme.clone();
 
         div()
             .h(px(HISTORY_ROW_HEIGHT))
@@ -737,59 +814,35 @@ impl GitHistory {
                 &theme,
             ))
             .child(
-                div()
-                    .flex_1()
-                    .min_w(px(80.0))
-                    .overflow_hidden()
-                    .flex()
-                    .items_center()
-                    .gap(px(5.0))
-                    .pr(px(8.0))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(px(12.0))
-                            .text_color(theme.text)
-                            .child(SharedString::from(if commit.subject.is_empty() {
-                                "(no subject)".to_string()
-                            } else {
-                                commit.subject
-                            })),
-                    )
-                    .child(
-                        div()
-                            .max_w(px(HISTORY_REF_AREA_MAX_WIDTH))
-                            .min_w_0()
-                            .overflow_hidden()
-                            .flex()
-                            .items_center()
-                            .gap(px(5.0))
-                            .children(
-                                visible_refs
-                                    .into_iter()
-                                    .map(|reference| Self::render_ref(reference, index, &theme)),
-                            )
-                            .when(hidden_ref_count > 0, |element| {
-                                let descriptions = hidden_ref_descriptions.clone();
-                                element.child(
-                                    div()
-                                        .id(("history-ref-overflow", index))
-                                        .flex_none()
-                                        .text_size(px(10.0))
-                                        .text_color(theme.text_faint)
-                                        .child(SharedString::from(format!("+{hidden_ref_count}")))
-                                        .tooltip(move |_, cx| {
-                                            cx.new(|_| HistoryRefTooltip {
-                                                descriptions: descriptions.clone(),
-                                            })
-                                            .into()
-                                        })
-                                        .tooltip_show_delay(Duration::from_millis(350)),
-                                )
-                            }),
-                    ),
+                container_query(move |size, _, _| {
+                    let refs_width = ref_area_width(f32::from(size.width));
+                    div()
+                        .size_full()
+                        .flex()
+                        .items_center()
+                        .gap(px(HISTORY_REF_GAP))
+                        .pr(px(8.0))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(12.0))
+                                .text_color(commit_theme.text)
+                                .child(SharedString::from(commit_subject.clone())),
+                        )
+                        .when(!commit_refs.is_empty(), |element| {
+                            element.child(Self::render_ref_area(
+                                commit_refs.clone(),
+                                index,
+                                refs_width,
+                                &commit_theme,
+                            ))
+                        })
+                })
+                .flex_1()
+                .min_w(px(HISTORY_COMMIT_SUBJECT_MIN_WIDTH))
+                .overflow_hidden(),
             )
             .child(
                 div()
@@ -1032,11 +1085,23 @@ mod tests {
     }
 
     #[test]
-    fn ref_badges_show_one_reference_and_count_the_rest() {
-        assert_eq!(ref_display_counts(0), (0, 0));
-        assert_eq!(ref_display_counts(1), (1, 0));
-        assert_eq!(ref_display_counts(2), (1, 1));
-        assert_eq!(ref_display_counts(4), (1, 3));
+    fn ref_badges_expand_with_the_available_width() {
+        let reference = |label: &str| GitHistoryRef {
+            kind: GitHistoryRefKind::Branch,
+            label: label.into(),
+        };
+        let refs = vec![reference("main"), reference("tag"), reference("origin")];
+        assert_eq!(visible_ref_count(&[], 100.0), 0);
+        assert_eq!(visible_ref_count(&refs, 70.0), 1);
+        assert_eq!(visible_ref_count(&refs, 115.0), 2);
+        assert_eq!(visible_ref_count(&refs, 200.0), 3);
+    }
+
+    #[test]
+    fn ref_area_preserves_subject_space_and_caps_at_forty_five_percent() {
+        assert_eq!(ref_area_width(80.0), 0.0);
+        assert!((ref_area_width(200.0) - 86.4).abs() < 0.001);
+        assert!((ref_area_width(400.0) - 176.4).abs() < 0.001);
     }
 
     #[test]
