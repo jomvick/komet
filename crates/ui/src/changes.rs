@@ -1554,6 +1554,16 @@ impl Changes {
             .base_ref
             .clone()
             .unwrap_or_else(|| "…".to_string());
+        // Even truncation: taffy shrinks flex items ∝ factor × basis, and the
+        // default factor of 1 splits the deficit proportionally to content —
+        // a long branch stayed near-whole while a short base ("main") read as
+        // a bare ellipsis (user report). Weighting each side's factor by its
+        // own length SQUARED (mono font, so chars ∝ px) lands the deficit
+        // ~cubically on the longer name: the short side's loss stays
+        // sub-pixel even under a big deficit (a linear weight still cost it
+        // a char), while equal lengths still split evenly.
+        let branch_weight = (branch.chars().count().max(1) as f32).powi(2);
+        let base_weight = (base.chars().count().max(1) as f32).powi(2);
         let trigger = div()
             .id("changes-ref-trigger")
             .h(px(22.0))
@@ -1562,6 +1572,7 @@ impl Changes {
             // trigger with a long base name plowed over the header buttons
             // (user report); both sides truncate instead.
             .min_w_0()
+            .flex_shrink(base_weight)
             .flex()
             .flex_row()
             .items_center()
@@ -1627,6 +1638,7 @@ impl Changes {
                 .child(
                     div()
                         .min_w_0()
+                        .flex_shrink(branch_weight)
                         .truncate()
                         .font_family(theme.font_mono.clone())
                         .text_size(px(11.5))
