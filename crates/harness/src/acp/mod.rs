@@ -1462,9 +1462,10 @@ fn handle_server_request_live(
     method: &str,
     params: &Value,
     request_input: &std::sync::Arc<RequestInputFn>,
+    open_questions: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
 ) -> Vec<AgentEvent> {
     if method == CURSOR_ASK_QUESTION {
-        ask_cursor_questions(client, id, params, request_input);
+        ask_cursor_questions(client, id, params, request_input, open_questions);
         return Vec::new();
     }
     if method != "session/request_permission" {
@@ -1501,6 +1502,10 @@ fn handle_server_request_live(
     };
     let client = client.clone();
     let request_input = std::sync::Arc::clone(request_input);
+    // Pending questions block the agent — the quiet-settle must not read
+    // that silence as a finished turn.
+    let open_questions = std::sync::Arc::clone(open_questions);
+    open_questions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     tokio::spawn(async move {
         let answers = (request_input)(vec![question.clone()])
             .await
@@ -1522,6 +1527,7 @@ fn handle_server_request_live(
             ),
             None => client.respond(&id, json!({ "outcome": { "outcome": "cancelled" } })),
         }
+        open_questions.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     });
     Vec::new()
 }
@@ -1562,6 +1568,7 @@ fn ask_cursor_questions(
     id: Value,
     params: &Value,
     request_input: &std::sync::Arc<RequestInputFn>,
+    open_questions: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
 ) {
     let asked = cursor_questions(params);
     if asked.is_empty() {
@@ -1573,11 +1580,14 @@ fn ask_cursor_questions(
     }
     let client = client.clone();
     let request_input = std::sync::Arc::clone(request_input);
+    let open_questions = std::sync::Arc::clone(open_questions);
+    open_questions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     tokio::spawn(async move {
         let answers = (request_input)(asked.iter().map(|q| q.question.clone()).collect())
             .await
             .unwrap_or_default();
         client.respond(&id, cursor_answer_outcome(&asked, &answers));
+        open_questions.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
     });
 }
 
@@ -1718,6 +1728,39 @@ fn prompt_like_request(
     params: Value,
 ) -> BoxFuture<'static, Result<Value, HarnessError>> {
     Box::pin(async move { client.request(method, params).await })
+}
+
+/// Track the liveness signals the blanket quiet-settle keys on: content
+/// proves the turn produced something; an open tool call or a pending
+/// question proves silence is legitimate.
+fn track_turn_signals(
+    ev: &AgentEvent,
+    content_seen: &mut bool,
+    open_tools: &mut std::collections::HashSet<String>,
+) {
+    match ev {
+        AgentEvent::TextDelta { text } if !text.is_empty() => *content_seen = true,
+        AgentEvent::ToolCall { id, .. } => {
+            *content_seen = true;
+            open_tools.insert(id.clone());
+        }
+        AgentEvent::ToolResult { id, .. } => {
+            open_tools.remove(id);
+        }
+        _ => {}
+    }
+}
+
+/// True for the session's terminal accounting frame: a `usage_update`
+/// carrying `cost`, which claude-agent-acp derives once per turn from the
+/// CLI's result message — the turn-is-over tell that survives even when the
+/// prompt response itself is dropped (the starved-turn bug).
+fn is_turn_end_cost_update(params: &Value, session_id: &str) -> bool {
+    params.get("sessionId").and_then(Value::as_str) == Some(session_id)
+        && params.get("update").is_some_and(|u| {
+            u.get("sessionUpdate").and_then(Value::as_str) == Some("usage_update")
+                && u.get("cost").is_some()
+        })
 }
 
 /// A mid-turn `_session/steering` call. `idleBehavior: promptRequired`
@@ -1981,11 +2024,81 @@ async fn run_session(session: Session) {
     let mut done_current = false;
     let mut done_after_interrupt = false;
     let mut escalation: Option<tokio::task::JoinHandle<()>> = None;
+    // Starved-turn recovery (2026-08-12 stuck-Working incident): a
+    // `session/prompt` sent while the agent runs a SELF-CONTINUED turn (a
+    // background-task re-invocation no prompt started) starves —
+    // claude-agent-acp does not track turns it did not start, so the merged
+    // turn's result is never attributed to the pending prompt (reproduced
+    // against 0.66.0; the prompt's TEXT still reaches the model, queued by
+    // the CLI). The tell is protocol evidence, not timing: a steering call
+    // answered `promptRequired`/`noRunningTurn` while OUR prompt is
+    // outstanding means the adapter has no turn that could ever settle it.
+    // A short grace covers the true turn-end race (its response lands within
+    // milliseconds); past it, the dead prompt is closed out with a Done and
+    // the queued steer is promoted to a fresh turn.
+    const STARVE_GRACE: Duration = Duration::from_secs(2);
+    let mut starve_deadline: Option<tokio::time::Instant> = None;
+    // Deterministic turn-end hint (claude-agent-acp, verified against
+    // 0.66.0): the adapter derives exactly one cost-bearing `usage_update`
+    // per turn from the CLI's terminal result — INCLUDING turns whose
+    // prompt response it then drops (the starve above; the cost frame and
+    // the response share a timestamp in every healthy trace). While our
+    // prompt is outstanding, that update means the turn is already over:
+    // give the real response a short head start (it lands within
+    // milliseconds when it lands at all), then settle via the recovery arm.
+    // This is what keeps a dropped reply's stuck-Working window near zero
+    // instead of watchdog-length. Gated to Claude — the one adapter whose
+    // cost semantics are verified end-of-turn-only.
+    const COST_HINT_GRACE: Duration = Duration::from_secs(1);
+    let cost_hint_enabled = harness == HarnessId::ClaudeCode;
+    // BLANKET dropped-reply settle, adapter-agnostic: any ACP agent whose
+    // prompt response goes missing must not strand the turn. Signals that
+    // exist in core ACP stand in for the adapter-specific cost frame: once
+    // the turn has streamed content, every tool call it opened has resolved,
+    // no permission/question round-trip is pending, and the stream has been
+    // quiet past the window, the turn is settled through the same recovery
+    // arm. A false settle is recoverable by design (the engine folds any
+    // later output as a self-continued segment and re-arms Working; a late
+    // response resolves a dropped channel), which is what makes a tight
+    // window safe where a hard per-turn timeout was rejected.
+    // `KOMET_ACP_QUIET_SETTLE_MS` overrides; 0 disables.
+    let quiet_settle: Option<Duration> = match std::env::var("KOMET_ACP_QUIET_SETTLE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        Some(0) => None,
+        Some(ms) => Some(Duration::from_millis(ms)),
+        None => Some(Duration::from_secs(30)),
+    };
+    let mut last_update_at = tokio::time::Instant::now();
+    let mut turn_content_seen = false;
+    // A steering injection makes the cost hint unsafe for the REST of the
+    // turn: the adapter emits a cost-bearing usage_update for the injected
+    // message itself, mid-turn, indistinguishable in shape from the
+    // terminal one (verified against 0.66.0 — premature Done exactly one
+    // grace after injection). Steered turns settle off their real response
+    // (healthy in every trace); the quiet settle stays as their backstop.
+    let mut steered_this_turn = false;
+    let mut open_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let open_questions = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // PREVENTION, ahead of all the recovery above: never send a
+    // `session/prompt` into a session that is visibly mid SELF-CONTINUED
+    // turn — that prompt's reply is what the adapter drops (the verified
+    // starve). Visibly busy = an open tool call, or stream traffic within
+    // BUSY_RECENT, with no prompt of ours outstanding. The discipline is
+    // Zed's, verified against the real adapter: `session/cancel` the
+    // unowned turn, give it CANCEL_FLUSH to die and drain, then prompt.
+    // This makes the interactive path starve-free; the settle layers below
+    // remain for the notification race a client cannot see coming.
+    const BUSY_RECENT: Duration = Duration::from_secs(3);
+    const CANCEL_FLUSH: Duration = Duration::from_secs(2);
+    let mut cancel_flush_deadline: Option<tokio::time::Instant> = None;
 
     'main: loop {
         tokio::select! {
             res = async { turn.as_mut().expect("guarded by if").await }, if turn.is_some() => {
                 turn = None;
+                starve_deadline = None;
                 // Settle an in-flight `_session/steering` call BEFORE closing
                 // the turn: its response rides the same stdout as the prompt
                 // response, so by now it is (nearly always) already parsed —
@@ -2062,6 +2175,7 @@ async fn run_session(session: Session) {
                                 &method,
                                 &params,
                                 &request_input,
+                                &open_questions,
                             ) {
                                 if !send(&event_tx, ev).await {
                                     consumer_gone = true;
@@ -2132,6 +2246,10 @@ async fn run_session(session: Session) {
                         break 'main;
                     }
                     done_current = false;
+                    turn_content_seen = false;
+                    steered_this_turn = false;
+                    open_tools.clear();
+                    last_update_at = tokio::time::Instant::now();
                     turn = Some(prompt_turn(client.clone(), session_id.clone(), text));
                 } else if !steering_open {
                     break 'main;
@@ -2140,6 +2258,30 @@ async fn run_session(session: Session) {
 
             inc = incoming.recv() => match inc {
                 Some(Incoming::Notification { method, params }) => {
+                    last_update_at = tokio::time::Instant::now();
+                    // Turn-end cost hint (see COST_HINT_GRACE above): arm the
+                    // fast settle when the turn's terminal accounting frame
+                    // arrives with our prompt still unsettled.
+                    if cost_hint_enabled
+                        && turn.is_some()
+                        && !interrupted
+                        && !steered_this_turn
+                        // An in-flight steering call means an injection cost
+                        // frame may already be on the wire ahead of its
+                        // response (select order is not the pipe order).
+                        && steering_call.is_none()
+                        && starve_deadline.is_none()
+                        && method == "session/update"
+                        && is_turn_end_cost_update(&params, &session_id)
+                    {
+                        tracing::debug!(
+                            target: "komet_harness::acp",
+                            "turn-end cost update observed with the prompt \
+                             unsettled; arming fast settle"
+                        );
+                        starve_deadline =
+                            Some(tokio::time::Instant::now() + COST_HINT_GRACE);
+                    }
                     // Other notifications (other sessions, agent noise) are
                     // tolerated by design.
                     let events = if method == "session/update" {
@@ -2148,15 +2290,21 @@ async fn run_session(session: Session) {
                         cursor_notification_events(&method, &params)
                     };
                     for ev in events {
+                        track_turn_signals(&ev, &mut turn_content_seen, &mut open_tools);
                         if !send(&event_tx, ev).await {
                             break 'main;
                         }
                     }
                 }
                 Some(Incoming::Request { id, method, params }) => {
-                    for ev in
-                        handle_server_request_live(&client, id, &method, &params, &request_input)
-                    {
+                    for ev in handle_server_request_live(
+                        &client,
+                        id,
+                        &method,
+                        &params,
+                        &request_input,
+                        &open_questions,
+                    ) {
                         if !send(&event_tx, ev).await {
                             break 'main;
                         }
@@ -2236,6 +2384,11 @@ async fn run_session(session: Session) {
                     // and no Done ever coming — the stranded-Working /
                     // eternal-timer bug. Post-turn: nothing left to do.
                     if turn.is_some() {
+                        steered_this_turn = true;
+                        // The injection proves the turn is LIVE: any settle
+                        // deadline armed off a cost frame that raced this
+                        // response is invalid evidence.
+                        starve_deadline = None;
                         // Pre-injection updates can still sit in `incoming`
                         // (responses bypass that queue): drain them into the
                         // CURRENT segment first, or text the agent streamed
@@ -2264,6 +2417,7 @@ async fn run_session(session: Session) {
                                         &method,
                                         &params,
                                         &request_input,
+                                        &open_questions,
                                     ) {
                                         if !send(&event_tx, ev).await {
                                             consumer_gone = true;
@@ -2295,7 +2449,27 @@ async fn run_session(session: Session) {
                     }
                 } else if turn.is_some() {
                     // Raced the turn end: redeliver at the boundary the
-                    // loop is about to hit.
+                    // loop is about to hit. `noRunningTurn` is stronger —
+                    // the adapter says nothing is running while our prompt
+                    // is still outstanding: the starved-turn signature. Arm
+                    // the grace deadline; if the prompt's response does not
+                    // land first, the recovery arm below settles the dead
+                    // turn and promotes this steer.
+                    if res
+                        .as_ref()
+                        .ok()
+                        .and_then(|r| r.get("reason"))
+                        .and_then(Value::as_str)
+                        == Some("noRunningTurn")
+                    {
+                        tracing::warn!(
+                            target: "komet_harness::acp",
+                            "steering answered noRunningTurn with a prompt \
+                             outstanding; arming starved-turn recovery"
+                        );
+                        starve_deadline =
+                            Some(tokio::time::Instant::now() + STARVE_GRACE);
+                    }
                     queued_steers.push_back(text);
                 } else {
                     // The turn ended while the call was in flight and its
@@ -2314,6 +2488,10 @@ async fn run_session(session: Session) {
                         break 'main;
                     }
                     done_current = false;
+                    turn_content_seen = false;
+                    steered_this_turn = false;
+                    open_tools.clear();
+                    last_update_at = tokio::time::Instant::now();
                     turn = Some(prompt_turn(client.clone(), session_id.clone(), text));
                 }
                 while let Some(next_text) = steer_backlog.pop_front() {
@@ -2327,12 +2505,174 @@ async fn run_session(session: Session) {
                 }
             },
 
+            // Busy-session cancel flushed (see BUSY_RECENT/CANCEL_FLUSH
+            // above): the unowned self-continued turn had its cancel and a
+            // drain window; the queued steer becomes a fresh prompt on a
+            // now-idle agent.
+            _ = tokio::time::sleep_until(
+                cancel_flush_deadline.unwrap_or_else(tokio::time::Instant::now)
+            ), if cancel_flush_deadline.is_some() && !interrupted => {
+                cancel_flush_deadline = None;
+                if turn.is_none()
+                    && let Some(text) = queued_steers.pop_front()
+                {
+                    let (prev, next) = rotate(&mut assistant_message_id);
+                    if !send(
+                        &event_tx,
+                        AgentEvent::Steered {
+                            assistant_message_id: Some(prev),
+                            next_assistant_message_id: Some(next),
+                        },
+                    )
+                    .await
+                    {
+                        break 'main;
+                    }
+                    done_current = false;
+                    turn_content_seen = false;
+                    steered_this_turn = false;
+                    open_tools.clear();
+                    last_update_at = tokio::time::Instant::now();
+                    turn = Some(prompt_turn(client.clone(), session_id.clone(), text));
+                } else if turn.is_none() && !steering_open {
+                    // Mailbox closed while the flush waited: nothing left.
+                    break 'main;
+                }
+            },
+
+            // BLANKET quiet settle (see `quiet_settle` above), adapter-
+            // agnostic: content streamed, every tool resolved, no question
+            // pending, stream quiet past the window with the prompt still
+            // unsettled. Feeds the recovery arm below by expiring its
+            // deadline — one settle path for all three evidence sources.
+            _ = tokio::time::sleep_until(
+                last_update_at + quiet_settle.unwrap_or_default()
+            ), if quiet_settle.is_some()
+                && starve_deadline.is_none()
+                && turn.is_some()
+                && !interrupted
+                && turn_content_seen
+                && open_tools.is_empty()
+                && open_questions.load(std::sync::atomic::Ordering::SeqCst) == 0 =>
+            {
+                tracing::warn!(
+                    target: "komet_harness::acp",
+                    quiet_ms = quiet_settle.unwrap_or_default().as_millis() as u64,
+                    "turn quiet past the settle window with completed output; \
+                     treating the prompt response as dropped"
+                );
+                starve_deadline = Some(tokio::time::Instant::now());
+            },
+
+            // Starved-turn recovery: the grace elapsed with the prompt still
+            // unsettled after turn-end evidence — the turn's terminal cost
+            // frame (COST_HINT_GRACE, ~immediate), a steering call answered
+            // noRunningTurn (STARVE_GRACE), or the blanket quiet settle
+            // above. Close the dead turn out
+            // with a Done — its output already streamed as session/updates
+            // and its text was delivered via the CLI's own queue — then
+            // promote any queued steer to a fresh prompt, which settles
+            // normally on a now-idle agent (verified against the real
+            // adapter).
+            _ = tokio::time::sleep_until(
+                starve_deadline.unwrap_or_else(tokio::time::Instant::now)
+            ), if starve_deadline.is_some() && turn.is_some() && !interrupted => {
+                starve_deadline = None;
+                tracing::warn!(
+                    target: "komet_harness::acp",
+                    "prompt response missing past turn-end evidence; settling \
+                     the dead turn (and promoting any queued steer)"
+                );
+                // Drop the dead future: a response that somehow arrives later
+                // resolves a closed channel harmlessly.
+                turn = None;
+                let (prev, _next) = rotate(&mut assistant_message_id);
+                if !send(
+                    &event_tx,
+                    AgentEvent::AssistantMessageCompleted { assistant_message_id: prev },
+                )
+                .await
+                {
+                    break 'main;
+                }
+                done_current = true;
+                if !send(
+                    &event_tx,
+                    AgentEvent::Done {
+                        status: DoneStatus::Completed,
+                        result: None,
+                        error: None,
+                        session_id: Some(session_id.clone()),
+                    },
+                )
+                .await
+                {
+                    break 'main;
+                }
+                if let Some(text) = queued_steers.pop_front() {
+                    let (prev, next) = rotate(&mut assistant_message_id);
+                    if !send(
+                        &event_tx,
+                        AgentEvent::Steered {
+                            assistant_message_id: Some(prev),
+                            next_assistant_message_id: Some(next),
+                        },
+                    )
+                    .await
+                    {
+                        break 'main;
+                    }
+                    done_current = false;
+                    turn_content_seen = false;
+                    steered_this_turn = false;
+                    open_tools.clear();
+                    last_update_at = tokio::time::Instant::now();
+                    turn = Some(prompt_turn(client.clone(), session_id.clone(), text));
+                } else if !steering_open {
+                    // Mirror the normal turn-settled exit: mailbox closed
+                    // and nothing left to run — the session is over.
+                    break 'main;
+                }
+            },
+
             steer = steering.recv(), if steering_open && !interrupted => match steer {
                 Some(msg) => {
                     // Same transform as the initial prompt: Claude's
                     // Ultrathink prefix rides every steer too.
                     let text = prompt_transform(request.reasoning, &msg.prompt);
-                    if turn.is_none() {
+                    if turn.is_none() && cancel_flush_deadline.is_some() {
+                        // A busy-session cancel is already in flight: this
+                        // steer lines up behind it and dispatches at flush.
+                        queued_steers.push_back(text);
+                    } else if turn.is_none()
+                        && !cost_hint_enabled
+                        && (!open_tools.is_empty()
+                            || last_update_at.elapsed() < BUSY_RECENT)
+                    {
+                        // Mid self-continued turn (see BUSY_RECENT above):
+                        // cancel it rather than prompt into the starve.
+                        //
+                        // Claude skips this branch ON PURPOSE and prompts
+                        // straight in — its NATIVE semantics: the CLI queues
+                        // the message and folds it into the running turn (no
+                        // work lost, verified from live session data). The
+                        // adapter drops that prompt's reply, and the
+                        // cost-frame settle reconstructs it ~1s after the
+                        // merged turn really ends. Only adapters with no
+                        // verified turn-end frame pay the cancel.
+                        tracing::info!(
+                            target: "komet_harness::acp",
+                            "steer into a self-continuing session; cancelling \
+                             the unowned turn before prompting"
+                        );
+                        client.notify(
+                            "session/cancel",
+                            Some(json!({ "sessionId": session_id })),
+                        );
+                        queued_steers.push_back(text);
+                        cancel_flush_deadline =
+                            Some(tokio::time::Instant::now() + CANCEL_FLUSH);
+                    } else if turn.is_none() {
                         // Idle between turns: a steer is simply the next turn.
                         let (prev, next) = rotate(&mut assistant_message_id);
                         if !send(
@@ -2347,6 +2687,10 @@ async fn run_session(session: Session) {
                             break 'main;
                         }
                         done_current = false;
+                        turn_content_seen = false;
+                        steered_this_turn = false;
+                        open_tools.clear();
+                        last_update_at = tokio::time::Instant::now();
                         turn = Some(prompt_turn(client.clone(), session_id.clone(), text));
                     } else if steer_ext {
                         // Mid-turn injection via the `_session/steering`

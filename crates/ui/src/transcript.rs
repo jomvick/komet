@@ -247,6 +247,11 @@ pub enum ToolDetail {
 /// Max verbatim output lines per chip before the counted tail row.
 pub const OUTPUT_DETAIL_MAX_LINES: usize = 24;
 
+/// Max diff lines an inline tool-diff detail renders — the detail is one
+/// stacked element inside its transcript row, so it must stay bounded
+/// (~600 lines ≈ 12.6k px, several screens of context before the cut).
+pub const DIFF_DETAIL_MAX_LINES: usize = 600;
+
 /// Per-line height of an output detail block (diff blocks use the changes
 /// pane's own [`crate::changes::DIFF_LINE_HEIGHT`]).
 pub const OUTPUT_LINE_HEIGHT: f32 = 18.0;
@@ -266,10 +271,15 @@ pub fn tool_detail(
     diff_stats: Option<&[komet_doc::ToolDiffStat]>,
 ) -> Option<ToolDetail> {
     if let Some(diff) = diff {
-        let file = diff_to_file(diff);
+        let mut file = diff_to_file(diff);
         if file.hunks.is_empty() {
             return None;
         }
+        // A transcript diff renders as one stacked element inside its row —
+        // cap it so a whole-file rewrite (or fetched full-diff blob) can't
+        // build tens of thousands of elements per frame. The changes pane
+        // has no such cap; it virtualizes per line.
+        crate::changes::truncate_file_lines(&mut file, DIFF_DETAIL_MAX_LINES);
         let highlight = highlight_file(&file);
         return Some(ToolDetail::Diff {
             file: Arc::new(file),
@@ -310,6 +320,7 @@ pub fn diff_to_file(diff: &komet_proto::ToolDiff) -> crate::changes::FileDiff {
     let text_diff = similar::TextDiff::from_lines(old, &diff.new_text);
     let mut hunks = Vec::new();
     let (mut additions, mut deletions) = (0u32, 0u32);
+    let mut max_line = 0u32;
     for group in text_diff.grouped_ops(3) {
         let (Some(first), Some(last)) = (group.first(), group.last()) else {
             continue;
@@ -337,10 +348,15 @@ pub fn diff_to_file(diff: &komet_proto::ToolDiff) -> crate::changes::FileDiff {
                     }
                     similar::ChangeTag::Equal => LineKind::Context,
                 };
+                let old_no = change.old_index().map(|n| n as u32 + 1);
+                let new_no = change.new_index().map(|n| n as u32 + 1);
+                max_line = max_line
+                    .max(old_no.unwrap_or(0))
+                    .max(new_no.unwrap_or(0));
                 lines.push(DiffLine {
                     kind,
-                    old_no: change.old_index().map(|n| n as u32 + 1),
-                    new_no: change.new_index().map(|n| n as u32 + 1),
+                    old_no,
+                    new_no,
                     text: change.value().trim_end_matches('\n').to_owned(),
                 });
             }
@@ -360,6 +376,7 @@ pub fn diff_to_file(diff: &komet_proto::ToolDiff) -> crate::changes::FileDiff {
         hunks,
         additions,
         deletions,
+        max_line,
     }
 }
 

@@ -9,11 +9,11 @@
 //!   background-only setting's focus check) is decided at the call site, so
 //!   every platform path behaves identically. Unbundled dev runs
 //!   (`cargo run`) have no notification
-//!   center — those adopt the INSTALLED Komet.app's bundle identity (the
+//!   center — those adopt the installed Komet app's bundle identity (the
 //!   terminal-notifier technique: override `-[NSBundle bundleIdentifier]` for
-//!   the main bundle), so dev banners still show the komet icon; a click may
+//!   the main bundle), so dev banners still show the Komet icon; a click may
 //!   focus the installed app rather than the dev binary — acceptable for a
-//!   dev-only path. Machines without Komet.app installed fall back to
+//!   dev-only path. Machines without Komet installed fall back to
 //!   `osascript`, attributed to Script Editor (cosmetics only).
 //! - Linux: `notify-send` (libnotify's CLI, present on every mainstream
 //!   desktop).
@@ -151,7 +151,7 @@ mod delegate {
 /// terminal-notifier / mac-notification-sys technique. The notification
 /// center refuses processes whose main bundle has no identifier and resolves
 /// each banner's name + icon from the identifier at delivery, so overriding
-/// `-[NSBundle bundleIdentifier]` to answer the installed Komet.app's id for
+/// `-[NSBundle bundleIdentifier]` to answer the installed Komet app's id for
 /// the MAIN bundle (other bundles keep the original implementation) makes
 /// dev-run banners look exactly like the packaged app's.
 #[cfg(target_os = "macos")]

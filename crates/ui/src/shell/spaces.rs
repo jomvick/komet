@@ -321,18 +321,16 @@ impl Shell {
             })
             .on_hover(motion::hover_listener("spaces-filter"))
             .cursor_pointer()
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, _, _| this.spaces_menu.note_trigger_press()),
+            )
             .on_click(cx.listener(|this, _, window, cx| {
-                // The menu's `on_mouse_down_out` already closed it on this
-                // click's mouse-down (the trigger is outside the card), so by
-                // the time the click lands the menu reads as closed — without
-                // the guard, clicking the open trigger would close-and-reopen.
-                let just_dismissed = this
-                    .spaces_menu_dismissed_at
-                    .is_some_and(|at| at.elapsed() < Duration::from_millis(400));
-                this.spaces_menu_dismissed_at = None;
-                if this.spaces_menu.is_open() {
+                // A press that found the menu open closes it (the card's
+                // mouse-down-out already began the close) — never reopen.
+                if this.spaces_menu.take_press_was_open() {
                     this.close_spaces_menu(cx);
-                } else if !just_dismissed {
+                } else {
                     this.open_spaces_menu(window, cx);
                 }
             }))
@@ -561,7 +559,6 @@ impl Shell {
                 this.spaces_menu_key(event, cx)
             }))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                this.spaces_menu_dismissed_at = Some(std::time::Instant::now());
                 this.close_spaces_menu(cx);
             }))
             .flex()

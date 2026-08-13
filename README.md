@@ -2,7 +2,7 @@
 
 Control your coding agents (Claude Code, Codex, Cursor, Grok, Hermes, Pi) locally by default, with optional multi-device sync.
 
-![Komet running a Claude Code session](docs/screenshot.png)
+![Komet driving a Claude Code session with a live branch diff sidebar](apps/landing/public/assets/app-screenshot.jpg)
 
 Every device runs a small engine that stores sessions on that device. A new installation starts in local-only mode without an account or a network connection.
 
