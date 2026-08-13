@@ -1162,99 +1162,125 @@ impl RpcService for EngineRpc {
                 })
             }
             methods::GET_CHECKOUT_FILE_DIFF_TEXT => {
-                let p: komet_proto::GetCheckoutFileDiffTextRequest = parse_params(params)?;
-                let identity = self
-                    .repos
-                    .checkout_identity(std::path::Path::new(&p.cwd))
-                    .await
-                    .map_err(|error| RpcError::Failed(error.to_string()))?;
-                if identity.id != p.checkout_id {
-                    return Err(RpcError::Failed("checkoutId does not match cwd".into()));
-                }
-                let root = identity.root.as_path();
-                let (snapshot, base) = match p.mode.as_str() {
-                    "branch" => {
-                        let base_ref = p
-                            .base_ref
-                            .as_deref()
-                            .ok_or_else(|| RpcError::Failed("baseRef required".into()))?;
-                        let base = crate::diff_sync::merge_base(root, base_ref)
+                // This branch contains several large nested async futures. Keep it
+                // behind an allocation so every unrelated RPC does not carry that
+                // state in `EngineRpc::handle`'s stack frame.
+                Box::pin(async move {
+                    let p: komet_proto::GetCheckoutFileDiffTextRequest = parse_params(params)?;
+                    let identity =
+                        Box::pin(self.repos.checkout_identity(std::path::Path::new(&p.cwd)))
                             .await
                             .map_err(|error| RpcError::Failed(error.to_string()))?;
-                        let snapshot =
-                            crate::diff_sync::capture_diff_against(&self.repos, root, Some(&base))
+                    if identity.id != p.checkout_id {
+                        return Err(RpcError::Failed("checkoutId does not match cwd".into()));
+                    }
+                    let root = identity.root.as_path();
+                    let (snapshot, base) = match p.mode.as_str() {
+                        "branch" => {
+                            let base_ref = p
+                                .base_ref
+                                .as_deref()
+                                .ok_or_else(|| RpcError::Failed("baseRef required".into()))?;
+                            let base = Box::pin(crate::diff_sync::merge_base(root, base_ref))
                                 .await
                                 .map_err(|error| RpcError::Failed(error.to_string()))?;
-                        (snapshot, base)
-                    }
-                    "turn" => {
-                        let chat_id = p
-                            .chat_id
-                            .as_deref()
-                            .ok_or_else(|| RpcError::Failed("chatId required".into()))?;
-                        let turn = self
-                            .diff_sync
-                            .turn_snapshot(chat_id)
-                            .filter(|snapshot| snapshot.root == identity.root)
-                            .ok_or_else(|| RpcError::Failed("no turn recorded".into()))?;
-                        let snapshot =
-                            crate::diff_sync::capture_turn_diff(&self.repos, root, &turn.tree)
+                            let snapshot = Box::pin(crate::diff_sync::capture_diff_against(
+                                &self.repos,
+                                root,
+                                Some(&base),
+                            ))
+                            .await
+                            .map_err(|error| RpcError::Failed(error.to_string()))?;
+                            (snapshot, base)
+                        }
+                        "turn" => {
+                            let chat_id = p
+                                .chat_id
+                                .as_deref()
+                                .ok_or_else(|| RpcError::Failed("chatId required".into()))?;
+                            let turn = self
+                                .diff_sync
+                                .turn_snapshot(chat_id)
+                                .filter(|snapshot| snapshot.root == identity.root)
+                                .ok_or_else(|| RpcError::Failed("no turn recorded".into()))?;
+                            let snapshot = Box::pin(crate::diff_sync::capture_turn_diff(
+                                &self.repos,
+                                root,
+                                &turn.tree,
+                            ))
+                            .await
+                            .map_err(|error| RpcError::Failed(error.to_string()))?;
+                            (snapshot, turn.tree)
+                        }
+                        _ => {
+                            let base = Box::pin(crate::diff_sync::working_diff_base(root))
                                 .await
                                 .map_err(|error| RpcError::Failed(error.to_string()))?;
-                        (snapshot, turn.tree)
+                            let snapshot =
+                                Box::pin(crate::diff_sync::capture_diff(&self.repos, root))
+                                    .await
+                                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                            (snapshot, base)
+                        }
+                    };
+                    let stale = || komet_proto::CheckoutFileDiffText {
+                        diff_checksum: p.diff_checksum.clone(),
+                        old_text: None,
+                        new_text: None,
+                        old_content_hash: None,
+                        new_content_hash: None,
+                        binary: false,
+                        truncated: false,
+                        stale: true,
+                    };
+                    if snapshot.checksum != p.diff_checksum {
+                        return RpcReply::value(&stale());
                     }
-                    _ => {
-                        let base = crate::diff_sync::working_diff_base(root)
+                    let file = snapshot
+                        .files
+                        .iter()
+                        .find(|file| file.path == p.path)
+                        .ok_or_else(|| {
+                            RpcError::Failed("path is not part of diff snapshot".into())
+                        })?;
+                    let pair = Box::pin(crate::diff_sync::read_diff_file_text(root, &base, file))
+                        .await
+                        .map_err(|error| RpcError::Failed(error.to_string()))?;
+                    let current = match p.mode.as_str() {
+                        "branch" => {
+                            Box::pin(crate::diff_sync::capture_diff_against(
+                                &self.repos,
+                                root,
+                                Some(&base),
+                            ))
                             .await
-                            .map_err(|error| RpcError::Failed(error.to_string()))?;
-                        let snapshot = crate::diff_sync::capture_diff(&self.repos, root)
+                        }
+                        "turn" => {
+                            Box::pin(crate::diff_sync::capture_turn_diff(
+                                &self.repos,
+                                root,
+                                &base,
+                            ))
                             .await
-                            .map_err(|error| RpcError::Failed(error.to_string()))?;
-                        (snapshot, base)
+                        }
+                        _ => Box::pin(crate::diff_sync::capture_diff(&self.repos, root)).await,
                     }
-                };
-                let stale = || komet_proto::CheckoutFileDiffText {
-                    diff_checksum: p.diff_checksum.clone(),
-                    old_text: None,
-                    new_text: None,
-                    old_content_hash: None,
-                    new_content_hash: None,
-                    binary: false,
-                    truncated: false,
-                    stale: true,
-                };
-                if snapshot.checksum != p.diff_checksum {
-                    return RpcReply::value(&stale());
-                }
-                let file = snapshot
-                    .files
-                    .iter()
-                    .find(|file| file.path == p.path)
-                    .ok_or_else(|| RpcError::Failed("path is not part of diff snapshot".into()))?;
-                let pair = crate::diff_sync::read_diff_file_text(root, &base, file)
-                    .await
                     .map_err(|error| RpcError::Failed(error.to_string()))?;
-                let current = match p.mode.as_str() {
-                    "branch" => {
-                        crate::diff_sync::capture_diff_against(&self.repos, root, Some(&base)).await
+                    if current.checksum != p.diff_checksum {
+                        return RpcReply::value(&stale());
                     }
-                    "turn" => crate::diff_sync::capture_turn_diff(&self.repos, root, &base).await,
-                    _ => crate::diff_sync::capture_diff(&self.repos, root).await,
-                }
-                .map_err(|error| RpcError::Failed(error.to_string()))?;
-                if current.checksum != p.diff_checksum {
-                    return RpcReply::value(&stale());
-                }
-                RpcReply::value(&komet_proto::CheckoutFileDiffText {
-                    diff_checksum: p.diff_checksum,
-                    old_text: pair.old_text,
-                    new_text: pair.new_text,
-                    old_content_hash: pair.old_content_hash,
-                    new_content_hash: pair.new_content_hash,
-                    binary: pair.binary,
-                    truncated: pair.truncated,
-                    stale: false,
+                    RpcReply::value(&komet_proto::CheckoutFileDiffText {
+                        diff_checksum: p.diff_checksum,
+                        old_text: pair.old_text,
+                        new_text: pair.new_text,
+                        old_content_hash: pair.old_content_hash,
+                        new_content_hash: pair.new_content_hash,
+                        binary: pair.binary,
+                        truncated: pair.truncated,
+                        stale: false,
+                    })
                 })
+                .await
             }
             methods::LIST_REPOS => RpcReply::value(&self.repos.list().await),
             methods::ADD_REPO => {

@@ -799,6 +799,46 @@ async fn diff_sync_publishes_and_updates_chat_branch() {
     core.shutdown().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkout_file_diff_text_rpc_fits_the_default_worker_stack() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo_dir = tmp.path().join("repo");
+    init_repo(&repo_dir).await;
+    std::fs::write(repo_dir.join("a.txt"), "one\ntwo edited\n").expect("dirty tree");
+
+    let core = assemble(&tmp.path().join("data"));
+    let identity = core
+        .repos
+        .checkout_identity(&repo_dir)
+        .await
+        .expect("checkout identity");
+    let snapshot = capture_diff(&core.repos, &repo_dir)
+        .await
+        .expect("diff snapshot");
+    let client = komet_rpc::memory_client(core.rpc_service());
+
+    let response = client
+        .call(
+            methods::GET_CHECKOUT_FILE_DIFF_TEXT,
+            serde_json::json!({
+                "checkoutId": identity.id,
+                "cwd": repo_dir,
+                "path": "a.txt",
+                "mode": "working",
+                "diffChecksum": snapshot.checksum,
+            }),
+        )
+        .await
+        .expect("GetCheckoutFileDiffText");
+    let response: komet_proto::CheckoutFileDiffText =
+        serde_json::from_value(response).expect("typed response");
+    assert_eq!(response.old_text.as_deref(), Some("one\ntwo\n"));
+    assert_eq!(response.new_text.as_deref(), Some("one\ntwo edited\n"));
+    assert!(!response.stale);
+
+    core.shutdown().await;
+}
+
 // ---------------------------------------------------------------------------
 // Terminals
 // ---------------------------------------------------------------------------
