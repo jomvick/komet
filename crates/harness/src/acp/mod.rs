@@ -2057,18 +2057,33 @@ async fn run_session(session: Session) {
     // the turn has streamed content, every tool call it opened has resolved,
     // no permission/question round-trip is pending, and the stream has been
     // quiet past the window, the turn is settled through the same recovery
-    // arm. A false settle is recoverable by design (the engine folds any
-    // later output as a self-continued segment and re-arms Working; a late
-    // response resolves a dropped channel), which is what makes a tight
-    // window safe where a hard per-turn timeout was rejected.
+    // arm. A false settle is only PARTLY recoverable: the engine folds any
+    // later output as a self-continued segment and re-arms Working, but the
+    // turn is orphaned — the real response resolves a closed channel, no
+    // Done ever comes, and the session strands Working until the engine's
+    // quiesce watchdog parks it.
+    //
+    // Claude is EXEMPT, even from the env knob: claude-agent-acp forwards
+    // no thinking traffic, so a long silent reasoning stretch in exactly
+    // the "looks finished" state (content streamed, every tool resolved)
+    // is indistinguishable from a dropped reply — 30s of quiet falsely
+    // settled live turns mid-thought (2026-08-13), producing both a
+    // premature Done and the stuck-Working orphan above. Claude's
+    // genuinely dropped replies already settle deterministically (the
+    // cost-frame hint above, `noRunningTurn` steering evidence); the
+    // engine watchdog backstops anything left.
     // `KOMET_ACP_QUIET_SETTLE_MS` overrides; 0 disables.
-    let quiet_settle: Option<Duration> = match std::env::var("KOMET_ACP_QUIET_SETTLE_MS")
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-    {
-        Some(0) => None,
-        Some(ms) => Some(Duration::from_millis(ms)),
-        None => Some(Duration::from_secs(30)),
+    let quiet_settle: Option<Duration> = if cost_hint_enabled {
+        None
+    } else {
+        match std::env::var("KOMET_ACP_QUIET_SETTLE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            Some(0) => None,
+            Some(ms) => Some(Duration::from_millis(ms)),
+            None => Some(Duration::from_secs(30)),
+        }
     };
     let mut last_update_at = tokio::time::Instant::now();
     let mut turn_content_seen = false;
@@ -2077,7 +2092,8 @@ async fn run_session(session: Session) {
     // message itself, mid-turn, indistinguishable in shape from the
     // terminal one (verified against 0.66.0 — premature Done exactly one
     // grace after injection). Steered turns settle off their real response
-    // (healthy in every trace); the quiet settle stays as their backstop.
+    // (healthy in every trace); the engine's quiesce watchdog backstops
+    // them (the quiet settle used to, before the Claude exemption above).
     let mut steered_this_turn = false;
     let mut open_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
     let open_questions = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));

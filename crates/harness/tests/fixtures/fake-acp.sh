@@ -316,6 +316,21 @@ case "$promptline" in
   emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
   ;;
 
+*scenario:quiet-thinking*)
+  # The 2026-08-13 false settle: every tool RESOLVED, then a long silent
+  # thinking stretch (claude-agent-acp forwards no thinking traffic), then
+  # the turn continues and ends normally. This is exactly the "looks
+  # finished" state the blanket settle keys on; Claude must hold through
+  # it — a false settle here orphans the real turn (its response lands on
+  # a closed channel; the session strands Working).
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"working"}}'
+  update '{"sessionUpdate":"tool_call","toolCallId":"th-1","title":"quick read","kind":"read","status":"pending","rawInput":{"path":"/w/src/x.rs"}}'
+  update '{"sessionUpdate":"tool_call_update","toolCallId":"th-1","status":"completed","content":[]}'
+  sleep 4
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"finished"}}'
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  ;;
+
 *scenario:interrupt*)
   update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"working"}}'
   read -r intline || exit 1

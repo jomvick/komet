@@ -80,11 +80,12 @@ fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
 }
 
 async fn run_and_collect(
+    harness: AcpHarness,
     prompt: &str,
     timeout: Duration,
 ) -> Vec<(std::time::Instant, AgentEvent)> {
     let (controls, _steer, _token) = controls();
-    let harness = AcpHarness::grok().with_executable(fixture_path());
+    let harness = harness.with_executable(fixture_path());
     let stream = harness.run(request(prompt), controls).await.expect("run starts");
     tokio::time::timeout(timeout, async move {
         let mut stream = stream;
@@ -115,7 +116,8 @@ fn dones(events: &[(std::time::Instant, AgentEvent)]) -> Vec<(DoneStatus, Option
 async fn generic_dropped_reply_settles_off_the_quiet_window() {
     init_env();
     let started = std::time::Instant::now();
-    let events = run_and_collect("scenario:quiet-starve", Duration::from_secs(20)).await;
+    let events =
+        run_and_collect(AcpHarness::grok(), "scenario:quiet-starve", Duration::from_secs(20)).await;
     assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)], "{events:?}");
     let done_at = events
         .iter()
@@ -138,7 +140,12 @@ async fn generic_dropped_reply_settles_off_the_quiet_window() {
 #[tokio::test]
 async fn open_tool_call_holds_the_quiet_settle_off() {
     init_env();
-    let events = run_and_collect("scenario:quiet-tool-guard", Duration::from_secs(20)).await;
+    let events = run_and_collect(
+        AcpHarness::grok(),
+        "scenario:quiet-tool-guard",
+        Duration::from_secs(20),
+    )
+    .await;
     assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)], "{events:?}");
     // The "finished" text (streamed after the quiet stretch) must precede
     // the single Done — a premature settle would have flipped that order.
@@ -153,5 +160,40 @@ async fn open_tool_call_holds_the_quiet_settle_off() {
     assert!(
         finished < done,
         "the turn must survive the quiet stretch intact: {events:?}"
+    );
+}
+
+/// The 2026-08-13 regression: Claude thinking silently in exactly the
+/// settle's "looks finished" state — content streamed, every tool resolved,
+/// wire quiet far past the window. claude-agent-acp forwards no thinking
+/// traffic, so this is routine mid-turn silence, not a dropped reply; a
+/// false settle here orphans the real turn (premature Done, then the
+/// post-quiet tail folds as self-continued output and the session strands
+/// Working when the real response lands on a closed channel). Claude must
+/// ignore the blanket settle — even with the env knob set, as it is
+/// process-wide in this binary.
+#[tokio::test]
+async fn claude_thinking_silence_never_settles_the_turn() {
+    init_env();
+    let events = run_and_collect(
+        AcpHarness::claude(),
+        "scenario:quiet-thinking",
+        Duration::from_secs(20),
+    )
+    .await;
+    assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)], "{events:?}");
+    // The "finished" text (streamed after the 4s quiet stretch, ~3x the
+    // window) must precede the single Done — a false settle flips the order.
+    let finished = events
+        .iter()
+        .position(|(_, e)| matches!(e, AgentEvent::TextDelta { text } if text == "finished"))
+        .unwrap_or_else(|| panic!("post-quiet text must fold into the SAME turn: {events:?}"));
+    let done = events
+        .iter()
+        .position(|(_, e)| matches!(e, AgentEvent::Done { .. }))
+        .expect("done asserted above");
+    assert!(
+        finished < done,
+        "the turn must survive silent thinking intact: {events:?}"
     );
 }
