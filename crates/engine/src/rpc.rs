@@ -750,6 +750,8 @@ fn forwardable(method: &str) -> bool {
             | methods::CREATE_REPO
             | methods::LIST_BRANCHES
             | methods::LIST_REFS
+            | methods::LIST_GIT_HISTORY
+            | methods::FETCH_ALL
             | methods::SWITCH_REF
             | methods::LIST_FOLDERS
             | methods::SEARCH_FILES
@@ -1212,6 +1214,39 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&refs)
             }
+            methods::LIST_GIT_HISTORY => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    cwd: String,
+                    #[serde(default)]
+                    cursor: usize,
+                    #[serde(default = "default_git_history_limit")]
+                    limit: usize,
+                }
+                fn default_git_history_limit() -> usize {
+                    crate::repos::GIT_HISTORY_DEFAULT_LIMIT
+                }
+                let p: P = parse_params(params)?;
+                let history = self
+                    .repos
+                    .history(std::path::Path::new(&p.cwd), p.cursor, p.limit)
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&history)
+            }
+            methods::FETCH_ALL => {
+                let p: RepoPathParams = parse_params(params)?;
+                self.repos
+                    .fetch_all(std::path::Path::new(&p.repo_path))
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                // Remote refs are repository state too. Force the checkout
+                // watchers to publish a fresh snapshot instead of waiting for
+                // the repair tick (some platforms do not report packed-refs).
+                self.diff_sync.sync_all();
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
             methods::SWITCH_REF => {
                 let p: SwitchRefParams = parse_params(params)?;
                 let branch = self
@@ -1454,6 +1489,7 @@ mod tests {
         assert!(!forwardable(methods::LOCAL_DEVICE));
         assert!(forwardable(methods::QUEUE_COMMAND));
         assert!(forwardable(methods::SEARCH_FILES));
+        assert!(forwardable(methods::FETCH_ALL));
     }
 
     #[test]

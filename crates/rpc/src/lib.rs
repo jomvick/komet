@@ -78,6 +78,9 @@ pub mod methods {
     pub const CREATE_REPO: &str = "CreateRepo";
     pub const LIST_BRANCHES: &str = "ListBranches";
     pub const LIST_REFS: &str = "ListRefs";
+    pub const LIST_GIT_HISTORY: &str = "ListGitHistory";
+    /// Update remote-tracking refs without changing HEAD, the index, or files.
+    pub const FETCH_ALL: &str = "FetchAll";
     pub const SWITCH_REF: &str = "SwitchRef";
     pub const LIST_FOLDERS: &str = "ListFolders";
     /// Fuzzy relative-path search rooted in a known chat or space checkout.
