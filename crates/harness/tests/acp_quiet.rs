@@ -12,7 +12,7 @@ use futures::StreamExt;
 use tokio::sync::{mpsc, oneshot};
 
 use komet_harness::{
-    AcpHarness, CancellationToken, Harness, HarnessError, RunControls, SteerMessage,
+    AcpHarness, CancellationToken, Harness, RunControls, SteerMessage,
 };
 use komet_proto::{
     AgentEvent, DoneStatus, RunRequest, SandboxLevel, UserInputAnswer, UserInputQuestion,
