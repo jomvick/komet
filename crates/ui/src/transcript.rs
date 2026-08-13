@@ -1449,9 +1449,21 @@ impl Transcript {
 
     /// Replace the transcript's scroll animation task (rail click / jump).
     pub(crate) fn set_scroll_task(&mut self, task: Task<()>) {
-        self.remove_own_turn_runway();
+        // Rail navigation within the session RELEASES the hold but keeps the
+        // runway (user spec: only leaving and revisiting the session clears
+        // it) — scrolling back down re-arms the hold like any restick.
+        self.release_own_turn_hold();
         self.pinned = false;
         self.scroll_anim = Some(task);
+    }
+
+    /// Give the viewport to the user/navigation without dropping the
+    /// reservation: the pad stays, the hold stands down until a restick.
+    fn release_own_turn_hold(&mut self) {
+        if let Some(anchor) = self.own_turn.as_mut() {
+            anchor.held = false;
+        }
+        self.own_turn_last_tick = None;
     }
 
     fn remeasure_last_row(&self) {
@@ -1460,15 +1472,7 @@ impl Transcript {
         }
     }
 
-    /// Drop the temporary send runway without enabling follow-tail. Used when
-    /// explicit user navigation supersedes the automatic own-turn behavior.
-    fn remove_own_turn_runway(&mut self) {
-        if self.own_turn.take().is_some() {
-            self.remeasure_last_row();
-        }
-        self.own_turn_kick = false;
-        self.own_turn_last_tick = None;
-    }
+
 
     pub(crate) fn distance_from_bottom(&self) -> f32 {
         let max = f32::from(self.list.max_offset_for_scrollbar().y);
@@ -1493,15 +1497,52 @@ impl Transcript {
         let this = cx.weak_entity();
         cx.defer(move |cx| {
             this.update(cx, |this: &mut Transcript, cx| {
-                // Wheel/touch input RELEASES an own-turn hold (clamping it
-                // locked scrolling for as long as the reservation held —
-                // user report). The reservation stays behind as plain
-                // scrollable space; normal escape/restick applies below.
-                if let Some(anchor) = this.own_turn.as_mut()
-                    && anchor.held
-                {
-                    anchor.held = false;
-                    this.own_turn_last_tick = None;
+                // Wheel/touch while a runway lives: input owns the viewport,
+                // and the BOTTOM PIN must stay out of it entirely. Escaping
+                // releases the hold (the reservation stays behind as plain
+                // scrollable space); returning toward the bottom re-arms the
+                // HOLD, never `pinned` — a restick pin glued the view to the
+                // bottom of the reservation pad, where streaming reads as
+                // text stuck at the viewport top with the runway never
+                // filling (user report; the pad can't resize there either,
+                // its anchor being off-screen). macOS trackpad momentum can
+                // even release-and-restick within one gesture right after a
+                // send, so under the old rules the prompt never landed at
+                // the top at all.
+                if this.own_turn.is_some() {
+                    let distance = this.distance_from_bottom();
+                    let previous = this.last_scroll_distance;
+                    this.last_scroll_distance = distance;
+                    let held = this.own_turn.as_ref().is_some_and(|a| a.held);
+                    if distance > previous + 1.0 && distance > AT_BOTTOM_PX {
+                        // Input moving away from the bottom breaks the hold.
+                        if let Some(anchor) = this.own_turn.as_mut() {
+                            anchor.held = false;
+                        }
+                        this.own_turn_last_tick = None;
+                        this.pinned = false;
+                        this.spring.reset();
+                        this.spring_last_tick = None;
+                    } else if !held
+                        && (distance <= AT_BOTTOM_PX
+                            || Self::should_restick(distance, previous))
+                    {
+                        // Returning to the bottom returns to the RUNWAY: the
+                        // glide re-lands the prompt at its inset.
+                        if let Some(anchor) = this.own_turn.as_mut() {
+                            anchor.held = true;
+                            anchor.positioned = false;
+                        }
+                        this.own_turn_last_tick = None;
+                        this.own_turn_kick = true;
+                    }
+                    let show = distance > SCROLL_BUTTON_THRESHOLD_PX
+                        && !this.own_turn.as_ref().is_some_and(|a| a.held);
+                    if show != this.show_jump_button {
+                        this.show_jump_button = show;
+                    }
+                    cx.notify();
+                    return;
                 }
                 let distance = this.distance_from_bottom();
                 let previous = this.last_scroll_distance;
@@ -1758,9 +1799,22 @@ impl Transcript {
 
     /// The scroll-to-bottom pill's click: glide back to the end and re-pin.
     pub fn jump_to_bottom(&mut self, cx: &mut Context<Self>) {
-        self.remove_own_turn_runway();
+        // With a live runway, "bottom" IS the held position (the reservation
+        // makes prompt-at-top and pad-bottom the same place): re-arm the hold
+        // and glide back instead of destroying the runway (user spec — only
+        // navigating away and back clears it).
+        if let Some(anchor) = self.own_turn.as_mut() {
+            anchor.held = true;
+            anchor.positioned = false;
+            self.own_turn_last_tick = None;
+            self.own_turn_kick = true;
+            self.show_jump_button = false;
+            cx.notify();
+            return;
+        }
         self.engage_pin(cx);
     }
+
 
     /// Re-engage the bottom pin with a glide. Long jumps teleport to within
     /// [`GLIDE_MAX_VIEWPORTS`] of the end first (mugen `springToBottom`);
