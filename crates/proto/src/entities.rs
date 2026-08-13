@@ -217,6 +217,48 @@ pub struct RepoRef {
     pub worktree_path: Option<String>,
 }
 
+/// Public Git reference attached to a commit in the history graph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GitHistoryRefKind {
+    Branch,
+    Remote,
+    Tag,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitHistoryRef {
+    pub kind: GitHistoryRefKind,
+    pub label: String,
+}
+
+/// One topologically ordered row in the repository history graph.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitHistoryCommit {
+    pub sha: String,
+    pub parent_shas: Vec<String>,
+    pub subject: String,
+    pub author_name: String,
+    pub author_email: String,
+    pub authored_at: String,
+    #[serde(default)]
+    pub refs: Vec<GitHistoryRef>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitHistoryPage {
+    pub commits: Vec<GitHistoryCommit>,
+    pub head_sha: Option<String>,
+    pub next_cursor: Option<usize>,
+    pub total_count: Option<usize>,
+    /// Number of commits reachable from the active checkout's HEAD.
+    #[serde(default)]
+    pub head_commit_count: Option<usize>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Worktree {

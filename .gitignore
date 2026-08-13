@@ -1,5 +1,7 @@
 /target
 **/*.rs.bk
+# Local-only scratch space — holds signing/notary credentials, never commit.
+/ignore/
 *.pdb
 .DS_Store
 .env

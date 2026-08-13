@@ -12,7 +12,7 @@ use komet_engine::{
     EngineCore, HarnessRegistry, Repos, Terminals, capture_diff, capture_diff_against,
     capture_turn_diff, merge_base, snapshot_tree,
 };
-use komet_proto::TerminalEvent;
+use komet_proto::{GitHistoryRefKind, TerminalEvent};
 use komet_rpc::methods;
 
 // ---------------------------------------------------------------------------
@@ -36,6 +36,22 @@ async fn git(cwd: &Path, args: &[&str]) {
         args,
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+async fn git_stdout(cwd: &Path, args: &[&str]) -> String {
+    let output = tokio::process::Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .await
+        .expect("git spawns");
+    assert!(
+        output.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
 /// Init a repo at `dir` with one committed file `a.txt`.
@@ -204,6 +220,126 @@ async fn repos_round_trip_add_branches_worktrees() {
     assert!(
         repos.create("demo repo!").await.is_err(),
         "duplicate create rejected"
+    );
+}
+
+#[tokio::test]
+async fn git_history_is_topological_paged_and_carries_public_refs() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo_dir = tmp.path().join("history-repo");
+    init_repo(&repo_dir).await;
+    git(&repo_dir, &["checkout", "-b", "feature"]).await;
+    std::fs::write(repo_dir.join("feature.txt"), "feature\n").expect("feature file");
+    git(&repo_dir, &["add", "."]).await;
+    git(&repo_dir, &["commit", "-m", "feature commit"]).await;
+    git(&repo_dir, &["checkout", "main"]).await;
+    std::fs::write(repo_dir.join("main.txt"), "main\n").expect("main file");
+    git(&repo_dir, &["add", "."]).await;
+    git(&repo_dir, &["commit", "-m", "main commit"]).await;
+    git(
+        &repo_dir,
+        &["merge", "--no-ff", "feature", "-m", "merge feature"],
+    )
+    .await;
+    git(&repo_dir, &["tag", "v1"]).await;
+    git(
+        &repo_dir,
+        &["update-ref", "refs/remotes/origin/main", "HEAD"],
+    )
+    .await;
+
+    let repos = test_repos(&tmp.path().join("data"));
+    let first = repos.history(&repo_dir, 0, 2).await.expect("first page");
+    assert_eq!(first.commits.len(), 2);
+    assert_eq!(first.total_count, Some(4));
+    assert_eq!(first.head_commit_count, Some(4));
+    assert_eq!(first.next_cursor, Some(2));
+    assert_eq!(
+        first.head_sha.as_deref(),
+        Some(first.commits[0].sha.as_str())
+    );
+    assert_eq!(first.commits[0].parent_shas.len(), 2);
+    assert!(first.commits[0].refs.iter().any(|reference| {
+        reference.kind == GitHistoryRefKind::Branch && reference.label == "main"
+    }));
+    assert!(first.commits[0].refs.iter().any(|reference| {
+        reference.kind == GitHistoryRefKind::Remote && reference.label == "origin/main"
+    }));
+    assert!(
+        first.commits[0].refs.iter().any(|reference| {
+            reference.kind == GitHistoryRefKind::Tag && reference.label == "v1"
+        })
+    );
+
+    let second = repos.history(&repo_dir, 2, 2).await.expect("second page");
+    assert_eq!(second.commits.len(), 2);
+    assert_eq!(second.next_cursor, None);
+    assert_eq!(second.total_count, None);
+    assert_eq!(second.head_commit_count, None);
+}
+
+#[tokio::test]
+async fn fetch_all_updates_only_remote_tracking_refs() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo_dir = tmp.path().join("fetch-repo");
+    let remote_dir = tmp.path().join("remote.git");
+    init_repo(&repo_dir).await;
+    git(
+        tmp.path(),
+        &["init", "--bare", remote_dir.to_str().unwrap()],
+    )
+    .await;
+    git(
+        &repo_dir,
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+    )
+    .await;
+    git(&repo_dir, &["push", "-u", "origin", "main"]).await;
+
+    let peer_dir = tmp.path().join("peer");
+    git(
+        tmp.path(),
+        &[
+            "clone",
+            remote_dir.to_str().unwrap(),
+            peer_dir.to_str().unwrap(),
+        ],
+    )
+    .await;
+    git(&peer_dir, &["checkout", "main"]).await;
+    std::fs::write(peer_dir.join("remote.txt"), "remote\n").expect("remote file");
+    git(&peer_dir, &["add", "."]).await;
+    git(&peer_dir, &["commit", "-m", "remote commit"]).await;
+    git(&peer_dir, &["push", "origin", "main"]).await;
+
+    std::fs::write(repo_dir.join("a.txt"), "staged locally\n").expect("local edit");
+    git(&repo_dir, &["add", "a.txt"]).await;
+    std::fs::write(repo_dir.join("untracked.txt"), "untracked\n").expect("untracked file");
+    let head_before = git_stdout(&repo_dir, &["rev-parse", "HEAD"]).await;
+    let branch_before = git_stdout(&repo_dir, &["branch", "--show-current"]).await;
+    let status_before = git_stdout(&repo_dir, &["status", "--porcelain=v1"]).await;
+    let remote_before = git_stdout(&repo_dir, &["rev-parse", "origin/main"]).await;
+
+    test_repos(&tmp.path().join("data"))
+        .fetch_all(&repo_dir)
+        .await
+        .expect("fetch all");
+
+    assert_ne!(
+        git_stdout(&repo_dir, &["rev-parse", "origin/main"]).await,
+        remote_before
+    );
+    assert_eq!(
+        git_stdout(&repo_dir, &["rev-parse", "HEAD"]).await,
+        head_before
+    );
+    assert_eq!(
+        git_stdout(&repo_dir, &["branch", "--show-current"]).await,
+        branch_before
+    );
+    assert_eq!(
+        git_stdout(&repo_dir, &["status", "--porcelain=v1"]).await,
+        status_before
     );
 }
 

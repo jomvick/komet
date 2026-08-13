@@ -251,13 +251,13 @@ impl SessionsEngine {
         request: RunRequest,
         message_id: Option<String>,
     ) -> Result<String, EngineError> {
-        self.dispatch_with(chat_id, harness_id, request, message_id, true)
+        self.dispatch_with(chat_id, harness_id, request, message_id, false)
             .await
     }
 
-    /// [`Self::dispatch`] with resume injection controllable: the failed-resume
-    /// retry re-dispatches with `inject_resume = false` so a session id the
-    /// harness just rejected can never be re-injected from the journal.
+    /// [`Self::dispatch`] with the startup-crash retry marker: the retry
+    /// re-dispatches with `startup_retry = true`, which makes that attempt
+    /// final (its own startup death surfaces instead of retrying again).
     /// Boxed future: `drive_run` re-enters this for that retry, and the
     /// erasure breaks the opaque-type cycle the recursion would otherwise form.
     fn dispatch_with<'a>(
@@ -266,9 +266,9 @@ impl SessionsEngine {
         harness_id: HarnessId,
         request: RunRequest,
         message_id: Option<String>,
-        inject_resume: bool,
+        startup_retry: bool,
     ) -> futures::future::BoxFuture<'a, Result<String, EngineError>> {
-        Box::pin(self.dispatch_inner(chat_id, harness_id, request, message_id, inject_resume))
+        Box::pin(self.dispatch_inner(chat_id, harness_id, request, message_id, startup_retry))
     }
 
     async fn dispatch_inner(
@@ -277,7 +277,7 @@ impl SessionsEngine {
         harness_id: HarnessId,
         mut request: RunRequest,
         mut message_id: Option<String>,
-        inject_resume: bool,
+        startup_retry: bool,
     ) -> Result<String, EngineError> {
         // Project-less chats store cwd `~` (the creating device can't know the
         // host's home); expand it here, on the host, where the run spawns.
@@ -349,9 +349,12 @@ impl SessionsEngine {
         // Engine-owned resume (komet sessions.ts:736 — every dispatch read the
         // chat's stored harness session): callers always send `resume: None`;
         // the engine threads the chat's prior harness session back in so a new
-        // process (app restart) continues the same harness conversation.
+        // process (app restart) continues the same harness conversation. The
+        // startup-crash retry injects too — a stale id is the harness's
+        // problem now (`session/load` falls back to `session/new` internally),
+        // and starting the retry fresh silently dropped a good conversation.
         let mut resume_injected = false;
-        if request.resume.is_none() && inject_resume {
+        if request.resume.is_none() {
             request.resume = self.inner.resume_for(chat_id, &request.cwd);
             resume_injected = request.resume.is_some();
         }
@@ -426,6 +429,7 @@ impl SessionsEngine {
             RunResumeState {
                 user_message_id: user_id,
                 resume_injected,
+                startup_retry,
             },
         ));
         Ok(run_id)
@@ -832,21 +836,12 @@ impl Inner {
         }
     }
 
-    /// A harness rejected the stored session id: tombstone it (empty string on
-    /// the row, cleared cache) so no lookup source — including the journal,
-    /// which still names the dead id — can re-inject it.
-    fn forget_harness_session(&self, chat_id: &str) {
-        lock(&self.harness_sessions).insert(
-            chat_id.to_string(),
-            HarnessSessionRef {
-                session_id: String::new(),
-                cwd: String::new(),
-            },
-        );
-        if let Some(ws) = self.workspace() {
-            ws.set_chat_harness_session(chat_id, "", "");
-        }
-    }
+    // NB: there is deliberately no `forget_harness_session` anymore. The old
+    // tombstone fired on "run died before SessionStarted", which — since the
+    // ACP conversion made stale ids a harness-internal fallback — only ever
+    // meant a child STARTUP failure, and permanently severed good
+    // conversations (user incident 2026-08-13). A truly stale id simply
+    // yields a fresh session whose SessionStarted overwrites the row.
 
     /// The session id to resume for a run in `chat_id` launching from `cwd`
     /// (komet sessions.ts:736, looked up on every dispatch):
@@ -1021,13 +1016,15 @@ fn expand_home(cwd: &str) -> String {
     }
 }
 
-/// Resume bookkeeping for one run task: which user entry the run answers (so a
-/// failed-resume retry re-dispatches idempotently against the same doc entry)
-/// and whether `dispatch` injected the resume id itself (only engine-injected
-/// resumes are retried fresh — a caller-specified resume fails loudly).
+/// Resume bookkeeping for one run task: which user entry the run answers (so
+/// the startup-crash retry re-dispatches idempotently against the same doc
+/// entry), whether `dispatch` injected the resume id itself (only
+/// engine-injected resumes retry — a caller-specified resume fails loudly),
+/// and whether this run already IS the retry (one attempt only).
 struct RunResumeState {
     user_message_id: String,
     resume_injected: bool,
+    startup_retry: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1048,8 +1045,9 @@ async fn drive_run(
     let harness_id = harness.id();
     let user_prompt = request.prompt.clone();
     let run_cwd = request.cwd.clone();
-    // Kept whole for the failed-resume retry (fresh session, same user entry).
-    // Option so the retry branch (inside the event loop) can take ownership.
+    // Kept whole for the startup-crash retry (same user entry; dispatch
+    // re-injects the stored resume id). Option so the retry branch (inside
+    // the event loop) can take ownership.
     let mut retry_request = Some(RunRequest {
         resume: None,
         ..request.clone()
@@ -1424,13 +1422,19 @@ async fn drive_run(
             _ => {}
         }
 
-        // Failed-resume fallback: an engine-injected `--resume` naming a session
-        // the harness no longer knows dies before ever starting (claude exits
-        // without an init frame; codex falls back internally via thread/start).
-        // Signature: errored Done, no SessionStarted, nothing streamed. Retry
-        // ONCE as a fresh session against the same user entry — tombstone the
-        // dead id first so no lookup source (journal included) re-injects it.
+        // Startup-crash retry: a run that dies before ever starting (errored
+        // Done, no SessionStarted, nothing streamed) means the AGENT CHILD
+        // failed to come up — not that the injected resume id was bad. Since
+        // the ACP conversion (2026-08-08) a stale id is handled inside the
+        // harness (`session/load` falls back to `session/new`), so the old
+        // guess here — tombstone the id, retry fresh — fired only on child
+        // startup failures and permanently severed GOOD conversations (user
+        // incident 2026-08-13). The id stays; retry ONCE against the same
+        // user entry, resume and all, in case the crash was transient. A
+        // helper that is down hard fails the retry too and surfaces its
+        // crash text (the harness now appends exit status + stderr).
         if resume_state.resume_injected
+            && !resume_state.startup_retry
             && !saw_session_started
             && folded.is_empty()
             && !interrupted
@@ -1445,9 +1449,8 @@ async fn drive_run(
         {
             tracing::warn!(
                 chat = %chat_id,
-                "harness rejected injected resume id; retrying as a fresh session"
+                "run died before session start; retrying once (resume kept)"
             );
-            inner.forget_harness_session(&chat_id);
             inner.remove_run(&chat_id, &run_id);
             let engine = SessionsEngine {
                 inner: inner.clone(),
@@ -1455,13 +1458,13 @@ async fn drive_run(
             let chat = chat_id.clone();
             let message_id = resume_state.user_message_id.clone();
             tokio::spawn(async move {
-                // `inject_resume = false`: the retry must start fresh. The user
-                // entry write inside dispatch is idempotent by message id.
+                // The user entry write inside dispatch is idempotent by
+                // message id; `startup_retry` makes this attempt final.
                 if let Err(err) = engine
-                    .dispatch_with(&chat, harness_id, retry, Some(message_id), false)
+                    .dispatch_with(&chat, harness_id, retry, Some(message_id), true)
                     .await
                 {
-                    tracing::error!(chat = %chat, error = %err, "fresh-session retry dispatch failed");
+                    tracing::error!(chat = %chat, error = %err, "startup-crash retry dispatch failed");
                     // No run is coming: leaving the row Working would spin
                     // the session forever with nothing behind it.
                     engine

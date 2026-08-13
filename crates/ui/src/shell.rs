@@ -722,23 +722,17 @@ impl Shell {
         });
         let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
         let composer = cx.new(|cx| Composer::new(state.clone(), cx));
-        // The first send stages prompt-at-top → follow-tail; later sends keep
-        // the transcript's original follow-tail behavior.
+        // Every send glides the prompt to the viewport top and reserves the
+        // reply's space below it (notes-app parity).
         let composer_events = cx.subscribe(&composer, {
             let transcript = transcript.clone();
             move |_this: &mut Shell, _, event: &ComposerEvent, cx| match event {
                 ComposerEvent::Sent {
                     chat_id,
                     message_id,
-                    started_empty,
                 } => {
                     transcript.update(cx, |t, cx| {
-                        t.on_own_send(
-                            chat_id.clone(),
-                            message_id.clone(),
-                            *started_empty,
-                            cx,
-                        )
+                        t.on_own_send(chat_id.clone(), message_id.clone(), cx)
                     });
                 }
             }
