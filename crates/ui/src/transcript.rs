@@ -226,6 +226,11 @@ pub struct ToolItem {
     /// Precomputed here because rows are cached by fingerprint — diffing and
     /// tokenizing per paint would run on every scroll frame.
     pub detail: Option<Arc<ToolDetail>>,
+    /// Expandable full-invocation block: the complete tool call (whole
+    /// command / pattern / URL / input JSON) that the chip header collapses
+    /// to one truncated line. Rendered above `detail` in the open card.
+    /// Precomputed for the same reason as `detail`.
+    pub invocation: Option<Arc<ToolDetail>>,
     /// Sidecar key of the full output (chat2-sync A3) — the doc carries only
     /// a one-line summary; expanding offers a lazy "Show full output" fetch.
     pub output_ref: Option<SharedString>,
@@ -312,6 +317,90 @@ pub fn tool_detail(
         .map(|l| SharedString::from(l.to_owned()))
         .collect();
     // Trim trailing blank output lines so the block hugs its content.
+    while lines.last().is_some_and(|l| l.trim().is_empty()) {
+        lines.pop();
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    let truncated_by = lines.len().saturating_sub(OUTPUT_DETAIL_MAX_LINES);
+    lines.truncate(OUTPUT_DETAIL_MAX_LINES);
+    Some(ToolDetail::Output {
+        lines,
+        truncated_by,
+    })
+}
+
+/// Columns at which an invocation line soft-wraps into continuation lines.
+/// The wrap is char-counted, not measured — block heights must be analytic —
+/// so the budget is sized to fit the narrowest useful transcript pane.
+pub const CALL_WRAP_COLS: usize = 80;
+
+/// Soft-wrap one raw line into [`CALL_WRAP_COLS`]-char chunks so a long
+/// single-line command stays fully readable instead of ellipsizing.
+fn wrap_cols(line: &str, cols: usize) -> Vec<SharedString> {
+    if line.chars().count() <= cols {
+        return vec![SharedString::from(line.to_owned())];
+    }
+    line.chars()
+        .collect::<Vec<_>>()
+        .chunks(cols)
+        .map(|chunk| SharedString::from(chunk.iter().collect::<String>()))
+        .collect()
+}
+
+/// Build a chip's full-invocation block — the complete tool call the header
+/// truncates to one line: the whole command, pattern, or URL, todo items one
+/// per line, MCP/unknown input as pretty-printed JSON. Reuses the output
+/// code-block payload so rendering and height stay one implementation.
+pub fn call_block(call: &ToolCall) -> Option<ToolDetail> {
+    let text: String = match call {
+        ToolCall::Exec { command } => command.clone(),
+        ToolCall::ReadFile { path } => path.clone(),
+        ToolCall::WriteFile { path, content } => match content {
+            Some(content) => format!("{path}\n{content}"),
+            None => path.clone(),
+        },
+        ToolCall::EditFile { path, .. } => path.clone(),
+        ToolCall::ApplyPatch { path } => path.clone().unwrap_or_else(|| "workspace".into()),
+        ToolCall::Search { pattern, path } => match path {
+            Some(path) => format!("{pattern} in {path}"),
+            None => pattern.clone(),
+        },
+        ToolCall::Glob { pattern } => pattern.clone(),
+        ToolCall::WebFetch { url, prompt } => match prompt {
+            Some(prompt) => format!("{url}\n{prompt}"),
+            None => url.clone(),
+        },
+        ToolCall::WebSearch { query } => query.clone(),
+        ToolCall::Todo { items } => items
+            .iter()
+            .map(|i| format!("{} {}", if i.done { "[x]" } else { "[ ]" }, i.text))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        ToolCall::Mcp {
+            server,
+            tool,
+            input,
+        } => match input {
+            Some(input) => format!(
+                "{server} · {tool}\n{}",
+                serde_json::to_string_pretty(input).unwrap_or_default()
+            ),
+            None => format!("{server} · {tool}"),
+        },
+        ToolCall::Unknown { name, input } => match input {
+            Some(input) => format!(
+                "{name}\n{}",
+                serde_json::to_string_pretty(input).unwrap_or_default()
+            ),
+            None => name.clone(),
+        },
+    };
+    let mut lines: Vec<SharedString> = text
+        .lines()
+        .flat_map(|l| wrap_cols(l, CALL_WRAP_COLS))
+        .collect();
     while lines.last().is_some_and(|l| l.trim().is_empty()) {
         lines.pop();
     }
@@ -541,6 +630,19 @@ fn tool_fingerprint(tools: &[ToolItem], auto_open: bool) -> u64 {
                 }
             }
         }
+        // The invocation block is pure over `call`, which the one-line hash
+        // above only covers by length — hash its bytes so an in-place call
+        // update (a streaming MCP input, a growing todo list) re-splices.
+        if let Some(ToolDetail::Output {
+            lines,
+            truncated_by,
+        }) = t.invocation.as_deref()
+        {
+            for line in lines {
+                acc.extend_from_slice(line.as_bytes());
+            }
+            acc.extend_from_slice(&(*truncated_by as u32).to_le_bytes());
+        }
         // Sidecar refs arriving after the resolve tick must re-splice too —
         // they add the fetch affordance without changing the detail payload.
         acc.push(t.output_ref.is_some() as u8 | (t.diff_ref.is_some() as u8) << 1);
@@ -647,6 +749,7 @@ pub fn rows_for_entry(
                     resolved: *resolved,
                     detail: tool_detail(output.as_deref(), diff.as_ref(), diff_stats.as_deref())
                         .map(Arc::new),
+                    invocation: call_block(call).map(Arc::new),
                     output_ref: output_ref.clone().map(SharedString::from),
                     output_bytes: *output_bytes,
                     diff_ref: diff_ref.clone().map(SharedString::from),
@@ -2791,6 +2894,10 @@ impl Transcript {
                 best.map(|(_, d)| d).or_else(|| tool.detail.clone())
             })
             .collect();
+        // Full-invocation blocks — with them, EVERY chip expands: the click
+        // always answers "what exactly was this call?", output or not.
+        let invocations: Vec<Option<Arc<ToolDetail>>> =
+            tools.iter().map(|tool| tool.invocation.clone()).collect();
         // Fetch affordance under each open detail whose full payload is still
         // sidecar-only: `(ref, label)`. Diff offered first (the richer
         // upgrade), then the output — a fetched ref hands the affordance to
@@ -2846,9 +2953,10 @@ impl Transcript {
         // the FINAL state; a mid-tween detail already counts as its target).
         let detail_folds: Vec<FoldState> = details
             .iter()
+            .zip(&invocations)
             .enumerate()
-            .map(|(ix, detail)| {
-                if detail.is_none() {
+            .map(|(ix, (detail, invocation))| {
+                if detail.is_none() && invocation.is_none() {
                     return FoldState::default();
                 }
                 self.tool_details
@@ -2859,17 +2967,22 @@ impl Transcript {
             .collect();
         let detail_opens: Vec<bool> = details
             .iter()
+            .zip(&invocations)
             .zip(&detail_folds)
-            .map(|(detail, fold)| detail.is_some() && fold.open.unwrap_or(false))
+            .map(|((detail, invocation), fold)| {
+                (detail.is_some() || invocation.is_some()) && fold.open.unwrap_or(false)
+            })
             .collect();
         let open_height = chips_height(tools.len())
             + details
                 .iter()
+                .zip(&invocations)
                 .zip(&affordances)
                 .zip(&detail_opens)
                 .filter(|(_, open)| **open)
-                .map(|((detail, affordance), _)| {
-                    detail.as_deref().map_or(0.0, detail_height)
+                .map(|(((detail, invocation), affordance), _)| {
+                    invocation.as_deref().map_or(0.0, detail_height)
+                        + detail.as_deref().map_or(0.0, detail_height)
                         + if affordance.is_some() {
                             BLOB_AFFORDANCE_HEIGHT
                         } else {
@@ -2930,9 +3043,11 @@ impl Transcript {
             .flex_col()
             .gap(px(CHIP_GAP))
             .children(tools.iter().enumerate().map(|(ix, tool)| {
-                let Some(detail) = details[ix].clone() else {
+                let detail = details[ix].clone();
+                let invocation = invocations[ix].clone();
+                if detail.is_none() && invocation.is_none() {
                     return tool_chip(tool, theme);
-                };
+                }
                 let affordance = affordances[ix].clone();
                 let affordance_h = if affordance.is_some() {
                     BLOB_AFFORDANCE_HEIGHT
@@ -2954,7 +3069,10 @@ impl Transcript {
                 // (user report: "tool calls cut off at the bottom"). The
                 // explicit height is also what the open/close tween animates.
                 let closed_h = CHIP_CARD_HEIGHT;
-                let open_h = CHIP_CARD_HEIGHT + detail_height(&detail) + affordance_h;
+                let open_h = CHIP_CARD_HEIGHT
+                    + invocation.as_deref().map_or(0.0, detail_height)
+                    + detail.as_deref().map_or(0.0, detail_height)
+                    + affordance_h;
                 let card_target = if open { open_h } else { closed_h };
                 let animating = dfold.epoch > 0
                     && dfold
@@ -2990,15 +3108,19 @@ impl Transcript {
                             .child(chip_header(tool, open, theme)),
                     );
                 // The body stays mounted while the close tween shrinks over it.
+                // Invocation first (what was asked), then output/diff (what
+                // came back), each under its own hairline.
                 if open || animating {
-                    card = card
-                        .child(
-                            div()
-                                .h(px(DETAIL_SEPARATOR))
-                                .flex_none()
-                                .bg(crate::theme::hairline(0.06)),
-                        )
-                        .child(detail_body(&detail, theme));
+                    for block in [&invocation, &detail].into_iter().flatten() {
+                        card = card
+                            .child(
+                                div()
+                                    .h(px(DETAIL_SEPARATOR))
+                                    .flex_none()
+                                    .bg(crate::theme::hairline(0.06)),
+                            )
+                            .child(detail_body(block, theme));
+                    }
                     if let Some((blob_ref, label)) = affordance {
                         let loading = matches!(
                             self.blob_details.get(&blob_ref),
@@ -4213,6 +4335,7 @@ mod tests {
             is_error: false,
             resolved: true,
             detail: None,
+            invocation: None,
             output_ref: None,
             output_bytes: None,
             diff_ref: None,
@@ -4226,6 +4349,7 @@ mod tests {
             is_error: false,
             resolved: true,
             detail: None,
+            invocation: None,
             output_ref: None,
             output_bytes: None,
             diff_ref: None,
@@ -4255,6 +4379,7 @@ mod tests {
                 is_error: false,
                 resolved: true,
                 detail: None,
+                invocation: None,
                 output_ref: None,
                 output_bytes: None,
                 diff_ref: None,
@@ -4266,6 +4391,7 @@ mod tests {
                 is_error: false,
                 resolved: true,
                 detail: None,
+                invocation: None,
                 output_ref: None,
                 output_bytes: None,
                 diff_ref: None,
@@ -4275,6 +4401,7 @@ mod tests {
                 is_error: false,
                 resolved: true,
                 detail: None,
+                invocation: None,
                 output_ref: None,
                 output_bytes: None,
                 diff_ref: None,
@@ -4343,6 +4470,71 @@ mod tests {
             query: "line one\nline two".into(),
         });
         assert_eq!(q, "line one line two");
+    }
+
+    #[test]
+    fn call_block_carries_the_full_invocation() {
+        // Multi-line command: verbatim lines, not the flattened chip line.
+        let Some(ToolDetail::Output {
+            lines,
+            truncated_by,
+        }) = call_block(&ToolCall::Exec {
+            command: "set -e\ncargo test".into(),
+        })
+        else {
+            panic!("expected an output block")
+        };
+        assert_eq!(truncated_by, 0);
+        assert_eq!(
+            lines.iter().map(|l| l.as_ref()).collect::<Vec<_>>(),
+            vec!["set -e", "cargo test"]
+        );
+
+        // A long single-line command soft-wraps instead of ellipsizing.
+        let Some(ToolDetail::Output { lines, .. }) = call_block(&ToolCall::Exec {
+            command: "x".repeat(CALL_WRAP_COLS * 2 + 10),
+        }) else {
+            panic!("expected an output block")
+        };
+        assert_eq!(lines.len(), 3);
+        assert!(lines.iter().all(|l| l.chars().count() <= CALL_WRAP_COLS));
+
+        // MCP input pretty-prints under the `server · tool` line.
+        let Some(ToolDetail::Output { lines, .. }) = call_block(&ToolCall::Mcp {
+            server: "gh".into(),
+            tool: "issues".into(),
+            input: Some(serde_json::json!({"repo": "komet"})),
+        }) else {
+            panic!("expected an output block")
+        };
+        assert_eq!(lines[0].as_ref(), "gh · issues");
+        assert!(lines.iter().any(|l| l.contains("\"repo\": \"komet\"")));
+
+        // Todos list one item per line with checkbox state.
+        let Some(ToolDetail::Output { lines, .. }) = call_block(&ToolCall::Todo {
+            items: vec![
+                komet_proto::TodoItem {
+                    text: "a".into(),
+                    done: true,
+                },
+                komet_proto::TodoItem {
+                    text: "b".into(),
+                    done: false,
+                },
+            ],
+        }) else {
+            panic!("expected an output block")
+        };
+        assert_eq!(
+            lines.iter().map(|l| l.as_ref()).collect::<Vec<_>>(),
+            vec!["[x] a", "[ ] b"]
+        );
+
+        // Blank invocation → no block; the chip stays a plain card.
+        assert!(call_block(&ToolCall::Exec {
+            command: "  \n ".into()
+        })
+        .is_none());
     }
 
     #[test]
