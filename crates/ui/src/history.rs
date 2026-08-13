@@ -20,7 +20,8 @@ use crate::theme::Theme;
 const HISTORY_PAGE_SIZE: usize = 100;
 const HISTORY_ROW_HEIGHT: f32 = 36.0;
 const HISTORY_LANE_SPACING: f32 = 12.0;
-const HISTORY_NODE_RADIUS: f32 = 3.25;
+const HISTORY_NODE_RADIUS: f32 = 3.0;
+const HISTORY_HEAD_RING_PADDING: f32 = 2.0;
 const HISTORY_STROKE_WIDTH: f32 = 1.5;
 const HISTORY_GRAPH_SATURATION: f32 = 0.72;
 const HISTORY_GRAPH_SIDE_PADDING: f32 = 5.0;
@@ -507,9 +508,11 @@ impl GitHistory {
                 element.child(
                     div()
                         .absolute()
-                        .left(px(node_x - HISTORY_NODE_RADIUS - 2.25))
-                        .top(px(HISTORY_ROW_HEIGHT / 2.0 - HISTORY_NODE_RADIUS - 2.25))
-                        .size(px((HISTORY_NODE_RADIUS + 2.25) * 2.0))
+                        .left(px(node_x - HISTORY_NODE_RADIUS - HISTORY_HEAD_RING_PADDING))
+                        .top(px(HISTORY_ROW_HEIGHT / 2.0
+                            - HISTORY_NODE_RADIUS
+                            - HISTORY_HEAD_RING_PADDING))
+                        .size(px((HISTORY_NODE_RADIUS + HISTORY_HEAD_RING_PADDING) * 2.0))
                         .rounded_full()
                         .border_1()
                         .border_color(color)
