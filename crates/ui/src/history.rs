@@ -921,8 +921,6 @@ impl GitHistory {
             .items_center()
             .gap(px(2.0))
             .rounded(px(4.0))
-            .border_1()
-            .border_color(color.opacity(0.22))
             .bg(color.opacity(0.07))
             .text_size(px(10.0))
             .text_color(color.opacity(0.9))
