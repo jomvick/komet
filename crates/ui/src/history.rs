@@ -10,9 +10,9 @@ use chrono::DateTime;
 use komet_proto::{GitHistoryCommit, GitHistoryPage, GitHistoryRef, GitHistoryRefKind};
 use komet_rpc::methods;
 use gpui::{
-    AnyElement, App, ClipboardItem, Context, Entity, ListAlignment, ListState, PathBuilder, Render,
-    SharedString, Subscription, Task, Window, canvas, container_query, div, list, point,
-    prelude::*, px,
+    AnyElement, App, ClipboardItem, Context, Entity, EventEmitter, ListAlignment, ListState,
+    PathBuilder, Render, SharedString, Subscription, Task, Window, canvas, container_query, div,
+    list, point, prelude::*, px,
 };
 
 use crate::state::AppState;
@@ -338,12 +338,102 @@ pub struct GitHistory {
     copied_sha: Option<String>,
     request_task: Option<Task<()>>,
     copy_task: Option<Task<()>>,
+    fetching_all: bool,
+    fetch_for: Option<String>,
+    fetch_error: Option<SharedString>,
+    fetch_task: Option<Task<()>>,
     _observe: Subscription,
 }
+
+pub enum GitHistoryEvent {
+    FetchSucceeded,
+}
+
+impl EventEmitter<GitHistoryEvent> for GitHistory {}
 
 pub struct GitHistoryCount {
     history: Entity<GitHistory>,
     _observe: Subscription,
+}
+
+pub struct GitHistoryFetchButton {
+    history: Entity<GitHistory>,
+    _observe: Subscription,
+}
+
+impl GitHistoryFetchButton {
+    pub fn new(history: Entity<GitHistory>, cx: &mut Context<Self>) -> Self {
+        let observe = cx.observe(&history, |_, _, cx| cx.notify());
+        Self {
+            history,
+            _observe: observe,
+        }
+    }
+}
+
+impl Render for GitHistoryFetchButton {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::of(cx).clone();
+        let fetching = self.history.read(cx).fetching_all;
+        let history = self.history.clone();
+        div()
+            .id("history-fetch-all")
+            .h(px(24.0))
+            .px(px(8.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap(px(6.0))
+            .rounded(px(6.0))
+            .bg(if fetching {
+                crate::theme::wash(0.05)
+            } else {
+                crate::motion::hover_blend(
+                    "history-fetch-all",
+                    crate::theme::wash(0.0),
+                    crate::theme::wash(0.14),
+                )
+            })
+            .occlude()
+            .on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
+                window.prevent_default()
+            })
+            .when(!fetching, |element| {
+                element
+                    .cursor_pointer()
+                    .on_hover(crate::motion::hover_listener("history-fetch-all"))
+                    .on_click(move |_, _, cx| {
+                        cx.stop_propagation();
+                        history.update(cx, |history, cx| history.fetch_all(cx));
+                    })
+            })
+            .child(if fetching {
+                crate::loaders::mini_gradient_spinner(
+                    "history-fetch-all-spinner",
+                    1.75,
+                    cx.entity_id(),
+                    cx,
+                )
+                .into_any_element()
+            } else {
+                crate::icons::icon(crate::icons::CLOUD)
+                    .size(px(12.0))
+                    .text_color(theme.text_muted.opacity(0.75))
+                    .into_any_element()
+            })
+            .child(
+                div()
+                    .whitespace_nowrap()
+                    .text_size(px(11.0))
+                    .text_color(if fetching {
+                        theme.text_faint
+                    } else {
+                        theme.text_muted
+                    })
+                    .child(if fetching { "Fetching…" } else { "Fetch all" }),
+            )
+    }
 }
 
 impl GitHistoryCount {
@@ -418,6 +508,10 @@ impl GitHistory {
             copied_sha: None,
             request_task: None,
             copy_task: None,
+            fetching_all: false,
+            fetch_for: None,
+            fetch_error: None,
+            fetch_task: None,
             _observe: observe,
         }
     }
@@ -435,6 +529,10 @@ impl GitHistory {
     pub fn ensure_loaded(&mut self, cx: &mut Context<Self>) {
         self.started = true;
         let Some((key, cwd, target)) = self.context(cx) else {
+            self.fetch_task = None;
+            self.fetching_all = false;
+            self.fetch_for = None;
+            self.fetch_error = None;
             self.target_key = None;
             self.commits.clear();
             self.total_count = None;
@@ -451,6 +549,10 @@ impl GitHistory {
             return;
         }
         self.request_task = None;
+        self.fetch_task = None;
+        self.fetching_all = false;
+        self.fetch_for = None;
+        self.fetch_error = None;
         self.loading = false;
         self.target_key = Some(key.clone());
         self.commits.clear();
@@ -470,6 +572,54 @@ impl GitHistory {
         };
         self.target_key = Some(key.clone());
         self.fetch_page(key, cwd, target, 0, true, cx);
+    }
+
+    pub fn fetch_all(&mut self, cx: &mut Context<Self>) {
+        if self.fetching_all {
+            return;
+        }
+        let Some((key, cwd, target)) = self.context(cx) else {
+            return;
+        };
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        self.fetching_all = true;
+        self.fetch_for = Some(key.clone());
+        self.fetch_error = None;
+        cx.notify();
+        self.fetch_task = Some(cx.spawn(async move |this, cx| {
+            let mut params = serde_json::Map::new();
+            params.insert("repoPath".into(), serde_json::Value::String(cwd.clone()));
+            if let Some(target) = target.clone() {
+                params.insert("targetDeviceId".into(), serde_json::Value::String(target));
+            }
+            let result = engine
+                .client()
+                .call(methods::FETCH_ALL, serde_json::Value::Object(params))
+                .await;
+            this.update(cx, |history, cx| {
+                if history.fetch_for.as_deref() != Some(key.as_str()) {
+                    return;
+                }
+                history.fetching_all = false;
+                history.fetch_for = None;
+                match result {
+                    Ok(_) => {
+                        history.fetch_error = None;
+                        // Cancel a pre-fetch history request so the next page
+                        // is guaranteed to observe the updated remote refs.
+                        history.request_task = None;
+                        history.loading = false;
+                        history.fetch_page(key, cwd, target, 0, true, cx);
+                        cx.emit(GitHistoryEvent::FetchSucceeded);
+                    }
+                    Err(error) => history.fetch_error = Some(error.to_string().into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     pub fn commit_count(&self) -> Option<usize> {
@@ -1040,6 +1190,23 @@ impl Render for GitHistory {
             .size_full()
             .flex()
             .flex_col()
+            .when_some(self.fetch_error.clone(), |element, error| {
+                element.child(
+                    div()
+                        .h(px(28.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .px(px(8.0))
+                        .border_b_1()
+                        .border_color(theme.danger.opacity(0.16))
+                        .bg(theme.danger.opacity(0.05))
+                        .truncate()
+                        .text_size(px(11.0))
+                        .text_color(theme.danger_muted)
+                        .child(SharedString::from(format!("Fetch failed: {error}"))),
+                )
+            })
             .when_some(
                 self.error.clone().filter(|_| !self.commits.is_empty()),
                 |element, error| {

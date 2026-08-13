@@ -38,6 +38,22 @@ async fn git(cwd: &Path, args: &[&str]) {
     );
 }
 
+async fn git_stdout(cwd: &Path, args: &[&str]) -> String {
+    let output = tokio::process::Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .await
+        .expect("git spawns");
+    assert!(
+        output.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
 /// Init a repo at `dir` with one committed file `a.txt`.
 async fn init_repo(dir: &Path) {
     std::fs::create_dir_all(dir).expect("repo dir");
@@ -260,6 +276,71 @@ async fn git_history_is_topological_paged_and_carries_public_refs() {
     assert_eq!(second.next_cursor, None);
     assert_eq!(second.total_count, None);
     assert_eq!(second.head_commit_count, None);
+}
+
+#[tokio::test]
+async fn fetch_all_updates_only_remote_tracking_refs() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo_dir = tmp.path().join("fetch-repo");
+    let remote_dir = tmp.path().join("remote.git");
+    init_repo(&repo_dir).await;
+    git(
+        tmp.path(),
+        &["init", "--bare", remote_dir.to_str().unwrap()],
+    )
+    .await;
+    git(
+        &repo_dir,
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+    )
+    .await;
+    git(&repo_dir, &["push", "-u", "origin", "main"]).await;
+
+    let peer_dir = tmp.path().join("peer");
+    git(
+        tmp.path(),
+        &[
+            "clone",
+            remote_dir.to_str().unwrap(),
+            peer_dir.to_str().unwrap(),
+        ],
+    )
+    .await;
+    git(&peer_dir, &["checkout", "main"]).await;
+    std::fs::write(peer_dir.join("remote.txt"), "remote\n").expect("remote file");
+    git(&peer_dir, &["add", "."]).await;
+    git(&peer_dir, &["commit", "-m", "remote commit"]).await;
+    git(&peer_dir, &["push", "origin", "main"]).await;
+
+    std::fs::write(repo_dir.join("a.txt"), "staged locally\n").expect("local edit");
+    git(&repo_dir, &["add", "a.txt"]).await;
+    std::fs::write(repo_dir.join("untracked.txt"), "untracked\n").expect("untracked file");
+    let head_before = git_stdout(&repo_dir, &["rev-parse", "HEAD"]).await;
+    let branch_before = git_stdout(&repo_dir, &["branch", "--show-current"]).await;
+    let status_before = git_stdout(&repo_dir, &["status", "--porcelain=v1"]).await;
+    let remote_before = git_stdout(&repo_dir, &["rev-parse", "origin/main"]).await;
+
+    test_repos(&tmp.path().join("data"))
+        .fetch_all(&repo_dir)
+        .await
+        .expect("fetch all");
+
+    assert_ne!(
+        git_stdout(&repo_dir, &["rev-parse", "origin/main"]).await,
+        remote_before
+    );
+    assert_eq!(
+        git_stdout(&repo_dir, &["rev-parse", "HEAD"]).await,
+        head_before
+    );
+    assert_eq!(
+        git_stdout(&repo_dir, &["branch", "--show-current"]).await,
+        branch_before
+    );
+    assert_eq!(
+        git_stdout(&repo_dir, &["status", "--porcelain=v1"]).await,
+        status_before
+    );
 }
 
 // ---------------------------------------------------------------------------

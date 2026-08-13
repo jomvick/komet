@@ -36,7 +36,7 @@ use komet_proto::{Chat, CheckoutDiff};
 use komet_rpc::methods;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
-use crate::history::{GitHistory, GitHistoryCount};
+use crate::history::{GitHistory, GitHistoryCount, GitHistoryEvent, GitHistoryFetchButton};
 use crate::markdown::highlight::{Lang, LineCarry, Token, lang_for_tag, tokenize_line};
 use crate::markdown::render;
 use crate::motion::{self, AnimationExt as _, CHEVRON, COLLAPSE};
@@ -788,6 +788,8 @@ pub struct Changes {
     ref_menu: Popup<RefMenu>,
     history: Option<Entity<GitHistory>>,
     history_count: Option<Entity<GitHistoryCount>>,
+    history_fetch_button: Option<Entity<GitHistoryFetchButton>>,
+    history_events: Option<Subscription>,
     _observe: Subscription,
 }
 
@@ -825,6 +827,8 @@ impl Changes {
             ref_menu: Popup::default(),
             history: None,
             history_count: None,
+            history_fetch_button: None,
+            history_events: None,
             _observe: observe,
         }
     }
@@ -1150,6 +1154,25 @@ impl Changes {
             return history.clone();
         }
         let history = cx.new(|cx| GitHistory::new(self.state.clone(), cx));
+        self.history_events = Some(cx.subscribe(
+            &history,
+            |this: &mut Self, _, event, cx| match event {
+                GitHistoryEvent::FetchSucceeded => {
+                    // Remote refs affect branch choices and every scoped diff
+                    // based on a ref. Force fresh reads after the engine has
+                    // also kicked its checkout-status watcher.
+                    this.branches_for = None;
+                    this.scoped_for = None;
+                    this.scoped_inflight = None;
+                    this.scoped_task = None;
+                    this.ensure_branches(cx);
+                    if this.scope != DiffScope::History {
+                        this.ensure_scoped(cx);
+                    }
+                    cx.notify();
+                }
+            },
+        ));
         self.history = Some(history.clone());
         history
     }
@@ -1162,6 +1185,16 @@ impl Changes {
         let count = cx.new(|cx| GitHistoryCount::new(history, cx));
         self.history_count = Some(count.clone());
         count
+    }
+
+    fn history_fetch_button(&mut self, cx: &mut Context<Self>) -> Entity<GitHistoryFetchButton> {
+        if let Some(button) = &self.history_fetch_button {
+            return button.clone();
+        }
+        let history = self.history_pane(cx);
+        let button = cx.new(|cx| GitHistoryFetchButton::new(history, cx));
+        self.history_fetch_button = Some(button.clone());
+        button
     }
 
     fn set_base_ref(&mut self, base: String, cx: &mut Context<Self>) {
@@ -1815,6 +1848,8 @@ impl Changes {
         let theme = Theme::of(cx).clone();
         let scope = self.scope;
         let history_count = (scope == DiffScope::History).then(|| self.history_count(cx));
+        let history_fetch_button =
+            (scope == DiffScope::History).then(|| self.history_fetch_button(cx));
         let trigger = div()
             .id("changes-scope-trigger")
             .h(px(24.0))
@@ -1874,12 +1909,20 @@ impl Changes {
         };
 
         let trailing: AnyElement = if scope == DiffScope::History {
-            Self::header_button("history-refresh", crate::icons::REFRESH, &theme)
-                .on_click(cx.listener(|this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.history_pane(cx)
-                        .update(cx, |history, cx| history.refresh(cx));
-                }))
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap(px(2.0))
+                .children(history_fetch_button)
+                .child(
+                    Self::header_button("history-refresh", crate::icons::REFRESH, &theme)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.history_pane(cx)
+                                .update(cx, |history, cx| history.refresh(cx));
+                        })),
+                )
                 .into_any_element()
         } else {
             Self::header_button("changes-fold-all", crate::icons::FOLD_VERTICAL, &theme)

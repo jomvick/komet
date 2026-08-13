@@ -200,6 +200,14 @@ impl Repos {
         })
     }
 
+    /// Fetch every configured remote without pruning or integrating anything
+    /// into the active branch. This intentionally updates refs only.
+    pub async fn fetch_all(&self, repo_path: &Path) -> Result<(), EngineError> {
+        self.git(&["fetch", "--all", "--quiet"], Some(repo_path))
+            .await
+            .map(drop)
+    }
+
     /// The absolute Git `HEAD` file for event-driven external branch reconciliation.
     pub async fn git_head_path(&self, path: &Path) -> Result<PathBuf, EngineError> {
         let git_dir = self
