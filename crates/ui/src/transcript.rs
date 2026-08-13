@@ -114,13 +114,16 @@ pub const GLIDE_MAX_VIEWPORTS: f32 = 2.5;
 /// The titlebar overlays the full-height list, so its height is part of the
 /// inset; the extra 10px matches the first row's breathing room.
 const OWN_SEND_TOP_INSET_PX: f32 = Theme::TITLEBAR_HEIGHT + 10.0;
-/// Turn-height allowance baked into the PROVISIONAL reservation (sized before
-/// the sent rows have measured). Deliberately an UNDERSHOOT: too small a pad
-/// parks the prompt a bit below its inset until the refinement lands — still
-/// visible, so its bounds exist and the refinement can land. Too large a pad
-/// overscrolls the prompt off the top, where an unmeasured anchor row can
-/// never refine — the view sticks in blank runway (rig-caught).
-const OWN_SEND_PROMPT_ALLOWANCE_PX: f32 = 160.0;
+/// Scroll slack kept UNDER the reservation: the held layout stays this many
+/// px taller than the viewport, so the list never drops into its
+/// shorter-than-viewport regime — where a bottom-aligned list reports no
+/// item bounds (sizing goes blind), scroll_to clamps, and the prompt's
+/// position becomes a function of content height instead of the hold
+/// (rig-traced: the prompt crept up while chips streamed in and dropped
+/// back down when the turn completed and the trailer vanished). Well inside
+/// the 70px restick band, so returning to "the bottom" still re-arms the
+/// hold.
+const OWN_SEND_SCROLL_SLACK_PX: f32 = 24.0;
 /// Per-60fps-frame fraction of the remaining entry glide retained (~90%
 /// covered in ~230ms, ease-out).
 const OWN_SEND_GLIDE_RETAIN: f32 = 0.85;
@@ -1731,6 +1734,18 @@ impl Transcript {
         }
     }
 
+    /// The held prompt's top offset from the viewport top. Row 0 already
+    /// carries the titlebar chrome inside its own box (the first row's
+    /// top gap), so the hold adds nothing — adding the inset on top parked
+    /// a new chat's first prompt a double-chrome ~66px low (user report).
+    fn own_send_inset(anchor_ix: usize) -> f32 {
+        if anchor_ix == 0 {
+            0.0
+        } else {
+            OWN_SEND_TOP_INSET_PX
+        }
+    }
+
     fn own_turn_anchor_ix(&self) -> Option<usize> {
         let anchor = self.own_turn.as_ref()?;
         self.rows
@@ -1757,20 +1772,29 @@ impl Transcript {
             return;
         };
         let base_pad = self.bottom_clearance + Theme::TRANSCRIPT_FADE_BAND + 8.0;
-        let usable = viewport_height - OWN_SEND_TOP_INSET_PX - base_pad;
+        let inset = Self::own_send_inset(anchor_ix);
+        // The slack keeps the held layout scrollable (see the constant) —
+        // the reservation deliberately over-fills by this much.
+        let usable = viewport_height - inset - base_pad + OWN_SEND_SCROLL_SLACK_PX;
         let current = self.own_turn.as_ref().map_or(0.0, |a| a.runway);
 
         // A fresh anchor installs a provisional pad BEFORE anything needs
         // bounds: the just-sent rows sit below the fold, unmeasured, and
         // without the pad there is no scroll room to bring them into the
         // measured window (gating the pad on their bounds deadlocked — the
-        // clamped scroll kept them unmeasured forever). Sized for a turn of
-        // [`OWN_SEND_PROMPT_ALLOWANCE_PX`] so the entry glide UNDERSHOOTS
-        // (see the constant), keeping the anchor row on-screen for the
-        // refinement below to finish the job.
+        // clamped scroll kept them unmeasured forever). Sized at FULL
+        // `usable` — a deliberate overshoot by the turn's own height, safe
+        // under the absolute hold (scroll_to pins the prompt regardless) and
+        // REQUIRED for short chats: gpui's bottom-aligned list reports no
+        // item bounds while its content is shorter than the viewport
+        // (rig-traced: a new session's first send sat ~150px below the
+        // inset forever — the old undershot pad left the content short, the
+        // bounds-free scroll_to clamped, and the bounds-gated refinement
+        // could never rescue it). Overshooting guarantees the scroll room;
+        // the surplus sits below the fold until the refinement trues it.
         if current <= 0.0 {
             if let Some(anchor) = self.own_turn.as_mut() {
-                anchor.runway = (usable - OWN_SEND_PROMPT_ALLOWANCE_PX).max(0.0);
+                anchor.runway = usable.max(0.0);
             }
             self.remeasure_last_row();
             cx.notify();
@@ -1833,7 +1857,7 @@ impl Transcript {
                 .bounds_for_item(anchor_ix)
                 .is_none_or(|b| {
                     (f32::from(b.top())
-                        - (f32::from(viewport.top()) + OWN_SEND_TOP_INSET_PX))
+                        - (f32::from(viewport.top()) + inset))
                         .abs()
                         > 0.5
                 });
@@ -1842,7 +1866,7 @@ impl Transcript {
                     item_ix: anchor_ix,
                     offset_in_item: px(0.0),
                 });
-                self.list.scroll_by(px(-OWN_SEND_TOP_INSET_PX));
+                self.list.scroll_by(px(-inset));
                 cx.notify();
             }
             return;
@@ -1861,7 +1885,7 @@ impl Transcript {
         // prompt, so this leg can never overshoot it).
         let err = match self.list.bounds_for_item(anchor_ix) {
             Some(bounds) => {
-                f32::from(bounds.top()) - (f32::from(viewport.top()) + OWN_SEND_TOP_INSET_PX)
+                f32::from(bounds.top()) - (f32::from(viewport.top()) + inset)
             }
             None => self.distance_from_bottom(),
         };
@@ -1877,7 +1901,7 @@ impl Transcript {
                 item_ix: anchor_ix,
                 offset_in_item: px(0.0),
             });
-            self.list.scroll_by(px(-OWN_SEND_TOP_INSET_PX));
+            self.list.scroll_by(px(-inset));
             if let Some(anchor) = self.own_turn.as_mut() {
                 anchor.positioned = true;
             }
