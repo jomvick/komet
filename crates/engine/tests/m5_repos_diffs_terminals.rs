@@ -10,7 +10,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 
 use komet_engine::{
     EngineCore, HarnessRegistry, Repos, Terminals, capture_diff, capture_diff_against,
-    capture_turn_diff, merge_base, snapshot_tree,
+    capture_turn_diff, merge_base, read_diff_file_text, snapshot_tree, working_diff_base,
 };
 use komet_proto::{GitHistoryRefKind, TerminalEvent};
 use komet_rpc::methods;
@@ -518,6 +518,46 @@ async fn diff_capture_against_merge_base_shows_branch_changes() {
 }
 
 #[tokio::test]
+async fn diff_file_text_returns_both_checked_sources() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo_dir = tmp.path().join("repo");
+    init_repo(&repo_dir).await;
+    let repos = test_repos(&tmp.path().join("data"));
+    std::fs::write(repo_dir.join("a.txt"), "one\nchanged\n").expect("edit a.txt");
+
+    let snapshot = capture_diff(&repos, &repo_dir).await.expect("capture");
+    let file = snapshot
+        .files
+        .iter()
+        .find(|file| file.path == "a.txt")
+        .unwrap();
+    let base = working_diff_base(&repo_dir).await.expect("base");
+    let pair = read_diff_file_text(&repo_dir, &base, file)
+        .await
+        .expect("source pair");
+    assert_eq!(pair.old_text.as_deref(), Some("one\ntwo\n"));
+    assert_eq!(pair.new_text.as_deref(), Some("one\nchanged\n"));
+    assert!(pair.old_content_hash.is_some());
+    assert!(pair.new_content_hash.is_some());
+    assert!(!pair.binary);
+    assert!(!pair.truncated);
+
+    let escape = komet_proto::DiffFileSummary {
+        path: "../outside.txt".into(),
+        old_path: None,
+        status: "modified".into(),
+        additions: 1,
+        deletions: 1,
+        binary: false,
+    };
+    assert!(
+        read_diff_file_text(&repo_dir, &base, &escape)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
 async fn turn_diff_captures_only_changes_since_snapshot() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let repo_dir = tmp.path().join("repo");
@@ -538,8 +578,11 @@ async fn turn_diff_captures_only_changes_since_snapshot() {
     assert!(clean.files.is_empty());
 
     // The "turn" edits one file and adds another.
-    std::fs::write(repo_dir.join("pre.txt"), "before the turn\nedited in turn\n")
-        .expect("edit pre.txt");
+    std::fs::write(
+        repo_dir.join("pre.txt"),
+        "before the turn\nedited in turn\n",
+    )
+    .expect("edit pre.txt");
     std::fs::write(repo_dir.join("turn.txt"), "made this turn\n").expect("turn.txt");
     let turn = capture_turn_diff(&repos, &repo_dir, &turn_tree)
         .await
