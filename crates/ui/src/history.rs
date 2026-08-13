@@ -224,6 +224,14 @@ fn ref_color(reference: &GitHistoryRef, theme: &Theme) -> gpui::Hsla {
     }
 }
 
+fn ref_icon(kind: GitHistoryRefKind) -> &'static str {
+    match kind {
+        GitHistoryRefKind::Branch => crate::icons::GIT_BRANCH,
+        GitHistoryRefKind::Remote => crate::icons::CLOUD,
+        GitHistoryRefKind::Tag => crate::icons::TAG,
+    }
+}
+
 fn graph_color(mut color: gpui::Hsla) -> gpui::Hsla {
     color.s *= HISTORY_GRAPH_SATURATION;
     color
@@ -532,6 +540,7 @@ impl GitHistory {
 
     fn render_ref(reference: GitHistoryRef, theme: &Theme) -> AnyElement {
         let color = ref_color(&reference, theme);
+        let icon = ref_icon(reference.kind);
         div()
             .h(px(16.0))
             .max_w(px(112.0))
@@ -539,12 +548,19 @@ impl GitHistory {
             .flex_none()
             .flex()
             .items_center()
+            .gap(px(2.0))
             .rounded(px(4.0))
             .border_1()
             .border_color(color.opacity(0.22))
             .bg(color.opacity(0.07))
             .text_size(px(10.0))
             .text_color(color.opacity(0.9))
+            .child(
+                crate::icons::icon(icon)
+                    .size(px(10.0))
+                    .mt(px(1.0))
+                    .text_color(color.opacity(0.78)),
+            )
             .child(
                 div()
                     .min_w_0()
