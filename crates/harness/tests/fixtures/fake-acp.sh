@@ -196,6 +196,126 @@ case "$promptline" in
   fi
   ;;
 
+*scenario:starve*)
+  # The 2026-08-12 wedge: the prompt's turn was consumed by CLI-side
+  # self-continuation and its response NEVER comes. Steering then answers
+  # noRunningTurn — the harness must settle the dead turn after its grace
+  # and promote the queued steer to a fresh session/prompt.
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"working"}}'
+  read -r steerline || exit 1
+  sid=$(rid "$steerline")
+  has "$steerline" '"method":"_session/steering"' || exit 1
+  emit "{\"id\":$sid,\"result\":{\"outcome\":\"promptRequired\",\"reason\":\"noRunningTurn\"}}"
+  # No response to $pid, ever. The next line must be the promoted prompt.
+  read -r followline || exit 1
+  fid=$(rid "$followline")
+  if has "$followline" '"method":"session/prompt"' && has "$followline" 'what about now'; then
+    update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"promoted"}}'
+    emit "{\"id\":$fid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  else
+    emit "{\"id\":$fid,\"result\":{\"stopReason\":\"refusal\"}}"
+  fi
+  ;;
+
+*scenario:cost-starve*)
+  # The dropped-reply turn end, no steer involved: the turn's terminal
+  # cost frame arrives but the prompt response never does. The harness
+  # (claude spec) must settle the turn ~1s after the cost frame instead of
+  # stranding Working. Script exits shortly after so the stream ends.
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"working"}}'
+  update '{"sessionUpdate":"usage_update","used":22457,"size":1000000,"cost":{"amount":0.01,"currency":"USD"}}'
+  # No response to $pid, ever.
+  sleep 6
+  exit 0
+  ;;
+
+*scenario:busy-steer*)
+  # Prevention: the turn settles, then the agent SELF-CONTINUES (a turn no
+  # prompt started, visible as an open tool call). A steer arriving now
+  # must NOT become a session/prompt (the adapter drops that reply — the
+  # verified starve): the harness cancels the unowned turn first, then
+  # prompts after the flush window.
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"first"}}'
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  update '{"sessionUpdate":"tool_call","toolCallId":"sc-1","title":"self-continued work","kind":"execute","status":"pending","rawInput":{"command":"make"}}'
+  read -r cancelline || exit 1
+  has "$cancelline" '"method":"session/cancel"' || exit 1
+  update '{"sessionUpdate":"tool_call_update","toolCallId":"sc-1","status":"completed","content":[]}'
+  read -r followline || exit 1
+  fid=$(rid "$followline")
+  if has "$followline" '"method":"session/prompt"' && has "$followline" 'what about now'; then
+    update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"fresh answer"}}'
+    emit "{\"id\":$fid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  else
+    emit "{\"id\":$fid,\"result\":{\"stopReason\":\"refusal\"}}"
+  fi
+  ;;
+
+*scenario:native-busy-steer*)
+  # Claude's native path: steer into a self-continued turn must arrive as a
+  # plain session/prompt (NO cancel — the CLI folds it into the running
+  # turn natively). The adapter drops that prompt's reply; the harness must
+  # settle off the turn-end cost frame instead.
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"first"}}'
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  update '{"sessionUpdate":"tool_call","toolCallId":"sc-2","title":"self-continued work","kind":"execute","status":"pending","rawInput":{"command":"make"}}'
+  read -r followline || exit 1
+  if has "$followline" '"method":"session/cancel"'; then
+    # Cancelling would kill the agent's in-flight work: fail loudly.
+    update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"CANCELLED-NATIVE-WORK"}}'
+    exit 1
+  fi
+  fid=$(rid "$followline")
+  { has "$followline" '"method":"session/prompt"' && has "$followline" 'what about now'; } || exit 1
+  # The merged turn finishes: tool resolves, folded reply streams, the
+  # terminal cost frame arrives — and the prompt response NEVER does.
+  update '{"sessionUpdate":"tool_call_update","toolCallId":"sc-2","status":"completed","content":[]}'
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"merged reply"}}'
+  update '{"sessionUpdate":"usage_update","used":30000,"size":1000000,"cost":{"amount":0.02,"currency":"USD"}}'
+  sleep 6
+  exit 0
+  ;;
+
+*scenario:steer-cost-noise*)
+  # The injection cost frame (2026-08-13): claude-agent-acp stamps a
+  # cost-bearing usage_update for the injected message itself, MID-turn,
+  # identical in shape to the terminal one. The harness (claude spec) must
+  # not settle off it — the turn continues and ends via its real response:
+  # exactly one Done, all text intact.
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"first"}}'
+  read -r steerline || exit 1
+  sid=$(rid "$steerline")
+  has "$steerline" '"method":"_session/steering"' || exit 1
+  emit "{\"id\":$sid,\"result\":{\"outcome\":\"injected\"}}"
+  update '{"sessionUpdate":"usage_update","used":21429,"size":200000,"cost":{"amount":0.0006,"currency":"USD"},"_meta":{"_claude/origin":{"kind":"human"}}}'
+  sleep 3
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"steered tail"}}'
+  update '{"sessionUpdate":"usage_update","used":21884,"size":200000,"cost":{"amount":0.02,"currency":"USD"},"_meta":{"_claude/origin":{"kind":"human"}}}'
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  ;;
+
+*scenario:quiet-starve*)
+  # Blanket dropped-reply settle, no adapter-specific evidence: content
+  # streamed, no open tool, then silence — the response never comes. The
+  # harness must settle off the generic quiet window (tests set
+  # KOMET_ACP_QUIET_SETTLE_MS small), well before this stream's 8s EOF.
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"working"}}'
+  sleep 8
+  exit 0
+  ;;
+
+*scenario:quiet-tool-guard*)
+  # The guard: an OPEN tool call makes silence legitimate. Quiet stretch is
+  # far past the test's settle window, but the pending tool must hold the
+  # settle off; the turn then ends normally — exactly one Done.
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"working"}}'
+  update '{"sessionUpdate":"tool_call","toolCallId":"slow-1","title":"slow build","kind":"execute","status":"pending","rawInput":{"command":"make"}}'
+  sleep 4
+  update '{"sessionUpdate":"tool_call_update","toolCallId":"slow-1","status":"completed","content":[]}'
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"finished"}}'
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  ;;
+
 *scenario:interrupt*)
   update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"working"}}'
   read -r intline || exit 1

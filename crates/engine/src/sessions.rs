@@ -1119,6 +1119,28 @@ async fn drive_run(
     const SESSION_IDLE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
     let mut idle_since: Option<tokio::time::Instant> = None;
     let steerable = harness.supports_steering();
+    // TURN-QUIESCE WATCHDOG (2026-08-12 stuck-Working incident): a harness
+    // that loses a turn's Done — the adapter never settles `session/prompt`
+    // even though the agent finished — strands Working forever: the live
+    // heartbeat above keeps the row fresh, and there is no per-turn timeout
+    // by design. This is NOT that stall timeout: it never ends the run or
+    // errors anything. When the stream has been silent past the window AND
+    // the fold shows completed output with nothing in flight (no unresolved
+    // tool, no open question), the turn parks exactly like a Done would —
+    // segment finalized Complete, status Idle, child and mailbox warm. A
+    // false trip (the agent was quietly waiting on something invisible)
+    // costs a status dip: the parked-resume path below re-arms Working the
+    // moment output flows again, and nothing is lost. `KOMET_TURN_QUIESCE_MS`
+    // overrides the window; 0 disables.
+    let quiesce_after: Option<std::time::Duration> = match std::env::var("KOMET_TURN_QUIESCE_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        Some(0) => None,
+        Some(ms) => Some(std::time::Duration::from_millis(ms)),
+        None => Some(std::time::Duration::from_secs(120)),
+    };
+    let mut last_stream_activity = tokio::time::Instant::now();
 
     let final_status = loop {
         let event: AgentEvent = tokio::select! {
@@ -1203,11 +1225,64 @@ async fn drive_run(
                 dirty = false;
                 continue;
             }
+            // Turn-quiesce watchdog (see the knob above). Armed only when the
+            // fold says nothing is in flight: an unresolved tool part is a
+            // command still running (legitimately silent for minutes — the
+            // rejected stall-timeout case), an unresolved input part is a
+            // question awaiting the user. The live-plan chip is exempt from
+            // the tool check: it is a singleton that never resolves. An EMPTY
+            // fold still arms — a Steered boundary that no output ever
+            // follows is one of the wedge shapes — it just parks without
+            // writing a segment (an empty finalize would leave a stub entry).
+            _ = tokio::time::sleep_until(
+                last_stream_activity + quiesce_after.unwrap_or_default()
+            ), if quiesce_after.is_some()
+                && idle_since.is_none()
+                && !interrupted
+                && steerable
+                && !folded.iter().any(|p| match p {
+                    MessagePart::Tool { id, resolved: false, .. } => {
+                        id != komet_proto::LIVE_PLAN_TOOL_ID
+                    }
+                    MessagePart::Input { resolved: false, .. } => true,
+                    _ => false,
+                }) =>
+            {
+                tracing::warn!(
+                    chat = %chat_id,
+                    quiet_ms = quiesce_after.unwrap_or_default().as_millis() as u64,
+                    "turn quiesced: stream silent after completed output with no \
+                     turn-end; parking (suspected missing harness Done)"
+                );
+                if !folded.is_empty() || writer.is_some() {
+                    if let Err(err) = finish_segment(
+                        doc_ref,
+                        writer.take(),
+                        &entry_id,
+                        &device_id,
+                        segment_started,
+                        &folded,
+                        MessageStatus::Complete,
+                    ) {
+                        tracing::warn!(chat = %chat_id, error = %err, "quiesce segment finish failed");
+                    }
+                    inner.note_message(&chat_id, &folded_text(&folded));
+                }
+                folded.clear();
+                dirty = false;
+                entry_id = new_id();
+                segment_started = now_ms();
+                idle_since = Some(tokio::time::Instant::now());
+                inner.set_status(&chat_id, SessionStatus::Idle, false);
+                continue;
+            }
         };
 
         // Any stream activity proves the run is alive — keep the session's
-        // freshness inside the UI's 45s staleness window (throttled).
+        // freshness inside the UI's 45s staleness window (throttled), and
+        // push the quiesce watchdog's window out.
         inner.touch_session(&chat_id);
+        last_stream_activity = tokio::time::Instant::now();
         // The engine's input bridge is the sole authority on input requests:
         // it mints the id and parks the resolver BEFORE emitting the event,
         // so a legitimate id is always pending here. A harness emitting its
@@ -1231,40 +1306,81 @@ async fn drive_run(
                 continue;
             }
         }
-        // PARKED: only a steer boundary (or an input round-trip / terminal
-        // Done) re-opens the session. The ACP child keeps forwarding
-        // `session/update` frames after a turn completes — late
-        // tool_call_updates for long-running commands, command refreshes,
-        // reasoning heartbeats. Treating those as "the next turn" re-armed
-        // Working with no Done ever coming (the eternally-running session
-        // bug) and folded orphan parts into a phantom segment.
+        // PARKED: a steer boundary, a terminal Done, or SELF-CONTINUED OUTPUT
+        // re-opens the session; everything else stays gated. The ACP child
+        // keeps forwarding `session/update` frames after a turn completes,
+        // and they split two ways:
+        //
+        // - Post-turn NOISE — late tool_call_updates for commands folded in a
+        //   prior segment, command refreshes, reasoning heartbeats. Treating
+        //   those as "the next turn" re-armed Working with no Done ever
+        //   coming (the eternally-running session bug) and folded orphan
+        //   parts into a phantom segment. Still dropped.
+        // - SELF-CONTINUED WORK — Claude Code re-invokes itself when a
+        //   background task finishes (turns no prompt started) and streams
+        //   real output for them. Dropping those LOST transcript content
+        //   (2026-08-12: "Build finished successfully…" streamed by the
+        //   agent, absent from the doc). Fresh text or a genuinely new tool
+        //   call resumes the session: new segment, Working, and the turn
+        //   settles again via Done — or via the quiesce watchdog, which is
+        //   what makes this resume safe where the naive version was not.
+        //
+        // The RESUME_GATE separates the two by arrival time: a finished
+        // turn's tail flush lands within milliseconds of its Done, while a
+        // self-continued turn starts a whole new agent round trip (seconds
+        // at minimum, minutes in the incident). Inside the gate everything
+        // non-boundary stays inert, exactly as before.
+        const RESUME_GATE: std::time::Duration = std::time::Duration::from_secs(1);
         if idle_since.is_some() {
-            match &event {
-                AgentEvent::Steered { .. } => {
-                    idle_since = None;
-                    inner.set_status(&chat_id, SessionStatus::Working, true);
-                }
-                AgentEvent::Done { .. } => {
-                    idle_since = None;
-                }
-                // A question with NO turn behind it (post-turn permission
-                // noise): answer it empty right here. Un-parking into
-                // AwaitingInput would disarm the idle reaper with no Done
-                // ever coming — stranded status, leaked warm child.
-                AgentEvent::InputRequested { request_id, .. } => {
-                    let resolver = lock(&inner.runs)
-                        .get(&chat_id)
-                        .and_then(|h| lock(&h.pending_inputs).remove(request_id));
-                    if let Some(tx) = resolver {
-                        let _ = tx.send(Vec::new());
+            let self_continued = idle_since
+                .is_some_and(|parked_at| parked_at.elapsed() >= RESUME_GATE)
+                && (matches!(
+                    &event,
+                    AgentEvent::TextDelta { text } if !text.is_empty()
+                ) || matches!(
+                    &event,
+                    AgentEvent::ToolCall { id, .. }
+                        if id == komet_proto::LIVE_PLAN_TOOL_ID || !seen_tools.contains(id)
+                ));
+            if self_continued {
+                tracing::info!(
+                    chat = %chat_id,
+                    "parked session resumed by self-continued agent output"
+                );
+                idle_since = None;
+                // The park cleared the fold; rotate to a fresh entry and
+                // fall through — this event is the new segment's first part.
+                entry_id = new_id();
+                segment_started = now_ms();
+                inner.set_status(&chat_id, SessionStatus::Working, true);
+            } else {
+                match &event {
+                    AgentEvent::Steered { .. } => {
+                        idle_since = None;
+                        inner.set_status(&chat_id, SessionStatus::Working, true);
                     }
-                    tracing::debug!(chat = %chat_id, "parked session: post-turn input request auto-declined");
-                    continue;
+                    AgentEvent::Done { .. } => {
+                        idle_since = None;
+                    }
+                    // A question with NO turn behind it (post-turn permission
+                    // noise): answer it empty right here. Un-parking into
+                    // AwaitingInput would disarm the idle reaper with no Done
+                    // ever coming — stranded status, leaked warm child.
+                    AgentEvent::InputRequested { request_id, .. } => {
+                        let resolver = lock(&inner.runs)
+                            .get(&chat_id)
+                            .and_then(|h| lock(&h.pending_inputs).remove(request_id));
+                        if let Some(tx) = resolver {
+                            let _ = tx.send(Vec::new());
+                        }
+                        tracing::debug!(chat = %chat_id, "parked session: post-turn input request auto-declined");
+                        continue;
+                    }
+                    // A stale answer settling after its turn already closed:
+                    // nothing is running — stay parked.
+                    AgentEvent::InputResolved { .. } => continue,
+                    _ => continue,
                 }
-                // A stale answer settling after its turn already closed:
-                // nothing is running — stay parked.
-                AgentEvent::InputResolved { .. } => continue,
-                _ => continue,
             }
         }
         // Empty reasoning deltas are PURE heartbeats: redacted thinking and
