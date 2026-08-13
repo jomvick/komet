@@ -3,7 +3,7 @@
 //! This crate intentionally has no UI, RPC, or engine dependencies. Public
 //! ranges are byte offsets relative to one UTF-8 source line.
 
-use std::{ops::Range, path::Path, sync::atomic::AtomicUsize};
+use std::{collections::BTreeSet, ops::Range, path::Path, sync::atomic::AtomicUsize};
 
 use tree_sitter_highlight::{HighlightConfiguration, HighlightEvent, Highlighter};
 
@@ -207,33 +207,63 @@ fn validate_span(source: &str, range: &Range<usize>) -> Result<(), HighlightErro
 }
 
 fn normalize_line(spans: Vec<HighlightSpan>) -> Vec<HighlightSpan> {
-    let mut boundaries = spans
+    #[derive(Clone, Copy)]
+    enum Edge {
+        Start(usize),
+        End(usize),
+    }
+
+    let mut edges = spans
         .iter()
-        .flat_map(|span| [span.range.start, span.range.end])
+        .enumerate()
+        .flat_map(|(index, span)| {
+            [
+                (span.range.start, Edge::Start(index)),
+                (span.range.end, Edge::End(index)),
+            ]
+        })
         .collect::<Vec<_>>();
-    boundaries.sort_unstable();
-    boundaries.dedup();
+    edges.sort_unstable_by_key(|(offset, _)| *offset);
+
+    // The span index is the tie-breaker so equal-precedence overlaps retain
+    // the old `Iterator::max_by_key` behavior (the later span wins).
+    let mut active = BTreeSet::new();
     let mut normalized: Vec<HighlightSpan> = Vec::new();
-    for pair in boundaries.windows(2) {
-        let range = pair[0]..pair[1];
-        if range.is_empty() {
+    let mut cursor = 0;
+    while cursor < edges.len() {
+        let offset = edges[cursor].0;
+        let group_start = cursor;
+        while cursor < edges.len() && edges[cursor].0 == offset {
+            if let Edge::End(index) = edges[cursor].1 {
+                active.remove(&(spans[index].kind.precedence(), index));
+            }
+            cursor += 1;
+        }
+        for (_, edge) in &edges[group_start..cursor] {
+            if let Edge::Start(index) = *edge {
+                active.insert((spans[index].kind.precedence(), index));
+            }
+        }
+
+        let Some(next_offset) = edges.get(cursor).map(|(next, _)| *next) else {
+            break;
+        };
+        if offset == next_offset {
             continue;
         }
-        let Some(kind) = spans
-            .iter()
-            .filter(|span| span.range.start <= range.start && span.range.end >= range.end)
-            .map(|span| span.kind)
-            .max_by_key(|kind| kind.precedence())
-        else {
-            continue;
-        };
-        if let Some(previous) = normalized.last_mut()
-            && previous.kind == kind
-            && previous.range.end == range.start
-        {
-            previous.range.end = range.end;
-        } else {
-            normalized.push(HighlightSpan { range, kind });
+        if let Some((_, index)) = active.last().copied() {
+            let kind = spans[index].kind;
+            if let Some(previous) = normalized.last_mut()
+                && previous.kind == kind
+                && previous.range.end == offset
+            {
+                previous.range.end = next_offset;
+            } else {
+                normalized.push(HighlightSpan {
+                    range: offset..next_offset,
+                    kind,
+                });
+            }
         }
     }
     normalized
@@ -283,7 +313,7 @@ pub fn highlight_with_limits(
     let mut primary_configuration = configuration(language)?;
     primary_configuration.configure(CAPTURE_NAMES);
     let injected = if matches!(language, LanguageId::Html | LanguageId::Markdown) {
-        [LanguageId::JavaScript, LanguageId::Css, LanguageId::Json]
+        injected_languages(language)
             .into_iter()
             .filter_map(|language| {
                 let mut config = configuration(language).ok()?;
@@ -332,6 +362,18 @@ pub fn highlight_with_limits(
         }
     }
     HighlightedDocument::from_absolute_spans(language, request.source, spans)
+}
+
+fn injected_languages(parent: LanguageId) -> Vec<LanguageId> {
+    use LanguageId::*;
+    match parent {
+        Html => vec![JavaScript, Css, Json],
+        Markdown => vec![
+            Rust, JavaScript, Jsx, TypeScript, Tsx, Python, Go, Json, Jsonc, Bash, Toml, Html, Css,
+            Yaml, C, Cpp, CSharp, Java, Kotlin, Swift, Ruby, Php, Sql, Lua, Dockerfile, Nix, Make,
+        ],
+        _ => Vec::new(),
+    }
 }
 
 fn rust_configuration() -> Result<HighlightConfiguration, HighlightError> {
@@ -805,6 +847,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn normalization_preserves_overlap_precedence_and_tie_order() {
+        let normalized = normalize_line(vec![
+            HighlightSpan {
+                range: 0..10,
+                kind: HighlightKind::Variable,
+            },
+            HighlightSpan {
+                range: 2..8,
+                kind: HighlightKind::Keyword,
+            },
+            HighlightSpan {
+                range: 4..6,
+                kind: HighlightKind::String,
+            },
+        ]);
+        assert_eq!(
+            normalized,
+            vec![
+                HighlightSpan {
+                    range: 0..2,
+                    kind: HighlightKind::Variable,
+                },
+                HighlightSpan {
+                    range: 2..4,
+                    kind: HighlightKind::Keyword,
+                },
+                HighlightSpan {
+                    range: 4..6,
+                    kind: HighlightKind::String,
+                },
+                HighlightSpan {
+                    range: 6..8,
+                    kind: HighlightKind::Keyword,
+                },
+                HighlightSpan {
+                    range: 8..10,
+                    kind: HighlightKind::Variable,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn minified_lines_normalize_without_quadratic_rescans() {
+        let source = "let value=1;".repeat(8_000);
+        let document = highlight(HighlightRequest {
+            source: &source,
+            path: Some("bundle.js"),
+            fence_tag: None,
+        })
+        .unwrap();
+        assert!(document.lines[0].len() > 20_000);
+    }
+
     fn highlighted_fragments(source: &str) -> Vec<(&str, HighlightKind)> {
         let document = highlight(HighlightRequest {
             source,
@@ -1040,5 +1137,31 @@ fn build(value: usize) -> Widget {
         })
         .unwrap();
         assert_eq!(document.language, LanguageId::Markdown);
+    }
+
+    #[test]
+    fn markdown_fences_use_all_bundled_child_grammars() {
+        let source = "```rust\nfn main() { let value = 42; }\n```\n\n```yaml\nenabled: true\n```\n";
+        let document = highlight(HighlightRequest {
+            source,
+            path: Some("README.md"),
+            fence_tag: None,
+        })
+        .unwrap();
+        assert!(
+            document.lines[1]
+                .iter()
+                .any(|span| span.kind == HighlightKind::Keyword),
+            "Rust fence was not injected: {:?}",
+            document.lines[1]
+        );
+        assert!(
+            document.lines[5].iter().any(|span| matches!(
+                span.kind,
+                HighlightKind::Property | HighlightKind::Boolean | HighlightKind::String
+            )),
+            "YAML fence was not injected: {:?}",
+            document.lines[5]
+        );
     }
 }

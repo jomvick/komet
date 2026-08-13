@@ -29,7 +29,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use gpui::{
@@ -1061,7 +1061,7 @@ pub fn format_elapsed(secs: i64) -> String {
 
 struct HighlightEntry {
     key: DocumentHighlightKey,
-    document: Option<Arc<komet_syntax::HighlightedDocument>>,
+    document: Option<Weak<komet_syntax::HighlightedDocument>>,
     _task: Option<Task<()>>,
 }
 
@@ -1089,14 +1089,17 @@ impl HighlightStore {
         if let Some(entry) = self.entries.get(&slot_key)
             && entry.key == document_key
         {
-            return entry.document.clone();
+            let document = entry.document.as_ref()?;
+            if let Some(document) = document.upgrade() {
+                return Some(document);
+            }
         }
         if let Some(document) = self.cache.get(&document_key) {
             self.entries.insert(
                 slot_key,
                 HighlightEntry {
                     key: document_key,
-                    document: Some(document.clone()),
+                    document: Some(Arc::downgrade(&document)),
                     _task: None,
                 },
             );
@@ -1149,11 +1152,10 @@ impl HighlightStore {
             this.update(cx, |transcript, cx| {
                 if let Some(document) = document {
                     let document = Arc::new(document);
-                    transcript.highlights.cache.insert(
-                        document_key,
-                        source_bytes,
-                        document.clone(),
-                    );
+                    let retained = transcript
+                        .highlights
+                        .cache
+                        .insert(document_key, document.clone());
                     if let Some(entry) = transcript.highlights.entries.get_mut(&slot_key)
                         && entry.key == document_key
                     {
@@ -1164,7 +1166,7 @@ impl HighlightStore {
                             elapsed_us = started.elapsed().as_micros() as u64,
                             "syntax highlight ready"
                         );
-                        entry.document = Some(document);
+                        entry.document = retained.then(|| Arc::downgrade(&document));
                         cx.notify();
                     }
                 }
