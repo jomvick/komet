@@ -14,7 +14,7 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::time::Instant;
 
-use komet_syntax::HighlightKind;
+use komet_syntax::{HighlightKind, HighlightSpan, HighlightedDocument};
 use gpui::{
     AnyElement, BorderStyle, Bounds, FontStyle, FontWeight, Hsla, InteractiveText, SharedString,
     StyledText, TextRun, UnderlineStyle, Window, canvas, div, font, point, prelude::*, px, quad,
@@ -159,7 +159,7 @@ impl RenderCache {
 }
 
 /// Per-line highlight tokens for a code block, or `None` while pending.
-pub type CodeHighlight<'a> = Option<&'a [Vec<Token>]>;
+pub type CodeHighlight<'a> = Option<&'a [Vec<HighlightSpan>]>;
 
 /// Render a whole tree stacked with the md block gap. `highlight` resolves
 /// tokens for a top-level block index (code blocks only).
@@ -168,14 +168,14 @@ pub fn render_tree(
     opts: &RenderOptions,
     theme: &Theme,
     window: &Window,
-    highlight: &dyn Fn(usize) -> Option<std::sync::Arc<Vec<Vec<Token>>>>,
+    highlight: &dyn Fn(usize) -> Option<std::sync::Arc<HighlightedDocument>>,
 ) -> AnyElement {
     div()
         .flex()
         .flex_col()
         .gap(px(MD_BLOCK_GAP))
         .children(tree.blocks.iter().enumerate().map(|(ix, top)| {
-            let lines = highlight(ix);
+            let document = highlight(ix);
             render_block(
                 &top.block,
                 ix,
@@ -183,7 +183,9 @@ pub fn render_tree(
                 opts,
                 theme,
                 window,
-                lines.as_deref().map(|l| &l[..]),
+                document
+                    .as_deref()
+                    .map(|document| document.lines.as_slice()),
             )
         }))
         .into_any_element()
@@ -1015,13 +1017,13 @@ fn render_code_block(
             .split('\n')
             .enumerate()
             .map(|(li, line)| {
-                let tokens = highlight
+                let spans = highlight
                     .and_then(|h| h.get(li))
                     .map(|t| &t[..])
                     .unwrap_or(&[]);
                 (
                     SharedString::from(line.to_string()),
-                    runs_for_code_line(line, tokens, &mono, theme),
+                    runs_for_syntax_line(line, spans, &mono, theme),
                 )
             })
             .collect();
@@ -1172,6 +1174,39 @@ pub fn runs_for_code_line(
     })
 }
 
+/// Build paint-only runs from the neutral Tree-sitter contract.
+pub fn runs_for_syntax_line(
+    line: &str,
+    spans: &[HighlightSpan],
+    mono: &gpui::Font,
+    theme: &Theme,
+) -> Vec<TextRun> {
+    let plain = |len: usize| TextRun {
+        len,
+        font: mono.clone(),
+        color: theme.text,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let mut runs = Vec::new();
+    let mut at = 0usize;
+    for span in spans {
+        if span.range.start > at {
+            runs.push(plain(span.range.start - at));
+        }
+        let mut run = plain(span.range.len());
+        run.color = token_color(span.kind, theme);
+        runs.push(run);
+        at = span.range.end;
+    }
+    if at < line.len() {
+        runs.push(plain(line.len() - at));
+    }
+    runs.retain(|run| run.len > 0);
+    runs
+}
+
 /// [`runs_for_code_line`] with a caller-supplied palette (the diff pane keys
 /// its plain color differently; the hues are shared via [`token_color`]).
 pub fn runs_with_palette(
@@ -1228,6 +1263,26 @@ mod tests {
         );
         // At least one non-plain color made it through.
         assert!(runs.iter().any(|r| r.color != theme.text));
+    }
+
+    #[test]
+    fn tree_sitter_runs_are_rich_and_paint_only() {
+        let theme = Theme::dark();
+        let mono = font(theme.font_mono.clone());
+        let line = "let widget = build!(42);";
+        let document = komet_syntax::highlight(komet_syntax::HighlightRequest {
+            source: line,
+            path: None,
+            fence_tag: Some("rust"),
+        })
+        .unwrap();
+        let runs = runs_for_syntax_line(line, &document.lines[0], &mono, &theme);
+        assert_eq!(runs.iter().map(|run| run.len).sum::<usize>(), line.len());
+        assert!(runs.iter().all(|run| run.font == mono));
+        let colors = runs.iter().map(|run| run.color).collect::<Vec<_>>();
+        assert!(colors.contains(&theme.syntax.keyword));
+        assert!(colors.contains(&theme.syntax.macro_name));
+        assert!(colors.contains(&theme.syntax.number));
     }
 
     #[test]

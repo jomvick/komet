@@ -1,0 +1,131 @@
+//! Bounded cache for neutral syntax documents.
+//!
+//! Colors and GPUI runs deliberately stay outside this cache so appearance
+//! changes recolor existing spans without parsing again.
+
+use std::{
+    collections::{HashMap, VecDeque},
+    sync::Arc,
+};
+
+use komet_syntax::{HighlightedDocument, LanguageId};
+use sha2::{Digest, Sha256};
+
+pub const QUERY_GENERATION: u32 = 1;
+const MAX_DOCUMENTS: usize = 96;
+const MAX_RETAINED_BYTES: usize = 24 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DocumentHighlightKey {
+    pub language: LanguageId,
+    pub content_hash: [u8; 32],
+    pub query_generation: u32,
+}
+
+impl DocumentHighlightKey {
+    pub fn new(language: LanguageId, source: &str) -> Self {
+        Self {
+            language,
+            content_hash: Sha256::digest(source.as_bytes()).into(),
+            query_generation: QUERY_GENERATION,
+        }
+    }
+}
+
+struct CachedDocument {
+    source_bytes: usize,
+    document: Arc<HighlightedDocument>,
+}
+
+#[derive(Default)]
+pub struct SyntaxHighlightCache {
+    documents: HashMap<DocumentHighlightKey, CachedDocument>,
+    recency: VecDeque<DocumentHighlightKey>,
+    retained_bytes: usize,
+}
+
+impl SyntaxHighlightCache {
+    pub fn get(&mut self, key: &DocumentHighlightKey) -> Option<Arc<HighlightedDocument>> {
+        let document = self.documents.get(key)?.document.clone();
+        self.touch(*key);
+        Some(document)
+    }
+
+    pub fn insert(
+        &mut self,
+        key: DocumentHighlightKey,
+        source_bytes: usize,
+        document: Arc<HighlightedDocument>,
+    ) {
+        if let Some(previous) = self.documents.remove(&key) {
+            self.retained_bytes = self.retained_bytes.saturating_sub(previous.source_bytes);
+        }
+        self.retained_bytes = self.retained_bytes.saturating_add(source_bytes);
+        self.documents.insert(
+            key,
+            CachedDocument {
+                source_bytes,
+                document,
+            },
+        );
+        self.touch(key);
+        while self.documents.len() > MAX_DOCUMENTS || self.retained_bytes > MAX_RETAINED_BYTES {
+            let Some(oldest) = self.recency.pop_front() else {
+                break;
+            };
+            if let Some(removed) = self.documents.remove(&oldest) {
+                self.retained_bytes = self.retained_bytes.saturating_sub(removed.source_bytes);
+            }
+        }
+    }
+
+    fn touch(&mut self, key: DocumentHighlightKey) {
+        self.recency.retain(|candidate| *candidate != key);
+        self.recency.push_back(key);
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.documents.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_depends_on_content_language_and_query_not_theme() {
+        let rust = DocumentHighlightKey::new(LanguageId::Rust, "fn main() {}");
+        assert_eq!(
+            rust,
+            DocumentHighlightKey::new(LanguageId::Rust, "fn main() {}")
+        );
+        assert_ne!(
+            rust,
+            DocumentHighlightKey::new(LanguageId::Rust, "fn other() {}")
+        );
+        assert_ne!(
+            rust,
+            DocumentHighlightKey::new(LanguageId::TypeScript, "fn main() {}")
+        );
+    }
+
+    #[test]
+    fn cache_reuses_neutral_documents() {
+        let source = "fn main() {}";
+        let key = DocumentHighlightKey::new(LanguageId::Rust, source);
+        let document = Arc::new(
+            komet_syntax::highlight(komet_syntax::HighlightRequest {
+                source,
+                path: None,
+                fence_tag: Some("rust"),
+            })
+            .unwrap(),
+        );
+        let mut cache = SyntaxHighlightCache::default();
+        cache.insert(key, source.len(), document.clone());
+        assert!(Arc::ptr_eq(&cache.get(&key).unwrap(), &document));
+        assert_eq!(cache.len(), 1);
+    }
+}
