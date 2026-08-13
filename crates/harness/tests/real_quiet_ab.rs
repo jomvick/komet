@@ -82,6 +82,31 @@ fn brief(ev: &AgentEvent) -> String {
 #[ignore = "real claude CLI + network; run explicitly for the A/B evidence probe"]
 async fn real_claude_quiet_ab_probe() {
     init_env();
+    let runs: usize = std::env::var("AB_RUNS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    let mut clean = 0usize;
+    let mut orphaned = 0usize;
+    for run in 1..=runs {
+        let (dones, after, finished) = probe_once(run == 1).await;
+        println!(
+            "RUN {run}/{runs} VERDICT: dones={dones} content_events_after_first_done={after} \
+             finished_text_contains_PROBE_DONE={finished}"
+        );
+        if after == 0 && dones == 1 {
+            clean += 1;
+        } else {
+            orphaned += 1;
+        }
+    }
+    println!(
+        "SUMMARY: runs={runs} clean={clean} orphaned={orphaned} \
+         (clean = one Done, ordered last; orphaned = premature Done, tail after it)"
+    );
+}
+
+async fn probe_once(print_trace: bool) -> (usize, usize, bool) {
     let (controls, steer_tx, _token) = controls();
     let harness = AcpHarness::claude();
     let req = RunRequest {
@@ -140,9 +165,11 @@ async fn real_claude_quiet_ab_probe() {
         }
     }
 
-    println!("--- TRACE (quiet knob = {QUIET_MS}ms) ---");
-    for (at, ev) in &events {
-        println!("{:>8.3}s  {}", at.as_secs_f64(), brief(ev));
+    if print_trace {
+        println!("--- TRACE (quiet knob = {QUIET_MS}ms) ---");
+        for (at, ev) in &events {
+            println!("{:>8.3}s  {}", at.as_secs_f64(), brief(ev));
+        }
     }
     let first_done_idx = events
         .iter()
@@ -173,13 +200,5 @@ async fn real_claude_quiet_ab_probe() {
             _ => None,
         })
         .collect();
-    println!(
-        "VERDICT: dones={dones} content_events_after_first_done={after} \
-         finished_text_contains_PROBE_DONE={}",
-        text.contains("PROBE-DONE")
-    );
-    println!(
-        "VERDICT-MEANING: after==0 && dones==1 → turn survived intact; \
-         after>0 → FALSE SETTLE (premature Done, orphaned tail)"
-    );
+    (dones, after, text.contains("PROBE-DONE"))
 }
