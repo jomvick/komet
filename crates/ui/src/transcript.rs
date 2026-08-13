@@ -226,6 +226,11 @@ pub struct ToolItem {
     /// Precomputed here because rows are cached by fingerprint — diffing and
     /// tokenizing per paint would run on every scroll frame.
     pub detail: Option<Arc<ToolDetail>>,
+    /// Expandable full-invocation block: the complete tool call (whole
+    /// command / pattern / URL / input JSON) that the chip header collapses
+    /// to one truncated line. Rendered above `detail` in the open card.
+    /// Precomputed for the same reason as `detail`.
+    pub invocation: Option<Arc<ToolDetail>>,
     /// Sidecar key of the full output (chat2-sync A3) — the doc carries only
     /// a one-line summary; expanding offers a lazy "Show full output" fetch.
     pub output_ref: Option<SharedString>,
@@ -312,6 +317,90 @@ pub fn tool_detail(
         .map(|l| SharedString::from(l.to_owned()))
         .collect();
     // Trim trailing blank output lines so the block hugs its content.
+    while lines.last().is_some_and(|l| l.trim().is_empty()) {
+        lines.pop();
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    let truncated_by = lines.len().saturating_sub(OUTPUT_DETAIL_MAX_LINES);
+    lines.truncate(OUTPUT_DETAIL_MAX_LINES);
+    Some(ToolDetail::Output {
+        lines,
+        truncated_by,
+    })
+}
+
+/// Columns at which an invocation line soft-wraps into continuation lines.
+/// The wrap is char-counted, not measured — block heights must be analytic —
+/// so the budget is sized to fit the narrowest useful transcript pane.
+pub const CALL_WRAP_COLS: usize = 80;
+
+/// Soft-wrap one raw line into [`CALL_WRAP_COLS`]-char chunks so a long
+/// single-line command stays fully readable instead of ellipsizing.
+fn wrap_cols(line: &str, cols: usize) -> Vec<SharedString> {
+    if line.chars().count() <= cols {
+        return vec![SharedString::from(line.to_owned())];
+    }
+    line.chars()
+        .collect::<Vec<_>>()
+        .chunks(cols)
+        .map(|chunk| SharedString::from(chunk.iter().collect::<String>()))
+        .collect()
+}
+
+/// Build a chip's full-invocation block — the complete tool call the header
+/// truncates to one line: the whole command, pattern, or URL, todo items one
+/// per line, MCP/unknown input as pretty-printed JSON. Reuses the output
+/// code-block payload so rendering and height stay one implementation.
+pub fn call_block(call: &ToolCall) -> Option<ToolDetail> {
+    let text: String = match call {
+        ToolCall::Exec { command } => command.clone(),
+        ToolCall::ReadFile { path } => path.clone(),
+        ToolCall::WriteFile { path, content } => match content {
+            Some(content) => format!("{path}\n{content}"),
+            None => path.clone(),
+        },
+        ToolCall::EditFile { path, .. } => path.clone(),
+        ToolCall::ApplyPatch { path } => path.clone().unwrap_or_else(|| "workspace".into()),
+        ToolCall::Search { pattern, path } => match path {
+            Some(path) => format!("{pattern} in {path}"),
+            None => pattern.clone(),
+        },
+        ToolCall::Glob { pattern } => pattern.clone(),
+        ToolCall::WebFetch { url, prompt } => match prompt {
+            Some(prompt) => format!("{url}\n{prompt}"),
+            None => url.clone(),
+        },
+        ToolCall::WebSearch { query } => query.clone(),
+        ToolCall::Todo { items } => items
+            .iter()
+            .map(|i| format!("{} {}", if i.done { "[x]" } else { "[ ]" }, i.text))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        ToolCall::Mcp {
+            server,
+            tool,
+            input,
+        } => match input {
+            Some(input) => format!(
+                "{server} · {tool}\n{}",
+                serde_json::to_string_pretty(input).unwrap_or_default()
+            ),
+            None => format!("{server} · {tool}"),
+        },
+        ToolCall::Unknown { name, input } => match input {
+            Some(input) => format!(
+                "{name}\n{}",
+                serde_json::to_string_pretty(input).unwrap_or_default()
+            ),
+            None => name.clone(),
+        },
+    };
+    let mut lines: Vec<SharedString> = text
+        .lines()
+        .flat_map(|l| wrap_cols(l, CALL_WRAP_COLS))
+        .collect();
     while lines.last().is_some_and(|l| l.trim().is_empty()) {
         lines.pop();
     }
@@ -541,6 +630,19 @@ fn tool_fingerprint(tools: &[ToolItem], auto_open: bool) -> u64 {
                 }
             }
         }
+        // The invocation block is pure over `call`, which the one-line hash
+        // above only covers by length — hash its bytes so an in-place call
+        // update (a streaming MCP input, a growing todo list) re-splices.
+        if let Some(ToolDetail::Output {
+            lines,
+            truncated_by,
+        }) = t.invocation.as_deref()
+        {
+            for line in lines {
+                acc.extend_from_slice(line.as_bytes());
+            }
+            acc.extend_from_slice(&(*truncated_by as u32).to_le_bytes());
+        }
         // Sidecar refs arriving after the resolve tick must re-splice too —
         // they add the fetch affordance without changing the detail payload.
         acc.push(t.output_ref.is_some() as u8 | (t.diff_ref.is_some() as u8) << 1);
@@ -647,6 +749,7 @@ pub fn rows_for_entry(
                     resolved: *resolved,
                     detail: tool_detail(output.as_deref(), diff.as_ref(), diff_stats.as_deref())
                         .map(Arc::new),
+                    invocation: call_block(call).map(Arc::new),
                     output_ref: output_ref.clone().map(SharedString::from),
                     output_bytes: *output_bytes,
                     diff_ref: diff_ref.clone().map(SharedString::from),
@@ -1449,9 +1552,21 @@ impl Transcript {
 
     /// Replace the transcript's scroll animation task (rail click / jump).
     pub(crate) fn set_scroll_task(&mut self, task: Task<()>) {
-        self.remove_own_turn_runway();
+        // Rail navigation within the session RELEASES the hold but keeps the
+        // runway (user spec: only leaving and revisiting the session clears
+        // it) — scrolling back down re-arms the hold like any restick.
+        self.release_own_turn_hold();
         self.pinned = false;
         self.scroll_anim = Some(task);
+    }
+
+    /// Give the viewport to the user/navigation without dropping the
+    /// reservation: the pad stays, the hold stands down until a restick.
+    fn release_own_turn_hold(&mut self) {
+        if let Some(anchor) = self.own_turn.as_mut() {
+            anchor.held = false;
+        }
+        self.own_turn_last_tick = None;
     }
 
     fn remeasure_last_row(&self) {
@@ -1460,15 +1575,7 @@ impl Transcript {
         }
     }
 
-    /// Drop the temporary send runway without enabling follow-tail. Used when
-    /// explicit user navigation supersedes the automatic own-turn behavior.
-    fn remove_own_turn_runway(&mut self) {
-        if self.own_turn.take().is_some() {
-            self.remeasure_last_row();
-        }
-        self.own_turn_kick = false;
-        self.own_turn_last_tick = None;
-    }
+
 
     pub(crate) fn distance_from_bottom(&self) -> f32 {
         let max = f32::from(self.list.max_offset_for_scrollbar().y);
@@ -1493,15 +1600,52 @@ impl Transcript {
         let this = cx.weak_entity();
         cx.defer(move |cx| {
             this.update(cx, |this: &mut Transcript, cx| {
-                // Wheel/touch input RELEASES an own-turn hold (clamping it
-                // locked scrolling for as long as the reservation held —
-                // user report). The reservation stays behind as plain
-                // scrollable space; normal escape/restick applies below.
-                if let Some(anchor) = this.own_turn.as_mut()
-                    && anchor.held
-                {
-                    anchor.held = false;
-                    this.own_turn_last_tick = None;
+                // Wheel/touch while a runway lives: input owns the viewport,
+                // and the BOTTOM PIN must stay out of it entirely. Escaping
+                // releases the hold (the reservation stays behind as plain
+                // scrollable space); returning toward the bottom re-arms the
+                // HOLD, never `pinned` — a restick pin glued the view to the
+                // bottom of the reservation pad, where streaming reads as
+                // text stuck at the viewport top with the runway never
+                // filling (user report; the pad can't resize there either,
+                // its anchor being off-screen). macOS trackpad momentum can
+                // even release-and-restick within one gesture right after a
+                // send, so under the old rules the prompt never landed at
+                // the top at all.
+                if this.own_turn.is_some() {
+                    let distance = this.distance_from_bottom();
+                    let previous = this.last_scroll_distance;
+                    this.last_scroll_distance = distance;
+                    let held = this.own_turn.as_ref().is_some_and(|a| a.held);
+                    if distance > previous + 1.0 && distance > AT_BOTTOM_PX {
+                        // Input moving away from the bottom breaks the hold.
+                        if let Some(anchor) = this.own_turn.as_mut() {
+                            anchor.held = false;
+                        }
+                        this.own_turn_last_tick = None;
+                        this.pinned = false;
+                        this.spring.reset();
+                        this.spring_last_tick = None;
+                    } else if !held
+                        && (distance <= AT_BOTTOM_PX
+                            || Self::should_restick(distance, previous))
+                    {
+                        // Returning to the bottom returns to the RUNWAY: the
+                        // glide re-lands the prompt at its inset.
+                        if let Some(anchor) = this.own_turn.as_mut() {
+                            anchor.held = true;
+                            anchor.positioned = false;
+                        }
+                        this.own_turn_last_tick = None;
+                        this.own_turn_kick = true;
+                    }
+                    let show = distance > SCROLL_BUTTON_THRESHOLD_PX
+                        && !this.own_turn.as_ref().is_some_and(|a| a.held);
+                    if show != this.show_jump_button {
+                        this.show_jump_button = show;
+                    }
+                    cx.notify();
+                    return;
                 }
                 let distance = this.distance_from_bottom();
                 let previous = this.last_scroll_distance;
@@ -1758,9 +1902,22 @@ impl Transcript {
 
     /// The scroll-to-bottom pill's click: glide back to the end and re-pin.
     pub fn jump_to_bottom(&mut self, cx: &mut Context<Self>) {
-        self.remove_own_turn_runway();
+        // With a live runway, "bottom" IS the held position (the reservation
+        // makes prompt-at-top and pad-bottom the same place): re-arm the hold
+        // and glide back instead of destroying the runway (user spec — only
+        // navigating away and back clears it).
+        if let Some(anchor) = self.own_turn.as_mut() {
+            anchor.held = true;
+            anchor.positioned = false;
+            self.own_turn_last_tick = None;
+            self.own_turn_kick = true;
+            self.show_jump_button = false;
+            cx.notify();
+            return;
+        }
         self.engage_pin(cx);
     }
+
 
     /// Re-engage the bottom pin with a glide. Long jumps teleport to within
     /// [`GLIDE_MAX_VIEWPORTS`] of the end first (mugen `springToBottom`);
@@ -2737,6 +2894,10 @@ impl Transcript {
                 best.map(|(_, d)| d).or_else(|| tool.detail.clone())
             })
             .collect();
+        // Full-invocation blocks — with them, EVERY chip expands: the click
+        // always answers "what exactly was this call?", output or not.
+        let invocations: Vec<Option<Arc<ToolDetail>>> =
+            tools.iter().map(|tool| tool.invocation.clone()).collect();
         // Fetch affordance under each open detail whose full payload is still
         // sidecar-only: `(ref, label)`. Diff offered first (the richer
         // upgrade), then the output — a fetched ref hands the affordance to
@@ -2792,9 +2953,10 @@ impl Transcript {
         // the FINAL state; a mid-tween detail already counts as its target).
         let detail_folds: Vec<FoldState> = details
             .iter()
+            .zip(&invocations)
             .enumerate()
-            .map(|(ix, detail)| {
-                if detail.is_none() {
+            .map(|(ix, (detail, invocation))| {
+                if detail.is_none() && invocation.is_none() {
                     return FoldState::default();
                 }
                 self.tool_details
@@ -2805,17 +2967,22 @@ impl Transcript {
             .collect();
         let detail_opens: Vec<bool> = details
             .iter()
+            .zip(&invocations)
             .zip(&detail_folds)
-            .map(|(detail, fold)| detail.is_some() && fold.open.unwrap_or(false))
+            .map(|((detail, invocation), fold)| {
+                (detail.is_some() || invocation.is_some()) && fold.open.unwrap_or(false)
+            })
             .collect();
         let open_height = chips_height(tools.len())
             + details
                 .iter()
+                .zip(&invocations)
                 .zip(&affordances)
                 .zip(&detail_opens)
                 .filter(|(_, open)| **open)
-                .map(|((detail, affordance), _)| {
-                    detail.as_deref().map_or(0.0, detail_height)
+                .map(|(((detail, invocation), affordance), _)| {
+                    invocation.as_deref().map_or(0.0, detail_height)
+                        + detail.as_deref().map_or(0.0, detail_height)
                         + if affordance.is_some() {
                             BLOB_AFFORDANCE_HEIGHT
                         } else {
@@ -2876,9 +3043,11 @@ impl Transcript {
             .flex_col()
             .gap(px(CHIP_GAP))
             .children(tools.iter().enumerate().map(|(ix, tool)| {
-                let Some(detail) = details[ix].clone() else {
+                let detail = details[ix].clone();
+                let invocation = invocations[ix].clone();
+                if detail.is_none() && invocation.is_none() {
                     return tool_chip(tool, theme);
-                };
+                }
                 let affordance = affordances[ix].clone();
                 let affordance_h = if affordance.is_some() {
                     BLOB_AFFORDANCE_HEIGHT
@@ -2900,7 +3069,10 @@ impl Transcript {
                 // (user report: "tool calls cut off at the bottom"). The
                 // explicit height is also what the open/close tween animates.
                 let closed_h = CHIP_CARD_HEIGHT;
-                let open_h = CHIP_CARD_HEIGHT + detail_height(&detail) + affordance_h;
+                let open_h = CHIP_CARD_HEIGHT
+                    + invocation.as_deref().map_or(0.0, detail_height)
+                    + detail.as_deref().map_or(0.0, detail_height)
+                    + affordance_h;
                 let card_target = if open { open_h } else { closed_h };
                 let animating = dfold.epoch > 0
                     && dfold
@@ -2936,15 +3108,19 @@ impl Transcript {
                             .child(chip_header(tool, open, theme)),
                     );
                 // The body stays mounted while the close tween shrinks over it.
+                // Invocation first (what was asked), then output/diff (what
+                // came back), each under its own hairline.
                 if open || animating {
-                    card = card
-                        .child(
-                            div()
-                                .h(px(DETAIL_SEPARATOR))
-                                .flex_none()
-                                .bg(crate::theme::hairline(0.06)),
-                        )
-                        .child(detail_body(&detail, theme));
+                    for block in [&invocation, &detail].into_iter().flatten() {
+                        card = card
+                            .child(
+                                div()
+                                    .h(px(DETAIL_SEPARATOR))
+                                    .flex_none()
+                                    .bg(crate::theme::hairline(0.06)),
+                            )
+                            .child(detail_body(block, theme));
+                    }
                     if let Some((blob_ref, label)) = affordance {
                         let loading = matches!(
                             self.blob_details.get(&blob_ref),
@@ -4159,6 +4335,7 @@ mod tests {
             is_error: false,
             resolved: true,
             detail: None,
+            invocation: None,
             output_ref: None,
             output_bytes: None,
             diff_ref: None,
@@ -4172,6 +4349,7 @@ mod tests {
             is_error: false,
             resolved: true,
             detail: None,
+            invocation: None,
             output_ref: None,
             output_bytes: None,
             diff_ref: None,
@@ -4201,6 +4379,7 @@ mod tests {
                 is_error: false,
                 resolved: true,
                 detail: None,
+                invocation: None,
                 output_ref: None,
                 output_bytes: None,
                 diff_ref: None,
@@ -4212,6 +4391,7 @@ mod tests {
                 is_error: false,
                 resolved: true,
                 detail: None,
+                invocation: None,
                 output_ref: None,
                 output_bytes: None,
                 diff_ref: None,
@@ -4221,6 +4401,7 @@ mod tests {
                 is_error: false,
                 resolved: true,
                 detail: None,
+                invocation: None,
                 output_ref: None,
                 output_bytes: None,
                 diff_ref: None,
@@ -4289,6 +4470,71 @@ mod tests {
             query: "line one\nline two".into(),
         });
         assert_eq!(q, "line one line two");
+    }
+
+    #[test]
+    fn call_block_carries_the_full_invocation() {
+        // Multi-line command: verbatim lines, not the flattened chip line.
+        let Some(ToolDetail::Output {
+            lines,
+            truncated_by,
+        }) = call_block(&ToolCall::Exec {
+            command: "set -e\ncargo test".into(),
+        })
+        else {
+            panic!("expected an output block")
+        };
+        assert_eq!(truncated_by, 0);
+        assert_eq!(
+            lines.iter().map(|l| l.as_ref()).collect::<Vec<_>>(),
+            vec!["set -e", "cargo test"]
+        );
+
+        // A long single-line command soft-wraps instead of ellipsizing.
+        let Some(ToolDetail::Output { lines, .. }) = call_block(&ToolCall::Exec {
+            command: "x".repeat(CALL_WRAP_COLS * 2 + 10),
+        }) else {
+            panic!("expected an output block")
+        };
+        assert_eq!(lines.len(), 3);
+        assert!(lines.iter().all(|l| l.chars().count() <= CALL_WRAP_COLS));
+
+        // MCP input pretty-prints under the `server · tool` line.
+        let Some(ToolDetail::Output { lines, .. }) = call_block(&ToolCall::Mcp {
+            server: "gh".into(),
+            tool: "issues".into(),
+            input: Some(serde_json::json!({"repo": "komet"})),
+        }) else {
+            panic!("expected an output block")
+        };
+        assert_eq!(lines[0].as_ref(), "gh · issues");
+        assert!(lines.iter().any(|l| l.contains("\"repo\": \"komet\"")));
+
+        // Todos list one item per line with checkbox state.
+        let Some(ToolDetail::Output { lines, .. }) = call_block(&ToolCall::Todo {
+            items: vec![
+                komet_proto::TodoItem {
+                    text: "a".into(),
+                    done: true,
+                },
+                komet_proto::TodoItem {
+                    text: "b".into(),
+                    done: false,
+                },
+            ],
+        }) else {
+            panic!("expected an output block")
+        };
+        assert_eq!(
+            lines.iter().map(|l| l.as_ref()).collect::<Vec<_>>(),
+            vec!["[x] a", "[ ] b"]
+        );
+
+        // Blank invocation → no block; the chip stays a plain card.
+        assert!(call_block(&ToolCall::Exec {
+            command: "  \n ".into()
+        })
+        .is_none());
     }
 
     #[test]

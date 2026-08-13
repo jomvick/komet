@@ -2320,6 +2320,30 @@ async fn run_session(session: Session) {
                     // tolerated by design.
                     let events = if method == "session/update" {
                         session_update_events(&params, &session_id)
+                    } else if method == "_session/turn_ended" {
+                        // Autonomous turn-end (claude-agent-acp extension,
+                        // `_`-prefixed like `_session/steering`): a turn the
+                        // agent started on its own — a background-task wake —
+                        // has no `session/prompt` to settle, so its SDK-side
+                        // turn-end previously vanished at the adapter and the
+                        // engine's quiesce watchdog was the only settle path
+                        // (≤2min of phantom Working per notification, user
+                        // report 2026-08-13). Gated to BETWEEN prompts: a
+                        // live turn settles through its own response.
+                        if turn.is_none()
+                            && !interrupted
+                            && params.get("sessionId").and_then(Value::as_str)
+                                == Some(session_id.as_str())
+                        {
+                            vec![AgentEvent::Done {
+                                status: DoneStatus::Completed,
+                                result: None,
+                                error: None,
+                                session_id: Some(session_id.clone()),
+                            }]
+                        } else {
+                            Vec::new()
+                        }
                     } else {
                         cursor_notification_events(&method, &params)
                     };
