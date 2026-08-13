@@ -1484,3 +1484,42 @@ async fn injection_cost_frame_never_settles_a_steered_turn() {
         .expect("done asserted above");
     assert!(tail < done, "{events:?}");
 }
+
+#[tokio::test]
+async fn autonomous_turn_ended_extension_settles_between_prompts() {
+    // A background-task wake makes the agent stream a turn no prompt started;
+    // its SDK-side turn-end has no `session/prompt` to settle, so the adapter
+    // forwards the `_session/turn_ended` extension instead — which must map
+    // to a completed Done exactly once, only for this session, and only
+    // between prompts (the engine's quiesce watchdog then stays a backstop,
+    // not the settle path).
+    let (controls, _steer, _token) = controls();
+    let events = run_to_end(&harness(), request("scenario:autonomous-end"), controls).await;
+
+    let d = dones(&events);
+    assert_eq!(d.len(), 2, "prompt turn + autonomous turn, no third: {events:?}");
+    assert!(
+        d.iter().all(|(s, e)| *s == DoneStatus::Completed && e.is_none()),
+        "{events:?}"
+    );
+
+    // The self-continued output sits BETWEEN the two Dones.
+    let first_done = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::Done { .. }))
+        .unwrap();
+    let last_done = events
+        .iter()
+        .rposition(|e| matches!(e, AgentEvent::Done { .. }))
+        .unwrap();
+    let background = events
+        .iter()
+        .position(
+            |e| matches!(e, AgentEvent::TextDelta { text } if text == "background finished"),
+        )
+        .expect("self-continued output surfaces: {events:?}");
+    assert!(
+        first_done < background && background < last_done,
+        "{events:?}"
+    );
+}

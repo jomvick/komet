@@ -94,6 +94,20 @@ case "$promptline" in
   emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
   ;;
 
+*scenario:autonomous-end*)
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"on it"}}'
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  # Background-task wake: a self-continued cycle streams real output with no
+  # prompt in flight, then announces its end with the turn-ended extension.
+  # The sleep orders it AFTER the prompt response settles (responses resolve
+  # through a different channel than notifications and can race).
+  sleep 1
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"background finished"}}'
+  emit "{\"method\":\"_session/turn_ended\",\"params\":{\"sessionId\":\"$SID\",\"stopReason\":\"end_turn\"}}"
+  # Another session's marker must map to nothing.
+  emit "{\"method\":\"_session/turn_ended\",\"params\":{\"sessionId\":\"other\",\"stopReason\":\"end_turn\"}}"
+  ;;
+
 *scenario:happy*)
   update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Hello"}}'
   update '{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"thinking"}}'
