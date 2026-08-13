@@ -276,6 +276,24 @@ case "$promptline" in
   exit 0
   ;;
 
+*scenario:steer-cost-noise*)
+  # The injection cost frame (2026-08-13): claude-agent-acp stamps a
+  # cost-bearing usage_update for the injected message itself, MID-turn,
+  # identical in shape to the terminal one. The harness (claude spec) must
+  # not settle off it — the turn continues and ends via its real response:
+  # exactly one Done, all text intact.
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"first"}}'
+  read -r steerline || exit 1
+  sid=$(rid "$steerline")
+  has "$steerline" '"method":"_session/steering"' || exit 1
+  emit "{\"id\":$sid,\"result\":{\"outcome\":\"injected\"}}"
+  update '{"sessionUpdate":"usage_update","used":21429,"size":200000,"cost":{"amount":0.0006,"currency":"USD"},"_meta":{"_claude/origin":{"kind":"human"}}}'
+  sleep 3
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"steered tail"}}'
+  update '{"sessionUpdate":"usage_update","used":21884,"size":200000,"cost":{"amount":0.02,"currency":"USD"},"_meta":{"_claude/origin":{"kind":"human"}}}'
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  ;;
+
 *scenario:quiet-starve*)
   # Blanket dropped-reply settle, no adapter-specific evidence: content
   # streamed, no open tool, then silence — the response never comes. The

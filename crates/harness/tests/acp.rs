@@ -1296,3 +1296,191 @@ async fn claude_busy_steer_rides_native_queueing_and_the_cost_frame() {
         "settle at {done2_at:?} — should ride the cost frame (~1s), not EOF"
     );
 }
+
+/// Every installed real agent, through the one shared loop all the
+/// starve/settle changes live in: a short live turn with a mid-turn steer —
+/// injection on StepBoundary agents, boundary delivery on TurnBoundary ones,
+/// busy-path handling where it applies. Contract per agent that starts:
+/// every Done is Completed and the stream ENDS (no stranding) inside the
+/// budget. Agents that fail auth/startup are reported and skipped. Run:
+/// `cargo test -p komet-harness --test acp -- --ignored --nocapture real_all_harnesses`
+#[tokio::test]
+#[ignore = "runs every installed+authenticated agent CLI; costs a few small prompts"]
+async fn real_all_harnesses_settle_with_a_mid_turn_steer() {
+    let agents: Vec<(&str, AcpHarness)> = vec![
+        ("claude", AcpHarness::claude()),
+        ("codex", AcpHarness::codex()),
+        ("cursor", AcpHarness::cursor()),
+        ("grok", AcpHarness::grok()),
+        ("pi", AcpHarness::pi()),
+    ];
+    let mut failures: Vec<String> = Vec::new();
+    for (name, h) in agents {
+        let (controls, steer_tx, _token) = controls();
+        let mut req = request(
+            "Write the numbers 1 2 3 4 5, one per line, then stop. \
+             If another instruction arrives, follow it too.",
+        );
+        req.model = None;
+        req.reasoning = None;
+        req.cwd = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        let stream = match h.run(req, controls).await {
+            Ok(s) => s,
+            Err(e) => {
+                println!("[{name}] SKIP — did not start: {e}");
+                continue;
+            }
+        };
+        let outcome = tokio::time::timeout(Duration::from_secs(120), async move {
+            let mut stream = stream;
+            let mut events = Vec::new();
+            let mut steer = Some(steer_tx);
+            while let Some(ev) = stream.next().await {
+                let ev = ev.expect("stream event");
+                if matches!(ev, AgentEvent::TextDelta { .. })
+                    && let Some(tx) = steer.take()
+                {
+                    let _ = tx
+                        .send(SteerMessage {
+                            prompt: "Also write the word EXTRA on its own line.".into(),
+                            message_id: None,
+                        })
+                        .await;
+                    // Sender drops: the mailbox closes, so once every turn
+                    // settles the stream must end — stranding shows as the
+                    // 120s timeout.
+                }
+                events.push(ev);
+            }
+            events
+        })
+        .await;
+        match outcome {
+            Err(_) => failures.push(format!("[{name}] STRANDED: stream still open after 120s")),
+            Ok(events) => {
+                let ds = dones(&events);
+                let auth_failure = ds.iter().any(|(s, e)| {
+                    *s == DoneStatus::Errored
+                        && e.as_deref().is_some_and(|e| {
+                            let e = e.to_lowercase();
+                            e.contains("auth") || e.contains("login") || e.contains("not installed")
+                        })
+                });
+                if auth_failure {
+                    println!("[{name}] SKIP — needs auth: {ds:?}");
+                } else if ds.is_empty() || ds.iter().any(|(s, _)| *s != DoneStatus::Completed) {
+                    failures.push(format!("[{name}] BAD DONES: {ds:?}"));
+                } else {
+                    let texts = events
+                        .iter()
+                        .filter(|e| matches!(e, AgentEvent::TextDelta { .. }))
+                        .count();
+                    println!(
+                        "[{name}] OK — {} turn(s) settled, {texts} text deltas",
+                        ds.len()
+                    );
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// Debug variant of the multi-harness sweep, claude only, printing every
+/// event with a timestamp — for diagnosing strands the sweep can only name.
+/// `cargo test -p komet-harness --test acp -- --ignored --nocapture real_claude_debug`
+#[tokio::test]
+#[ignore = "debug harness; needs the claude CLI; costs one small prompt"]
+async fn real_claude_debug_steer_trace() {
+    let (controls, steer_tx, _token) = controls();
+    let h = AcpHarness::claude();
+    let mut req = request(
+        "Write the numbers 1 2 3 4 5, one per line, then stop. \
+         If another instruction arrives, follow it too.",
+    );
+    req.model = None;
+    req.reasoning = None;
+    req.cwd = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let started = std::time::Instant::now();
+    let stream = h.run(req, controls).await.expect("run starts");
+    let _ = tokio::time::timeout(Duration::from_secs(60), async move {
+        let mut stream = stream;
+        let mut steer = Some(steer_tx);
+        while let Some(ev) = stream.next().await {
+            let ev = ev.expect("stream event");
+            let t = started.elapsed();
+            match &ev {
+                AgentEvent::TextDelta { text } => println!("{t:?} TEXT {:?}", &text[..text.len().min(40)]),
+                other => println!("{t:?} {other:?}"),
+            }
+            if matches!(ev, AgentEvent::TextDelta { .. })
+                && let Some(tx) = steer.take()
+            {
+                println!("{:?} >>> sending steer", started.elapsed());
+                let _ = tx
+                    .send(SteerMessage {
+                        prompt: "Also write the word EXTRA on its own line.".into(),
+                        message_id: None,
+                    })
+                    .await;
+            }
+        }
+        println!("{:?} <<< stream ended", started.elapsed());
+    })
+    .await;
+    println!("{:?} === test done (timeout means strand)", started.elapsed());
+}
+
+/// The injection cost frame must never settle a steered turn: the fixture
+/// stamps a mid-turn cost frame right after the injection (real adapter
+/// behavior, indistinguishable in shape from the terminal frame), holds the
+/// turn open past the 1s cost grace + 2s slack, then finishes normally.
+/// Exactly one Done; the post-injection text folds into the same turn.
+#[tokio::test]
+async fn injection_cost_frame_never_settles_a_steered_turn() {
+    let (controls, steer, _token) = controls();
+    let harness = AcpHarness::claude().with_executable(fixture_path());
+    let stream = harness
+        .run(request("scenario:steer-cost-noise"), controls)
+        .await
+        .expect("run starts");
+    let events = tokio::time::timeout(Duration::from_secs(15), async move {
+        let mut events = Vec::new();
+        let mut stream = stream;
+        let mut steer = Some(steer);
+        while let Some(ev) = stream.next().await {
+            let ev = ev.expect("stream event");
+            if matches!(ev, AgentEvent::TextDelta { ref text } if text == "first")
+                && let Some(tx) = steer.take()
+            {
+                tx.send(SteerMessage {
+                    prompt: "redirect please".into(),
+                    message_id: None,
+                })
+                .await
+                .expect("steer sent");
+            }
+            events.push(ev);
+        }
+        events
+    })
+    .await
+    .expect("run finished in time");
+
+    assert_eq!(
+        dones(&events),
+        vec![(DoneStatus::Completed, None)],
+        "a premature cost-frame settle would double-Done: {events:?}"
+    );
+    // The post-injection text arrives BEFORE the single Done — a false
+    // settle would flip that order.
+    let tail = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::TextDelta { text } if text == "steered tail"))
+        .expect("steered tail must fold into the live turn: {events:?}");
+    let done = events
+        .iter()
+        .position(|e| matches!(e, AgentEvent::Done { .. }))
+        .expect("done asserted above");
+    assert!(tail < done, "{events:?}");
+}

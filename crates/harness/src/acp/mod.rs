@@ -2072,6 +2072,13 @@ async fn run_session(session: Session) {
     };
     let mut last_update_at = tokio::time::Instant::now();
     let mut turn_content_seen = false;
+    // A steering injection makes the cost hint unsafe for the REST of the
+    // turn: the adapter emits a cost-bearing usage_update for the injected
+    // message itself, mid-turn, indistinguishable in shape from the
+    // terminal one (verified against 0.66.0 — premature Done exactly one
+    // grace after injection). Steered turns settle off their real response
+    // (healthy in every trace); the quiet settle stays as their backstop.
+    let mut steered_this_turn = false;
     let mut open_tools: std::collections::HashSet<String> = std::collections::HashSet::new();
     let open_questions = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     // PREVENTION, ahead of all the recovery above: never send a
@@ -2240,6 +2247,7 @@ async fn run_session(session: Session) {
                     }
                     done_current = false;
                     turn_content_seen = false;
+                    steered_this_turn = false;
                     open_tools.clear();
                     last_update_at = tokio::time::Instant::now();
                     turn = Some(prompt_turn(client.clone(), session_id.clone(), text));
@@ -2257,6 +2265,11 @@ async fn run_session(session: Session) {
                     if cost_hint_enabled
                         && turn.is_some()
                         && !interrupted
+                        && !steered_this_turn
+                        // An in-flight steering call means an injection cost
+                        // frame may already be on the wire ahead of its
+                        // response (select order is not the pipe order).
+                        && steering_call.is_none()
                         && starve_deadline.is_none()
                         && method == "session/update"
                         && is_turn_end_cost_update(&params, &session_id)
@@ -2371,6 +2384,11 @@ async fn run_session(session: Session) {
                     // and no Done ever coming — the stranded-Working /
                     // eternal-timer bug. Post-turn: nothing left to do.
                     if turn.is_some() {
+                        steered_this_turn = true;
+                        // The injection proves the turn is LIVE: any settle
+                        // deadline armed off a cost frame that raced this
+                        // response is invalid evidence.
+                        starve_deadline = None;
                         // Pre-injection updates can still sit in `incoming`
                         // (responses bypass that queue): drain them into the
                         // CURRENT segment first, or text the agent streamed
@@ -2471,6 +2489,7 @@ async fn run_session(session: Session) {
                     }
                     done_current = false;
                     turn_content_seen = false;
+                    steered_this_turn = false;
                     open_tools.clear();
                     last_update_at = tokio::time::Instant::now();
                     turn = Some(prompt_turn(client.clone(), session_id.clone(), text));
@@ -2511,9 +2530,13 @@ async fn run_session(session: Session) {
                     }
                     done_current = false;
                     turn_content_seen = false;
+                    steered_this_turn = false;
                     open_tools.clear();
                     last_update_at = tokio::time::Instant::now();
                     turn = Some(prompt_turn(client.clone(), session_id.clone(), text));
+                } else if turn.is_none() && !steering_open {
+                    // Mailbox closed while the flush waited: nothing left.
+                    break 'main;
                 }
             },
 
@@ -2601,9 +2624,14 @@ async fn run_session(session: Session) {
                     }
                     done_current = false;
                     turn_content_seen = false;
+                    steered_this_turn = false;
                     open_tools.clear();
                     last_update_at = tokio::time::Instant::now();
                     turn = Some(prompt_turn(client.clone(), session_id.clone(), text));
+                } else if !steering_open {
+                    // Mirror the normal turn-settled exit: mailbox closed
+                    // and nothing left to run — the session is over.
+                    break 'main;
                 }
             },
 
@@ -2660,6 +2688,7 @@ async fn run_session(session: Session) {
                         }
                         done_current = false;
                         turn_content_seen = false;
+                        steered_this_turn = false;
                         open_tools.clear();
                         last_update_at = tokio::time::Instant::now();
                         turn = Some(prompt_turn(client.clone(), session_id.clone(), text));
