@@ -251,6 +251,31 @@ case "$promptline" in
   fi
   ;;
 
+*scenario:native-busy-steer*)
+  # Claude's native path: steer into a self-continued turn must arrive as a
+  # plain session/prompt (NO cancel — the CLI folds it into the running
+  # turn natively). The adapter drops that prompt's reply; the harness must
+  # settle off the turn-end cost frame instead.
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"first"}}'
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  update '{"sessionUpdate":"tool_call","toolCallId":"sc-2","title":"self-continued work","kind":"execute","status":"pending","rawInput":{"command":"make"}}'
+  read -r followline || exit 1
+  if has "$followline" '"method":"session/cancel"'; then
+    # Cancelling would kill the agent's in-flight work: fail loudly.
+    update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"CANCELLED-NATIVE-WORK"}}'
+    exit 1
+  fi
+  fid=$(rid "$followline")
+  { has "$followline" '"method":"session/prompt"' && has "$followline" 'what about now'; } || exit 1
+  # The merged turn finishes: tool resolves, folded reply streams, the
+  # terminal cost frame arrives — and the prompt response NEVER does.
+  update '{"sessionUpdate":"tool_call_update","toolCallId":"sc-2","status":"completed","content":[]}'
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"merged reply"}}'
+  update '{"sessionUpdate":"usage_update","used":30000,"size":1000000,"cost":{"amount":0.02,"currency":"USD"}}'
+  sleep 6
+  exit 0
+  ;;
+
 *scenario:quiet-starve*)
   # Blanket dropped-reply settle, no adapter-specific evidence: content
   # streamed, no open tool, then silence — the response never comes. The

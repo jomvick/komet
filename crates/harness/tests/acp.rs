@@ -1227,3 +1227,72 @@ async fn steer_into_self_continuation_cancels_before_prompting() {
         .expect("dones asserted above");
     assert!(first_done < steered, "{events:?}");
 }
+
+/// Claude's native busy-steer path: a steer into a self-continued turn goes
+/// out as a PLAIN prompt (the fixture hard-fails on any session/cancel —
+/// cancelling would kill the agent's in-flight work). The CLI folds the
+/// message into the running turn natively; the adapter drops the prompt's
+/// reply; the cost-frame settle closes the turn ~1s after the merged turn
+/// really ends — well before the fixture's held-open stream EOF.
+#[tokio::test]
+async fn claude_busy_steer_rides_native_queueing_and_the_cost_frame() {
+    let (controls, steer, _token) = controls();
+    let harness = AcpHarness::claude().with_executable(fixture_path());
+    let started = std::time::Instant::now();
+    let stream = harness
+        .run(request("scenario:native-busy-steer"), controls)
+        .await
+        .expect("run starts");
+    let (events, done2_at) = tokio::time::timeout(Duration::from_secs(15), async move {
+        let mut events = Vec::new();
+        let mut done2_at = None;
+        let mut dones_seen = 0usize;
+        let mut stream = stream;
+        let mut steer = Some(steer);
+        while let Some(ev) = stream.next().await {
+            let ev = ev.expect("stream event");
+            if matches!(&ev, AgentEvent::ToolCall { id, .. } if id == "sc-2")
+                && let Some(tx) = steer.take()
+            {
+                tx.send(SteerMessage {
+                    prompt: "what about now".into(),
+                    message_id: None,
+                })
+                .await
+                .expect("steer sent");
+            }
+            if matches!(ev, AgentEvent::Done { .. }) {
+                dones_seen += 1;
+                if dones_seen == 2 {
+                    done2_at = Some(started.elapsed());
+                }
+            }
+            events.push(ev);
+        }
+        (events, done2_at)
+    })
+    .await
+    .expect("run finished in time");
+
+    assert_eq!(
+        dones(&events),
+        vec![(DoneStatus::Completed, None), (DoneStatus::Completed, None)],
+        "{events:?}"
+    );
+    // The merged turn's folded output streamed through (nothing cancelled)…
+    assert!(events.contains(&AgentEvent::TextDelta {
+        text: "merged reply".into()
+    }));
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::TextDelta { text } if text.contains("CANCELLED"))),
+        "the native path must never cancel self-continued work: {events:?}"
+    );
+    // …and the settle rode the cost frame, not the 6s stream EOF.
+    let done2_at = done2_at.expect("second done asserted above");
+    assert!(
+        done2_at < Duration::from_secs(5),
+        "settle at {done2_at:?} — should ride the cost frame (~1s), not EOF"
+    );
+}

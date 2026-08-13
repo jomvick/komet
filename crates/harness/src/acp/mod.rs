@@ -2617,11 +2617,21 @@ async fn run_session(session: Session) {
                         // steer lines up behind it and dispatches at flush.
                         queued_steers.push_back(text);
                     } else if turn.is_none()
+                        && !cost_hint_enabled
                         && (!open_tools.is_empty()
                             || last_update_at.elapsed() < BUSY_RECENT)
                     {
                         // Mid self-continued turn (see BUSY_RECENT above):
                         // cancel it rather than prompt into the starve.
+                        //
+                        // Claude skips this branch ON PURPOSE and prompts
+                        // straight in — its NATIVE semantics: the CLI queues
+                        // the message and folds it into the running turn (no
+                        // work lost, verified from live session data). The
+                        // adapter drops that prompt's reply, and the
+                        // cost-frame settle reconstructs it ~1s after the
+                        // merged turn really ends. Only adapters with no
+                        // verified turn-end frame pay the cancel.
                         tracing::info!(
                             target: "komet_harness::acp",
                             "steer into a self-continuing session; cancelling \
