@@ -79,7 +79,49 @@ fi
 tar -czf "$APP_TARBALL" -s '/^Komet\.app/Komet.app/' -C "$OUT_DIR" Komet.app
 echo "packaged: $APP_TARBALL"
 
-hdiutil create -volname Komet -srcfolder "$APP" -ov -format UDZO "$DMG"
+# The dmg presents the classic drag-into-Applications layout over the
+# ascii-hands artwork (committed renders from scripts/dmg-background.py).
+# dmgbuild writes the .DS_Store (background, icon view, icon positions)
+# directly — no Finder scripting, so it also works on headless CI runners.
+python3 -c 'import dmgbuild' 2>/dev/null ||
+  python3 -m pip install --quiet --user dmgbuild 2>/dev/null ||
+  python3 -m pip install --quiet --user --break-system-packages dmgbuild
+
+# Pair the 1x/2x background renders into a hidpi tiff so the artwork stays
+# crisp on retina displays.
+BG_TIFF="$OUT_DIR/dmg-background.tiff"
+tiffutil -cathidpicheck "$ROOT/dist/macos/dmg-background.png" \
+  "$ROOT/dist/macos/dmg-background@2x.png" -out "$BG_TIFF" >/dev/null 2>&1
+
+APP="$APP" DMG="$DMG" BG_TIFF="$BG_TIFF" python3 - <<'PY'
+import os
+import dmgbuild
+
+app = os.environ["APP"]
+dmgbuild.build_dmg(
+    filename=os.environ["DMG"],
+    volume_name="Komet",
+    settings={
+        "format": "UDZO",
+        "files": [app],
+        "symlinks": {"Applications": "/Applications"},
+        "icon": os.path.join(app, "Contents/Resources/komet.icns"),
+        "background": os.environ["BG_TIFF"],
+        "show_status_bar": False,
+        "show_tab_view": False,
+        "show_toolbar": False,
+        "show_pathbar": False,
+        "show_sidebar": False,
+        "default_view": "icon-view",
+        # Window and icon geometry must match scripts/dmg-background.py.
+        "window_rect": ((200, 120), (660, 400)),
+        "icon_size": 104,
+        "text_size": 12,
+        "icon_locations": {"Komet.app": (165, 195), "Applications": (495, 195)},
+    },
+)
+PY
+rm -f "$BG_TIFF"
 if $NOTARIZE; then
   notarize "$DMG"
   xcrun stapler staple "$DMG"
