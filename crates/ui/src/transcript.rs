@@ -1449,9 +1449,21 @@ impl Transcript {
 
     /// Replace the transcript's scroll animation task (rail click / jump).
     pub(crate) fn set_scroll_task(&mut self, task: Task<()>) {
-        self.remove_own_turn_runway();
+        // Rail navigation within the session RELEASES the hold but keeps the
+        // runway (user spec: only leaving and revisiting the session clears
+        // it) — scrolling back down re-arms the hold like any restick.
+        self.release_own_turn_hold();
         self.pinned = false;
         self.scroll_anim = Some(task);
+    }
+
+    /// Give the viewport to the user/navigation without dropping the
+    /// reservation: the pad stays, the hold stands down until a restick.
+    fn release_own_turn_hold(&mut self) {
+        if let Some(anchor) = self.own_turn.as_mut() {
+            anchor.held = false;
+        }
+        self.own_turn_last_tick = None;
     }
 
     fn remeasure_last_row(&self) {
@@ -1460,15 +1472,7 @@ impl Transcript {
         }
     }
 
-    /// Drop the temporary send runway without enabling follow-tail. Used when
-    /// explicit user navigation supersedes the automatic own-turn behavior.
-    fn remove_own_turn_runway(&mut self) {
-        if self.own_turn.take().is_some() {
-            self.remeasure_last_row();
-        }
-        self.own_turn_kick = false;
-        self.own_turn_last_tick = None;
-    }
+
 
     pub(crate) fn distance_from_bottom(&self) -> f32 {
         let max = f32::from(self.list.max_offset_for_scrollbar().y);
@@ -1795,9 +1799,22 @@ impl Transcript {
 
     /// The scroll-to-bottom pill's click: glide back to the end and re-pin.
     pub fn jump_to_bottom(&mut self, cx: &mut Context<Self>) {
-        self.remove_own_turn_runway();
+        // With a live runway, "bottom" IS the held position (the reservation
+        // makes prompt-at-top and pad-bottom the same place): re-arm the hold
+        // and glide back instead of destroying the runway (user spec — only
+        // navigating away and back clears it).
+        if let Some(anchor) = self.own_turn.as_mut() {
+            anchor.held = true;
+            anchor.positioned = false;
+            self.own_turn_last_tick = None;
+            self.own_turn_kick = true;
+            self.show_jump_button = false;
+            cx.notify();
+            return;
+        }
         self.engage_pin(cx);
     }
+
 
     /// Re-engage the bottom pin with a glide. Long jumps teleport to within
     /// [`GLIDE_MAX_VIEWPORTS`] of the end first (mugen `springToBottom`);
