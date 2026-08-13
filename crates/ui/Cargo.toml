@@ -12,6 +12,7 @@ komet-doc.workspace = true
 komet-engine.workspace = true
 komet-rpc.workspace = true
 komet-update.workspace = true
+komet-syntax.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
 gpui_tokio.workspace = true

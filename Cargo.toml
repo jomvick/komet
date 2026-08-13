@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/syntax",
     "crates/proto",
     "crates/doc",
     "crates/sync",
@@ -27,6 +28,7 @@ komet-engine = { path = "crates/engine" }
 komet-rpc = { path = "crates/rpc" }
 komet-update = { path = "crates/update" }
 komet-ui = { path = "crates/ui" }
+komet-syntax = { path = "crates/syntax" }
 
 # CRDT
 loro = "1.13"
@@ -113,5 +115,4 @@ opt-level = 0
 
 [profile.dev.package."*"]
 opt-level = 2
-
 

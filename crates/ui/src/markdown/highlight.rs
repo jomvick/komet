@@ -11,6 +11,8 @@
 
 use std::ops::Range;
 
+pub use komet_syntax::LanguageId as Lang;
+
 /// Token paint class. `Plain` gaps are implicit (only non-plain spans are emitted).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenClass {
@@ -38,32 +40,9 @@ pub enum LineCarry {
     InString(u8),
 }
 
-/// Supported languages.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Lang {
-    Rust,
-    Js,
-    Python,
-    Go,
-    Json,
-    Bash,
-    Toml,
-    Markdown,
-}
-
 /// Map a fenced-code info tag to a language.
 pub fn lang_for_tag(tag: &str) -> Option<Lang> {
-    match tag.to_ascii_lowercase().as_str() {
-        "rust" | "rs" => Some(Lang::Rust),
-        "ts" | "tsx" | "typescript" | "js" | "jsx" | "javascript" | "mjs" | "cjs" => Some(Lang::Js),
-        "python" | "py" => Some(Lang::Python),
-        "go" | "golang" => Some(Lang::Go),
-        "json" | "jsonc" => Some(Lang::Json),
-        "bash" | "sh" | "shell" | "zsh" | "console" => Some(Lang::Bash),
-        "toml" => Some(Lang::Toml),
-        "md" | "markdown" => Some(Lang::Markdown),
-        _ => None,
-    }
+    komet_syntax::language_for_alias(tag)
 }
 
 struct StringSpec {
@@ -109,7 +88,7 @@ fn spec(lang: Lang) -> &'static LangSpec {
                 "super", "trait", "true", "type", "unsafe", "use", "where", "while",
             ],
         },
-        Lang::Js => &LangSpec {
+        Lang::JavaScript | Lang::Jsx | Lang::TypeScript | Lang::Tsx => &LangSpec {
             line_comments: &["//"],
             comment_needs_boundary: false,
             block_comment: Some(("/*", "*/")),
@@ -253,7 +232,7 @@ fn spec(lang: Lang) -> &'static LangSpec {
                 "var",
             ],
         },
-        Lang::Json => &LangSpec {
+        Lang::Json | Lang::Jsonc => &LangSpec {
             line_comments: &[],
             comment_needs_boundary: false,
             block_comment: None,
@@ -309,6 +288,31 @@ fn spec(lang: Lang) -> &'static LangSpec {
                 multiline: false,
                 escapes: false,
             }],
+            keywords: &[],
+        },
+        // The legacy adapter intentionally has no rules for languages that were
+        // not supported before the shared registry. Tree-sitter replaces it in
+        // later commits; until then these languages remain plain.
+        Lang::Html
+        | Lang::Css
+        | Lang::Yaml
+        | Lang::C
+        | Lang::Cpp
+        | Lang::CSharp
+        | Lang::Java
+        | Lang::Kotlin
+        | Lang::Swift
+        | Lang::Ruby
+        | Lang::Php
+        | Lang::Sql
+        | Lang::Lua
+        | Lang::Dockerfile
+        | Lang::Nix
+        | Lang::Make => &LangSpec {
+            line_comments: &[],
+            comment_needs_boundary: false,
+            block_comment: None,
+            strings: &[],
             keywords: &[],
         },
     }
@@ -641,7 +645,7 @@ mod tests {
 
     #[test]
     fn js_template_string_carries() {
-        let lines = tokenize_block(Lang::Js, "const s = `multi\nline`; let n = 5");
+        let lines = tokenize_block(Lang::JavaScript, "const s = `multi\nline`; let n = 5");
         assert!(lines[0].iter().any(|t| t.class == TokenClass::StringLit));
         assert!(lines[1].iter().any(|t| t.class == TokenClass::StringLit));
         assert!(lines[1].iter().any(|t| t.class == TokenClass::Number));
@@ -666,7 +670,7 @@ mod tests {
     #[test]
     fn lang_tags_resolve() {
         assert_eq!(lang_for_tag("RS"), Some(Lang::Rust));
-        assert_eq!(lang_for_tag("tsx"), Some(Lang::Js));
+        assert_eq!(lang_for_tag("tsx"), Some(Lang::Tsx));
         assert_eq!(lang_for_tag("shell"), Some(Lang::Bash));
         assert_eq!(lang_for_tag("unknown-lang"), None);
     }
