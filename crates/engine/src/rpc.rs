@@ -1117,60 +1117,77 @@ impl RpcService for EngineRpc {
             // turn-start tree snapshot against the current tree; anything else
             // is the plain working-tree capture.
             methods::GET_CHECKOUT_DIFF => {
-                #[derive(Deserialize)]
-                #[serde(rename_all = "camelCase")]
-                struct P {
-                    cwd: String,
-                    #[serde(default)]
-                    mode: String,
-                    base_ref: Option<String>,
-                    chat_id: Option<String>,
-                }
-                let p: P = parse_params(params)?;
-                let identity = self
-                    .repos
-                    .checkout_identity(std::path::Path::new(&p.cwd))
-                    .await
+                // Keep the scoped-diff future off the dispatcher's stack. The
+                // per-commit path adds another nested git-capture future.
+                Box::pin(async move {
+                    #[derive(Deserialize)]
+                    #[serde(rename_all = "camelCase")]
+                    struct P {
+                        cwd: String,
+                        #[serde(default)]
+                        mode: String,
+                        base_ref: Option<String>,
+                        chat_id: Option<String>,
+                        commit_sha: Option<String>,
+                    }
+                    let p: P = parse_params(params)?;
+                    let identity = self
+                        .repos
+                        .checkout_identity(std::path::Path::new(&p.cwd))
+                        .await
+                        .map_err(|e| RpcError::Failed(e.to_string()))?;
+                    let root = identity.root.as_path();
+                    let snapshot = match p.mode.as_str() {
+                        "branch" => {
+                            let base_ref = p
+                                .base_ref
+                                .as_deref()
+                                .ok_or_else(|| RpcError::Failed("baseRef required".into()))?;
+                            let base = crate::diff_sync::merge_base(root, base_ref)
+                                .await
+                                .map_err(|e| RpcError::Failed(e.to_string()))?;
+                            crate::diff_sync::capture_diff_against(&self.repos, root, Some(&base))
+                                .await
+                        }
+                        // One commit's own changes (History → per-commit tab):
+                        // parent (or the empty tree) vs the commit itself.
+                        "commit" => {
+                            let sha = p
+                                .commit_sha
+                                .as_deref()
+                                .ok_or_else(|| RpcError::Failed("commitSha required".into()))?;
+                            crate::diff_sync::capture_commit_diff(&self.repos, root, sha).await
+                        }
+                        "turn" => {
+                            let chat_id = p
+                                .chat_id
+                                .as_deref()
+                                .ok_or_else(|| RpcError::Failed("chatId required".into()))?;
+                            let snapshot = self
+                                .diff_sync
+                                .turn_snapshot(chat_id)
+                                .filter(|s| s.root == identity.root)
+                                .ok_or_else(|| RpcError::Failed("no turn recorded".into()))?;
+                            crate::diff_sync::capture_turn_diff(&self.repos, root, &snapshot.tree)
+                                .await
+                        }
+                        _ => crate::diff_sync::capture_diff(&self.repos, root).await,
+                    }
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
-                let root = identity.root.as_path();
-                let snapshot = match p.mode.as_str() {
-                    "branch" => {
-                        let base_ref = p
-                            .base_ref
-                            .as_deref()
-                            .ok_or_else(|| RpcError::Failed("baseRef required".into()))?;
-                        let base = crate::diff_sync::merge_base(root, base_ref)
-                            .await
-                            .map_err(|e| RpcError::Failed(e.to_string()))?;
-                        crate::diff_sync::capture_diff_against(&self.repos, root, Some(&base)).await
-                    }
-                    "turn" => {
-                        let chat_id = p
-                            .chat_id
-                            .as_deref()
-                            .ok_or_else(|| RpcError::Failed("chatId required".into()))?;
-                        let snapshot = self
-                            .diff_sync
-                            .turn_snapshot(chat_id)
-                            .filter(|s| s.root == identity.root)
-                            .ok_or_else(|| RpcError::Failed("no turn recorded".into()))?;
-                        crate::diff_sync::capture_turn_diff(&self.repos, root, &snapshot.tree).await
-                    }
-                    _ => crate::diff_sync::capture_diff(&self.repos, root).await,
-                }
-                .map_err(|e| RpcError::Failed(e.to_string()))?;
-                RpcReply::value(&komet_proto::CheckoutDiff {
-                    checkout_id: identity.id,
-                    device_id: self.doc_host.device_id().to_string(),
-                    cwd: identity.root.to_string_lossy().to_string(),
-                    patch: snapshot.patch,
-                    files: snapshot.files,
-                    additions: snapshot.additions,
-                    deletions: snapshot.deletions,
-                    truncated: snapshot.truncated,
-                    checksum: snapshot.checksum,
-                    updated_at: chrono::Utc::now(),
+                    RpcReply::value(&komet_proto::CheckoutDiff {
+                        checkout_id: identity.id,
+                        device_id: self.doc_host.device_id().to_string(),
+                        cwd: identity.root.to_string_lossy().to_string(),
+                        patch: snapshot.patch,
+                        files: snapshot.files,
+                        additions: snapshot.additions,
+                        deletions: snapshot.deletions,
+                        truncated: snapshot.truncated,
+                        checksum: snapshot.checksum,
+                        updated_at: chrono::Utc::now(),
+                    })
                 })
+                .await
             }
             methods::GET_CHECKOUT_FILE_DIFF_TEXT => {
                 // This branch contains several large nested async futures. Keep it

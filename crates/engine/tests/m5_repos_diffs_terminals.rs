@@ -9,8 +9,9 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
 use komet_engine::{
-    EngineCore, HarnessRegistry, Repos, Terminals, capture_diff, capture_diff_against,
-    capture_turn_diff, merge_base, read_diff_file_text, snapshot_tree, working_diff_base,
+    EngineCore, HarnessRegistry, Repos, Terminals, capture_commit_diff, capture_diff,
+    capture_diff_against, capture_turn_diff, merge_base, read_diff_file_text, snapshot_tree,
+    working_diff_base,
 };
 use komet_proto::{GitHistoryRefKind, TerminalEvent};
 use komet_rpc::methods;
@@ -179,9 +180,17 @@ async fn repos_round_trip_add_branches_worktrees() {
         by_name("main").current,
         "main is the main checkout: {refs:?}"
     );
+    // macOS exposes /var through the /private/var symlink, while Git reports
+    // the canonical worktree path. Compare canonical paths so the assertion
+    // is stable across platforms and temporary-directory roots.
+    let listed_worktree_path = by_name(&worktree.branch)
+        .worktree_path
+        .as_deref()
+        .map(Path::new)
+        .and_then(|path| std::fs::canonicalize(path).ok());
+    let expected_worktree_path = std::fs::canonicalize(&worktree.path).ok();
     assert_eq!(
-        by_name(&worktree.branch).worktree_path.as_deref(),
-        Some(worktree.path.as_str()),
+        listed_worktree_path, expected_worktree_path,
         "worktree branch maps to its path: {refs:?}"
     );
     let plain_ref = by_name("feature/x");
@@ -555,6 +564,38 @@ async fn diff_file_text_returns_both_checked_sources() {
             .await
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn commit_diff_captures_one_commit_and_roots_diff_the_empty_tree() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo_dir = tmp.path().join("repo");
+    init_repo(&repo_dir).await;
+    let repos = test_repos(&tmp.path().join("data"));
+
+    // A second commit plus an uncommitted edit on top.
+    std::fs::write(repo_dir.join("c.txt"), "second commit\n").expect("write c.txt");
+    git(&repo_dir, &["add", "."]).await;
+    git(&repo_dir, &["commit", "-m", "second"]).await;
+    std::fs::write(repo_dir.join("a.txt"), "one\ntwo\nuncommitted\n").expect("edit a.txt");
+
+    let head = git_stdout(&repo_dir, &["rev-parse", "HEAD"]).await;
+    let snapshot = capture_commit_diff(&repos, &repo_dir, &head)
+        .await
+        .expect("commit capture");
+    // Only the commit's own change — never the working tree on top.
+    assert!(snapshot.patch.contains("+second commit"));
+    assert!(!snapshot.patch.contains("uncommitted"));
+    assert_eq!(snapshot.files.len(), 1);
+    assert_eq!(snapshot.files[0].path, "c.txt");
+    assert_eq!(snapshot.head_sha.as_deref(), Some(head.as_str()));
+
+    // The root commit diffs against the empty tree instead of erroring.
+    let root = git_stdout(&repo_dir, &["rev-list", "--max-parents=0", "HEAD"]).await;
+    let root_snapshot = capture_commit_diff(&repos, &repo_dir, &root)
+        .await
+        .expect("root capture");
+    assert!(root_snapshot.files.iter().any(|f| f.path == "a.txt"));
 }
 
 #[tokio::test]
