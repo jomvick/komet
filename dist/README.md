@@ -45,10 +45,12 @@ installed builds can update into Komet. CI runs this on tags
    sed "s/__VERSION__/$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')/" \
      dist/macos/Info.plist > Komet.app/Contents/Info.plist
    ```
-3. Icon: generate `komet.icns` from `dist/komet.png` (`iconutil`) and place it at
+3. Icon: generate `komet.icns` from `dist/macos/icon-1024.png` (the macOS-shaped
+   variant of the artwork — squircle mask, margins, and shadow pre-baked, since
+   `sips` can't apply an alpha mask) and place it at
    `Komet.app/Contents/Resources/komet.icns`:
    ```sh
-   mkdir komet.iconset && sips -z 256 256 dist/komet.png --out komet.iconset/icon_256x256.png
+   mkdir komet.iconset && sips -z 256 256 dist/macos/icon-1024.png --out komet.iconset/icon_256x256.png
    iconutil -c icns komet.iconset -o Komet.app/Contents/Resources/komet.icns
    ```
 4. Sign + notarize (required for distribution):

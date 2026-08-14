@@ -162,7 +162,10 @@ async fn sending_a_message_unarchives_the_chat() {
     core.doc_host
         .queue_command(CHAT, run_payload("msg-ua-1"))
         .expect("queue run command");
-    assert!(!archived(&core), "sending a message must unarchive the chat");
+    assert!(
+        !archived(&core),
+        "sending a message must unarchive the chat"
+    );
     wait_for(|| complete_assistant_count(&core) == 1, "turn to complete").await;
 
     // A non-message command must NOT revive it.

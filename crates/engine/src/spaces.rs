@@ -25,6 +25,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::Duration;
 
 use tokio::sync::{mpsc, watch};
+use tokio_util::sync::CancellationToken;
 
 use komet_proto::Space;
 
@@ -48,6 +49,10 @@ struct SpacesSyncInner {
     workspace: WorkspaceHost,
     device_id: String,
     entries: Mutex<HashMap<String, Arc<SpaceEntry>>>,
+    /// Ends the supervisor loop eagerly on shutdown (weak refs alone only end
+    /// it once the whole graph drops).
+    cancel: CancellationToken,
+    supervisor: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -69,13 +74,27 @@ impl SpacesSync {
                 workspace: workspace.clone(),
                 device_id: device_id.to_string(),
                 entries: Mutex::new(HashMap::new()),
+                cancel: CancellationToken::new(),
+                supervisor: Mutex::new(None),
             }),
         };
-        tokio::spawn(spaces_task(
+        let task = tokio::spawn(spaces_task(
             Arc::downgrade(&sync.inner),
             workspace.watch_spaces(),
+            sync.inner.cancel.clone(),
         ));
+        *lock(&sync.inner.supervisor) = Some(task);
         sync
+    }
+
+    /// Stop the supervisor loop and wait for it to exit (per-space tasks are
+    /// purely local and end when their entries drop). Idempotent.
+    pub async fn shutdown(&self) {
+        self.inner.cancel.cancel();
+        let task = lock(&self.inner.supervisor).take();
+        if let Some(task) = task {
+            let _ = task.await;
+        }
     }
 
     /// Reconcile + recheck now (tests / opportunistic callers).
@@ -239,8 +258,12 @@ fn sweep_orphans(inner: &Arc<SpacesSyncInner>) {
 }
 
 /// Spaces-watch follower + repair tick. Weak handles so dropping the service
-/// tears the loop down.
-async fn spaces_task(inner: Weak<SpacesSyncInner>, mut spaces_rx: watch::Receiver<Vec<Space>>) {
+/// tears the loop down; the token ends it eagerly on shutdown.
+async fn spaces_task(
+    inner: Weak<SpacesSyncInner>,
+    mut spaces_rx: watch::Receiver<Vec<Space>>,
+    cancel: CancellationToken,
+) {
     let mut repair = tokio::time::interval(REPAIR_INTERVAL);
     repair.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     repair.tick().await; // consume the immediate first tick
@@ -251,6 +274,7 @@ async fn spaces_task(inner: Weak<SpacesSyncInner>, mut spaces_rx: watch::Receive
     }
     loop {
         tokio::select! {
+            _ = cancel.cancelled() => break,
             changed = spaces_rx.changed() => {
                 if changed.is_err() {
                     break;

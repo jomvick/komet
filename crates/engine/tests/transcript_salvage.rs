@@ -18,7 +18,12 @@ fn assemble(dir: &std::path::Path) -> EngineCore {
         .expect("engine core assembles")
 }
 
-fn entry(id: &str, role: MessageRole, text: &str, status: Option<MessageStatus>) -> SessionMessageEntry {
+fn entry(
+    id: &str,
+    role: MessageRole,
+    text: &str,
+    status: Option<MessageStatus>,
+) -> SessionMessageEntry {
     SessionMessageEntry {
         id: id.into(),
         role,
@@ -68,8 +73,13 @@ async fn blank_journaled_chat_recovers_entries_from_fat_rollback() {
     )
     .unwrap();
     let fat = SessionDoc::init(CHAT).unwrap();
-    fat.push_message(&entry("u-1", MessageRole::User, "the codeword is PINEAPPLE", None))
-        .unwrap();
+    fat.push_message(&entry(
+        "u-1",
+        MessageRole::User,
+        "the codeword is PINEAPPLE",
+        None,
+    ))
+    .unwrap();
     fat.push_message(&entry(
         "a-1",
         MessageRole::Assistant,
@@ -120,6 +130,10 @@ async fn blank_journaled_chat_recovers_entries_from_fat_rollback() {
         .ok()
         .and_then(|h| h.doc().read_entries().ok())
         .unwrap_or_default();
-    assert_eq!(after.len(), 2, "salvage duplicated entries on reboot: {after:?}");
+    assert_eq!(
+        after.len(),
+        2,
+        "salvage duplicated entries on reboot: {after:?}"
+    );
     core.shutdown().await;
 }

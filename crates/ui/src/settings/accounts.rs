@@ -411,7 +411,11 @@ impl AccountsPage {
                         )
                 }))
                 .into_any_element();
-            trigger = trigger.child(popover::anchored_menu("accounts-device-menu", menu, closing));
+            trigger = trigger.child(popover::anchored_menu(
+                "accounts-device-menu",
+                menu,
+                closing,
+            ));
         }
         trigger.into_any_element()
     }

@@ -32,9 +32,7 @@ async fn main() {
     let session = komet_doc::SessionDoc::from_doc(doc.clone());
     let parsed = session.read_entries().map(|e| e.len() as u64).unwrap_or(0);
     for i in 0..msgs.len() {
-        if let Some(loro::ValueOrContainer::Container(loro::Container::Map(m))) =
-            msgs.get(i)
-        {
+        if let Some(loro::ValueOrContainer::Container(loro::Container::Map(m))) = msgs.get(i) {
             if let Some(loro::ValueOrContainer::Container(loro::Container::List(parts))) =
                 m.get("parts")
             {

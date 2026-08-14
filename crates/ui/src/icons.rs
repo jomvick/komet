@@ -125,6 +125,11 @@ icon_assets![
     (STOP, "stop"),
     (CHECK, "check"),
     (COPY, "copy"),
+    // Hand-drawn star pair in the Solar Linear style (like the terminal/
+    // plus/return ports) — outline for the favorite affordance, bold for the
+    // favorited state and the picker's favorites rail tab.
+    (STAR, "star"),
+    (STAR_BOLD, "star-bold"),
     (KOMET_LOGO, "komet-logo"),
     // Harness brand marks (icons.tsx).
     (CLAUDE_MARK, "claude-mark"),

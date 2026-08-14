@@ -25,7 +25,7 @@ only CPU-heavy path (compaction/snapshot export) while adding real risk.
 - Pricing has no language-sensitive CPU component; dominant cost lever is maximizing hibernation.
 - Ecosystem: production CRDT-DO backends (pluv, y-durableobjects, PartyKit-style) are TS + wasm cores.
 
-## Consequences for komet-native
+## Consequences for komet
 - apps/edge (session-room, device-room, worker front, auth, R2 attachments) carries over as the
   TS edge — port/adapt, don't rewrite. All 14 smoke assertions already exist.
 - Rust backend + gpui app use the `loro` Rust crate 1.13.7; binary format identical to JS 1.13.7

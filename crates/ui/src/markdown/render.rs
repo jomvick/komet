@@ -14,12 +14,12 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::time::Instant;
 
-use komet_syntax::{HighlightKind, HighlightSpan, HighlightedDocument};
 use gpui::{
     AnyElement, BorderStyle, Bounds, FontStyle, FontWeight, Hsla, InteractiveText, SharedString,
     StyledText, TextRun, UnderlineStyle, Window, canvas, div, font, point, prelude::*, px, quad,
     size,
 };
+use komet_syntax::{HighlightKind, HighlightSpan, HighlightedDocument};
 
 use crate::theme::Theme;
 

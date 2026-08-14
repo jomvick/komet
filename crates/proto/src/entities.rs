@@ -1,6 +1,6 @@
 //! Synced entity rows (workspace doc) and local projections.
 //!
-//! In komet these were synced Postgres rows; in komet-native they live in the per-org
+//! In komet these were synced Postgres rows; in komet they live in the per-org
 //! workspace Loro doc (see ARCHITECTURE.md §2.2) with the same field surface.
 
 use chrono::{DateTime, Utc};

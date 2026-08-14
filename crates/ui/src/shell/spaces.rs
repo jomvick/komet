@@ -10,8 +10,8 @@
 
 use super::*;
 use crate::pickers::{breadcrumbs, browser_rows, completion_prefix_len, parent_path};
-use komet_proto::{ChatIndicator, Device, FolderListing, Space};
 use gpui::FocusHandle;
+use komet_proto::{ChatIndicator, Device, FolderListing, Space};
 
 /// The space-filter dropdown, `Some` while open. The same searchable-menu
 /// recipe as the composer's ref picker: filter input on top
@@ -476,19 +476,17 @@ impl Shell {
                 .collect()
         };
 
-        let list = div()
-            .id("spaces-menu-list")
-            .flex()
-            .flex_col()
-            .gap(px(2.0))
-            .max_h(px(224.0))
-            .overflow_y_scroll()
-            .track_scroll(&list_scroll)
-            .children(
-                details
-                    .into_iter()
-                    .enumerate()
-                    .map(|(ix, (row, label, tag, offline))| {
+        let list =
+            div()
+                .id("spaces-menu-list")
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .max_h(px(224.0))
+                .overflow_y_scroll()
+                .track_scroll(&list_scroll)
+                .children(details.into_iter().enumerate().map(
+                    |(ix, (row, label, tag, offline))| {
                         let is_selected = match &row {
                             SpacesMenuRow::All => filter.is_none(),
                             SpacesMenuRow::Space(id) => filter.as_deref() == Some(id.as_str()),
@@ -549,8 +547,8 @@ impl Shell {
                         })
                         // No check glyph — the selected row's wash (menu_row's
                         // active styling) is the selection signal.
-                    }),
-            );
+                    },
+                ));
 
         popover::popover_card(theme)
             .w(px(248.0))
@@ -800,9 +798,7 @@ impl Shell {
                         .rounded(px(6.0))
                         .cursor_pointer()
                         .when(is_selected, |el| el.bg(selected_wash))
-                        .when(!is_selected, |el| {
-                            el.hover(|s| s.bg(theme.glass_hover()))
-                        })
+                        .when(!is_selected, |el| el.hover(|s| s.bg(theme.glass_hover())))
                         .on_hover(cx.listener(move |this, entered: &bool, _, cx| {
                             if *entered {
                                 if this.archived_hover.as_deref() != Some(hover_id.as_str()) {
@@ -1898,7 +1894,15 @@ impl Shell {
                 .child(body)
                 .child(footer)
                 .into_any_element();
-        Some(popover::modal("add-space-dialog", viewport, card))
+        // The glass-modal variant: lighter scrim + a frost radius matching
+        // this card's 14px rounding, so the palette reads like the popovers
+        // instead of a flat slab over a 60% dim (user request).
+        Some(popover::modal_glass(
+            "add-space-dialog",
+            viewport,
+            card,
+            14.0,
+        ))
     }
 
     // ---- space context menu / rename / delete overlays ----

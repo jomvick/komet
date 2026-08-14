@@ -294,11 +294,12 @@ pub fn classify_key(key: &str, cmd: bool, ctrl: bool) -> MenuKey {
 // ---------------------------------------------------------------------------
 
 /// The floating-menu surface (komet `.glass-surface` + `menuSurface`):
-/// `rounded-xl border border-white/[0.1] p-1` over the frosted glass tint.
-/// gpui has no backdrop blur at the pinned rev, so the glass
-/// (`oklch(0.33 0 0 / 34%)` over blurred dark content) is approximated with
-/// the near-opaque tone it composites to on the dark panels (~#161616), plus
-/// the same hairline + baked-in shadow.
+/// `rounded-xl border border-white/[0.1] p-1` over the frosted glass tint —
+/// the real recipe now that the fork paints backdrop blur: the
+/// [`Theme::glass_overlay`] tint (`oklch(0.33 0 0 / 34%)` on dark) over the
+/// [`crate::frost::MENU_BLUR`] blur from the mount helpers below, plus the
+/// same hairline + baked-in shadow. Opaque platforms keep the near-opaque
+/// tone the reference composites to on the dark panels (~#161616).
 pub fn popover_card(theme: &Theme) -> gpui::Div {
     let card = div()
         .border_1()
@@ -360,7 +361,7 @@ fn exit_progress(since: std::time::Instant) -> f32 {
 /// primitive ignores `element_opacity`, so without this the glass slab would
 /// hold full strength through the fade and pop off at unmount.
 fn frosted_menu(exit: Option<f32>, content: AnyElement) -> AnyElement {
-    let blur = 16.0 * (1.0 - exit.unwrap_or(0.0));
+    let blur = crate::frost::MENU_BLUR * (1.0 - exit.unwrap_or(0.0));
     crate::frost::frosted(12.0, blur, content).into_any_element()
 }
 
@@ -373,9 +374,7 @@ fn frosted_menu(exit: Option<f32>, content: AnyElement) -> AnyElement {
 /// underneath.
 fn menu_motion(id: SharedString, exit: Option<f32>, inner: gpui::Div) -> AnyElement {
     if let Some(t) = exit {
-        let inner = inner
-            .relative()
-            .child(div().absolute().inset_0().occlude());
+        let inner = inner.relative().child(div().absolute().inset_0().occlude());
         motion::menu_out(SharedString::from(format!("{id}-out")), t, inner).into_any_element()
     } else {
         motion::menu_in(id, inner).into_any_element()
@@ -548,11 +547,7 @@ pub fn menu_at(
             .position(position)
             .anchor(Anchor::TopLeft)
             .snap_to_window_with_margin(px(8.0))
-            .child(menu_motion(
-                id.into(),
-                exit,
-                div().occlude().child(content),
-            )),
+            .child(menu_motion(id.into(), exit, div().occlude().child(content))),
     )
     .priority(1)
     .into_any_element()
@@ -573,13 +568,39 @@ pub(crate) fn scrim_alpha(alpha_dark: f32) -> gpui::Hsla {
 /// Full-window modal: dim scrim + centered card with the `dialog-in` entrance.
 /// The scrim swallows clicks; the caller wires its own dismiss/confirm.
 /// `viewport` is the window size (an `anchored` layer sizes to its children,
-/// so the scrim needs explicit dimensions).
+/// so the scrim needs explicit dimensions). The frost radius matches
+/// [`dialog_card`]'s 16px rounding.
 pub fn modal(
     id: impl Into<ElementId>,
     viewport: gpui::Size<Pixels>,
     card: AnyElement,
 ) -> AnyElement {
-    let card = crate::frost::frosted(12.0, 16.0, card).into_any_element();
+    modal_with(id, viewport, card, 16.0, 0.6)
+}
+
+/// [`modal`] for glass-tinted cards (the add-space palette): a LIGHTER scrim,
+/// so the frosted card reads like the popovers — the standard 0.6 dim buried
+/// the backdrop hue under the blur and the palette came out a flat grey slab
+/// next to the hue-inheriting menus (user report). `corner_radius` must match
+/// the card's rounding.
+pub fn modal_glass(
+    id: impl Into<ElementId>,
+    viewport: gpui::Size<Pixels>,
+    card: AnyElement,
+    corner_radius: f32,
+) -> AnyElement {
+    modal_with(id, viewport, card, corner_radius, 0.35)
+}
+
+fn modal_with(
+    id: impl Into<ElementId>,
+    viewport: gpui::Size<Pixels>,
+    card: AnyElement,
+    corner_radius: f32,
+    scrim: f32,
+) -> AnyElement {
+    let card =
+        crate::frost::frosted(corner_radius, crate::frost::MENU_BLUR, card).into_any_element();
     gpui::deferred(
         gpui::anchored()
             .position(gpui::point(px(0.0), px(0.0)))
@@ -588,7 +609,7 @@ pub fn modal(
                     .occlude()
                     .w(viewport.width)
                     .h(viewport.height)
-                    .bg(scrim_alpha(0.6))
+                    .bg(scrim_alpha(scrim))
                     .flex()
                     .items_center()
                     .justify_center()

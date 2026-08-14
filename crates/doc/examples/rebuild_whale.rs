@@ -1,12 +1,14 @@
 //! Run the M1 thin rebuild against a REAL whale snapshot (read-only: loads a
 //! snapshot file, rebuilds, reports accounting — writes nothing anywhere).
 //! Usage: cargo run -p komet-doc --example rebuild_whale -- <snapshot.bin>
+use loro::LoroDoc;
 use komet_doc::rebuild::{doc_epoch, rebuild_thin_doc};
 use komet_doc::schema::SessionDoc;
-use loro::LoroDoc;
 
 fn main() {
-    let path = std::env::args().nth(1).expect("usage: rebuild_whale <snapshot.bin>");
+    let path = std::env::args()
+        .nth(1)
+        .expect("usage: rebuild_whale <snapshot.bin>");
     let bytes = std::fs::read(&path).expect("read snapshot");
     let doc = LoroDoc::new();
     doc.import(&bytes).expect("import snapshot");

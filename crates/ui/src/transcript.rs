@@ -114,11 +114,19 @@ pub const GLIDE_MAX_VIEWPORTS: f32 = 2.5;
 /// A freshly-sent prompt rests this far below the transcript viewport's top.
 /// The titlebar overlays the full-height list, so its height is part of the
 /// inset; the extra 10px matches the first row's breathing room.
-const OWN_SEND_TOP_INSET_PX: f32 = Theme::TITLEBAR_HEIGHT + 10.0;
-/// Per-60fps-frame fraction of the remaining glide covered when a send
-/// re-anchors the viewport onto the new prompt (~90% in ~230ms, ease-out).
+pub(crate) const OWN_SEND_TOP_INSET_PX: f32 = Theme::TITLEBAR_HEIGHT + 10.0;
+/// Epsilon of extra height under the reservation. The runway ends AT the
+/// app's bottom — this is not scroll room (24px of it read as a janky
+/// overshoot-and-fight zone, user report) — it exists only to keep the held
+/// layout out of gpui's shorter-than-viewport regime, where a bottom-aligned
+/// list reports no item bounds (sizing goes blind) and position becomes a
+/// function of content height instead of the hold. Two pixels of travel is
+/// below perception.
+const OWN_SEND_SCROLL_SLACK_PX: f32 = 2.0;
+/// Per-60fps-frame fraction of the remaining entry glide retained (~90%
+/// covered in ~230ms, ease-out).
 const OWN_SEND_GLIDE_RETAIN: f32 = 0.85;
-/// The anchor glide snaps to its hold position within this error.
+/// The entry glide snaps to the absolute hold within this error.
 const OWN_SEND_GLIDE_SNAP_PX: f32 = 1.0;
 
 /// The reservation a held turn still needs: the room under the prompt's
@@ -219,6 +227,11 @@ pub struct ToolItem {
     /// Precomputed here because rows are cached by fingerprint — diffing and
     /// tokenizing per paint would run on every scroll frame.
     pub detail: Option<Arc<ToolDetail>>,
+    /// Expandable full-invocation block: the complete tool call (whole
+    /// command / pattern / URL / input JSON) that the chip header collapses
+    /// to one truncated line. Rendered above `detail` in the open card.
+    /// Precomputed for the same reason as `detail`.
+    pub invocation: Option<Arc<ToolDetail>>,
     /// Sidecar key of the full output (chat2-sync A3) — the doc carries only
     /// a one-line summary; expanding offers a lazy "Show full output" fetch.
     pub output_ref: Option<SharedString>,
@@ -306,6 +319,90 @@ pub fn tool_detail(
         .map(|l| SharedString::from(l.to_owned()))
         .collect();
     // Trim trailing blank output lines so the block hugs its content.
+    while lines.last().is_some_and(|l| l.trim().is_empty()) {
+        lines.pop();
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    let truncated_by = lines.len().saturating_sub(OUTPUT_DETAIL_MAX_LINES);
+    lines.truncate(OUTPUT_DETAIL_MAX_LINES);
+    Some(ToolDetail::Output {
+        lines,
+        truncated_by,
+    })
+}
+
+/// Columns at which an invocation line soft-wraps into continuation lines.
+/// The wrap is char-counted, not measured — block heights must be analytic —
+/// so the budget is sized to fit the narrowest useful transcript pane.
+pub const CALL_WRAP_COLS: usize = 80;
+
+/// Soft-wrap one raw line into [`CALL_WRAP_COLS`]-char chunks so a long
+/// single-line command stays fully readable instead of ellipsizing.
+fn wrap_cols(line: &str, cols: usize) -> Vec<SharedString> {
+    if line.chars().count() <= cols {
+        return vec![SharedString::from(line.to_owned())];
+    }
+    line.chars()
+        .collect::<Vec<_>>()
+        .chunks(cols)
+        .map(|chunk| SharedString::from(chunk.iter().collect::<String>()))
+        .collect()
+}
+
+/// Build a chip's full-invocation block — the complete tool call the header
+/// truncates to one line: the whole command, pattern, or URL, todo items one
+/// per line, MCP/unknown input as pretty-printed JSON. Reuses the output
+/// code-block payload so rendering and height stay one implementation.
+pub fn call_block(call: &ToolCall) -> Option<ToolDetail> {
+    let text: String = match call {
+        ToolCall::Exec { command } => command.clone(),
+        ToolCall::ReadFile { path } => path.clone(),
+        ToolCall::WriteFile { path, content } => match content {
+            Some(content) => format!("{path}\n{content}"),
+            None => path.clone(),
+        },
+        ToolCall::EditFile { path, .. } => path.clone(),
+        ToolCall::ApplyPatch { path } => path.clone().unwrap_or_else(|| "workspace".into()),
+        ToolCall::Search { pattern, path } => match path {
+            Some(path) => format!("{pattern} in {path}"),
+            None => pattern.clone(),
+        },
+        ToolCall::Glob { pattern } => pattern.clone(),
+        ToolCall::WebFetch { url, prompt } => match prompt {
+            Some(prompt) => format!("{url}\n{prompt}"),
+            None => url.clone(),
+        },
+        ToolCall::WebSearch { query } => query.clone(),
+        ToolCall::Todo { items } => items
+            .iter()
+            .map(|i| format!("{} {}", if i.done { "[x]" } else { "[ ]" }, i.text))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        ToolCall::Mcp {
+            server,
+            tool,
+            input,
+        } => match input {
+            Some(input) => format!(
+                "{server} · {tool}\n{}",
+                serde_json::to_string_pretty(input).unwrap_or_default()
+            ),
+            None => format!("{server} · {tool}"),
+        },
+        ToolCall::Unknown { name, input } => match input {
+            Some(input) => format!(
+                "{name}\n{}",
+                serde_json::to_string_pretty(input).unwrap_or_default()
+            ),
+            None => name.clone(),
+        },
+    };
+    let mut lines: Vec<SharedString> = text
+        .lines()
+        .flat_map(|l| wrap_cols(l, CALL_WRAP_COLS))
+        .collect();
     while lines.last().is_some_and(|l| l.trim().is_empty()) {
         lines.pop();
     }
@@ -515,6 +612,19 @@ fn tool_fingerprint(tools: &[ToolItem], auto_open: bool) -> u64 {
                 }
             }
         }
+        // The invocation block is pure over `call`, which the one-line hash
+        // above only covers by length — hash its bytes so an in-place call
+        // update (a streaming MCP input, a growing todo list) re-splices.
+        if let Some(ToolDetail::Output {
+            lines,
+            truncated_by,
+        }) = t.invocation.as_deref()
+        {
+            for line in lines {
+                acc.extend_from_slice(line.as_bytes());
+            }
+            acc.extend_from_slice(&(*truncated_by as u32).to_le_bytes());
+        }
         // Sidecar refs arriving after the resolve tick must re-splice too —
         // they add the fetch affordance without changing the detail payload.
         acc.push(t.output_ref.is_some() as u8 | (t.diff_ref.is_some() as u8) << 1);
@@ -621,6 +731,7 @@ pub fn rows_for_entry(
                     resolved: *resolved,
                     detail: tool_detail(output.as_deref(), diff.as_ref(), diff_stats.as_deref())
                         .map(Arc::new),
+                    invocation: call_block(call).map(Arc::new),
                     output_ref: output_ref.clone().map(SharedString::from),
                     output_bytes: *output_bytes,
                     diff_ref: diff_ref.clone().map(SharedString::from),
@@ -1213,19 +1324,29 @@ struct FoldState {
 }
 
 /// Layout state for the most recent locally-sent turn (notes-app parity):
-/// EVERY send glides the prompt to the viewport top and reserves the space
-/// below it for the reply — a trailing runway pad sized `usable − turn
-/// height`, i.e. a min-height for the turn. The pad shrinks 1:1 as the reply
-/// grows (zero net motion), so the hold is stable across steers and finished
-/// turns until the reply overflows the reservation — at which point the pad
-/// is ~0 and the bottom spring takes over with no height jump. Cleared by
-/// explicit navigation and chat switches (revisits start at the bottom).
+/// EVERY send reserves the space below the prompt for the reply — a trailing
+/// runway pad sized `usable − turn height`, i.e. a min-height for the turn,
+/// shrinking 1:1 as the reply streams so the held layout never moves. The
+/// entry is an eased glide onto the prompt; landed, the hold re-asserts the
+/// prompt's position absolutely after every layout (the bottom spring can't
+/// hold here: parking at exact distance 0 re-glues gpui's list, which then
+/// hard-tracks the pad's stale bottom on every commit — rig-traced). Wheel
+/// input releases the hold, leaving the reservation as plain scrollable
+/// space. The anchor retires once the reply overflows the reservation (pad
+/// ~0, height-neutral) and on explicit navigation / chat switches (revisits
+/// start at the bottom).
 struct OwnTurnAnchor {
     chat_id: String,
     message_id: SharedString,
     /// Current reservation pad on the last row (`usable − turn_height`).
     runway: f32,
-    /// The send glide has landed; the anchor now holds position exactly.
+    /// The step still owns the viewport (glide → hold). Any wheel/touch
+    /// input releases it — the reservation stays behind as plain scrollable
+    /// space, and the ordinary escape/restick rules apply from then on.
+    held: bool,
+    /// The entry glide has landed; the hold now re-asserts the prompt's
+    /// position absolutely after every layout (glue- and lag-proof — the
+    /// exact mechanism the shipped first-send anchor used).
     positioned: bool,
 }
 
@@ -1279,11 +1400,8 @@ pub struct Transcript {
     own_turn_kick: bool,
     /// One own-turn `on_next_frame` callback in flight at most.
     own_turn_scheduled: bool,
-    /// Wall-clock of the previous own-turn glide tick (`None` = not gliding).
+    /// Wall-clock of the previous entry-glide tick (`None` = not gliding).
     own_turn_last_tick: Option<Instant>,
-    /// The runway was removed on the previous frame; engage the bottom spring
-    /// only after layout has incorporated that removal.
-    own_turn_release_pending: bool,
     spring: StickSpring,
     /// Wall-clock of the previous spring tick (`None` = parked).
     spring_last_tick: Option<Instant>,
@@ -1379,7 +1497,6 @@ impl Transcript {
             own_turn_kick: false,
             own_turn_scheduled: false,
             own_turn_last_tick: None,
-            own_turn_release_pending: false,
             spring: StickSpring::new(),
             spring_last_tick: None,
             spring_settled_at: None,
@@ -1455,26 +1572,27 @@ impl Transcript {
 
     /// Replace the transcript's scroll animation task (rail click / jump).
     pub(crate) fn set_scroll_task(&mut self, task: Task<()>) {
-        self.remove_own_turn_runway();
+        // Rail navigation within the session RELEASES the hold but keeps the
+        // runway (user spec: only leaving and revisiting the session clears
+        // it) — scrolling back down re-arms the hold like any restick.
+        self.release_own_turn_hold();
         self.pinned = false;
         self.scroll_anim = Some(task);
+    }
+
+    /// Give the viewport to the user/navigation without dropping the
+    /// reservation: the pad stays, the hold stands down until a restick.
+    fn release_own_turn_hold(&mut self) {
+        if let Some(anchor) = self.own_turn.as_mut() {
+            anchor.held = false;
+        }
+        self.own_turn_last_tick = None;
     }
 
     fn remeasure_last_row(&self) {
         if let Some(last) = self.rows.len().checked_sub(1) {
             self.list.remeasure_items(last..last + 1);
         }
-    }
-
-    /// Drop the temporary send runway without enabling follow-tail. Used when
-    /// explicit user navigation supersedes the automatic own-turn behavior.
-    fn remove_own_turn_runway(&mut self) {
-        if self.own_turn.take().is_some() {
-            self.remeasure_last_row();
-        }
-        self.own_turn_kick = false;
-        self.own_turn_last_tick = None;
-        self.own_turn_release_pending = false;
     }
 
     pub(crate) fn distance_from_bottom(&self) -> f32 {
@@ -1500,33 +1618,69 @@ impl Transcript {
         let this = cx.weak_entity();
         cx.defer(move |cx| {
             this.update(cx, |this: &mut Transcript, cx| {
-                // While a landed own-turn anchor holds, everything already
-                // fits on screen — the prompt at the top, the whole reply
-                // below, and under that only reserved runway. Wheel/touch has
-                // nothing to reveal in either direction, so clamp back to the
-                // anchor instead of handing over the viewport (cancelling
-                // here collapses the runway and teleports the layout by up to
-                // a viewport). The runway retires when the reply outgrows it;
-                // explicit navigation (jump pill, rail clicks, chat switches)
-                // still cancels it. During the send glide the step fn owns
-                // the offset — input just waits the ~200ms out.
+                // Wheel/touch while a runway lives: input owns the viewport,
+                // and the BOTTOM PIN must stay out of it entirely. Escaping
+                // releases the hold (the reservation stays behind as plain
+                // scrollable space); returning toward the bottom re-arms the
+                // HOLD, never `pinned` — a restick pin glued the view to the
+                // bottom of the reservation pad, where streaming reads as
+                // text stuck at the viewport top with the runway never
+                // filling (user report; the pad can't resize there either,
+                // its anchor being off-screen). macOS trackpad momentum can
+                // even release-and-restick within one gesture right after a
+                // send, so under the old rules the prompt never landed at
+                // the top at all.
                 if this.own_turn.is_some() {
-                    let landed = this
-                        .own_turn
-                        .as_ref()
-                        .is_some_and(|anchor| anchor.positioned);
-                    if landed && let Some(ix) = this.own_turn_anchor_ix() {
-                        this.list.scroll_to(ListOffset {
-                            item_ix: ix,
-                            offset_in_item: px(0.0),
-                        });
-                        this.list.scroll_by(px(-OWN_SEND_TOP_INSET_PX));
+                    let distance = this.distance_from_bottom();
+                    let previous = this.last_scroll_distance;
+                    this.last_scroll_distance = distance;
+                    let held = this.own_turn.as_ref().is_some_and(|a| a.held);
+                    if distance > previous + 1.0 && distance > AT_BOTTOM_PX {
+                        // Input moving away from the bottom breaks the hold.
+                        if let Some(anchor) = this.own_turn.as_mut() {
+                            anchor.held = false;
+                        }
+                        this.own_turn_last_tick = None;
+                        this.pinned = false;
+                        this.spring.reset();
+                        this.spring_last_tick = None;
+                    } else if !held
+                        && (distance <= AT_BOTTOM_PX || Self::should_restick(distance, previous))
+                    {
+                        // Returning to the bottom returns to the RUNWAY: the
+                        // glide re-lands the prompt at its inset.
+                        if let Some(anchor) = this.own_turn.as_mut() {
+                            anchor.held = true;
+                            anchor.positioned = false;
+                        }
+                        this.own_turn_last_tick = None;
+                        this.own_turn_kick = true;
+                    } else if held {
+                        // Wheel-down while held: the bottom is a HARD STOP.
+                        // The pad runs one frame behind a streaming commit,
+                        // so the list's own end-clamp can briefly admit
+                        // travel into the transient surplus — re-assert the
+                        // hold in the same effect cycle, before anything
+                        // paints, and the sink never reaches the screen.
+                        // (scroll_to is bounds-free, so this also covers the
+                        // wheel gluing the offset at the end.)
+                        if let Some(ix) = this.own_turn_anchor_ix() {
+                            this.list.scroll_to(ListOffset {
+                                item_ix: ix,
+                                offset_in_item: px(0.0),
+                            });
+                            this.list.scroll_by(px(-Self::own_send_inset(ix)));
+                        }
+                        this.last_scroll_distance = this.distance_from_bottom();
                     }
-                    this.last_scroll_distance = this.distance_from_bottom();
+                    let show = distance > SCROLL_BUTTON_THRESHOLD_PX
+                        && !this.own_turn.as_ref().is_some_and(|a| a.held);
+                    if show != this.show_jump_button {
+                        this.show_jump_button = show;
+                    }
+                    cx.notify();
                     return;
                 }
-                // User input supersedes a pending post-handoff re-pin.
-                this.own_turn_release_pending = false;
                 let distance = this.distance_from_bottom();
                 let previous = this.last_scroll_distance;
                 this.last_scroll_distance = distance;
@@ -1556,12 +1710,13 @@ impl Transcript {
         });
     }
 
-    /// Glide a locally-sent prompt to the viewport top and reserve the space
-    /// below it for the reply — EVERY send, not just the first (a steer or a
-    /// post-turn send used to collapse the previous reservation and drop the
-    /// messages back down — user report). [`Self::step_own_turn`] sizes the
-    /// reservation, drives the glide, and hands off to the bottom spring
-    /// once the reply outgrows the reserved space.
+    /// Reserve the reply's space below a locally-sent prompt — EVERY send,
+    /// not just the first (a steer or a post-turn send used to collapse the
+    /// previous reservation and drop the messages back down — user report).
+    /// [`Self::step_own_turn`] sizes the reservation; the motion is just the
+    /// bottom pin: with the pad installed, the spring's glide to the new
+    /// bottom lands the prompt at the top. Replacing a still-held previous
+    /// anchor collapses its pad into the same glide — one continuous motion.
     pub fn on_own_send(&mut self, chat_id: String, message_id: String, cx: &mut Context<Self>) {
         self.pinned = false;
         self.show_jump_button = false;
@@ -1570,20 +1725,56 @@ impl Transcript {
         self.spring_settled_at = None;
         self.spring_kick = false;
         self.scroll_anim = None;
-        // Replacing a still-held previous anchor: its pad collapses on the
-        // next remeasure while the glide re-targets the new prompt — one
-        // continuous motion, no release frame needed.
+        // A glued offset re-snaps to the end on EVERY layout — the pad would
+        // land and the viewport hard-track its bottom in the same frame,
+        // skipping the glide entirely (rig-traced). Pin the offset to a
+        // CONCRETE visible item first; the pad then reads as scrollable
+        // distance for the glide to cover.
+        self.materialize_scroll_anchor();
         self.own_turn = Some(OwnTurnAnchor {
             chat_id,
             message_id: SharedString::from(message_id),
             runway: 0.0,
+            held: true,
             positioned: false,
         });
-        self.own_turn_release_pending = false;
         self.own_turn_last_tick = None;
         self.own_turn_kick = true;
         self.remeasure_last_row();
         cx.notify();
+    }
+
+    /// Convert a glued scroll offset (`None`/past-the-end — layout re-snaps
+    /// it to the end each frame) into a concrete `{item, offset}` anchored at
+    /// the first visible row, which layout holds still.
+    fn materialize_scroll_anchor(&mut self) {
+        if !self.is_glued() {
+            return;
+        }
+        let vp_top = f32::from(self.list.viewport_bounds().top());
+        for ix in 0..self.rows.len() {
+            if let Some(bounds) = self.list.bounds_for_item(ix)
+                && f32::from(bounds.bottom()) > vp_top + 0.5
+            {
+                self.list.scroll_to(ListOffset {
+                    item_ix: ix,
+                    offset_in_item: px(vp_top - f32::from(bounds.top())),
+                });
+                return;
+            }
+        }
+    }
+
+    /// The held prompt's top offset from the viewport top. Row 0 already
+    /// carries the titlebar chrome inside its own box (the first row's
+    /// top gap), so the hold adds nothing — adding the inset on top parked
+    /// a new chat's first prompt a double-chrome ~66px low (user report).
+    fn own_send_inset(anchor_ix: usize) -> f32 {
+        if anchor_ix == 0 {
+            0.0
+        } else {
+            OWN_SEND_TOP_INSET_PX
+        }
     }
 
     fn own_turn_anchor_ix(&self) -> Option<usize> {
@@ -1593,17 +1784,17 @@ impl Transcript {
             .position(|row| row.turn_start && row.entry_id == anchor.message_id)
     }
 
-    /// One post-layout own-turn step: install the runway, position the prompt,
-    /// then watch the real content bottom until it consumes the visible room.
+    /// One post-layout own-turn step: size the reservation pad. Pure layout —
+    /// all motion is the ordinary bottom pin (see [`OwnTurnAnchor`]).
     fn step_own_turn(&mut self, cx: &mut Context<Self>) {
         self.own_turn_kick = false;
-
-        if self.own_turn_release_pending {
-            self.own_turn_release_pending = false;
-            self.engage_pin(cx);
-            return;
-        }
-
+        // Layout moves the bottom too (pad refinement, streaming growth):
+        // refresh the wheel handler's escape baseline every frame so only a
+        // WHEEL's own delta registers as user intent. Without this, the pad
+        // growing at turn-completion between two wheel events read as
+        // "scrolled away" and silently released the hold — the next wheels
+        // then sank unopposed deep into the runway blank (rig-traced).
+        self.last_scroll_distance = self.distance_from_bottom();
         let Some(anchor_ix) = self.own_turn_anchor_ix() else {
             // The optimistic echo may arrive on the next state notification.
             return;
@@ -1618,34 +1809,52 @@ impl Transcript {
         let Some(last_ix) = self.rows.len().checked_sub(1) else {
             return;
         };
+        let base_pad = self.bottom_clearance + Theme::TRANSCRIPT_FADE_BAND + 8.0;
+        let inset = Self::own_send_inset(anchor_ix);
+        // A glued offset hard-tracks a GROWING end — streamed text visually
+        // pushes everything above it up while the runway blank persists
+        // below (user report; the glued representation also hides every
+        // item's bounds, so the sizing that would consume the runway goes
+        // blind). Dissolve it for HELD and RELEASED views alike. The glued
+        // sentinel resolves NUMERICALLY to the total content height (a
+        // viewport top past the last item), so a small nudge lands in an
+        // absurd overscroll that layout's under-fill normalizer re-glues on
+        // the very next frame — an invisible wedge loop (rig-traced).
+        // Stepping back a FULL viewport from the sentinel is exactly "end
+        // at the screen bottom": the same visual position, concrete.
+        if self.is_glued() {
+            self.list.scroll_by(px(-viewport_height));
+        }
+        // The slack keeps the held layout scrollable (see the constant) —
+        // the reservation deliberately over-fills by this much.
+        let usable = viewport_height - inset - base_pad + OWN_SEND_SCROLL_SLACK_PX;
+        let current = self.own_turn.as_ref().map_or(0.0, |a| a.runway);
 
-        // ---- reservation: a min-height for the turn, on the last row -------
-        // A fresh anchor installs a full-viewport pad BEFORE anything needs
+        // A fresh anchor installs a provisional pad BEFORE anything needs
         // bounds: the just-sent rows sit below the fold, unmeasured, and
         // without the pad there is no scroll room to bring them into the
         // measured window (gating the pad on their bounds deadlocked — the
-        // clamped scroll kept them unmeasured forever). It refines to the
-        // true reservation as soon as the turn measures.
-        let fresh = self
-            .own_turn
-            .as_ref()
-            .is_some_and(|anchor| anchor.runway <= 0.0 && !anchor.positioned);
-        if fresh {
+        // clamped scroll kept them unmeasured forever). Sized at FULL
+        // `usable` — a deliberate overshoot by the turn's own height, safe
+        // under the absolute hold (scroll_to pins the prompt regardless) and
+        // REQUIRED for short chats: gpui's bottom-aligned list reports no
+        // item bounds while its content is shorter than the viewport
+        // (rig-traced: a new session's first send sat ~150px below the
+        // inset forever — the old undershot pad left the content short, the
+        // bounds-free scroll_to clamped, and the bounds-gated refinement
+        // could never rescue it). Overshooting guarantees the scroll room;
+        // the surplus sits below the fold until the refinement trues it.
+        if current <= 0.0 {
             if let Some(anchor) = self.own_turn.as_mut() {
-                anchor.runway = viewport_height;
+                anchor.runway = usable.max(0.0);
             }
             self.remeasure_last_row();
-            self.own_turn_kick = true;
             cx.notify();
             return;
         }
-        let base_pad = self.bottom_clearance + Theme::TRANSCRIPT_FADE_BAND + 8.0;
-        let usable = viewport_height - OWN_SEND_TOP_INSET_PX - base_pad;
-        let current = self.own_turn.as_ref().map_or(0.0, |a| a.runway);
-        let positioned = self
-            .own_turn
-            .as_ref()
-            .is_some_and(|anchor| anchor.positioned);
+
+        // ---- reservation sizing (skipped while unmeasured: the provisional
+        // pad stands; the render gate re-runs this every live frame) --------
         if let (Some(anchor_bounds), Some(last_bounds)) = (
             self.list.bounds_for_item(anchor_ix),
             self.list.bounds_for_item(last_ix),
@@ -1656,21 +1865,28 @@ impl Transcript {
                 - current
                 - base_pad;
             let target = own_turn_reservation(usable, turn_height);
+            // FLOOR: never shrink the pad faster than the viewport allows.
+            // The step runs a frame behind content growth, so a wheel that
+            // lands inside that window can sink the view toward the stale
+            // end; snapping the pad straight to `target` then pulls the end
+            // UP THROUGH the viewport (the list clamps instantly — a visible
+            // yank, user report "stutter push back"). Shrinking is capped so
+            // the end never rises above the current view; deferred surplus
+            // burns off as the view moves away from the stop.
+            let dist = self.distance_from_bottom();
+            let floor = current - (dist - OWN_SEND_SCROLL_SLACK_PX).max(0.0);
+            let target = target.max(floor.min(current));
             if target <= 0.5 {
                 // The reply has outgrown the reserved space (or the prompt
-                // alone overfills it): the pad is ~0, so releasing to the
-                // bottom spring is height-neutral — continuous, not a
-                // one-viewport jump. Before the glide has landed, skip the
-                // anchor entirely rather than gliding to the top only to be
-                // yanked back down.
-                self.own_turn = None;
+                // alone overfills it): the pad is ~0, so dropping it is
+                // height-neutral. A still-held view hands off to the bottom
+                // pin; a released one doesn't move at all.
+                let held = self.own_turn.take().is_some_and(|a| a.held);
                 self.remeasure_last_row();
-                if positioned {
-                    self.own_turn_release_pending = true;
-                    self.own_turn_kick = true;
-                    cx.notify();
-                } else {
+                if held {
                     self.engage_pin(cx);
+                } else {
+                    cx.notify();
                 }
                 return;
             }
@@ -1678,35 +1894,87 @@ impl Transcript {
                 if let Some(anchor) = self.own_turn.as_mut() {
                     anchor.runway = target;
                 }
-                // Growth into the reservation shrinks the pad 1:1 — the
-                // turn's total height (and the held viewport) never moves.
+                // Growth into the reservation shrinks the pad 1:1 — the held
+                // layout never moves.
                 self.remeasure_last_row();
-                self.own_turn_kick = true;
                 cx.notify();
             }
         }
 
-        // ---- glide to the hold, then hold exactly --------------------------
-        let Some(anchor_bounds) = self.list.bounds_for_item(anchor_ix) else {
-            // The anchor is outside the measured window (a send fired while
-            // scrolled deep into history): teleport onto it; the glide covers
-            // the remaining error once it measures.
-            self.list.scroll_to(ListOffset {
-                item_ix: anchor_ix,
-                offset_in_item: px(0.0),
-            });
-            self.list.scroll_by(px(-OWN_SEND_TOP_INSET_PX));
-            self.own_turn_kick = true;
-            cx.notify();
+        // ---- entry glide, then absolute hold -------------------------------
+        let (held, positioned) = self
+            .own_turn
+            .as_ref()
+            .map_or((false, false), |a| (a.held, a.positioned));
+        if !held {
             return;
-        };
-        let err =
-            f32::from(anchor_bounds.top()) - (f32::from(viewport.top()) + OWN_SEND_TOP_INSET_PX);
+        }
         if positioned {
-            // Landed: pin the prompt through content changes above it.
-            if err.abs() > 0.5 {
-                self.list.scroll_by(px(err));
+            // Landed: re-assert the prompt's position after every layout.
+            // scroll_to is absolute and bounds-independent, so neither glue
+            // re-snaps, pad-sizing lag, nor a splice's unmeasured flicker can
+            // carry the view off the prompt (each broke the spring-held
+            // variants of this — rig-traced). ONE-SIDED: only upward drift
+            // (view above the hold) is corrected. The scroll slack under the
+            // reservation is legal resting space — wheel-down sinks into it
+            // and stops hard at the list's own clamp; snapping back up from
+            // there made the bottom bounce/stutter on every scroll event
+            // (user report). Way-below-slack (impossible short of a bug)
+            // still re-asserts.
+            let moved = match self.list.bounds_for_item(anchor_ix) {
+                Some(b) => {
+                    let err = f32::from(b.top()) - (f32::from(viewport.top()) + inset);
+                    // The legal rest zone below the hold is the epsilon plus
+                    // rounding; anything deeper is a transient-collision sink
+                    // and rubber-bands back.
+                    err > 0.5 || err < -(OWN_SEND_SCROLL_SLACK_PX + 2.0)
+                }
+                // Bounds vanish in the glued representation (dissolved
+                // above, so at most for this one frame) and through splice
+                // flicker. Near the stop that is dead-band space — no
+                // assert (asserting on None here was the bottom bounce);
+                // far from it the position is unknowable flicker: re-assert.
+                None => self.distance_from_bottom() > OWN_SEND_SCROLL_SLACK_PX + 8.0,
+            };
+            if moved {
+                // Correct with the entry glide's ease, not a snap: the only
+                // in-band escapes are one-frame commit transients and splice
+                // flicker, and an eased ~200ms return reads as native
+                // rubber-banding where an instant re-assert read as stutter
+                // (user report). Bounds-less flicker still snaps — there is
+                // nothing to ease against.
+                match self.list.bounds_for_item(anchor_ix) {
+                    Some(b) => {
+                        let err = f32::from(b.top()) - (f32::from(viewport.top()) + inset);
+                        let now = Instant::now();
+                        let frames = match self.own_turn_last_tick {
+                            Some(last) => (now.duration_since(last).as_secs_f32() * 1000.0
+                                / SPRING_FRAME_MS)
+                                .min(SPRING_MAX_CATCHUP_FRAMES),
+                            None => 1.0,
+                        };
+                        self.own_turn_last_tick = Some(now);
+                        let ease = 1.0 - OWN_SEND_GLIDE_RETAIN.powf(frames);
+                        if err.abs() <= OWN_SEND_GLIDE_SNAP_PX {
+                            self.list.scroll_by(px(err));
+                            self.own_turn_last_tick = None;
+                        } else {
+                            self.list.scroll_by(px(err * ease));
+                        }
+                        self.own_turn_kick = true;
+                    }
+                    None => {
+                        self.list.scroll_to(ListOffset {
+                            item_ix: anchor_ix,
+                            offset_in_item: px(0.0),
+                        });
+                        self.list.scroll_by(px(-inset));
+                        self.own_turn_last_tick = None;
+                    }
+                }
                 cx.notify();
+            } else {
+                self.own_turn_last_tick = None;
             }
             return;
         }
@@ -1717,24 +1985,69 @@ impl Transcript {
             None => 1.0,
         };
         self.own_turn_last_tick = Some(now);
-        // Far sends teleport to within the glide band first (mugen parity).
+        let ease = 1.0 - OWN_SEND_GLIDE_RETAIN.powf(frames);
+        // Remaining travel: the anchor's own error once it measures; the
+        // bottom distance while it is still below the measured window (the
+        // undershot provisional pad guarantees the bottom stops short of the
+        // prompt, so this leg can never overshoot it).
+        // The two error legs mean DIFFERENT things at zero: on the bounds
+        // leg, err 0 is AT the hold (no correction needed); on the bounds-
+        // less leg, err is the distance to the pad's bottom — arrival there
+        // still needs the absolute snap onto the anchor (the short-chat/
+        // glued landing, where bounds never appear). Conflating them once
+        // marked entries "positioned" at the pad bottom without ever
+        // landing (rig-caught: sends parked deep in blank runway).
+        let (err, anchored) = match self.list.bounds_for_item(anchor_ix) {
+            Some(bounds) => (
+                f32::from(bounds.top()) - (f32::from(viewport.top()) + inset),
+                true,
+            ),
+            None => (self.distance_from_bottom(), false),
+        };
         let glide_max = GLIDE_MAX_VIEWPORTS * viewport_height;
-        let err = if err.abs() > glide_max {
-            let teleport = err - err.signum() * glide_max;
-            self.list.scroll_by(px(teleport));
-            err - teleport
+        let err = if err > glide_max {
+            self.list.scroll_by(px(err - glide_max));
+            glide_max
         } else {
             err
         };
-        if err.abs() <= OWN_SEND_GLIDE_SNAP_PX || motion::reduced_motion(cx) {
-            self.list.scroll_by(px(err));
+        let land = |list: &ListState| {
+            list.scroll_to(ListOffset {
+                item_ix: anchor_ix,
+                offset_in_item: px(0.0),
+            });
+            list.scroll_by(px(-inset));
+        };
+        if motion::reduced_motion(cx) {
+            land(&self.list);
+            if let Some(anchor) = self.own_turn.as_mut() {
+                anchor.positioned = true;
+            }
+            self.own_turn_last_tick = None;
+        } else if anchored
+            && err <= OWN_SEND_GLIDE_SNAP_PX
+            && err >= -(OWN_SEND_SCROLL_SLACK_PX + 2.0)
+        {
+            // At the hold — or resting inside the slack under it (a restick
+            // that fired at the true bottom): land WITHOUT pulling the view
+            // up. Only a still-above position gets the snap.
+            if err > 0.5 {
+                land(&self.list);
+            }
+            if let Some(anchor) = self.own_turn.as_mut() {
+                anchor.positioned = true;
+            }
+            self.own_turn_last_tick = None;
+        } else if !anchored && err <= OWN_SEND_GLIDE_SNAP_PX {
+            // Arrived at the bottom with the anchor still unmeasured: the
+            // absolute, bounds-free snap IS the landing.
+            land(&self.list);
             if let Some(anchor) = self.own_turn.as_mut() {
                 anchor.positioned = true;
             }
             self.own_turn_last_tick = None;
         } else {
-            self.list
-                .scroll_by(px(err * (1.0 - OWN_SEND_GLIDE_RETAIN.powf(frames))));
+            self.list.scroll_by(px(err * ease));
         }
         self.own_turn_kick = true;
         cx.notify();
@@ -1753,7 +2066,19 @@ impl Transcript {
 
     /// The scroll-to-bottom pill's click: glide back to the end and re-pin.
     pub fn jump_to_bottom(&mut self, cx: &mut Context<Self>) {
-        self.remove_own_turn_runway();
+        // With a live runway, "bottom" IS the held position (the reservation
+        // makes prompt-at-top and pad-bottom the same place): re-arm the hold
+        // and glide back instead of destroying the runway (user spec — only
+        // navigating away and back clears it).
+        if let Some(anchor) = self.own_turn.as_mut() {
+            anchor.held = true;
+            anchor.positioned = false;
+            self.own_turn_last_tick = None;
+            self.own_turn_kick = true;
+            self.show_jump_button = false;
+            cx.notify();
+            return;
+        }
         self.engage_pin(cx);
     }
 
@@ -1871,7 +2196,6 @@ impl Transcript {
             if !keep_own_turn {
                 self.own_turn = None;
                 self.own_turn_kick = false;
-                self.own_turn_release_pending = false;
             }
             self.chat_id = selected;
             self.rows.clear();
@@ -1883,6 +2207,8 @@ impl Transcript {
             self.render_cache.borrow_mut().clear();
             self.highlights.entries.clear();
             self.list.reset(0);
+            // A kept own-turn hold (send-created chat) owns the viewport;
+            // otherwise the fresh attach pins to the bottom.
             self.pinned = self.own_turn.is_none();
             self.spring.reset();
             self.spring_last_tick = None;
@@ -2773,6 +3099,10 @@ impl Transcript {
                 best.map(|(_, d)| d).or_else(|| tool.detail.clone())
             })
             .collect();
+        // Full-invocation blocks — with them, EVERY chip expands: the click
+        // always answers "what exactly was this call?", output or not.
+        let invocations: Vec<Option<Arc<ToolDetail>>> =
+            tools.iter().map(|tool| tool.invocation.clone()).collect();
         // Fetch affordance under each open detail whose full payload is still
         // sidecar-only: `(ref, label)`. Diff offered first (the richer
         // upgrade), then the output — a fetched ref hands the affordance to
@@ -2827,9 +3157,10 @@ impl Transcript {
         // the FINAL state; a mid-tween detail already counts as its target).
         let detail_folds: Vec<FoldState> = details
             .iter()
+            .zip(&invocations)
             .enumerate()
-            .map(|(ix, detail)| {
-                if detail.is_none() {
+            .map(|(ix, (detail, invocation))| {
+                if detail.is_none() && invocation.is_none() {
                     return FoldState::default();
                 }
                 self.tool_details
@@ -2840,8 +3171,11 @@ impl Transcript {
             .collect();
         let detail_opens: Vec<bool> = details
             .iter()
+            .zip(&invocations)
             .zip(&detail_folds)
-            .map(|(detail, fold)| detail.is_some() && fold.open.unwrap_or(false))
+            .map(|((detail, invocation), fold)| {
+                (detail.is_some() || invocation.is_some()) && fold.open.unwrap_or(false)
+            })
             .collect();
         let detail_highlights: Vec<Option<Arc<crate::changes::DiffHighlights>>> = details
             .iter()
@@ -2856,11 +3190,13 @@ impl Transcript {
         let open_height = chips_height(tools.len())
             + details
                 .iter()
+                .zip(&invocations)
                 .zip(&affordances)
                 .zip(&detail_opens)
                 .filter(|(_, open)| **open)
-                .map(|((detail, affordance), _)| {
-                    detail.as_deref().map_or(0.0, detail_height)
+                .map(|(((detail, invocation), affordance), _)| {
+                    invocation.as_deref().map_or(0.0, detail_height)
+                        + detail.as_deref().map_or(0.0, detail_height)
                         + if affordance.is_some() {
                             BLOB_AFFORDANCE_HEIGHT
                         } else {
@@ -2921,9 +3257,11 @@ impl Transcript {
             .flex_col()
             .gap(px(CHIP_GAP))
             .children(tools.iter().enumerate().map(|(ix, tool)| {
-                let Some(detail) = details[ix].clone() else {
+                let detail = details[ix].clone();
+                let invocation = invocations[ix].clone();
+                if detail.is_none() && invocation.is_none() {
                     return tool_chip(tool, theme);
-                };
+                }
                 let affordance = affordances[ix].clone();
                 let affordance_h = if affordance.is_some() {
                     BLOB_AFFORDANCE_HEIGHT
@@ -2945,13 +3283,17 @@ impl Transcript {
                 // (user report: "tool calls cut off at the bottom"). The
                 // explicit height is also what the open/close tween animates.
                 let closed_h = CHIP_CARD_HEIGHT;
-                let open_h = CHIP_CARD_HEIGHT + detail_height(&detail) + affordance_h;
+                let open_h = CHIP_CARD_HEIGHT
+                    + invocation.as_deref().map_or(0.0, detail_height)
+                    + detail.as_deref().map_or(0.0, detail_height)
+                    + affordance_h;
                 let card_target = if open { open_h } else { closed_h };
                 let animating = dfold.epoch > 0
                     && dfold
                         .toggled_at
                         .is_some_and(|at| at.elapsed() < FOLD_TWEEN_WINDOW);
                 let toggle_key = key.clone();
+                let group_key = row_id.clone();
                 let mut card = div()
                     .my(px((CHIP_HEIGHT - CHIP_CARD_HEIGHT) / 2.0))
                     .ml(px(12.0))
@@ -2976,20 +3318,51 @@ impl Transcript {
                                 entry.open = Some(!currently_open);
                                 entry.epoch += 1;
                                 entry.toggled_at = Some(Instant::now());
+                                // Arm the GROUP body's height tween too (open
+                                // state untouched): the body's height is
+                                // analytic over the final detail state, so
+                                // without a tween the row snaps to the target
+                                // height while the card is still mid-tween —
+                                // content below teleported on expand and the
+                                // shrinking card clipped on collapse (user
+                                // report). `open_height` was computed with
+                                // the detail still in its pre-click state,
+                                // which is exactly the tween's start; both
+                                // tweens share the click instant and the
+                                // RESIZE curve, so the row tracks the card's
+                                // bottom edge frame-for-frame.
+                                let group = this.folds.entry(group_key.clone()).or_default();
+                                group.from = open_height;
+                                group.epoch += 1;
+                                group.toggled_at = Some(Instant::now());
                                 cx.notify();
                             }))
                             .child(chip_header(tool, open, theme)),
                     );
                 // The body stays mounted while the close tween shrinks over it.
+                // Invocation first (what was asked), then output/diff (what
+                // came back), each under its own hairline.
                 if open || animating {
-                    card = card
-                        .child(
-                            div()
-                                .h(px(DETAIL_SEPARATOR))
-                                .flex_none()
-                                .bg(crate::theme::hairline(0.06)),
-                        )
-                        .child(detail_body(&detail, detail_highlights[ix].clone(), theme));
+                    if let Some(invocation) = invocation.as_deref() {
+                        card = card
+                            .child(
+                                div()
+                                    .h(px(DETAIL_SEPARATOR))
+                                    .flex_none()
+                                    .bg(crate::theme::hairline(0.06)),
+                            )
+                            .child(detail_body(invocation, None, theme));
+                    }
+                    if let Some(detail) = detail.as_deref() {
+                        card = card
+                            .child(
+                                div()
+                                    .h(px(DETAIL_SEPARATOR))
+                                    .flex_none()
+                                    .bg(crate::theme::hairline(0.06)),
+                            )
+                            .child(detail_body(detail, detail_highlights[ix].clone(), theme));
+                    }
                     if let Some((blob_ref, label)) = affordance {
                         let loading = matches!(
                             self.blob_details.get(&blob_ref),
@@ -4218,6 +4591,7 @@ mod tests {
             is_error: false,
             resolved: true,
             detail: None,
+            invocation: None,
             output_ref: None,
             output_bytes: None,
             diff_ref: None,
@@ -4231,6 +4605,7 @@ mod tests {
             is_error: false,
             resolved: true,
             detail: None,
+            invocation: None,
             output_ref: None,
             output_bytes: None,
             diff_ref: None,
@@ -4260,6 +4635,7 @@ mod tests {
                 is_error: false,
                 resolved: true,
                 detail: None,
+                invocation: None,
                 output_ref: None,
                 output_bytes: None,
                 diff_ref: None,
@@ -4271,6 +4647,7 @@ mod tests {
                 is_error: false,
                 resolved: true,
                 detail: None,
+                invocation: None,
                 output_ref: None,
                 output_bytes: None,
                 diff_ref: None,
@@ -4280,6 +4657,7 @@ mod tests {
                 is_error: false,
                 resolved: true,
                 detail: None,
+                invocation: None,
                 output_ref: None,
                 output_bytes: None,
                 diff_ref: None,
@@ -4348,6 +4726,73 @@ mod tests {
             query: "line one\nline two".into(),
         });
         assert_eq!(q, "line one line two");
+    }
+
+    #[test]
+    fn call_block_carries_the_full_invocation() {
+        // Multi-line command: verbatim lines, not the flattened chip line.
+        let Some(ToolDetail::Output {
+            lines,
+            truncated_by,
+        }) = call_block(&ToolCall::Exec {
+            command: "set -e\ncargo test".into(),
+        })
+        else {
+            panic!("expected an output block")
+        };
+        assert_eq!(truncated_by, 0);
+        assert_eq!(
+            lines.iter().map(|l| l.as_ref()).collect::<Vec<_>>(),
+            vec!["set -e", "cargo test"]
+        );
+
+        // A long single-line command soft-wraps instead of ellipsizing.
+        let Some(ToolDetail::Output { lines, .. }) = call_block(&ToolCall::Exec {
+            command: "x".repeat(CALL_WRAP_COLS * 2 + 10),
+        }) else {
+            panic!("expected an output block")
+        };
+        assert_eq!(lines.len(), 3);
+        assert!(lines.iter().all(|l| l.chars().count() <= CALL_WRAP_COLS));
+
+        // MCP input pretty-prints under the `server · tool` line.
+        let Some(ToolDetail::Output { lines, .. }) = call_block(&ToolCall::Mcp {
+            server: "gh".into(),
+            tool: "issues".into(),
+            input: Some(serde_json::json!({"repo": "komet"})),
+        }) else {
+            panic!("expected an output block")
+        };
+        assert_eq!(lines[0].as_ref(), "gh · issues");
+        assert!(lines.iter().any(|l| l.contains("\"repo\": \"komet\"")));
+
+        // Todos list one item per line with checkbox state.
+        let Some(ToolDetail::Output { lines, .. }) = call_block(&ToolCall::Todo {
+            items: vec![
+                komet_proto::TodoItem {
+                    text: "a".into(),
+                    done: true,
+                },
+                komet_proto::TodoItem {
+                    text: "b".into(),
+                    done: false,
+                },
+            ],
+        }) else {
+            panic!("expected an output block")
+        };
+        assert_eq!(
+            lines.iter().map(|l| l.as_ref()).collect::<Vec<_>>(),
+            vec!["[x] a", "[ ] b"]
+        );
+
+        // Blank invocation → no block; the chip stays a plain card.
+        assert!(
+            call_block(&ToolCall::Exec {
+                command: "  \n ".into()
+            })
+            .is_none()
+        );
     }
 
     #[test]

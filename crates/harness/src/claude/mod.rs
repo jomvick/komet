@@ -5,4 +5,4 @@
 //! module used to hold was retired with the ACP conversion
 //! (docs/research/acp.md).
 
-pub(crate) mod catalog;
+pub mod catalog;

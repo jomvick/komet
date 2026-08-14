@@ -28,8 +28,10 @@ use gpui_tokio::Tokio;
 use serde::de::DeserializeOwned;
 
 use komet_doc::{SessionMessageEntry, TranscriptDesync, TranscriptFrame};
-use komet_engine::{Engine, EngineConfig, EngineRuntime, rpc::AuthRpc};
-use komet_proto::{AuthState, Chat, ChatIndicator, Device, HarnessId, Session, Space};
+use komet_engine::{Engine, EngineConfig, EngineRuntime, InstanceLock, rpc::AuthRpc};
+use komet_proto::{
+    AuthState, Chat, ChatIndicator, Device, EngineInfo, HarnessId, Session, Space, WorkspaceScope,
+};
 use komet_rpc::{RpcClient, RpcError, RpcReply, RpcService, connect_ws, memory_client, methods};
 
 // ---------------------------------------------------------------------------
@@ -39,7 +41,7 @@ use komet_rpc::{RpcClient, RpcError, RpcReply, RpcService, connect_ws, memory_cl
 /// Everything needed to reach (or start) an engine.
 #[derive(Debug, Clone)]
 pub struct EngineBootConfig {
-    /// Data directory for the embedded engine (`~/.komet-native`).
+    /// Data directory for the embedded engine (`~/.komet`).
     pub data_dir: PathBuf,
     /// Localhost IPC port to probe / serve.
     pub ipc_port: u16,
@@ -111,21 +113,33 @@ impl EngineBackend for InProcessEngine {
 #[derive(Clone)]
 enum DeferredEngineState {
     Waiting,
-    Ready(Arc<dyn RpcService>),
+    Ready,
     Failed(String),
 }
 
-/// Serves AuthRpc immediately, then holds all data RPC calls until the signed-in
-/// user's identity-scoped engine is assembled. Existing UI subscriptions remain
-/// pending and attach to the real service without reconnecting.
+/// Serves engine identity and AuthRpc immediately, then holds data calls only
+/// while a captured synced profile still needs organization onboarding.
+/// Existing subscriptions attach to the assembled service without reconnecting.
 struct DeferredEngineRpc {
     auth: AuthRpc,
+    engine_info: EngineInfo,
     state: tokio::sync::watch::Receiver<DeferredEngineState>,
+    service: Arc<tokio::sync::OnceCell<Arc<dyn RpcService>>>,
 }
 
 #[async_trait]
 impl RpcService for DeferredEngineRpc {
     async fn handle(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError> {
+        if method == methods::ENGINE_INFO {
+            return RpcReply::value(&self.engine_info);
+        }
+        if method == methods::ENGINE_READY {
+            let mut state = self.state.clone();
+            return match wait_for_deferred_engine(&mut state).await {
+                Ok(()) => RpcReply::value(&serde_json::json!({ "ready": true })),
+                Err(message) => Err(RpcError::Failed(message)),
+            };
+        }
         if AuthRpc::handles(method) {
             return self.auth.handle(method, params).await;
         }
@@ -135,7 +149,12 @@ impl RpcService for DeferredEngineRpc {
             let current = { state.borrow().clone() };
             match current {
                 DeferredEngineState::Waiting => {}
-                DeferredEngineState::Ready(service) => {
+                DeferredEngineState::Ready => {
+                    let service = self.service.get().ok_or_else(|| {
+                        RpcError::Failed(
+                            "embedded engine became ready without an RPC service".into(),
+                        )
+                    })?;
                     return service.handle(method, params).await;
                 }
                 DeferredEngineState::Failed(message) => return Err(RpcError::Failed(message)),
@@ -145,10 +164,28 @@ impl RpcService for DeferredEngineRpc {
     }
 }
 
+async fn wait_for_deferred_engine(
+    state: &mut tokio::sync::watch::Receiver<DeferredEngineState>,
+) -> Result<(), String> {
+    loop {
+        let current = { state.borrow().clone() };
+        match current {
+            DeferredEngineState::Waiting => {}
+            DeferredEngineState::Ready => return Ok(()),
+            DeferredEngineState::Failed(message) => return Err(message),
+        }
+        state
+            .changed()
+            .await
+            .map_err(|_| "embedded engine assembly ended without a result".to_string())?;
+    }
+}
+
 /// External daemon over `ws://127.0.0.1:{port}`.
 struct RemoteEngine {
-    client: RpcClient,
+    client: Arc<RpcClient>,
     url: String,
+    lifecycle_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 #[async_trait]
@@ -162,7 +199,10 @@ impl EngineBackend for RemoteEngine {
         }
     }
     async fn shutdown(&self) {
-        // The daemon outlives this viewport; nothing to tear down.
+        // The daemon outlives this viewport; only stop our readiness probe.
+        if let Some(task) = self.lifecycle_task.lock().await.take() {
+            task.abort();
+        }
     }
 }
 
@@ -170,6 +210,8 @@ impl EngineBackend for RemoteEngine {
 #[derive(Clone)]
 pub struct EngineHandle {
     inner: Arc<dyn EngineBackend>,
+    engine_info: EngineInfo,
+    deferred_state: Option<tokio::sync::watch::Receiver<DeferredEngineState>>,
 }
 
 impl EngineHandle {
@@ -177,25 +219,15 @@ impl EngineHandle {
     /// Must run on the tokio runtime (`Tokio::spawn`): both transports spawn
     /// tokio tasks.
     pub async fn bootstrap(config: EngineBootConfig) -> anyhow::Result<EngineHandle> {
-        let url = format!("ws://127.0.0.1:{}", config.ipc_port);
-        let probe = tokio::time::timeout(
-            std::time::Duration::from_millis(750),
-            tokio::net::TcpStream::connect(("127.0.0.1", config.ipc_port)),
-        )
-        .await;
-        if matches!(probe, Ok(Ok(_))) {
-            tracing::info!(%url, "engine daemon detected; connecting");
-            match connect_ws(&url).await {
-                Ok(client) => {
-                    return Ok(EngineHandle {
-                        inner: Arc::new(RemoteEngine { client, url }),
-                    });
-                }
-                // Something is on the port but it is not an engine (or it is
-                // wedged). Fall through and embed: a stranger holding 27654
-                // should cost other viewports, not this window.
-                Err(err) => tracing::warn!(%url, error = %err, "not an engine; embedding instead"),
-            }
+        // Invariant: at most one bootstrap in this process runs probe+embed at
+        // a time. The winner binds the deferred IPC listener before releasing
+        // the gate, so a concurrent viewport's probe finds it and attaches as
+        // Remote instead of racing it for the data dir.
+        static BOOTSTRAP_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _gate = BOOTSTRAP_GATE.lock().await;
+
+        if let Some(handle) = Self::attach_to_daemon(config.ipc_port).await {
+            return Ok(handle);
         }
 
         tracing::info!(data_dir = %config.data_dir.display(), "no daemon on port; embedding engine");
@@ -208,20 +240,50 @@ impl EngineHandle {
             org_id: config.org_id,
             workos_client_id: config.workos_client_id,
         };
+
+        // Own the data dir before opening anything under it or binding IPC —
+        // the lock, not the port bind, is the ownership decision. A failed
+        // acquire means an out-of-process engine holds the dir but was not
+        // serving IPC at probe time (a daemon mid-start): wait for its
+        // listener, re-trying the lock in case it dies instead.
+        std::fs::create_dir_all(&engine_config.data_dir)?;
+        let lock_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let lock = loop {
+            match InstanceLock::acquire(&engine_config.data_dir) {
+                Ok(lock) => break lock,
+                Err(err) => {
+                    if std::time::Instant::now() >= lock_deadline {
+                        return Err(err.into());
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    if let Some(handle) = Self::attach_to_daemon(engine_config.ipc_port).await {
+                        return Ok(handle);
+                    }
+                }
+            }
+        };
+
         let auth = Engine::build_auth(&engine_config).await;
+        let workspace_scope = Engine::initial_workspace_scope(&auth);
+        let initial_profile = Engine::resolve_profile(&engine_config, &auth, workspace_scope)?;
+        let profile_is_resolved = initial_profile.is_some();
+        let engine_info = Engine::engine_info(&engine_config, workspace_scope)?;
         let refresh_task = auth.spawn_refresh_loop();
-        let (state_tx, state_rx) = tokio::sync::watch::channel(DeferredEngineState::Waiting);
+        let (state_tx, mut state_rx) = tokio::sync::watch::channel(DeferredEngineState::Waiting);
+        let assembled_service = Arc::new(tokio::sync::OnceCell::new());
         let service: Arc<dyn RpcService> = Arc::new(DeferredEngineRpc {
             auth: AuthRpc::new(auth.clone()),
-            state: state_rx,
+            engine_info: engine_info.clone(),
+            state: state_rx.clone(),
+            service: assembled_service.clone(),
         });
         let client = memory_client(service.clone());
 
         // Serve the same service on the IPC port so a terminal viewport can
         // attach to this window's engine with no setup. Deliberately the
         // *deferred* service, not the assembled one: a viewport that connects
-        // before sign-in gets AuthRpc (so it can show its own gate) and its
-        // data subscriptions wait exactly as this window's do.
+        // during cloud onboarding gets EngineInfo and AuthRpc immediately, and
+        // its data subscriptions wait exactly as this window's do.
         //
         // Best-effort — losing the bind race with another engine costs other
         // viewports, not this one.
@@ -238,22 +300,50 @@ impl EngineHandle {
         };
         let runtime = Arc::new(tokio::sync::Mutex::new(None));
         let runtime_for_boot = runtime.clone();
+        let service_for_boot = assembled_service.clone();
+        // The instance lock rides into the boot task and is consumed by
+        // assembly — held through sign-in onboarding too, because this process
+        // owns the data dir from the moment it decided to embed.
         let boot_task = tokio::spawn(async move {
-            let mut auth_state = auth.watch_state();
-            while !auth_state.borrow().is_signed_in() {
-                if auth_state.changed().await.is_err() {
-                    state_tx.send_replace(DeferredEngineState::Failed(
-                        "authentication state closed before sign-in".into(),
-                    ));
-                    return;
+            let profile = match initial_profile {
+                Some(profile) => profile,
+                None => {
+                    let mut auth_state = auth.watch_state();
+                    while !auth_state.borrow().is_signed_in() {
+                        if auth_state.changed().await.is_err() {
+                            state_tx.send_replace(DeferredEngineState::Failed(
+                                "authentication state closed before workspace onboarding".into(),
+                            ));
+                            return;
+                        }
+                    }
+                    match Engine::resolve_profile(&engine_config, &auth, workspace_scope) {
+                        Ok(Some(profile)) => profile,
+                        Ok(None) => {
+                            state_tx.send_replace(DeferredEngineState::Failed(
+                                "workspace onboarding completed without an organization".into(),
+                            ));
+                            return;
+                        }
+                        Err(err) => {
+                            state_tx.send_replace(DeferredEngineState::Failed(err.to_string()));
+                            return;
+                        }
+                    }
                 }
-            }
+            };
 
-            match Engine::assemble_runtime(&engine_config, auth).await {
+            match Engine::assemble_runtime_with_lock(&engine_config, auth, profile, lock).await {
                 Ok(engine_runtime) => {
                     let service: Arc<dyn RpcService> = engine_runtime.core().rpc_service();
                     *runtime_for_boot.lock().await = Some(engine_runtime);
-                    state_tx.send_replace(DeferredEngineState::Ready(service));
+                    if service_for_boot.set(service).is_err() {
+                        state_tx.send_replace(DeferredEngineState::Failed(
+                            "embedded engine RPC service was assembled more than once".into(),
+                        ));
+                        return;
+                    }
+                    state_tx.send_replace(DeferredEngineState::Ready);
                 }
                 Err(err) => {
                     tracing::error!(error = %err, "embedded engine assembly failed");
@@ -261,7 +351,7 @@ impl EngineHandle {
                 }
             }
         });
-        Ok(EngineHandle {
+        let handle = EngineHandle {
             inner: Arc::new(InProcessEngine {
                 runtime,
                 boot_task,
@@ -269,7 +359,86 @@ impl EngineHandle {
                 ipc_task,
                 client,
             }),
-        })
+            engine_info,
+            deferred_state: Some(state_rx.clone()),
+        };
+        // Local, development, and already-resolved synced profiles need no
+        // authentication UI while assembling. Keep the viewport Connecting
+        // until their stores and journals are actually open, and surface a
+        // boot failure through the existing bootstrap error path.
+        if profile_is_resolved && let Err(message) = wait_for_deferred_engine(&mut state_rx).await {
+            handle.shutdown().await;
+            return Err(anyhow::anyhow!(message));
+        }
+        Ok(handle)
+    }
+
+    /// Probe the IPC port and, if a live engine answers, attach as a remote
+    /// viewport. `None` means embed: nothing listening, a non-engine listener,
+    /// or a listener without an identity.
+    async fn attach_to_daemon(ipc_port: u16) -> Option<EngineHandle> {
+        let url = format!("ws://127.0.0.1:{ipc_port}");
+        let probe = tokio::time::timeout(
+            std::time::Duration::from_millis(750),
+            tokio::net::TcpStream::connect(("127.0.0.1", ipc_port)),
+        )
+        .await;
+        if !matches!(probe, Ok(Ok(_))) {
+            return None;
+        }
+        tracing::info!(%url, "engine daemon detected; connecting");
+        match connect_ws(&url).await {
+            Ok(client) => match query_engine_info(&client).await {
+                Ok(engine_info) => {
+                    let client = Arc::new(client);
+                    let (state_tx, state_rx) =
+                        tokio::sync::watch::channel(DeferredEngineState::Waiting);
+                    let lifecycle_client = client.clone();
+                    let lifecycle_task = tokio::spawn(async move {
+                        let state = match lifecycle_client
+                            .call(methods::ENGINE_READY, serde_json::json!({}))
+                            .await
+                        {
+                            Ok(_) => DeferredEngineState::Ready,
+                            // EngineReady was added after EngineInfo. An older daemon
+                            // that does not expose the barrier is already assembled.
+                            Err(RpcError::Failed(message))
+                                if message
+                                    == format!("unknown method: {}", methods::ENGINE_READY) =>
+                            {
+                                DeferredEngineState::Ready
+                            }
+                            Err(err) => DeferredEngineState::Failed(err.to_string()),
+                        };
+                        state_tx.send_replace(state);
+                    });
+                    Some(EngineHandle {
+                        inner: Arc::new(RemoteEngine {
+                            client,
+                            url,
+                            lifecycle_task: tokio::sync::Mutex::new(Some(lifecycle_task)),
+                        }),
+                        engine_info,
+                        deferred_state: Some(state_rx),
+                    })
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        %url,
+                        error = %err,
+                        "listener did not provide engine identity; embedding instead"
+                    );
+                    None
+                }
+            },
+            // Something is on the port but it is not an engine (or it is
+            // wedged). Fall through and embed: a stranger holding 27654
+            // should cost other viewports, not this window.
+            Err(err) => {
+                tracing::warn!(%url, error = %err, "not an engine; embedding instead");
+                None
+            }
+        }
     }
 
     pub fn client(&self) -> &RpcClient {
@@ -280,8 +449,44 @@ impl EngineHandle {
         self.inner.mode()
     }
 
+    pub fn engine_info(&self) -> &EngineInfo {
+        &self.engine_info
+    }
+
+    fn deferred_state(&self) -> Option<tokio::sync::watch::Receiver<DeferredEngineState>> {
+        self.deferred_state.clone()
+    }
+
     pub async fn shutdown(&self) {
         self.inner.shutdown().await;
+    }
+}
+
+/// Query the current protocol first, with a conservative fallback for daemons
+/// from before `EngineInfo` existed. Old daemons are always treated as synced.
+async fn query_engine_info(client: &RpcClient) -> Result<EngineInfo, RpcError> {
+    match client
+        .call_as(methods::ENGINE_INFO, serde_json::json!({}))
+        .await
+    {
+        Ok(info) => Ok(info),
+        Err(RpcError::Failed(message))
+            if message == format!("unknown method: {}", methods::ENGINE_INFO) =>
+        {
+            #[derive(serde::Deserialize)]
+            #[serde(rename_all = "camelCase")]
+            struct LocalDevice {
+                device_id: String,
+            }
+            let legacy: LocalDevice = client
+                .call_as(methods::LOCAL_DEVICE, serde_json::json!({}))
+                .await?;
+            Ok(EngineInfo {
+                device_id: legacy.device_id,
+                workspace_scope: WorkspaceScope::Synced,
+            })
+        }
+        Err(err) => Err(err),
     }
 }
 
@@ -361,6 +566,9 @@ pub const PENDING_SEND_TTL_MS: i64 = 30_000;
 /// glue ([`Self::bootstrap`], [`Self::select_chat`]) layers subscriptions on top.
 pub struct AppState {
     pub connection: ConnectionStatus,
+    /// Fixed data boundary of the attached engine. Authentication may change
+    /// in place, but changing this scope requires assembling a new runtime.
+    pub workspace_scope: Option<WorkspaceScope>,
     /// Auth stream value; `None` until the engine reports one (M4).
     pub auth: Option<AuthState>,
     pub devices: Vec<Device>,
@@ -421,6 +629,7 @@ impl AppState {
     pub fn new() -> Self {
         Self {
             connection: ConnectionStatus::Connecting,
+            workspace_scope: None,
             auth: None,
             devices: Vec::new(),
             spaces: Vec::new(),
@@ -497,7 +706,17 @@ impl AppState {
         }
     }
 
-    pub fn apply_devices(&mut self, devices: Vec<Device>) {
+    pub fn apply_devices(&mut self, mut devices: Vec<Device>) {
+        // A local-only workspace has no remote device identity to distinguish.
+        // Keep the engine's legacy sentinel out of the UI while preserving real
+        // hostnames and user-assigned device names.
+        if self.workspace_scope == Some(WorkspaceScope::Local)
+            && let Some(local_id) = self.local_device_id.as_deref()
+            && let Some(device) = devices.iter_mut().find(|device| device.id == local_id)
+            && device.name == "unknown-device"
+        {
+            device.name = "Local".to_string();
+        }
         self.devices = devices;
     }
 
@@ -627,7 +846,9 @@ impl AppState {
     pub fn pending_send_started(&self, chat_id: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
         self.pending_sends
             .get(chat_id)
-            .filter(|p| now.signed_duration_since(p.started).num_milliseconds() <= PENDING_SEND_TTL_MS)
+            .filter(|p| {
+                now.signed_duration_since(p.started).num_milliseconds() <= PENDING_SEND_TTL_MS
+            })
             .map(|p| p.started)
     }
 
@@ -755,7 +976,9 @@ impl AppState {
     /// call sites (user request), never words in the tag.
     pub fn space_device_tag(&self, space: &Space, now: DateTime<Utc>) -> (String, bool) {
         let offline = !self.device_online(&space.device_id, now);
-        let device = self.device_name(&space.device_id).unwrap_or("Unknown device");
+        let device = self
+            .device_name(&space.device_id)
+            .unwrap_or("Unknown device");
         (format!("@ {device}"), offline)
     }
 
@@ -811,11 +1034,40 @@ impl AppState {
     }
 
     pub fn gate(&self) -> GatePhase {
-        gate_phase(&self.connection, self.auth.as_ref())
+        gate_phase(&self.connection, self.workspace_scope, self.auth.as_ref())
     }
 
     pub fn engine(&self) -> Option<&EngineHandle> {
         self.engine.as_ref()
+    }
+
+    /// Drop every account-scoped view and subscription after its runtime has
+    /// stopped. The next bootstrap must never render rows from the previous
+    /// account while the local profile is opening.
+    pub fn prepare_runtime_replacement(&mut self, cx: &mut Context<Self>) {
+        self.engine = None;
+        self.watch_tasks.clear();
+        self.transcript_task = None;
+        self.connection = ConnectionStatus::Connecting;
+        self.workspace_scope = None;
+        self.auth = None;
+        self.devices.clear();
+        self.spaces.clear();
+        self.chats.clear();
+        self.sessions.clear();
+        self.selected_space = None;
+        self.no_project = false;
+        self.selected_device = None;
+        self.selected_chat = None;
+        self.auto_selected = false;
+        self.chats_synced = false;
+        self.spaces_synced = false;
+        self.transcript.clear();
+        self.echoes.clear();
+        self.pending_sends.clear();
+        self.local_device_id = None;
+        self.update = None;
+        cx.notify();
     }
 
     // ---- gpui glue ----
@@ -826,6 +1078,8 @@ impl AppState {
         let data_dir = config.data_dir.clone();
         state.update(cx, |s, cx| {
             s.connection = ConnectionStatus::Connecting;
+            s.workspace_scope = None;
+            s.auth = None;
             s.data_dir = Some(data_dir);
             cx.notify();
         });
@@ -855,9 +1109,15 @@ impl AppState {
     /// Methods the engine doesn't serve yet (chats/devices/auth land with the
     /// workspace doc in M4) fail their subscribe and are skipped gracefully.
     fn attach_engine(&mut self, handle: EngineHandle, cx: &mut Context<Self>) {
-        self.connection = ConnectionStatus::Ready;
+        let engine_info = handle.engine_info();
+        self.workspace_scope = Some(engine_info.workspace_scope);
+        self.local_device_id = Some(engine_info.device_id.clone());
         self.engine = Some(handle.clone());
-        self.watch_tasks = vec![
+        let mut watch_tasks = Vec::with_capacity(8);
+        if let Some(task) = spawn_deferred_engine_watch(cx, handle.clone()) {
+            watch_tasks.push(task);
+        }
+        watch_tasks.extend([
             spawn_watch(
                 cx,
                 handle.clone(),
@@ -891,7 +1151,11 @@ impl AppState {
                 AppState::apply_update,
             ),
             spawn_local_device_probe(cx, handle.clone()),
-        ];
+        ]);
+        self.watch_tasks = watch_tasks;
+        // EngineInfo is part of the attachment boundary: views must know which
+        // data profile they reached before they are allowed to render Ready.
+        self.connection = ConnectionStatus::Ready;
         // Re-subscribe the transcript if a chat was already selected (reconnect path).
         if let Some(chat_id) = self.selected_chat.clone() {
             self.transcript_task = Some(spawn_transcript_watch(cx, handle, chat_id));
@@ -1001,6 +1265,32 @@ impl AppState {
         })
         .detach();
     }
+}
+
+/// Observe assembly after an early attach (cloud onboarding or another viewport
+/// reaching the embedded engine over IPC). Data subscriptions wait on the same
+/// result, but their individual errors are not authoritative: older engines may
+/// legitimately omit a watch method. Only the assembly result may fail the
+/// whole connection.
+fn spawn_deferred_engine_watch(
+    cx: &mut Context<AppState>,
+    handle: EngineHandle,
+) -> Option<Task<()>> {
+    let mut deferred = handle.deferred_state()?;
+    Some(cx.spawn(async move |this, cx| {
+        let Err(failure) = wait_for_deferred_engine(&mut deferred).await else {
+            return;
+        };
+        tracing::error!(error = %failure, "engine assembly failed after attachment");
+        // Embedded handles release their IPC listener before exposing Retry;
+        // remote handles stop their completed readiness probe.
+        handle.shutdown().await;
+        this.update(cx, |state, cx| {
+            state.connection = ConnectionStatus::Failed(failure);
+            cx.notify();
+        })
+        .ok();
+    }))
 }
 
 /// Chats watch. Boot selection is the shell's job (it lands on the first
@@ -1224,6 +1514,104 @@ mod tests {
         listener.local_addr().unwrap().port()
     }
 
+    struct LegacyIdentityRpc;
+
+    #[async_trait]
+    impl RpcService for LegacyIdentityRpc {
+        async fn handle(
+            &self,
+            method: &str,
+            _params: serde_json::Value,
+        ) -> Result<RpcReply, RpcError> {
+            match method {
+                methods::LOCAL_DEVICE => {
+                    RpcReply::value(&serde_json::json!({ "deviceId": "legacy-device" }))
+                }
+                other => Err(RpcError::UnknownMethod(other.into())),
+            }
+        }
+    }
+
+    struct DeferredIdentityRpc {
+        engine_info: EngineInfo,
+        state: tokio::sync::watch::Receiver<DeferredEngineState>,
+    }
+
+    #[async_trait]
+    impl RpcService for DeferredIdentityRpc {
+        async fn handle(
+            &self,
+            method: &str,
+            _params: serde_json::Value,
+        ) -> Result<RpcReply, RpcError> {
+            match method {
+                methods::ENGINE_INFO => RpcReply::value(&self.engine_info),
+                methods::ENGINE_READY => {
+                    let mut state = self.state.clone();
+                    wait_for_deferred_engine(&mut state)
+                        .await
+                        .map_err(RpcError::Failed)?;
+                    RpcReply::value(&serde_json::json!({ "ready": true }))
+                }
+                other => Err(RpcError::UnknownMethod(other.into())),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_daemon_identity_falls_back_to_synced_scope() {
+        let client = memory_client(Arc::new(LegacyIdentityRpc));
+
+        let info = query_engine_info(&client).await.unwrap();
+
+        assert_eq!(info.device_id, "legacy-device");
+        assert_eq!(info.workspace_scope, WorkspaceScope::Synced);
+        assert_eq!(
+            gate_phase(
+                &ConnectionStatus::Ready,
+                Some(info.workspace_scope),
+                Some(&AuthState::SignedOut),
+            ),
+            GatePhase::SignIn
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_viewport_treats_legacy_daemon_as_ready() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(komet_rpc::serve_ws_listener(
+            listener,
+            Arc::new(LegacyIdentityRpc),
+        ));
+        let dir = tempfile::tempdir().unwrap();
+        let handle = EngineHandle::bootstrap(EngineBootConfig {
+            data_dir: dir.path().to_path_buf(),
+            ipc_port: port,
+            edge_url: "http://127.0.0.1:1".into(),
+            edge_token: None,
+            org_id: None,
+            workos_client_id: None,
+            default_harness: HarnessId::Mock,
+        })
+        .await
+        .expect("legacy daemon remains attachable");
+
+        let mut deferred = handle
+            .deferred_state()
+            .expect("remote viewport tracks readiness");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            wait_for_deferred_engine(&mut deferred),
+        )
+        .await
+        .expect("legacy readiness fallback completes")
+        .expect("unknown EngineReady means the old daemon is assembled");
+
+        handle.shutdown().await;
+        server.abort();
+    }
+
     #[tokio::test]
     async fn bootstrap_embeds_engine_when_port_is_free() {
         let dir = tempfile::tempdir().unwrap();
@@ -1239,6 +1627,14 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(handle.mode(), EngineMode::InProcess);
+        assert!(matches!(
+            handle
+                .deferred_state()
+                .expect("embedded lifecycle")
+                .borrow()
+                .clone(),
+            DeferredEngineState::Ready
+        ));
         // Same protocol over the in-memory transport: a real engine answers.
         let harnesses = handle
             .client()
@@ -1247,6 +1643,100 @@ mod tests {
             .unwrap();
         assert!(harnesses.as_array().is_some_and(|h| !h.is_empty()));
         handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn bootstrap_reports_local_assembly_failure_before_returning_a_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        komet_engine::EngineProfile::local(dir.path()).unwrap();
+        std::fs::create_dir(dir.path().join("profiles")).unwrap();
+        std::fs::write(dir.path().join("profiles/local"), b"not a directory").unwrap();
+        let port = free_port().await;
+
+        let error = match EngineHandle::bootstrap(EngineBootConfig {
+            data_dir: dir.path().to_path_buf(),
+            ipc_port: port,
+            edge_url: "http://127.0.0.1:1".into(),
+            edge_token: None,
+            org_id: None,
+            workos_client_id: Some("client_test".into()),
+            default_harness: HarnessId::Mock,
+        })
+        .await
+        {
+            Ok(handle) => {
+                handle.shutdown().await;
+                panic!("a corrupt local store must fail bootstrap")
+            }
+            Err(error) => error,
+        };
+
+        assert!(!format!("{error:#}").is_empty());
+        assert!(
+            tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_err(),
+            "failed bootstrap must release the IPC listener"
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_engine_failure_remains_observable_after_early_attach() {
+        let (state_tx, mut state_rx) = tokio::sync::watch::channel(DeferredEngineState::Waiting);
+        state_tx.send_replace(DeferredEngineState::Failed("store failed".into()));
+
+        assert_eq!(
+            wait_for_deferred_engine(&mut state_rx).await,
+            Err("store failed".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_viewport_observes_deferred_engine_failure() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (state_tx, state_rx) = tokio::sync::watch::channel(DeferredEngineState::Waiting);
+        let server = tokio::spawn(komet_rpc::serve_ws_listener(
+            listener,
+            Arc::new(DeferredIdentityRpc {
+                engine_info: EngineInfo {
+                    device_id: "owner-device".into(),
+                    workspace_scope: WorkspaceScope::Local,
+                },
+                state: state_rx,
+            }),
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        let handle = EngineHandle::bootstrap(EngineBootConfig {
+            data_dir: dir.path().to_path_buf(),
+            ipc_port: port,
+            edge_url: "http://127.0.0.1:1".into(),
+            edge_token: None,
+            org_id: None,
+            workos_client_id: None,
+            default_harness: HarnessId::Mock,
+        })
+        .await
+        .expect("second viewport attaches over IPC");
+        assert!(matches!(handle.mode(), EngineMode::Remote { .. }));
+
+        let mut deferred = handle
+            .deferred_state()
+            .expect("remote viewport tracks engine readiness");
+        state_tx.send_replace(DeferredEngineState::Failed("store failed".into()));
+        assert_eq!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                wait_for_deferred_engine(&mut deferred),
+            )
+            .await
+            .expect("remote readiness probe completes"),
+            Err("store failed".into())
+        );
+
+        handle.shutdown().await;
+        server.abort();
     }
 
     #[tokio::test]
@@ -1291,6 +1781,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_bootstraps_elect_one_embedded_engine() {
+        // Two viewports of one app booting at once (the Local-switch restart
+        // path): both used to probe a closed port, both embedded, and one lost
+        // the data-dir lock. The bootstrap gate must elect exactly one owner
+        // and turn the other into a plain remote attach.
+        let dir = tempfile::tempdir().unwrap();
+        let port = free_port().await;
+        let config = EngineBootConfig {
+            data_dir: dir.path().to_path_buf(),
+            ipc_port: port,
+            edge_url: "http://127.0.0.1:1".into(),
+            edge_token: None, // offline
+            org_id: None,
+            workos_client_id: None,
+            default_harness: HarnessId::Mock,
+        };
+        let (a, b) = tokio::join!(
+            EngineHandle::bootstrap(config.clone()),
+            EngineHandle::bootstrap(config.clone()),
+        );
+        let a = a.expect("first viewport boots");
+        let b = b.expect("second viewport boots");
+
+        let modes = [a.mode(), b.mode()];
+        assert_eq!(
+            modes
+                .iter()
+                .filter(|mode| **mode == EngineMode::InProcess)
+                .count(),
+            1,
+            "exactly one viewport embeds: {modes:?}"
+        );
+        assert_eq!(
+            modes
+                .iter()
+                .filter(|mode| matches!(mode, EngineMode::Remote { .. }))
+                .count(),
+            1,
+            "the other attaches over IPC: {modes:?}"
+        );
+
+        for handle in [&a, &b] {
+            let mut deferred = handle.deferred_state().expect("lifecycle tracked");
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                wait_for_deferred_engine(&mut deferred),
+            )
+            .await
+            .expect("readiness resolves")
+            .expect("both viewports reach Ready");
+        }
+
+        b.shutdown().await;
+        a.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn a_stranger_on_the_ipc_port_does_not_wedge_the_window() {
         // The port probe only proves *something* is listening. A process that
         // accepts TCP and never speaks WebSocket used to hang the dial forever;
@@ -1326,7 +1873,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn production_bootstrap_requires_sign_in_before_opening_engine_data() {
+    async fn production_bootstrap_opens_local_data_without_sign_in() {
         let dir = tempfile::tempdir().unwrap();
         let handle = EngineHandle::bootstrap(EngineBootConfig {
             data_dir: dir.path().to_path_buf(),
@@ -1340,6 +1887,14 @@ mod tests {
         .await
         .unwrap();
 
+        assert_eq!(handle.engine_info().workspace_scope, WorkspaceScope::Local);
+        let info: EngineInfo = handle
+            .client()
+            .call_as(methods::ENGINE_INFO, serde_json::json!({}))
+            .await
+            .unwrap();
+        assert_eq!(info, *handle.engine_info());
+
         let mut auth = handle
             .client()
             .subscribe(methods::AUTH_STATUS, serde_json::json!({}))
@@ -1349,6 +1904,55 @@ mod tests {
             parse_auth_state(&auth.recv().await.unwrap()),
             Some(AuthState::SignedOut)
         );
+        let harnesses = handle
+            .client()
+            .call(methods::LIST_HARNESSES, serde_json::json!({}))
+            .await
+            .expect("local data RPC is immediately available");
+        assert!(harnesses.as_array().is_some_and(|items| !items.is_empty()));
+        assert!(
+            !dir.path().join("orgs/dev-org/dev-user").exists(),
+            "production boot must not create dev-user data"
+        );
+        assert!(dir.path().join("profiles/local").is_dir());
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn engine_info_is_available_while_cloud_onboarding_is_deferred() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("session.json"),
+            r#"{"refreshToken":"saved","user":{"id":"user_1","email":"u@example.com"}}"#,
+        )
+        .unwrap();
+        let handle = EngineHandle::bootstrap(EngineBootConfig {
+            data_dir: dir.path().to_path_buf(),
+            ipc_port: free_port().await,
+            edge_url: "http://127.0.0.1:1".into(),
+            edge_token: None,
+            org_id: None,
+            workos_client_id: Some("client_test".into()),
+            default_harness: HarnessId::Mock,
+        })
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            handle
+                .deferred_state()
+                .expect("embedded lifecycle")
+                .borrow()
+                .clone(),
+            DeferredEngineState::Waiting
+        ));
+
+        let info: EngineInfo = handle
+            .client()
+            .call_as(methods::ENGINE_INFO, serde_json::json!({}))
+            .await
+            .expect("EngineInfo bypasses deferred cloud stores");
+        assert_eq!(info.workspace_scope, WorkspaceScope::Synced);
         assert!(
             tokio::time::timeout(
                 std::time::Duration::from_millis(100),
@@ -1358,12 +1962,9 @@ mod tests {
             )
             .await
             .is_err(),
-            "data RPC must wait behind the production sign-in gate"
+            "cloud data waits for organization onboarding"
         );
-        assert!(
-            !dir.path().join("orgs/dev-org/dev-user").exists(),
-            "production boot must not create dev-user data"
-        );
+        assert!(!dir.path().join("orgs").exists());
         handle.shutdown().await;
     }
 
@@ -1400,12 +2001,24 @@ mod tests {
                 url: format!("ws://127.0.0.1:{port}")
             }
         );
+        assert_eq!(
+            handle.engine_info().workspace_scope,
+            WorkspaceScope::Development
+        );
         let harnesses = handle
             .client()
             .call(methods::LIST_HARNESSES, serde_json::json!({}))
             .await
             .unwrap();
         assert!(harnesses.as_array().is_some_and(|h| !h.is_empty()));
+        assert!(matches!(
+            handle
+                .client()
+                .call(methods::STOP_ENGINE, serde_json::json!({}))
+                .await,
+            Err(RpcError::Failed(message))
+                if message == format!("unknown method: {}", methods::STOP_ENGINE)
+        ));
     }
 
     fn chat(id: &str, created_min: i64, last_msg_min: Option<i64>) -> Chat {
@@ -1473,6 +2086,35 @@ mod tests {
             status: None,
             continuation_of: None,
         }
+    }
+
+    fn device(id: &str, name: &str) -> Device {
+        Device {
+            id: id.into(),
+            name: name.into(),
+            platform: "macos".into(),
+            last_seen_at: None,
+            created_at: None,
+            version: None,
+        }
+    }
+
+    #[test]
+    fn local_workspace_hides_the_unknown_device_sentinel() {
+        let mut state = AppState::new();
+        state.workspace_scope = Some(WorkspaceScope::Local);
+        state.local_device_id = Some("local".into());
+
+        state.apply_devices(vec![
+            device("local", "unknown-device"),
+            device("remote", "unknown-device"),
+        ]);
+
+        assert_eq!(state.device_name("local"), Some("Local"));
+        assert_eq!(state.device_name("remote"), Some("unknown-device"));
+
+        state.apply_devices(vec![device("local", "José's MacBook Pro")]);
+        assert_eq!(state.device_name("local"), Some("José's MacBook Pro"));
     }
 
     #[test]
@@ -1833,22 +2475,33 @@ mod tests {
             name: None,
         };
         assert_eq!(
-            gate_phase(&ConnectionStatus::Connecting, None),
+            gate_phase(&ConnectionStatus::Connecting, None, None),
             GatePhase::Loading
         );
         assert_eq!(
-            gate_phase(&ConnectionStatus::Failed("boom".into()), None),
+            gate_phase(&ConnectionStatus::Failed("boom".into()), None, None),
             GatePhase::Failed("boom".into())
         );
-        // Unknown auth (pre-M4) gates nothing.
-        assert_eq!(gate_phase(&ConnectionStatus::Ready, None), GatePhase::Ready);
         assert_eq!(
-            gate_phase(&ConnectionStatus::Ready, Some(&AuthState::SignedOut)),
+            gate_phase(
+                &ConnectionStatus::Ready,
+                Some(WorkspaceScope::Local),
+                Some(&AuthState::SignedOut),
+            ),
+            GatePhase::Ready
+        );
+        assert_eq!(
+            gate_phase(
+                &ConnectionStatus::Ready,
+                Some(WorkspaceScope::Synced),
+                Some(&AuthState::SignedOut),
+            ),
             GatePhase::SignIn
         );
         assert_eq!(
             gate_phase(
                 &ConnectionStatus::Ready,
+                Some(WorkspaceScope::Synced),
                 Some(&AuthState::SignedIn {
                     user: user.clone(),
                     org_id: None
@@ -1860,10 +2513,39 @@ mod tests {
         assert_eq!(
             gate_phase(
                 &ConnectionStatus::Ready,
+                Some(WorkspaceScope::Synced),
                 Some(&AuthState::NeedsOrganization { user })
             ),
             GatePhase::OrgGate
         );
+    }
+
+    #[test]
+    fn auth_changes_do_not_change_a_local_runtime_scope_or_watches() {
+        let mut state = AppState::new();
+        state.workspace_scope = Some(WorkspaceScope::Local);
+        state.watch_tasks.push(Task::ready(()));
+
+        state.apply_auth(AuthState::NeedsOrganization {
+            user: UserProfile {
+                id: "u".into(),
+                email: "w@example.com".into(),
+                name: None,
+            },
+        });
+        assert_eq!(state.workspace_scope, Some(WorkspaceScope::Local));
+        assert_eq!(state.watch_tasks.len(), 1);
+
+        state.apply_auth(AuthState::SignedIn {
+            user: UserProfile {
+                id: "u".into(),
+                email: "w@example.com".into(),
+                name: None,
+            },
+            org_id: Some("org-1".into()),
+        });
+        assert_eq!(state.workspace_scope, Some(WorkspaceScope::Local));
+        assert_eq!(state.watch_tasks.len(), 1);
     }
 
     #[test]

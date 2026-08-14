@@ -29,13 +29,15 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 install -m 755 "$ROOT/target/release/komet" "$APP/Contents/MacOS/komet"
 sed "s/__VERSION__/$VERSION/" "$ROOT/dist/macos/Info.plist" >"$APP/Contents/Info.plist"
 
-# Icon: iconset from the shared 1024×1024 Komet artwork in dist/komet.png.
+# Icon: iconset from the pre-masked macOS icon (squircle + margins + shadow
+# baked into dist/macos/icon-1024.png — sips can't alpha-mask, so the mask is
+# applied ahead of time; dist/komet.png stays the full-bleed shared artwork).
 ICONSET="$OUT_DIR/komet.iconset"
 rm -rf "$ICONSET" && mkdir -p "$ICONSET"
 for size in 16 32 128 256 512; do
-  sips -z "$size" "$size" "$ROOT/dist/komet.png" --out "$ICONSET/icon_${size}x${size}.png" >/dev/null
+  sips -z "$size" "$size" "$ROOT/dist/macos/icon-1024.png" --out "$ICONSET/icon_${size}x${size}.png" >/dev/null
   retina=$((size * 2))
-  sips -z "$retina" "$retina" "$ROOT/dist/komet.png" --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null
+  sips -z "$retina" "$retina" "$ROOT/dist/macos/icon-1024.png" --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null
 done
 iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/komet.icns"
 rm -rf "$ICONSET"
@@ -64,8 +66,7 @@ NOTARIZE=false
 if $NOTARIZE; then
   # Staple the bundle BEFORE tarring it: the auto-updater swaps the .app with
   # no dmg involved, so the tarball copy must carry its own ticket to pass
-  # Gatekeeper offline. The ticket lives inside the bundle, so the tarball's
-  # Komet.app → Komet.app rename below doesn't disturb it.
+  # Gatekeeper offline.
   ZIP="$OUT_DIR/komet-notarize.zip"
   ditto -c -k --keepParent "$APP" "$ZIP"
   notarize "$ZIP"
@@ -73,10 +74,8 @@ if $NOTARIZE; then
   xcrun stapler staple "$APP"
 fi
 
-# The auto-updater artifact: keep the historical Komet.app path inside the
-# tarball so already-installed Komet builds can consume the first Komet
-# release. The DMG still presents Komet.app to new installs.
-tar -czf "$APP_TARBALL" -s '/^Komet\.app/Komet.app/' -C "$OUT_DIR" Komet.app
+# The auto-updater artifact.
+tar -czf "$APP_TARBALL" -C "$OUT_DIR" Komet.app
 echo "packaged: $APP_TARBALL"
 
 # The dmg presents the classic drag-into-Applications layout over the

@@ -22,9 +22,7 @@ use futures::StreamExt;
 use tokio::sync::{mpsc, oneshot};
 
 use komet_harness::{AcpHarness, CancellationToken, Harness, RunControls, SteerMessage};
-use komet_proto::{
-    AgentEvent, RunRequest, SandboxLevel, UserInputAnswer, UserInputQuestion,
-};
+use komet_proto::{AgentEvent, RunRequest, SandboxLevel, UserInputAnswer, UserInputQuestion};
 
 const QUIET_MS: u64 = 800;
 /// How long to keep observing after the FIRST Done — on unfixed code the

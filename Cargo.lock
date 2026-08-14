@@ -663,7 +663,7 @@ dependencies = [
  "bitflags 2.13.1",
  "cexpr",
  "clang-sys",
- "itertools 0.11.0",
+ "itertools 0.12.1",
  "log",
  "prettyplease",
  "proc-macro2",
@@ -1144,223 +1144,6 @@ name = "colorchoice"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
-
-[[package]]
-name = "komet"
-version = "0.1.57"
-dependencies = [
- "anyhow",
- "clap",
- "komet-engine",
- "komet-rpc",
- "komet-ui",
- "komet-update",
- "libc",
- "mimalloc",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "komet-doc"
-version = "0.1.57"
-dependencies = [
- "chrono",
- "komet-proto",
- "loro",
- "serde",
- "serde_json",
- "similar",
- "thiserror 2.0.19",
- "tracing",
-]
-
-[[package]]
-name = "komet-engine"
-version = "0.1.57"
-dependencies = [
- "anyhow",
- "async-trait",
- "base64",
- "chrono",
- "komet-doc",
- "komet-harness",
- "komet-proto",
- "komet-rpc",
- "komet-sync",
- "komet-update",
- "futures",
- "ignore",
- "libc",
- "loro",
- "notify",
- "portable-pty",
- "reqwest",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror 2.0.19",
- "tokio",
- "tokio-tungstenite",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "komet-harness"
-version = "0.1.57"
-dependencies = [
- "anyhow",
- "async-trait",
- "base64",
- "komet-proto",
- "futures",
- "libc",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.19",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "komet-proto"
-version = "0.1.57"
-dependencies = [
- "chrono",
- "serde",
- "serde_json",
- "uuid",
-]
-
-[[package]]
-name = "komet-rpc"
-version = "0.1.57"
-dependencies = [
- "anyhow",
- "async-trait",
- "komet-proto",
- "komet-sync",
- "futures",
- "serde",
- "serde_json",
- "thiserror 2.0.19",
- "tokio",
- "tokio-tungstenite",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "komet-sync"
-version = "0.1.57"
-dependencies = [
- "chrono",
- "komet-doc",
- "komet-proto",
- "futures",
- "loro",
- "loro-protocol",
- "reqwest",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.19",
- "tokio",
- "tokio-tungstenite",
- "tracing",
- "uuid",
-]
-
-[[package]]
-name = "komet-syntax"
-version = "0.1.57"
-dependencies = [
- "thiserror 2.0.19",
- "tree-sitter",
- "tree-sitter-bash",
- "tree-sitter-c",
- "tree-sitter-c-sharp",
- "tree-sitter-containerfile",
- "tree-sitter-cpp",
- "tree-sitter-css",
- "tree-sitter-go",
- "tree-sitter-highlight",
- "tree-sitter-html",
- "tree-sitter-java",
- "tree-sitter-javascript",
- "tree-sitter-json",
- "tree-sitter-kotlin-ng",
- "tree-sitter-lua",
- "tree-sitter-make",
- "tree-sitter-md",
- "tree-sitter-nix",
- "tree-sitter-php",
- "tree-sitter-python",
- "tree-sitter-ruby",
- "tree-sitter-rust",
- "tree-sitter-sequel",
- "tree-sitter-swift",
- "tree-sitter-toml-ng",
- "tree-sitter-typescript",
- "tree-sitter-yaml",
-]
-
-[[package]]
-name = "komet-ui"
-version = "0.1.57"
-dependencies = [
- "alacritty_terminal",
- "anyhow",
- "async-trait",
- "base64",
- "chrono",
- "komet-doc",
- "komet-engine",
- "komet-proto",
- "komet-rpc",
- "komet-syntax",
- "komet-update",
- "futures",
- "gpui",
- "gpui_platform",
- "gpui_tokio",
- "objc",
- "pulldown-cmark",
- "serde",
- "serde_json",
- "sha2",
- "similar",
- "tempfile",
- "tokio",
- "tracing",
- "unicode-segmentation",
- "uuid",
-]
-
-[[package]]
-name = "komet-update"
-version = "0.1.57"
-dependencies = [
- "anyhow",
- "futures",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "tokio",
- "tracing",
-]
 
 [[package]]
 name = "compression-codecs"
@@ -2063,7 +1846,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5540,7 +5323,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6025,7 +5808,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.4.15",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6038,7 +5821,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6977,7 +6760,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7203,6 +6986,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "futures-util",
  "pin-project-lite",
  "tokio",
 ]
@@ -8479,7 +8263,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -9310,6 +9094,227 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "komet"
+version = "0.1.62"
+dependencies = [
+ "anyhow",
+ "clap",
+ "libc",
+ "mimalloc",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "komet-engine",
+ "komet-rpc",
+ "komet-ui",
+ "komet-update",
+]
+
+[[package]]
+name = "komet-doc"
+version = "0.1.62"
+dependencies = [
+ "chrono",
+ "loro",
+ "serde",
+ "serde_json",
+ "similar",
+ "thiserror 2.0.19",
+ "tracing",
+ "komet-proto",
+]
+
+[[package]]
+name = "komet-engine"
+version = "0.1.62"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64",
+ "chrono",
+ "futures",
+ "gethostname",
+ "ignore",
+ "libc",
+ "loro",
+ "notify",
+ "portable-pty",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "tokio-tungstenite",
+ "tokio-util",
+ "tracing",
+ "uuid",
+ "komet-doc",
+ "komet-harness",
+ "komet-proto",
+ "komet-rpc",
+ "komet-sync",
+ "komet-update",
+]
+
+[[package]]
+name = "komet-harness"
+version = "0.1.62"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64",
+ "futures",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+ "komet-proto",
+]
+
+[[package]]
+name = "komet-proto"
+version = "0.1.62"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "komet-rpc"
+version = "0.1.62"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "futures",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "uuid",
+ "komet-doc",
+ "komet-proto",
+ "komet-sync",
+]
+
+[[package]]
+name = "komet-sync"
+version = "0.1.62"
+dependencies = [
+ "chrono",
+ "futures",
+ "loro",
+ "loro-protocol",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "uuid",
+ "komet-doc",
+ "komet-proto",
+]
+
+[[package]]
+name = "komet-syntax"
+version = "0.1.62"
+dependencies = [
+ "thiserror 2.0.19",
+ "tree-sitter",
+ "tree-sitter-bash",
+ "tree-sitter-c",
+ "tree-sitter-c-sharp",
+ "tree-sitter-containerfile",
+ "tree-sitter-cpp",
+ "tree-sitter-css",
+ "tree-sitter-go",
+ "tree-sitter-highlight",
+ "tree-sitter-html",
+ "tree-sitter-java",
+ "tree-sitter-javascript",
+ "tree-sitter-json",
+ "tree-sitter-kotlin-ng",
+ "tree-sitter-lua",
+ "tree-sitter-make",
+ "tree-sitter-md",
+ "tree-sitter-nix",
+ "tree-sitter-php",
+ "tree-sitter-python",
+ "tree-sitter-ruby",
+ "tree-sitter-rust",
+ "tree-sitter-sequel",
+ "tree-sitter-swift",
+ "tree-sitter-toml-ng",
+ "tree-sitter-typescript",
+ "tree-sitter-yaml",
+]
+
+[[package]]
+name = "komet-ui"
+version = "0.1.62"
+dependencies = [
+ "alacritty_terminal",
+ "anyhow",
+ "async-trait",
+ "base64",
+ "chrono",
+ "futures",
+ "gpui",
+ "gpui_platform",
+ "gpui_tokio",
+ "objc",
+ "pulldown-cmark",
+ "serde",
+ "serde_json",
+ "sha2",
+ "similar",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "unicode-segmentation",
+ "uuid",
+ "komet-doc",
+ "komet-engine",
+ "komet-harness",
+ "komet-proto",
+ "komet-rpc",
+ "komet-syntax",
+ "komet-update",
+]
+
+[[package]]
+name = "komet-update"
+version = "0.1.62"
+dependencies = [
+ "anyhow",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

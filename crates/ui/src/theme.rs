@@ -34,8 +34,8 @@
 
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 
-use komet_syntax::HighlightKind;
 use gpui::{App, Global, Hsla, SharedString, hsla};
+use komet_syntax::HighlightKind;
 
 /// Which appearance the app is painting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
@@ -526,13 +526,19 @@ impl Theme {
     }
 
     /// The translucent tint floating cards paint over their backdrop blur
-    /// (see [`crate::frost::frosted`]). Dark: 65% — a dark tint dominates the
-    /// blur at low coverage. Light: heavier — a white tint at 65% left menu
-    /// text ghosting over whatever sat behind the popover, so light coverage
+    /// (see [`crate::frost::frosted`]). Dark: the reference komet
+    /// `.glass-surface` menu tint verbatim — `oklch(0.33 0 0 / 34%)`. The
+    /// previous `surface_overlay` at 65% was tuned back when the tint had to
+    /// *approximate* the composited recipe without a real blur; kept over the
+    /// blur it buried the backdrop's colour and menus read as flat grey slabs
+    /// next to the hue-inheriting chrome (user report). At 34% the blurred
+    /// backdrop carries the card and the mid-grey only lifts it off the
+    /// plane. Light: heavier — a translucent white tint left menu text
+    /// ghosting over whatever sat behind the popover, so light coverage
     /// steps up to keep rows on a known background.
     pub fn glass_overlay(&self) -> Hsla {
         match self.appearance {
-            Appearance::Dark => self.surface_overlay.opacity(0.65),
+            Appearance::Dark => oklch(0.33, 0.0, 0.0).opacity(0.34),
             Appearance::Light => self.surface_overlay.opacity(0.85),
         }
     }

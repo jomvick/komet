@@ -221,7 +221,10 @@ async fn real_all_harnesses_quiet_survey() {
             println!(
                 "[{name}] run {i}/{runs}: dones={:?} after_first_done={} finished={} \
                  max_live_gap={:.3}s (window margin {:.1}x) → {}",
-                o.dones.iter().map(|(s, _)| format!("{s:?}")).collect::<Vec<_>>(),
+                o.dones
+                    .iter()
+                    .map(|(s, _)| format!("{s:?}"))
+                    .collect::<Vec<_>>(),
                 o.after_first_done,
                 o.finished,
                 o.max_gap.as_secs_f64(),
