@@ -69,8 +69,11 @@ pub struct LocalImportStatus {
 }
 
 /// Per-item progress for the wizard's progress step.
+/// NB: `rename_all` renames the *variants* (the `kind` tag); struct-variant
+/// *fields* need `rename_all_fields` — without it the wire shape silently
+/// ships snake_case counters (caught by `import_events_serialize_camel_case`).
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase", tag = "kind")]
+#[serde(rename_all = "camelCase", rename_all_fields = "camelCase", tag = "kind")]
 pub enum ImportEvent {
     /// Emitted once, before any copying.
     Start { chats: usize, spaces: usize },
@@ -369,6 +372,35 @@ impl LocalImporter {
         row.room_gen = Some(CHAT2_DOC_EPOCH);
         self.inner.workspace.import_chat_row(&row)?;
         Ok(copied)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ImportEvent;
+
+    #[test]
+    fn import_events_serialize_camel_case() {
+        let summary = serde_json::to_value(ImportEvent::Summary {
+            imported_chats: 2,
+            imported_spaces: 1,
+            skipped_chats: 0,
+            skipped_spaces: 0,
+            journals_copied: 2,
+            ledger_rows_merged: 3,
+            errors: Vec::new(),
+        })
+        .expect("serialize");
+        assert_eq!(summary["kind"], "summary");
+        assert_eq!(summary["importedChats"], 2, "fields must be camelCase: {summary}");
+        let chat = serde_json::to_value(ImportEvent::Chat {
+            index: 0,
+            total: 2,
+            chat_id: "c1".into(),
+            title: None,
+        })
+        .expect("serialize");
+        assert_eq!(chat["chatId"], "c1", "fields must be camelCase: {chat}");
     }
 }
 
