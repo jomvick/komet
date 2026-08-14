@@ -1870,6 +1870,9 @@ impl Changes {
             .map(|chat| chat.id.clone());
         let mode = self.scope.mode().to_string();
         let base_ref = self.base_ref.clone();
+        let commit_sha = (self.scope == DiffScope::Commit)
+            .then(|| self.commit.as_ref().map(|commit| commit.sha.clone()))
+            .flatten();
         let fetch_file = file.clone();
         let fetch_path = path.clone();
         let fetch_task = match (active, engine) {
@@ -1881,6 +1884,7 @@ impl Changes {
                     mode,
                     base_ref,
                     chat_id,
+                    commit_sha,
                     diff_checksum: diff.checksum,
                 };
                 let mut params = serde_json::to_value(request)

@@ -344,6 +344,11 @@ pub struct GetCheckoutFileDiffTextRequest {
     pub base_ref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chat_id: Option<String>,
+    /// Pinned commit for History's per-commit diff scope. When present, the
+    /// source pair is read from the commit parent and this commit, never from
+    /// the live working tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_sha: Option<String>,
     pub diff_checksum: String,
 }
 
@@ -520,11 +525,13 @@ mod tests {
             mode: "branch".into(),
             base_ref: Some("main".into()),
             chat_id: None,
+            commit_sha: Some("deadbeef".into()),
             diff_checksum: "abc".into(),
         };
         let value = serde_json::to_value(&request).unwrap();
         assert_eq!(value["checkoutId"], "checkout");
         assert_eq!(value["diffChecksum"], "abc");
+        assert_eq!(value["commitSha"], "deadbeef");
         assert_eq!(
             serde_json::from_value::<GetCheckoutFileDiffTextRequest>(value).unwrap(),
             request

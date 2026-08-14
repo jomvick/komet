@@ -1203,7 +1203,7 @@ impl RpcService for EngineRpc {
                         return Err(RpcError::Failed("checkoutId does not match cwd".into()));
                     }
                     let root = identity.root.as_path();
-                    let (snapshot, base) = match p.mode.as_str() {
+                    let (snapshot, base, target) = match p.mode.as_str() {
                         "branch" => {
                             let base_ref = p
                                 .base_ref
@@ -1219,7 +1219,23 @@ impl RpcService for EngineRpc {
                             ))
                             .await
                             .map_err(|error| RpcError::Failed(error.to_string()))?;
-                            (snapshot, base)
+                            (snapshot, base, None)
+                        }
+                        "commit" => {
+                            let sha = p
+                                .commit_sha
+                                .as_deref()
+                                .ok_or_else(|| RpcError::Failed("commitSha required".into()))?;
+                            let base =
+                                Box::pin(crate::diff_sync::commit_diff_base(root, sha)).await;
+                            let snapshot = Box::pin(crate::diff_sync::capture_commit_diff(
+                                &self.repos,
+                                root,
+                                sha,
+                            ))
+                            .await
+                            .map_err(|error| RpcError::Failed(error.to_string()))?;
+                            (snapshot, base, Some(sha.to_string()))
                         }
                         "turn" => {
                             let chat_id = p
@@ -1238,7 +1254,7 @@ impl RpcService for EngineRpc {
                             ))
                             .await
                             .map_err(|error| RpcError::Failed(error.to_string()))?;
-                            (snapshot, turn.tree)
+                            (snapshot, turn.tree, None)
                         }
                         _ => {
                             let base = Box::pin(crate::diff_sync::working_diff_base(root))
@@ -1248,7 +1264,7 @@ impl RpcService for EngineRpc {
                                 Box::pin(crate::diff_sync::capture_diff(&self.repos, root))
                                     .await
                                     .map_err(|error| RpcError::Failed(error.to_string()))?;
-                            (snapshot, base)
+                            (snapshot, base, None)
                         }
                     };
                     let stale = || komet_proto::CheckoutFileDiffText {
@@ -1271,9 +1287,14 @@ impl RpcService for EngineRpc {
                         .ok_or_else(|| {
                             RpcError::Failed("path is not part of diff snapshot".into())
                         })?;
-                    let pair = Box::pin(crate::diff_sync::read_diff_file_text(root, &base, file))
-                        .await
-                        .map_err(|error| RpcError::Failed(error.to_string()))?;
+                    let pair = Box::pin(crate::diff_sync::read_diff_file_text_at(
+                        root,
+                        &base,
+                        target.as_deref(),
+                        file,
+                    ))
+                    .await
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
                     let current = match p.mode.as_str() {
                         "branch" => {
                             Box::pin(crate::diff_sync::capture_diff_against(
@@ -1288,6 +1309,18 @@ impl RpcService for EngineRpc {
                                 &self.repos,
                                 root,
                                 &base,
+                            ))
+                            .await
+                        }
+                        "commit" => {
+                            let sha = p
+                                .commit_sha
+                                .as_deref()
+                                .ok_or_else(|| RpcError::Failed("commitSha required".into()))?;
+                            Box::pin(crate::diff_sync::capture_commit_diff(
+                                &self.repos,
+                                root,
+                                sha,
                             ))
                             .await
                         }

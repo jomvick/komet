@@ -850,6 +850,11 @@ async fn read_worktree_source(root: &Path, path: &Path) -> Result<Capture, Engin
     })
 }
 
+async fn read_git_source(root: &Path, revision: &str, path: &Path) -> Result<Capture, EngineError> {
+    let spec = format!("{revision}:{}", path.to_string_lossy());
+    capture_git(root, &["cat-file", "blob", &spec], MAX_DIFF_SOURCE_BYTES).await
+}
+
 /// Read the exact old/new documents for one file in a previously captured diff.
 /// Paths must come from that snapshot's file summary; callers still recheck the
 /// snapshot checksum after this read to close the filesystem race.
@@ -858,17 +863,30 @@ pub async fn read_diff_file_text(
     base: &str,
     file: &DiffFileSummary,
 ) -> Result<DiffFileTextPair, EngineError> {
+    read_diff_file_text_at(root, base, None, file).await
+}
+
+/// Read the exact old/new documents for one file in a diff between `base` and
+/// an optional committed target. Without a target, the new source is the live
+/// working tree; with one, both sources are immutable Git blobs.
+pub(crate) async fn read_diff_file_text_at(
+    root: &Path,
+    base: &str,
+    target: Option<&str>,
+    file: &DiffFileSummary,
+) -> Result<DiffFileTextPair, EngineError> {
     let new_path = validate_diff_path(&file.path)?;
     let old_path = validate_diff_path(file.old_path.as_deref().unwrap_or(&file.path))?;
 
     let old = if file.status == "added" {
         None
     } else {
-        let spec = format!("{base}:{}", old_path.to_string_lossy());
-        Some(capture_git(root, &["cat-file", "blob", &spec], MAX_DIFF_SOURCE_BYTES).await?)
+        Some(read_git_source(root, base, old_path).await?)
     };
     let new = if file.status == "deleted" {
         None
+    } else if let Some(target) = target {
+        Some(read_git_source(root, target, new_path).await?)
     } else {
         Some(read_worktree_source(root, new_path).await?)
     };
@@ -901,6 +919,21 @@ pub async fn read_diff_file_text(
         binary,
         truncated: false,
     })
+}
+
+/// Resolve the parent used as a commit diff's old side. Root commits compare
+/// against Git's canonical empty tree.
+pub(crate) async fn commit_diff_base(root: &Path, sha: &str) -> String {
+    let parent_spec = format!("{sha}^");
+    let parent = capture_git(root, &["rev-parse", "--verify", &parent_spec], 256)
+        .await
+        .map(|capture| String::from_utf8_lossy(&capture.stdout).trim().to_string())
+        .unwrap_or_default();
+    if parent.is_empty() {
+        EMPTY_TREE_SHA.to_string()
+    } else {
+        parent
+    }
 }
 
 pub async fn working_diff_base(root: &Path) -> Result<String, EngineError> {
@@ -1095,16 +1128,7 @@ pub async fn capture_commit_diff(
     root: &Path,
     sha: &str,
 ) -> Result<DiffSnapshot, EngineError> {
-    let parent_spec = format!("{sha}^");
-    let parent = capture_git(root, &["rev-parse", "--verify", &parent_spec], 256)
-        .await
-        .map(|c| String::from_utf8_lossy(&c.stdout).trim().to_string())
-        .unwrap_or_default();
-    let base: String = if parent.is_empty() {
-        EMPTY_TREE_SHA.to_string()
-    } else {
-        parent
-    };
+    let base = commit_diff_base(root, sha).await;
     let branch = repos
         .current_branch(root)
         .await
