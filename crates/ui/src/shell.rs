@@ -4222,7 +4222,10 @@ impl Shell {
                                         .size(px(13.0))
                                         .text_color(theme.text_muted),
                                 )
-                                .child(SharedString::from("Git diff")),
+                                // "Git", not "Git diff" — the surface hosts
+                                // history and per-commit views too (user
+                                // request; matches the picker card).
+                                .child(SharedString::from("Git")),
                         ),
                 )
                 .into_any_element();
