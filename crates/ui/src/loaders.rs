@@ -228,6 +228,15 @@ fn hero_ascii(theme: &Theme) -> AnyElement {
         .flex()
         .flex_col()
         .font_family(theme.font_mono.clone())
+        // Ligatures OFF, like the terminal grid and the landing page's own
+        // `.hero-ascii` rule: the art is a character grid full of `--`/`::`
+        // runs, and a contextual substitution would collapse cells and bend
+        // the picture (the `codex --yolo` bug, in still life).
+        .font_features(gpui::FontFeatures(std::sync::Arc::new(vec![
+            ("liga".into(), 0),
+            ("calt".into(), 0),
+            ("dlig".into(), 0),
+        ])))
         .text_size(px(FONT))
         .line_height(px(LINE))
         // `theme.text` IS near-white on dark; on light it flips to the ink
