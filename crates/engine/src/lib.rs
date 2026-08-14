@@ -37,8 +37,9 @@ pub mod workspace_host;
 pub use agent_accounts::{AgentAccounts, AgentAccountsConfig};
 pub use auth::{Auth, AuthConfig, AuthState, AuthUser, OrgMembership};
 pub use diff_sync::{
-    CheckoutDiffSync, DiffSidecar, DiffSnapshot, TurnSnapshot, capture_diff, capture_diff_against,
-    capture_turn_diff, merge_base, snapshot_tree,
+    CheckoutDiffSync, DiffFileTextPair, DiffSidecar, DiffSnapshot, TurnSnapshot,
+    capture_commit_diff, capture_diff, capture_diff_against, capture_turn_diff, merge_base,
+    read_diff_file_text, snapshot_tree, working_diff_base,
 };
 pub use doc_host::{ChatDocHandle, DocHost, DocHostConfig, EdgeConfig};
 pub use instance_lock::InstanceLock;
@@ -232,7 +233,6 @@ impl EngineCore {
         let uploads = Uploads::from_root_with_fallback(
             profile.uploads_root(),
             legacy_uploads_root.as_deref(),
-            edge.clone(),
         );
         // A recorded local→synced import grants this account the local
         // profile's uploads root read-only — transcripts imported earlier
@@ -458,7 +458,6 @@ impl EngineCore {
         if let Some(updater) = updater {
             updater.shutdown().await;
         }
-        self.uploads.shutdown().await;
         self.diff_sync.shutdown().await;
         self.spaces_sync.shutdown().await;
         self.doc_host.shutdown_workers().await;

@@ -29,7 +29,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use gpui::{
@@ -41,13 +41,14 @@ use gpui::{
 use komet_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
 use komet_proto::ToolCall;
 
-use crate::markdown::highlight::{Lang, LineCarry, Token, lang_for_tag, tokenize_line};
 use crate::markdown::parser::{Block, BlockTree, IncrementalParser, parse_full};
 use crate::markdown::render::{self, RenderCache, RenderOptions};
 use crate::markdown::veil::RowVeil;
 use crate::motion::{self, AnimationExt as _, RESIZE};
 use crate::state::AppState;
+use crate::syntax_cache::{DocumentHighlightKey, SyntaxHighlightCache};
 use crate::theme::Theme;
+use komet_syntax::LanguageId as Lang;
 
 // ---------------------------------------------------------------------------
 // Constants (mugen ports)
@@ -254,7 +255,8 @@ pub enum ToolDetail {
     /// tokens — rendered by `changes::render_file_body`.
     Diff {
         file: Arc<crate::changes::FileDiff>,
-        highlight: Option<Arc<Vec<Vec<crate::markdown::highlight::Token>>>>,
+        old_text: Option<Arc<str>>,
+        new_text: Option<Arc<str>>,
     },
     /// Per-file `+N −N` stat rows — what the thin doc keeps of an edit
     /// (chat2-sync A1). The full diff upgrades this to [`ToolDetail::Diff`]
@@ -300,10 +302,10 @@ pub fn tool_detail(
         // build tens of thousands of elements per frame. The changes pane
         // has no such cap; it virtualizes per line.
         crate::changes::truncate_file_lines(&mut file, DIFF_DETAIL_MAX_LINES);
-        let highlight = highlight_file(&file);
         return Some(ToolDetail::Diff {
             file: Arc::new(file),
-            highlight,
+            old_text: diff.old_text.as_deref().map(Arc::from),
+            new_text: Some(Arc::from(diff.new_text.as_str())),
         });
     }
     if let Some(stats) = diff_stats.filter(|s| !s.is_empty()) {
@@ -480,24 +482,6 @@ pub fn diff_to_file(diff: &komet_proto::ToolDiff) -> crate::changes::FileDiff {
         deletions,
         max_line,
     }
-}
-
-/// Synchronous syntax tokens for a tool diff — the payload is doc-capped, so
-/// unlike the changes pane's time-sliced background pass this can run inline
-/// at row-build time (rows are fingerprint-cached, not per-frame).
-fn highlight_file(
-    file: &crate::changes::FileDiff,
-) -> Option<Arc<Vec<Vec<crate::markdown::highlight::Token>>>> {
-    use crate::markdown::highlight::{LineCarry, tokenize_line};
-    let lang = crate::changes::lang_for_path(&file.path)?;
-    let lines: Vec<Vec<crate::markdown::highlight::Token>> = file
-        .hunks
-        .iter()
-        .flat_map(|h| h.lines.iter())
-        // Diff lines are fragments — no carry across lines (changes.rs).
-        .map(|l| tokenize_line(lang, &l.text, LineCarry::None).0)
-        .collect();
-    Some(Arc::new(lines))
 }
 
 #[derive(Clone)]
@@ -1186,23 +1170,9 @@ pub fn format_elapsed(secs: i64) -> String {
 // Highlight store (background, time-sliced, paint-only)
 // ---------------------------------------------------------------------------
 
-async fn yield_now() {
-    let mut yielded = false;
-    futures::future::poll_fn(move |cx| {
-        if yielded {
-            std::task::Poll::Ready(())
-        } else {
-            yielded = true;
-            cx.waker().wake_by_ref();
-            std::task::Poll::Pending
-        }
-    })
-    .await
-}
-
 struct HighlightEntry {
-    code_len: usize,
-    lines: Option<Arc<Vec<Vec<Token>>>>,
+    key: DocumentHighlightKey,
+    document: Option<Weak<komet_syntax::HighlightedDocument>>,
     _task: Option<Task<()>>,
 }
 
@@ -1212,6 +1182,7 @@ struct HighlightEntry {
 #[derive(Default)]
 struct HighlightStore {
     entries: HashMap<(SharedString, usize), HighlightEntry>,
+    cache: SyntaxHighlightCache,
 }
 
 impl HighlightStore {
@@ -1223,41 +1194,92 @@ impl HighlightStore {
         lang: Lang,
         code: &str,
         cx: &mut Context<Transcript>,
-    ) -> Option<Arc<Vec<Vec<Token>>>> {
-        let key = (row_id.clone(), block_ix);
-        if let Some(entry) = self.entries.get(&key)
-            && entry.code_len == code.len()
+    ) -> Option<Arc<komet_syntax::HighlightedDocument>> {
+        let slot_key = (row_id.clone(), block_ix);
+        let document_key = DocumentHighlightKey::new(lang, code);
+        if let Some(entry) = self.entries.get(&slot_key)
+            && entry.key == document_key
         {
-            return entry.lines.clone();
+            let document = entry.document.as_ref()?;
+            if let Some(document) = document.upgrade() {
+                return Some(document);
+            }
         }
-        // Keep stale lines visible while the fresh parse runs (paint-only, so a
-        // briefly stale color is harmless; lengths shift at most on the tail).
-        let stale = self.entries.get(&key).and_then(|e| e.lines.clone());
+        if let Some(document) = self.cache.get(&document_key) {
+            self.entries.insert(
+                slot_key,
+                HighlightEntry {
+                    key: document_key,
+                    document: Some(Arc::downgrade(&document)),
+                    _task: None,
+                },
+            );
+            return Some(document);
+        }
         let code = code.to_string();
-        let code_len = code.len();
+        let source_bytes = code.len();
         let task = cx.spawn(async move |this, cx| {
-            let lines = cx
+            let started = Instant::now();
+            let document = cx
                 .background_executor()
                 .spawn(async move {
-                    let mut carry = LineCarry::None;
-                    let mut out = Vec::new();
-                    for (ix, line) in code.split('\n').enumerate() {
-                        let (tokens, next) = tokenize_line(lang, line, carry);
-                        carry = next;
-                        out.push(tokens);
-                        if ix % 128 == 127 {
-                            yield_now().await;
-                        }
-                    }
-                    out
+                    komet_syntax::highlight(komet_syntax::HighlightRequest {
+                        source: &code,
+                        path: None,
+                        fence_tag: Some(match lang {
+                            Lang::Rust => "rust",
+                            Lang::JavaScript => "javascript",
+                            Lang::Jsx => "jsx",
+                            Lang::TypeScript => "typescript",
+                            Lang::Tsx => "tsx",
+                            Lang::Python => "python",
+                            Lang::Go => "go",
+                            Lang::Json => "json",
+                            Lang::Jsonc => "jsonc",
+                            Lang::Bash => "bash",
+                            Lang::Toml => "toml",
+                            Lang::Markdown => "markdown",
+                            Lang::Html => "html",
+                            Lang::Css => "css",
+                            Lang::Yaml => "yaml",
+                            Lang::C => "c",
+                            Lang::Cpp => "cpp",
+                            Lang::CSharp => "csharp",
+                            Lang::Java => "java",
+                            Lang::Kotlin => "kotlin",
+                            Lang::Swift => "swift",
+                            Lang::Ruby => "ruby",
+                            Lang::Php => "php",
+                            Lang::Sql => "sql",
+                            Lang::Lua => "lua",
+                            Lang::Dockerfile => "dockerfile",
+                            Lang::Nix => "nix",
+                            Lang::Make => "make",
+                        }),
+                    })
+                    .ok()
                 })
                 .await;
             this.update(cx, |transcript, cx| {
-                if let Some(entry) = transcript.highlights.entries.get_mut(&key)
-                    && entry.code_len == code_len
-                {
-                    entry.lines = Some(Arc::new(lines));
-                    cx.notify();
+                if let Some(document) = document {
+                    let document = Arc::new(document);
+                    let retained = transcript
+                        .highlights
+                        .cache
+                        .insert(document_key, document.clone());
+                    if let Some(entry) = transcript.highlights.entries.get_mut(&slot_key)
+                        && entry.key == document_key
+                    {
+                        tracing::debug!(
+                            language = ?lang,
+                            source_bytes,
+                            spans = document.lines.iter().map(Vec::len).sum::<usize>(),
+                            elapsed_us = started.elapsed().as_micros() as u64,
+                            "syntax highlight ready"
+                        );
+                        entry.document = retained.then(|| Arc::downgrade(&document));
+                        cx.notify();
+                    }
                 }
             })
             .ok();
@@ -1265,12 +1287,12 @@ impl HighlightStore {
         self.entries.insert(
             (row_id, block_ix),
             HighlightEntry {
-                code_len,
-                lines: stale.clone(),
+                key: document_key,
+                document: None,
                 _task: Some(task),
             },
         );
-        stale
+        None
     }
 }
 
@@ -2783,7 +2805,7 @@ impl Transcript {
                     highlight
                         .get(block_ix)
                         .and_then(|o| o.as_deref())
-                        .map(|v| v.as_slice()),
+                        .map(|document| document.lines.as_slice()),
                 )
             }
             RowKind::LiveMarkdown { tree, block_ix } => {
@@ -2826,7 +2848,7 @@ impl Transcript {
                     highlight
                         .get(block_ix)
                         .and_then(|o| o.as_deref())
-                        .map(|v| v.as_slice()),
+                        .map(|document| document.lines.as_slice()),
                 );
                 if let Some(start) = timer {
                     record_live_frame_us(start.elapsed().as_micros() as u64);
@@ -2988,14 +3010,16 @@ impl Transcript {
         tree: &Arc<BlockTree>,
         only: Option<usize>,
         cx: &mut Context<Self>,
-    ) -> HashMap<usize, Option<Arc<Vec<Vec<Token>>>>> {
+    ) -> HashMap<usize, Option<Arc<komet_syntax::HighlightedDocument>>> {
         let mut out = HashMap::new();
         for (ix, top) in tree.blocks.iter().enumerate() {
             if only.is_some_and(|o| o != ix) {
                 continue;
             }
             if let Block::CodeBlock { language, code } = &top.block
-                && let Some(lang) = language.as_deref().and_then(lang_for_tag)
+                && let Some(lang) = language
+                    .as_deref()
+                    .and_then(komet_syntax::language_for_alias)
             {
                 out.insert(
                     ix,
@@ -3004,6 +3028,43 @@ impl Transcript {
             }
         }
         out
+    }
+
+    fn tool_diff_highlight_for(
+        &mut self,
+        row_id: &SharedString,
+        tool_ix: usize,
+        detail: &ToolDetail,
+        cx: &mut Context<Self>,
+    ) -> Option<Arc<crate::changes::DiffHighlights>> {
+        let ToolDetail::Diff {
+            file,
+            old_text,
+            new_text,
+        } = detail
+        else {
+            return None;
+        };
+        let cache_row: SharedString = format!("{row_id}#tool-diff-{tool_ix}").into();
+        let old = match old_text {
+            Some(source) => {
+                let path = file.old_path.as_deref().unwrap_or(&file.path);
+                let lang = komet_syntax::language_for_path(path)?;
+                Some(
+                    self.highlights
+                        .request(cache_row.clone(), 0, lang, source, cx)?,
+                )
+            }
+            None => None,
+        };
+        let new = match new_text {
+            Some(source) => {
+                let lang = komet_syntax::language_for_path(&file.path)?;
+                Some(self.highlights.request(cache_row, 1, lang, source, cx)?)
+            }
+            None => None,
+        };
+        Some(Arc::new(crate::changes::DiffHighlights { old, new }))
     }
 
     fn render_tool_group(
@@ -3114,6 +3175,16 @@ impl Transcript {
             .zip(&detail_folds)
             .map(|((detail, invocation), fold)| {
                 (detail.is_some() || invocation.is_some()) && fold.open.unwrap_or(false)
+            })
+            .collect();
+        let detail_highlights: Vec<Option<Arc<crate::changes::DiffHighlights>>> = details
+            .iter()
+            .enumerate()
+            .map(|(ix, detail)| {
+                detail
+                    .as_deref()
+                    .filter(|_| detail_opens[ix])
+                    .and_then(|detail| self.tool_diff_highlight_for(row_id, ix, detail, cx))
             })
             .collect();
         let open_height = chips_height(tools.len())
@@ -3272,7 +3343,7 @@ impl Transcript {
                 // Invocation first (what was asked), then output/diff (what
                 // came back), each under its own hairline.
                 if open || animating {
-                    for block in [&invocation, &detail].into_iter().flatten() {
+                    if let Some(invocation) = invocation.as_deref() {
                         card = card
                             .child(
                                 div()
@@ -3280,7 +3351,17 @@ impl Transcript {
                                     .flex_none()
                                     .bg(crate::theme::hairline(0.06)),
                             )
-                            .child(detail_body(block, theme));
+                            .child(detail_body(invocation, None, theme));
+                    }
+                    if let Some(detail) = detail.as_deref() {
+                        card = card
+                            .child(
+                                div()
+                                    .h(px(DETAIL_SEPARATOR))
+                                    .flex_none()
+                                    .bg(crate::theme::hairline(0.06)),
+                            )
+                            .child(detail_body(detail, detail_highlights[ix].clone(), theme));
                     }
                     if let Some((blob_ref, label)) = affordance {
                         let loading = matches!(
@@ -3608,13 +3689,17 @@ fn tool_icon_path(call: &ToolCall) -> &'static str {
 /// syntax runs — so an inline tool diff is indistinguishable from the
 /// checkout diff sidebar. Output renders as a code block: verbatim mono
 /// lines, indentation intact, counted-tail truncation.
-fn detail_body(detail: &ToolDetail, theme: &Theme) -> AnyElement {
+fn detail_body(
+    detail: &ToolDetail,
+    diff_highlights: Option<Arc<crate::changes::DiffHighlights>>,
+    theme: &Theme,
+) -> AnyElement {
     let body = div().w_full().min_w_0().flex().flex_col().overflow_hidden();
     match detail {
-        ToolDetail::Diff { file, highlight } => body
-            .child(crate::changes::render_file_body(
+        ToolDetail::Diff { file, .. } => body
+            .child(crate::changes::render_file_body_with_syntax(
                 file,
-                highlight.clone(),
+                diff_highlights,
                 theme,
             ))
             .into_any_element(),
@@ -4429,7 +4514,11 @@ mod tests {
             old_text: Some(old.join("\n") + "\n"),
             new_text: new.join("\n") + "\n",
         };
-        let Some(ToolDetail::Diff { file, highlight }) = tool_detail(None, Some(&diff), None)
+        let Some(ToolDetail::Diff {
+            file,
+            old_text,
+            new_text,
+        }) = tool_detail(None, Some(&diff), None)
         else {
             panic!("expected diff detail");
         };
@@ -4454,21 +4543,25 @@ mod tests {
         assert_eq!(add.new_no, Some(10));
         assert_eq!(add.text, "LINE 10");
         assert_eq!((file.additions, file.deletions), (1, 1));
-        // .rs path → syntax tokens computed, one entry per hunk line.
-        let highlight = highlight.expect("rust highlights");
-        assert_eq!(highlight.len(), hunk.lines.len());
+        assert_eq!(old_text.as_deref(), diff.old_text.as_deref());
+        assert_eq!(new_text.as_deref(), Some(diff.new_text.as_str()));
         // New files carry Added status (and no old numbers).
         let created = komet_proto::ToolDiff {
             path: "/w/new.txt".into(),
             old_text: None,
             new_text: "only\n".into(),
         };
-        let Some(ToolDetail::Diff { file, highlight }) = tool_detail(None, Some(&created), None)
+        let Some(ToolDetail::Diff {
+            file,
+            old_text,
+            new_text,
+        }) = tool_detail(None, Some(&created), None)
         else {
             panic!("expected diff detail");
         };
         assert_eq!(file.status, crate::changes::FileStatus::Added);
-        assert!(highlight.is_none(), ".txt has no language");
+        assert!(old_text.is_none());
+        assert_eq!(new_text.as_deref(), Some("only\n"));
 
         // Output: verbatim lines (indentation intact), counted-tail cap.
         let output = (0..40)
