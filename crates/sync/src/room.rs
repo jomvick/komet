@@ -1364,7 +1364,8 @@ impl Session {
                             "updates repeatedly rejected (stale peer or reset server doc); redialing fresh"
                         );
                         return Err(SyncError::WebSocket(
-                            "resync cap exhausted: server keeps rejecting our updates; redialing".into(),
+                            "resync cap exhausted: server keeps rejecting our updates; redialing"
+                                .into(),
                         ));
                     }
                     self.invalid_rejoins += 1;

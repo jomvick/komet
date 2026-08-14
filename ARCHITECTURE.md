@@ -1,4 +1,4 @@
-# komet-native — Architecture
+# komet — Architecture
 
 A ground-up native rewrite of [komet](../komet) — a multi-device controller for coding agents
 (Claude Code / Codex) — in Rust, with a gpui UI. Fresh app; no backwards compatibility required.
@@ -118,7 +118,7 @@ This is komet's proven design, kept verbatim.
 ## 3. Cargo workspace
 
 ```
-komet-native/
+komet/
   Cargo.toml                 # workspace
   crates/
     proto/        komet-proto    # wire types: AgentEvent, ToolCall, RunRequest, Model,
@@ -216,7 +216,7 @@ Direct ports of komet behaviors (spec: feature-inventory §3):
   permissions/AskUserQuestion→requestInput, resume, steering); Codex via app-server JSON-RPC or
   `codex exec --json`; model/reasoning/option catalogs ported from `packages/harness`.
 - **Repos/diffs**: git2 or `git` subprocess (subprocess — matches komet, avoids libgit2 edge
-  cases); worktrees under `~/.komet-native/worktrees`; fs watchers (`notify`) + 2min repair; diff
+  cases); worktrees under `~/.komet/worktrees`; fs watchers (`notify`) + 2min repair; diff
   capture (patch + numstat + untracked, 3MiB cap, sha256) → workspace registry summary + DO diff
   sidecar.
 - **Agent accounts**: credential-slot swap (macOS Keychain via `security-framework`, files

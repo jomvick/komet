@@ -1,18 +1,18 @@
 //! Local-first startup boundaries and captured synced-session behavior.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
-use komet_engine::{AuthState, Engine, EngineConfig, EngineInfo, HarnessId, WorkspaceScope};
-use komet_rpc::{connect_ws, memory_client, methods};
 use futures::{SinkExt, StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::tungstenite::handshake::server::{
     Request as WsRequest, Response as WsResponse,
 };
+use komet_engine::{AuthState, Engine, EngineConfig, EngineInfo, HarnessId, WorkspaceScope};
+use komet_rpc::{connect_ws, memory_client, methods};
 
 fn config(
     data_dir: &std::path::Path,
@@ -157,8 +157,8 @@ async fn serve_daemon_edge(
                 "exp": 4_102_444_800_u64,
                 "org_id": "org_1"
             });
-            let claims = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .encode(claims.to_string());
+            let claims =
+                base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(claims.to_string());
             serde_json::json!({
                 "accessToken": format!("e30.{claims}.sig"),
                 "refreshToken": "rotated-refresh"
@@ -206,7 +206,12 @@ async fn serve_daemon_edge(
                 }
             } else if serde_json::from_str::<serde_json::Value>(&text)
                 .ok()
-                .and_then(|frame| frame.get("t").and_then(|value| value.as_str()).map(str::to_string))
+                .and_then(|frame| {
+                    frame
+                        .get("t")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_string)
+                })
                 .as_deref()
                 == Some("hello")
             {
@@ -218,7 +223,11 @@ async fn serve_daemon_edge(
                     "rows": [],
                     "presence": {}
                 });
-                if sink.send(WsMessage::Text(state.to_string().into())).await.is_err() {
+                if sink
+                    .send(WsMessage::Text(state.to_string().into()))
+                    .await
+                    .is_err()
+                {
                     return;
                 }
             }
@@ -577,7 +586,9 @@ async fn online_runtime_shutdown_stops_edge_workers_and_retires_the_graph() {
     )
     .unwrap();
 
-    let runtime = Engine::assemble_runtime(&config, auth, profile).await.unwrap();
+    let runtime = Engine::assemble_runtime(&config, auth, profile)
+        .await
+        .unwrap();
     let retired = runtime.core().doc_host.retirement_probe();
 
     // Live traffic proof: the mirror drain (and the woken release checker) must
@@ -597,7 +608,11 @@ async fn online_runtime_shutdown_stops_edge_workers_and_retires_the_graph() {
     let after = requests.load(Ordering::SeqCst);
     drop(runtime);
 
-    wait_until(&*retired, "engine graph still reachable after shutdown + drop").await;
+    wait_until(
+        &*retired,
+        "engine graph still reachable after shutdown + drop",
+    )
+    .await;
     // Longer than two mirror retry periods: a surviving drain loop would land
     // another PUT in this window.
     tokio::time::sleep(std::time::Duration::from_millis(2500)).await;

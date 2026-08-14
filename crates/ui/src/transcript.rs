@@ -171,7 +171,6 @@ impl StickSpring {
         *self = Self::new();
     }
 
-
     /// Residual motion below mugen's settle thresholds (`v < .05 && targetVel
     /// < .05`)?
     pub fn is_idle(&self) -> bool {
@@ -455,9 +454,7 @@ pub fn diff_to_file(diff: &komet_proto::ToolDiff) -> crate::changes::FileDiff {
                 };
                 let old_no = change.old_index().map(|n| n as u32 + 1);
                 let new_no = change.new_index().map(|n| n as u32 + 1);
-                max_line = max_line
-                    .max(old_no.unwrap_or(0))
-                    .max(new_no.unwrap_or(0));
+                max_line = max_line.max(old_no.unwrap_or(0)).max(new_no.unwrap_or(0));
                 lines.push(DiffLine {
                     kind,
                     old_no,
@@ -1576,8 +1573,6 @@ impl Transcript {
         }
     }
 
-
-
     pub(crate) fn distance_from_bottom(&self) -> f32 {
         let max = f32::from(self.list.max_offset_for_scrollbar().y);
         let cur = f32::from(self.list.scroll_px_offset_for_scrollbar().y);
@@ -1628,8 +1623,7 @@ impl Transcript {
                         this.spring.reset();
                         this.spring_last_tick = None;
                     } else if !held
-                        && (distance <= AT_BOTTOM_PX
-                            || Self::should_restick(distance, previous))
+                        && (distance <= AT_BOTTOM_PX || Self::should_restick(distance, previous))
                     {
                         // Returning to the bottom returns to the RUNWAY: the
                         // glide re-lands the prompt at its inset.
@@ -1929,12 +1923,10 @@ impl Transcript {
                 // nothing to ease against.
                 match self.list.bounds_for_item(anchor_ix) {
                     Some(b) => {
-                        let err =
-                            f32::from(b.top()) - (f32::from(viewport.top()) + inset);
+                        let err = f32::from(b.top()) - (f32::from(viewport.top()) + inset);
                         let now = Instant::now();
                         let frames = match self.own_turn_last_tick {
-                            Some(last) => (now.duration_since(last).as_secs_f32()
-                                * 1000.0
+                            Some(last) => (now.duration_since(last).as_secs_f32() * 1000.0
                                 / SPRING_FRAME_MS)
                                 .min(SPRING_MAX_CATCHUP_FRAMES),
                             None => 1.0,
@@ -2010,7 +2002,8 @@ impl Transcript {
                 anchor.positioned = true;
             }
             self.own_turn_last_tick = None;
-        } else if anchored && err <= OWN_SEND_GLIDE_SNAP_PX
+        } else if anchored
+            && err <= OWN_SEND_GLIDE_SNAP_PX
             && err >= -(OWN_SEND_SCROLL_SLACK_PX + 2.0)
         {
             // At the hold — or resting inside the slack under it (a restick
@@ -2066,7 +2059,6 @@ impl Transcript {
         }
         self.engage_pin(cx);
     }
-
 
     /// Re-engage the bottom pin with a glide. Long jumps teleport to within
     /// [`GLIDE_MAX_VIEWPORTS`] of the end first (mugen `springToBottom`);
@@ -2271,7 +2263,7 @@ impl Transcript {
                     // start — the end-of-turn up/down jump the spring then has
                     // to walk back. `remeasure_items` keeps old sizes as hints
                     // and holds the anchor across the remeasure.
-                self.list.remeasure_items(old_range);
+                    self.list.remeasure_items(old_range);
                 } else {
                     self.list.splice(old_range, count);
                 }
@@ -2373,7 +2365,10 @@ impl Transcript {
             .await;
             let fetched = match reply {
                 Ok(value) => {
-                    let text = value.get("text").and_then(|t| t.as_str()).unwrap_or_default();
+                    let text = value
+                        .get("text")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or_default();
                     blob_detail(text, is_diff)
                         .map(|d| BlobFetch::Ready(Arc::new(d)))
                         .unwrap_or(BlobFetch::Failed)
@@ -3062,8 +3057,7 @@ impl Transcript {
                     let mut best: Option<(u64, &SharedString)> = None;
                     for blob_ref in [&tool.diff_ref, &tool.output_ref].into_iter().flatten() {
                         if matches!(self.blob_details.get(blob_ref), Some(BlobFetch::Ready(_))) {
-                            let order =
-                                self.blob_fetch_order.get(blob_ref).copied().unwrap_or(0);
+                            let order = self.blob_fetch_order.get(blob_ref).copied().unwrap_or(0);
                             if best.is_none_or(|(o, _)| order > o) {
                                 best = Some((order, blob_ref));
                             }
@@ -4435,7 +4429,8 @@ mod tests {
             old_text: Some(old.join("\n") + "\n"),
             new_text: new.join("\n") + "\n",
         };
-        let Some(ToolDetail::Diff { file, highlight }) = tool_detail(None, Some(&diff), None) else {
+        let Some(ToolDetail::Diff { file, highlight }) = tool_detail(None, Some(&diff), None)
+        else {
             panic!("expected diff detail");
         };
         // One hunk: the change plus 3 context lines each side, real numbers.
@@ -4468,7 +4463,8 @@ mod tests {
             old_text: None,
             new_text: "only\n".into(),
         };
-        let Some(ToolDetail::Diff { file, highlight }) = tool_detail(None, Some(&created), None) else {
+        let Some(ToolDetail::Diff { file, highlight }) = tool_detail(None, Some(&created), None)
+        else {
             panic!("expected diff detail");
         };
         assert_eq!(file.status, crate::changes::FileStatus::Added);
@@ -4698,10 +4694,12 @@ mod tests {
         );
 
         // Blank invocation → no block; the chip stays a plain card.
-        assert!(call_block(&ToolCall::Exec {
-            command: "  \n ".into()
-        })
-        .is_none());
+        assert!(
+            call_block(&ToolCall::Exec {
+                command: "  \n ".into()
+            })
+            .is_none()
+        );
     }
 
     #[test]

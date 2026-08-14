@@ -1,19 +1,19 @@
 #!/bin/sh
 # Komet (native) headless installer.
 #
-#   curl -fsSL https://komet.komet.sh/install.sh | sh
+#   curl -fsSL https://komet.sh/install.sh | sh
 #
 # Installs the self-contained native binary (no runtime deps) to
-# ~/.komet-native/app, puts `komet` on PATH, and runs it as a local-only
+# ~/.komet/app, puts `komet` on PATH, and runs it as a local-only
 # systemd user service that survives reboots. Signing in is optional and
 # enables sync after a restart. Re-running
-# upgrades in place; ~/.komet-native state is preserved.
+# upgrades in place; ~/.komet state is preserved.
 #
 # The binary ships with production endpoints baked in: no KOMET_EDGE_URL or
-# client-id configuration needed. Overrides (if any) go in ~/.komet-native/env.
+# client-id configuration needed. Overrides (if any) go in ~/.komet/env.
 set -eu
 
-BASE="${KOMET_BASE_URL:-https://komet.komet.sh}"
+BASE="${KOMET_BASE_URL:-https://komet.sh}"
 
 # --- platform ---------------------------------------------------------------
 os="$(uname -s)"
@@ -43,7 +43,7 @@ esac
 ver="$(curl -fsSL "$BASE/releases/latest.txt" | tr -d '[:space:]')"
 [ -n "$ver" ] || { echo "komet install: could not resolve latest version" >&2; exit 1; }
 file="komet-$ver-$plat-$arch.tar.gz"
-data_root="$HOME/.komet-native"
+data_root="$HOME/.komet"
 app_root="$data_root/app"
 dest="$app_root/$ver"
 
@@ -69,7 +69,7 @@ ln -sf "$app_root/current/komet" "$HOME/.local/bin/komet"
 service=manual
 if command -v systemctl >/dev/null 2>&1 && [ -n "${XDG_RUNTIME_DIR:-}" ]; then
   mkdir -p "$HOME/.config/systemd/user"
-  cat >"$HOME/.config/systemd/user/komet-native.service" <<'UNIT'
+  cat >"$HOME/.config/systemd/user/komet.service" <<'UNIT'
 [Unit]
 Description=Komet native headless engine
 After=network-online.target
@@ -77,17 +77,17 @@ StartLimitIntervalSec=60
 StartLimitBurst=5
 
 [Service]
-ExecStart=%h/.komet-native/app/current/komet headless
+ExecStart=%h/.komet/app/current/komet headless
 Restart=on-failure
 RestartSec=5
-EnvironmentFile=-%h/.komet-native/env
+EnvironmentFile=-%h/.komet/env
 
 [Install]
 WantedBy=default.target
 UNIT
   systemctl --user daemon-reload
-  systemctl --user enable komet-native
-  systemctl --user restart komet-native
+  systemctl --user enable komet
+  systemctl --user restart komet
   service=running
   # Keep the user manager (and the engine) running without an active login.
   loginctl enable-linger "$USER" 2>/dev/null \
@@ -112,12 +112,12 @@ echo ""
 case "$service" in
   running)
     echo "the engine is running with the new version (local-only unless sync is enabled)."
-    echo "  systemctl --user status komet-native    check the service"
+    echo "  systemctl --user status komet    check the service"
     echo ""
     echo "optional sync (local sessions stay local):"
-    echo "  systemctl --user stop komet-native"
+    echo "  systemctl --user stop komet"
     echo "  komet login"
-    echo "  systemctl --user restart komet-native"
+    echo "  systemctl --user restart komet"
     ;;
   manual)
     echo "next: run the local-only engine with \`komet headless\`."

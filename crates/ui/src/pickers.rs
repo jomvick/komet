@@ -493,11 +493,10 @@ impl Pickers {
         // A Settings → Agents toggle changed some device's enabled set:
         // force-refresh the cached catalog so the rail/chips follow without a
         // restart (stale rows stay visible while the reload runs).
-        let catalog_observe =
-            cx.observe_global::<HarnessCatalogChanged>(|this: &mut Self, cx| {
-                this.ensure_harnesses(true, cx);
-                cx.notify();
-            });
+        let catalog_observe = cx.observe_global::<HarnessCatalogChanged>(|this: &mut Self, cx| {
+            this.ensure_harnesses(true, cx);
+            cx.notify();
+        });
         // Dev/testing knob: `KOMET_OPEN_PICKER=model|traits|repo|branch` boots
         // with that popover open — synthetic input can't reach the app on
         // headless compositors, so captures need a data-side path.
@@ -1416,12 +1415,10 @@ impl Pickers {
                 rows
             }
             ModelRail::Harness => {
-                let Some(descriptor) = descriptors.iter().find(|d| Some(d.id) == effective)
-                else {
+                let Some(descriptor) = descriptors.iter().find(|d| Some(d.id) == effective) else {
                     return Vec::new();
                 };
-                let Some(models) = self.models.get(&descriptor.id).and_then(|l| l.ready())
-                else {
+                let Some(models) = self.models.get(&descriptor.id).and_then(|l| l.ready()) else {
                     return Vec::new();
                 };
                 let (starred, rest): (Vec<&Model>, Vec<&Model>) = models
@@ -1445,8 +1442,7 @@ impl Pickers {
         self.visible_model_rows(cx)
             .iter()
             .position(|row| {
-                Some(row.harness) == effective
-                    && selected.as_deref() == Some(row.model.id.as_str())
+                Some(row.harness) == effective && selected.as_deref() == Some(row.model.id.as_str())
             })
             .unwrap_or(0)
     }
@@ -1627,7 +1623,11 @@ impl Pickers {
     /// [`NO_ACTIVE_ROW`] when nothing is selected (the no-project canvas must
     /// not open with row 0 wearing a phantom highlight — user report).
     fn selected_space_index(&self, cx: &App) -> usize {
-        let selected = self.state.read(cx).selected_space_row().map(|s| s.id.clone());
+        let selected = self
+            .state
+            .read(cx)
+            .selected_space_row()
+            .map(|s| s.id.clone());
         selected
             .as_deref()
             .and_then(|id| self.scoped_space_rows(cx).iter().position(|s| s.id == id))
@@ -1645,7 +1645,8 @@ impl Pickers {
     }
 
     fn pick_device(&mut self, device_id: String, cx: &mut Context<Self>) {
-        self.state.update(cx, |s, cx| s.select_device(device_id, cx));
+        self.state
+            .update(cx, |s, cx| s.select_device(device_id, cx));
         self.remember_target(cx);
         self.close(cx);
     }
@@ -1721,62 +1722,63 @@ impl Pickers {
             )
         };
         let active = self.active;
-        let body: AnyElement = if rows.is_empty() {
-            div()
-                .p(px(Theme::SPACE_SM))
-                .text_size(px(12.0))
-                .text_color(theme.text_faint)
-                .child(SharedString::from("No devices match."))
-                .into_any_element()
-        } else {
-            div()
-                .id("device-list")
-                .flex()
-                .flex_col()
-                .gap(px(2.0))
-                .max_h(px(224.0))
-                .overflow_y_scroll()
-                .children(rows.into_iter().zip(online).enumerate().map(
-                    |(ix, (device, online))| {
-                        let is_local = local.as_deref() == Some(device.id.as_str());
-                        let label: SharedString = device.name.clone().into();
-                        let is_selected = effective.as_deref() == Some(device.id.as_str());
-                        let pick_id = device.id.clone();
-                        popover::menu_row_nav(
-                            &theme,
-                            is_selected,
-                            ix == active,
-                            format!("device-row-{ix}"),
-                        )
-                        .id(("device-row", ix))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.pick_device(pick_id.clone(), cx);
-                        }))
-                        .child(div().flex_1().min_w_0().truncate().child(label))
-                        // The local device wears a muted right-aligned "You"
-                        // instead of a "(this device)" suffix in the name.
-                        .when(is_local, |el| {
-                            el.child(
-                                div()
-                                    .flex_none()
-                                    .text_size(px(10.0))
-                                    .text_color(theme.text_muted.opacity(0.45))
-                                    .child(SharedString::from("You")),
+        let body: AnyElement =
+            if rows.is_empty() {
+                div()
+                    .p(px(Theme::SPACE_SM))
+                    .text_size(px(12.0))
+                    .text_color(theme.text_faint)
+                    .child(SharedString::from("No devices match."))
+                    .into_any_element()
+            } else {
+                div()
+                    .id("device-list")
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .max_h(px(224.0))
+                    .overflow_y_scroll()
+                    .children(rows.into_iter().zip(online).enumerate().map(
+                        |(ix, (device, online))| {
+                            let is_local = local.as_deref() == Some(device.id.as_str());
+                            let label: SharedString = device.name.clone().into();
+                            let is_selected = effective.as_deref() == Some(device.id.as_str());
+                            let pick_id = device.id.clone();
+                            popover::menu_row_nav(
+                                &theme,
+                                is_selected,
+                                ix == active,
+                                format!("device-row-{ix}"),
                             )
-                        })
-                        // Disconnected glyph, not the word (user request).
-                        .when(!online, |el| {
-                            el.child(
-                                crate::icons::icon(crate::icons::WIFI_OFF)
-                                    .size(px(12.0))
-                                    .flex_none()
-                                    .text_color(theme.warning.opacity(0.8)),
-                            )
-                        })
-                    },
-                ))
-                .into_any_element()
-        };
+                            .id(("device-row", ix))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.pick_device(pick_id.clone(), cx);
+                            }))
+                            .child(div().flex_1().min_w_0().truncate().child(label))
+                            // The local device wears a muted right-aligned "You"
+                            // instead of a "(this device)" suffix in the name.
+                            .when(is_local, |el| {
+                                el.child(
+                                    div()
+                                        .flex_none()
+                                        .text_size(px(10.0))
+                                        .text_color(theme.text_muted.opacity(0.45))
+                                        .child(SharedString::from("You")),
+                                )
+                            })
+                            // Disconnected glyph, not the word (user request).
+                            .when(!online, |el| {
+                                el.child(
+                                    crate::icons::icon(crate::icons::WIFI_OFF)
+                                        .size(px(12.0))
+                                        .flex_none()
+                                        .text_color(theme.warning.opacity(0.8)),
+                                )
+                            })
+                        },
+                    ))
+                    .into_any_element()
+            };
         div()
             .flex()
             .flex_col()
@@ -1792,7 +1794,11 @@ impl Pickers {
     fn render_space_popover(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let rows = self.filtered_space_rows(cx);
-        let selected = self.state.read(cx).selected_space_row().map(|s| s.id.clone());
+        let selected = self
+            .state
+            .read(cx)
+            .selected_space_row()
+            .map(|s| s.id.clone());
         let active = self.active;
         let body: AnyElement = if rows.is_empty() {
             // Distinguish "the filter ate everything" from "this device has
@@ -2271,19 +2277,29 @@ impl Pickers {
             };
             // Mirrors the draft chips: checkout hugs the left edge, ref the
             // right.
-            let left = div().flex().flex_row().items_center().min_w_0().child(
-                Self::footer_label(icon_path, SharedString::from(label), &theme),
-            );
-            let right = div().flex().flex_row().items_center().min_w_0().child(
-                Self::footer_label(
+            let left = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .min_w_0()
+                .child(Self::footer_label(
+                    icon_path,
+                    SharedString::from(label),
+                    &theme,
+                ));
+            let right = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .min_w_0()
+                .child(Self::footer_label(
                     crate::icons::GIT_BRANCH,
                     chat.branch
                         .clone()
                         .map(SharedString::from)
                         .unwrap_or_else(|| SharedString::from("No ref")),
                     &theme,
-                ),
-            );
+                ));
             return Some(row().child(left).child(right).into_any_element());
         }
 
@@ -2739,7 +2755,9 @@ impl Pickers {
                                 theme.text_muted.opacity(0.75)
                             }),
                     )
-                    .when(favorites_view, |el| el.child(rail_indicator(picker_purple(&theme)))),
+                    .when(favorites_view, |el| {
+                        el.child(rail_indicator(picker_purple(&theme)))
+                    }),
             );
             // Full-bleed divider, aligned with the search row's bottom
             // hairline (see the height math there) — one line across.
@@ -2782,7 +2800,9 @@ impl Pickers {
                                 theme.text_muted
                             }),
                         ))
-                        .when(is_viewed, |el| el.child(rail_indicator(picker_purple(&theme)))),
+                        .when(is_viewed, |el| {
+                            el.child(rail_indicator(picker_purple(&theme)))
+                        }),
                 );
             }
             column.into_any_element()
@@ -2896,9 +2916,7 @@ impl Pickers {
                                                 .size(px(11.0))
                                                 .flex_none()
                                                 .text_color(
-                                                    tint.unwrap_or(
-                                                        theme.text_muted.opacity(0.7),
-                                                    ),
+                                                    tint.unwrap_or(theme.text_muted.opacity(0.7)),
                                                 ),
                                         )
                                         .child(
@@ -2966,9 +2984,13 @@ impl Pickers {
                         cx,
                     )]
                 }
-                _ => vec![
-                    popover::skeleton_rows("model-skeleton", &theme, 4, cx.entity_id(), cx),
-                ],
+                _ => vec![popover::skeleton_rows(
+                    "model-skeleton",
+                    &theme,
+                    4,
+                    cx.entity_id(),
+                    cx,
+                )],
             }
         };
 
@@ -3728,7 +3750,10 @@ mod tests {
         // A saved choice the option no longer offers falls back to the default
         // label rather than vanishing or echoing a stale id.
         let mut stale = serde_json::Map::new();
-        stale.insert("speed".into(), serde_json::Value::String("ludicrous".into()));
+        stale.insert(
+            "speed".into(),
+            serde_json::Value::String("ludicrous".into()),
+        );
         assert_eq!(
             traits_summary(Some(&model), None, &stale),
             Some("Standard · Normal".to_string())
@@ -3974,8 +3999,7 @@ mod tests {
             vec![HarnessId::ClaudeCode, HarnessId::Codex]
         );
         // The device's flags win: Grok on, Codex off; catalog order holds.
-        let offered =
-            offered_harnesses_impl(&catalog(Some(true), Some(false), Some(true)), false);
+        let offered = offered_harnesses_impl(&catalog(Some(true), Some(false), Some(true)), false);
         assert_eq!(
             offered.iter().map(|d| d.id).collect::<Vec<_>>(),
             vec![HarnessId::ClaudeCode, HarnessId::Grok]

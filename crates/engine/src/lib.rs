@@ -84,7 +84,7 @@ pub(crate) fn new_id() -> String {
 
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
-    /// Data directory (default `~/.komet-native`, dev `~/.komet-native-dev`).
+    /// Data directory (default `~/.komet`, dev `~/.komet-dev`).
     pub data_dir: PathBuf,
     /// Edge base URL.
     pub edge_url: String,

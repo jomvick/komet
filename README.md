@@ -9,7 +9,7 @@ Every device runs a small engine that stores sessions on that device. A new inst
 ## Install and run locally (Linux)
 
 ```bash
-curl -fsSL https://komet.komet.sh/install.sh | sh
+curl -fsSL https://komet.sh/install.sh | sh
 komet status
 ```
 

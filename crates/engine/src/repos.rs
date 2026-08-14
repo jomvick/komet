@@ -4,7 +4,7 @@
 //! Repos are device-local (paths differ per machine), so the known set is a plain
 //! JSON list (`{data_dir}/repos.json`) — no sync. Existing repos can live anywhere
 //! the user points us; cloned/created ones land in `{data_dir}/repos`. Worktrees are
-//! created under `~/.komet-native/worktrees/<repoName>/<worktreeName>` (NOT the data
+//! created under `~/.komet/worktrees/<repoName>/<worktreeName>` (NOT the data
 //! dir — worktrees are user-facing working checkouts), with an auto-generated name +
 //! matching `komet/<name>` branch. `KOMET_WORKTREES_DIR` overrides the root.
 //!
@@ -79,7 +79,7 @@ fn default_worktrees_root() -> PathBuf {
     std::env::var_os("KOMET_WORKTREES_DIR")
         .filter(|s| !s.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| home_dir().join(".komet-native").join("worktrees"))
+        .unwrap_or_else(|| home_dir().join(".komet").join("worktrees"))
 }
 
 struct ReposInner {
@@ -96,7 +96,7 @@ pub struct Repos {
 
 impl Repos {
     /// `data_dir` holds `repos.json` + cloned/created repos; the worktree root
-    /// comes from `$KOMET_WORKTREES_DIR` or `~/.komet-native/worktrees`.
+    /// comes from `$KOMET_WORKTREES_DIR` or `~/.komet/worktrees`.
     pub fn new(data_dir: &Path, device_id: &str) -> Self {
         Self::with_worktrees_root(data_dir, device_id, default_worktrees_root())
     }

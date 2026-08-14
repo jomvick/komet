@@ -4,8 +4,8 @@ name: release
 #   - Linux headless tarballs (x86_64 + aarch64) via scripts/package-linux.sh
 #   - macOS dmg (Apple silicon) via scripts/package-macos.sh
 # then create a GitHub Release AND upload everything to the
-# `komet-native-releases` R2 bucket (served at komet.komet.sh/releases/* for
-# `curl -fsSL https://komet.komet.sh/install.sh | sh`), bumping latest.txt.
+# `komet-native-releases` R2 bucket (served at komet.sh/releases/* for
+# `curl -fsSL https://komet.sh/install.sh | sh`), bumping latest.txt.
 #
 # Trigger: push a tag `v<version>` matching the workspace version in
 # Cargo.toml (bump it in the same commit), or run manually via
@@ -138,7 +138,7 @@ jobs:
         with:
           files: dist/*
           generate_release_notes: true
-      - name: upload to R2 (komet.komet.sh/releases/*)
+      - name: upload to R2 (komet.sh/releases/*)
         if: env.CLOUDFLARE_API_TOKEN != ''
         run: |
           for f in dist/*; do

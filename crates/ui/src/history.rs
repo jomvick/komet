@@ -7,13 +7,13 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use chrono::DateTime;
-use komet_proto::{GitHistoryCommit, GitHistoryPage, GitHistoryRef, GitHistoryRefKind};
-use komet_rpc::methods;
 use gpui::{
     AnyElement, App, ClipboardItem, Context, Entity, EventEmitter, ListAlignment, ListState,
     PathBuilder, Render, SharedString, Subscription, Task, Window, canvas, container_query, div,
     list, point, prelude::*, px,
 };
+use komet_proto::{GitHistoryCommit, GitHistoryPage, GitHistoryRef, GitHistoryRefKind};
+use komet_rpc::methods;
 
 use crate::state::AppState;
 use crate::theme::Theme;

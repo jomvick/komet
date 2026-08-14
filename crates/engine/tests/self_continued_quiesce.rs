@@ -226,7 +226,9 @@ async fn self_continued_turn_parks_on_the_short_window() {
 
     // Background wake: self-continued output past the resume gate.
     tokio::time::sleep(Duration::from_millis(1200)).await;
-    rig.feed.send(text("The build is green. Released.")).unwrap();
+    rig.feed
+        .send(text("The build is green. Released."))
+        .unwrap();
     wait_for(
         || status(&rig.core) == Some(SessionStatus::Working),
         "self-continued output resumes Working",

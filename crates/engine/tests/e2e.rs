@@ -1886,9 +1886,7 @@ async fn stale_tool_echo_after_steer_boundary_does_not_split_text() {
             output: None,
             diff: None,
         },
-        AgentEvent::TextDelta {
-            text: "two".into(),
-        },
+        AgentEvent::TextDelta { text: "two".into() },
         done(DoneStatus::Completed),
     ];
     let dir = tempfile::tempdir().unwrap();
@@ -1906,8 +1904,7 @@ async fn stale_tool_echo_after_steer_boundary_does_not_split_text() {
     wait_for(
         || {
             entries_now(&core).len() == 3
-                && core.sessions.session_status(CHAT).map(|s| s.status)
-                    == Some(SessionStatus::Idle)
+                && core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Idle)
         },
         "both segments to land",
     )

@@ -63,7 +63,7 @@ fn post_impl(title: &str, body: &str) {
 /// The identity banners are attributed to — the packaged app's bundle id
 /// (`dist/macos/Info.plist`), which the center resolves to its name + icon.
 #[cfg(target_os = "macos")]
-const MACOS_BUNDLE_ID: &std::ffi::CStr = c"dev.komet.native";
+const MACOS_BUNDLE_ID: &std::ffi::CStr = c"sh.komet.app";
 
 /// Deliver through the app's notification center; false when the process has
 /// no bundle (dev runs — `defaultUserNotificationCenter` is nil there) and
@@ -137,8 +137,7 @@ mod delegate {
                 .expect("KometNotifyDelegate registered twice");
             decl.add_method(
                 sel!(userNotificationCenter:shouldPresentNotification:),
-                should_present
-                    as extern "C" fn(&Object, Sel, *mut Object, *mut Object) -> BOOL,
+                should_present as extern "C" fn(&Object, Sel, *mut Object, *mut Object) -> BOOL,
             );
             let class = decl.register();
             let instance: *mut Object = msg_send![class, new];

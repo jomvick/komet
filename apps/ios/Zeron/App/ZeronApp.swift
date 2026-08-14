@@ -1,4 +1,4 @@
-// Komet for iOS — a viewport onto the komet-native mesh. The phone is a peer
+// Komet for iOS — a viewport onto the komet mesh. The phone is a peer
 // device: it joins the workspace and session doc rooms and drives remote
 // engines through the durable command queue.
 

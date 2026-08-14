@@ -636,7 +636,13 @@ impl EngineRpc {
                 cwd,
             } => {
                 self.workspace
-                    .create_chat(&chat_id, space_id.as_deref(), device_id.as_deref(), config, cwd)
+                    .create_chat(
+                        &chat_id,
+                        space_id.as_deref(),
+                        device_id.as_deref(),
+                        config,
+                        cwd,
+                    )
                     .map_err(failed)?;
                 if let Some(branch) = branch.as_deref().filter(|b| !b.is_empty()) {
                     self.workspace
@@ -1135,8 +1141,7 @@ impl RpcService for EngineRpc {
                         let base = crate::diff_sync::merge_base(root, base_ref)
                             .await
                             .map_err(|e| RpcError::Failed(e.to_string()))?;
-                        crate::diff_sync::capture_diff_against(&self.repos, root, Some(&base))
-                            .await
+                        crate::diff_sync::capture_diff_against(&self.repos, root, Some(&base)).await
                     }
                     "turn" => {
                         let chat_id = p
@@ -1148,8 +1153,7 @@ impl RpcService for EngineRpc {
                             .turn_snapshot(chat_id)
                             .filter(|s| s.root == identity.root)
                             .ok_or_else(|| RpcError::Failed("no turn recorded".into()))?;
-                        crate::diff_sync::capture_turn_diff(&self.repos, root, &snapshot.tree)
-                            .await
+                        crate::diff_sync::capture_turn_diff(&self.repos, root, &snapshot.tree).await
                     }
                     _ => crate::diff_sync::capture_diff(&self.repos, root).await,
                 }

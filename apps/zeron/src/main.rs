@@ -59,7 +59,7 @@ enum DaemonCommand {
 
 /// Production edge (Cloudflare Worker + Durable Objects on the komet.sh zone).
 /// `KOMET_EDGE_URL` overrides (local dev / self-hosting).
-const DEFAULT_EDGE_URL: &str = "https://edge.komet.komet.sh";
+const DEFAULT_EDGE_URL: &str = "https://edge.komet.sh";
 
 /// Production WorkOS AuthKit client id — public knowledge (it appears in every
 /// authorize URL), so baking it in is safe. Overridden by `KOMET_WORKOS_CLIENT_ID`;
@@ -242,8 +242,17 @@ fn harness_from_env() -> komet_engine::HarnessId {
 }
 
 fn dirs_data_dir() -> std::path::PathBuf {
-    let home = std::env::var_os("HOME").expect("HOME not set");
-    std::path::PathBuf::from(home).join(".komet-native")
+    let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME not set"));
+    let dir = home.join(".komet");
+    // One-shot 0.2.0 migration: adopt the pre-rename data dir (sign-in,
+    // device identity, prefs) instead of starting fresh.
+    if !dir.exists() {
+        let old = home.join(".komet-native");
+        if old.exists() && std::fs::rename(&old, &dir).is_ok() {
+            eprintln!("migrated data dir {} -> {}", old.display(), dir.display());
+        }
+    }
+    dir
 }
 
 /// `komet sync`: dial the running engine's IPC and print per-room sync state.

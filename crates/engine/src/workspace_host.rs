@@ -305,11 +305,7 @@ impl WorkspaceHost {
     /// server through this. Production always goes through [`Self::join_room`].
     #[doc(hidden)]
     pub fn connect_registry_url(&self, url: &str) {
-        self.spawn_join(
-            Arc::new(komet_sync::StaticUrl(url.to_string())),
-            None,
-            None,
-        );
+        self.spawn_join(Arc::new(komet_sync::StaticUrl(url.to_string())), None, None);
     }
 
     fn spawn_join(

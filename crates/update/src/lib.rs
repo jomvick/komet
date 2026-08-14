@@ -9,7 +9,7 @@
 //! releases published before the manifest existed.
 //!
 //! Install kinds and their update paths:
-//! - **Managed** (`~/.komet-native/app/<ver>` + `current` symlink — the curl|sh
+//! - **Managed** (`~/.komet/app/<ver>` + `current` symlink — the curl|sh
 //!   installer): download the headless tarball into a new versioned dir, flip
 //!   the symlink, restart the service. Same flow the installer script performs,
 //!   natively.
@@ -164,7 +164,7 @@ fn http_client() -> anyhow::Result<reqwest::Client> {
 /// How this binary was installed — decides the update path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstallKind {
-    /// `~/.komet-native/app/<ver>/komet` behind the `current` symlink
+    /// `~/.komet/app/<ver>/komet` behind the `current` symlink
     /// (curl|sh installer / a previous `komet update`).
     Managed { app_root: PathBuf },
     /// Running out of a macOS `.app` bundle.
@@ -184,7 +184,7 @@ pub fn detect_install() -> InstallKind {
 fn detect_install_from(exe: &Path, home: Option<&Path>) -> InstallKind {
     if let Some(home) = home {
         // `current_exe` resolves the `current` symlink to the versioned dir.
-        let app_root = home.join(".komet-native").join("app");
+        let app_root = home.join(".komet").join("app");
         if exe.starts_with(&app_root) {
             return InstallKind::Managed { app_root };
         }
@@ -357,10 +357,10 @@ pub fn restart_service() -> anyhow::Result<()> {
         let uid = String::from_utf8_lossy(&output.stdout).trim().to_string();
         run(
             "launchctl",
-            &["kickstart", "-k", &format!("gui/{uid}/sh.komet.komet")],
+            &["kickstart", "-k", &format!("gui/{uid}/sh.komet.app")],
         )
     } else {
-        run("systemctl", &["--user", "restart", "komet-native.service"])
+        run("systemctl", &["--user", "restart", "komet.service"])
     }
 }
 
@@ -369,9 +369,7 @@ pub fn restart_service() -> anyhow::Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Download + unpack the app tarball into `{data_dir}/updates/<ver>/Komet.app`
-/// (idempotent). The payload keeps this legacy internal name so installed
-/// Komet builds can update into Komet without a bootstrap release. Returns the
-/// staged bundle path.
+/// (idempotent). Returns the staged bundle path.
 pub async fn stage_mac_app(
     edge_url: &str,
     manifest: &Manifest,
@@ -724,11 +722,11 @@ mod tests {
     fn install_kind_detection() {
         assert_eq!(
             detect_install_from(
-                Path::new("/home/u/.komet-native/app/0.1.1/komet"),
+                Path::new("/home/u/.komet/app/0.1.1/komet"),
                 Some(Path::new("/home/u")),
             ),
             InstallKind::Managed {
-                app_root: PathBuf::from("/home/u/.komet-native/app")
+                app_root: PathBuf::from("/home/u/.komet/app")
             }
         );
         assert_eq!(

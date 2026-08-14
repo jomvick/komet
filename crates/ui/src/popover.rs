@@ -374,9 +374,7 @@ fn frosted_menu(exit: Option<f32>, content: AnyElement) -> AnyElement {
 /// underneath.
 fn menu_motion(id: SharedString, exit: Option<f32>, inner: gpui::Div) -> AnyElement {
     if let Some(t) = exit {
-        let inner = inner
-            .relative()
-            .child(div().absolute().inset_0().occlude());
+        let inner = inner.relative().child(div().absolute().inset_0().occlude());
         motion::menu_out(SharedString::from(format!("{id}-out")), t, inner).into_any_element()
     } else {
         motion::menu_in(id, inner).into_any_element()
@@ -549,11 +547,7 @@ pub fn menu_at(
             .position(position)
             .anchor(Anchor::TopLeft)
             .snap_to_window_with_margin(px(8.0))
-            .child(menu_motion(
-                id.into(),
-                exit,
-                div().occlude().child(content),
-            )),
+            .child(menu_motion(id.into(), exit, div().occlude().child(content))),
     )
     .priority(1)
     .into_any_element()
@@ -605,7 +599,8 @@ fn modal_with(
     corner_radius: f32,
     scrim: f32,
 ) -> AnyElement {
-    let card = crate::frost::frosted(corner_radius, crate::frost::MENU_BLUR, card).into_any_element();
+    let card =
+        crate::frost::frosted(corner_radius, crate::frost::MENU_BLUR, card).into_any_element();
     gpui::deferred(
         gpui::anchored()
             .position(gpui::point(px(0.0), px(0.0)))

@@ -21,10 +21,10 @@ use gpui::{
     Task, Window, WindowControlArea, actions, div, prelude::*, px,
 };
 
+use gpui_tokio::Tokio;
 use komet_engine::InstanceLock;
 use komet_proto::{AuthState, WorkspaceScope};
 use komet_rpc::methods;
-use gpui_tokio::Tokio;
 
 use crate::changes::Changes;
 use crate::composer::{Composer, ComposerEvent, ComposerInput, ComposerInputEvent};
@@ -2424,21 +2424,20 @@ impl Shell {
                     // Glyph slot: Done wears the check; every other status a
                     // dot in its color (the Working spinner lives at the
                     // row's bottom-right, not up here).
-                    let glyph: AnyElement =
-                        if status == komet_proto::ChatIndicator::Completed {
-                            icon(icons::CHECK)
-                                .size(px(11.0))
-                                .flex_none()
-                                .text_color(status_color)
-                                .into_any_element()
-                        } else {
-                            div()
-                                .size(px(6.0))
-                                .flex_none()
-                                .rounded_full()
-                                .bg(status_color)
-                                .into_any_element()
-                        };
+                    let glyph: AnyElement = if status == komet_proto::ChatIndicator::Completed {
+                        icon(icons::CHECK)
+                            .size(px(11.0))
+                            .flex_none()
+                            .text_color(status_color)
+                            .into_any_element()
+                    } else {
+                        div()
+                            .size(px(6.0))
+                            .flex_none()
+                            .rounded_full()
+                            .bg(status_color)
+                            .into_any_element()
+                    };
                     div()
                         .flex()
                         .flex_row()
@@ -2622,12 +2621,13 @@ impl Shell {
                     // Working rows animate the spinner at the row's
                     // bottom-right (the status word keeps its dot up top).
                     .when(status == komet_proto::ChatIndicator::Working, |el| {
-                        el.child(div().flex_1()).child(loaders::mini_gradient_spinner(
-                            format!("chat-working-{id}"),
-                            2.0,
-                            cx.entity_id(),
-                            cx,
-                        ))
+                        el.child(div().flex_1())
+                            .child(loaders::mini_gradient_spinner(
+                                format!("chat-working-{id}"),
+                                2.0,
+                                cx.entity_id(),
+                                cx,
+                            ))
                     }),
             )
             .into_any_element()
@@ -2754,15 +2754,12 @@ impl Shell {
             // rode the previous frame's offset, so the last frame of a content
             // shrink (row archived while scrolled) left a phantom fade stuck
             // over an unscrollable list (user report).
-            .child(crate::edge_fade::edge_faded(
-                SIDEBAR_GLASS_FADE_BAND,
-                true,
-                true,
-                div()
-                    .relative()
-                    .flex_1()
-                    .min_h_0()
-                    .child(
+            .child(
+                crate::edge_fade::edge_faded(
+                    SIDEBAR_GLASS_FADE_BAND,
+                    true,
+                    true,
+                    div().relative().flex_1().min_h_0().child(
                         div()
                             .id("sidebar-lists")
                             .size_full()
@@ -2793,8 +2790,9 @@ impl Shell {
                             })
                             .children(archived_section),
                     ),
+                )
+                .fade_overflow_y(&self.sidebar_scroll),
             )
-            .fade_overflow_y(&self.sidebar_scroll))
             // Update strip (above the user menu; below the lists).
             .when_some(self.render_update_strip(theme, cx), |el, strip| {
                 el.child(strip)
@@ -3162,8 +3160,11 @@ impl Shell {
                         .child(SharedString::from("Settings")),
                 )
                 .into_any_element();
-            trigger =
-                trigger.child(popover::anchored_menu_above("user-menu-popover", menu, closing));
+            trigger = trigger.child(popover::anchored_menu_above(
+                "user-menu-popover",
+                menu,
+                closing,
+            ));
         }
         trigger.into_any_element()
     }
@@ -3733,18 +3734,20 @@ impl Shell {
                         .absolute()
                         .inset_0()
                         .bottom(px(term_h))
-                        .child(crate::edge_fade::edge_faded(
-                            Theme::TRANSCRIPT_FADE_BAND,
-                            true,
-                            true,
-                            div().size_full().child(outlet),
+                        .child(
+                            crate::edge_fade::edge_faded(
+                                Theme::TRANSCRIPT_FADE_BAND,
+                                true,
+                                true,
+                                div().size_full().child(outlet),
+                            )
+                            // Fully faded BY the titlebar's bottom edge (the
+                            // title text is opaque — overlap read as collision),
+                            // ramping in the band just below it.
+                            .inset_top(Theme::TITLEBAR_HEIGHT)
+                            .band_top(Theme::TRANSCRIPT_FADE_BAND)
+                            .band_bottom(bottom_band),
                         )
-                        // Fully faded BY the titlebar's bottom edge (the
-                        // title text is opaque — overlap read as collision),
-                        // ramping in the band just below it.
-                        .inset_top(Theme::TITLEBAR_HEIGHT)
-                        .band_top(Theme::TRANSCRIPT_FADE_BAND)
-                        .band_bottom(bottom_band))
                         .children(self.render_jump_to_bottom(stack_h, cx))
                 },
             )
@@ -3801,7 +3804,11 @@ impl Shell {
     /// `stack_h` is the measured bottom chrome stack the full-height
     /// transcript scrolls under — the pill anchors just above it (the -14
     /// carries the old status-strip overlap).
-    fn render_jump_to_bottom(&mut self, stack_h: f32, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_jump_to_bottom(
+        &mut self,
+        stack_h: f32,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         if !self.transcript.read(cx).jump_button_shown() {
             return None;
         }
@@ -4041,7 +4048,11 @@ impl Shell {
             // clipped into unreachability — user-reported dead resize),
             // overlapping the panel's left border.
             .left(px(0.0));
-        let panel_bg = if theme.is_glass() { bg.opacity(0.4) } else { bg };
+        let panel_bg = if theme.is_glass() {
+            bg.opacity(0.4)
+        } else {
+            bg
+        };
         let panel = div()
             .size_full()
             .flex()
@@ -5012,14 +5023,7 @@ impl Render for Shell {
                             .child(card)
                             .child(right),
                     )
-                    .child(
-                        div()
-                            .absolute()
-                            .top_0()
-                            .left_0()
-                            .right_0()
-                            .child(title_bar),
-                    )
+                    .child(div().absolute().top_0().left_0().right_0().child(title_bar))
                     .child(self.render_titlebar_cluster(cx))
                     .children(overlays);
                 root.child(sidebar_tone)
@@ -5131,10 +5135,7 @@ mod tests {
         let synced = crate::state::EngineHandle::bootstrap(boot.clone())
             .await
             .expect("saved session opens its synced profile");
-        assert_eq!(
-            synced.engine_info().workspace_scope,
-            WorkspaceScope::Synced
-        );
+        assert_eq!(synced.engine_info().workspace_scope, WorkspaceScope::Synced);
 
         synced
             .client()

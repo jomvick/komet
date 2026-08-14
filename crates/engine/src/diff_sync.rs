@@ -955,9 +955,7 @@ pub async fn merge_base(root: &Path, base_ref: &str) -> Result<String, EngineErr
     let capture = capture_git(root, &["merge-base", base_ref, "HEAD"], 256).await?;
     let sha = String::from_utf8_lossy(&capture.stdout).trim().to_string();
     if sha.is_empty() {
-        return Err(EngineError::Other(format!(
-            "no merge base with {base_ref}"
-        )));
+        return Err(EngineError::Other(format!("no merge base with {base_ref}")));
     }
     Ok(sha)
 }

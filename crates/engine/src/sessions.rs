@@ -196,10 +196,10 @@ impl SessionsEngine {
     }
 
     fn doc_handle(&self, chat_id: &str) -> Result<Arc<ChatDocHandle>, EngineError> {
-        let host =
-            self.inner.doc_host().ok_or_else(|| {
-                EngineError::Other("doc host not wired into sessions engine".into())
-            })?;
+        let host = self
+            .inner
+            .doc_host()
+            .ok_or_else(|| EngineError::Other("doc host not wired into sessions engine".into()))?;
         host.open(chat_id)
     }
 
@@ -460,7 +460,13 @@ impl SessionsEngine {
         let target = lock(&self.inner.runs)
             .get(chat_id)
             .filter(|h| h.steerable)
-            .map(|h| (h.run_id.clone(), h.steer_tx.clone(), h.routed_steers.clone()));
+            .map(|h| {
+                (
+                    h.run_id.clone(),
+                    h.steer_tx.clone(),
+                    h.routed_steers.clone(),
+                )
+            });
         let Some((run_id, steer_tx, ledger)) = target else {
             return Ok(SteerOutcome::NotSteerable);
         };

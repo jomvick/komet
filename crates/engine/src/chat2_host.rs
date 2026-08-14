@@ -10,10 +10,10 @@
 
 use std::sync::Arc;
 
+use futures::future::BoxFuture;
 use komet_doc::SessionDoc;
 use komet_sync::chat_client::{ChatDocSink, CheckpointFetcher};
 use komet_sync::{DocsStore, SyncError};
-use futures::future::BoxFuture;
 
 use crate::doc_host::EdgeConfig;
 
@@ -180,8 +180,10 @@ impl CheckpointFetcher for EdgeCheckpointFetcher {
                     .and_then(|v| v.to_str().ok())
                     .map(str::to_string);
                 if seq.is_some() && seen_seq.is_some() && seq != seen_seq {
-                    tracing::info!(resumed_at = got.len(),
-                        "chat2 checkpoint replaced mid-download; restarting from 0");
+                    tracing::info!(
+                        resumed_at = got.len(),
+                        "chat2 checkpoint replaced mid-download; restarting from 0"
+                    );
                     got.clear();
                     seen_seq = seq;
                     continue;

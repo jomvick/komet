@@ -682,9 +682,18 @@ fn salvage_part(part: &serde_json::Value, entry_id: &str, ix: usize) -> Option<M
         return Some(MessagePart::Tool {
             id,
             call,
-            is_error: obj.get("isError").and_then(|x| x.as_bool()).unwrap_or(false),
-            resolved: obj.get("resolved").and_then(|x| x.as_bool()).unwrap_or(true),
-            output: obj.get("output").and_then(|x| x.as_str()).map(str::to_owned),
+            is_error: obj
+                .get("isError")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(false),
+            resolved: obj
+                .get("resolved")
+                .and_then(|x| x.as_bool())
+                .unwrap_or(true),
+            output: obj
+                .get("output")
+                .and_then(|x| x.as_str())
+                .map(str::to_owned),
             diff: None,
             output_ref: None,
             output_bytes: None,
@@ -1192,7 +1201,9 @@ mod tests {
             role: MessageRole::Assistant,
             parts: vec![MessagePart::Tool {
                 id: "t1".into(),
-                call: ToolCall::Exec { command: "ls".into() },
+                call: ToolCall::Exec {
+                    command: "ls".into(),
+                },
                 is_error: false,
                 resolved: true,
                 output: Some("full inline output\nline 2".into()),
@@ -1300,12 +1311,19 @@ mod tests {
             ]
         });
         let entry = entry_from_json(v.clone()).expect("salvaged");
-        assert!(entry.id.starts_with("recovered-"), "deterministic stand-in id");
+        assert!(
+            entry.id.starts_with("recovered-"),
+            "deterministic stand-in id"
+        );
         let again = entry_from_json(v).expect("salvaged again");
         assert_eq!(entry.id, again.id, "recovered id is stable across reads");
         assert_eq!(entry.role, MessageRole::Assistant);
         assert_eq!(entry.created_at, 123);
-        assert_eq!(entry.parts.len(), 2, "text parts survive, contentless part dropped");
+        assert_eq!(
+            entry.parts.len(),
+            2,
+            "text parts survive, contentless part dropped"
+        );
         match &entry.parts[0] {
             MessagePart::Text { text, .. } => assert_eq!(text, "still readable"),
             other => panic!("unexpected {other:?}"),
@@ -1318,7 +1336,10 @@ mod tests {
             "parts": [ { "id": "t1", "call": { "kind": "exec", "command": "ls" }, "output": "x" } ]
         });
         let entry = entry_from_json(v).expect("salvaged");
-        assert!(matches!(&entry.parts[0], MessagePart::Tool { resolved: true, .. }));
+        assert!(matches!(
+            &entry.parts[0],
+            MessagePart::Tool { resolved: true, .. }
+        ));
 
         // Only non-objects are truly unsalvageable.
         assert!(entry_from_json(serde_json::json!("garbage")).is_err());
