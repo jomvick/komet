@@ -98,7 +98,10 @@ struct Inner {
     device_id: String,
     journal: Arc<RunJournal>,
     registry: Arc<HarnessRegistry>,
-    doc_host: OnceLock<DocHost>,
+    /// Set-once (first wins), cleared on runtime retirement: sessions and
+    /// doc-host reference each other through Arcs, so this back-edge must be
+    /// severable for a replaced engine graph to drop.
+    doc_host: Mutex<Option<DocHost>>,
     /// chat_id → live run.
     runs: Mutex<HashMap<String, RunHandle>>,
     /// chat_id → broadcast hub (retained across runs so subscribers survive turns).
@@ -145,7 +148,7 @@ impl SessionsEngine {
                 device_id,
                 journal,
                 registry,
-                doc_host: OnceLock::new(),
+                doc_host: Mutex::new(None),
                 runs: Mutex::new(HashMap::new()),
                 hubs: Mutex::new(HashMap::new()),
                 statuses: Mutex::new(HashMap::new()),
@@ -161,7 +164,18 @@ impl SessionsEngine {
     /// Wire the doc host (called once at engine assembly; the two services are mutually
     /// referential by design — sessions stream into docs, docs execute commands here).
     pub fn set_doc_host(&self, host: DocHost) {
-        let _ = self.inner.doc_host.set(host);
+        // First set wins (the OnceLock contract this slot replaced).
+        let mut slot = lock(&self.inner.doc_host);
+        if slot.is_none() {
+            *slot = Some(host);
+        }
+    }
+
+    /// Sever the doc-host back-edge (runtime retirement; the doc host's
+    /// `shutdown_workers` clears its own sessions edge). Every access site
+    /// already treats a missing doc host as "not wired".
+    pub fn clear_doc_host(&self) {
+        lock(&self.inner.doc_host).take();
     }
 
     /// Wire the chat auto-titler (called once at engine assembly). After each
@@ -183,7 +197,7 @@ impl SessionsEngine {
 
     fn doc_handle(&self, chat_id: &str) -> Result<Arc<ChatDocHandle>, EngineError> {
         let host =
-            self.inner.doc_host.get().ok_or_else(|| {
+            self.inner.doc_host().ok_or_else(|| {
                 EngineError::Other("doc host not wired into sessions engine".into())
             })?;
         host.open(chat_id)
@@ -636,7 +650,7 @@ impl SessionsEngine {
             let (user_id, prompt_text) = prompt.expect("gated by will_resume");
             let sessions = self.clone();
             tokio::spawn(async move {
-                let Some(host) = sessions.inner.doc_host.get().cloned() else {
+                let Some(host) = sessions.inner.doc_host() else {
                     return;
                 };
                 let request = sessions
@@ -803,8 +817,13 @@ impl Inner {
         }
     }
 
-    fn workspace(&self) -> Option<&crate::workspace_host::WorkspaceHost> {
-        self.doc_host.get().and_then(|host| host.workspace())
+    /// The doc host, once wired. `None` before assembly or after retirement.
+    fn doc_host(&self) -> Option<DocHost> {
+        lock(&self.doc_host).clone()
+    }
+
+    fn workspace(&self) -> Option<crate::workspace_host::WorkspaceHost> {
+        self.doc_host().and_then(|host| host.workspace().cloned())
     }
 
     /// Sidebar freshness: push a message-persist preview into the chat's workspace row.

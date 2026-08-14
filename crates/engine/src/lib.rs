@@ -124,6 +124,8 @@ pub struct EngineCore {
     /// Release checker (attached by [`Engine::assemble_runtime`]) — the
     /// UpdateStatus stream + ApplyUpdate.
     updater: std::sync::Mutex<Option<komet_update::Updater>>,
+    /// The updater's token-change wake forwarder — owned so shutdown can end it.
+    updater_wake: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// Exclusive data-dir lock — held for the engine's lifetime (single-instance).
     _instance_lock: InstanceLock,
 }
@@ -170,6 +172,21 @@ impl EngineCore {
         // SQLite snapshots + journals. Taken before any store opens or the IPC
         // port binds; held (and kernel-released on crash) for the engine's life.
         let lock = InstanceLock::acquire(data_dir)?;
+        Self::assemble_with_profile_locked(profile, registry, default_harness, edge, lock)
+    }
+
+    /// Assemble against a pre-acquired [`InstanceLock`]. The headed app takes
+    /// the lock before binding the IPC port so the listener owner and the
+    /// data-dir owner cannot diverge when several viewports bootstrap at once.
+    pub fn assemble_with_profile_locked(
+        profile: EngineProfile,
+        registry: Arc<HarnessRegistry>,
+        default_harness: HarnessId,
+        edge: Option<EdgeConfig>,
+        lock: InstanceLock,
+    ) -> Result<Self, EngineError> {
+        let data_dir = profile.device_root();
+        std::fs::create_dir_all(data_dir)?;
         let legacy_uploads_root = profile.claim_legacy_uploads_root()?;
         let device_id = load_or_create_device_id(data_dir)?;
         // This device's harness enablement (Settings → Agents) rides the
@@ -242,6 +259,7 @@ impl EngineCore {
             auth: std::sync::Mutex::new(None),
             links: std::sync::Mutex::new(None),
             updater: std::sync::Mutex::new(None),
+            updater_wake: std::sync::Mutex::new(None),
             _instance_lock: lock,
         })
     }
@@ -293,6 +311,13 @@ impl EngineCore {
     }
 
     /// Attach the release checker (before building the RPC service).
+    pub fn set_updater_wake(&self, handle: tokio::task::JoinHandle<()>) {
+        *self
+            .updater_wake
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handle);
+    }
+
     pub fn set_updater(&self, updater: komet_update::Updater) {
         *self
             .updater
@@ -384,8 +409,35 @@ impl EngineCore {
         self.sessions.shutdown().await;
         self.terminals.shutdown();
         self.agent_accounts.shutdown();
+        // Cancel + await every worker that can reach Edge before flushing: a
+        // replaced synced runtime must not keep polling releases or draining
+        // the attachment outbox under the old identity after Local boots.
+        let wake = self
+            .updater_wake
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(wake) = wake {
+            wake.abort();
+            let _ = wake.await;
+        }
+        let updater = self
+            .updater
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(updater) = updater {
+            updater.shutdown().await;
+        }
+        self.uploads.shutdown().await;
+        self.diff_sync.shutdown().await;
+        self.spaces_sync.shutdown().await;
+        self.doc_host.shutdown_workers().await;
         self.doc_host.flush_all();
         self.workspace.shutdown();
+        // Break the sessions ⇄ doc-host retain cycle so the replaced graph can
+        // actually be freed once the last handle drops.
+        self.sessions.clear_doc_host();
     }
 }
 
@@ -569,6 +621,27 @@ impl Engine {
         auth: Auth,
         profile: EngineProfile,
     ) -> anyhow::Result<EngineRuntime> {
+        Self::assemble_runtime_inner(config, auth, profile, None).await
+    }
+
+    /// Like [`Self::assemble_runtime`], but against an [`InstanceLock`] the
+    /// caller already holds on the profile's device root (headed bootstrap
+    /// acquires it before binding IPC).
+    pub async fn assemble_runtime_with_lock(
+        config: &EngineConfig,
+        auth: Auth,
+        profile: EngineProfile,
+        lock: InstanceLock,
+    ) -> anyhow::Result<EngineRuntime> {
+        Self::assemble_runtime_inner(config, auth, profile, Some(lock)).await
+    }
+
+    async fn assemble_runtime_inner(
+        config: &EngineConfig,
+        auth: Auth,
+        profile: EngineProfile,
+        lock: Option<InstanceLock>,
+    ) -> anyhow::Result<EngineRuntime> {
         let edge_enabled = match profile.scope() {
             WorkspaceScope::Local => false,
             WorkspaceScope::Synced => {
@@ -592,12 +665,21 @@ impl Engine {
             EdgeConfig::new(config.edge_url.clone(), Arc::new(auth.clone())).with_device(device_id)
         });
 
-        let core = EngineCore::assemble_with_profile(
-            profile,
-            Arc::new(default_registry()),
-            config.default_harness,
-            edge.clone(),
-        )?;
+        let core = match lock {
+            Some(lock) => EngineCore::assemble_with_profile_locked(
+                profile,
+                Arc::new(default_registry()),
+                config.default_harness,
+                edge.clone(),
+                lock,
+            )?,
+            None => EngineCore::assemble_with_profile(
+                profile,
+                Arc::new(default_registry()),
+                config.default_harness,
+                edge.clone(),
+            )?,
+        };
         core.set_auth(auth.clone());
         if edge_enabled {
             // Release checker: polls {edge}/releases on a 6h cadence; headless
@@ -611,11 +693,12 @@ impl Engine {
             let updater = komet_update::Updater::spawn(config.edge_url.clone(), Some(quiescent));
             if let Some(mut token_changes) = edge.as_ref().and_then(EdgeConfig::token_changes) {
                 let updater_for_tokens = updater.clone();
-                tokio::spawn(async move {
+                let wake = tokio::spawn(async move {
                     while token_changes.changed().await.is_ok() {
                         updater_for_tokens.check_now();
                     }
                 });
+                core.set_updater_wake(wake);
             }
             core.set_updater(updater);
         }

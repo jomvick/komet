@@ -515,6 +515,10 @@ pub struct Updater {
     status_tx: Arc<watch::Sender<UpdateStatus>>,
     check_tx: Arc<watch::Sender<u64>>,
     quiescent: Option<QuiescentCheck>,
+    /// Flips to true exactly once; the check loop selects against it so
+    /// cancellation lands at any await point (no tokio-util in this crate).
+    shutdown_tx: Arc<watch::Sender<bool>>,
+    check_task: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl Updater {
@@ -522,15 +526,34 @@ impl Updater {
     pub fn spawn(edge_url: String, quiescent: Option<QuiescentCheck>) -> Self {
         let (status_tx, _) = watch::channel(UpdateStatus::initial());
         let (check_tx, _) = watch::channel(0);
+        let (shutdown_tx, _) = watch::channel(false);
         let updater = Self {
             edge_url,
             status_tx: Arc::new(status_tx),
             check_tx: Arc::new(check_tx),
             quiescent,
+            shutdown_tx: Arc::new(shutdown_tx),
+            check_task: Arc::new(std::sync::Mutex::new(None)),
         };
         let for_loop = updater.clone();
-        tokio::spawn(async move { for_loop.check_loop().await });
+        let task = tokio::spawn(async move { for_loop.check_loop().await });
+        *updater.check_task.lock().unwrap() = Some(task);
         updater
+    }
+
+    /// Stop the check loop and wait for it to exit — a replaced runtime must
+    /// not keep polling `{edge}/releases` (or auto-applying) in the background.
+    /// Idempotent, and callable from any clone.
+    pub async fn shutdown(&self) {
+        let _ = self.shutdown_tx.send(true);
+        let task = self
+            .check_task
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .take();
+        if let Some(task) = task {
+            let _ = task.await;
+        }
     }
 
     pub fn watch(&self) -> watch::Receiver<UpdateStatus> {
@@ -549,24 +572,33 @@ impl Updater {
     }
 
     async fn check_loop(&self) {
-        let mut checks = self.check_tx.subscribe();
+        let mut shutdown = self.shutdown_tx.subscribe();
+        // Shutdown must cut the loop at ANY await point — including mid
+        // `check_once()` / `auto_apply_when_idle()` HTTP — so the whole body
+        // races the flag rather than checking it between iterations.
         tokio::select! {
-            _ = tokio::time::sleep(CHECK_INITIAL_DELAY) => {}
-            _ = checks.changed() => {}
-        }
-        loop {
-            let ok = self.check_once().await;
-            if ok
-                && self.status_tx.borrow().update_available
-                && auto_update_enabled()
-                && let InstallKind::Managed { .. } = detect_install()
-            {
-                self.auto_apply_when_idle().await;
-            }
-            tokio::select! {
-                _ = tokio::time::sleep(if ok { CHECK_INTERVAL } else { CHECK_RETRY }) => {}
-                _ = checks.changed() => {}
-            }
+            _ = shutdown.wait_for(|stop| *stop) => {}
+            _ = async {
+                let mut checks = self.check_tx.subscribe();
+                tokio::select! {
+                    _ = tokio::time::sleep(CHECK_INITIAL_DELAY) => {}
+                    _ = checks.changed() => {}
+                }
+                loop {
+                    let ok = self.check_once().await;
+                    if ok
+                        && self.status_tx.borrow().update_available
+                        && auto_update_enabled()
+                        && let InstallKind::Managed { .. } = detect_install()
+                    {
+                        self.auto_apply_when_idle().await;
+                    }
+                    tokio::select! {
+                        _ = tokio::time::sleep(if ok { CHECK_INTERVAL } else { CHECK_RETRY }) => {}
+                        _ = checks.changed() => {}
+                    }
+                }
+            } => {}
         }
     }
 

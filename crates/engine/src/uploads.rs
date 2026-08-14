@@ -68,6 +68,10 @@ struct UploadsInner {
     edge: Option<EdgeConfig>,
     http: reqwest::Client,
     mirror_kick: tokio::sync::watch::Sender<u64>,
+    /// Cuts the mirror worker at any await point — a cancel mid-drain must
+    /// drop the in-flight PUT, not let it finish under a stale bearer.
+    mirror_cancel: tokio_util::sync::CancellationToken,
+    mirror_task: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 #[derive(Clone)]
@@ -108,6 +112,8 @@ impl Uploads {
                     .build()
                     .unwrap_or_else(|_| reqwest::Client::new()),
                 mirror_kick,
+                mirror_cancel: tokio_util::sync::CancellationToken::new(),
+                mirror_task: std::sync::Mutex::new(None),
             }),
         };
         if uploads.inner.edge.is_some() && tokio::runtime::Handle::try_current().is_ok() {
@@ -328,19 +334,41 @@ impl Uploads {
         Ok(())
     }
 
+    /// Stop the mirror worker and wait for it to exit. A cancel mid-drain
+    /// aborts the in-flight `PUT /attachments/{sha}` — after sign-out nothing
+    /// queued may keep uploading under the old bearer. Idempotent; a no-op for
+    /// local profiles (no edge, no worker spawned).
+    pub async fn shutdown(&self) {
+        self.inner.mirror_cancel.cancel();
+        let task = self
+            .inner
+            .mirror_task
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .take();
+        if let Some(task) = task {
+            let _ = task.await;
+        }
+    }
+
     fn spawn_mirror_worker(&self) {
         let weak = Arc::downgrade(&self.inner);
         let mut kicks = self.inner.mirror_kick.subscribe();
         let mut token_changes = self.inner.edge.as_ref().and_then(EdgeConfig::token_changes);
-        tokio::spawn(async move {
+        let cancel = self.inner.mirror_cancel.clone();
+        let task = tokio::spawn(async move {
             let mut retry = MIRROR_RETRY_BASE;
             loop {
                 let Some(inner) = weak.upgrade() else { return };
-                let pending = drain_mirror_outbox(&inner).await;
+                let pending = tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    pending = drain_mirror_outbox(&inner) => pending,
+                };
                 drop(inner);
                 if !pending {
                     retry = MIRROR_RETRY_BASE;
                     tokio::select! {
+                        _ = cancel.cancelled() => return,
                         changed = kicks.changed() => {
                             if changed.is_err() { return; }
                         }
@@ -349,6 +377,7 @@ impl Uploads {
                     continue;
                 }
                 tokio::select! {
+                    _ = cancel.cancelled() => return,
                     _ = tokio::time::sleep(retry) => {
                         retry = (retry * 2).min(MIRROR_RETRY_CAP);
                     }
@@ -362,6 +391,11 @@ impl Uploads {
                 }
             }
         });
+        *self
+            .inner
+            .mirror_task
+            .lock()
+            .unwrap_or_else(|err| err.into_inner()) = Some(task);
     }
 }
 

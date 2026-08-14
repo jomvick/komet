@@ -29,6 +29,7 @@ portable-pty.workspace = true
 base64 = "0.22"
 libc.workspace = true
 gethostname.workspace = true
+tokio-util = { workspace = true, features = ["rt"] }
 sha2.workspace = true
 reqwest.workspace = true
 ignore.workspace = true
