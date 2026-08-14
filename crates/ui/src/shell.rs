@@ -201,8 +201,14 @@ pub enum RightSurface {
 
 /// Per-chat panel open flags (komet parity: `sessionPanels` — the terminal and
 /// changes panels open *per session*, in memory only; heights and every other
-/// persisted setting stay global). New/unknown chats default to closed.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+/// persisted setting stay global).
+///
+/// The terminal DRAWER defaults closed; the right pane defaults OPEN (user
+/// request) — it lands on the surface picker, which is the intended entry
+/// point to terminals and git. `Default` is hand-written for exactly that
+/// asymmetry, and the map's `or_default()` makes an untouched chat read as
+/// open while a toggle still round-trips.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ChatPanels {
     pub terminal_open: bool,
     /// Right pane visible (the surface host — historically the Changes pane).
@@ -210,6 +216,16 @@ pub struct ChatPanels {
     /// Which surface tab renders; validated against the live tab list each
     /// frame (a closed tab falls back gracefully).
     pub right_active: RightSurface,
+}
+
+impl Default for ChatPanels {
+    fn default() -> Self {
+        Self {
+            terminal_open: false,
+            changes_open: true,
+            right_active: RightSurface::Picker,
+        }
+    }
 }
 
 /// The session-scoped panel map. Keys are chat ids; the new-chat canvas uses
@@ -1064,8 +1080,13 @@ impl Shell {
         }
     }
 
+    /// Whether the right pane shows. NOT gated on git any more: the pane is
+    /// a surface HOST now (terminals work in any space), so only the Git
+    /// surface rows check `space_git_detected`. Still hidden on the
+    /// new-session canvas, where the titlebar carries no toggle to close it
+    /// again (an earlier user request).
     fn right_pane_open(&self, cx: &App) -> bool {
-        self.panels.get(&self.panel_key(cx)).changes_open && self.space_git_detected(cx)
+        !self.active_chat.is_empty() && self.panels.get(&self.panel_key(cx)).changes_open
     }
 
     /// The current chat's terminal flag (per-session, in-memory).
@@ -1096,10 +1117,7 @@ impl Shell {
     }
 
     fn toggle_right_pane(&mut self, cx: &mut Context<Self>) {
-        // No git in this space → no diff pane, Cmd-B goes dead.
-        if !self.space_git_detected(cx) {
-            return;
-        }
+        // No git gate: the pane hosts terminals too (see `right_pane_open`).
         let from = self.right_target(cx);
         let key = self.panel_key(cx);
         let open = self.panels.toggle_changes(&key);
@@ -3920,13 +3938,17 @@ impl Shell {
                                     this.add_terminal_surface(cx);
                                 })),
                             )
-                            .child(
-                                row("surface-card-git", icons::GIT_BRANCH, "Git").on_click(
-                                    cx.listener(|this, _, _, cx| {
-                                        this.add_diff_surface(cx);
-                                    }),
-                                ),
-                            ),
+                            // Git only where there IS git — the pane itself
+                            // no longer gates on it (terminals work anywhere).
+                            .when(self.space_git_detected(cx), |el| {
+                                el.child(
+                                    row("surface-card-git", icons::GIT_BRANCH, "Git").on_click(
+                                        cx.listener(|this, _, _, cx| {
+                                            this.add_diff_surface(cx);
+                                        }),
+                                    ),
+                                )
+                            }),
                     ),
             )
             .into_any_element()
@@ -5178,13 +5200,11 @@ impl Render for Shell {
         let root = match self.splash {
             SplashPhase::Visible => {
                 let theme = Theme::of(cx).clone();
-                let view = cx.entity_id();
-                root.child(loaders::splash_overlay(&theme, false, view, cx))
+                root.child(loaders::splash_overlay(&theme, false))
             }
             SplashPhase::FadingOut => {
                 let theme = Theme::of(cx).clone();
-                let view = cx.entity_id();
-                root.child(loaders::splash_overlay(&theme, true, view, cx))
+                root.child(loaders::splash_overlay(&theme, true))
             }
             SplashPhase::Gone => root,
         };
@@ -5265,12 +5285,15 @@ mod tests {
     // ---- per-session panel flags (§1.10/1.11 parity: komet sessionPanels) ----
 
     #[test]
-    fn session_panels_default_closed_per_chat() {
+    fn session_panels_default_terminal_closed_right_pane_open() {
         let panels = SessionPanels::default();
         assert_eq!(panels.get("a"), ChatPanels::default());
+        // The terminal drawer stays closed; the right pane opens onto the
+        // surface picker (user request).
         assert!(!panels.get("a").terminal_open);
-        assert!(!panels.get("a").changes_open);
-        // The new-chat canvas ("" key) is its own session, also closed.
+        assert!(panels.get("a").changes_open);
+        assert_eq!(panels.get("a").right_active, RightSurface::Picker);
+        // The new-chat canvas ("" key) is its own session, same defaults.
         assert!(!panels.get("").terminal_open);
     }
 
@@ -5282,11 +5305,12 @@ mod tests {
         assert!(panels.get("a").terminal_open);
         assert!(!panels.get("b").terminal_open);
         assert!(!panels.get("").terminal_open);
-        // Changes pane in B is independent of A's terminal.
-        assert!(panels.toggle_changes("b"));
-        assert!(panels.get("b").changes_open);
+        // The right pane starts open, so B's first toggle CLOSES it — and
+        // only B's (A is untouched, still default-open).
+        assert!(!panels.toggle_changes("b"));
+        assert!(!panels.get("b").changes_open);
         assert!(!panels.get("b").terminal_open);
-        assert!(!panels.get("a").changes_open);
+        assert!(panels.get("a").changes_open);
         // Switching back to A restores A's state untouched.
         assert!(panels.get("a").terminal_open);
         // Toggling off round-trips.
@@ -5297,17 +5321,22 @@ mod tests {
     #[test]
     fn session_panels_both_flags_coexist_per_chat() {
         let mut panels = SessionPanels::default();
+        // Terminal opens, the default-open right pane closes: independent
+        // flags on one chat, and neither leaks to another.
         panels.toggle_terminal("a");
         panels.toggle_changes("a");
         assert_eq!(
             panels.get("a"),
             ChatPanels {
                 terminal_open: true,
-                changes_open: true,
+                changes_open: false,
                 ..Default::default()
             }
         );
         assert_eq!(panels.get("b"), ChatPanels::default());
+        // The right pane round-trips back open.
+        assert!(panels.toggle_changes("a"));
+        assert!(panels.get("a").changes_open);
     }
 
     #[test]

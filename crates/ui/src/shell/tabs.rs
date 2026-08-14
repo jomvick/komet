@@ -99,7 +99,6 @@ impl Shell {
                 None => (SharedString::from(""), None, None, true),
             }
         };
-        let git = self.space_git_detected(cx);
 
         // The new-session `+` renders in the WINDOW-CONTROL CLUSTER while the
         // sidebar is collapsed (`render_titlebar_cluster`) — this row only
@@ -122,8 +121,7 @@ impl Shell {
         // the pane itself would sit under the drag region and never see a
         // click. Closed, it is just the stable open/close toggle. Hidden on
         // the new-session canvas (user request) — nothing to diff yet.
-        let takeover =
-            git && !on_canvas && self.right_pane_open(cx) && self.right_pane_expanded;
+        let takeover = !on_canvas && self.right_pane_open(cx) && self.right_pane_expanded;
         // In takeover the title hides and the strip owns the whole band, so
         // the row's left inset pulls back to the sidebar seam — the title
         // inset would push the scope dropdown off the pane's own left gutter
@@ -148,7 +146,7 @@ impl Shell {
         } else {
             content_left
         };
-        let trailing: Option<gpui::AnyElement> = if !git || on_canvas {
+        let trailing: Option<gpui::AnyElement> = if on_canvas {
             None
         } else if self.right_pane_open(cx) {
             let right_now = self.eval_tween(self.right_tween, self.right_target(cx));
