@@ -235,29 +235,234 @@
   }
   .agent-icon:hover { background-color: var(--purple-hi); }
 
-  /* ── features ────────────────────────────────────────── */
-  .features {
-    display: grid;
-    grid-template-columns: repeat(4, 1fr);
-    gap: 48px 40px;
-    padding: 96px 32px 0;
+  /* ── panel (features · gallery · harnesses) ─────────── */
+  /* one bordered frame with corner ticks; cells divide with hairlines
+     instead of floating in whitespace */
+  .panel-sect { padding-top: 110px; position: relative; z-index: 1; }
+  .panel-sect > .wrap { position: relative; z-index: 1; }
+  /* transparent: the reach figures show through under the cells; the top
+     and bottom rules run the full page width, the side borders stay at
+     wrap width */
+  .panel {
+    position: relative;
+    border-left: 1px solid var(--line);
+    border-right: 1px solid var(--line);
   }
-  .cell .idx {
-    font-size: 11px;
-    font-weight: 600;
-    letter-spacing: 0.14em;
-    color: var(--purple-hi);
-    margin-bottom: 16px;
+  .panel::before, .panel::after {
+    content: "";
+    position: absolute;
+    left: 50%;
+    transform: translateX(-50%);
+    width: 100vw;
+    height: 1px;
+    background: var(--line);
   }
+  .panel::before { top: 0; }
+  .panel::after { bottom: 0; }
+  .pdot {
+    position: absolute;
+    width: 5px;
+    height: 5px;
+    background: #453763;
+    z-index: 2;
+  }
+  .pdot.tl { top: 0; left: 0; transform: translate(-50%, -50%); }
+  .pdot.tr { top: 0; right: 0; transform: translate(50%, -50%); }
+  .pdot.bl { bottom: 0; left: 0; transform: translate(-50%, 50%); }
+  .pdot.br { bottom: 0; right: 0; transform: translate(50%, 50%); }
+  .panel-row + .panel-row { border-top: 1px solid var(--line-soft); }
+
+  .p-features { display: grid; grid-template-columns: repeat(4, 1fr); }
+  .cell { padding: 30px 26px 34px; }
+  .cell + .cell { border-left: 1px solid var(--line-soft); }
   .cell h3 {
-    font-size: 16px;
+    font-size: 15.5px;
     font-weight: 600;
     letter-spacing: -0.015em;
     margin-bottom: 10px;
   }
   .cell p { font-size: 13.5px; line-height: 1.65; color: var(--dim); }
-  @media (max-width: 980px) { .features { grid-template-columns: repeat(2, 1fr); } }
-  @media (max-width: 560px) { .features { grid-template-columns: 1fr; gap: 36px; } }
+
+  .p-gallery { display: grid; grid-template-columns: repeat(3, 1fr); }
+  .p-gallery figure { margin: 0; padding: 22px 22px 18px; }
+  .p-gallery figure + figure { border-left: 1px solid var(--line-soft); }
+  .p-gallery img {
+    display: block;
+    width: 100%;
+    height: auto;
+    border: 1px solid var(--line-soft);
+    border-radius: 6px;
+  }
+  .p-gallery figcaption {
+    margin-top: 13px;
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.02em;
+    color: var(--faint);
+  }
+
+  .p-harness { display: grid; grid-template-columns: 1.08fr 1fr; }
+  .p-diagram {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 46px 40px;
+    border-right: 1px solid var(--line-soft);
+  }
+  /* faint dot grid, vignetted so it dissolves before the cell edges */
+  .p-diagram::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background: radial-gradient(rgba(139,92,246,0.13) 1px, transparent 1.5px) 0 0 / 23px 23px;
+    -webkit-mask-image: radial-gradient(72% 72% at 50% 50%, #000 30%, transparent 100%);
+    mask-image: radial-gradient(72% 72% at 50% 50%, #000 30%, transparent 100%);
+    pointer-events: none;
+  }
+  /* hub-and-spoke: two overlapping dashed SVG lines per spoke — a faint
+     base plus a sparse purple accent — sharing one dashoffset animation,
+     staggered per spoke so the pulses drift toward the hub in sequence */
+  .spoke-wrap {
+    position: relative;
+    width: 100%;
+    max-width: 430px;
+    aspect-ratio: 1;
+  }
+  .spoke-wrap::before {
+    content: "";
+    position: absolute;
+    inset: 16%;
+    background: radial-gradient(50% 50% at 50% 50%, rgba(91,52,184,0.22), transparent 62%);
+    pointer-events: none;
+  }
+  .spoke-wrap > svg { position: absolute; inset: 0; width: 100%; height: 100%; }
+  .spoke-line, .spoke-accent { stroke-width: 0.35; }
+  .spoke-line {
+    stroke: #2a2140;
+    stroke-dasharray: 1.6 2.4;
+    animation: spoke-flow 2.2s linear infinite;
+  }
+  .spoke-accent {
+    stroke: var(--purple);
+    stroke-dasharray: 0.7 10;
+    animation: spoke-flow 2.2s linear infinite;
+  }
+  @keyframes spoke-flow { to { stroke-dashoffset: -12px; } }
+  .spoke-hub {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%);
+    width: 74px;
+    height: 74px;
+    padding: 8px;
+    background: #0c0913;
+    border: 1px solid var(--line);
+    border-radius: 17px;
+    box-shadow: 0 12px 34px -10px rgba(0,0,0,0.8), 0 0 34px -6px rgba(139,92,246,0.35);
+  }
+  .spoke-hub img { display: block; width: 100%; height: 100%; border-radius: 11px; }
+  .spoke-node {
+    position: absolute;
+    transform: translate(-50%, -50%);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 13px;
+    background: #0b0812;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    box-shadow: 0 5px 16px -6px rgba(0,0,0,0.6);
+    white-space: nowrap;
+  }
+  .spoke-node .agent-icon { width: 17px; height: 17px; }
+  .spoke-node span:last-child {
+    font-size: 12.5px;
+    font-weight: 500;
+    color: var(--dim);
+  }
+  .p-copy {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    padding: 48px 46px;
+  }
+  .p-copy h2 {
+    font-size: clamp(21px, 2.4vw, 27px);
+    font-weight: 600;
+    letter-spacing: -0.025em;
+    text-wrap: balance;
+  }
+  .p-copy p {
+    margin-top: 14px;
+    max-width: 400px;
+    font-size: 14px;
+    line-height: 1.65;
+    color: var(--dim);
+  }
+  .p-copy .cta-row { margin-top: 26px; display: flex; gap: 14px; }
+  .harness-fallback { display: none; }
+  @media (max-width: 980px) {
+    .p-features { grid-template-columns: repeat(2, 1fr); }
+    .cell + .cell { border-left: 0; }
+    .cell:nth-child(even) { border-left: 1px solid var(--line-soft); }
+    .cell:nth-child(n+3) { border-top: 1px solid var(--line-soft); }
+  }
+  @media (max-width: 900px) {
+    .p-gallery { grid-template-columns: 1fr; }
+    .p-gallery figure + figure { border-left: 0; border-top: 1px solid var(--line-soft); }
+    .p-harness { grid-template-columns: 1fr; }
+    .p-copy { order: -1; padding: 38px 26px; }
+    .p-diagram { border-right: 0; border-top: 1px solid var(--line-soft); }
+  }
+  @media (max-width: 560px) {
+    .p-features { grid-template-columns: 1fr; }
+    .cell { padding: 24px 20px 26px; }
+    .cell:nth-child(even) { border-left: 0; }
+    .cell + .cell { border-top: 1px solid var(--line-soft); }
+  }
+  @media (max-width: 520px) {
+    .spoke-wrap { display: none; }
+    .p-diagram { padding: 30px 24px; }
+    .harness-fallback {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 18px 16px;
+      width: 100%;
+      position: relative;
+    }
+    .harness-fallback .cell-agent {
+      display: flex;
+      align-items: center;
+      gap: 9px;
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--dim);
+    }
+    .harness-fallback .agent-icon { width: 18px; height: 18px; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .spoke-line, .spoke-accent { animation: none; }
+  }
+
+  /* ── reach ascii ─────────────────────────────────────── */
+  /* the reaching-figures relief, rendered through the same baked-density
+     glyph field as the closing hands */
+  /* the two figures flank the panel from the page edges, vertically
+     centered on it and layered underneath — the arms reach in behind
+     the panel like the hands behind the closing */
+  .reach-left, .reach-right {
+    position: absolute;
+    top: calc(50% + 55px); /* visual center of the panel (offsets the section's top padding) */
+    transform: translateY(-50%);
+    z-index: 0;
+    height: auto !important;
+    -webkit-mask-image: linear-gradient(to bottom, transparent 0%, #000 16%, #000 84%, transparent 100%);
+    mask-image: linear-gradient(to bottom, transparent 0%, #000 16%, #000 84%, transparent 100%);
+  }
+  .reach-left { left: 0; width: min(540px, 44vw) !important; }
+  .reach-right { right: 0; width: min(516px, 42vw) !important; }
 
   /* ── tweets ──────────────────────────────────────────── */
   /* z-index keeps the cards above the closing section's ascii hand,
@@ -269,27 +474,22 @@
     letter-spacing: -0.025em;
     text-wrap: balance;
   }
-  /* full-bleed marquee: two rows drifting opposite ways; each track holds
-     the same card group twice, so translating -50% loops seamlessly */
+  .tweets .sub {
+    margin-top: 14px;
+    max-width: 460px;
+    font-size: 14.5px;
+    line-height: 1.65;
+    color: var(--dim);
+  }
+  /* full-bleed marquee strip: flat cells split by hairlines (no floating
+     cards); each row holds its card group twice so translating -50% loops
+     seamlessly */
   .tweet-marquee {
-    margin-top: 40px;
+    margin-top: 44px;
     display: flex;
     flex-direction: column;
     gap: 14px;
-    position: relative;
   }
-  .tweet-marquee::before,
-  .tweet-marquee::after {
-    content: "";
-    position: absolute;
-    top: 0;
-    bottom: 0;
-    z-index: 2;
-    width: max(48px, 50vw - 570px);
-    pointer-events: none;
-  }
-  .tweet-marquee::before { left: 0; background: linear-gradient(90deg, var(--bg), transparent); }
-  .tweet-marquee::after { right: 0; background: linear-gradient(270deg, var(--bg), transparent); }
   .tweet-row { overflow: hidden; }
   .tweet-track {
     display: flex;
@@ -307,35 +507,39 @@
     from { transform: translateX(0); }
     to { transform: translateX(-50%); }
   }
-  .tweet-group {
-    display: flex;
-    gap: 14px;
-    padding-right: 14px;
-  }
+  .tweet-group { display: flex; gap: 14px; padding-right: 14px; }
   .tweet {
-    display: flex;
-    flex-direction: column;
-    width: clamp(270px, 23vw, 320px);
-    height: 150px;
+    position: relative;
+    display: block;
+    width: 348px;
     flex: 0 0 auto;
-    padding: 16px 18px;
-    background: rgba(139, 92, 246, 0.04);
-    -webkit-backdrop-filter: blur(10px);
-    backdrop-filter: blur(10px);
     border: 1px solid var(--line-soft);
     border-radius: 10px;
-    transition: border-color .15s, background .15s;
+    overflow: hidden;
+    -webkit-backdrop-filter: blur(10px);
+    backdrop-filter: blur(10px);
+    transition: background .2s, border-color .2s;
   }
-  .tweet:hover { border-color: var(--faint); background: rgba(139, 92, 246, 0.08); }
-  @media (prefers-reduced-motion: reduce) {
-    .tweet-track { animation: none; }
-    .tweet-row { overflow-x: auto; }
+  .tweet:hover { background: rgba(139, 92, 246, 0.05); border-color: var(--line); }
+  .tweet::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    top: 20px;
+    width: 2px;
+    height: 24px;
+    background: var(--purple);
+    transform: scaleX(0);
+    transform-origin: left;
+    transition: transform .2s;
   }
+  .tweet:hover::before { transform: scaleX(1); }
   .tweet-head {
     display: flex;
     align-items: center;
-    gap: 10px;
-    margin-bottom: 12px;
+    gap: 11px;
+    padding: 14px 18px;
+    border-bottom: 1px solid var(--line-soft);
   }
   .tweet-head img {
     width: 34px;
@@ -343,7 +547,7 @@
     border-radius: 50%;
     flex: 0 0 auto;
   }
-  .tweet-who { min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+  .tweet-who { min-width: 0; flex: 1; display: flex; flex-direction: column; gap: 2px; }
   .tweet-name {
     font-size: 13px;
     font-weight: 600;
@@ -360,18 +564,21 @@
     overflow: hidden;
     text-overflow: ellipsis;
   }
-  .tweet-head svg {
-    width: 14px;
-    height: 14px;
-    margin-left: auto;
-    fill: var(--faint);
+  .tweet-arrow {
+    width: 17px;
+    height: 17px;
     flex: 0 0 auto;
-    transition: fill .15s;
+    color: var(--purple-hi);
+    opacity: 0;
+    transform: translate(-3px, 3px);
+    transition: opacity .2s, transform .2s;
   }
-  .tweet:hover .tweet-head svg { fill: var(--ink); }
+  .tweet:hover .tweet-arrow { opacity: 1; transform: none; }
   .tweet p {
-    font-size: 13px;
-    line-height: 1.55;
+    padding: 14px 18px;
+    height: 118px;
+    font-size: 13.5px;
+    line-height: 1.58;
     color: var(--dim);
     white-space: pre-line;
     overflow-wrap: break-word;
@@ -379,6 +586,11 @@
     -webkit-line-clamp: 4;
     -webkit-box-orient: vertical;
     overflow: hidden;
+  }
+  .tweet .hl { color: var(--purple-hi); font-style: normal; }
+  @media (prefers-reduced-motion: reduce) {
+    .tweet-track { animation: none; }
+    .tweet-row { overflow-x: auto; }
   }
 
   /* ── closing ─────────────────────────────────────────── */
@@ -451,13 +663,13 @@
     .agent-icon { width: 20px; height: 20px; }
     .shot { padding: 28px 0 0; }
     .shot img { border-radius: 4px; }
-    .features { padding: 64px 20px 0; gap: 36px; }
+    .panel-sect { padding-top: 72px; }
+    .reach-left, .reach-right { display: none; }
     .tweets { padding: 84px 0 0; }
     .tweet-marquee { margin-top: 28px; }
-    .tweet-marquee::before, .tweet-marquee::after { width: 24px; }
     .tweet-track { animation-duration: 56s; }
     .tweet-row.is-reverse .tweet-track { animation-duration: 62s; }
-    .tweet { width: 272px; height: 146px; padding: 14px 16px; }
+    .tweet { width: 300px; }
     .closing { margin: 80px 0 56px; }
     .closing p { font-size: 14px; }
     .closing .cta-row { margin-top: 28px; }
@@ -567,36 +779,124 @@
     </div>
   </section>
 
-  <section class="wrap features">
-    <div class="cell">
-      <div class="idx">Cross-device</div>
-      <h3>Every session, on every device</h3>
-      <p>Start an agent on one machine. Open the same session on another
-         device and continue. Transcripts, diffs and approvals sync live.</p>
+  <section class="panel-sect">
+    <canvas class="reach-left" aria-hidden="true"></canvas>
+    <canvas class="reach-right" aria-hidden="true"></canvas>
+    <div class="wrap">
+    <div class="panel">
+      <i class="pdot tl"></i><i class="pdot tr"></i><i class="pdot bl"></i><i class="pdot br"></i>
+      <div class="panel-row p-features">
+      <div class="cell">
+        <h3>Every session, on every device</h3>
+        <p>Start an agent on one machine. Open the same session on another
+           device and continue. Transcripts, diffs and approvals sync live.</p>
+      </div>
+      <div class="cell">
+        <h3>The tools you use, streamlined</h3>
+        <p>Komet is not a new harness. It runs the harnesses you already use
+           each day — Claude Code, Codex and more — in one fast window.</p>
+      </div>
+      <div class="cell">
+        <h3>Quick on slow networks</h3>
+        <p>Komet sends only small sync updates over the wire. Remote sessions
+           stay quick on weak connections — even on plane Wi-Fi.</p>
+      </div>
+      <div class="cell">
+        <h3>A fast, native client</h3>
+        <p>The engine is pure Rust. The app is GPU-rendered, with no browser
+           wrapper. It is a quick window over every agent you run.</p>
+      </div>
+      </div>
+      <div class="panel-row p-gallery">
+        <figure>
+          <img src="/assets/shots/sessions.png" alt="Komet session list showing agent sessions running on another machine" loading="lazy" width="907" height="627" />
+          <figcaption>Every machine's sessions, one list</figcaption>
+        </figure>
+        <figure>
+          <img src="/assets/shots/diff.png" alt="Komet branch diff view with added and removed lines across 299 changed files" loading="lazy" width="907" height="627" />
+          <figcaption>Branch diffs, live as agents work</figcaption>
+        </figure>
+        <figure>
+          <img src="/assets/shots/history.png" alt="Komet commit history view with a branching commit graph" loading="lazy" width="907" height="627" />
+          <figcaption>Commit history for every workspace</figcaption>
+        </figure>
+      </div>
+      <div class="panel-row p-harness">
+        <div class="p-diagram">
+          <div class="spoke-wrap" aria-hidden="true">
+            <svg viewBox="0 0 100 100" preserveAspectRatio="xMidYMid meet">
+              <g>
+                <line x1="50" y1="12" x2="50" y2="39" class="spoke-line" style="animation-delay: 0s"></line>
+                <line x1="50" y1="12" x2="50" y2="39" class="spoke-accent" style="animation-delay: 0s"></line>
+              </g>
+              <g>
+                <line x1="82.91" y1="31" x2="59.53" y2="44.5" class="spoke-line" style="animation-delay: .25s"></line>
+                <line x1="82.91" y1="31" x2="59.53" y2="44.5" class="spoke-accent" style="animation-delay: .25s"></line>
+              </g>
+              <g>
+                <line x1="82.91" y1="69" x2="59.53" y2="55.5" class="spoke-line" style="animation-delay: .5s"></line>
+                <line x1="82.91" y1="69" x2="59.53" y2="55.5" class="spoke-accent" style="animation-delay: .5s"></line>
+              </g>
+              <g>
+                <line x1="50" y1="88" x2="50" y2="61" class="spoke-line" style="animation-delay: .75s"></line>
+                <line x1="50" y1="88" x2="50" y2="61" class="spoke-accent" style="animation-delay: .75s"></line>
+              </g>
+              <g>
+                <line x1="17.09" y1="69" x2="40.47" y2="55.5" class="spoke-line" style="animation-delay: 1s"></line>
+                <line x1="17.09" y1="69" x2="40.47" y2="55.5" class="spoke-accent" style="animation-delay: 1s"></line>
+              </g>
+              <g>
+                <line x1="17.09" y1="31" x2="40.47" y2="44.5" class="spoke-line" style="animation-delay: 1.25s"></line>
+                <line x1="17.09" y1="31" x2="40.47" y2="44.5" class="spoke-accent" style="animation-delay: 1.25s"></line>
+              </g>
+            </svg>
+            <div class="spoke-hub"><img src="/assets/komet-app-icon.png" width="128" height="128" alt="" /></div>
+            <div class="spoke-node" style="left: 50%; top: 12%">
+              <span class="agent-icon" style="--icon: url('/assets/icons/claude-mark.svg')"></span><span>Claude Code</span>
+            </div>
+            <div class="spoke-node" style="left: 82.91%; top: 31%">
+              <span class="agent-icon" style="--icon: url('/assets/icons/openai-mark.svg')"></span><span>Codex</span>
+            </div>
+            <div class="spoke-node" style="left: 82.91%; top: 69%">
+              <span class="agent-icon" style="--icon: url('/assets/icons/cursor-mark.svg')"></span><span>Cursor</span>
+            </div>
+            <div class="spoke-node" style="left: 50%; top: 88%">
+              <span class="agent-icon" style="--icon: url('/assets/icons/pi-mark.svg')"></span><span>Pi</span>
+            </div>
+            <div class="spoke-node" style="left: 17.09%; top: 69%">
+              <span class="agent-icon" style="--icon: url('/assets/icons/hermes-mark.svg')"></span><span>Hermes</span>
+            </div>
+            <div class="spoke-node" style="left: 17.09%; top: 31%">
+              <span class="agent-icon" style="--icon: url('/assets/icons/grok-mark.svg')"></span><span>Grok</span>
+            </div>
+          </div>
+          <div class="harness-fallback">
+            <div class="cell-agent"><span class="agent-icon" style="--icon: url('/assets/icons/claude-mark.svg')"></span>Claude Code</div>
+            <div class="cell-agent"><span class="agent-icon" style="--icon: url('/assets/icons/openai-mark.svg')"></span>Codex</div>
+            <div class="cell-agent"><span class="agent-icon" style="--icon: url('/assets/icons/cursor-mark.svg')"></span>Cursor</div>
+            <div class="cell-agent"><span class="agent-icon" style="--icon: url('/assets/icons/grok-mark.svg')"></span>Grok</div>
+            <div class="cell-agent"><span class="agent-icon" style="--icon: url('/assets/icons/hermes-mark.svg')"></span>Hermes</div>
+            <div class="cell-agent"><span class="agent-icon" style="--icon: url('/assets/icons/pi-mark.svg')"></span>Pi</div>
+          </div>
+        </div>
+        <div class="p-copy">
+          <h2>Runs what you already use</h2>
+          <p>Komet is not a new harness. It drives Claude Code, Codex, Cursor,
+             Grok, Hermes and Pi — the same sessions and tools you use each day,
+             in one fast native window on every device.</p>
+          <div class="cta-row">
+            <a class="btn ghost" href="https://github.com/komet/komet-native">Star on GitHub ↗</a>
+          </div>
+        </div>
+      </div>
     </div>
-    <div class="cell">
-      <div class="idx">Your harnesses</div>
-      <h3>The tools you use, streamlined</h3>
-      <p>Komet is not a new harness. It runs the harnesses you already use
-         each day — Claude Code, Codex and more — in one fast window.</p>
-    </div>
-    <div class="cell">
-      <div class="idx">Lightweight</div>
-      <h3>Quick on slow networks</h3>
-      <p>Komet sends only small sync updates over the wire. Remote sessions
-         stay quick on weak connections — even on plane Wi-Fi.</p>
-    </div>
-    <div class="cell">
-      <div class="idx">Native</div>
-      <h3>A fast, native client</h3>
-      <p>The engine is pure Rust. The app is GPU-rendered, with no browser
-         wrapper. It is a quick window over every agent you run.</p>
     </div>
   </section>
 
   <section class="tweets">
     <div class="wrap">
-      <h2>What people are saying about Komet</h2>
+      <h2>What are people saying</h2>
+      <p class="sub">See how people really feel about Komet.</p>
     </div>
     <div class="tweet-marquee" aria-label="Posts about Komet on X">
       <div class="tweet-row">
@@ -606,15 +906,15 @@
               <div class="tweet-head">
                 <img src="/assets/tweets/zebassembly.jpg" alt="" loading="lazy" width="200" height="200" />
                 <div class="tweet-who"><span class="tweet-name">zeb</span><span class="tweet-handle">@zebassembly</span></div>
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+                <svg class="tweet-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 17L17 7M8 7h9v9"/></svg>
               </div>
-              <p>This looks absolutely fantastic, I can't think of a single example of GPUI looking this good.</p>
+              <p>This looks absolutely fantastic, I can't think of a single example of <em class="hl">GPUI</em> looking this good.</p>
             </a>
             <a class="tweet" href="https://x.com/n3o773/status/2082902752150393102" target="_blank" rel="noopener">
               <div class="tweet-head">
                 <img src="/assets/tweets/n3o773.jpg" alt="" loading="lazy" width="200" height="200" />
                 <div class="tweet-who"><span class="tweet-name">neo</span><span class="tweet-handle">@n3o773</span></div>
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+                <svg class="tweet-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 17L17 7M8 7h9v9"/></svg>
               </div>
               <p>Damn that UI is crisp!!</p>
             </a>
@@ -622,7 +922,7 @@
               <div class="tweet-head">
                 <img src="/assets/tweets/jv_nguyen518.jpg" alt="" loading="lazy" width="200" height="200" />
                 <div class="tweet-who"><span class="tweet-name">Justin Vu Nguyen</span><span class="tweet-handle">@jv_nguyen518</span></div>
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+                <svg class="tweet-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 17L17 7M8 7h9v9"/></svg>
               </div>
               <p>woah this is buttery af!!</p>
             </a>
@@ -630,7 +930,7 @@
               <div class="tweet-head">
                 <img src="/assets/tweets/emanueledpt.jpg" alt="" loading="lazy" width="200" height="200" />
                 <div class="tweet-who"><span class="tweet-name">Emanuele Di Pietro</span><span class="tweet-handle">@emanueledpt</span></div>
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+                <svg class="tweet-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 17L17 7M8 7h9v9"/></svg>
               </div>
               <p>similar to synara and the name too
 gg
@@ -640,15 +940,15 @@ this space is so crowded</p>
               <div class="tweet-head">
                 <img src="/assets/tweets/lik_ai_.jpg" alt="" loading="lazy" width="200" height="200" />
                 <div class="tweet-who"><span class="tweet-name">Kai</span><span class="tweet-handle">@lik_ai_</span></div>
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+                <svg class="tweet-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 17L17 7M8 7h9v9"/></svg>
               </div>
-              <p>So... waku.sh</p>
+              <p>So... <em class="hl">waku.sh</em></p>
             </a>
             <a class="tweet" href="https://x.com/maxktz/status/2082956238153723904" target="_blank" rel="noopener">
               <div class="tweet-head">
                 <img src="/assets/tweets/maxktz.jpg" alt="" loading="lazy" width="200" height="200" />
                 <div class="tweet-who"><span class="tweet-name">Max Katz</span><span class="tweet-handle">@maxktz</span></div>
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+                <svg class="tweet-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 17L17 7M8 7h9v9"/></svg>
               </div>
               <p>amazing!</p>
             </a>
@@ -656,7 +956,7 @@ this space is so crowded</p>
               <div class="tweet-head">
                 <img src="/assets/tweets/dipxsyy.jpg" alt="" loading="lazy" width="200" height="200" />
                 <div class="tweet-who"><span class="tweet-name">Deepanshu Mishra</span><span class="tweet-handle">@dipxsyy</span></div>
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+                <svg class="tweet-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 17L17 7M8 7h9v9"/></svg>
               </div>
               <p>clean af</p>
             </a>
@@ -664,7 +964,7 @@ this space is so crowded</p>
               <div class="tweet-head">
                 <img src="/assets/tweets/0xwthw.jpg" alt="" loading="lazy" width="200" height="200" />
                 <div class="tweet-who"><span class="tweet-name">wthw</span><span class="tweet-handle">@0xwthw</span></div>
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+                <svg class="tweet-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 17L17 7M8 7h9v9"/></svg>
               </div>
               <p>if i see another multi-agent terminal orchestrator app i'm gonna crash out</p>
             </a>
@@ -674,15 +974,15 @@ this space is so crowded</p>
               <div class="tweet-head">
                 <img src="/assets/tweets/zebassembly.jpg" alt="" loading="lazy" width="200" height="200" />
                 <div class="tweet-who"><span class="tweet-name">zeb</span><span class="tweet-handle">@zebassembly</span></div>
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+                <svg class="tweet-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 17L17 7M8 7h9v9"/></svg>
               </div>
-              <p>This looks absolutely fantastic, I can't think of a single example of GPUI looking this good.</p>
+              <p>This looks absolutely fantastic, I can't think of a single example of <em class="hl">GPUI</em> looking this good.</p>
             </a>
             <a class="tweet" href="https://x.com/n3o773/status/2082902752150393102" target="_blank" rel="noopener" tabindex="-1">
               <div class="tweet-head">
                 <img src="/assets/tweets/n3o773.jpg" alt="" loading="lazy" width="200" height="200" />
                 <div class="tweet-who"><span class="tweet-name">neo</span><span class="tweet-handle">@n3o773</span></div>
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+                <svg class="tweet-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 17L17 7M8 7h9v9"/></svg>
               </div>
               <p>Damn that UI is crisp!!</p>
             </a>
@@ -690,7 +990,7 @@ this space is so crowded</p>
               <div class="tweet-head">
                 <img src="/assets/tweets/jv_nguyen518.jpg" alt="" loading="lazy" width="200" height="200" />
                 <div class="tweet-who"><span class="tweet-name">Justin Vu Nguyen</span><span class="tweet-handle">@jv_nguyen518</span></div>
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+                <svg class="tweet-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 17L17 7M8 7h9v9"/></svg>
               </div>
               <p>woah this is buttery af!!</p>
             </a>
@@ -698,7 +998,7 @@ this space is so crowded</p>
               <div class="tweet-head">
                 <img src="/assets/tweets/emanueledpt.jpg" alt="" loading="lazy" width="200" height="200" />
                 <div class="tweet-who"><span class="tweet-name">Emanuele Di Pietro</span><span class="tweet-handle">@emanueledpt</span></div>
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+                <svg class="tweet-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 17L17 7M8 7h9v9"/></svg>
               </div>
               <p>similar to synara and the name too
 gg
@@ -708,15 +1008,15 @@ this space is so crowded</p>
               <div class="tweet-head">
                 <img src="/assets/tweets/lik_ai_.jpg" alt="" loading="lazy" width="200" height="200" />
                 <div class="tweet-who"><span class="tweet-name">Kai</span><span class="tweet-handle">@lik_ai_</span></div>
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+                <svg class="tweet-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 17L17 7M8 7h9v9"/></svg>
               </div>
-              <p>So... waku.sh</p>
+              <p>So... <em class="hl">waku.sh</em></p>
             </a>
             <a class="tweet" href="https://x.com/maxktz/status/2082956238153723904" target="_blank" rel="noopener" tabindex="-1">
               <div class="tweet-head">
                 <img src="/assets/tweets/maxktz.jpg" alt="" loading="lazy" width="200" height="200" />
                 <div class="tweet-who"><span class="tweet-name">Max Katz</span><span class="tweet-handle">@maxktz</span></div>
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+                <svg class="tweet-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 17L17 7M8 7h9v9"/></svg>
               </div>
               <p>amazing!</p>
             </a>
@@ -724,7 +1024,7 @@ this space is so crowded</p>
               <div class="tweet-head">
                 <img src="/assets/tweets/dipxsyy.jpg" alt="" loading="lazy" width="200" height="200" />
                 <div class="tweet-who"><span class="tweet-name">Deepanshu Mishra</span><span class="tweet-handle">@dipxsyy</span></div>
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+                <svg class="tweet-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 17L17 7M8 7h9v9"/></svg>
               </div>
               <p>clean af</p>
             </a>
@@ -732,7 +1032,7 @@ this space is so crowded</p>
               <div class="tweet-head">
                 <img src="/assets/tweets/0xwthw.jpg" alt="" loading="lazy" width="200" height="200" />
                 <div class="tweet-who"><span class="tweet-name">wthw</span><span class="tweet-handle">@0xwthw</span></div>
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+                <svg class="tweet-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 17L17 7M8 7h9v9"/></svg>
               </div>
               <p>if i see another multi-agent terminal orchestrator app i'm gonna crash out</p>
             </a>
@@ -746,15 +1046,15 @@ this space is so crowded</p>
               <div class="tweet-head">
                 <img src="/assets/tweets/mrbye32.jpg" alt="" loading="lazy" width="200" height="200" />
                 <div class="tweet-who"><span class="tweet-name">Yuri - 1bye</span><span class="tweet-handle">@MrBye32</span></div>
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+                <svg class="tweet-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 17L17 7M8 7h9v9"/></svg>
               </div>
-              <p>what a smooth animations on gpui, impressive!</p>
+              <p>what a smooth animations on <em class="hl">gpui</em>, impressive!</p>
             </a>
             <a class="tweet" href="https://x.com/dwhitedesign/status/2082636175831953730" target="_blank" rel="noopener">
               <div class="tweet-head">
                 <img src="/assets/tweets/dwhitedesign.jpg" alt="" loading="lazy" width="200" height="200" />
                 <div class="tweet-who"><span class="tweet-name">Daniel White</span><span class="tweet-handle">@dwhitedesign</span></div>
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+                <svg class="tweet-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 17L17 7M8 7h9v9"/></svg>
               </div>
               <p>Yooo besides the question that UI &amp; UX is sexy man !!</p>
             </a>
@@ -762,7 +1062,7 @@ this space is so crowded</p>
               <div class="tweet-head">
                 <img src="/assets/tweets/netflixoriginl.jpg" alt="" loading="lazy" width="200" height="200" />
                 <div class="tweet-who"><span class="tweet-name">baily</span><span class="tweet-handle">@netflixoriginl</span></div>
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+                <svg class="tweet-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 17L17 7M8 7h9v9"/></svg>
               </div>
               <p>I need this, what is it? 😅</p>
             </a>
@@ -770,7 +1070,7 @@ this space is so crowded</p>
               <div class="tweet-head">
                 <img src="/assets/tweets/mrlemoos.jpg" alt="" loading="lazy" width="200" height="200" />
                 <div class="tweet-who"><span class="tweet-name">Leo - mrlemoos.dev</span><span class="tweet-handle">@mrlemoos</span></div>
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+                <svg class="tweet-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 17L17 7M8 7h9v9"/></svg>
               </div>
               <p>Looks beautiful btw.</p>
             </a>
@@ -778,7 +1078,7 @@ this space is so crowded</p>
               <div class="tweet-head">
                 <img src="/assets/tweets/ravthemann.jpg" alt="" loading="lazy" width="200" height="200" />
                 <div class="tweet-who"><span class="tweet-name">Aarav A</span><span class="tweet-handle">@RavTheMann</span></div>
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+                <svg class="tweet-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 17L17 7M8 7h9v9"/></svg>
               </div>
               <p>sick
 love the ui</p>
@@ -787,7 +1087,7 @@ love the ui</p>
               <div class="tweet-head">
                 <img src="/assets/tweets/sebuzdugan.jpg" alt="" loading="lazy" width="200" height="200" />
                 <div class="tweet-who"><span class="tweet-name">Sebastian Buzdugan</span><span class="tweet-handle">@sebuzdugan</span></div>
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+                <svg class="tweet-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 17L17 7M8 7h9v9"/></svg>
               </div>
               <p>native is nice, but stale claude sessions will hurt more than electron overhead</p>
             </a>
@@ -795,9 +1095,9 @@ love the ui</p>
               <div class="tweet-head">
                 <img src="/assets/tweets/lucianmarin.jpg" alt="" loading="lazy" width="200" height="200" />
                 <div class="tweet-who"><span class="tweet-name">Lucian Marin</span><span class="tweet-handle">@lucianmarin</span></div>
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+                <svg class="tweet-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 17L17 7M8 7h9v9"/></svg>
               </div>
-              <p>@superdoteng is working on exactly the same thing.</p>
+              <p><em class="hl">@superdoteng</em> is working on exactly the same thing.</p>
             </a>
           </div>
           <div class="tweet-group" aria-hidden="true">
@@ -805,15 +1105,15 @@ love the ui</p>
               <div class="tweet-head">
                 <img src="/assets/tweets/mrbye32.jpg" alt="" loading="lazy" width="200" height="200" />
                 <div class="tweet-who"><span class="tweet-name">Yuri - 1bye</span><span class="tweet-handle">@MrBye32</span></div>
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+                <svg class="tweet-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 17L17 7M8 7h9v9"/></svg>
               </div>
-              <p>what a smooth animations on gpui, impressive!</p>
+              <p>what a smooth animations on <em class="hl">gpui</em>, impressive!</p>
             </a>
             <a class="tweet" href="https://x.com/dwhitedesign/status/2082636175831953730" target="_blank" rel="noopener" tabindex="-1">
               <div class="tweet-head">
                 <img src="/assets/tweets/dwhitedesign.jpg" alt="" loading="lazy" width="200" height="200" />
                 <div class="tweet-who"><span class="tweet-name">Daniel White</span><span class="tweet-handle">@dwhitedesign</span></div>
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+                <svg class="tweet-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 17L17 7M8 7h9v9"/></svg>
               </div>
               <p>Yooo besides the question that UI &amp; UX is sexy man !!</p>
             </a>
@@ -821,7 +1121,7 @@ love the ui</p>
               <div class="tweet-head">
                 <img src="/assets/tweets/netflixoriginl.jpg" alt="" loading="lazy" width="200" height="200" />
                 <div class="tweet-who"><span class="tweet-name">baily</span><span class="tweet-handle">@netflixoriginl</span></div>
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+                <svg class="tweet-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 17L17 7M8 7h9v9"/></svg>
               </div>
               <p>I need this, what is it? 😅</p>
             </a>
@@ -829,7 +1129,7 @@ love the ui</p>
               <div class="tweet-head">
                 <img src="/assets/tweets/mrlemoos.jpg" alt="" loading="lazy" width="200" height="200" />
                 <div class="tweet-who"><span class="tweet-name">Leo - mrlemoos.dev</span><span class="tweet-handle">@mrlemoos</span></div>
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+                <svg class="tweet-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 17L17 7M8 7h9v9"/></svg>
               </div>
               <p>Looks beautiful btw.</p>
             </a>
@@ -837,7 +1137,7 @@ love the ui</p>
               <div class="tweet-head">
                 <img src="/assets/tweets/ravthemann.jpg" alt="" loading="lazy" width="200" height="200" />
                 <div class="tweet-who"><span class="tweet-name">Aarav A</span><span class="tweet-handle">@RavTheMann</span></div>
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+                <svg class="tweet-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 17L17 7M8 7h9v9"/></svg>
               </div>
               <p>sick
 love the ui</p>
@@ -846,7 +1146,7 @@ love the ui</p>
               <div class="tweet-head">
                 <img src="/assets/tweets/sebuzdugan.jpg" alt="" loading="lazy" width="200" height="200" />
                 <div class="tweet-who"><span class="tweet-name">Sebastian Buzdugan</span><span class="tweet-handle">@sebuzdugan</span></div>
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+                <svg class="tweet-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 17L17 7M8 7h9v9"/></svg>
               </div>
               <p>native is nice, but stale claude sessions will hurt more than electron overhead</p>
             </a>
@@ -854,15 +1154,15 @@ love the ui</p>
               <div class="tweet-head">
                 <img src="/assets/tweets/lucianmarin.jpg" alt="" loading="lazy" width="200" height="200" />
                 <div class="tweet-who"><span class="tweet-name">Lucian Marin</span><span class="tweet-handle">@lucianmarin</span></div>
-                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+                <svg class="tweet-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7 17L17 7M8 7h9v9"/></svg>
               </div>
-              <p>@superdoteng is working on exactly the same thing.</p>
+              <p><em class="hl">@superdoteng</em> is working on exactly the same thing.</p>
             </a>
           </div>
         </div>
       </div>
-    </div>
   </section>
+
 
   <section class="closing">
     <canvas class="hand-ascii hand-down" aria-hidden="true"></canvas>
@@ -1074,6 +1374,90 @@ love the ui</p>
 001100002222220333335333333333333670767650332020
 000000123332222233353333333333333367076665040022
 000100000020200202035533003330033036777055404222` },
+      { sel: ".reach-left", ox: 293, data: `866642000000410000000000002310000000000022210
+565443200000001100000000000000000000000111111
+564322210000000001200000000000000100000000000
+431001111100000102520220000000000000100000000
+320000000200000464455254310000000000000000000
+100100000000016489988865883000000000010000000
+112100000000008999998874770000000000100000010
+431000000000037999999479810000000010000000000
+320000000000058889979988400000002000000000000
+201000000000026758999977200000000000000000000
+220000000000134569999885000000000000000000001
+000000000101112689999960000000000000000000010
+243330153010002899942410000001000000000000100
+788887895000001699920000000000010000000000000
+899999830000000389840000000000000000000220000
+799999941000000135863200000000000200002221000
+689999997100000000231110000000000002200001000
+779999998400000130000011000000000001000000010
+789999999974200220000027620000000000000000011
+999999999999875440000589520000000000100000000
+989999999998887385423999500000000001000000000
+868999899854000269988799971000000000000000000
+548999988775654206996069887410000000000000000
+446999988888756864870004889985010000000000000
+555899999998624788820000268984010000001000000
+565799998889866789600000001688643333557710220
+676899998777788998100000000049999999998874378
+878999875577346684000000000001366776542059747
+888999851036304463000110000000000000000000257
+999998887101100003210002000000000000000000008
+989999867860100004222100000000010000000000001
+899998865465320025401210000000001110000000000
+999999776335333234541210000000000200000000001
+999889876300232355444211000000002100000000000
+999987888763001125434320000000012000000000000
+999997578885310000233323000002332100000000000
+988898756653210110003435301022133200001000000
+999987665555300000000243445342333310110000003
+999998656765421000000013442323322343212201343
+999999998875453100000002554333433444333224434
+999999998976764211000003455443444455444345442
+999999999899887654201000255556544445545545542` },
+      { sel: ".reach-right", ox: 338, data: `0000122332210000002200001223332333345667889
+1000143101100000000110000111100011234466789
+0012001000000000000002102200000000122234577
+0110000000000000010000231100000000000123554
+0000000000022110121000000000000000023234444
+0000000000210100001100000000000002243234334
+0000000001000000000230000000002232011234434
+0000000120000000000001000000000020000003433
+1000001100000000000000000000000100000011233
+0221200000000000000100000000000000000010455
+0021000000000000000000000000000000000002446
+0000000000000000000000000000000000000033235
+0000000000000000000000110000000000000122223
+0000000000001000000000001000011210000111222
+0000000000000000000000001100000111210021122
+0000000000000000000000011000000001122122213
+0000000010000000000000010000000000001103232
+0000000000000000000000000000000000000013320
+0000000100000000000013000000000000000013222
+2100000000000000000001000000000000111111123
+1010000000000000000000000000000000001000013
+0000000000100000000000000000000000001000013
+0000000000220110100000000000232200310200103
+0000010000012100000000000002315456431000122
+0000000000000011000000000000644786596011212
+0000000000000010000000000000113899888322235
+5300000000000000000010000004025889998332554
+9541000000000000000002000002478999996024334
+8310000000100000001000010000799987985222233
+6400000100000000000000000000017987762000001
+2000000365000000100000000020000999200000000
+0000001477435630000000000000035895000032000
+1000000266888886100010000012036751000037776
+1000000134200048874322433458622200000058999
+0100000000100101589988999999985033000599997
+0110010100001100013466678888798446446999999
+3212101011013101110122123443458999999999999
+2421001001222112221133531322445898878998999
+2311110001323222211344443334555588888899999
+2222111113134333214435345555566679999999999
+3322222242453444344543355555666667999999999
+2433223335554433454543456556566777999999999` },
     ]
       .map((h) => {
         const cv = document.querySelector(h.sel);
