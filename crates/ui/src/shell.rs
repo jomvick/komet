@@ -531,6 +531,9 @@ pub struct Shell {
     right_tabs: std::collections::HashMap<String, Vec<RightSurface>>,
     /// In-flight surface-tab drag (slide animation state).
     right_tab_drag: Option<RightTabDragState>,
+    /// Surface-tab strip scroll (the strip overflows horizontally, t3
+    /// ScrollArea-style; drag drop-math reads the offset back out).
+    right_tab_scroll: gpui::ScrollHandle,
     /// Chat outlet vs settings pages.
     route: Route,
     /// Route history behind the titlebar back/forward buttons (§ nav history).
@@ -760,6 +763,7 @@ impl Shell {
             diff_seq: 0,
             right_tabs: std::collections::HashMap::new(),
             right_tab_drag: None,
+            right_tab_scroll: gpui::ScrollHandle::new(),
             route,
             nav,
             devices_page: None,
@@ -3973,7 +3977,11 @@ impl Shell {
             .flex_row()
             .items_center()
             .gap(px(4.0))
-            .overflow_hidden()
+            // Overflowing tabs scroll horizontally (t3 hides the bar too;
+            // trackpad/shift-wheel pans) instead of clipping under the
+            // expand button (user report).
+            .overflow_x_scroll()
+            .track_scroll(&self.right_tab_scroll)
             .on_drag_move::<RightTabDrag>(cx.listener(
                 move |this, event: &gpui::DragMoveEvent<RightTabDrag>, _, cx| {
                     let payload = event.drag(cx);
@@ -3981,8 +3989,11 @@ impl Shell {
                         return;
                     }
                     let from = payload.from;
-                    let rel_x =
-                        f32::from(event.event.position.x) - f32::from(event.bounds.left());
+                    // Content-space x: the pointer offset plus however far
+                    // the strip is scrolled (offset.x goes negative).
+                    let rel_x = f32::from(event.event.position.x)
+                        - f32::from(event.bounds.left())
+                        - f32::from(this.right_tab_scroll.offset().x);
                     let over = crate::terminal::panel::drop_index(rel_x, CHIP_SLOT, count);
                     this.update_right_tab_drag_over(from, over, cx);
                 },
