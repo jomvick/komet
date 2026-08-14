@@ -1757,6 +1757,13 @@ impl Transcript {
     /// all motion is the ordinary bottom pin (see [`OwnTurnAnchor`]).
     fn step_own_turn(&mut self, cx: &mut Context<Self>) {
         self.own_turn_kick = false;
+        // Layout moves the bottom too (pad refinement, streaming growth):
+        // refresh the wheel handler's escape baseline every frame so only a
+        // WHEEL's own delta registers as user intent. Without this, the pad
+        // growing at turn-completion between two wheel events read as
+        // "scrolled away" and silently released the hold — the next wheels
+        // then sank unopposed deep into the runway blank (rig-traced).
+        self.last_scroll_distance = self.distance_from_bottom();
         let Some(anchor_ix) = self.own_turn_anchor_ix() else {
             // The optimistic echo may arrive on the next state notification.
             return;
@@ -1851,16 +1858,42 @@ impl Transcript {
             // scroll_to is absolute and bounds-independent, so neither glue
             // re-snaps, pad-sizing lag, nor a splice's unmeasured flicker can
             // carry the view off the prompt (each broke the spring-held
-            // variants of this — rig-traced).
-            let moved = self
-                .list
-                .bounds_for_item(anchor_ix)
-                .is_none_or(|b| {
-                    (f32::from(b.top())
-                        - (f32::from(viewport.top()) + inset))
-                        .abs()
-                        > 0.5
-                });
+            // variants of this — rig-traced). ONE-SIDED: only upward drift
+            // (view above the hold) is corrected. The scroll slack under the
+            // reservation is legal resting space — wheel-down sinks into it
+            // and stops hard at the list's own clamp; snapping back up from
+            // there made the bottom bounce/stutter on every scroll event
+            // (user report). Way-below-slack (impossible short of a bug)
+            // still re-asserts.
+            let moved = match self.list.bounds_for_item(anchor_ix) {
+                Some(b) => {
+                    let err = f32::from(b.top()) - (f32::from(viewport.top()) + inset);
+                    err > 0.5 || err < -(OWN_SEND_SCROLL_SLACK_PX + 8.0)
+                }
+                // The GLUED offset representation reports no bounds for ANY
+                // item (rig-traced: avail=[] with logical top == rows.len())
+                // — and wheel-down to the true bottom is exactly where the
+                // offset glues. That bottom is at most the scroll slack below
+                // the hold: legal dead-band space, so no assert (asserting on
+                // None here was the bottom bounce — every wheel event sank
+                // into the slack, glued, lost bounds, and got snapped back
+                // up). But glue also hard-tracks a GROWING end, which would
+                // re-open the streaming drift for a user parked there —
+                // de-glue in place (~1px, imperceptible) so the offset
+                // re-anchors to an item and the dead band governs from the
+                // next frame. A boundless frame far from the bottom is
+                // splice flicker with an unknowable position: re-assert.
+                None => {
+                    if self.distance_from_bottom() <= OWN_SEND_SCROLL_SLACK_PX + 8.0 {
+                        if self.is_glued() {
+                            self.list.scroll_by(px(-0.75));
+                        }
+                        false
+                    } else {
+                        true
+                    }
+                }
+            };
             if moved {
                 self.list.scroll_to(ListOffset {
                     item_ix: anchor_ix,
@@ -1883,11 +1916,19 @@ impl Transcript {
         // bottom distance while it is still below the measured window (the
         // undershot provisional pad guarantees the bottom stops short of the
         // prompt, so this leg can never overshoot it).
-        let err = match self.list.bounds_for_item(anchor_ix) {
-            Some(bounds) => {
-                f32::from(bounds.top()) - (f32::from(viewport.top()) + inset)
-            }
-            None => self.distance_from_bottom(),
+        // The two error legs mean DIFFERENT things at zero: on the bounds
+        // leg, err 0 is AT the hold (no correction needed); on the bounds-
+        // less leg, err is the distance to the pad's bottom — arrival there
+        // still needs the absolute snap onto the anchor (the short-chat/
+        // glued landing, where bounds never appear). Conflating them once
+        // marked entries "positioned" at the pad bottom without ever
+        // landing (rig-caught: sends parked deep in blank runway).
+        let (err, anchored) = match self.list.bounds_for_item(anchor_ix) {
+            Some(bounds) => (
+                f32::from(bounds.top()) - (f32::from(viewport.top()) + inset),
+                true,
+            ),
+            None => (self.distance_from_bottom(), false),
         };
         let glide_max = GLIDE_MAX_VIEWPORTS * viewport_height;
         let err = if err > glide_max {
@@ -1896,12 +1937,36 @@ impl Transcript {
         } else {
             err
         };
-        if err.abs() <= OWN_SEND_GLIDE_SNAP_PX || motion::reduced_motion(cx) {
-            self.list.scroll_to(ListOffset {
+        let land = |list: &ListState| {
+            list.scroll_to(ListOffset {
                 item_ix: anchor_ix,
                 offset_in_item: px(0.0),
             });
-            self.list.scroll_by(px(-inset));
+            list.scroll_by(px(-inset));
+        };
+        if motion::reduced_motion(cx) {
+            land(&self.list);
+            if let Some(anchor) = self.own_turn.as_mut() {
+                anchor.positioned = true;
+            }
+            self.own_turn_last_tick = None;
+        } else if anchored && err <= OWN_SEND_GLIDE_SNAP_PX
+            && err >= -(OWN_SEND_SCROLL_SLACK_PX + 8.0)
+        {
+            // At the hold — or resting inside the slack under it (a restick
+            // that fired at the true bottom): land WITHOUT pulling the view
+            // up. Only a still-above position gets the snap.
+            if err > 0.5 {
+                land(&self.list);
+            }
+            if let Some(anchor) = self.own_turn.as_mut() {
+                anchor.positioned = true;
+            }
+            self.own_turn_last_tick = None;
+        } else if !anchored && err <= OWN_SEND_GLIDE_SNAP_PX {
+            // Arrived at the bottom with the anchor still unmeasured: the
+            // absolute, bounds-free snap IS the landing.
+            land(&self.list);
             if let Some(anchor) = self.own_turn.as_mut() {
                 anchor.positioned = true;
             }
