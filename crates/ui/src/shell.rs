@@ -3835,10 +3835,10 @@ impl Shell {
     /// The right pane's empty state (t3code RightPanelEmptyState): a
     /// centered "Open a surface" heading over the two surface cards —
     /// Terminal and Git.
-    /// The right pane's empty state: a quiet mark over a compact vertical
-    /// list of surface rows (icon + label) — the Capy arrangement (user
-    /// request): the old two-card grid clipped in narrow panes and wasted
-    /// short ones.
+    /// The right pane's empty state: the "Open a surface" heading over a
+    /// compact vertical list of surface rows (icon + label) — the Capy
+    /// arrangement (user request): the old two-card grid clipped in narrow
+    /// panes and wasted short ones.
     fn render_surface_picker(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let text = theme.text;
@@ -3886,13 +3886,26 @@ impl Shell {
                     .flex_col()
                     .items_center()
                     .child(
-                        icon(icons::KOMET_LOGO)
-                            .size(px(44.0))
-                            .text_color(muted.opacity(0.35)),
+                        div()
+                            .text_center()
+                            .text_size(px(13.0))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(text)
+                            .child(SharedString::from("Open a surface")),
                     )
                     .child(
                         div()
-                            .mt(px(20.0))
+                            .mt(px(4.0))
+                            .text_center()
+                            .text_size(px(11.5))
+                            .text_color(muted)
+                            .child(SharedString::from(
+                                "Choose what to show in the right panel.",
+                            )),
+                    )
+                    .child(
+                        div()
+                            .mt(px(16.0))
                             .w_full()
                             .flex()
                             .flex_col()
