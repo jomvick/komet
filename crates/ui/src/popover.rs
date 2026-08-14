@@ -574,13 +574,38 @@ pub(crate) fn scrim_alpha(alpha_dark: f32) -> gpui::Hsla {
 /// Full-window modal: dim scrim + centered card with the `dialog-in` entrance.
 /// The scrim swallows clicks; the caller wires its own dismiss/confirm.
 /// `viewport` is the window size (an `anchored` layer sizes to its children,
-/// so the scrim needs explicit dimensions).
+/// so the scrim needs explicit dimensions). The frost radius matches
+/// [`dialog_card`]'s 16px rounding.
 pub fn modal(
     id: impl Into<ElementId>,
     viewport: gpui::Size<Pixels>,
     card: AnyElement,
 ) -> AnyElement {
-    let card = crate::frost::frosted(12.0, crate::frost::MENU_BLUR, card).into_any_element();
+    modal_with(id, viewport, card, 16.0, 0.6)
+}
+
+/// [`modal`] for glass-tinted cards (the add-space palette): a LIGHTER scrim,
+/// so the frosted card reads like the popovers — the standard 0.6 dim buried
+/// the backdrop hue under the blur and the palette came out a flat grey slab
+/// next to the hue-inheriting menus (user report). `corner_radius` must match
+/// the card's rounding.
+pub fn modal_glass(
+    id: impl Into<ElementId>,
+    viewport: gpui::Size<Pixels>,
+    card: AnyElement,
+    corner_radius: f32,
+) -> AnyElement {
+    modal_with(id, viewport, card, corner_radius, 0.35)
+}
+
+fn modal_with(
+    id: impl Into<ElementId>,
+    viewport: gpui::Size<Pixels>,
+    card: AnyElement,
+    corner_radius: f32,
+    scrim: f32,
+) -> AnyElement {
+    let card = crate::frost::frosted(corner_radius, crate::frost::MENU_BLUR, card).into_any_element();
     gpui::deferred(
         gpui::anchored()
             .position(gpui::point(px(0.0), px(0.0)))
@@ -589,7 +614,7 @@ pub fn modal(
                     .occlude()
                     .w(viewport.width)
                     .h(viewport.height)
-                    .bg(scrim_alpha(0.6))
+                    .bg(scrim_alpha(scrim))
                     .flex()
                     .items_center()
                     .justify_center()

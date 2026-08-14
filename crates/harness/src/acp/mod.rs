@@ -783,21 +783,39 @@ fn models_from_session(session_response: &Value, catalog: &[Model]) -> Vec<Model
         .filter_map(trait_from_config_option)
         .collect();
 
-    let known = |id: &str| catalog.iter().find(|m| norm_id(&m.id) == norm_id(id));
+    let exact = |id: &str| catalog.iter().find(|m| norm_id(&m.id) == norm_id(id));
+    // Family-alias catalog row: the claude adapter advertises bare aliases
+    // (`opus`, `sonnet`, `haiku`) meaning "the current generation" — match
+    // them to the first (flagship-ordered) catalog row of that family so
+    // the picker shows the curated label/ladder ("Opus 5") instead of the
+    // terse alias. Alphabetic-only ids ONLY: versioned ids
+    // (`gpt-5.2-codex`) must never fuzzy-match a foreign row.
+    let alias = |id: &str| {
+        let norm = norm_id(id);
+        (!norm.is_empty() && norm.chars().all(|c| c.is_ascii_alphabetic()))
+            .then(|| catalog.iter().find(|m| norm_id(&m.id).contains(&norm)))
+            .flatten()
+    };
     let build = |id: &str,
                  name: Option<&str>,
                  description: Option<&str>,
                  options: Vec<ModelOption>|
      -> Model {
-        let known = known(id);
+        let exact = exact(id);
+        let aliased = if exact.is_none() { alias(id) } else { None };
+        let known = exact.or(aliased);
+        // The wire name wins for real ids; an ALIAS row's terse wire name
+        // ("Opus") loses to the curated family label/description.
         Model {
             id: id.to_owned(),
-            label: name
-                .map(str::to_owned)
+            label: aliased
+                .map(|m| m.label.clone())
+                .or_else(|| name.map(str::to_owned))
                 .or_else(|| known.map(|m| m.label.clone()))
                 .unwrap_or_else(|| id.to_owned()),
-            description: description
-                .map(str::to_owned)
+            description: aliased
+                .and_then(|m| m.description.clone())
+                .or_else(|| description.map(str::to_owned))
                 .or_else(|| known.and_then(|m| m.description.clone())),
             reasoning_levels: match known.filter(|m| !m.reasoning_levels.is_empty()) {
                 Some(m) => m.reasoning_levels.clone(),
@@ -818,32 +836,52 @@ fn models_from_session(session_response: &Value, catalog: &[Model]) -> Vec<Model
             .iter()
             .filter_map(|o| o.get("value").and_then(Value::as_str))
             .collect();
+        // `default` is an ALIAS row (Claude Code's "Default (recommended)"),
+        // duplicating whichever real model the CLI resolves it to — dropped
+        // whenever a real row exists (it read as clutter in the picker, user
+        // request). Send-side, a chat that saved `default` still matches the
+        // advertised value exactly.
+        let has_real = raw_ids.iter().any(|id| norm_id(id) != "default");
         return model_select
             .iter()
             .filter_map(|o| {
                 let id = o.get("value").and_then(Value::as_str)?;
-                // A 1M variant folds into its base row's Context Window
-                // trait; it only stands alone when its bare base id is not
-                // advertised (the claude adapter lists `opus[1m]` with no
-                // bare `opus` when the CLI pins the 1M window).
-                if let Some(base) = strip_context_hint(id)
-                    && raw_ids.contains(&base)
-                {
+                if has_real && norm_id(id) == "default" {
                     return None;
                 }
+                let name = o.get("name").and_then(Value::as_str);
+                let description = o.get("description").and_then(Value::as_str);
                 let mut options = wire_options.clone();
+                if let Some(base) = strip_context_hint(id) {
+                    // A 1M variant with its bare base advertised too folds
+                    // into THAT row's Context Window trait (added below).
+                    if raw_ids.contains(&base) {
+                        return None;
+                    }
+                    // Orphan 1M variant (`opus[1m]` with no bare `opus` —
+                    // the CLI pins the 1M window): present it AS the base
+                    // model with the trait defaulting to 1M, instead of a
+                    // one-off "Opus (1M context)" row (user request). The
+                    // send path recomposes the advertised id via
+                    // `pick_model_value`'s compose/family fallback.
+                    let mut window = crate::claude::catalog::context_window();
+                    window.default_choice = "1m".into();
+                    options.push(window);
+                    return Some(build(
+                        base,
+                        name.map(strip_trailing_parenthetical)
+                            .filter(|n| !n.is_empty()),
+                        description,
+                        options,
+                    ));
+                }
                 if raw_ids
                     .iter()
                     .any(|raw| strip_context_hint(raw) == Some(id))
                 {
                     options.push(crate::claude::catalog::context_window());
                 }
-                Some(build(
-                    id,
-                    o.get("name").and_then(Value::as_str),
-                    o.get("description").and_then(Value::as_str),
-                    options,
-                ))
+                Some(build(id, name, description, options))
             })
             .collect();
     }
@@ -863,7 +901,7 @@ fn models_from_session(session_response: &Value, catalog: &[Model]) -> Vec<Model
                 id,
                 m.get("name").and_then(Value::as_str),
                 m.get("description").and_then(Value::as_str),
-                known(id).map(|k| k.options.clone()).unwrap_or_default(),
+                exact(id).map(|k| k.options.clone()).unwrap_or_default(),
             ))
         })
         .collect()
@@ -1140,6 +1178,16 @@ fn context_hint_1m(id: &str) -> bool {
 /// none.
 fn strip_context_hint(id: &str) -> Option<&str> {
     id.strip_suffix("[1m]").or_else(|| id.strip_suffix("-1m"))
+}
+
+/// A wire display name with its trailing parenthetical removed
+/// ("Opus (1M context)" → "Opus") — a folded base row must not keep the
+/// variant tag.
+fn strip_trailing_parenthetical(name: &str) -> &str {
+    match name.rfind(" (") {
+        Some(at) if name.ends_with(')') => name[..at].trim_end(),
+        _ => name,
+    }
 }
 
 /// Pick the advertised model value for a requested model id. Agents differ in
@@ -3055,10 +3103,13 @@ mod tests {
     }
 
     #[test]
-    fn orphan_1m_variants_stand_alone() {
-        // The real claude adapter advertises `opus[1m]` with NO bare `opus`
-        // when the CLI pins the 1M window — those rows must survive, not
-        // collapse into a base that was never advertised.
+    fn default_alias_drops_and_orphan_1m_variants_fold_to_their_base() {
+        // The real claude adapter advertises a `default` alias row plus
+        // `opus[1m]` with NO bare `opus` (the CLI pins the 1M window).
+        // Both made the picker read like a settings dump (user report):
+        // `default` duplicates a real model, and the orphan 1M variant now
+        // presents AS its base model with the Context Window trait pinned
+        // to 1M.
         let response = json!({
             "sessionId": "s-1",
             "configOptions": [{
@@ -3067,8 +3118,8 @@ mod tests {
                 "type": "select",
                 "currentValue": "claude-fable-5[1m]",
                 "options": [
-                    { "value": "default", "name": "Default" },
-                    { "value": "opus[1m]", "name": "Opus" },
+                    { "value": "default", "name": "Default (recommended)" },
+                    { "value": "opus[1m]", "name": "Opus (1M context)" },
                     { "value": "claude-fable-5[1m]", "name": "Fable 5" },
                     { "value": "sonnet", "name": "Sonnet" },
                     { "value": "haiku", "name": "Haiku" },
@@ -3078,15 +3129,67 @@ mod tests {
         let models = models_from_session(&response, &[]);
         assert_eq!(
             models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
-            vec![
-                "default",
-                "opus[1m]",
-                "claude-fable-5[1m]",
-                "sonnet",
-                "haiku"
-            ]
+            vec!["opus", "claude-fable-5", "sonnet", "haiku"]
         );
-        assert!(models.iter().all(|m| m.options.is_empty()));
+        // The folded rows keep a de-parenthesized wire name (no catalog
+        // here) and carry the 1M-pinned window trait.
+        assert_eq!(models[0].label, "Opus");
+        let window = models[0].options.iter().find(|o| o.id == "contextWindow");
+        assert_eq!(window.map(|o| o.default_choice.as_str()), Some("1m"));
+        assert!(
+            models[1]
+                .options
+                .iter()
+                .any(|o| o.id == "contextWindow" && o.default_choice == "1m")
+        );
+        // The bare aliases stay untouched.
+        assert!(models[2].options.is_empty());
+        assert!(models[3].options.is_empty());
+    }
+
+    #[test]
+    fn claude_aliases_enrich_from_the_curated_catalog() {
+        // Same wire shape, WITH the claude catalog: bare aliases pick up the
+        // flagship row's curated label/description/ladder, versioned ids
+        // keep their wire name.
+        let response = json!({
+            "sessionId": "s-1",
+            "configOptions": [{
+                "id": "model",
+                "category": "model",
+                "type": "select",
+                "currentValue": "default",
+                "options": [
+                    { "value": "default", "name": "Default (recommended)" },
+                    { "value": "opus[1m]", "name": "Opus (1M context)" },
+                    { "value": "fable", "name": "Fable" },
+                    { "value": "sonnet", "name": "Sonnet" },
+                    { "value": "haiku", "name": "Haiku" },
+                ],
+            }],
+        });
+        let models = models_from_session(&response, &crate::claude::catalog::static_models());
+        assert_eq!(
+            models.iter().map(|m| m.label.as_str()).collect::<Vec<_>>(),
+            vec!["Opus 5", "Fable 5", "Sonnet 5", "Haiku 4.5"]
+        );
+        // The alias rows carry the catalog's per-model ladders.
+        assert!(
+            models[1]
+                .reasoning_levels
+                .contains(&ReasoningLevel::Ultracode)
+        );
+        assert!(models[3].reasoning_levels.is_empty());
+        // Versioned ids never fuzzy-match: a foreign id passes through.
+        let foreign = json!({
+            "sessionId": "s-1",
+            "configOptions": [{
+                "id": "model", "category": "model", "type": "select",
+                "options": [{ "value": "claude-opus-9-mini", "name": "Opus 9 Mini" }],
+            }],
+        });
+        let models = models_from_session(&foreign, &crate::claude::catalog::static_models());
+        assert_eq!(models[0].label, "Opus 9 Mini");
     }
 
     #[test]
