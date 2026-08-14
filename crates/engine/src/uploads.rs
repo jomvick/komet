@@ -49,8 +49,10 @@ struct UploadsInner {
     dir: PathBuf,
     /// Chunk staging (`{uploads_root}/tmp/{uploadId}/`).
     tmp: PathBuf,
-    /// Historical roots accepted for reads only. Writes and staging never use them.
-    read_only_roots: Vec<PathBuf>,
+    /// Historical roots accepted for reads only. Writes and staging never use
+    /// them. RwLock: a local-profile import adds its source root at runtime so
+    /// imported transcripts resolve without an engine restart.
+    read_only_roots: std::sync::RwLock<Vec<PathBuf>>,
 }
 
 #[derive(Clone)]
@@ -75,10 +77,12 @@ impl Uploads {
             inner: Arc::new(UploadsInner {
                 tmp: dir.join("tmp"),
                 dir: dir.to_path_buf(),
-                read_only_roots: legacy_read_root
-                    .into_iter()
-                    .map(Path::to_path_buf)
-                    .collect(),
+                read_only_roots: std::sync::RwLock::new(
+                    legacy_read_root
+                        .into_iter()
+                        .map(Path::to_path_buf)
+                        .collect(),
+                ),
             }),
         }
     }
@@ -86,6 +90,20 @@ impl Uploads {
     /// The durable uploads dir (a path-jail root).
     pub fn dir(&self) -> &Path {
         &self.inner.dir
+    }
+
+    /// Accept `root` for reads from now on (idempotent). Profile import calls
+    /// this so transcripts that embed absolute paths under the local profile's
+    /// uploads root keep resolving after the switch to a synced profile.
+    pub fn add_read_only_root(&self, root: &Path) {
+        let mut roots = self
+            .inner
+            .read_only_roots
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !roots.iter().any(|r| r == root) {
+            roots.push(root.to_path_buf());
+        }
     }
 
     /// Stage one base64 chunk. Positional (`seq`) writes are IDEMPOTENT: a client
@@ -228,8 +246,14 @@ impl Uploads {
         let outside = || EngineError::Other("Attachment is outside the upload cache".into());
         // Canonicalize BOTH sides so `..` segments and symlinks can't escape.
         let resolved = std::fs::canonicalize(path).map_err(|_| outside())?;
+        let read_roots = self
+            .inner
+            .read_only_roots
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         let allowed = std::iter::once(&self.inner.dir)
-            .chain(self.inner.read_only_roots.iter())
+            .chain(read_roots.iter())
             .chain(extra_roots.iter())
             .filter_map(|root| std::fs::canonicalize(root).ok())
             .any(|root| resolved.starts_with(&root) && resolved != root);
