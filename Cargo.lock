@@ -1147,7 +1147,7 @@ checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
 name = "komet"
-version = "0.1.58"
+version = "0.1.59"
 dependencies = [
  "anyhow",
  "clap",
@@ -1166,7 +1166,7 @@ dependencies = [
 
 [[package]]
 name = "komet-doc"
-version = "0.1.58"
+version = "0.1.59"
 dependencies = [
  "chrono",
  "komet-proto",
@@ -1180,7 +1180,7 @@ dependencies = [
 
 [[package]]
 name = "komet-engine"
-version = "0.1.58"
+version = "0.1.59"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1213,7 +1213,7 @@ dependencies = [
 
 [[package]]
 name = "komet-harness"
-version = "0.1.58"
+version = "0.1.59"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1233,7 +1233,7 @@ dependencies = [
 
 [[package]]
 name = "komet-proto"
-version = "0.1.58"
+version = "0.1.59"
 dependencies = [
  "chrono",
  "serde",
@@ -1243,7 +1243,7 @@ dependencies = [
 
 [[package]]
 name = "komet-rpc"
-version = "0.1.58"
+version = "0.1.59"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1261,7 +1261,7 @@ dependencies = [
 
 [[package]]
 name = "komet-sync"
-version = "0.1.58"
+version = "0.1.59"
 dependencies = [
  "chrono",
  "komet-doc",
@@ -1283,7 +1283,7 @@ dependencies = [
 
 [[package]]
 name = "komet-ui"
-version = "0.1.58"
+version = "0.1.59"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -1313,7 +1313,7 @@ dependencies = [
 
 [[package]]
 name = "komet-update"
-version = "0.1.58"
+version = "0.1.59"
 dependencies = [
  "anyhow",
  "futures",
