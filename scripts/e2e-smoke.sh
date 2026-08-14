@@ -36,7 +36,7 @@ cleanup() {
       kill "$pid" 2>/dev/null || true
     fi
   done
-  # The edge runs in its own session (setsid) — kill the whole wrangler group
+  # The edge runs in its own process group — kill the whole wrangler group
   # (npx → wrangler → workerd children).
   [[ -n "$EDGE_PID" ]] && kill -- -"$EDGE_PID" 2>/dev/null || true
   sleep 1
@@ -76,9 +76,13 @@ if curl -sf -m 3 "$EDGE_URL/health" | grep -q '"auth":"dev"'; then
   echo "edge: reusing healthy dev-mode worker on :$EDGE_PORT"
 else
   echo "edge: starting wrangler dev on :$EDGE_PORT"
-  setsid bash -c "cd '$ROOT/edge' && exec npx wrangler dev --port '$EDGE_PORT' --var AUTH_MODE:dev" \
+  # Monitor mode gives the background job its own process group on both macOS
+  # and Linux, without depending on the Linux-only `setsid` utility.
+  set -m
+  bash -c "cd '$ROOT/edge' && exec npx wrangler dev --port '$EDGE_PORT' --var AUTH_MODE:dev" \
     >"$LOG_DIR/edge.log" 2>&1 &
   EDGE_PID=$!
+  set +m
   wait_for "edge /health" 90 curl -sf -m 3 "$EDGE_URL/health"
 fi
 

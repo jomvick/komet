@@ -21,6 +21,8 @@ use gpui::{
     Task, Window, WindowControlArea, actions, div, prelude::*, px,
 };
 
+use komet_engine::InstanceLock;
+use komet_proto::{AuthState, WorkspaceScope};
 use komet_rpc::methods;
 use gpui_tokio::Tokio;
 
@@ -33,9 +35,9 @@ use crate::popover::{self, Loadable};
 use crate::rail;
 use crate::settings::accounts::AccountsPage;
 use crate::settings::appearance::AppearancePage;
-use crate::settings::harnesses::HarnessesPage;
 use crate::settings::archived::ArchivedPage;
 use crate::settings::devices::DevicesPage;
+use crate::settings::harnesses::HarnessesPage;
 use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
 use crate::settings::{
@@ -43,8 +45,8 @@ use crate::settings::{
     SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, TERMINAL_DEFAULT_HEIGHT, UiSettings, platform_combo,
 };
 use crate::state::{
-    AppState, ConnectionStatus, EngineBootConfig, GatePhase, Indicator, OrgRow, format_time_ago,
-    org_name_valid, parse_orgs, sort_memberships,
+    AppState, ConnectionStatus, EngineBootConfig, EngineMode, GatePhase, Indicator, OrgRow,
+    format_time_ago, org_name_valid, parse_orgs, sort_memberships,
 };
 use crate::terminal::panel::{TerminalPanel, ToggleTerminal, clamp_terminal_height};
 use crate::theme::Theme;
@@ -416,6 +418,139 @@ enum UpdateFlow {
     Failed(SharedString),
 }
 
+/// Account lifecycle owned by this process. Enabling sync never mutates the
+/// attached local engine; a new synced runtime is assembled only after quit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SyncFlow {
+    Idle,
+    Enabling,
+    Canceling,
+    RestartPending { notice_open: bool },
+    SignOutConfirm,
+    SigningOut,
+    SignedOutRestartRequired,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccountMenuAction {
+    EnableSync,
+    SyncInProgress,
+    RestartPending,
+    SignOut,
+}
+
+const RUNTIME_CHANGE_TIMEOUT: Duration = Duration::from_secs(10);
+const RUNTIME_CHANGE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Wait until a stopped daemon can no longer win the next bootstrap probe and
+/// has released the data directory for the replacement runtime.
+async fn wait_for_remote_engine_shutdown(
+    ipc_port: u16,
+    data_dir: &std::path::Path,
+    timeout: Duration,
+) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let port_closed = !matches!(
+            tokio::time::timeout(
+                Duration::from_millis(200),
+                tokio::net::TcpStream::connect(("127.0.0.1", ipc_port)),
+            )
+            .await,
+            Ok(Ok(_))
+        );
+        if port_closed && InstanceLock::holder(data_dir).is_none() {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "the daemon did not finish stopping within {} seconds",
+                timeout.as_secs()
+            ));
+        }
+        tokio::time::sleep(RUNTIME_CHANGE_POLL_INTERVAL).await;
+    }
+}
+
+/// Stop the engine that owns the synced profile and wait until a local runtime
+/// can safely acquire both its IPC port and data-directory lock.
+async fn stop_synced_runtime(
+    engine: crate::state::EngineHandle,
+    ipc_port: u16,
+    data_dir: &std::path::Path,
+) -> Result<(), String> {
+    let stop_error = if matches!(engine.mode(), EngineMode::Remote { .. }) {
+        engine
+            .client()
+            .call(methods::STOP_ENGINE, serde_json::json!({}))
+            .await
+            .err()
+            .map(|error| error.to_string())
+    } else {
+        None
+    };
+    engine.shutdown().await;
+    match wait_for_remote_engine_shutdown(ipc_port, data_dir, RUNTIME_CHANGE_TIMEOUT).await {
+        Ok(()) => Ok(()),
+        Err(error) => match stop_error {
+            Some(stop_error) => Err(format!("{stop_error}; {error}")),
+            None => Err(error),
+        },
+    }
+}
+
+fn account_menu_action(scope: Option<WorkspaceScope>, flow: SyncFlow) -> Option<AccountMenuAction> {
+    match scope {
+        Some(WorkspaceScope::Local) => match flow {
+            SyncFlow::Idle => Some(AccountMenuAction::EnableSync),
+            SyncFlow::Enabling | SyncFlow::Canceling => Some(AccountMenuAction::SyncInProgress),
+            SyncFlow::RestartPending { .. } => Some(AccountMenuAction::RestartPending),
+            SyncFlow::SignOutConfirm
+            | SyncFlow::SigningOut
+            | SyncFlow::SignedOutRestartRequired => None,
+        },
+        Some(WorkspaceScope::Synced) => match flow {
+            SyncFlow::SignedOutRestartRequired => None,
+            _ => Some(AccountMenuAction::SignOut),
+        },
+        Some(WorkspaceScope::Development) | None => None,
+    }
+}
+
+fn sync_flow_after_auth(
+    flow: SyncFlow,
+    scope: Option<WorkspaceScope>,
+    auth: Option<&AuthState>,
+) -> SyncFlow {
+    match scope {
+        Some(WorkspaceScope::Local) => match (flow, auth) {
+            // AuthStatus belongs to the runtime, not to the Shell that opened
+            // the browser. Every attached viewport must advertise the pending
+            // profile switch once any of them completes sign-in.
+            (SyncFlow::RestartPending { .. }, Some(AuthState::SignedOut)) => SyncFlow::Idle,
+            (SyncFlow::Canceling, Some(AuthState::SignedIn { .. })) => flow,
+            (SyncFlow::RestartPending { .. }, Some(AuthState::SignedIn { .. })) => flow,
+            (_, Some(AuthState::SignedIn { .. })) => SyncFlow::RestartPending { notice_open: true },
+            _ => flow,
+        },
+        Some(WorkspaceScope::Synced) => match auth {
+            // AuthStatus is shared by every viewport attached to the runtime.
+            // Once a synced store loses its credentials, every Shell must stop:
+            // letting another viewport sign in would authenticate a new account
+            // while the engine still serves the previous account's fixed store.
+            Some(AuthState::SignedOut) => SyncFlow::SignedOutRestartRequired,
+            _ => match flow {
+                SyncFlow::SignOutConfirm
+                | SyncFlow::SigningOut
+                | SyncFlow::SignedOutRestartRequired => flow,
+                _ => SyncFlow::Idle,
+            },
+        },
+        Some(WorkspaceScope::Development) => SyncFlow::Idle,
+        None => flow,
+    }
+}
+
 /// The "Create your workspace" gate (feature-inventory §1.2 OrgGate).
 struct OrgGateUi {
     name_input: Entity<ComposerInput>,
@@ -506,8 +641,11 @@ pub struct Shell {
     /// Cached: `detect_install` stats `current_exe` and this renders per frame.
     install: komet_update::InstallKind,
     org: Option<OrgGateUi>,
+    sync_flow: SyncFlow,
     mutate_task: Option<Task<()>>,
     auth_task: Option<Task<()>>,
+    runtime_change_task: Option<Task<()>>,
+    runtime_change_error: Option<SharedString>,
     /// Kept for the failed-gate "Retry" action.
     boot: EngineBootConfig,
     data_dir: PathBuf,
@@ -705,8 +843,11 @@ impl Shell {
             update_dismissed: None,
             install: komet_update::detect_install(),
             org: None,
+            sync_flow: SyncFlow::Idle,
             mutate_task: None,
             auth_task: None,
+            runtime_change_task: None,
+            runtime_change_error: None,
             boot,
             data_dir,
             settings,
@@ -744,6 +885,27 @@ impl Shell {
     // ---- splash ----
 
     fn on_state_changed(&mut self, state: &Entity<AppState>, cx: &mut Context<Self>) {
+        let next_sync_flow = {
+            let state = state.read(cx);
+            sync_flow_after_auth(self.sync_flow, state.workspace_scope, state.auth.as_ref())
+        };
+        if next_sync_flow != self.sync_flow {
+            self.sync_flow = next_sync_flow;
+            if matches!(self.sync_flow, SyncFlow::RestartPending { .. }) {
+                self.org = None;
+            }
+        }
+        let signed_out_synced = {
+            let state = state.read(cx);
+            state.workspace_scope == Some(WorkspaceScope::Synced)
+                && matches!(state.auth, Some(AuthState::SignedOut))
+        };
+        // AuthStatus is shared by every viewport. Whichever viewport owns the
+        // embedded runtime drains it; remote viewports request daemon shutdown
+        // and all of them independently reattach to the new local runtime.
+        if signed_out_synced && self.runtime_change_task.is_none() {
+            self.start_local_runtime_transition(false, cx);
+        }
         // Capture knob: the add-space palette needs only the device registry.
         if self.debug_dialog.as_deref() == Some("add-space") && !state.read(cx).devices.is_empty() {
             self.debug_dialog = None;
@@ -1447,28 +1609,192 @@ impl Shell {
         cx.notify();
     }
 
-    fn sign_out(&mut self, cx: &mut Context<Self>) {
+    fn request_sign_out(&mut self, cx: &mut Context<Self>) {
         self.close_user_menu(cx);
+        if self.state.read(cx).workspace_scope != Some(WorkspaceScope::Synced) {
+            return;
+        }
+        self.sync_flow = SyncFlow::SignOutConfirm;
+        cx.notify();
+    }
+
+    fn confirm_sign_out(&mut self, cx: &mut Context<Self>) {
+        self.start_local_runtime_transition(true, cx);
+    }
+
+    fn start_local_runtime_transition(&mut self, sign_out: bool, cx: &mut Context<Self>) {
+        if self.runtime_change_task.is_some() {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.runtime_change_error = Some("Engine not connected".into());
+            self.sync_flow = SyncFlow::SignedOutRestartRequired;
+            cx.notify();
+            return;
+        };
+        self.sync_flow = SyncFlow::SigningOut;
+        self.runtime_change_error = None;
+        let ipc_port = self.boot.ipc_port;
+        let data_dir = self.data_dir.clone();
+        let shutdown_dir = data_dir.clone();
+        let transition = Tokio::spawn(cx, async move {
+            if sign_out {
+                engine
+                    .client()
+                    .call(methods::SIGN_OUT, serde_json::json!({}))
+                    .await
+                    .map_err(|error| format!("Sign out failed: {error}"))?;
+            }
+            stop_synced_runtime(engine, ipc_port, &shutdown_dir).await
+        });
+        let state = self.state.clone();
+        let boot = self.boot.clone();
+        self.runtime_change_task = Some(cx.spawn(async move |this, cx| {
+            let result = match transition.await {
+                Ok(result) => result,
+                Err(error) => Err(error.to_string()),
+            };
+            this.update(cx, |shell, cx| {
+                shell.runtime_change_task = None;
+                match result {
+                    Ok(()) => {
+                        shell.sync_flow = SyncFlow::Idle;
+                        shell.runtime_change_error = None;
+                        shell.org = None;
+                        shell.route = Route::Chat;
+                        shell.space_boot_applied = false;
+                        state.update(cx, |state, cx| state.prepare_runtime_replacement(cx));
+                        AppState::bootstrap(state.clone(), boot, cx);
+                    }
+                    Err(error) => {
+                        shell.sync_flow = SyncFlow::SignedOutRestartRequired;
+                        shell.runtime_change_error = Some(error.into());
+                        cx.notify();
+                    }
+                }
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    fn cancel_auth_setup(&mut self, cx: &mut Context<Self>) {
+        let local = self.state.read(cx).workspace_scope == Some(WorkspaceScope::Local);
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
+        let pending_auth = self.auth_task.take();
+        let pending_org = self.org.as_mut().and_then(|org| org.task.take());
+        if local {
+            self.sync_flow = SyncFlow::Canceling;
+        }
         self.auth_task = Some(cx.spawn(async move |this, cx| {
-            if let Err(err) = engine
+            // Do not race SignOut against an exchange or organization write
+            // that can still persist a session after credentials were cleared.
+            if let Some(task) = pending_auth {
+                task.await;
+            }
+            if let Some(task) = pending_org {
+                task.await;
+            }
+            let result = engine
                 .client()
                 .call(methods::SIGN_OUT, serde_json::json!({}))
+                .await;
+            this.update(cx, |shell, cx| {
+                match result {
+                    Ok(_) => {
+                        shell.org = None;
+                        if local {
+                            shell.sync_flow = SyncFlow::Idle;
+                        }
+                    }
+                    Err(err) => {
+                        if local {
+                            shell.sync_flow = SyncFlow::Enabling;
+                        }
+                        shell.sidebar_notice =
+                            Some(format!("Could not cancel sign-in: {err}").into());
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+        cx.notify();
+    }
+
+    fn postpone_sync_restart(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.sync_flow, SyncFlow::RestartPending { .. }) {
+            self.sync_flow = SyncFlow::RestartPending { notice_open: false };
+            cx.notify();
+        }
+    }
+
+    fn reopen_sync_notice(&mut self, cx: &mut Context<Self>) {
+        self.close_user_menu(cx);
+        if matches!(self.sync_flow, SyncFlow::RestartPending { .. }) {
+            self.sync_flow = SyncFlow::RestartPending { notice_open: true };
+            cx.notify();
+        }
+    }
+
+    fn quit_for_runtime_change(&mut self, cx: &mut Context<Self>) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.runtime_change_error = Some("Engine not connected".into());
+            cx.notify();
+            return;
+        };
+        if engine.mode() == EngineMode::InProcess {
+            cx.quit();
+            return;
+        }
+        if self.runtime_change_task.is_some() {
+            return;
+        }
+
+        self.runtime_change_error = None;
+        let ipc_port = self.boot.ipc_port;
+        let data_dir = self.data_dir.clone();
+        let shutdown = Tokio::spawn(cx, async move {
+            engine
+                .client()
+                .call(methods::STOP_ENGINE, serde_json::json!({}))
                 .await
-            {
-                this.update(cx, |shell, cx| {
-                    shell.sidebar_notice = Some(format!("Sign out failed: {err}").into());
-                    cx.notify();
-                })
-                .ok();
-            }
+                .map_err(|err| err.to_string())?;
+            wait_for_remote_engine_shutdown(ipc_port, &data_dir, RUNTIME_CHANGE_TIMEOUT).await
+        });
+        self.runtime_change_task = Some(cx.spawn(async move |this, cx| {
+            let result = match shutdown.await {
+                Ok(result) => result,
+                Err(err) => Err(err.to_string()),
+            };
+            this.update(cx, |shell, cx| {
+                shell.runtime_change_task = None;
+                match result {
+                    Ok(_) => cx.quit(),
+                    Err(err) => {
+                        shell.runtime_change_error = Some(format!(
+                            "Could not stop the remote engine: {err}. Run `komet daemon stop`, then quit and reopen Komet."
+                        ).into());
+                        cx.notify();
+                    }
+                }
+            })
+            .ok();
         }));
         cx.notify();
     }
 
     fn start_sign_in(&mut self, cx: &mut Context<Self>) {
+        let scope = self.state.read(cx).workspace_scope;
+        if scope == Some(WorkspaceScope::Development) {
+            return;
+        }
+        self.close_user_menu(cx);
+        if scope == Some(WorkspaceScope::Local) {
+            self.sync_flow = SyncFlow::Enabling;
+        }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
@@ -1482,14 +1808,20 @@ impl Shell {
                     if let Some(url) = value.get("url").and_then(|u| u.as_str()) {
                         cx.open_url(url);
                     }
+                    cx.notify();
                 }
                 Err(err) => {
+                    if scope == Some(WorkspaceScope::Local) && shell.sync_flow == SyncFlow::Enabling
+                    {
+                        shell.sync_flow = SyncFlow::Idle;
+                    }
                     shell.sidebar_notice = Some(format!("Sign in failed: {err}").into());
                     cx.notify();
                 }
             })
             .ok();
         }));
+        cx.notify();
     }
 
     // ---- org gate ----
@@ -2305,7 +2637,10 @@ impl Shell {
     /// section (folder + device rows, add-space), the global Active sessions
     /// list, the notice strip, and the UserMenu (§1.6).
     fn render_chat_sidebar(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let user = self.state.read(cx).auth_user().cloned();
+        let (user, workspace_scope) = {
+            let state = self.state.read(cx);
+            (state.auth_user().cloned(), state.workspace_scope)
+        };
 
         // Keyed rows: (stable key, estimated height, element) — the key + height
         // list drives the §1.6 resort FLIP diff below (attention-bucket
@@ -2365,12 +2700,38 @@ impl Shell {
         // t3code's archived accordion, below the active list.
         let archived_section = self.render_archived_section(theme, cx);
 
-        let user_line: SharedString = user
-            .as_ref()
-            .map(|u| u.name.clone().unwrap_or_else(|| u.email.clone()).into())
-            .unwrap_or_else(|| SharedString::from("Not signed in"));
-        let user_email: Option<SharedString> = user.as_ref().map(|u| u.email.clone().into());
-        let user_menu = self.render_user_menu(user_line.clone(), user_email.clone(), theme, cx);
+        let (user_line, trigger_subline, menu_identity): (
+            SharedString,
+            Option<SharedString>,
+            SharedString,
+        ) = match workspace_scope {
+            Some(WorkspaceScope::Local) => {
+                let line = if matches!(self.sync_flow, SyncFlow::RestartPending { .. }) {
+                    "Sync ready after restart"
+                } else {
+                    "Local only"
+                };
+                (line.into(), None, "Stored on this device".into())
+            }
+            Some(WorkspaceScope::Development) => (
+                "Development".into(),
+                Some("Local development runtime".into()),
+                "Authentication disabled".into(),
+            ),
+            Some(WorkspaceScope::Synced) | None => {
+                let line: SharedString = user
+                    .as_ref()
+                    .map(|u| u.name.clone().unwrap_or_else(|| u.email.clone()).into())
+                    .unwrap_or_else(|| SharedString::from("Not signed in"));
+                let email = user
+                    .as_ref()
+                    .map(|u| SharedString::from(u.email.clone()))
+                    .unwrap_or_else(|| line.clone());
+                (line, Some("Alpha".into()), email)
+            }
+        };
+        let user_menu =
+            self.render_user_menu(user_line.clone(), trigger_subline, menu_identity, theme, cx);
 
         // The space filter lives ABOVE the scroll region (fixed) so its
         // dropdown can float without being clipped by the list's overflow.
@@ -2610,18 +2971,20 @@ impl Shell {
         }
     }
 
-    /// UserMenu (§1.6): name/email trigger row; menu with plan badge, Open
-    /// settings, Sign out.
+    /// Scope-aware sidebar identity and account menu. Local runtimes advertise
+    /// their storage boundary and offer sync; synced runtimes offer sign-out.
     fn render_user_menu(
         &mut self,
         user_line: SharedString,
-        user_email: Option<SharedString>,
+        trigger_subline: Option<SharedString>,
+        menu_identity: SharedString,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let open = self.user_menu.is_open();
-        // Bottom-of-sidebar identity (komet user-menu.tsx): avatar circle +
-        // name with the plan label underneath, Alpha badge chip on the right.
+        let action = account_menu_action(self.state.read(cx).workspace_scope, self.sync_flow);
+        // Bottom-of-sidebar identity: avatar circle + scope/account label and
+        // its secondary status line.
         let initial: SharedString = user_line
             .chars()
             .next()
@@ -2682,7 +3045,7 @@ impl Shell {
                     .child(initial),
             )
             .child(
-                // Name with the plan label underneath — no chip on the right.
+                // Name with an optional status line underneath — no chip on the right.
                 div()
                     .flex_1()
                     .min_w_0()
@@ -2697,13 +3060,15 @@ impl Shell {
                             .truncate()
                             .child(user_line.clone()),
                     )
-                    .child(
-                        div()
-                            .text_size(px(11.0))
-                            .line_height(px(15.0))
-                            .text_color(theme.text_muted)
-                            .child(SharedString::from("Alpha")),
-                    ),
+                    .when_some(trigger_subline, |identity, subline| {
+                        identity.child(
+                            div()
+                                .text_size(px(11.0))
+                                .line_height(px(15.0))
+                                .text_color(theme.text_muted)
+                                .child(subline),
+                        )
+                    }),
             );
         if self.user_menu.get().is_some() {
             let closing = self.user_menu.closing_since();
@@ -2711,9 +3076,7 @@ impl Shell {
             // (exactly as wide as the trigger row — sidebar minus its p-2
             // gutters), `flex-col gap-0.5`, then: one small muted email line
             // (`px-2 pb-1 pt-1.5 text-[11px] text-muted-foreground/70`),
-            // "Settings", separator, "Sign out". Both rows are plain
-            // `menuItem`s with muted 16px icons — sign-out carries NO
-            // destructive tone in the original.
+            // the action selected by the runtime scope, then "Settings".
             let menu = popover::popover_card(theme)
                 .w(px(self.settings.sidebar_width - 2.0 * Theme::SPACE_SM))
                 .on_mouse_down_out(cx.listener(|this, _, _, cx| {
@@ -2730,8 +3093,61 @@ impl Shell {
                         .text_size(px(11.0))
                         .text_color(theme.text_muted.opacity(0.7))
                         .truncate()
-                        .child(user_email.unwrap_or(user_line)),
+                        .child(menu_identity),
                 )
+                .when_some(action, |menu, action| {
+                    let row = match action {
+                        AccountMenuAction::EnableSync => {
+                            popover::menu_row(theme, false, "user-menu-enable-sync")
+                                .id("user-menu-enable-sync")
+                                .on_click(cx.listener(|this, _, _, cx| this.start_sign_in(cx)))
+                                .child(
+                                    icon(icons::GLOBAL)
+                                        .size(px(16.0))
+                                        .text_color(theme.text_muted),
+                                )
+                                .child(SharedString::from("Enable sync"))
+                                .into_any_element()
+                        }
+                        AccountMenuAction::SyncInProgress => {
+                            popover::menu_row(theme, false, "user-menu-sync-progress")
+                                .id("user-menu-sync-progress")
+                                .opacity(0.6)
+                                .child(
+                                    icon(icons::GLOBAL)
+                                        .size(px(16.0))
+                                        .text_color(theme.text_muted),
+                                )
+                                .child(SharedString::from("Sync setup in progress"))
+                                .into_any_element()
+                        }
+                        AccountMenuAction::RestartPending => {
+                            popover::menu_row(theme, false, "user-menu-sync-restart")
+                                .id("user-menu-sync-restart")
+                                .on_click(cx.listener(|this, _, _, cx| this.reopen_sync_notice(cx)))
+                                .child(
+                                    icon(icons::RESTART)
+                                        .size(px(16.0))
+                                        .text_color(theme.text_muted),
+                                )
+                                .child(SharedString::from("Sync ready after restart"))
+                                .into_any_element()
+                        }
+                        AccountMenuAction::SignOut => {
+                            popover::menu_row(theme, false, "user-menu-signout")
+                                .id("user-menu-signout")
+                                .on_click(cx.listener(|this, _, _, cx| this.request_sign_out(cx)))
+                                .child(
+                                    icon(icons::LOGOUT_2)
+                                        .size(px(16.0))
+                                        .text_color(theme.text_muted),
+                                )
+                                .child(SharedString::from("Sign out"))
+                                .into_any_element()
+                        }
+                    };
+                    menu.child(row).child(popover::menu_separator())
+                })
                 .child(
                     popover::menu_row(theme, false, "user-menu-settings")
                         .id("user-menu-settings")
@@ -2745,18 +3161,6 @@ impl Shell {
                         )
                         .child(SharedString::from("Settings")),
                 )
-                .child(popover::menu_separator())
-                .child(
-                    popover::menu_row(theme, false, "user-menu-signout")
-                        .id("user-menu-signout")
-                        .on_click(cx.listener(|this, _, _, cx| this.sign_out(cx)))
-                        .child(
-                            icon(icons::LOGOUT_2)
-                                .size(px(16.0))
-                                .text_color(theme.text_muted),
-                        )
-                        .child(SharedString::from("Sign out")),
-                )
                 .into_any_element();
             trigger =
                 trigger.child(popover::anchored_menu_above("user-menu-popover", menu, closing));
@@ -2764,8 +3168,176 @@ impl Shell {
         trigger.into_any_element()
     }
 
-    /// Floating layers owned by the shell: the session context menu and the
-    /// rename / delete-confirm dialogs.
+    fn render_sync_overlay(
+        &mut self,
+        viewport: gpui::Size<Pixels>,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let theme = Theme::of(cx).clone();
+        let needs_org = matches!(
+            self.state.read(cx).auth.as_ref(),
+            Some(AuthState::NeedsOrganization { .. })
+        );
+        let remote_engine = self
+            .state
+            .read(cx)
+            .engine()
+            .is_some_and(|engine| matches!(engine.mode(), EngineMode::Remote { .. }));
+        let runtime_change_label = if self.runtime_change_task.is_some() {
+            "Stopping engine…"
+        } else if remote_engine {
+            "Stop daemon and quit"
+        } else {
+            "Quit Komet"
+        };
+
+        if self.sync_flow == SyncFlow::Enabling && needs_org {
+            return Some(self.render_org_gate(cx));
+        }
+
+        let card = match self.sync_flow {
+            SyncFlow::Enabling => popover::dialog_card(&theme)
+                .child(popover::dialog_title(&theme, "Enable sync"))
+                .child(
+                    div().mt(px(6.0)).child(popover::dialog_body(
+                        &theme,
+                        "Finish signing in in your browser. Komet will keep using this local workspace until you quit and reopen.",
+                    )),
+                )
+                .child(
+                    div()
+                        .mt(px(16.0))
+                        .flex()
+                        .flex_row()
+                        .justify_end()
+                        .gap(px(8.0))
+                        .child(
+                            popover::btn_ghost(&theme, "Cancel", "sync-enable-cancel")
+                                .id("sync-enable-cancel")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.cancel_auth_setup(cx)
+                                })),
+                        )
+                        .child(
+                            popover::btn_primary(&theme, "Open browser again")
+                                .id("sync-enable-open-browser")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.start_sign_in(cx)
+                                })),
+                        ),
+                )
+                .into_any_element(),
+            SyncFlow::Canceling => popover::dialog_card(&theme)
+                .child(popover::dialog_title(&theme, "Canceling sync setup…"))
+                .child(
+                    div().mt(px(6.0)).child(popover::dialog_body(
+                        &theme,
+                        "Removing the partial sign-in before returning to your local workspace.",
+                    )),
+                )
+                .into_any_element(),
+            SyncFlow::RestartPending { notice_open: true } => popover::dialog_card(&theme)
+                .child(popover::dialog_title(
+                    &theme,
+                    "Sync is ready after restart",
+                ))
+                .child(
+                    div().mt(px(6.0)).child(popover::dialog_body(
+                        &theme,
+                        if remote_engine {
+                            "Komet is using a background daemon. Stop it and quit Komet, then reopen to start the synced workspace. Existing local sessions stay on this device and will not be uploaded."
+                        } else {
+                            "Quit and reopen Komet to start the synced workspace. Existing local sessions stay on this device and will not be uploaded."
+                        },
+                    )),
+                )
+                .when_some(self.runtime_change_error.clone(), |card, error| {
+                    card.child(
+                        div()
+                            .mt(px(10.0))
+                            .text_size(px(12.0))
+                            .line_height(px(17.0))
+                            .text_color(theme.danger)
+                            .child(error),
+                    )
+                })
+                .child(
+                    div()
+                        .mt(px(16.0))
+                        .flex()
+                        .flex_row()
+                        .justify_end()
+                        .gap(px(8.0))
+                        .child(
+                            popover::btn_ghost(&theme, "Later", "sync-restart-later")
+                                .id("sync-restart-later")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.postpone_sync_restart(cx)
+                                })),
+                        )
+                        .child(
+                            popover::btn_primary(&theme, runtime_change_label)
+                                .id("sync-restart-quit")
+                                .when(self.runtime_change_task.is_some(), |button| {
+                                    button.opacity(0.6)
+                                })
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.quit_for_runtime_change(cx)
+                                })),
+                        ),
+                )
+                .into_any_element(),
+            SyncFlow::SignOutConfirm => popover::dialog_card(&theme)
+                .child(popover::dialog_title(&theme, "Sign out?"))
+                .child(
+                    div().mt(px(6.0)).child(popover::dialog_body(
+                        &theme,
+                        "Komet will remove your credentials, close the synced workspace, and continue in local mode.",
+                    )),
+                )
+                .child(
+                    div()
+                        .mt(px(16.0))
+                        .flex()
+                        .flex_row()
+                        .justify_end()
+                        .gap(px(8.0))
+                        .child(
+                            popover::btn_ghost(&theme, "Cancel", "signout-cancel")
+                                .id("signout-cancel")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.sync_flow = SyncFlow::Idle;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            popover::btn_danger(&theme, "Sign out")
+                                .id("signout-confirm")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.confirm_sign_out(cx)
+                                })),
+                        ),
+                )
+                .into_any_element(),
+            SyncFlow::SigningOut => popover::dialog_card(&theme)
+                .child(popover::dialog_title(&theme, "Signing out…"))
+                .child(
+                    div().mt(px(6.0)).child(popover::dialog_body(
+                        &theme,
+                        "Removing account credentials and closing the synced workspace.",
+                    )),
+                )
+                .into_any_element(),
+            SyncFlow::Idle
+            | SyncFlow::RestartPending { notice_open: false }
+            | SyncFlow::SignedOutRestartRequired => return None,
+        };
+
+        Some(popover::modal("sync-lifecycle-dialog", viewport, card))
+    }
+
+    /// Floating layers owned by the shell: context menus, edit dialogs, and
+    /// the local-to-synced account lifecycle.
     fn render_overlays(
         &mut self,
         viewport: gpui::Size<Pixels>,
@@ -2929,6 +3501,10 @@ impl Shell {
             overlays.push(popover::modal("delete-chat-dialog", viewport, card));
         }
 
+        if let Some(sync) = self.render_sync_overlay(viewport, cx) {
+            overlays.push(sync);
+        }
+
         overlays
     }
 
@@ -3049,20 +3625,6 @@ impl Shell {
                                 .id("onboarding-add-space")
                                 .mt(px(20.0))
                                 .on_click(cx.listener(|this, _, _, cx| this.open_add_space(cx))),
-                        )
-                        .child(
-                            div()
-                                .id("onboarding-no-project")
-                                .mt(px(10.0))
-                                .text_size(px(12.0))
-                                .text_color(theme.text_muted.opacity(0.6))
-                                .cursor_pointer()
-                                .hover(|s| s.text_color(theme.text_muted))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.state
-                                        .update(cx, |s, cx| s.select_space(None, cx));
-                                }))
-                                .child(SharedString::from("Or start without a project")),
                         ),
                 ))
                 .into_any_element()
@@ -3512,6 +4074,90 @@ impl Shell {
         )
     }
 
+    fn render_signed_out_restart(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::of(cx).clone();
+        let runtime_change_label = if self.runtime_change_task.is_some() {
+            "Stopping engine…"
+        } else {
+            "Retry local mode"
+        };
+        let card = div()
+            .w(px(380.0))
+            .px(px(32.0))
+            .py(px(40.0))
+            .rounded(px(12.0))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.surface_card)
+            .shadow_lg()
+            .flex()
+            .flex_col()
+            .items_center()
+            .text_center()
+            .child(
+                icon(icons::KOMET_LOGO)
+                    .w(px(31.4))
+                    .h(px(36.0))
+                    .text_color(theme.text),
+            )
+            .child(
+                div()
+                    .mt(px(24.0))
+                    .text_size(px(18.0))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme.text)
+                    .child(SharedString::from("Signed out")),
+            )
+            .child(
+                div()
+                    .mt(px(6.0))
+                    .mb(px(24.0))
+                    .text_size(px(13.0))
+                    .line_height(px(19.0))
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from(
+                        "Komet removed your credentials but could not finish closing the previous synced workspace. Retry before continuing in local mode.",
+                    )),
+            )
+            .when_some(self.runtime_change_error.clone(), |card, error| {
+                card.child(
+                    div()
+                        .mb(px(16.0))
+                        .text_size(px(12.0))
+                        .line_height(px(17.0))
+                        .text_color(theme.danger)
+                        .child(error),
+                )
+            })
+            .child(
+                popover::btn_primary(&theme, runtime_change_label)
+                    .id("signed-out-quit")
+                    .when(self.runtime_change_task.is_some(), |button| {
+                        button.opacity(0.6)
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.start_local_runtime_transition(false, cx)
+                    })),
+            );
+
+        div()
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(theme.bg)
+            .child(grid_backdrop(&theme))
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(motion::fade_in("signed-out-restart", card)),
+            )
+            .into_any_element()
+    }
+
     /// Toggle the changes-panel takeover (the header's expand button, t3code
     /// parity): the panel grows to fill everything right of the sidebar,
     /// hiding the conversation column; toggling back restores the saved
@@ -3641,11 +4287,12 @@ impl Shell {
             .into_any_element()
     }
 
-    /// The OrgGate ("Create your workspace"): name form + existing memberships
-    /// + "Use a different account" (feature-inventory §1.2).
+    /// Organization onboarding used by the synced gate and, for a local
+    /// runtime, only after the user explicitly starts the sync opt-in.
     fn render_org_gate(&mut self, cx: &mut Context<Self>) -> AnyElement {
         self.ensure_org_ui(cx);
         let theme = Theme::of(cx).clone();
+        let local_setup = self.state.read(cx).workspace_scope == Some(WorkspaceScope::Local);
         let Some(org) = self.org.as_ref() else {
             return Empty.into_any_element();
         };
@@ -3840,14 +4487,19 @@ impl Shell {
                         .text_color(theme.text_muted.opacity(0.6))
                         .cursor_pointer()
                         .hover(|s| s.text_color(theme.text))
-                        .on_click(cx.listener(|this, _, _, cx| this.sign_out(cx)))
-                        .child(SharedString::from("Use a different account")),
+                        .on_click(cx.listener(|this, _, _, cx| this.cancel_auth_setup(cx)))
+                        .child(SharedString::from(if local_setup {
+                            "Cancel sync setup"
+                        } else {
+                            "Use a different account"
+                        })),
                 ),
             );
 
         div()
-            .size_full()
-            .relative()
+            .absolute()
+            .inset_0()
+            .occlude()
             .bg(theme.bg)
             .child(grid_backdrop(&theme))
             .child(
@@ -4129,6 +4781,12 @@ impl Render for Shell {
         // frost paints translucent — the sidebar and card margins read as
         // glass while the opaque card keeps text off it.
         let (frost, text, font) = (theme.glass(), theme.text, theme.font_sans.clone());
+        let (workspace_scope, auth) = {
+            let state = self.state.read(cx);
+            (state.workspace_scope, state.auth.clone())
+        };
+        self.sync_flow = sync_flow_after_auth(self.sync_flow, workspace_scope, auth.as_ref());
+        let restart_required = self.sync_flow == SyncFlow::SignedOutRestartRequired;
         let gate = self
             .debug_gate
             .clone()
@@ -4167,7 +4825,8 @@ impl Render for Shell {
                 }
             }));
         }
-        if matches!(gate, GatePhase::Ready)
+        if !restart_required
+            && matches!(gate, GatePhase::Ready)
             && matches!(self.route, Route::Chat)
             && window.focused(cx).is_none()
         {
@@ -4211,7 +4870,12 @@ impl Render for Shell {
                 }
             }));
 
-        let root = match &gate {
+        let render_gate = if restart_required {
+            GatePhase::Loading
+        } else {
+            gate.clone()
+        };
+        let root = match &render_gate {
             GatePhase::Ready => {
                 // Focus is a sync signal: on the rising edge of window
                 // activation, nudge every open room to verify liveness — a
@@ -4371,6 +5035,12 @@ impl Render for Shell {
                 root.child(card)
             }
         };
+        let root = if restart_required {
+            let restart = self.render_signed_out_restart(cx);
+            root.child(restart)
+        } else {
+            root
+        };
 
         // A manually-driven tween is mid-flight: keep frames coming (the same
         // scheduling `with_animation` would have requested). Hover color fades
@@ -4399,7 +5069,9 @@ impl Render for Shell {
         // keep them above the splash and every auth/org/error gate as well as
         // the full application. Gate pages also need a native drag surface
         // because they do not render the unified tabs/settings titlebar.
-        let root = if matches!(gate, GatePhase::Ready) || !cfg!(target_os = "windows") {
+        let root = if (!restart_required && matches!(gate, GatePhase::Ready))
+            || !cfg!(target_os = "windows")
+        {
             root
         } else {
             root.child(
@@ -4419,6 +5091,217 @@ impl Render for Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn remote_shutdown_waits_for_ipc_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            drop(listener);
+        });
+
+        wait_for_remote_engine_shutdown(port, dir.path(), Duration::from_secs(2))
+            .await
+            .unwrap();
+        release.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn signed_out_synced_runtime_stops_and_reboots_local() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("session.json"),
+            r#"{"refreshToken":"still-valid","user":{"id":"user_1","email":"u@example.com"},"orgId":"org_1"}"#,
+        )
+        .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let boot = EngineBootConfig {
+            data_dir: dir.path().to_path_buf(),
+            ipc_port: port,
+            edge_url: "http://127.0.0.1:1".into(),
+            edge_token: None,
+            org_id: None,
+            workos_client_id: Some("client_test".into()),
+            default_harness: komet_proto::HarnessId::Mock,
+        };
+        let synced = crate::state::EngineHandle::bootstrap(boot.clone())
+            .await
+            .expect("saved session opens its synced profile");
+        assert_eq!(
+            synced.engine_info().workspace_scope,
+            WorkspaceScope::Synced
+        );
+
+        synced
+            .client()
+            .call(methods::SIGN_OUT, serde_json::json!({}))
+            .await
+            .expect("sign out clears credentials");
+        stop_synced_runtime(synced, port, dir.path())
+            .await
+            .expect("synced runtime drains and releases ownership");
+
+        assert!(!dir.path().join("session.json").exists());
+        let local = crate::state::EngineHandle::bootstrap(boot)
+            .await
+            .expect("same process can continue locally");
+        assert_eq!(local.engine_info().workspace_scope, WorkspaceScope::Local);
+        local.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn remote_shutdown_waits_for_engine_lock_release() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = InstanceLock::acquire(dir.path()).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let lock_released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let released_by_task = lock_released.clone();
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            drop(lock);
+            released_by_task.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        wait_for_remote_engine_shutdown(port, dir.path(), Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert!(lock_released.load(std::sync::atomic::Ordering::SeqCst));
+        release.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_shutdown_times_out_while_ipc_remains_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let error = wait_for_remote_engine_shutdown(port, dir.path(), Duration::from_millis(100))
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("did not finish stopping"));
+        drop(listener);
+    }
+
+    #[test]
+    fn account_actions_follow_the_attached_workspace_scope() {
+        assert_eq!(
+            account_menu_action(Some(WorkspaceScope::Local), SyncFlow::Idle),
+            Some(AccountMenuAction::EnableSync)
+        );
+        assert_eq!(
+            account_menu_action(Some(WorkspaceScope::Synced), SyncFlow::Idle),
+            Some(AccountMenuAction::SignOut)
+        );
+        assert_eq!(
+            account_menu_action(Some(WorkspaceScope::Development), SyncFlow::Idle),
+            None
+        );
+    }
+
+    #[test]
+    fn local_sign_in_waits_for_a_new_runtime_before_syncing() {
+        let signed_in = AuthState::SignedIn {
+            user: komet_proto::UserProfile {
+                id: "user-1".into(),
+                email: "user@example.com".into(),
+                name: None,
+            },
+            org_id: Some("org-1".into()),
+        };
+
+        assert_eq!(
+            sync_flow_after_auth(
+                SyncFlow::Enabling,
+                Some(WorkspaceScope::Local),
+                Some(&signed_in),
+            ),
+            SyncFlow::RestartPending { notice_open: true }
+        );
+        assert_eq!(
+            sync_flow_after_auth(
+                SyncFlow::Idle,
+                Some(WorkspaceScope::Local),
+                Some(&signed_in),
+            ),
+            SyncFlow::RestartPending { notice_open: true },
+            "another viewport derives the pending restart from AuthStatus"
+        );
+        assert_eq!(
+            sync_flow_after_auth(
+                SyncFlow::RestartPending { notice_open: false },
+                Some(WorkspaceScope::Local),
+                Some(&signed_in),
+            ),
+            SyncFlow::RestartPending { notice_open: false },
+            "shared auth updates do not reopen a postponed notice"
+        );
+        assert_eq!(
+            account_menu_action(
+                Some(WorkspaceScope::Local),
+                SyncFlow::RestartPending { notice_open: false },
+            ),
+            Some(AccountMenuAction::RestartPending)
+        );
+        for notice_open in [true, false] {
+            assert_eq!(
+                sync_flow_after_auth(
+                    SyncFlow::RestartPending { notice_open },
+                    Some(WorkspaceScope::Local),
+                    Some(&AuthState::SignedOut),
+                ),
+                SyncFlow::Idle,
+                "revoked credentials cancel the pending synced restart"
+            );
+        }
+    }
+
+    #[test]
+    fn synced_sign_out_blocks_every_viewport_and_cannot_switch_accounts() {
+        let signed_in_as_another_user = AuthState::SignedIn {
+            user: komet_proto::UserProfile {
+                id: "user-2".into(),
+                email: "other@example.com".into(),
+                name: None,
+            },
+            org_id: Some("org-2".into()),
+        };
+
+        assert_eq!(
+            sync_flow_after_auth(
+                SyncFlow::SigningOut,
+                Some(WorkspaceScope::Synced),
+                Some(&AuthState::SignedOut),
+            ),
+            SyncFlow::SignedOutRestartRequired,
+            "the viewport that requested sign-out is blocked by AuthStatus"
+        );
+        assert_eq!(
+            sync_flow_after_auth(
+                SyncFlow::Idle,
+                Some(WorkspaceScope::Synced),
+                Some(&AuthState::SignedOut),
+            ),
+            SyncFlow::SignedOutRestartRequired,
+            "another viewport observing the same runtime is also blocked"
+        );
+        assert_eq!(
+            sync_flow_after_auth(
+                SyncFlow::SignedOutRestartRequired,
+                Some(WorkspaceScope::Synced),
+                Some(&signed_in_as_another_user),
+            ),
+            SyncFlow::SignedOutRestartRequired,
+            "new credentials cannot reopen the previous account's store"
+        );
+    }
 
     #[test]
     fn titlebar_cluster_matches_komet_window_controls() {

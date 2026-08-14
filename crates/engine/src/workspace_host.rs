@@ -66,6 +66,24 @@ const SNAPSHOT_DEBOUNCE_MS: u64 = 1_000;
 /// their retries into a thundering herd on the cold DO.
 pub(crate) const JOIN_RETRY_BASE: std::time::Duration = std::time::Duration::from_millis(500);
 pub(crate) const JOIN_RETRY_CAP: std::time::Duration = std::time::Duration::from_secs(30);
+
+pub(crate) async fn token_changed(changes: &mut Option<tokio::sync::watch::Receiver<u64>>) {
+    match changes {
+        Some(changes) => {
+            let _ = changes.changed().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
+async fn token_revoked(token: &Option<Arc<dyn komet_rpc::TokenSource>>) -> bool {
+    match token {
+        Some(token) => token.token().await.is_none(),
+        // Fixed test/dev URLs have no revocable credential source.
+        None => false,
+    }
+}
+
 /// Quiet-probe cadence for the registry room: fixed at 15 minutes. One room
 /// per engine, so the fixed cadence costs ~100 DO wakes/day total, and the
 /// probe is deadline-checked — a mute room is detected within
@@ -213,7 +231,8 @@ impl WorkspaceHost {
         store.delete_snapshot(LEGACY_WORKSPACE_DOC_ID).ok();
 
         // Boot: upsert our own device row. A user-set name (RenameDevice is LWW from
-        // any device) survives restarts — only a missing row gets the hostname.
+        // any device) survives restarts. The old fallback sentinel is repaired with
+        // the platform-resolved name because it was never a user-selected name.
         let now = Utc::now();
         let existing = doc
             .read_devices()?
@@ -221,11 +240,10 @@ impl WorkspaceHost {
             .find(|d| d.id == config.device_id);
         doc.upsert_device(&Device {
             id: config.device_id.clone(),
-            name: existing
-                .as_ref()
-                .map(|d| d.name.clone())
-                .filter(|n| !n.is_empty())
-                .unwrap_or_else(|| config.device_name.clone()),
+            name: device_name_on_boot(
+                existing.as_ref().map(|device| device.name.as_str()),
+                &config.device_name,
+            ),
             platform: config.platform.clone(),
             last_seen_at: Some(now),
             // First registration stamps `createdAt`; restarts keep the original
@@ -279,7 +297,7 @@ impl WorkspaceHost {
         let org_id = self.inner.config.org_id.clone();
         // Per-dial URL provider: the bearer is re-read on every (re)connect.
         let url = edge.room_url(format!("/registry/{org_id}/ws"));
-        self.spawn_join(url);
+        self.spawn_join(url, edge.token_changes(), Some(edge.token.clone()));
     }
 
     /// Test seam: join a registry room at a fixed WebSocket URL without an
@@ -287,15 +305,25 @@ impl WorkspaceHost {
     /// server through this. Production always goes through [`Self::join_room`].
     #[doc(hidden)]
     pub fn connect_registry_url(&self, url: &str) {
-        self.spawn_join(Arc::new(komet_sync::StaticUrl(url.to_string())));
+        self.spawn_join(
+            Arc::new(komet_sync::StaticUrl(url.to_string())),
+            None,
+            None,
+        );
     }
 
-    fn spawn_join(&self, url: Arc<dyn komet_sync::UrlProvider>) {
+    fn spawn_join(
+        &self,
+        url: Arc<dyn komet_sync::UrlProvider>,
+        mut token_changes: Option<tokio::sync::watch::Receiver<u64>>,
+        token: Option<Arc<dyn komet_rpc::TokenSource>>,
+    ) {
         let org_id = self.inner.config.org_id.clone();
         let reg = self.inner.reg.clone();
         let device_id = self.inner.config.device_id.clone();
         let weak = Arc::downgrade(&self.inner);
         tokio::spawn(async move {
+            let mut wake = komet_sync::wake::subscribe();
             // `RegistryClient` only self-reconnects AFTER a first successful
             // join; an INITIAL failure (a 500 from an overloaded DO, a token
             // racing a refresh, an edge deploy) must not end this task and
@@ -321,28 +349,43 @@ impl WorkspaceHost {
                         let client = Arc::new(client);
                         client.set_presence(now_ms());
                         let mut events = client.events();
+                        if token_revoked(&token).await {
+                            return;
+                        }
                         let Some(inner) = weak.upgrade() else { return };
-                        *lock(&inner.room) = Some(client);
+                        *lock(&inner.room) = Some(client.clone());
                         inner.bump_changed();
                         tracing::info!(org = %org_id, "registry room joined");
                         drop(inner);
+                        // The slot is the sole owner. This lets engine-level
+                        // revocation close the socket synchronously by taking it.
+                        drop(client);
                         // The event pump lives for the client's whole life
                         // (across its self-reconnects); it ends only when the
                         // client is dropped at host teardown.
                         loop {
-                            match events.recv().await {
-                                Ok(komet_sync::RegistryEvent::Applied)
-                                | Ok(komet_sync::RegistryEvent::Connected) => {
-                                    let Some(inner) = weak.upgrade() else { return };
-                                    inner.bump_changed();
+                            tokio::select! {
+                                event = events.recv() => match event {
+                                    Ok(komet_sync::RegistryEvent::Applied)
+                                    | Ok(komet_sync::RegistryEvent::Connected) => {
+                                        let Some(inner) = weak.upgrade() else { return };
+                                        inner.bump_changed();
+                                    }
+                                    Ok(komet_sync::RegistryEvent::Presence) => {
+                                        let Some(inner) = weak.upgrade() else { return };
+                                        inner.publish();
+                                    }
+                                    Ok(komet_sync::RegistryEvent::Disconnected) => {}
+                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                                },
+                                _ = token_changed(&mut token_changes) => {
+                                    if token_revoked(&token).await {
+                                        tracing::info!(org = %org_id,
+                                            "registry credentials removed; leaving room");
+                                        break;
+                                    }
                                 }
-                                Ok(komet_sync::RegistryEvent::Presence) => {
-                                    let Some(inner) = weak.upgrade() else { return };
-                                    inner.publish();
-                                }
-                                Ok(komet_sync::RegistryEvent::Disconnected) => {}
-                                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                             }
                         }
                         if let Some(inner) = weak.upgrade() {
@@ -355,10 +398,28 @@ impl WorkspaceHost {
                             "registry room join failed; retrying");
                     }
                 }
-                tokio::time::sleep(backoff + join_retry_jitter()).await;
-                backoff = (backoff * 2).min(JOIN_RETRY_CAP);
+                tokio::select! {
+                    _ = tokio::time::sleep(backoff + join_retry_jitter()) => {
+                        backoff = (backoff * 2).min(JOIN_RETRY_CAP);
+                    }
+                    _ = wake.recv() => {
+                        backoff = JOIN_RETRY_BASE;
+                    }
+                    _ = token_changed(&mut token_changes) => {
+                        if token_revoked(&token).await {
+                            return;
+                        }
+                        backoff = JOIN_RETRY_BASE;
+                    }
+                }
             }
         });
+    }
+
+    /// Close the current registry membership before account-scoped state is
+    /// drained. The auth signal prevents an in-flight join from replacing it.
+    pub fn disconnect_edge(&self) {
+        lock(&self.inner.room).take();
     }
 
     /// Wire the "peer is alive" signal (fresh presence heartbeat) to a callback —
@@ -1189,9 +1250,35 @@ async fn workspace_task(weak: Weak<WorkspaceHostInner>, mut changed_rx: watch::R
     }
 }
 
+fn device_name_on_boot(existing_name: Option<&str>, detected_name: &str) -> String {
+    existing_name
+        .filter(|name| {
+            let name = name.trim();
+            !name.is_empty() && name != crate::LEGACY_UNKNOWN_DEVICE_NAME
+        })
+        .unwrap_or(detected_name)
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::linked_worktree_root;
+    use super::{device_name_on_boot, linked_worktree_root};
+
+    #[test]
+    fn boot_repairs_the_legacy_unknown_device_sentinel() {
+        assert_eq!(
+            device_name_on_boot(Some("unknown-device"), "MacBook Pro"),
+            "MacBook Pro"
+        );
+    }
+
+    #[test]
+    fn boot_preserves_a_user_selected_device_name() {
+        assert_eq!(
+            device_name_on_boot(Some("Work laptop"), "MacBook Pro"),
+            "Work laptop"
+        );
+    }
 
     #[test]
     fn linked_worktree_resolves_to_the_checkout_root() {

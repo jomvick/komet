@@ -21,6 +21,8 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 
 use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use komet_doc::{
     COMMAND_DEFAULT_TTL_MS, CommandBasedOn, CommandDisposition, DocError, EvaluationContext,
@@ -111,6 +113,10 @@ impl EdgeConfig {
         self.token.token().await
     }
 
+    pub fn token_changes(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        self.token.subscribe()
+    }
+
     /// A per-dial room URL provider for `path` (e.g. `/session/{chatId}/ws`):
     /// the bearer is re-fetched before every connect, so reconnects after a
     /// token expiry present a fresh `?token=` instead of the boot-time one.
@@ -161,8 +167,18 @@ pub struct DocHostConfig {
 struct DocHostInner {
     store: Arc<DocsStore>,
     config: DocHostConfig,
-    sessions: OnceLock<SessionsEngine>,
+    /// Set-once (first wins), cleared by `shutdown_workers`: sessions and
+    /// doc-host reference each other through Arcs, so a retired runtime's
+    /// graph only drops once this back-edge is severed.
+    sessions: Mutex<Option<SessionsEngine>>,
     workspace: OnceLock<WorkspaceHost>,
+    /// Cancels every worker spawned through `spawn_worker` — the loops'
+    /// own exit conditions (weak handle death, closed channels) don't cover
+    /// runtime replacement, where Edge-capable tasks must stop doing
+    /// network work even while something still pins the graph.
+    shutdown: CancellationToken,
+    /// Tracks every spawned worker so `shutdown_workers` can await them.
+    tasks: TaskTracker,
     handles: Mutex<HashMap<String, Arc<ChatDocHandle>>>,
     /// chat2 seeds in flight (one per chat — reopen storms must not race
     /// duplicate rebuild+checkpoint POSTs; benign server-side, wasteful).
@@ -371,8 +387,10 @@ impl DocHost {
             inner: Arc::new(DocHostInner {
                 store,
                 config,
-                sessions: OnceLock::new(),
+                sessions: Mutex::new(None),
                 workspace: OnceLock::new(),
+                shutdown: CancellationToken::new(),
+                tasks: TaskTracker::new(),
                 handles: Mutex::new(HashMap::new()),
                 seeding: Mutex::new(HashSet::new()),
                 seed_waiting: Mutex::new(HashSet::new()),
@@ -384,15 +402,86 @@ impl DocHost {
         }
     }
 
+    /// Every background task rides the tracker, raced against the shutdown
+    /// token: the loops' own exits stay authoritative in normal operation;
+    /// the token is the retirement override.
+    fn spawn_worker(&self, fut: impl std::future::Future<Output = ()> + Send + 'static) {
+        let cancel = self.inner.shutdown.clone();
+        self.inner.tasks.spawn(async move {
+            tokio::select! {
+                _ = cancel.cancelled() => {}
+                _ = fut => {}
+            }
+        });
+    }
+
+    /// `spawn_worker` for sites that pre-resolve a runtime handle (callers
+    /// reachable from bare sync contexts, where `tasks.spawn` would panic).
+    fn spawn_worker_on(
+        &self,
+        runtime: &tokio::runtime::Handle,
+        fut: impl std::future::Future<Output = ()> + Send + 'static,
+    ) {
+        let cancel = self.inner.shutdown.clone();
+        self.inner.tasks.spawn_on(
+            async move {
+                tokio::select! {
+                    _ = cancel.cancelled() => {}
+                    _ = fut => {}
+                }
+            },
+            runtime,
+        );
+    }
+
+    /// The sessions engine, once wired. `None` before assembly or after
+    /// `shutdown_workers` — callers treat both as "executor unavailable".
+    fn sessions(&self) -> Option<SessionsEngine> {
+        lock(&self.inner.sessions).clone()
+    }
+
     /// Wire the sessions engine (engine assembly; see `SessionsEngine::set_doc_host`).
     pub fn set_sessions(&self, sessions: SessionsEngine) {
-        let _ = self.inner.sessions.set(sessions);
+        {
+            // First set wins (the OnceLock contract this slot replaced).
+            let mut slot = lock(&self.inner.sessions);
+            if slot.is_none() {
+                *slot = Some(sessions);
+            }
+        }
         // Commands may already be pending in warm-opened docs.
         let handles: Vec<_> = lock(&self.inner.handles).values().cloned().collect();
         for handle in handles {
             let host = self.clone();
-            tokio::spawn(async move { host.drain_commands(&handle).await });
+            self.spawn_worker(async move { host.drain_commands(&handle).await });
         }
+    }
+
+    /// Retire this host's workers (runtime replacement, e.g. sign-out): cancel
+    /// and await every spawned task, drop every open chat handle (ending the
+    /// weak-keyed room/join loops and watcher streams), and sever the sessions
+    /// back-edge so the replaced engine graph can actually drop. Idempotent.
+    pub async fn shutdown_workers(&self) {
+        self.inner.shutdown.cancel();
+        self.inner.tasks.close();
+        self.inner.tasks.wait().await;
+        // Snapshot open docs BEFORE releasing their handles: the handles map
+        // holds the only strong doc refs, and an unflushed doc dies with it.
+        self.flush_all();
+        // Take the map under the lock, drop the handles outside it.
+        let handles = std::mem::take(&mut *lock(&self.inner.handles));
+        drop(handles);
+        lock(&self.inner.seeding).clear();
+        lock(&self.inner.seed_waiting).clear();
+        lock(&self.inner.sessions).take();
+    }
+
+    /// Test-only retirement sentinel: reports true once the doc-host graph
+    /// has actually been freed.
+    #[doc(hidden)]
+    pub fn retirement_probe(&self) -> Box<dyn Fn() -> bool + Send + Sync> {
+        let weak = Arc::downgrade(&self.inner);
+        Box::new(move || weak.upgrade().is_none())
     }
 
     /// Wire the workspace host (engine assembly) — the source of chat-ownership rows.
@@ -417,7 +506,7 @@ impl DocHost {
         const TICK: std::time::Duration = std::time::Duration::from_secs(30);
         const RETRY_GAP_MS: i64 = 10 * 60 * 1000;
         let host = self.clone();
-        tokio::spawn(async move {
+        self.spawn_worker(async move {
             let mut attempted: HashMap<String, i64> = HashMap::new();
             loop {
                 tokio::time::sleep(TICK).await;
@@ -470,7 +559,7 @@ impl DocHost {
     /// racing writer must never lose its doc out from under it.
     fn spawn_cutover_watcher(&self, mut chats: watch::Receiver<Vec<komet_proto::Chat>>) {
         let host = self.clone();
-        tokio::spawn(async move {
+        self.spawn_worker(async move {
             loop {
                 if chats.changed().await.is_err() {
                     return; // workspace host gone (shutdown)
@@ -847,7 +936,7 @@ impl DocHost {
                 self.spawn_s2_join(edge, chat_id, &doc, &handle);
             }
         }
-        tokio::spawn(chat_task(self.clone(), Arc::downgrade(&handle), changed_rx));
+        self.spawn_worker(chat_task(self.clone(), Arc::downgrade(&handle), changed_rx));
         self.evict_over_budget();
         Ok(handle)
     }
@@ -865,7 +954,9 @@ impl DocHost {
             let room_doc = doc.doc().clone();
             let chat = chat_id.to_string();
             let weak = Arc::downgrade(handle);
-            tokio::spawn(async move {
+            let edge = edge.clone();
+            let mut token_changes = edge.token_changes();
+            self.spawn_worker(async move {
                 let mut wake = komet_sync::wake::subscribe();
                 let mut backoff = crate::workspace_host::JOIN_RETRY_BASE;
                 loop {
@@ -885,12 +976,37 @@ impl DocHost {
                     .await;
                     match dial {
                         Ok(Ok(client)) => {
+                            if edge.bearer().await.is_none() {
+                                return;
+                            }
+                            let mut events = client.events();
                             let Some(handle) = weak.upgrade() else {
                                 return; // evicted mid-dial: drop leaves the room
                             };
                             *lock(&handle.room) = Some(client);
                             tracing::info!(chat = %chat, "session room joined");
-                            return;
+                            drop(handle);
+                            if token_changes.is_none() {
+                                return;
+                            }
+                            loop {
+                                tokio::select! {
+                                    event = events.recv() => match event {
+                                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                                        Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                                    },
+                                    _ = crate::workspace_host::token_changed(&mut token_changes) => {
+                                        if edge.bearer().await.is_none() {
+                                            if let Some(handle) = weak.upgrade() {
+                                                lock(&handle.room).take();
+                                            }
+                                            tracing::info!(chat = %chat,
+                                                "session credentials removed; leaving room");
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
                         }
                         Ok(Err(err)) => {
                             tracing::warn!(
@@ -915,6 +1031,9 @@ impl DocHost {
                         _ = wake.recv() => {
                             backoff = crate::workspace_host::JOIN_RETRY_BASE;
                         }
+                        _ = crate::workspace_host::token_changed(&mut token_changes) => {
+                            backoff = crate::workspace_host::JOIN_RETRY_BASE;
+                        }
                     }
                 }
             });
@@ -933,7 +1052,8 @@ impl DocHost {
         let device = self.inner.config.device_id.clone();
         let weak = Arc::downgrade(handle);
         let host = self.clone();
-        tokio::spawn(async move {
+        let mut token_changes = edge.token_changes();
+        self.spawn_worker(async move {
             let sink = Arc::new(crate::chat2_host::EngineChatSink::new(&doc, store, chat.clone()));
             // The sink holds only a Weak doc ref (a strong one made every
             // chat2 handle read as perma-pinned — LRU eviction dead); this
@@ -964,10 +1084,14 @@ impl DocHost {
                 .await;
                 match dial {
                     Ok(Ok(client)) => {
+                        if edge.bearer().await.is_none() {
+                            return;
+                        }
                         let Some(handle) = weak.upgrade() else {
                             return; // evicted mid-dial: drop leaves the room
                         };
                         let mut events = client.events();
+                        let mut lifecycle_events = client.events();
                         {
                             // Store + drain under ONE client-lock critical
                             // section: the subscription pushes to the buffer
@@ -996,7 +1120,7 @@ impl DocHost {
                         if host.is_host(&chat) {
                             let host = host.clone();
                             let weak = weak.clone();
-                            tokio::spawn(async move {
+                            host.clone().spawn_worker(async move {
                                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
                                 let Some(handle) = weak.upgrade() else { return };
                                 let no_checkpoint = lock(&handle.chat2)
@@ -1022,7 +1146,7 @@ impl DocHost {
                             let host = host.clone();
                             let weak = weak.clone();
                             let chat = chat.clone();
-                            tokio::spawn(async move {
+                            host.clone().spawn_worker(async move {
                                 use komet_sync::chat_client::ChatEvent;
                                 loop {
                                     match events.recv().await {
@@ -1043,7 +1167,29 @@ impl DocHost {
                                 }
                             });
                         }
-                        return;
+                        drop(handle);
+                        if token_changes.is_none() {
+                            return;
+                        }
+                        loop {
+                            tokio::select! {
+                                event = lifecycle_events.recv() => match event {
+                                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                                },
+                                _ = crate::workspace_host::token_changed(&mut token_changes) => {
+                                    if edge.bearer().await.is_none() {
+                                        if let Some(handle) = weak.upgrade() {
+                                            lock(&handle.chat2).take();
+                                            lock(&handle.chat2_local_sub).take();
+                                        }
+                                        tracing::info!(chat = %chat,
+                                            "chat2 credentials removed; leaving room");
+                                        return;
+                                    }
+                                }
+                            }
+                        }
                     }
                     Ok(Err(err)) => {
                         tracing::warn!(chat = %chat, error = %err,
@@ -1061,6 +1207,9 @@ impl DocHost {
                         backoff = (backoff * 2).min(crate::workspace_host::JOIN_RETRY_CAP);
                     }
                     _ = wake.recv() => {
+                        backoff = crate::workspace_host::JOIN_RETRY_BASE;
+                    }
+                    _ = crate::workspace_host::token_changed(&mut token_changes) => {
                         backoff = crate::workspace_host::JOIN_RETRY_BASE;
                     }
                 }
@@ -1093,7 +1242,7 @@ impl DocHost {
         let host = self.clone();
         let chat = chat_id.to_string();
         let weak = Arc::downgrade(handle);
-        tokio::spawn(async move {
+        self.spawn_worker(async move {
             async {
                 let mut ticks = 0u32;
                 loop {
@@ -1152,7 +1301,7 @@ impl DocHost {
         }
         let host = self.clone();
         let chat = chat_id.to_string();
-        tokio::spawn(async move {
+        self.spawn_worker(async move {
             let outcome = host.seed_chat2(&edge, &chat, doc).await;
             lock(&host.inner.seeding).remove(&chat);
             match outcome {
@@ -1300,7 +1449,7 @@ impl DocHost {
     /// never touched, and the salvage only runs on the hosting device.
     pub fn spawn_transcript_salvage(&self, journals_dir: std::path::PathBuf) {
         let host = self.clone();
-        tokio::spawn(async move {
+        self.spawn_worker(async move {
             // Let boot settle (registry load, room joins) before sweeping.
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
             let Some(ws) = host.workspace() else { return };
@@ -1433,7 +1582,7 @@ impl DocHost {
             let http = self.inner.http.clone();
             let edge_tail = edge.clone();
             let chat = chat_id.clone();
-            tokio::spawn(async move {
+            self.spawn_worker(async move {
                 let Some(bearer) = edge_tail.bearer().await else { return };
                 let url = format!(
                     "{}/chat2/{}/tail",
@@ -1488,7 +1637,7 @@ impl DocHost {
         let seq_covered = stats.cursor;
         let http = self.inner.http.clone();
         let weak_note = Arc::downgrade(handle);
-        tokio::spawn(async move {
+        self.spawn_worker(async move {
             let Some(bearer) = edge.bearer().await else {
                 in_flight.store(false, Ordering::Release);
                 return;
@@ -1758,7 +1907,7 @@ impl DocHost {
             host_device
         );
         let chat = chat_id.to_string();
-        runtime.spawn(async move {
+        self.spawn_worker_on(&runtime, async move {
             // Fresh bearer per request — never the boot-time snapshot.
             let Some(bearer) = edge.bearer().await else {
                 tracing::warn!(chat = %chat, "nudge skipped: signed out");
@@ -1803,7 +1952,7 @@ impl DocHost {
             chat_id,
             encode_part_segment(&payload.part_id)
         );
-        runtime.spawn(async move {
+        self.spawn_worker_on(&runtime, async move {
             let Some(bearer) = edge.bearer().await else {
                 return; // signed out; summary-only until the next session
             };
@@ -1923,8 +2072,8 @@ impl DocHost {
     /// Drain pending commands (host-only): evaluate → mark processed BEFORE execute →
     /// execute → write the outcome as the sole outcome writer.
     pub async fn drain_commands(&self, handle: &Arc<ChatDocHandle>) {
-        let Some(sessions) = self.inner.sessions.get() else {
-            return; // executor not wired yet; the set_sessions kick re-drains
+        let Some(sessions) = self.sessions() else {
+            return; // executor not wired yet (or retired); the set_sessions kick re-drains
         };
         if !self.is_host(&handle.chat_id) {
             return;
@@ -1981,7 +2130,7 @@ impl DocHost {
                     self.resolve_command(handle, &entry.id, SessionCommandStatus::Superseded, None);
                 }
                 CommandDisposition::Execute => {
-                    let (status, resolution) = match self.execute(sessions, handle, &entry).await {
+                    let (status, resolution) = match self.execute(&sessions, handle, &entry).await {
                         Ok(outcome) => outcome,
                         Err(err) => (SessionCommandStatus::Rejected, Some(err.to_string())),
                     };
@@ -2237,6 +2386,17 @@ impl DocHost {
         let handles: Vec<_> = lock(&self.inner.handles).values().cloned().collect();
         for handle in handles {
             self.save_snapshot(&handle);
+        }
+    }
+
+    /// Close all account-scoped room memberships before graceful engine
+    /// draining. Auth-aware join supervisors will not install a late client.
+    pub fn disconnect_edge(&self) {
+        let handles: Vec<_> = lock(&self.inner.handles).values().cloned().collect();
+        for handle in handles {
+            lock(&handle.room).take();
+            lock(&handle.chat2).take();
+            lock(&handle.chat2_local_sub).take();
         }
     }
 }

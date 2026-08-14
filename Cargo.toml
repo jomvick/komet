@@ -68,6 +68,7 @@ similar = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 libc = "0.2"
+gethostname = "1"
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 futures = "0.3"
 async-trait = "0.1"
@@ -113,5 +114,3 @@ opt-level = 0
 
 [profile.dev.package."*"]
 opt-level = 2
-
-

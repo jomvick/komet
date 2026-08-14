@@ -4,9 +4,8 @@
 //! `KOMET_*` environment captured at install time, so
 //! `KOMET_EDGE_URL=… komet daemon install` bakes that override in.
 //!
-//! Auth is decoupled: the service loads the session `komet login` persisted and
-//! exits with "run `komet login` first" otherwise (`terminal_sign_in`'s non-TTY
-//! path) — it never waits interactively for OAuth.
+//! Auth is decoupled: without a saved session the service remains up on the
+//! local-only profile. `komet login` and a service restart opt into sync.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -70,6 +69,9 @@ pub fn install(data_dir: &Path) -> anyhow::Result<()> {
     } else {
         bail!("komet daemon is only supported on macOS (launchd) and Linux (systemd)");
     }
+    println!(
+        "Without a saved account the engine stays local-only; sign-in and restart are optional for sync."
+    );
     println!(
         "Logs: {}",
         if cfg!(target_os = "macos") {
@@ -223,12 +225,8 @@ fn captured_env() -> Vec<(String, String)> {
 }
 
 fn render_systemd_unit(exe: &Path, env: &[(String, String)]) -> String {
-    // The start limit must actually trip on the "run `komet login` first"
-    // fail-fast exit (5 × RestartSec=5 lands inside the 60s window) — otherwise
-    // a signed-out daemon restart-loops forever.
     let mut unit = String::from(
-        "[Unit]\nDescription=Komet headless engine\nAfter=network-online.target\n\
-         StartLimitIntervalSec=60\nStartLimitBurst=5\n\n[Service]\n",
+        "[Unit]\nDescription=Komet headless engine\nAfter=network-online.target\nStartLimitIntervalSec=60\nStartLimitBurst=5\n\n[Service]\n",
     );
     for (key, value) in env {
         // systemd unquotes the value; escape the characters it treats specially.
@@ -394,9 +392,23 @@ mod tests {
         assert!(unit.contains("Environment=\"KOMET_EDGE_URL=https://edge.example\"\n"));
         // Inner quotes escaped so systemd re-parses the value verbatim.
         assert!(unit.contains("Environment=\"RUST_LOG=info,komet=\\\"debug\\\"\"\n"));
+        assert!(unit.contains("StartLimitIntervalSec=60\n"));
+        assert!(unit.contains("StartLimitBurst=5\n"));
         assert!(unit.contains("Restart=on-failure"));
+        assert!(!unit.contains("session.json"));
+        assert!(!unit.contains("ConditionPathExists"));
         assert!(unit.contains("EnvironmentFile=-%h/.komet-native/env"));
         assert!(unit.contains("WantedBy=default.target"));
+    }
+
+    #[test]
+    fn curl_installer_always_starts_the_local_capable_service() {
+        let installer = include_str!("../../../edge/src/install.sh");
+        assert!(!installer.contains("session.json"));
+        assert!(installer.contains("StartLimitIntervalSec=60\n"));
+        assert!(installer.contains("StartLimitBurst=5\n"));
+        assert!(installer.contains("systemctl --user enable komet-native"));
+        assert!(installer.contains("systemctl --user restart komet-native"));
     }
 
     #[test]

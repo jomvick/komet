@@ -12,7 +12,9 @@
 //!   remote devices' workspace session rows
 //! - `Mutate {op, …}` → `{ok}` — workspace entity mutations (createChat, renameChat,
 //!   setChatArchived, deleteChat, renameDevice, markChatSeen)
-//! - `LocalDevice` → `{deviceId}` — this engine's identity (never forwarded)
+//! - `EngineInfo` → `{deviceId, workspaceScope}` — this runtime's fixed identity
+//!   and data boundary (never forwarded)
+//! - `LocalDevice` → `{deviceId}` — legacy engine identity (never forwarded)
 //! - AuthRpc (feature-inventory §2): `AuthStatus` (stream), `SignIn`/`SignInHeadless` →
 //!   `{url}`, `CompleteSignIn {code}`, `SignOut`, `ListOrgs`, `CreateOrg {name}`,
 //!   `SelectOrg {organizationId}`
@@ -55,7 +57,7 @@ use std::time::Duration;
 use tokio::sync::watch;
 
 use komet_doc::{MessagePart, SessionCommandPayload};
-use komet_proto::{ChatConfig, HarnessId, ToolCall};
+use komet_proto::{ChatConfig, EngineInfo, HarnessId, ToolCall, WorkspaceScope};
 use komet_rpc::{LinkCache, RpcError, RpcReply, RpcService, methods, parse_params};
 
 use crate::agent_accounts::AgentAccounts;
@@ -380,6 +382,7 @@ pub struct EngineRpc {
     auth: Option<Auth>,
     links: Option<std::sync::Arc<LinkCache>>,
     updater: Option<komet_update::Updater>,
+    engine_info: EngineInfo,
 }
 
 impl EngineRpc {
@@ -394,7 +397,12 @@ impl EngineRpc {
         diff_sync: CheckoutDiffSync,
         uploads: Uploads,
         agent_accounts: AgentAccounts,
+        workspace_scope: WorkspaceScope,
     ) -> Self {
+        let engine_info = EngineInfo {
+            device_id: doc_host.device_id().to_string(),
+            workspace_scope,
+        };
         Self {
             sessions,
             doc_host,
@@ -408,6 +416,7 @@ impl EngineRpc {
             auth: None,
             links: None,
             updater: None,
+            engine_info,
         }
     }
 
@@ -966,6 +975,8 @@ impl RpcService for EngineRpc {
                 .await;
         }
         match method {
+            methods::ENGINE_INFO => RpcReply::value(&self.engine_info),
+            methods::ENGINE_READY => RpcReply::value(&serde_json::json!({ "ready": true })),
             methods::LIST_HARNESSES => RpcReply::value(&self.registry.descriptors()),
             methods::SET_HARNESS_ENABLED => {
                 let p: SetHarnessEnabledParams = parse_params(params)?;
@@ -1487,6 +1498,8 @@ mod tests {
     #[test]
     fn local_device_is_not_forwardable() {
         assert!(!forwardable(methods::LOCAL_DEVICE));
+        assert!(!forwardable(methods::ENGINE_INFO));
+        assert!(!forwardable(methods::ENGINE_READY));
         assert!(forwardable(methods::QUEUE_COMMAND));
         assert!(forwardable(methods::SEARCH_FILES));
         assert!(forwardable(methods::FETCH_ALL));
