@@ -29,13 +29,15 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 install -m 755 "$ROOT/target/release/komet" "$APP/Contents/MacOS/komet"
 sed "s/__VERSION__/$VERSION/" "$ROOT/dist/macos/Info.plist" >"$APP/Contents/Info.plist"
 
-# Icon: iconset from the shared 1024×1024 Komet artwork in dist/komet.png.
+# Icon: iconset from the pre-masked macOS icon (squircle + margins + shadow
+# baked into dist/macos/icon-1024.png — sips can't alpha-mask, so the mask is
+# applied ahead of time; dist/komet.png stays the full-bleed shared artwork).
 ICONSET="$OUT_DIR/komet.iconset"
 rm -rf "$ICONSET" && mkdir -p "$ICONSET"
 for size in 16 32 128 256 512; do
-  sips -z "$size" "$size" "$ROOT/dist/komet.png" --out "$ICONSET/icon_${size}x${size}.png" >/dev/null
+  sips -z "$size" "$size" "$ROOT/dist/macos/icon-1024.png" --out "$ICONSET/icon_${size}x${size}.png" >/dev/null
   retina=$((size * 2))
-  sips -z "$retina" "$retina" "$ROOT/dist/komet.png" --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null
+  sips -z "$retina" "$retina" "$ROOT/dist/macos/icon-1024.png" --out "$ICONSET/icon_${size}x${size}@2x.png" >/dev/null
 done
 iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/komet.icns"
 rm -rf "$ICONSET"
