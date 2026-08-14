@@ -327,6 +327,17 @@ impl TerminalPanel {
         cx.notify();
     }
 
+    /// A tab's display label: the live OSC 0/2 title when the running
+    /// program set one (shells title themselves with the cwd / running
+    /// command — the contextual name, user request), else the fixed
+    /// "Terminal N".
+    fn display_title(tab: &TerminalTab) -> SharedString {
+        match tab.emulator.title().map(str::trim) {
+            Some(title) if !title.is_empty() => title.to_string().into(),
+            _ => tab.title.clone(),
+        }
+    }
+
     // ---- embedded (right-pane surface) API — the shell's tab strip drives
     // ---- these; keys are stable across reorders/closes.
 
@@ -340,7 +351,7 @@ impl TerminalPanel {
             .map(|tabs| {
                 tabs.tabs
                     .iter()
-                    .map(|t| (t.key, t.title.clone(), t.exited.is_some()))
+                    .map(|t| (t.key, Self::display_title(t), t.exited.is_some()))
                     .collect()
             })
             .unwrap_or_default()
@@ -1110,9 +1121,10 @@ impl TerminalPanel {
                     .map(|(ix, tab)| {
                         let selected = ix == active;
                         let key = tab.key;
-                        // Fixed sequential label (komet: "Terminal N") — the
-                        // OSC title never replaces it.
-                        let title = tab.title.clone();
+                        // Contextual label (user request): the OSC title —
+                        // the shell's own cwd/command name — wins over the
+                        // fixed "Terminal N" fallback.
+                        let title = Self::display_title(tab);
                         let exited = tab.exited.is_some();
                         (ix, key, title, selected, exited)
                     })
