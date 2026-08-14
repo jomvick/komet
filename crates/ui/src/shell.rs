@@ -3506,12 +3506,12 @@ impl Shell {
                 let has_local_work = local_chats > 0;
                 let body: SharedString = match (&signed_in_email, has_local_work) {
                     (Some(email), true) => format!(
-                        "You're signed in as {email}. Bring the {local_chats} session{} from this device into your synced workspace, or start it fresh — either way, no restart needed.",
+                        "You're signed in as {email}. Bring the {local_chats} session{} from this device into your synced workspace, or start it fresh.",
                         if local_chats == 1 { "" } else { "s" },
                     )
                     .into(),
                     (Some(email), false) => format!(
-                        "You're signed in as {email}. Komet can switch to your synced workspace now — no restart needed."
+                        "You're signed in as {email}. Komet can switch to your synced workspace now."
                     )
                     .into(),
                     (None, true) => format!(
@@ -3519,9 +3519,7 @@ impl Shell {
                         if local_chats == 1 { "" } else { "s" },
                     )
                     .into(),
-                    (None, false) => {
-                        "Komet can switch to your synced workspace now — no restart needed.".into()
-                    }
+                    (None, false) => "Komet can switch to your synced workspace now.".into(),
                 };
                 let mut actions = div()
                     .mt(px(16.0))
@@ -3632,12 +3630,12 @@ impl Shell {
                 let body: SharedString = match (imported, skipped) {
                     (0, 0) => "Your synced workspace is ready.".into(),
                     (n, 0) => format!(
-                        "{n} session{} moved into your synced workspace — they'll sync to your other devices from here.",
+                        "{n} session{} moved into your synced workspace.",
                         if n == 1 { "" } else { "s" },
                     )
                     .into(),
                     (n, s) => format!(
-                        "{n} session{} imported, {s} already present. Everything now syncs from here.",
+                        "{n} session{} imported, {s} already present.",
                         if n == 1 { "" } else { "s" },
                     )
                     .into(),
