@@ -57,7 +57,10 @@ mod tabs;
 
 use spaces::{AddSpaceFlow, RenameSpaceDialog};
 
-actions!(shell, [ToggleSidebar, ToggleChanges, AddSpacePalette, NewSession]);
+actions!(
+    shell,
+    [ToggleSidebar, ToggleChanges, AddSpacePalette, NewSession]
+);
 
 // ---------------------------------------------------------------------------
 // Traffic-light-aware titlebar layout (feature-inventory §1.1)
@@ -522,8 +525,14 @@ enum SyncFlow {
     },
     /// The import stream reported errors or died early. Explicit retry step —
     /// structural idempotence makes re-running safe (only missing rows copy).
-    /// Details ride `runtime_change_error`.
-    ImportFailed,
+    /// Details ride `runtime_change_error`. `notice_open: false` = postponed:
+    /// the dialog is hidden but the failure stays pending, reachable through
+    /// the account menu — dismissal must never discard the only retry
+    /// entry point (under Synced scope the menu otherwise offers just
+    /// Sign out, and the local rows would be unreachable).
+    ImportFailed {
+        notice_open: bool,
+    },
     RestartPending {
         notice_open: bool,
     },
@@ -541,7 +550,7 @@ impl SyncFlow {
             SyncFlow::Switching { .. }
                 | SyncFlow::Importing { .. }
                 | SyncFlow::ImportDone { .. }
-                | SyncFlow::ImportFailed
+                | SyncFlow::ImportFailed { .. }
         )
     }
 }
@@ -665,16 +674,19 @@ fn account_menu_action(scope: Option<WorkspaceScope>, flow: SyncFlow) -> Option<
             SyncFlow::SwitchOffer { .. } | SyncFlow::RestartPending { .. } => {
                 Some(AccountMenuAction::RestartPending)
             }
+            SyncFlow::ImportFailed { .. } => Some(AccountMenuAction::RestartPending),
             SyncFlow::Switching { .. }
             | SyncFlow::Importing { .. }
-            | SyncFlow::ImportDone { .. }
-            | SyncFlow::ImportFailed => Some(AccountMenuAction::SyncInProgress),
+            | SyncFlow::ImportDone { .. } => Some(AccountMenuAction::SyncInProgress),
             SyncFlow::SignOutConfirm
             | SyncFlow::SigningOut
             | SyncFlow::SignedOutRestartRequired => None,
         },
         Some(WorkspaceScope::Synced) => match flow {
             SyncFlow::SignedOutRestartRequired => None,
+            // A pending import failure must stay reachable: this is the only
+            // surface that can reopen the retry dialog on a synced runtime.
+            SyncFlow::ImportFailed { .. } => Some(AccountMenuAction::RestartPending),
             _ if flow.is_switch_lifecycle() => Some(AccountMenuAction::SyncInProgress),
             _ => Some(AccountMenuAction::SignOut),
         },
@@ -2139,6 +2151,9 @@ impl Shell {
             SyncFlow::SwitchOffer { .. } => {
                 self.sync_flow = SyncFlow::SwitchOffer { notice_open: false };
             }
+            SyncFlow::ImportFailed { .. } => {
+                self.sync_flow = SyncFlow::ImportFailed { notice_open: false };
+            }
             _ => return,
         }
         cx.notify();
@@ -2152,6 +2167,9 @@ impl Shell {
             }
             SyncFlow::SwitchOffer { .. } => {
                 self.sync_flow = SyncFlow::SwitchOffer { notice_open: true };
+            }
+            SyncFlow::ImportFailed { .. } => {
+                self.sync_flow = SyncFlow::ImportFailed { notice_open: true };
             }
             _ => return,
         }
@@ -2298,7 +2316,7 @@ impl Shell {
                         // A stream that died before its summary is a failure —
                         // offer the in-place retry (idempotent).
                         if matches!(shell.sync_flow, SyncFlow::Importing { .. }) {
-                            shell.sync_flow = SyncFlow::ImportFailed;
+                            shell.sync_flow = SyncFlow::ImportFailed { notice_open: true };
                             shell.runtime_change_error =
                                 Some("The import stream ended before it finished.".into());
                         }
@@ -2314,7 +2332,7 @@ impl Shell {
                 this.update(cx, |shell, cx| {
                     shell.import_task = None;
                     if matches!(shell.sync_flow, SyncFlow::Importing { .. }) {
-                        shell.sync_flow = SyncFlow::ImportFailed;
+                        shell.sync_flow = SyncFlow::ImportFailed { notice_open: true };
                         shell.runtime_change_error = Some(error.into());
                         cx.notify();
                     }
@@ -2351,7 +2369,7 @@ impl Shell {
                         self.sync_flow = SyncFlow::ImportDone { imported, skipped };
                     }
                     Err(message) => {
-                        self.sync_flow = SyncFlow::ImportFailed;
+                        self.sync_flow = SyncFlow::ImportFailed { notice_open: true };
                         self.runtime_change_error = Some(message.into());
                     }
                 }
@@ -4028,7 +4046,7 @@ impl Shell {
                     )
                     .into_any_element()
             }
-            SyncFlow::ImportFailed => popover::dialog_card(&theme)
+            SyncFlow::ImportFailed { notice_open: true } => popover::dialog_card(&theme)
                 .child(popover::dialog_title(&theme, "Import didn't finish"))
                 .child(div().mt(px(6.0)).child(popover::dialog_body(
                     &theme,
@@ -4052,12 +4070,10 @@ impl Shell {
                         .justify_end()
                         .gap(px(8.0))
                         .child(
-                            popover::btn_ghost(&theme, "Not now", "import-failed-dismiss")
+                            popover::btn_ghost(&theme, "Later", "import-failed-dismiss")
                                 .id("import-failed-dismiss")
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    this.sync_flow = SyncFlow::Idle;
-                                    this.runtime_change_error = None;
-                                    cx.notify();
+                                    this.postpone_sync_restart(cx)
                                 })),
                         )
                         .child(
@@ -4163,6 +4179,7 @@ impl Shell {
                 .into_any_element(),
             SyncFlow::Idle
             | SyncFlow::SwitchOffer { notice_open: false }
+            | SyncFlow::ImportFailed { notice_open: false }
             | SyncFlow::RestartPending { notice_open: false }
             | SyncFlow::SignedOutRestartRequired => return None,
         };
@@ -6653,6 +6670,49 @@ mod tests {
     }
 
     #[test]
+    fn dismissed_import_failure_stays_reachable_on_a_synced_runtime() {
+        let signed_in = AuthState::SignedIn {
+            user: komet_proto::UserProfile {
+                id: "user-1".into(),
+                email: "user@example.com".into(),
+                name: None,
+            },
+            org_id: Some("org-1".into()),
+        };
+
+        // "Later" postpones the failure notice; it must not evaporate.
+        let dismissed = SyncFlow::ImportFailed { notice_open: false };
+        assert_eq!(
+            sync_flow_after_auth(dismissed, Some(WorkspaceScope::Synced), Some(&signed_in)),
+            dismissed,
+            "a postponed import failure survives auth/scope updates"
+        );
+
+        // …and the account menu on the SYNCED runtime still exposes the
+        // re-entry point. This is the whole point: after the switch there is
+        // no local runtime left to re-derive an offer from, so this menu row
+        // is the only path back to the retry dialog.
+        assert_eq!(
+            account_menu_action(Some(WorkspaceScope::Synced), dismissed),
+            Some(AccountMenuAction::RestartPending),
+            "retry must remain reachable after dismissal"
+        );
+        assert_eq!(
+            account_menu_action(
+                Some(WorkspaceScope::Synced),
+                SyncFlow::ImportFailed { notice_open: true },
+            ),
+            Some(AccountMenuAction::RestartPending)
+        );
+
+        // Resolving the failure restores the normal synced menu.
+        assert_eq!(
+            account_menu_action(Some(WorkspaceScope::Synced), SyncFlow::Idle),
+            Some(AccountMenuAction::SignOut)
+        );
+    }
+
+    #[test]
     fn switch_lifecycle_survives_the_runtime_replacement_window() {
         let signed_in = AuthState::SignedIn {
             user: komet_proto::UserProfile {
@@ -6669,7 +6729,8 @@ mod tests {
                 imported: 3,
                 skipped: 0,
             },
-            SyncFlow::ImportFailed,
+            SyncFlow::ImportFailed { notice_open: true },
+            SyncFlow::ImportFailed { notice_open: false },
         ] {
             // Local (before the stop), detached (mid-replacement), and synced
             // (replacement runtime up): the driver owns these states — auth
