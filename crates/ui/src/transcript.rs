@@ -114,16 +114,14 @@ pub const GLIDE_MAX_VIEWPORTS: f32 = 2.5;
 /// The titlebar overlays the full-height list, so its height is part of the
 /// inset; the extra 10px matches the first row's breathing room.
 const OWN_SEND_TOP_INSET_PX: f32 = Theme::TITLEBAR_HEIGHT + 10.0;
-/// Scroll slack kept UNDER the reservation: the held layout stays this many
-/// px taller than the viewport, so the list never drops into its
-/// shorter-than-viewport regime — where a bottom-aligned list reports no
-/// item bounds (sizing goes blind), scroll_to clamps, and the prompt's
-/// position becomes a function of content height instead of the hold
-/// (rig-traced: the prompt crept up while chips streamed in and dropped
-/// back down when the turn completed and the trailer vanished). Well inside
-/// the 70px restick band, so returning to "the bottom" still re-arms the
-/// hold.
-const OWN_SEND_SCROLL_SLACK_PX: f32 = 24.0;
+/// Epsilon of extra height under the reservation. The runway ends AT the
+/// app's bottom — this is not scroll room (24px of it read as a janky
+/// overshoot-and-fight zone, user report) — it exists only to keep the held
+/// layout out of gpui's shorter-than-viewport regime, where a bottom-aligned
+/// list reports no item bounds (sizing goes blind) and position becomes a
+/// function of content height instead of the hold. Two pixels of travel is
+/// below perception.
+const OWN_SEND_SCROLL_SLACK_PX: f32 = 2.0;
 /// Per-60fps-frame fraction of the remaining entry glide retained (~90%
 /// covered in ~230ms, ease-out).
 const OWN_SEND_GLIDE_RETAIN: f32 = 0.85;
@@ -1641,6 +1639,23 @@ impl Transcript {
                         }
                         this.own_turn_last_tick = None;
                         this.own_turn_kick = true;
+                    } else if held {
+                        // Wheel-down while held: the bottom is a HARD STOP.
+                        // The pad runs one frame behind a streaming commit,
+                        // so the list's own end-clamp can briefly admit
+                        // travel into the transient surplus — re-assert the
+                        // hold in the same effect cycle, before anything
+                        // paints, and the sink never reaches the screen.
+                        // (scroll_to is bounds-free, so this also covers the
+                        // wheel gluing the offset at the end.)
+                        if let Some(ix) = this.own_turn_anchor_ix() {
+                            this.list.scroll_to(ListOffset {
+                                item_ix: ix,
+                                offset_in_item: px(0.0),
+                            });
+                            this.list.scroll_by(px(-Self::own_send_inset(ix)));
+                        }
+                        this.last_scroll_distance = this.distance_from_bottom();
                     }
                     let show = distance > SCROLL_BUTTON_THRESHOLD_PX
                         && !this.own_turn.as_ref().is_some_and(|a| a.held);
@@ -1780,6 +1795,20 @@ impl Transcript {
         };
         let base_pad = self.bottom_clearance + Theme::TRANSCRIPT_FADE_BAND + 8.0;
         let inset = Self::own_send_inset(anchor_ix);
+        // A glued offset hard-tracks a GROWING end — streamed text visually
+        // pushes everything above it up while the runway blank persists
+        // below (user report; the glued representation also hides every
+        // item's bounds, so the sizing that would consume the runway goes
+        // blind). Dissolve it for HELD and RELEASED views alike. The glued
+        // sentinel resolves NUMERICALLY to the total content height (a
+        // viewport top past the last item), so a small nudge lands in an
+        // absurd overscroll that layout's under-fill normalizer re-glues on
+        // the very next frame — an invisible wedge loop (rig-traced).
+        // Stepping back a FULL viewport from the sentinel is exactly "end
+        // at the screen bottom": the same visual position, concrete.
+        if self.is_glued() {
+            self.list.scroll_by(px(-viewport_height));
+        }
         // The slack keeps the held layout scrollable (see the constant) —
         // the reservation deliberately over-fills by this much.
         let usable = viewport_height - inset - base_pad + OWN_SEND_SCROLL_SLACK_PX;
@@ -1820,6 +1849,17 @@ impl Transcript {
                 - current
                 - base_pad;
             let target = own_turn_reservation(usable, turn_height);
+            // FLOOR: never shrink the pad faster than the viewport allows.
+            // The step runs a frame behind content growth, so a wheel that
+            // lands inside that window can sink the view toward the stale
+            // end; snapping the pad straight to `target` then pulls the end
+            // UP THROUGH the viewport (the list clamps instantly — a visible
+            // yank, user report "stutter push back"). Shrinking is capped so
+            // the end never rises above the current view; deferred surplus
+            // burns off as the view moves away from the stop.
+            let dist = self.distance_from_bottom();
+            let floor = current - (dist - OWN_SEND_SCROLL_SLACK_PX).max(0.0);
+            let target = target.max(floor.min(current));
             if target <= 0.5 {
                 // The reply has outgrown the reserved space (or the prompt
                 // alone overfills it): the pad is ~0, so dropping it is
@@ -1868,39 +1908,59 @@ impl Transcript {
             let moved = match self.list.bounds_for_item(anchor_ix) {
                 Some(b) => {
                     let err = f32::from(b.top()) - (f32::from(viewport.top()) + inset);
-                    err > 0.5 || err < -(OWN_SEND_SCROLL_SLACK_PX + 8.0)
+                    // The legal rest zone below the hold is the epsilon plus
+                    // rounding; anything deeper is a transient-collision sink
+                    // and rubber-bands back.
+                    err > 0.5 || err < -(OWN_SEND_SCROLL_SLACK_PX + 2.0)
                 }
-                // The GLUED offset representation reports no bounds for ANY
-                // item (rig-traced: avail=[] with logical top == rows.len())
-                // — and wheel-down to the true bottom is exactly where the
-                // offset glues. That bottom is at most the scroll slack below
-                // the hold: legal dead-band space, so no assert (asserting on
-                // None here was the bottom bounce — every wheel event sank
-                // into the slack, glued, lost bounds, and got snapped back
-                // up). But glue also hard-tracks a GROWING end, which would
-                // re-open the streaming drift for a user parked there —
-                // de-glue in place (~1px, imperceptible) so the offset
-                // re-anchors to an item and the dead band governs from the
-                // next frame. A boundless frame far from the bottom is
-                // splice flicker with an unknowable position: re-assert.
-                None => {
-                    if self.distance_from_bottom() <= OWN_SEND_SCROLL_SLACK_PX + 8.0 {
-                        if self.is_glued() {
-                            self.list.scroll_by(px(-0.75));
-                        }
-                        false
-                    } else {
-                        true
-                    }
-                }
+                // Bounds vanish in the glued representation (dissolved
+                // above, so at most for this one frame) and through splice
+                // flicker. Near the stop that is dead-band space — no
+                // assert (asserting on None here was the bottom bounce);
+                // far from it the position is unknowable flicker: re-assert.
+                None => self.distance_from_bottom() > OWN_SEND_SCROLL_SLACK_PX + 8.0,
             };
             if moved {
-                self.list.scroll_to(ListOffset {
-                    item_ix: anchor_ix,
-                    offset_in_item: px(0.0),
-                });
-                self.list.scroll_by(px(-inset));
+                // Correct with the entry glide's ease, not a snap: the only
+                // in-band escapes are one-frame commit transients and splice
+                // flicker, and an eased ~200ms return reads as native
+                // rubber-banding where an instant re-assert read as stutter
+                // (user report). Bounds-less flicker still snaps — there is
+                // nothing to ease against.
+                match self.list.bounds_for_item(anchor_ix) {
+                    Some(b) => {
+                        let err =
+                            f32::from(b.top()) - (f32::from(viewport.top()) + inset);
+                        let now = Instant::now();
+                        let frames = match self.own_turn_last_tick {
+                            Some(last) => (now.duration_since(last).as_secs_f32()
+                                * 1000.0
+                                / SPRING_FRAME_MS)
+                                .min(SPRING_MAX_CATCHUP_FRAMES),
+                            None => 1.0,
+                        };
+                        self.own_turn_last_tick = Some(now);
+                        let ease = 1.0 - OWN_SEND_GLIDE_RETAIN.powf(frames);
+                        if err.abs() <= OWN_SEND_GLIDE_SNAP_PX {
+                            self.list.scroll_by(px(err));
+                            self.own_turn_last_tick = None;
+                        } else {
+                            self.list.scroll_by(px(err * ease));
+                        }
+                        self.own_turn_kick = true;
+                    }
+                    None => {
+                        self.list.scroll_to(ListOffset {
+                            item_ix: anchor_ix,
+                            offset_in_item: px(0.0),
+                        });
+                        self.list.scroll_by(px(-inset));
+                        self.own_turn_last_tick = None;
+                    }
+                }
                 cx.notify();
+            } else {
+                self.own_turn_last_tick = None;
             }
             return;
         }
@@ -1951,7 +2011,7 @@ impl Transcript {
             }
             self.own_turn_last_tick = None;
         } else if anchored && err <= OWN_SEND_GLIDE_SNAP_PX
-            && err >= -(OWN_SEND_SCROLL_SLACK_PX + 8.0)
+            && err >= -(OWN_SEND_SCROLL_SLACK_PX + 2.0)
         {
             // At the hold — or resting inside the slack under it (a restick
             // that fired at the true bottom): land WITHOUT pulling the view
@@ -2211,7 +2271,7 @@ impl Transcript {
                     // start — the end-of-turn up/down jump the spring then has
                     // to walk back. `remeasure_items` keeps old sizes as hints
                     // and holds the anchor across the remeasure.
-                    self.list.remeasure_items(old_range);
+                self.list.remeasure_items(old_range);
                 } else {
                     self.list.splice(old_range, count);
                 }
