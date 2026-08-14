@@ -9,7 +9,8 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
 use komet_engine::{
-    EngineCore, HarnessRegistry, Repos, Terminals, capture_diff, capture_diff_against,
+    EngineCore, HarnessRegistry, Repos, Terminals, capture_commit_diff, capture_diff,
+    capture_diff_against,
     capture_turn_diff, merge_base, snapshot_tree,
 };
 use komet_proto::{GitHistoryRefKind, TerminalEvent};
@@ -515,6 +516,38 @@ async fn diff_capture_against_merge_base_shows_branch_changes() {
 
     // Unknown ref errors instead of silently falling back.
     assert!(merge_base(&repo_dir, "no-such-ref").await.is_err());
+}
+
+#[tokio::test]
+async fn commit_diff_captures_one_commit_and_roots_diff_the_empty_tree() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let repo_dir = tmp.path().join("repo");
+    init_repo(&repo_dir).await;
+    let repos = test_repos(&tmp.path().join("data"));
+
+    // A second commit plus an uncommitted edit on top.
+    std::fs::write(repo_dir.join("c.txt"), "second commit\n").expect("write c.txt");
+    git(&repo_dir, &["add", "."]).await;
+    git(&repo_dir, &["commit", "-m", "second"]).await;
+    std::fs::write(repo_dir.join("a.txt"), "one\ntwo\nuncommitted\n").expect("edit a.txt");
+
+    let head = git_stdout(&repo_dir, &["rev-parse", "HEAD"]).await;
+    let snapshot = capture_commit_diff(&repos, &repo_dir, &head)
+        .await
+        .expect("commit capture");
+    // Only the commit's own change — never the working tree on top.
+    assert!(snapshot.patch.contains("+second commit"));
+    assert!(!snapshot.patch.contains("uncommitted"));
+    assert_eq!(snapshot.files.len(), 1);
+    assert_eq!(snapshot.files[0].path, "c.txt");
+    assert_eq!(snapshot.head_sha.as_deref(), Some(head.as_str()));
+
+    // The root commit diffs against the empty tree instead of erroring.
+    let root = git_stdout(&repo_dir, &["rev-list", "--max-parents=0", "HEAD"]).await;
+    let root_snapshot = capture_commit_diff(&repos, &repo_dir, &root)
+        .await
+        .expect("root capture");
+    assert!(root_snapshot.files.iter().any(|f| f.path == "a.txt"));
 }
 
 #[tokio::test]

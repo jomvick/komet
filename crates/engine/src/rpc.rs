@@ -1107,6 +1107,7 @@ impl RpcService for EngineRpc {
                     mode: String,
                     base_ref: Option<String>,
                     chat_id: Option<String>,
+                    commit_sha: Option<String>,
                 }
                 let p: P = parse_params(params)?;
                 let identity = self
@@ -1126,6 +1127,15 @@ impl RpcService for EngineRpc {
                             .map_err(|e| RpcError::Failed(e.to_string()))?;
                         crate::diff_sync::capture_diff_against(&self.repos, root, Some(&base))
                             .await
+                    }
+                    // One commit's own changes (History → per-commit tab):
+                    // parent (or the empty tree) vs the commit itself.
+                    "commit" => {
+                        let sha = p
+                            .commit_sha
+                            .as_deref()
+                            .ok_or_else(|| RpcError::Failed("commitSha required".into()))?;
+                        crate::diff_sync::capture_commit_diff(&self.repos, root, sha).await
                     }
                     "turn" => {
                         let chat_id = p

@@ -916,6 +916,107 @@ pub async fn capture_diff_against(
     })
 }
 
+/// Snapshot of one COMMIT's changes: first-parent (or the empty tree for a
+/// root commit) diffed against the commit itself — the History pane's
+/// per-commit tab. Commit-to-commit only: no working tree, no untracked
+/// synthesis.
+pub async fn capture_commit_diff(
+    repos: &Repos,
+    root: &Path,
+    sha: &str,
+) -> Result<DiffSnapshot, EngineError> {
+    let parent_spec = format!("{sha}^");
+    let parent = capture_git(root, &["rev-parse", "--verify", &parent_spec], 256)
+        .await
+        .map(|c| String::from_utf8_lossy(&c.stdout).trim().to_string())
+        .unwrap_or_default();
+    let base: String = if parent.is_empty() {
+        EMPTY_TREE_SHA.to_string()
+    } else {
+        parent
+    };
+    let branch = repos
+        .current_branch(root)
+        .await
+        .unwrap_or_else(|_| "HEAD".into());
+    let names = capture_git(
+        root,
+        &[
+            "diff",
+            "--name-status",
+            "-z",
+            "--find-renames",
+            &base,
+            sha,
+            "--",
+        ],
+        2 * 1024 * 1024,
+    )
+    .await?;
+    let nums = capture_git(
+        root,
+        &[
+            "diff",
+            "--numstat",
+            "-z",
+            "--find-renames",
+            &base,
+            sha,
+            "--",
+        ],
+        2 * 1024 * 1024,
+    )
+    .await?;
+    let tracked = capture_git(
+        root,
+        &[
+            "diff",
+            "--no-ext-diff",
+            "--no-color",
+            "--find-renames",
+            "--unified=3",
+            &base,
+            sha,
+            "--",
+        ],
+        MAX_PATCH_BYTES,
+    )
+    .await?;
+    let mut files = parse_name_status(&names.stdout);
+    apply_numstat(&mut files, &nums.stdout);
+    let mut patch = String::from_utf8_lossy(&tracked.stdout).to_string();
+    let truncated = tracked.truncated || names.truncated || nums.truncated;
+    if tracked.truncated {
+        let boundary = patch.rfind('\n').unwrap_or(0);
+        patch.truncate(boundary);
+        patch.push_str("\n# Komet diff truncated\n");
+    }
+    let additions: u32 = files.iter().map(|f| f.additions).sum();
+    let deletions: u32 = files.iter().map(|f| f.deletions).sum();
+    let files_json = serde_json::to_string(&files)
+        .map_err(|e| EngineError::Other(format!("diff files serialize: {e}")))?;
+    let mut hasher = Sha256::new();
+    hasher.update(branch.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(sha.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(patch.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(files_json.as_bytes());
+    hasher.update(if truncated { b"1" } else { b"0" });
+    let checksum = crate::repos::hex(&hasher.finalize());
+    Ok(DiffSnapshot {
+        branch,
+        head_sha: Some(sha.to_string()),
+        patch,
+        files,
+        additions,
+        deletions,
+        truncated,
+        checksum,
+    })
+}
+
 /// `git merge-base <base_ref> HEAD` — the diff base for "Branch changes".
 /// Errors when the ref is unknown or the histories are unrelated.
 pub async fn merge_base(root: &Path, base_ref: &str) -> Result<String, EngineError> {

@@ -32,8 +32,8 @@ pub mod workspace_host;
 pub use agent_accounts::{AgentAccounts, AgentAccountsConfig};
 pub use auth::{Auth, AuthConfig, AuthState, AuthUser, OrgMembership};
 pub use diff_sync::{
-    CheckoutDiffSync, DiffSidecar, DiffSnapshot, TurnSnapshot, capture_diff, capture_diff_against,
-    capture_turn_diff, merge_base, snapshot_tree,
+    CheckoutDiffSync, DiffSidecar, DiffSnapshot, TurnSnapshot, capture_commit_diff, capture_diff,
+    capture_diff_against, capture_turn_diff, merge_base, snapshot_tree,
 };
 pub use doc_host::{ChatDocHandle, DocHost, DocHostConfig, EdgeConfig};
 pub use instance_lock::InstanceLock;

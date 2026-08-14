@@ -24,7 +24,7 @@ use gpui::{
 use komet_rpc::methods;
 use gpui_tokio::Tokio;
 
-use crate::changes::Changes;
+use crate::changes::{Changes, ChangesEvent};
 use crate::composer::{Composer, ComposerEvent, ComposerInput, ComposerInputEvent};
 use crate::icons::{self, icon};
 use crate::loaders;
@@ -523,6 +523,8 @@ pub struct Shell {
     /// Diff surfaces by id — each tab its own [`Changes`] viewer with its own
     /// scope/base pick and diff watch (multiple diff panels, user request).
     diffs: std::collections::HashMap<u64, Entity<Changes>>,
+    /// Event hookups for [`Self::diffs`] (History rows opening commit tabs).
+    diff_subs: std::collections::HashMap<u64, Subscription>,
     diff_seq: u64,
     /// Ordered surface tabs per panel key (drag-reorderable; stale entries —
     /// closed terminals/diffs — are skipped at read time).
@@ -754,6 +756,7 @@ impl Shell {
             right_terminal: None,
             right_plus: popover::Popup::default(),
             diffs: std::collections::HashMap::new(),
+            diff_subs: std::collections::HashMap::new(),
             diff_seq: 0,
             right_tabs: std::collections::HashMap::new(),
             right_tab_drag: None,
@@ -996,7 +999,7 @@ impl Shell {
                 && let RightSurface::Diff(id) = self.resolved_right_active(cx)
                 && let Some(changes) = self.diffs.get(&id).cloned()
             {
-                changes.update(cx, |changes, cx| changes.ensure_watch(cx));
+                changes.update(cx, |changes, cx| changes.ensure_content(cx));
             }
         }
         match state.read(cx).connection {
@@ -1107,7 +1110,7 @@ impl Shell {
             && let Some(changes) = self.diffs.get(&id).cloned()
         {
             // Reopening onto a diff tab revalidates its watch.
-            changes.update(cx, |changes, cx| changes.ensure_watch(cx));
+            changes.update(cx, |changes, cx| changes.ensure_content(cx));
         }
         cx.notify();
     }
@@ -1141,8 +1144,10 @@ impl Shell {
             .filter_map(|surface| match surface {
                 RightSurface::Diff(id) => self
                     .diffs
-                    .contains_key(id)
-                    .then(|| (*surface, SharedString::from("Diff"))),
+                    .get(id)
+                    // Contextual title (user request): the pane's scope
+                    // label, or the pinned commit's subject.
+                    .map(|changes| (*surface, changes.read(cx).tab_title())),
                 RightSurface::Terminal(tab) => terminals
                     .iter()
                     .find(|(k, _, _)| k == tab)
@@ -1218,7 +1223,7 @@ impl Shell {
             }
             RightSurface::Diff(id) => {
                 if let Some(changes) = self.diffs.get(&id).cloned() {
-                    changes.update(cx, |changes, cx| changes.ensure_watch(cx));
+                    changes.update(cx, |changes, cx| changes.ensure_content(cx));
                 }
             }
             RightSurface::Picker => {}
@@ -1230,10 +1235,31 @@ impl Shell {
     /// FRESH diff tab with its own scope/base selection (multiple diff
     /// panels, user request).
     fn add_diff_surface(&mut self, cx: &mut Context<Self>) {
+        let changes = cx.new(|cx| Changes::new(self.state.clone(), cx));
+        self.register_diff_surface(changes, cx);
+    }
+
+    /// A History row click: the commit opens as its own pinned diff tab
+    /// (user request).
+    fn add_commit_diff_surface(
+        &mut self,
+        commit: komet_proto::GitHistoryCommit,
+        cx: &mut Context<Self>,
+    ) {
+        let changes = cx.new(|cx| Changes::for_commit(self.state.clone(), commit, cx));
+        self.register_diff_surface(changes, cx);
+    }
+
+    fn register_diff_surface(&mut self, changes: Entity<Changes>, cx: &mut Context<Self>) {
         self.diff_seq += 1;
         let id = self.diff_seq;
-        let changes = cx.new(|cx| Changes::new(self.state.clone(), cx));
+        let sub = cx.subscribe(&changes, |this: &mut Self, _, event, cx| match event {
+            ChangesEvent::OpenCommit(commit) => {
+                this.add_commit_diff_surface(commit.clone(), cx);
+            }
+        });
         self.diffs.insert(id, changes);
+        self.diff_subs.insert(id, sub);
         let key = self.panel_key(cx);
         self.right_tabs
             .entry(key)
@@ -1276,6 +1302,7 @@ impl Shell {
             RightSurface::Diff(id) => {
                 // Dropping the entity tears down its diff watch.
                 self.diffs.remove(&id);
+                self.diff_subs.remove(&id);
             }
             RightSurface::Terminal(tab) => {
                 let panel = self.right_terminal_panel(cx);
@@ -3715,7 +3742,7 @@ impl Shell {
                 RightSurface::Diff(id) if self.diffs.contains_key(&id) => {
                     let changes = self.diffs.get(&id).cloned().expect("checked");
                     // Idempotent — also covers a persisted-open pane on boot.
-                    changes.update(cx, |changes, cx| changes.ensure_watch(cx));
+                    changes.update(cx, |changes, cx| changes.ensure_content(cx));
                     // The diff options (scope dropdown, ref selector,
                     // fold-all) moved DOWN from the titlebar band — the
                     // surface tabs own that row now; the expand/close

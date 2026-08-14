@@ -32,7 +32,7 @@ use gpui::{
     SharedString, Subscription, Task, Window, div, font, list, prelude::*, px,
 };
 
-use komet_proto::{Chat, CheckoutDiff};
+use komet_proto::{Chat, CheckoutDiff, GitHistoryCommit};
 use komet_rpc::methods;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
@@ -444,6 +444,10 @@ pub enum DiffScope {
     LatestTurn,
     /// Repository commit graph. Hosted here until the right pane becomes tabs.
     History,
+    /// One commit's own changes (parent vs commit) — the per-commit tab a
+    /// History row click opens. Never listed in the scope menu
+    /// ([`Self::ALL`]); a commit-pinned pane is born this way and stays.
+    Commit,
 }
 
 impl DiffScope {
@@ -460,6 +464,7 @@ impl DiffScope {
             Self::Branch => "Branch changes",
             Self::LatestTurn => "Latest turn",
             Self::History => "History",
+            Self::Commit => "Commit",
         }
     }
 
@@ -470,6 +475,7 @@ impl DiffScope {
             Self::Branch => "branch",
             Self::LatestTurn => "turn",
             Self::History => "history",
+            Self::Commit => "commit",
         }
     }
 }
@@ -485,6 +491,7 @@ pub fn scope_label(scope: DiffScope, count: usize, base: Option<&str>) -> String
         },
         DiffScope::LatestTurn => format!("{count} Changed {files} this turn"),
         DiffScope::History => "History".to_string(),
+        DiffScope::Commit => format!("{count} Changed {files} in this commit"),
     }
 }
 
@@ -519,6 +526,7 @@ pub fn clean_message(scope: DiffScope, base: Option<&str>) -> String {
         },
         DiffScope::LatestTurn => "No changes this turn".to_string(),
         DiffScope::History => "No commits found".to_string(),
+        DiffScope::Commit => "Empty commit".to_string(),
     }
 }
 
@@ -790,8 +798,19 @@ pub struct Changes {
     history_count: Option<Entity<GitHistoryCount>>,
     history_fetch_button: Option<Entity<GitHistoryFetchButton>>,
     history_events: Option<Subscription>,
+    /// Pinned commit for a [`DiffScope::Commit`] pane (sha + subject drive
+    /// the fetch and the surface-tab title).
+    commit: Option<GitHistoryCommit>,
     _observe: Subscription,
 }
+
+/// Events the host (the right pane's surface strip) listens for.
+pub enum ChangesEvent {
+    /// A History row was clicked — open this commit as its own diff tab.
+    OpenCommit(GitHistoryCommit),
+}
+
+impl gpui::EventEmitter<ChangesEvent> for Changes {}
 
 impl Changes {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
@@ -829,8 +848,35 @@ impl Changes {
             history_count: None,
             history_fetch_button: None,
             history_events: None,
+            commit: None,
             _observe: observe,
         }
+    }
+
+    /// A pane pinned to one commit's diff (a History row click) — fetches
+    /// `parent vs commit` once and never offers the scope menu.
+    pub fn for_commit(
+        state: Entity<AppState>,
+        commit: GitHistoryCommit,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let mut changes = Self::new(state, cx);
+        changes.scope = DiffScope::Commit;
+        changes.commit = Some(commit);
+        changes
+    }
+
+    /// The surface-tab title (contextual, user request): the pinned commit's
+    /// subject (short sha for subject-less commits), else the scope's label.
+    pub fn tab_title(&self) -> gpui::SharedString {
+        if let Some(commit) = &self.commit {
+            let subject = commit.subject.trim();
+            if !subject.is_empty() {
+                return subject.to_string().into();
+            }
+            return commit.sha.chars().take(7).collect::<String>().into();
+        }
+        gpui::SharedString::from(self.scope.label())
     }
 
     /// The selected chat's host device when it differs from the connected
@@ -951,7 +997,7 @@ impl Changes {
     fn active_diff(&self, cx: &App) -> Option<CheckoutDiff> {
         match self.scope {
             DiffScope::WorkingTree => self.resolved(cx),
-            DiffScope::Branch | DiffScope::LatestTurn => self.scoped.clone(),
+            DiffScope::Branch | DiffScope::LatestTurn | DiffScope::Commit => self.scoped.clone(),
             DiffScope::History => None,
         }
     }
@@ -964,6 +1010,10 @@ impl Changes {
             DiffScope::Branch => format!("br:{}", self.base_ref.as_deref().unwrap_or("")),
             DiffScope::LatestTurn => "turn".to_string(),
             DiffScope::History => "history".to_string(),
+            DiffScope::Commit => format!(
+                "commit:{}",
+                self.commit.as_ref().map(|c| c.sha.as_str()).unwrap_or("")
+            ),
         }
     }
 
@@ -1067,14 +1117,22 @@ impl Changes {
             },
             _ => None,
         };
+        let commit_sha = match self.scope {
+            DiffScope::Commit => match &self.commit {
+                Some(commit) => Some(commit.sha.clone()),
+                None => return, // a commit pane without its pin never fetches
+            },
+            _ => None,
+        };
         let target = self.desired_target(cx);
         let context = format!(
-            "{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}",
             target.as_deref().unwrap_or("local"),
             chat_id,
             cwd,
             self.scope.mode(),
-            base.as_deref().unwrap_or("")
+            base.as_deref().unwrap_or(""),
+            commit_sha.as_deref().unwrap_or("")
         );
         let watch_sum = self.resolved(cx).map(|d| d.checksum).unwrap_or_default();
         let key = format!("{context}|{watch_sum}");
@@ -1103,6 +1161,9 @@ impl Changes {
             params.insert("chatId".into(), serde_json::Value::String(chat_id));
             if let Some(base) = base {
                 params.insert("baseRef".into(), serde_json::Value::String(base));
+            }
+            if let Some(sha) = commit_sha {
+                params.insert("commitSha".into(), serde_json::Value::String(sha));
             }
             if let Some(target) = target {
                 params.insert("targetDeviceId".into(), serde_json::Value::String(target));
@@ -1157,6 +1218,10 @@ impl Changes {
         self.history_events = Some(cx.subscribe(
             &history,
             |this: &mut Self, _, event, cx| match event {
+                GitHistoryEvent::OpenCommit(commit) => {
+                    // Bubble to the host — the surface strip opens the tab.
+                    cx.emit(ChangesEvent::OpenCommit(commit.clone()));
+                }
                 GitHistoryEvent::FetchSucceeded => {
                     // Remote refs affect branch choices and every scoped diff
                     // based on a ref. Force fresh reads after the engine has
@@ -1205,6 +1270,13 @@ impl Changes {
         cx.notify();
     }
 
+    /// Everything the pane needs kicked when (re)shown: the watch plus the
+    /// scope-specific loads (branches, scoped/commit capture, history) — the
+    /// shell's hook for freshly-mounted surface tabs.
+    pub fn ensure_content(&mut self, cx: &mut Context<Self>) {
+        self.sync(cx);
+    }
+
     /// Reconcile parsed content with the currently-active diff.
     fn sync(&mut self, cx: &mut Context<Self>) {
         // The watch follows the selected chat's host device (idempotent when
@@ -1215,7 +1287,9 @@ impl Changes {
                 .update(cx, |history, cx| history.ensure_loaded(cx));
             return;
         }
-        self.ensure_branches(cx);
+        if self.scope != DiffScope::Commit {
+            self.ensure_branches(cx);
+        }
         self.ensure_scoped(cx);
         let Some(diff) = self.active_diff(cx) else {
             if self.parsed.take().is_some() {
@@ -1846,6 +1920,49 @@ impl Changes {
     /// alongside, shell-owned (they mutate shell state).
     pub fn render_header_controls(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
+        // Commit-pinned pane: the pin never changes, so a fixed identity
+        // chip (mono short sha + subject) replaces the scope dropdown;
+        // fold-all still trails.
+        if let Some(commit) = self.commit.clone() {
+            let short: String = commit.sha.chars().take(7).collect();
+            return div()
+                .size_full()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .flex_none()
+                        .h(px(22.0))
+                        .px(px(6.0))
+                        .rounded(px(5.0))
+                        .flex()
+                        .items_center()
+                        .bg(crate::theme::ink(0.05))
+                        .font_family(theme.font_mono.clone())
+                        .text_size(px(10.5))
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from(short)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(12.0))
+                        .text_color(theme.text)
+                        .child(SharedString::from(commit.subject.clone())),
+                )
+                .child(
+                    Self::header_button("changes-fold-all", crate::icons::FOLD_VERTICAL, &theme)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            this.toggle_collapse_all(cx);
+                        })),
+                )
+                .into_any_element();
+        }
         let scope = self.scope;
         let history_count = (scope == DiffScope::History).then(|| self.history_count(cx));
         let history_fetch_button =
