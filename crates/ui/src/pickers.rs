@@ -3135,7 +3135,8 @@ fn default_badge(theme: &Theme) -> gpui::Div {
 /// orange even on the monochrome surface; the mock harness scripts
 /// Claude-flavoured runs, so it wears the Claude mark).
 /// The 3px bar marking the selected rail tab (t3 ModelPickerSidebar
-/// `SELECTED_INDICATOR_CLASS`), hugging the rail's right edge.
+/// `SELECTED_INDICATOR_CLASS`, `rounded-l-full`): LEFT half-capsule only —
+/// the flat right edge presses against the rail/pane border it hugs.
 fn rail_indicator(tint: gpui::Hsla) -> gpui::Div {
     div()
         .absolute()
@@ -3143,7 +3144,8 @@ fn rail_indicator(tint: gpui::Hsla) -> gpui::Div {
         .top(px(8.0))
         .w(px(3.0))
         .h(px(20.0))
-        .rounded(px(1.5))
+        .rounded_tl(px(3.0))
+        .rounded_bl(px(3.0))
         .bg(tint)
 }
 
