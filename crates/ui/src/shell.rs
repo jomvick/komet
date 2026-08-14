@@ -57,7 +57,7 @@ mod tabs;
 
 use spaces::{AddSpaceFlow, RenameSpaceDialog};
 
-actions!(shell, [ToggleSidebar, ToggleChanges, AddSpacePalette]);
+actions!(shell, [ToggleSidebar, ToggleChanges, AddSpacePalette, NewSession]);
 
 // ---------------------------------------------------------------------------
 // Traffic-light-aware titlebar layout (feature-inventory §1.1)
@@ -134,6 +134,11 @@ pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
         KeyBinding::new(
             &valid_or_default(&keymap.toggle_terminal, "mod-j"),
             ToggleTerminal,
+            None,
+        ),
+        KeyBinding::new(
+            &valid_or_default(&keymap.new_session, "mod-n"),
+            NewSession,
             None,
         ),
         // Fixed: ⌘K summons the add-space palette (the ⌘K chip in its search
@@ -5659,6 +5664,9 @@ impl Render for Shell {
                 }
             }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
+            // New session works from anywhere — `open_new_session` routes back
+            // to chat itself, so Settings is not a dead spot.
+            .on_action(cx.listener(|this, _: &NewSession, _, cx| this.open_new_session(cx)))
             .on_action(cx.listener(|this, _: &ToggleChanges, _, cx| {
                 if matches!(this.route, Route::Chat) {
                     this.toggle_right_pane(cx)
