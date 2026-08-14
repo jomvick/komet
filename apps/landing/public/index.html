@@ -245,21 +245,9 @@
      wrap width */
   .panel {
     position: relative;
-    border-left: 1px solid var(--line);
-    border-right: 1px solid var(--line);
   }
-  .panel::before, .panel::after {
-    content: "";
-    position: absolute;
-    left: 50%;
-    transform: translateX(-50%);
-    width: 100vw;
-    height: 1px;
-    background: var(--line);
-  }
-  .panel::before { top: 0; }
-  .panel::after { bottom: 0; }
   .pdot {
+    display: none;
     position: absolute;
     width: 5px;
     height: 5px;
@@ -270,11 +258,9 @@
   .pdot.tr { top: 0; right: 0; transform: translate(50%, -50%); }
   .pdot.bl { bottom: 0; left: 0; transform: translate(-50%, 50%); }
   .pdot.br { bottom: 0; right: 0; transform: translate(50%, 50%); }
-  .panel-row + .panel-row { border-top: 1px solid var(--line-soft); }
 
   .p-features { display: grid; grid-template-columns: repeat(4, 1fr); }
   .cell { padding: 30px 26px 34px; }
-  .cell + .cell { border-left: 1px solid var(--line-soft); }
   .cell h3 {
     font-size: 15.5px;
     font-weight: 600;
@@ -285,7 +271,6 @@
 
   .p-gallery { display: grid; grid-template-columns: repeat(3, 1fr); }
   .p-gallery figure { margin: 0; padding: 22px 22px 18px; }
-  .p-gallery figure + figure { border-left: 1px solid var(--line-soft); }
   .p-gallery img {
     display: block;
     width: 100%;
@@ -308,7 +293,6 @@
     align-items: center;
     justify-content: center;
     padding: 46px 40px;
-    border-right: 1px solid var(--line-soft);
   }
   /* faint dot grid, vignetted so it dissolves before the cell edges */
   .p-diagram::before {
@@ -405,22 +389,15 @@
   .harness-fallback { display: none; }
   @media (max-width: 980px) {
     .p-features { grid-template-columns: repeat(2, 1fr); }
-    .cell + .cell { border-left: 0; }
-    .cell:nth-child(even) { border-left: 1px solid var(--line-soft); }
-    .cell:nth-child(n+3) { border-top: 1px solid var(--line-soft); }
   }
   @media (max-width: 900px) {
     .p-gallery { grid-template-columns: 1fr; }
-    .p-gallery figure + figure { border-left: 0; border-top: 1px solid var(--line-soft); }
     .p-harness { grid-template-columns: 1fr; }
     .p-copy { order: -1; padding: 38px 26px; }
-    .p-diagram { border-right: 0; border-top: 1px solid var(--line-soft); }
   }
   @media (max-width: 560px) {
     .p-features { grid-template-columns: 1fr; }
     .cell { padding: 24px 20px 26px; }
-    .cell:nth-child(even) { border-left: 0; }
-    .cell + .cell { border-top: 1px solid var(--line-soft); }
   }
   @media (max-width: 520px) {
     .spoke-wrap { display: none; }
