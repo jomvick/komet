@@ -28,7 +28,7 @@ use crate::changes::Changes;
 use crate::composer::{Composer, ComposerEvent, ComposerInput, ComposerInputEvent};
 use crate::icons::{self, icon};
 use crate::loaders;
-use crate::motion::{self, AnimationExt as _, MotionSpec, RESIZE, SPLASH_OUT};
+use crate::motion::{self, AnimationExt as _, MotionSpec, RESIZE, SPLASH_OUT, TAB_SLIDE};
 use crate::popover::{self, Loadable};
 use crate::rail;
 use crate::settings::accounts::AccountsPage;
@@ -384,6 +384,16 @@ struct RightTabDrag {
     title: SharedString,
 }
 
+/// Live drag-over state for the surface-tab strip — the terminal drawer's
+/// [`crate::terminal::panel`] DragState, ported: `epoch` keys the 150ms
+/// slide-animation restarts as the hovered slot changes.
+struct RightTabDragState {
+    from: usize,
+    over: usize,
+    epoch: usize,
+    prev_over: usize,
+}
+
 /// Ghost chip following the pointer while a surface tab drags.
 struct SurfaceTabGhost {
     title: SharedString,
@@ -394,7 +404,7 @@ impl Render for SurfaceTabGhost {
         let theme = Theme::of(cx);
         div()
             .h(px(24.0))
-            .max_w(px(144.0))
+            .w(px(112.0))
             .px(px(8.0))
             .flex()
             .items_center()
@@ -517,6 +527,8 @@ pub struct Shell {
     /// Ordered surface tabs per panel key (drag-reorderable; stale entries —
     /// closed terminals/diffs — are skipped at read time).
     right_tabs: std::collections::HashMap<String, Vec<RightSurface>>,
+    /// In-flight surface-tab drag (slide animation state).
+    right_tab_drag: Option<RightTabDragState>,
     /// Chat outlet vs settings pages.
     route: Route,
     /// Route history behind the titlebar back/forward buttons (§ nav history).
@@ -744,6 +756,7 @@ impl Shell {
             diffs: std::collections::HashMap::new(),
             diff_seq: 0,
             right_tabs: std::collections::HashMap::new(),
+            right_tab_drag: None,
             route,
             nav,
             devices_page: None,
@@ -1150,6 +1163,29 @@ impl Shell {
             let surface = tabs.remove(from);
             tabs.insert(to, surface);
             cx.notify();
+        }
+    }
+
+    /// Track the hovered drop slot mid-drag (the terminal drawer's
+    /// `update_drag_over`, ported: epoch bumps restart the slide tween).
+    fn update_right_tab_drag_over(&mut self, from: usize, over: usize, cx: &mut Context<Self>) {
+        match &mut self.right_tab_drag {
+            Some(drag) if drag.over != over => {
+                drag.prev_over = drag.over;
+                drag.over = over;
+                drag.epoch += 1;
+                cx.notify();
+            }
+            Some(_) => {}
+            None => {
+                self.right_tab_drag = Some(RightTabDragState {
+                    from,
+                    over,
+                    epoch: 0,
+                    prev_over: from,
+                });
+                cx.notify();
+            }
         }
     }
 
@@ -3886,16 +3922,60 @@ impl Shell {
     /// (icon · title · ✕) plus the `+` menu — the t3code RightPanelTabs bar,
     /// living in the top row; the diff options moved into the pane below.
     pub(crate) fn render_right_tab_strip(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        /// Fixed chip slot — the terminal drawer's drag mechanics (drop-index
+        /// quantisation + slide offsets) assume uniform widths.
+        const CHIP_W: f32 = 112.0;
+        const CHIP_SLOT: f32 = CHIP_W + 4.0; // + the strip's own gap
+
         let theme = Theme::of(cx).clone();
+        // Heal drag state if the pointer was released outside the strip.
+        if self.right_tab_drag.is_some() && !cx.has_active_drag() {
+            self.right_tab_drag = None;
+        }
         let rows = self.right_surface_rows(cx);
+        let count = rows.len();
         let active = self.resolved_right_active(cx);
+        let drag = self
+            .right_tab_drag
+            .as_ref()
+            .map(|d| (d.from, d.over, d.epoch, d.prev_over));
         let mut strip = div()
+            .id("right-surface-strip")
             .size_full()
             .flex()
             .flex_row()
             .items_center()
             .gap(px(4.0))
-            .overflow_hidden();
+            .overflow_hidden()
+            .on_drag_move::<RightTabDrag>(cx.listener(
+                move |this, event: &gpui::DragMoveEvent<RightTabDrag>, _, cx| {
+                    let payload = event.drag(cx);
+                    if payload.panel_key != this.panel_key(cx) {
+                        return;
+                    }
+                    let from = payload.from;
+                    let rel_x =
+                        f32::from(event.event.position.x) - f32::from(event.bounds.left());
+                    let over = crate::terminal::panel::drop_index(rel_x, CHIP_SLOT, count);
+                    this.update_right_tab_drag_over(from, over, cx);
+                },
+            ))
+            .on_drop::<RightTabDrag>(cx.listener(
+                move |this, payload: &RightTabDrag, _, cx| {
+                    if payload.panel_key != this.panel_key(cx) {
+                        this.right_tab_drag = None;
+                        cx.notify();
+                        return;
+                    }
+                    let to = this
+                        .right_tab_drag
+                        .as_ref()
+                        .map(|d| d.over)
+                        .unwrap_or(payload.from);
+                    this.right_tab_drag = None;
+                    this.reorder_right_tabs(payload.from, to, cx);
+                },
+            ));
         for (ix, (surface, title)) in rows.into_iter().enumerate() {
             let is_active = surface == active;
             let icon_path = match surface {
@@ -3907,12 +3987,12 @@ impl Shell {
             // hovered (user request).
             let group: SharedString = format!("right-surface-tab-{ix}").into();
             let ghost_title = title.clone();
-            strip = strip.child(
-                div()
+            let chip = div()
                     .id(("right-surface-tab", ix))
                     .group(group.clone())
                     .h(px(24.0))
-                    .max_w(px(144.0))
+                    .w(px(CHIP_W))
+                    .flex_none()
                     .pl(px(4.0))
                     .pr(px(8.0))
                     .rounded(px(6.0))
@@ -3952,13 +4032,6 @@ impl Shell {
                             cx.new(|_| SurfaceTabGhost { title })
                         },
                     )
-                    .on_drop::<RightTabDrag>(cx.listener(
-                        move |this, payload: &RightTabDrag, _, cx| {
-                            if payload.panel_key == this.panel_key(cx) {
-                                this.reorder_right_tabs(payload.from, ix, cx);
-                            }
-                        },
-                    ))
                     .child(
                         // Leading slot: icon normally, ✕ on tab hover — two
                         // stacked layers opacity-swapped by the group hover.
@@ -4016,8 +4089,34 @@ impl Shell {
                                 theme.text_muted
                             })
                             .child(title),
-                    ),
-            );
+                    );
+            // Sliding transform while a sibling drags over (the terminal
+            // drawer's exact recipe): animate 150ms between committed
+            // offsets; the dragged tab leaves an invisible spacer — the
+            // ghost carries it.
+            let wrapped: AnyElement = match drag {
+                Some((from, over, epoch, prev_over)) if ix != from => {
+                    let target =
+                        crate::terminal::panel::slide_offset(ix, from, over) * CHIP_SLOT;
+                    let start =
+                        crate::terminal::panel::slide_offset(ix, from, prev_over) * CHIP_SLOT;
+                    div()
+                        .relative()
+                        .child(chip.with_animation(
+                            ("right-tab-slide", (ix as u64) | ((epoch as u64) << 32)),
+                            TAB_SLIDE.animation(),
+                            move |el, t| el.left(px(motion::lerp(start, target, t))),
+                        ))
+                        .into_any_element()
+                }
+                Some((from, ..)) if ix == from => div()
+                    .w(px(CHIP_W))
+                    .h(px(24.0))
+                    .flex_none()
+                    .into_any_element(),
+                _ => chip.into_any_element(),
+            };
+            strip = strip.child(wrapped);
         }
         // The `+` — a small menu offering the two surfaces (t3 "Add panel
         // surface"); mirrors the picker cards.
