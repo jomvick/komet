@@ -143,8 +143,9 @@ pub const INK_FILL_SCALE: f32 = 1.0;
 /// keeps separators legible instead of dissolving into the panel.
 pub const INK_HAIRLINE_SCALE: f32 = 1.35;
 
-/// Paint-only syntax colors. The parser retains richer categories than the
-/// palette needs, while this single mapping keeps every UI surface coherent.
+/// Paint-only syntax colors. The hues follow the Git history graph's lane
+/// palette (indigo, pink, emerald, amber, red, neutral), while light-mode
+/// variants are darkened enough to remain readable as text on white.
 #[derive(Debug, Clone)]
 pub struct SyntaxPalette {
     pub comment: Hsla,
@@ -204,75 +205,81 @@ impl SyntaxPalette {
     }
 
     fn dark(text: Hsla, comment: Hsla, danger: Hsla) -> Self {
-        let rose = oklch(0.709, 0.129, 20.0);
-        let violet = oklch(0.75, 0.13, 293.0);
-        let blue = oklch(0.76, 0.11, 255.0);
-        let green = oklch(0.77, 0.11, 168.0);
-        let teal = oklch(0.79, 0.10, 190.0);
-        let amber = oklch(0.78, 0.12, 80.0);
-        let orange = oklch(0.76, 0.12, 55.0);
+        // Same sources and 72% saturation treatment as history::graph_color.
+        let indigo = git_graph_tone(oklch(0.673, 0.182, 276.935));
+        let pink = git_graph_tone(oklch(0.718, 0.202, 349.761));
+        let emerald = git_graph_tone(oklch(0.765, 0.177, 163.223));
+        let amber = git_graph_tone(oklch(0.828, 0.189, 84.429));
+        let red = git_graph_tone(danger);
         Self {
             comment,
-            keyword: rose,
-            string: green,
-            string_special: teal,
-            escape: teal,
+            keyword: indigo,
+            string: emerald,
+            string_special: pink,
+            escape: pink,
             number: amber,
             boolean: amber,
             type_name: amber,
-            type_builtin: teal,
+            type_builtin: emerald,
             constructor: amber,
-            function: blue,
-            function_builtin: violet,
-            macro_name: violet,
-            property: orange,
-            constant: teal,
+            function: indigo,
+            function_builtin: pink,
+            macro_name: pink,
+            property: amber,
+            constant: emerald,
             variable: text,
-            variable_special: teal,
+            variable_special: pink,
             parameter: text,
             operator: text,
             punctuation: text,
-            tag: rose,
-            attribute: orange,
+            tag: pink,
+            attribute: amber,
             label: amber,
-            invalid: danger,
+            invalid: red,
         }
     }
 
     fn light(text: Hsla, comment: Hsla, danger: Hsla) -> Self {
-        let violet = oklch(0.47, 0.20, 293.0);
-        let blue = oklch(0.48, 0.16, 255.0);
-        let green = oklch(0.46, 0.11, 168.0);
-        let teal = oklch(0.46, 0.10, 190.0);
-        let amber = oklch(0.49, 0.12, 70.0);
-        let orange = oklch(0.50, 0.14, 50.0);
+        // Match the light graph's hue families at text-safe lightness.
+        let indigo = git_graph_tone(oklch(0.47, 0.20, 276.966));
+        let pink = git_graph_tone(oklch(0.47, 0.17, 0.584));
+        let emerald = git_graph_tone(oklch(0.46, 0.11, 163.225));
+        let amber = git_graph_tone(oklch(0.47, 0.12, 48.998));
+        let red = git_graph_tone(danger);
         Self {
             comment,
-            keyword: violet,
-            string: green,
-            string_special: teal,
-            escape: teal,
+            keyword: indigo,
+            string: emerald,
+            string_special: pink,
+            escape: pink,
             number: amber,
             boolean: amber,
             type_name: amber,
-            type_builtin: teal,
+            type_builtin: emerald,
             constructor: amber,
-            function: blue,
-            function_builtin: violet,
-            macro_name: violet,
-            property: orange,
-            constant: teal,
+            function: indigo,
+            function_builtin: pink,
+            macro_name: pink,
+            property: amber,
+            constant: emerald,
             variable: text,
-            variable_special: teal,
+            variable_special: pink,
             parameter: text,
             operator: text,
             punctuation: text,
-            tag: violet,
-            attribute: orange,
+            tag: pink,
+            attribute: amber,
             label: amber,
-            invalid: danger,
+            invalid: red,
         }
     }
+}
+
+/// Git history intentionally softens lane saturation so the graph remains
+/// colorful without competing with content. Syntax uses the same treatment.
+fn git_graph_tone(mut color: Hsla) -> Hsla {
+    color.s *= 0.72;
+    color
 }
 
 /// The app theme. Two concrete instances — [`Theme::dark`] and [`Theme::light`].
