@@ -159,9 +159,10 @@ impl Shell {
             // the buttons slide right on expand (user report).
             let gap_budget = if takeover { 8.0 } else { 16.0 };
             let avail = self.viewport_width - row_left - pr - gap_budget;
-            let controls = self
-                .changes_pane(cx)
-                .update(cx, |changes, cx| changes.render_header_controls(cx));
+            // The right pane's SURFACE TABS (t3 RightPanelTabs) — the diff
+            // options that used to live here moved into the pane's own
+            // second row; expand/close stay in this band (user request).
+            let controls = self.render_right_tab_strip(cx);
             Some(
                 div()
                     .flex_none()
