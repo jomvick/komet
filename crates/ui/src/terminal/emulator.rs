@@ -726,3 +726,4 @@ mod tests {
         assert_eq!(e.row_text(0), "é");
     }
 }
+
