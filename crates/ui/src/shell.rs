@@ -205,12 +205,11 @@ pub enum RightSurface {
 /// changes panels open *per session*, in memory only; heights and every other
 /// persisted setting stay global).
 ///
-/// The terminal DRAWER defaults closed; the right pane defaults OPEN (user
-/// request) — it lands on the surface picker, which is the intended entry
-/// point to terminals and git. `Default` is hand-written for exactly that
-/// asymmetry, and the map's `or_default()` makes an untouched chat read as
-/// open while a toggle still round-trips.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Everything defaults CLOSED — the right pane included (user request,
+/// revising the earlier default-open: it popped open on every session you
+/// visited). Opening is an explicit act, remembered per chat for the rest of
+/// the app run; a fresh open with no surface tabs lands on the picker.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ChatPanels {
     pub terminal_open: bool,
     /// Right pane visible (the surface host — historically the Changes pane).
@@ -218,16 +217,6 @@ pub struct ChatPanels {
     /// Which surface tab renders; validated against the live tab list each
     /// frame (a closed tab falls back gracefully).
     pub right_active: RightSurface,
-}
-
-impl Default for ChatPanels {
-    fn default() -> Self {
-        Self {
-            terminal_open: false,
-            changes_open: true,
-            right_active: RightSurface::Picker,
-        }
-    }
 }
 
 /// The session-scoped panel map. Keys are chat ids; the new-chat canvas uses
@@ -6166,15 +6155,15 @@ mod tests {
     // ---- per-session panel flags (§1.10/1.11 parity: komet sessionPanels) ----
 
     #[test]
-    fn session_panels_default_terminal_closed_right_pane_open() {
+    fn session_panels_default_closed_per_chat() {
         let panels = SessionPanels::default();
         assert_eq!(panels.get("a"), ChatPanels::default());
-        // The terminal drawer stays closed; the right pane opens onto the
-        // surface picker (user request).
+        // Everything closed until explicitly opened (user request — the
+        // brief default-open popped the pane on every visited session).
         assert!(!panels.get("a").terminal_open);
-        assert!(panels.get("a").changes_open);
+        assert!(!panels.get("a").changes_open);
         assert_eq!(panels.get("a").right_active, RightSurface::Picker);
-        // The new-chat canvas ("" key) is its own session, same defaults.
+        // The new-chat canvas ("" key) is its own session, also closed.
         assert!(!panels.get("").terminal_open);
     }
 
@@ -6186,12 +6175,11 @@ mod tests {
         assert!(panels.get("a").terminal_open);
         assert!(!panels.get("b").terminal_open);
         assert!(!panels.get("").terminal_open);
-        // The right pane starts open, so B's first toggle CLOSES it — and
-        // only B's (A is untouched, still default-open).
-        assert!(!panels.toggle_changes("b"));
-        assert!(!panels.get("b").changes_open);
+        // Changes pane in B is independent of A's terminal.
+        assert!(panels.toggle_changes("b"));
+        assert!(panels.get("b").changes_open);
         assert!(!panels.get("b").terminal_open);
-        assert!(panels.get("a").changes_open);
+        assert!(!panels.get("a").changes_open);
         // Switching back to A restores A's state untouched.
         assert!(panels.get("a").terminal_open);
         // Toggling off round-trips.
@@ -6202,22 +6190,20 @@ mod tests {
     #[test]
     fn session_panels_both_flags_coexist_per_chat() {
         let mut panels = SessionPanels::default();
-        // Terminal opens, the default-open right pane closes: independent
-        // flags on one chat, and neither leaks to another.
         panels.toggle_terminal("a");
         panels.toggle_changes("a");
         assert_eq!(
             panels.get("a"),
             ChatPanels {
                 terminal_open: true,
-                changes_open: false,
+                changes_open: true,
                 ..Default::default()
             }
         );
         assert_eq!(panels.get("b"), ChatPanels::default());
-        // The right pane round-trips back open.
-        assert!(panels.toggle_changes("a"));
-        assert!(panels.get("a").changes_open);
+        // The right pane round-trips back closed.
+        assert!(!panels.toggle_changes("a"));
+        assert!(!panels.get("a").changes_open);
     }
 
     #[test]
