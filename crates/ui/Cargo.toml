@@ -10,6 +10,7 @@ komet-proto.workspace = true
 similar.workspace = true
 komet-doc.workspace = true
 komet-engine.workspace = true
+komet-harness.workspace = true
 komet-rpc.workspace = true
 komet-update.workspace = true
 gpui.workspace = true

@@ -958,8 +958,9 @@ impl Pickers {
                 let loaded = match result {
                     Ok(value) => match serde_json::from_value::<Vec<Model>>(value) {
                         // Display hygiene for catalogs from older engines
-                        // (`default` alias rows, orphan `[1m]` variants).
-                        Ok(models) => Loadable::Ready(normalize_model_rows(models)),
+                        // (`default` alias rows, orphan `[1m]` variants,
+                        // version-less alias labels).
+                        Ok(models) => Loadable::Ready(normalize_model_rows(harness, models)),
                         Err(err) => Loadable::Error(err.to_string()),
                     },
                     Err(err) => Loadable::Error(err.to_string()),
@@ -1473,6 +1474,15 @@ impl Pickers {
     fn toggle_model_favorite(&mut self, harness: HarnessId, model: &str, cx: &mut Context<Self>) {
         self.defaults.toggle_favorite(harness, model);
         self.save_defaults();
+        // Starring REORDERS the list (stars float to the top / leave the
+        // favorites view) — the keyboard highlight follows the clicked row
+        // to its new index, else it strands on whatever slid into the old
+        // one and paints a second highlight (user report).
+        self.active = self
+            .visible_model_rows(cx)
+            .iter()
+            .position(|row| row.harness == harness && row.model.id == model)
+            .unwrap_or_else(|| self.selected_model_index(cx));
         cx.notify();
     }
 
@@ -2722,13 +2732,15 @@ impl Pickers {
                                 theme.text_muted.opacity(0.75)
                             }),
                     )
-                    .when(favorites_view, |el| el.child(rail_indicator(theme.accent))),
+                    .when(favorites_view, |el| el.child(rail_indicator(picker_purple(&theme)))),
             );
+            // Full-bleed divider, aligned with the search row's bottom
+            // hairline (see the height math there) — one line across.
             column = column.child(
                 div()
                     .h(px(1.0))
-                    .mx(px(4.0))
-                    .my(px(2.0))
+                    .mx(px(-4.0))
+                    .my(px(1.0))
                     .bg(crate::theme::hairline(0.08)),
             );
             for (ix, descriptor) in descriptors.iter().enumerate() {
@@ -2763,42 +2775,40 @@ impl Pickers {
                                 theme.text_muted
                             }),
                         ))
-                        .when(is_viewed, |el| el.child(rail_indicator(theme.accent))),
+                        .when(is_viewed, |el| el.child(rail_indicator(picker_purple(&theme)))),
                 );
             }
             column.into_any_element()
         });
 
-        // ── search row: icon + borderless input over an accent underline
-        //    (the input keeps focus while the popover is open, so the
-        //    underline doubles as its focus ring — t3 `focus-within:
-        //    border-ring`).
+        // ── search row: icon + borderless input over a FULL-BLEED hairline
+        //    (it meets the rail's divider at the same y, one line across the
+        //    card — user request; no accent tint). Height matches the rail's
+        //    star tab band exactly: 4px pad + 36px tab + 4px gap + 1px
+        //    divider margin = the hairline at y 45–46, same as this row's
+        //    inside-drawn bottom border at h 46.
         let search_row = div()
             .flex_none()
+            .h(px(46.0))
             .px(px(10.0))
-            .pt(px(8.0))
+            .border_b_1()
+            .border_color(crate::theme::hairline(0.08))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .child(
+                crate::icons::icon(crate::icons::MAGNIFER)
+                    .size(px(14.0))
+                    .flex_none()
+                    .text_color(theme.text_muted.opacity(0.7)),
+            )
             .child(
                 div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(8.0))
-                    .pb(px(8.0))
-                    .border_b_1()
-                    .border_color(theme.accent.opacity(0.55))
-                    .child(
-                        crate::icons::icon(crate::icons::MAGNIFER)
-                            .size(px(14.0))
-                            .flex_none()
-                            .text_color(theme.text_muted.opacity(0.7)),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_size(px(13.0))
-                            .child(self.search.clone()),
-                    ),
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(px(13.0))
+                    .child(self.search.clone()),
             );
 
         // ── model rows, flat — the scroll container's direct children so
@@ -2827,10 +2837,16 @@ impl Pickers {
                         .items_center()
                         .gap(px(10.0))
                         .cursor_pointer();
-                    if is_selected || is_active {
+                    // Selected and keyboard-highlighted must read as two
+                    // DIFFERENT treatments: identical washes made every
+                    // reorder (starring floats rows) look like two selected
+                    // rows (user report).
+                    if is_selected {
                         el = el
                             .bg(crate::theme::card_selected_bg())
                             .shadow(crate::theme::card_selected_shadows());
+                    } else if is_active {
+                        el = el.bg(crate::theme::ink(0.05));
                     } else {
                         el = el.hover(|s| s.bg(crate::theme::ink(0.06)));
                     }
@@ -3106,9 +3122,9 @@ fn default_badge(theme: &Theme) -> gpui::Div {
 /// Brand mark + optional tint for a harness (the Claude mark keeps its brand
 /// orange even on the monochrome surface; the mock harness scripts
 /// Claude-flavoured runs, so it wears the Claude mark).
-/// The 3px accent bar marking the selected rail tab (t3 ModelPickerSidebar
+/// The 3px bar marking the selected rail tab (t3 ModelPickerSidebar
 /// `SELECTED_INDICATOR_CLASS`), hugging the rail's right edge.
-fn rail_indicator(accent: gpui::Hsla) -> gpui::Div {
+fn rail_indicator(tint: gpui::Hsla) -> gpui::Div {
     div()
         .absolute()
         .right(px(-4.0))
@@ -3116,7 +3132,18 @@ fn rail_indicator(accent: gpui::Hsla) -> gpui::Div {
         .w(px(3.0))
         .h(px(20.0))
         .rounded(px(1.5))
-        .bg(accent)
+        .bg(tint)
+}
+
+/// The picker's selection purple — the app's violet identity (the "nice
+/// purple" family inline code wears), NOT the indigo `accent`: the indigo
+/// bar read blue against the glass (user request). violet-400 on dark,
+/// violet-600 on light (AA against white).
+fn picker_purple(theme: &Theme) -> gpui::Hsla {
+    match theme.appearance {
+        crate::theme::Appearance::Dark => crate::theme::oklch(0.702, 0.183, 293.541),
+        crate::theme::Appearance::Light => crate::theme::oklch(0.541, 0.281, 293.009),
+    }
 }
 
 /// Centered muted note filling an empty model list ("No models found").
@@ -3134,14 +3161,39 @@ fn empty_list_note(theme: &Theme, copy: &str) -> AnyElement {
 /// Display-side model-list hygiene, mirroring the engine's discovery-side
 /// fold (`models_from_session`) for catalogs served by OLDER engines (the
 /// space's device may run any version): the `default` alias row drops when a
-/// real row exists, and an orphan `<model>[1m]` variant presents as its base
-/// id with the Context Window trait pinned to 1M. Idempotent over
+/// real row exists, an orphan `<model>[1m]` variant presents as its base id
+/// with the Context Window trait pinned to 1M, and Claude rows adopt the
+/// curated catalog's labels so the version number always shows ("Opus 5",
+/// not the wire's terse "Opus" alias — user request). Idempotent over
 /// already-clean lists. The send path recomposes the advertised id from the
 /// base + trait (`pick_model_value`), so a folded pick still runs.
-pub(crate) fn normalize_model_rows(models: Vec<Model>) -> Vec<Model> {
+pub(crate) fn normalize_model_rows(harness: HarnessId, models: Vec<Model>) -> Vec<Model> {
     fn strip_1m(id: &str) -> Option<&str> {
         id.strip_suffix("[1m]").or_else(|| id.strip_suffix("-1m"))
     }
+    fn norm(id: &str) -> String {
+        id.chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .collect::<String>()
+            .to_ascii_lowercase()
+    }
+    let catalog = match harness {
+        HarnessId::ClaudeCode => komet_harness::claude::catalog::static_models(),
+        _ => Vec::new(),
+    };
+    // Curated label for an id: exact normalized match, else — for bare
+    // alphabetic aliases like `opus` — the first (flagship-ordered) family
+    // row. Versioned foreign ids never fuzzy-match.
+    let curated_label = |id: &str| -> Option<String> {
+        let id_norm = norm(id);
+        if let Some(row) = catalog.iter().find(|m| norm(&m.id) == id_norm) {
+            return Some(row.label.clone());
+        }
+        (!id_norm.is_empty() && id_norm.chars().all(|c| c.is_ascii_alphabetic()))
+            .then(|| catalog.iter().find(|m| norm(&m.id).contains(&id_norm)))
+            .flatten()
+            .map(|m| m.label.clone())
+    };
     let ids: Vec<String> = models.iter().map(|m| m.id.clone()).collect();
     let has_real = ids.iter().any(|id| !id.eq_ignore_ascii_case("default"));
     models
@@ -3183,6 +3235,9 @@ pub(crate) fn normalize_model_rows(models: Vec<Model>) -> Vec<Model> {
                         default_choice: "1m".into(),
                     });
                 }
+            }
+            if let Some(label) = curated_label(&model.id) {
+                model.label = label;
             }
             Some(model)
         })
@@ -3528,20 +3583,24 @@ mod tests {
 
     #[test]
     fn normalize_drops_default_alias_and_folds_orphan_1m_rows() {
-        // The shape an OLDER engine serves for Claude Code: a `default`
-        // alias row plus 1M-pinned variants with no bare base.
-        let models = normalize_model_rows(vec![
-            bare_model("default", "Default (recommended)"),
-            bare_model("opus[1m]", "Opus (1M context)"),
-            bare_model("claude-fable-5[1m]", "Fable 5"),
-            bare_model("sonnet", "Sonnet"),
-        ]);
+        // The shape an OLDER engine serves: a `default` alias row plus
+        // 1M-pinned variants with no bare base. A non-claude harness keeps
+        // wire labels (no curated catalog to borrow from).
+        let models = normalize_model_rows(
+            HarnessId::Codex,
+            vec![
+                bare_model("default", "Default (recommended)"),
+                bare_model("titan[1m]", "Titan (1M context)"),
+                bare_model("gpt-x-9[1m]", "GPT X-9"),
+                bare_model("nano", "Nano"),
+            ],
+        );
         assert_eq!(
             models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
-            vec!["opus", "claude-fable-5", "sonnet"]
+            vec!["titan", "gpt-x-9", "nano"]
         );
-        assert_eq!(models[0].label, "Opus");
-        assert_eq!(models[1].label, "Fable 5");
+        assert_eq!(models[0].label, "Titan");
+        assert_eq!(models[1].label, "GPT X-9");
         // Folded rows pin the Context Window trait to 1M.
         assert!(
             models[0]
@@ -3552,22 +3611,52 @@ mod tests {
         assert!(models[2].options.is_empty());
 
         // A `default`-only list survives (nothing real to prefer).
-        let only_default = normalize_model_rows(vec![bare_model("default", "Default")]);
+        let only_default =
+            normalize_model_rows(HarnessId::Codex, vec![bare_model("default", "Default")]);
         assert_eq!(only_default.len(), 1);
 
         // A base-plus-variant pair (already folded by a NEWER engine — the
         // variant never reaches us; belt-and-braces if it does): variant
         // drops, base is untouched.
-        let paired = normalize_model_rows(vec![
-            bare_model("claude-sonnet-5", "Sonnet 5"),
-            bare_model("claude-sonnet-5[1m]", "Sonnet 5 (1M)"),
-        ]);
+        let paired = normalize_model_rows(
+            HarnessId::Codex,
+            vec![
+                bare_model("titan-5", "Titan 5"),
+                bare_model("titan-5[1m]", "Titan 5 (1M)"),
+            ],
+        );
         assert_eq!(paired.len(), 1);
-        assert_eq!(paired[0].id, "claude-sonnet-5");
+        assert_eq!(paired[0].id, "titan-5");
 
         // Idempotent over a clean list.
-        let clean = vec![bare_model("claude-opus-5", "Opus 5")];
-        assert_eq!(normalize_model_rows(clean.clone()), clean);
+        let clean = vec![bare_model("titan-5", "Titan 5")];
+        assert_eq!(normalize_model_rows(HarnessId::Codex, clean.clone()), clean);
+    }
+
+    #[test]
+    fn normalize_gives_claude_rows_their_versioned_catalog_labels() {
+        // The real prod shape: alias values with terse names. Claude rows
+        // adopt the curated labels so the version number always shows
+        // (user request), exact ids included; foreign ids pass through.
+        let models = normalize_model_rows(
+            HarnessId::ClaudeCode,
+            vec![
+                bare_model("default", "Default (recommended)"),
+                bare_model("opus[1m]", "Opus (1M context)"),
+                bare_model("claude-fable-5[1m]", "Fable"),
+                bare_model("sonnet", "Sonnet"),
+                bare_model("haiku", "Haiku"),
+                bare_model("claude-nova-1", "Nova 1"),
+            ],
+        );
+        assert_eq!(
+            models.iter().map(|m| m.label.as_str()).collect::<Vec<_>>(),
+            vec!["Opus 5", "Fable 5", "Sonnet 5", "Haiku 4.5", "Nova 1"]
+        );
+        assert_eq!(
+            models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
+            vec!["opus", "claude-fable-5", "sonnet", "haiku", "claude-nova-1"]
+        );
     }
 
     #[test]
