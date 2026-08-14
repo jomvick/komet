@@ -259,6 +259,128 @@
   @media (max-width: 980px) { .features { grid-template-columns: repeat(2, 1fr); } }
   @media (max-width: 560px) { .features { grid-template-columns: 1fr; gap: 36px; } }
 
+  /* ── tweets ──────────────────────────────────────────── */
+  /* z-index keeps the cards above the closing section's ascii hand,
+     which reaches up into this section's bottom rows */
+  .tweets { padding: 130px 0 0; position: relative; z-index: 1; overflow: hidden; }
+  .tweets h2 {
+    font-size: clamp(24px, 3vw, 32px);
+    font-weight: 600;
+    letter-spacing: -0.025em;
+    text-wrap: balance;
+  }
+  /* full-bleed marquee: two rows drifting opposite ways; each track holds
+     the same card group twice, so translating -50% loops seamlessly */
+  .tweet-marquee {
+    margin-top: 40px;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    position: relative;
+  }
+  .tweet-marquee::before,
+  .tweet-marquee::after {
+    content: "";
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    z-index: 2;
+    width: max(48px, 50vw - 570px);
+    pointer-events: none;
+  }
+  .tweet-marquee::before { left: 0; background: linear-gradient(90deg, var(--bg), transparent); }
+  .tweet-marquee::after { right: 0; background: linear-gradient(270deg, var(--bg), transparent); }
+  .tweet-row { overflow: hidden; }
+  .tweet-track {
+    display: flex;
+    width: max-content;
+    will-change: transform;
+    animation: tweet-marquee 72s linear infinite;
+  }
+  .tweet-row.is-reverse .tweet-track {
+    animation-duration: 80s;
+    animation-direction: reverse;
+  }
+  .tweet-marquee:hover .tweet-track,
+  .tweet-marquee:focus-within .tweet-track { animation-play-state: paused; }
+  @keyframes tweet-marquee {
+    from { transform: translateX(0); }
+    to { transform: translateX(-50%); }
+  }
+  .tweet-group {
+    display: flex;
+    gap: 14px;
+    padding-right: 14px;
+  }
+  .tweet {
+    display: flex;
+    flex-direction: column;
+    width: clamp(270px, 23vw, 320px);
+    height: 150px;
+    flex: 0 0 auto;
+    padding: 16px 18px;
+    background: rgba(139, 92, 246, 0.04);
+    -webkit-backdrop-filter: blur(10px);
+    backdrop-filter: blur(10px);
+    border: 1px solid var(--line-soft);
+    border-radius: 10px;
+    transition: border-color .15s, background .15s;
+  }
+  .tweet:hover { border-color: var(--faint); background: rgba(139, 92, 246, 0.08); }
+  @media (prefers-reduced-motion: reduce) {
+    .tweet-track { animation: none; }
+    .tweet-row { overflow-x: auto; }
+  }
+  .tweet-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 12px;
+  }
+  .tweet-head img {
+    width: 34px;
+    height: 34px;
+    border-radius: 50%;
+    flex: 0 0 auto;
+  }
+  .tweet-who { min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+  .tweet-name {
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .tweet-handle {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--faint);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .tweet-head svg {
+    width: 14px;
+    height: 14px;
+    margin-left: auto;
+    fill: var(--faint);
+    flex: 0 0 auto;
+    transition: fill .15s;
+  }
+  .tweet:hover .tweet-head svg { fill: var(--ink); }
+  .tweet p {
+    font-size: 13px;
+    line-height: 1.55;
+    color: var(--dim);
+    white-space: pre-line;
+    overflow-wrap: break-word;
+    display: -webkit-box;
+    -webkit-line-clamp: 4;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+
   /* ── closing ─────────────────────────────────────────── */
   .closing {
     margin: 140px 0 80px;
@@ -330,6 +452,12 @@
     .shot { padding: 28px 0 0; }
     .shot img { border-radius: 4px; }
     .features { padding: 64px 20px 0; gap: 36px; }
+    .tweets { padding: 84px 0 0; }
+    .tweet-marquee { margin-top: 28px; }
+    .tweet-marquee::before, .tweet-marquee::after { width: 24px; }
+    .tweet-track { animation-duration: 56s; }
+    .tweet-row.is-reverse .tweet-track { animation-duration: 62s; }
+    .tweet { width: 272px; height: 146px; padding: 14px 16px; }
     .closing { margin: 80px 0 56px; }
     .closing p { font-size: 14px; }
     .closing .cta-row { margin-top: 28px; }
@@ -463,6 +591,276 @@
       <h3>A fast, native client</h3>
       <p>The engine is pure Rust. The app is GPU-rendered, with no browser
          wrapper. It is a quick window over every agent you run.</p>
+    </div>
+  </section>
+
+  <section class="tweets">
+    <div class="wrap">
+      <h2>What people are saying about Komet</h2>
+    </div>
+    <div class="tweet-marquee" aria-label="Posts about Komet on X">
+      <div class="tweet-row">
+        <div class="tweet-track">
+          <div class="tweet-group">
+            <a class="tweet" href="https://x.com/zebassembly/status/2082935161793245227" target="_blank" rel="noopener">
+              <div class="tweet-head">
+                <img src="/assets/tweets/zebassembly.jpg" alt="" loading="lazy" width="200" height="200" />
+                <div class="tweet-who"><span class="tweet-name">zeb</span><span class="tweet-handle">@zebassembly</span></div>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+              </div>
+              <p>This looks absolutely fantastic, I can't think of a single example of GPUI looking this good.</p>
+            </a>
+            <a class="tweet" href="https://x.com/n3o773/status/2082902752150393102" target="_blank" rel="noopener">
+              <div class="tweet-head">
+                <img src="/assets/tweets/n3o773.jpg" alt="" loading="lazy" width="200" height="200" />
+                <div class="tweet-who"><span class="tweet-name">neo</span><span class="tweet-handle">@n3o773</span></div>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+              </div>
+              <p>Damn that UI is crisp!!</p>
+            </a>
+            <a class="tweet" href="https://x.com/jv_nguyen518/status/2082897177001464251" target="_blank" rel="noopener">
+              <div class="tweet-head">
+                <img src="/assets/tweets/jv_nguyen518.jpg" alt="" loading="lazy" width="200" height="200" />
+                <div class="tweet-who"><span class="tweet-name">Justin Vu Nguyen</span><span class="tweet-handle">@jv_nguyen518</span></div>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+              </div>
+              <p>woah this is buttery af!!</p>
+            </a>
+            <a class="tweet" href="https://x.com/emanueledpt/status/2083105449608360297" target="_blank" rel="noopener">
+              <div class="tweet-head">
+                <img src="/assets/tweets/emanueledpt.jpg" alt="" loading="lazy" width="200" height="200" />
+                <div class="tweet-who"><span class="tweet-name">Emanuele Di Pietro</span><span class="tweet-handle">@emanueledpt</span></div>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+              </div>
+              <p>similar to synara and the name too
+gg
+this space is so crowded</p>
+            </a>
+            <a class="tweet" href="https://x.com/lik_ai_/status/2087740373254947192" target="_blank" rel="noopener">
+              <div class="tweet-head">
+                <img src="/assets/tweets/lik_ai_.jpg" alt="" loading="lazy" width="200" height="200" />
+                <div class="tweet-who"><span class="tweet-name">Kai</span><span class="tweet-handle">@lik_ai_</span></div>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+              </div>
+              <p>So... waku.sh</p>
+            </a>
+            <a class="tweet" href="https://x.com/maxktz/status/2082956238153723904" target="_blank" rel="noopener">
+              <div class="tweet-head">
+                <img src="/assets/tweets/maxktz.jpg" alt="" loading="lazy" width="200" height="200" />
+                <div class="tweet-who"><span class="tweet-name">Max Katz</span><span class="tweet-handle">@maxktz</span></div>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+              </div>
+              <p>amazing!</p>
+            </a>
+            <a class="tweet" href="https://x.com/dipxsyy/status/2082889765603742123" target="_blank" rel="noopener">
+              <div class="tweet-head">
+                <img src="/assets/tweets/dipxsyy.jpg" alt="" loading="lazy" width="200" height="200" />
+                <div class="tweet-who"><span class="tweet-name">Deepanshu Mishra</span><span class="tweet-handle">@dipxsyy</span></div>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+              </div>
+              <p>clean af</p>
+            </a>
+            <a class="tweet" href="https://x.com/0xwthw/status/2087320173522952320" target="_blank" rel="noopener">
+              <div class="tweet-head">
+                <img src="/assets/tweets/0xwthw.jpg" alt="" loading="lazy" width="200" height="200" />
+                <div class="tweet-who"><span class="tweet-name">wthw</span><span class="tweet-handle">@0xwthw</span></div>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+              </div>
+              <p>if i see another multi-agent terminal orchestrator app i'm gonna crash out</p>
+            </a>
+          </div>
+          <div class="tweet-group" aria-hidden="true">
+            <a class="tweet" href="https://x.com/zebassembly/status/2082935161793245227" target="_blank" rel="noopener" tabindex="-1">
+              <div class="tweet-head">
+                <img src="/assets/tweets/zebassembly.jpg" alt="" loading="lazy" width="200" height="200" />
+                <div class="tweet-who"><span class="tweet-name">zeb</span><span class="tweet-handle">@zebassembly</span></div>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+              </div>
+              <p>This looks absolutely fantastic, I can't think of a single example of GPUI looking this good.</p>
+            </a>
+            <a class="tweet" href="https://x.com/n3o773/status/2082902752150393102" target="_blank" rel="noopener" tabindex="-1">
+              <div class="tweet-head">
+                <img src="/assets/tweets/n3o773.jpg" alt="" loading="lazy" width="200" height="200" />
+                <div class="tweet-who"><span class="tweet-name">neo</span><span class="tweet-handle">@n3o773</span></div>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+              </div>
+              <p>Damn that UI is crisp!!</p>
+            </a>
+            <a class="tweet" href="https://x.com/jv_nguyen518/status/2082897177001464251" target="_blank" rel="noopener" tabindex="-1">
+              <div class="tweet-head">
+                <img src="/assets/tweets/jv_nguyen518.jpg" alt="" loading="lazy" width="200" height="200" />
+                <div class="tweet-who"><span class="tweet-name">Justin Vu Nguyen</span><span class="tweet-handle">@jv_nguyen518</span></div>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+              </div>
+              <p>woah this is buttery af!!</p>
+            </a>
+            <a class="tweet" href="https://x.com/emanueledpt/status/2083105449608360297" target="_blank" rel="noopener" tabindex="-1">
+              <div class="tweet-head">
+                <img src="/assets/tweets/emanueledpt.jpg" alt="" loading="lazy" width="200" height="200" />
+                <div class="tweet-who"><span class="tweet-name">Emanuele Di Pietro</span><span class="tweet-handle">@emanueledpt</span></div>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+              </div>
+              <p>similar to synara and the name too
+gg
+this space is so crowded</p>
+            </a>
+            <a class="tweet" href="https://x.com/lik_ai_/status/2087740373254947192" target="_blank" rel="noopener" tabindex="-1">
+              <div class="tweet-head">
+                <img src="/assets/tweets/lik_ai_.jpg" alt="" loading="lazy" width="200" height="200" />
+                <div class="tweet-who"><span class="tweet-name">Kai</span><span class="tweet-handle">@lik_ai_</span></div>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+              </div>
+              <p>So... waku.sh</p>
+            </a>
+            <a class="tweet" href="https://x.com/maxktz/status/2082956238153723904" target="_blank" rel="noopener" tabindex="-1">
+              <div class="tweet-head">
+                <img src="/assets/tweets/maxktz.jpg" alt="" loading="lazy" width="200" height="200" />
+                <div class="tweet-who"><span class="tweet-name">Max Katz</span><span class="tweet-handle">@maxktz</span></div>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+              </div>
+              <p>amazing!</p>
+            </a>
+            <a class="tweet" href="https://x.com/dipxsyy/status/2082889765603742123" target="_blank" rel="noopener" tabindex="-1">
+              <div class="tweet-head">
+                <img src="/assets/tweets/dipxsyy.jpg" alt="" loading="lazy" width="200" height="200" />
+                <div class="tweet-who"><span class="tweet-name">Deepanshu Mishra</span><span class="tweet-handle">@dipxsyy</span></div>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+              </div>
+              <p>clean af</p>
+            </a>
+            <a class="tweet" href="https://x.com/0xwthw/status/2087320173522952320" target="_blank" rel="noopener" tabindex="-1">
+              <div class="tweet-head">
+                <img src="/assets/tweets/0xwthw.jpg" alt="" loading="lazy" width="200" height="200" />
+                <div class="tweet-who"><span class="tweet-name">wthw</span><span class="tweet-handle">@0xwthw</span></div>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+              </div>
+              <p>if i see another multi-agent terminal orchestrator app i'm gonna crash out</p>
+            </a>
+          </div>
+        </div>
+      </div>
+      <div class="tweet-row is-reverse">
+        <div class="tweet-track">
+          <div class="tweet-group">
+            <a class="tweet" href="https://x.com/MrBye32/status/2082906082234568787" target="_blank" rel="noopener">
+              <div class="tweet-head">
+                <img src="/assets/tweets/mrbye32.jpg" alt="" loading="lazy" width="200" height="200" />
+                <div class="tweet-who"><span class="tweet-name">Yuri - 1bye</span><span class="tweet-handle">@MrBye32</span></div>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+              </div>
+              <p>what a smooth animations on gpui, impressive!</p>
+            </a>
+            <a class="tweet" href="https://x.com/dwhitedesign/status/2082636175831953730" target="_blank" rel="noopener">
+              <div class="tweet-head">
+                <img src="/assets/tweets/dwhitedesign.jpg" alt="" loading="lazy" width="200" height="200" />
+                <div class="tweet-who"><span class="tweet-name">Daniel White</span><span class="tweet-handle">@dwhitedesign</span></div>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+              </div>
+              <p>Yooo besides the question that UI &amp; UX is sexy man !!</p>
+            </a>
+            <a class="tweet" href="https://x.com/netflixoriginl/status/2082903481891934367" target="_blank" rel="noopener">
+              <div class="tweet-head">
+                <img src="/assets/tweets/netflixoriginl.jpg" alt="" loading="lazy" width="200" height="200" />
+                <div class="tweet-who"><span class="tweet-name">baily</span><span class="tweet-handle">@netflixoriginl</span></div>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+              </div>
+              <p>I need this, what is it? 😅</p>
+            </a>
+            <a class="tweet" href="https://x.com/mrlemoos/status/2083380138243453356" target="_blank" rel="noopener">
+              <div class="tweet-head">
+                <img src="/assets/tweets/mrlemoos.jpg" alt="" loading="lazy" width="200" height="200" />
+                <div class="tweet-who"><span class="tweet-name">Leo - mrlemoos.dev</span><span class="tweet-handle">@mrlemoos</span></div>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+              </div>
+              <p>Looks beautiful btw.</p>
+            </a>
+            <a class="tweet" href="https://x.com/RavTheMann/status/2083419265961754689" target="_blank" rel="noopener">
+              <div class="tweet-head">
+                <img src="/assets/tweets/ravthemann.jpg" alt="" loading="lazy" width="200" height="200" />
+                <div class="tweet-who"><span class="tweet-name">Aarav A</span><span class="tweet-handle">@RavTheMann</span></div>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+              </div>
+              <p>sick
+love the ui</p>
+            </a>
+            <a class="tweet" href="https://x.com/sebuzdugan/status/2083000351599239677" target="_blank" rel="noopener">
+              <div class="tweet-head">
+                <img src="/assets/tweets/sebuzdugan.jpg" alt="" loading="lazy" width="200" height="200" />
+                <div class="tweet-who"><span class="tweet-name">Sebastian Buzdugan</span><span class="tweet-handle">@sebuzdugan</span></div>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+              </div>
+              <p>native is nice, but stale claude sessions will hurt more than electron overhead</p>
+            </a>
+            <a class="tweet" href="https://x.com/lucianmarin/status/2083290898834637281" target="_blank" rel="noopener">
+              <div class="tweet-head">
+                <img src="/assets/tweets/lucianmarin.jpg" alt="" loading="lazy" width="200" height="200" />
+                <div class="tweet-who"><span class="tweet-name">Lucian Marin</span><span class="tweet-handle">@lucianmarin</span></div>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+              </div>
+              <p>@superdoteng is working on exactly the same thing.</p>
+            </a>
+          </div>
+          <div class="tweet-group" aria-hidden="true">
+            <a class="tweet" href="https://x.com/MrBye32/status/2082906082234568787" target="_blank" rel="noopener" tabindex="-1">
+              <div class="tweet-head">
+                <img src="/assets/tweets/mrbye32.jpg" alt="" loading="lazy" width="200" height="200" />
+                <div class="tweet-who"><span class="tweet-name">Yuri - 1bye</span><span class="tweet-handle">@MrBye32</span></div>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+              </div>
+              <p>what a smooth animations on gpui, impressive!</p>
+            </a>
+            <a class="tweet" href="https://x.com/dwhitedesign/status/2082636175831953730" target="_blank" rel="noopener" tabindex="-1">
+              <div class="tweet-head">
+                <img src="/assets/tweets/dwhitedesign.jpg" alt="" loading="lazy" width="200" height="200" />
+                <div class="tweet-who"><span class="tweet-name">Daniel White</span><span class="tweet-handle">@dwhitedesign</span></div>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+              </div>
+              <p>Yooo besides the question that UI &amp; UX is sexy man !!</p>
+            </a>
+            <a class="tweet" href="https://x.com/netflixoriginl/status/2082903481891934367" target="_blank" rel="noopener" tabindex="-1">
+              <div class="tweet-head">
+                <img src="/assets/tweets/netflixoriginl.jpg" alt="" loading="lazy" width="200" height="200" />
+                <div class="tweet-who"><span class="tweet-name">baily</span><span class="tweet-handle">@netflixoriginl</span></div>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+              </div>
+              <p>I need this, what is it? 😅</p>
+            </a>
+            <a class="tweet" href="https://x.com/mrlemoos/status/2083380138243453356" target="_blank" rel="noopener" tabindex="-1">
+              <div class="tweet-head">
+                <img src="/assets/tweets/mrlemoos.jpg" alt="" loading="lazy" width="200" height="200" />
+                <div class="tweet-who"><span class="tweet-name">Leo - mrlemoos.dev</span><span class="tweet-handle">@mrlemoos</span></div>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+              </div>
+              <p>Looks beautiful btw.</p>
+            </a>
+            <a class="tweet" href="https://x.com/RavTheMann/status/2083419265961754689" target="_blank" rel="noopener" tabindex="-1">
+              <div class="tweet-head">
+                <img src="/assets/tweets/ravthemann.jpg" alt="" loading="lazy" width="200" height="200" />
+                <div class="tweet-who"><span class="tweet-name">Aarav A</span><span class="tweet-handle">@RavTheMann</span></div>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+              </div>
+              <p>sick
+love the ui</p>
+            </a>
+            <a class="tweet" href="https://x.com/sebuzdugan/status/2083000351599239677" target="_blank" rel="noopener" tabindex="-1">
+              <div class="tweet-head">
+                <img src="/assets/tweets/sebuzdugan.jpg" alt="" loading="lazy" width="200" height="200" />
+                <div class="tweet-who"><span class="tweet-name">Sebastian Buzdugan</span><span class="tweet-handle">@sebuzdugan</span></div>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+              </div>
+              <p>native is nice, but stale claude sessions will hurt more than electron overhead</p>
+            </a>
+            <a class="tweet" href="https://x.com/lucianmarin/status/2083290898834637281" target="_blank" rel="noopener" tabindex="-1">
+              <div class="tweet-head">
+                <img src="/assets/tweets/lucianmarin.jpg" alt="" loading="lazy" width="200" height="200" />
+                <div class="tweet-who"><span class="tweet-name">Lucian Marin</span><span class="tweet-handle">@lucianmarin</span></div>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18.244 2.25h3.308l-7.227 8.26 8.502 11.24h-6.657l-5.214-6.817L4.99 21.75H1.68l7.73-8.835L1.254 2.25h6.826l4.713 6.231zm-1.161 17.52h1.833L7.084 4.126H5.117z"/></svg>
+              </div>
+              <p>@superdoteng is working on exactly the same thing.</p>
+            </a>
+          </div>
+        </div>
+      </div>
     </div>
   </section>
 
