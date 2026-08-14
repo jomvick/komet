@@ -3970,18 +3970,16 @@ impl Shell {
             .right_tab_drag
             .as_ref()
             .map(|d| (d.from, d.over, d.epoch, d.prev_over));
+        // Content row sized to its chips; the SCROLLER wraps it (the markdown
+        // tables' proven overflow-x shape — a flex container that is itself
+        // the scroller never overflowed, user report: "still not
+        // scrollable").
         let mut strip = div()
-            .id("right-surface-strip")
-            .size_full()
+            .h_full()
             .flex()
             .flex_row()
             .items_center()
             .gap(px(4.0))
-            // Overflowing tabs scroll horizontally (t3 hides the bar too;
-            // trackpad/shift-wheel pans) instead of clipping under the
-            // expand button (user report).
-            .overflow_x_scroll()
-            .track_scroll(&self.right_tab_scroll)
             .on_drag_move::<RightTabDrag>(cx.listener(
                 move |this, event: &gpui::DragMoveEvent<RightTabDrag>, _, cx| {
                     let payload = event.drag(cx);
@@ -3989,11 +3987,11 @@ impl Shell {
                         return;
                     }
                     let from = payload.from;
-                    // Content-space x: the pointer offset plus however far
-                    // the strip is scrolled (offset.x goes negative).
-                    let rel_x = f32::from(event.event.position.x)
-                        - f32::from(event.bounds.left())
-                        - f32::from(this.right_tab_scroll.offset().x);
+                    // The listener rides the CONTENT row, whose bounds shift
+                    // with the scroll — its left edge is already content
+                    // space, no offset compensation.
+                    let rel_x =
+                        f32::from(event.event.position.x) - f32::from(event.bounds.left());
                     let over = crate::terminal::panel::drop_index(rel_x, CHIP_SLOT, count);
                     this.update_right_tab_drag_over(from, over, cx);
                 },
@@ -4248,7 +4246,19 @@ impl Shell {
             ));
         }
         strip = strip.child(plus);
-        strip.into_any_element()
+        // Scroller + a glass edge-fade at whichever side has hidden overflow
+        // (the sidebar's per-glyph gradient recipe, horizontal).
+        let scroller = div()
+            .id("right-surface-strip")
+            .size_full()
+            .overflow_x_scroll()
+            .track_scroll(&self.right_tab_scroll)
+            .child(strip);
+        crate::edge_fade::edge_faded(18.0, false, false, scroller)
+            .fade_left(true)
+            .fade_right(true)
+            .fade_overflow_x(&self.right_tab_scroll)
+            .into_any_element()
     }
 
     /// Toggle the changes-panel takeover (the header's expand button, t3code
