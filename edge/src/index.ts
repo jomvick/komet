@@ -83,6 +83,12 @@ const forward = (
   url.pathname = path;
   if (search !== undefined) url.search = search;
   const headers = new Headers(request.headers);
+  // room-kind is a Worker-controlled signal (the DO relaxes owner gating for
+  // workspace rooms): clear any inbound value so only the explicit set below —
+  // reached solely on workspace forwards, after the org-membership check —
+  // can assert it. Do not drop this line; passthrough would let a caller
+  // choose their own room kind.
+  headers.delete(ROOM_KIND_HEADER);
   headers.set(AUTH_USER_HEADER, userId);
   if (roomKind) headers.set(ROOM_KIND_HEADER, roomKind);
   return stub.fetch(new Request(url.toString(), { ...requestInit(request), headers }));
