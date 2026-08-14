@@ -3970,6 +3970,36 @@ impl Shell {
             .right_tab_drag
             .as_ref()
             .map(|d| (d.from, d.over, d.epoch, d.prev_over));
+
+        // Fade geometry, from the LAST frame's scroll state (invisible lag).
+        // The EdgeFade scope below only per-pixel-fades GLYPHS horizontally —
+        // the fork's quad shader fades on y alone — so hover/active WASHES
+        // hard-cut at the clip (user report). Each chip therefore also
+        // carries a whole-element opacity ramp over the same band, computed
+        // from its slot position; quads, icons and text all reach 0 at the
+        // edge together.
+        const FADE_WIDTH: f32 = 36.0;
+        let scrolled = -f32::from(self.right_tab_scroll.offset().x);
+        let max_scroll = f32::from(self.right_tab_scroll.max_offset().x);
+        let fade_left = scrolled > 1.0;
+        let fade_right = scrolled < max_scroll - 1.0;
+        let viewport = f32::from(self.right_tab_scroll.bounds().size.width);
+        let edge_alpha = move |slot_left: f32, slot_right: f32| -> f32 {
+            if viewport <= 1.0 {
+                return 1.0;
+            }
+            let mut alpha = 1.0f32;
+            if fade_left {
+                // How far the chip's RIGHT edge has come in from the left.
+                alpha = alpha.min(((slot_right - scrolled) / FADE_WIDTH).clamp(0.0, 1.0));
+            }
+            if fade_right {
+                // How far the chip's LEFT edge sits from the right edge.
+                alpha =
+                    alpha.min(((viewport + scrolled - slot_left) / FADE_WIDTH).clamp(0.0, 1.0));
+            }
+            alpha * alpha
+        };
         // The old session-tab strip's proven scroll shape: the flex row IS
         // the scroller (id + overflow_x_scroll + track_scroll), wrapped in a
         // relative min_w_0 region below; drop math runs in CONTENT
@@ -4135,6 +4165,8 @@ impl Shell {
                             })
                             .child(title),
                     );
+            let slot_left = ix as f32 * CHIP_SLOT;
+            let chip = chip.opacity(edge_alpha(slot_left, slot_left + CHIP_W));
             // Sliding transform while a sibling drags over (the terminal
             // drawer's exact recipe): animate 150ms between committed
             // offsets; the dragged tab leaves an invisible spacer — the
@@ -4199,6 +4231,10 @@ impl Shell {
                     cx.notify();
                 }
             }))
+            .opacity({
+                let slot_left = count as f32 * CHIP_SLOT;
+                edge_alpha(slot_left, slot_left + 24.0)
+            })
             .child(
                 icon(icons::PLUS)
                     .size(px(13.0))
@@ -4255,15 +4291,9 @@ impl Shell {
             ));
         }
         strip = strip.child(plus);
-        // Edge fades on whichever side hides tabs (offset from the LAST
-        // frame — the lag is invisible; the old session-tab strip's exact
-        // recipe). Glass: per-glyph EdgeFade scope; opaque: painted
-        // gradients in the shell surface tone.
-        const FADE_WIDTH: f32 = 36.0;
-        let scrolled = -f32::from(self.right_tab_scroll.offset().x);
-        let max_scroll = f32::from(self.right_tab_scroll.max_offset().x);
-        let fade_left = scrolled > 1.0;
-        let fade_right = scrolled < max_scroll - 1.0;
+        // Edge fades on whichever side hides tabs (flags computed above).
+        // Glass: per-glyph EdgeFade scope over the chips' own opacity ramps;
+        // opaque: painted gradients in the shell surface tone.
         let glass = theme.is_glass();
         let bar_bg = theme.surface;
         let region = div()
