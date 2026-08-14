@@ -134,14 +134,17 @@ impl Shell {
         // strip doesn't want (it brings its own 8px pad), and doubling up
         // read as a hole after the `+` (user report).
         let row_left = if takeover {
-            // The scope dropdown should sit at the cluster's own 2px button
-            // rhythm off the `+` — anything more read as a hole in the button
-            // row (user report). Between `row_left` and the trigger box sit
-            // 16px of chrome (the row's 8px child gap + the strip's 8px pad),
-            // and `title_bar_content_start` adds a 10px text margin: land the
-            // box at cluster end + 2 ⇒ −(10 + 16 − 2).
+            // The surface tabs must LEFT-ALIGN with the pane's own rows (the
+            // diff options and stats strip carry an 8px box gutter off the
+            // seam — user report: rows started at different insets). The
+            // strip's width is capped to `avail`, which subtracts the row's
+            // 8px child gap — pulling row_left 8 LEFT of the seam cancels
+            // that, so the uncapped strip starts exactly at the seam and its
+            // own 8px pad lands the first chip on the pane gutter. The
+            // window-control cluster still wins while the sidebar is
+            // collapsed (the chips clear it instead of underlapping).
             let cluster_end = self.title_bar_content_start() - 10.0 + plus_inset - 14.0;
-            sidebar_now.max(cluster_end)
+            (sidebar_now - 8.0).max(cluster_end)
         } else {
             content_left
         };
