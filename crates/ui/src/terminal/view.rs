@@ -763,7 +763,14 @@ fn shape_row(
         // Anything that can leave the mono font gets its own pinned segment.
         let pinned = !ch.is_ascii() || cell.wide;
         if pinned {
-            flush(&mut segments, &mut text, &mut runs, seg_col, font_size, window);
+            flush(
+                &mut segments,
+                &mut text,
+                &mut runs,
+                seg_col,
+                font_size,
+                window,
+            );
         }
         if text.is_empty() {
             seg_col = col;
@@ -807,10 +814,24 @@ fn shape_row(
             }),
         }
         if pinned {
-            flush(&mut segments, &mut text, &mut runs, seg_col, font_size, window);
+            flush(
+                &mut segments,
+                &mut text,
+                &mut runs,
+                seg_col,
+                font_size,
+                window,
+            );
         }
     }
-    flush(&mut segments, &mut text, &mut runs, seg_col, font_size, window);
+    flush(
+        &mut segments,
+        &mut text,
+        &mut runs,
+        seg_col,
+        font_size,
+        window,
+    );
     segments
 }
 
