@@ -3835,50 +3835,41 @@ impl Shell {
     /// The right pane's empty state (t3code RightPanelEmptyState): a
     /// centered "Open a surface" heading over the two surface cards —
     /// Terminal and Git.
+    /// The right pane's empty state: a quiet mark over a compact vertical
+    /// list of surface rows (icon + label) — the Capy arrangement (user
+    /// request): the old two-card grid clipped in narrow panes and wasted
+    /// short ones.
     fn render_surface_picker(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let text = theme.text;
         let muted = theme.text_muted;
         let border = theme.border;
         let border_strong = theme.border_strong;
-        let card = |id: &'static str,
-                    icon_path: &'static str,
-                    title: &'static str,
-                    copy: &'static str| {
+        let row = |id: &'static str, icon_path: &'static str, title: &'static str| {
             div()
                 .id(id)
-                .flex_1()
-                .min_h(px(112.0))
-                .p(px(16.0))
+                .w_full()
+                .h(px(44.0))
+                .px(px(14.0))
                 .rounded(px(10.0))
                 .border_1()
                 .border_color(border)
                 .bg(crate::theme::ink(0.02))
                 .flex()
-                .flex_col()
-                .items_start()
+                .flex_row()
+                .items_center()
+                .gap(px(10.0))
                 .cursor_pointer()
-                .hover(move |s| s.bg(crate::theme::ink(0.05)).border_color(border_strong))
-                .child(
-                    icon(icon_path)
-                        .size(px(20.0))
-                        .text_color(muted),
-                )
+                .hover(move |s| {
+                    s.bg(crate::theme::ink(0.05)).border_color(border_strong)
+                })
+                .child(icon(icon_path).size(px(15.0)).flex_none().text_color(muted))
                 .child(
                     div()
-                        .mt(px(12.0))
                         .text_size(px(13.0))
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .text_color(text)
                         .child(SharedString::from(title)),
-                )
-                .child(
-                    div()
-                        .mt(px(4.0))
-                        .text_size(px(11.5))
-                        .line_height(px(16.0))
-                        .text_color(muted.opacity(0.8))
-                        .child(SharedString::from(copy)),
                 )
         };
         div()
@@ -3886,56 +3877,42 @@ impl Shell {
             .flex()
             .items_center()
             .justify_center()
-            .p(px(24.0))
+            .p(px(16.0))
             .child(
                 div()
                     .w_full()
-                    .max_w(px(480.0))
+                    .max_w(px(280.0))
                     .flex()
                     .flex_col()
+                    .items_center()
                     .child(
-                        div()
-                            .text_center()
-                            .text_size(px(13.0))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(text)
-                            .child(SharedString::from("Open a surface")),
+                        icon(icons::KOMET_LOGO)
+                            .size(px(44.0))
+                            .text_color(muted.opacity(0.35)),
                     )
                     .child(
                         div()
-                            .mt(px(4.0))
-                            .mb(px(20.0))
-                            .text_center()
-                            .text_size(px(11.5))
-                            .text_color(muted)
-                            .child(SharedString::from("Choose what to show in the right panel.")),
-                    )
-                    .child(
-                        div()
+                            .mt(px(20.0))
+                            .w_full()
                             .flex()
-                            .flex_row()
+                            .flex_col()
                             .gap(px(8.0))
                             .child(
-                                card(
+                                row(
                                     "surface-card-terminal",
                                     icons::TERMINAL,
                                     "Terminal",
-                                    "Start a shell in this workspace.",
                                 )
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.add_terminal_surface(cx);
                                 })),
                             )
                             .child(
-                                card(
-                                    "surface-card-git",
-                                    icons::GIT_BRANCH,
-                                    "Git",
-                                    "Review changes in this checkout.",
-                                )
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.add_diff_surface(cx);
-                                })),
+                                row("surface-card-git", icons::GIT_BRANCH, "Git").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.add_diff_surface(cx);
+                                    }),
+                                ),
                             ),
                     ),
             )
@@ -3971,35 +3948,14 @@ impl Shell {
             .as_ref()
             .map(|d| (d.from, d.over, d.epoch, d.prev_over));
 
-        // Fade geometry, from the LAST frame's scroll state (invisible lag).
-        // The EdgeFade scope below only per-pixel-fades GLYPHS horizontally —
-        // the fork's quad shader fades on y alone — so hover/active WASHES
-        // hard-cut at the clip (user report). Each chip therefore also
-        // carries a whole-element opacity ramp over the same band, computed
-        // from its slot position; quads, icons and text all reach 0 at the
-        // edge together.
+        // Fade flags from the LAST frame's scroll state (invisible lag).
+        // The EdgeFade scope below fades per-pixel on x for glyphs AND
+        // quads/images (fork 5d1f83d) — washes dissolve across the band.
         const FADE_WIDTH: f32 = 36.0;
         let scrolled = -f32::from(self.right_tab_scroll.offset().x);
         let max_scroll = f32::from(self.right_tab_scroll.max_offset().x);
         let fade_left = scrolled > 1.0;
         let fade_right = scrolled < max_scroll - 1.0;
-        let viewport = f32::from(self.right_tab_scroll.bounds().size.width);
-        let edge_alpha = move |slot_left: f32, slot_right: f32| -> f32 {
-            if viewport <= 1.0 {
-                return 1.0;
-            }
-            let mut alpha = 1.0f32;
-            if fade_left {
-                // How far the chip's RIGHT edge has come in from the left.
-                alpha = alpha.min(((slot_right - scrolled) / FADE_WIDTH).clamp(0.0, 1.0));
-            }
-            if fade_right {
-                // How far the chip's LEFT edge sits from the right edge.
-                alpha =
-                    alpha.min(((viewport + scrolled - slot_left) / FADE_WIDTH).clamp(0.0, 1.0));
-            }
-            alpha * alpha
-        };
         // The old session-tab strip's proven scroll shape: the flex row IS
         // the scroller (id + overflow_x_scroll + track_scroll), wrapped in a
         // relative min_w_0 region below; drop math runs in CONTENT
@@ -4165,8 +4121,6 @@ impl Shell {
                             })
                             .child(title),
                     );
-            let slot_left = ix as f32 * CHIP_SLOT;
-            let chip = chip.opacity(edge_alpha(slot_left, slot_left + CHIP_W));
             // Sliding transform while a sibling drags over (the terminal
             // drawer's exact recipe): animate 150ms between committed
             // offsets; the dragged tab leaves an invisible spacer — the
@@ -4231,10 +4185,6 @@ impl Shell {
                     cx.notify();
                 }
             }))
-            .opacity({
-                let slot_left = count as f32 * CHIP_SLOT;
-                edge_alpha(slot_left, slot_left + 24.0)
-            })
             .child(
                 icon(icons::PLUS)
                     .size(px(13.0))
