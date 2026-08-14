@@ -28,7 +28,7 @@ use gpui_tokio::Tokio;
 use serde::de::DeserializeOwned;
 
 use komet_doc::{SessionMessageEntry, TranscriptDesync, TranscriptFrame};
-use komet_engine::{Engine, EngineConfig, EngineRuntime, rpc::AuthRpc};
+use komet_engine::{Engine, EngineConfig, EngineRuntime, InstanceLock, rpc::AuthRpc};
 use komet_proto::{
     AuthState, Chat, ChatIndicator, Device, EngineInfo, HarnessId, Session, Space, WorkspaceScope,
 };
@@ -219,60 +219,15 @@ impl EngineHandle {
     /// Must run on the tokio runtime (`Tokio::spawn`): both transports spawn
     /// tokio tasks.
     pub async fn bootstrap(config: EngineBootConfig) -> anyhow::Result<EngineHandle> {
-        let url = format!("ws://127.0.0.1:{}", config.ipc_port);
-        let probe = tokio::time::timeout(
-            std::time::Duration::from_millis(750),
-            tokio::net::TcpStream::connect(("127.0.0.1", config.ipc_port)),
-        )
-        .await;
-        if matches!(probe, Ok(Ok(_))) {
-            tracing::info!(%url, "engine daemon detected; connecting");
-            match connect_ws(&url).await {
-                Ok(client) => match query_engine_info(&client).await {
-                    Ok(engine_info) => {
-                        let client = Arc::new(client);
-                        let (state_tx, state_rx) =
-                            tokio::sync::watch::channel(DeferredEngineState::Waiting);
-                        let lifecycle_client = client.clone();
-                        let lifecycle_task = tokio::spawn(async move {
-                            let state = match lifecycle_client
-                                .call(methods::ENGINE_READY, serde_json::json!({}))
-                                .await
-                            {
-                                Ok(_) => DeferredEngineState::Ready,
-                                // EngineReady was added after EngineInfo. An older daemon
-                                // that does not expose the barrier is already assembled.
-                                Err(RpcError::Failed(message))
-                                    if message
-                                        == format!("unknown method: {}", methods::ENGINE_READY) =>
-                                {
-                                    DeferredEngineState::Ready
-                                }
-                                Err(err) => DeferredEngineState::Failed(err.to_string()),
-                            };
-                            state_tx.send_replace(state);
-                        });
-                        return Ok(EngineHandle {
-                            inner: Arc::new(RemoteEngine {
-                                client,
-                                url,
-                                lifecycle_task: tokio::sync::Mutex::new(Some(lifecycle_task)),
-                            }),
-                            engine_info,
-                            deferred_state: Some(state_rx),
-                        });
-                    }
-                    Err(err) => tracing::warn!(
-                        %url,
-                        error = %err,
-                        "listener did not provide engine identity; embedding instead"
-                    ),
-                },
-                // Something is on the port but it is not an engine (or it is
-                // wedged). Fall through and embed: a stranger holding 27654
-                // should cost other viewports, not this window.
-                Err(err) => tracing::warn!(%url, error = %err, "not an engine; embedding instead"),
-            }
+        // Invariant: at most one bootstrap in this process runs probe+embed at
+        // a time. The winner binds the deferred IPC listener before releasing
+        // the gate, so a concurrent viewport's probe finds it and attaches as
+        // Remote instead of racing it for the data dir.
+        static BOOTSTRAP_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _gate = BOOTSTRAP_GATE.lock().await;
+
+        if let Some(handle) = Self::attach_to_daemon(config.ipc_port).await {
+            return Ok(handle);
         }
 
         tracing::info!(data_dir = %config.data_dir.display(), "no daemon on port; embedding engine");
@@ -285,6 +240,29 @@ impl EngineHandle {
             org_id: config.org_id,
             workos_client_id: config.workos_client_id,
         };
+
+        // Own the data dir before opening anything under it or binding IPC —
+        // the lock, not the port bind, is the ownership decision. A failed
+        // acquire means an out-of-process engine holds the dir but was not
+        // serving IPC at probe time (a daemon mid-start): wait for its
+        // listener, re-trying the lock in case it dies instead.
+        std::fs::create_dir_all(&engine_config.data_dir)?;
+        let lock_deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let lock = loop {
+            match InstanceLock::acquire(&engine_config.data_dir) {
+                Ok(lock) => break lock,
+                Err(err) => {
+                    if std::time::Instant::now() >= lock_deadline {
+                        return Err(err.into());
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    if let Some(handle) = Self::attach_to_daemon(engine_config.ipc_port).await {
+                        return Ok(handle);
+                    }
+                }
+            }
+        };
+
         let auth = Engine::build_auth(&engine_config).await;
         let workspace_scope = Engine::initial_workspace_scope(&auth);
         let initial_profile = Engine::resolve_profile(&engine_config, &auth, workspace_scope)?;
@@ -323,6 +301,9 @@ impl EngineHandle {
         let runtime = Arc::new(tokio::sync::Mutex::new(None));
         let runtime_for_boot = runtime.clone();
         let service_for_boot = assembled_service.clone();
+        // The instance lock rides into the boot task and is consumed by
+        // assembly — held through sign-in onboarding too, because this process
+        // owns the data dir from the moment it decided to embed.
         let boot_task = tokio::spawn(async move {
             let profile = match initial_profile {
                 Some(profile) => profile,
@@ -352,7 +333,7 @@ impl EngineHandle {
                 }
             };
 
-            match Engine::assemble_runtime(&engine_config, auth, profile).await {
+            match Engine::assemble_runtime_with_lock(&engine_config, auth, profile, lock).await {
                 Ok(engine_runtime) => {
                     let service: Arc<dyn RpcService> = engine_runtime.core().rpc_service();
                     *runtime_for_boot.lock().await = Some(engine_runtime);
@@ -390,6 +371,74 @@ impl EngineHandle {
             return Err(anyhow::anyhow!(message));
         }
         Ok(handle)
+    }
+
+    /// Probe the IPC port and, if a live engine answers, attach as a remote
+    /// viewport. `None` means embed: nothing listening, a non-engine listener,
+    /// or a listener without an identity.
+    async fn attach_to_daemon(ipc_port: u16) -> Option<EngineHandle> {
+        let url = format!("ws://127.0.0.1:{ipc_port}");
+        let probe = tokio::time::timeout(
+            std::time::Duration::from_millis(750),
+            tokio::net::TcpStream::connect(("127.0.0.1", ipc_port)),
+        )
+        .await;
+        if !matches!(probe, Ok(Ok(_))) {
+            return None;
+        }
+        tracing::info!(%url, "engine daemon detected; connecting");
+        match connect_ws(&url).await {
+            Ok(client) => match query_engine_info(&client).await {
+                Ok(engine_info) => {
+                    let client = Arc::new(client);
+                    let (state_tx, state_rx) =
+                        tokio::sync::watch::channel(DeferredEngineState::Waiting);
+                    let lifecycle_client = client.clone();
+                    let lifecycle_task = tokio::spawn(async move {
+                        let state = match lifecycle_client
+                            .call(methods::ENGINE_READY, serde_json::json!({}))
+                            .await
+                        {
+                            Ok(_) => DeferredEngineState::Ready,
+                            // EngineReady was added after EngineInfo. An older daemon
+                            // that does not expose the barrier is already assembled.
+                            Err(RpcError::Failed(message))
+                                if message
+                                    == format!("unknown method: {}", methods::ENGINE_READY) =>
+                            {
+                                DeferredEngineState::Ready
+                            }
+                            Err(err) => DeferredEngineState::Failed(err.to_string()),
+                        };
+                        state_tx.send_replace(state);
+                    });
+                    Some(EngineHandle {
+                        inner: Arc::new(RemoteEngine {
+                            client,
+                            url,
+                            lifecycle_task: tokio::sync::Mutex::new(Some(lifecycle_task)),
+                        }),
+                        engine_info,
+                        deferred_state: Some(state_rx),
+                    })
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        %url,
+                        error = %err,
+                        "listener did not provide engine identity; embedding instead"
+                    );
+                    None
+                }
+            },
+            // Something is on the port but it is not an engine (or it is
+            // wedged). Fall through and embed: a stranger holding 27654
+            // should cost other viewports, not this window.
+            Err(err) => {
+                tracing::warn!(%url, error = %err, "not an engine; embedding instead");
+                None
+            }
+        }
     }
 
     pub fn client(&self) -> &RpcClient {
@@ -1725,6 +1774,63 @@ mod tests {
                 .is_err(),
             "the port must be released on shutdown"
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_bootstraps_elect_one_embedded_engine() {
+        // Two viewports of one app booting at once (the Local-switch restart
+        // path): both used to probe a closed port, both embedded, and one lost
+        // the data-dir lock. The bootstrap gate must elect exactly one owner
+        // and turn the other into a plain remote attach.
+        let dir = tempfile::tempdir().unwrap();
+        let port = free_port().await;
+        let config = EngineBootConfig {
+            data_dir: dir.path().to_path_buf(),
+            ipc_port: port,
+            edge_url: "http://127.0.0.1:1".into(),
+            edge_token: None, // offline
+            org_id: None,
+            workos_client_id: None,
+            default_harness: HarnessId::Mock,
+        };
+        let (a, b) = tokio::join!(
+            EngineHandle::bootstrap(config.clone()),
+            EngineHandle::bootstrap(config.clone()),
+        );
+        let a = a.expect("first viewport boots");
+        let b = b.expect("second viewport boots");
+
+        let modes = [a.mode(), b.mode()];
+        assert_eq!(
+            modes
+                .iter()
+                .filter(|mode| **mode == EngineMode::InProcess)
+                .count(),
+            1,
+            "exactly one viewport embeds: {modes:?}"
+        );
+        assert_eq!(
+            modes
+                .iter()
+                .filter(|mode| matches!(mode, EngineMode::Remote { .. }))
+                .count(),
+            1,
+            "the other attaches over IPC: {modes:?}"
+        );
+
+        for handle in [&a, &b] {
+            let mut deferred = handle.deferred_state().expect("lifecycle tracked");
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                wait_for_deferred_engine(&mut deferred),
+            )
+            .await
+            .expect("readiness resolves")
+            .expect("both viewports reach Ready");
+        }
+
+        b.shutdown().await;
+        a.shutdown().await;
     }
 
     #[tokio::test]
