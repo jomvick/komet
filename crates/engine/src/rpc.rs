@@ -459,9 +459,9 @@ impl EngineRpc {
     }
 
     fn local_importer(&self) -> Result<&crate::local_import::LocalImporter, RpcError> {
-        self.local_import.as_ref().ok_or_else(|| {
-            RpcError::Failed("local import requires a synced workspace".into())
-        })
+        self.local_import
+            .as_ref()
+            .ok_or_else(|| RpcError::Failed("local import requires a synced workspace".into()))
     }
 
     /// Resolve a mention-search root from synced workspace rows. A client may

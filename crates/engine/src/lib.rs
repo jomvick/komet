@@ -238,11 +238,8 @@ impl EngineCore {
         // profile's uploads root read-only — transcripts imported earlier
         // embed absolute paths under it (same shape as the legacy adoption).
         if profile.scope() != WorkspaceScope::Local
-            && let Some(root) = local_import::marker_grants_read_root(
-                data_dir,
-                profile.org_id(),
-                profile.user_id(),
-            )
+            && let Some(root) =
+                local_import::marker_grants_read_root(data_dir, profile.org_id(), profile.user_id())
         {
             uploads.add_read_only_root(&root);
         }

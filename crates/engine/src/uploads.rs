@@ -105,7 +105,10 @@ impl Uploads {
                 outbox: dir.join("mirror-outbox"),
                 dir: dir.to_path_buf(),
                 read_only_roots: std::sync::RwLock::new(
-                    legacy_read_root.into_iter().map(Path::to_path_buf).collect(),
+                    legacy_read_root
+                        .into_iter()
+                        .map(Path::to_path_buf)
+                        .collect(),
                 ),
                 edge,
                 http: reqwest::Client::builder()

@@ -430,14 +430,30 @@ enum SyncFlow {
     /// Signed in on a local runtime: the wizard's choice step (bring local
     /// work / start fresh / later). `notice_open: false` = postponed, badge
     /// in the account menu.
-    SwitchOffer { notice_open: bool },
+    SwitchOffer {
+        notice_open: bool,
+    },
     /// Stopping the local runtime and bootstrapping the synced one in-place.
-    Switching { import: bool },
+    Switching {
+        import: bool,
+    },
     /// The one-time import stream is running on the new synced runtime.
-    Importing { done: usize, total: usize },
+    Importing {
+        done: usize,
+        total: usize,
+    },
     /// Import finished; the success step stays until dismissed.
-    ImportDone { imported: usize, skipped: usize },
-    RestartPending { notice_open: bool },
+    ImportDone {
+        imported: usize,
+        skipped: usize,
+    },
+    /// The import stream reported errors or died early. Explicit retry step —
+    /// structural idempotence makes re-running safe (only missing rows copy).
+    /// Details ride `runtime_change_error`.
+    ImportFailed,
+    RestartPending {
+        notice_open: bool,
+    },
     SignOutConfirm,
     SigningOut,
     SignedOutRestartRequired,
@@ -449,7 +465,10 @@ impl SyncFlow {
     fn is_switch_lifecycle(self) -> bool {
         matches!(
             self,
-            SyncFlow::Switching { .. } | SyncFlow::Importing { .. } | SyncFlow::ImportDone { .. }
+            SyncFlow::Switching { .. }
+                | SyncFlow::Importing { .. }
+                | SyncFlow::ImportDone { .. }
+                | SyncFlow::ImportFailed
         )
     }
 }
@@ -523,6 +542,48 @@ async fn stop_synced_runtime(
     }
 }
 
+/// What an import-summary stream item means for the wizard: `Ok((imported,
+/// skipped))` only when the engine reported zero errors; otherwise the
+/// user-facing failure message. Pure so the partial-failure path is testable.
+fn import_summary_outcome(item: &serde_json::Value) -> Result<(usize, usize), String> {
+    let count = |key: &str| item.get(key).and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let errors: Vec<&str> = item
+        .get("errors")
+        .and_then(|e| e.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    if errors.is_empty() {
+        return Ok((count("importedChats"), count("skippedChats")));
+    }
+    let first = errors.first().copied().unwrap_or("unknown error");
+    Err(if errors.len() == 1 {
+        format!("{} imported, 1 failure: {first}", count("importedChats"))
+    } else {
+        format!(
+            "{} imported, {} failures — first: {first}",
+            count("importedChats"),
+            errors.len()
+        )
+    })
+}
+
+/// The offer step's description of what a switch would bring along, or `None`
+/// when the local profile holds nothing importable. Spaces count as work:
+/// a projects-only profile must get the import choice too.
+fn local_work_phrase(chats: usize, spaces: usize) -> Option<String> {
+    let plural = |n: usize, word: &str| format!("{n} {word}{}", if n == 1 { "" } else { "s" });
+    match (chats, spaces) {
+        (0, 0) => None,
+        (c, 0) => Some(format!("the {}", plural(c, "session"))),
+        (0, s) => Some(format!("the {}", plural(s, "project"))),
+        (c, s) => Some(format!(
+            "the {} and {}",
+            plural(c, "session"),
+            plural(s, "project")
+        )),
+    }
+}
+
 fn account_menu_action(scope: Option<WorkspaceScope>, flow: SyncFlow) -> Option<AccountMenuAction> {
     match scope {
         Some(WorkspaceScope::Local) => match flow {
@@ -531,9 +592,10 @@ fn account_menu_action(scope: Option<WorkspaceScope>, flow: SyncFlow) -> Option<
             SyncFlow::SwitchOffer { .. } | SyncFlow::RestartPending { .. } => {
                 Some(AccountMenuAction::RestartPending)
             }
-            SyncFlow::Switching { .. } | SyncFlow::Importing { .. } | SyncFlow::ImportDone { .. } => {
-                Some(AccountMenuAction::SyncInProgress)
-            }
+            SyncFlow::Switching { .. }
+            | SyncFlow::Importing { .. }
+            | SyncFlow::ImportDone { .. }
+            | SyncFlow::ImportFailed => Some(AccountMenuAction::SyncInProgress),
             SyncFlow::SignOutConfirm
             | SyncFlow::SigningOut
             | SyncFlow::SignedOutRestartRequired => None,
@@ -1911,6 +1973,7 @@ impl Shell {
             return;
         };
         self.sync_flow = SyncFlow::Importing { done: 0, total: 0 };
+        self.runtime_change_error = None;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
         let stream = Tokio::spawn(cx, async move {
             let mut items = engine
@@ -1934,11 +1997,12 @@ impl Shell {
                     if ended {
                         shell.import_task = None;
                         shell.import_current = None;
-                        // A stream that died before its summary: fall back.
+                        // A stream that died before its summary is a failure —
+                        // offer the in-place retry (idempotent).
                         if matches!(shell.sync_flow, SyncFlow::Importing { .. }) {
-                            shell.sync_flow = SyncFlow::RestartPending { notice_open: true };
+                            shell.sync_flow = SyncFlow::ImportFailed;
                             shell.runtime_change_error =
-                                Some("Import did not finish — restart to retry.".into());
+                                Some("The import stream ended before it finished.".into());
                         }
                         cx.notify();
                     }
@@ -1952,7 +2016,7 @@ impl Shell {
                 this.update(cx, |shell, cx| {
                     shell.import_task = None;
                     if matches!(shell.sync_flow, SyncFlow::Importing { .. }) {
-                        shell.sync_flow = SyncFlow::RestartPending { notice_open: true };
+                        shell.sync_flow = SyncFlow::ImportFailed;
                         shell.runtime_change_error = Some(error.into());
                         cx.notify();
                     }
@@ -1979,16 +2043,20 @@ impl Shell {
                 self.sync_flow = SyncFlow::Importing { done: index, total };
             }
             Some("summary") => {
-                let imported = item
-                    .get("importedChats")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as usize;
-                let skipped = item
-                    .get("skippedChats")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as usize;
                 self.import_current = None;
-                self.sync_flow = SyncFlow::ImportDone { imported, skipped };
+                // A summary with errors is a FAILED import, however normally
+                // the stream ended — never present a partial migration as
+                // complete (the engine keeps collecting per-item failures
+                // precisely so this can be surfaced).
+                match import_summary_outcome(item) {
+                    Ok((imported, skipped)) => {
+                        self.sync_flow = SyncFlow::ImportDone { imported, skipped };
+                    }
+                    Err(message) => {
+                        self.sync_flow = SyncFlow::ImportFailed;
+                        self.runtime_change_error = Some(message.into());
+                    }
+                }
             }
             _ => return,
         }
@@ -3453,12 +3521,16 @@ impl Shell {
         }
 
         let signed_in_email: Option<SharedString> = match self.state.read(cx).auth.as_ref() {
-            Some(AuthState::SignedIn { user, .. }) => {
-                Some(SharedString::from(user.email.clone()))
-            }
+            Some(AuthState::SignedIn { user, .. }) => Some(SharedString::from(user.email.clone())),
             _ => None,
         };
-        let local_chats = self.state.read(cx).chats.len();
+        // Spaces count as local work too: a projects-only profile must get
+        // the import choice, not a bare "Switch now".
+        let (local_chats, local_spaces) = {
+            let state = self.state.read(cx);
+            (state.chats.len(), state.spaces.len())
+        };
+        let work_phrase = local_work_phrase(local_chats, local_spaces);
 
         let card = match self.sync_flow {
             SyncFlow::Enabling => popover::dialog_card(&theme)
@@ -3503,23 +3575,21 @@ impl Shell {
                 .into_any_element(),
             // ── in-place switch wizard ────────────────────────────────────
             SyncFlow::SwitchOffer { notice_open: true } => {
-                let has_local_work = local_chats > 0;
-                let body: SharedString = match (&signed_in_email, has_local_work) {
-                    (Some(email), true) => format!(
-                        "You're signed in as {email}. Bring the {local_chats} session{} from this device into your synced workspace, or start it fresh.",
-                        if local_chats == 1 { "" } else { "s" },
+                let has_local_work = work_phrase.is_some();
+                let body: SharedString = match (&signed_in_email, &work_phrase) {
+                    (Some(email), Some(phrase)) => format!(
+                        "You're signed in as {email}. Bring {phrase} from this device into your synced workspace, or start it fresh."
                     )
                     .into(),
-                    (Some(email), false) => format!(
+                    (Some(email), None) => format!(
                         "You're signed in as {email}. Komet can switch to your synced workspace now."
                     )
                     .into(),
-                    (None, true) => format!(
-                        "Bring the {local_chats} session{} from this device into your synced workspace, or start it fresh.",
-                        if local_chats == 1 { "" } else { "s" },
+                    (None, Some(phrase)) => format!(
+                        "Bring {phrase} from this device into your synced workspace, or start it fresh."
                     )
                     .into(),
-                    (None, false) => "Komet can switch to your synced workspace now.".into(),
+                    (None, None) => "Komet can switch to your synced workspace now.".into(),
                 };
                 let mut actions = div()
                     .mt(px(16.0))
@@ -3660,6 +3730,47 @@ impl Shell {
                     )
                     .into_any_element()
             }
+            SyncFlow::ImportFailed => popover::dialog_card(&theme)
+                .child(popover::dialog_title(&theme, "Import didn't finish"))
+                .child(div().mt(px(6.0)).child(popover::dialog_body(
+                    &theme,
+                    "Anything already imported is kept; retrying only copies what's missing.",
+                )))
+                .when_some(self.runtime_change_error.clone(), |card, error| {
+                    card.child(
+                        div()
+                            .mt(px(10.0))
+                            .text_size(px(12.0))
+                            .line_height(px(17.0))
+                            .text_color(theme.danger)
+                            .child(error),
+                    )
+                })
+                .child(
+                    div()
+                        .mt(px(16.0))
+                        .flex()
+                        .flex_row()
+                        .justify_end()
+                        .gap(px(8.0))
+                        .child(
+                            popover::btn_ghost(&theme, "Not now", "import-failed-dismiss")
+                                .id("import-failed-dismiss")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.sync_flow = SyncFlow::Idle;
+                                    this.runtime_change_error = None;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            popover::btn_primary(&theme, "Retry import")
+                                .id("import-failed-retry")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.spawn_local_import(cx)
+                                })),
+                        ),
+                )
+                .into_any_element(),
             SyncFlow::RestartPending { notice_open: true } => popover::dialog_card(&theme)
                 .child(popover::dialog_title(
                     &theme,
@@ -5698,6 +5809,52 @@ mod tests {
     }
 
     #[test]
+    fn import_summary_errors_are_a_failure_not_a_success() {
+        // Clean summary → done with counts.
+        let clean = serde_json::json!({
+            "kind": "summary", "importedChats": 2, "skippedChats": 1, "errors": []
+        });
+        assert_eq!(import_summary_outcome(&clean), Ok((2, 1)));
+
+        // Any error means the wizard must NOT say "all set" — partial
+        // migrations surface as an explicit failure with the first cause.
+        let partial = serde_json::json!({
+            "kind": "summary", "importedChats": 1, "skippedChats": 0,
+            "errors": ["chat c2: journal copy failed"]
+        });
+        let message = import_summary_outcome(&partial).expect_err("errors must fail");
+        assert!(message.contains("journal copy failed"), "{message}");
+        assert!(message.contains("1 imported"), "{message}");
+
+        let many = serde_json::json!({
+            "kind": "summary", "importedChats": 0, "skippedChats": 0,
+            "errors": ["a", "b", "c"]
+        });
+        let message = import_summary_outcome(&many).expect_err("errors must fail");
+        assert!(message.contains("3 failures"), "{message}");
+
+        // A summary missing the errors field entirely (older engine) is
+        // treated as clean rather than failing every import.
+        let legacy = serde_json::json!({ "kind": "summary", "importedChats": 4 });
+        assert_eq!(import_summary_outcome(&legacy), Ok((4, 0)));
+    }
+
+    #[test]
+    fn spaces_only_local_work_still_gets_the_import_offer() {
+        assert_eq!(local_work_phrase(0, 0), None, "nothing to bring");
+        assert_eq!(local_work_phrase(2, 0).as_deref(), Some("the 2 sessions"));
+        assert_eq!(
+            local_work_phrase(0, 1).as_deref(),
+            Some("the 1 project"),
+            "a projects-only profile must be offered the import, not a bare switch"
+        );
+        assert_eq!(
+            local_work_phrase(1, 2).as_deref(),
+            Some("the 1 session and 2 projects")
+        );
+    }
+
+    #[test]
     fn switch_lifecycle_survives_the_runtime_replacement_window() {
         let signed_in = AuthState::SignedIn {
             user: komet_proto::UserProfile {
@@ -5714,6 +5871,7 @@ mod tests {
                 imported: 3,
                 skipped: 0,
             },
+            SyncFlow::ImportFailed,
         ] {
             // Local (before the stop), detached (mid-replacement), and synced
             // (replacement runtime up): the driver owns these states — auth

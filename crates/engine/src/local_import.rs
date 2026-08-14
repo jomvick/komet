@@ -40,6 +40,15 @@ use crate::workspace_host::WorkspaceHost;
 /// accounts, and each gets its own one-time import.
 const MARKER_FILE: &str = "local-import.json";
 
+/// Serializes every marker read-modify-write in this process. Two runtimes in
+/// one process (a swap mid-flight, tests) must not lose an account's entry to
+/// a racing update; cross-process exclusion is the data-dir `InstanceLock`'s job.
+fn marker_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Marker {
     #[serde(default)]
@@ -73,7 +82,11 @@ pub struct LocalImportStatus {
 /// *fields* need `rename_all_fields` — without it the wire shape silently
 /// ships snake_case counters (caught by `import_events_serialize_camel_case`).
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase", rename_all_fields = "camelCase", tag = "kind")]
+#[serde(
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase",
+    tag = "kind"
+)]
 pub enum ImportEvent {
     /// Emitted once, before any copying.
     Start { chats: usize, spaces: usize },
@@ -152,15 +165,34 @@ impl LocalImporter {
         self.inner.data_dir.join(MARKER_FILE)
     }
 
-    fn load_marker(&self) -> Marker {
-        std::fs::read_to_string(self.marker_path())
-            .ok()
-            .and_then(|raw| serde_json::from_str(&raw).ok())
-            .unwrap_or_default()
+    /// Load the marker under [`marker_lock`]. A file that exists but does not
+    /// parse is moved aside to `local-import.json.corrupt` — its grants were
+    /// already unreadable (boot's [`marker_grants_read_root`] parses the same
+    /// file), and keeping the bytes as evidence beats silently clobbering them
+    /// on the next write.
+    fn load_marker_locked(&self) -> Marker {
+        let path = self.marker_path();
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(_) => return Marker::default(),
+        };
+        match serde_json::from_str(&raw) {
+            Ok(marker) => marker,
+            Err(err) => {
+                let aside = path.with_extension("json.corrupt");
+                tracing::warn!(error = %err, aside = %aside.display(),
+                    "local-import marker is corrupt; moving it aside");
+                if let Err(err) = std::fs::rename(&path, &aside) {
+                    tracing::warn!(error = %err, "corrupt marker aside failed");
+                }
+                Marker::default()
+            }
+        }
     }
 
     fn imported_before(&self) -> bool {
-        self.load_marker()
+        let _guard = marker_lock();
+        self.load_marker_locked()
             .imports
             .iter()
             .any(|e| e.org_id == self.inner.org_id && e.user_id == self.inner.user_id)
@@ -168,8 +200,16 @@ impl LocalImporter {
 
     /// Record a completed import and re-arm the read-only uploads root for
     /// future boots (`EngineCore::assemble` consults [`marker_grants_read_root`]).
-    fn record_import(&self, chats: usize, spaces: usize) {
-        let mut marker = self.load_marker();
+    ///
+    /// The read-modify-write is serialized process-wide (cross-process is
+    /// already excluded by the data-dir `InstanceLock`) and published
+    /// atomically — write + fsync a sibling temp file, then rename over the
+    /// marker — so a crash or short write can never truncate the file and
+    /// erase other accounts' grants. Failures propagate to the caller and end
+    /// up in the import summary.
+    fn record_import(&self, chats: usize, spaces: usize) -> Result<(), EngineError> {
+        let _guard = marker_lock();
+        let mut marker = self.load_marker_locked();
         marker
             .imports
             .retain(|e| !(e.org_id == self.inner.org_id && e.user_id == self.inner.user_id));
@@ -180,14 +220,23 @@ impl LocalImporter {
             imported_chats: chats,
             imported_spaces: spaces,
         });
-        match serde_json::to_vec_pretty(&marker) {
-            Ok(bytes) => {
-                if let Err(err) = std::fs::write(self.marker_path(), bytes) {
-                    tracing::warn!(error = %err, "local-import marker write failed");
-                }
+        let bytes = serde_json::to_vec_pretty(&marker)
+            .map_err(|err| EngineError::Other(format!("marker serialize: {err}")))?;
+        let path = self.marker_path();
+        let tmp = path.with_extension("json.tmp");
+        let publish = || -> std::io::Result<()> {
+            {
+                use std::io::Write;
+                let mut file = std::fs::File::create(&tmp)?;
+                file.write_all(&bytes)?;
+                file.sync_all()?;
             }
-            Err(err) => tracing::warn!(error = %err, "local-import marker serialize failed"),
-        }
+            std::fs::rename(&tmp, &path)
+        };
+        publish().map_err(|err| {
+            let _ = std::fs::remove_file(&tmp);
+            EngineError::Other(format!("marker write: {err}"))
+        })
     }
 
     /// Open the local profile's stores read-only-ish. `None` when the device
@@ -238,7 +287,10 @@ impl LocalImporter {
     /// `Summary`). Blocking (sqlite + fs) — callers run it off the async path.
     pub fn run(&self, mut emit: impl FnMut(ImportEvent)) -> Result<(), EngineError> {
         let Some((source_store, registry)) = self.open_source()? else {
-            emit(ImportEvent::Start { chats: 0, spaces: 0 });
+            emit(ImportEvent::Start {
+                chats: 0,
+                spaces: 0,
+            });
             emit(ImportEvent::Summary {
                 imported_chats: 0,
                 imported_spaces: 0,
@@ -315,11 +367,17 @@ impl LocalImporter {
             });
 
         // Transcripts embed absolute paths under the local uploads root; jail
-        // it read-only now (and on future boots, via the marker).
+        // it read-only now (and on future boots, via the marker). A marker
+        // that fails to persist means imported attachments stop resolving
+        // after a restart — that is a real failure, not a footnote.
         if self.source_uploads().is_dir() {
-            self.inner.uploads.add_read_only_root(&self.source_uploads());
+            self.inner
+                .uploads
+                .add_read_only_root(&self.source_uploads());
         }
-        self.record_import(imported_chats, imported_spaces);
+        if let Err(err) = self.record_import(imported_chats, imported_spaces) {
+            errors.push(format!("import marker: {err}"));
+        }
 
         emit(ImportEvent::Summary {
             imported_chats,
@@ -346,9 +404,12 @@ impl LocalImporter {
         if let Some(bytes) = source_store.load_snapshot(&chat.id)?
             && !self.inner.target_store.has_snapshot(&chat.id)?
         {
-            self.inner
-                .target_store
-                .save_snapshot_with_cursor(&chat.id, &bytes, 0, CHAT2_DOC_EPOCH)?;
+            self.inner.target_store.save_snapshot_with_cursor(
+                &chat.id,
+                &bytes,
+                0,
+                CHAT2_DOC_EPOCH,
+            )?;
         }
 
         let mut copied = false;
@@ -392,7 +453,10 @@ mod tests {
         })
         .expect("serialize");
         assert_eq!(summary["kind"], "summary");
-        assert_eq!(summary["importedChats"], 2, "fields must be camelCase: {summary}");
+        assert_eq!(
+            summary["importedChats"], 2,
+            "fields must be camelCase: {summary}"
+        );
         let chat = serde_json::to_value(ImportEvent::Chat {
             index: 0,
             total: 2,

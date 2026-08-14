@@ -23,7 +23,13 @@ async fn seed_local(data_dir: &std::path::Path) -> (String, String, String) {
 
     local
         .workspace
-        .create_space("space-1", &device, "/tmp/proj", Some("Project".into()), false)
+        .create_space(
+            "space-1",
+            &device,
+            "/tmp/proj",
+            Some("Project".into()),
+            false,
+        )
         .expect("create space");
     local
         .workspace
@@ -155,18 +161,15 @@ async fn local_work_imports_into_synced_profile_once() {
 
     // Doc bytes present in the synced store in born-chat2 shape (cursor 0,
     // epoch 2) — the shape DocHost pushes from VV zero on first room join.
-    let store = komet_sync::DocsStore::open(
-        dir.path().join("orgs").join("org1").join("user1"),
-    )
-    .expect("open synced store");
+    let store = komet_sync::DocsStore::open(dir.path().join("orgs").join("org1").join("user1"))
+        .expect("open synced store");
     let (bytes, cursor, epoch) = store
         .load_snapshot_with_cursor(&chat_doc)
         .expect("load")
         .expect("imported doc row");
     assert_eq!((cursor, epoch), (0, 2));
-    let source_store =
-        komet_sync::DocsStore::open(dir.path().join("profiles").join("local"))
-            .expect("open source store");
+    let source_store = komet_sync::DocsStore::open(dir.path().join("profiles").join("local"))
+        .expect("open source store");
     assert_eq!(
         source_store
             .load_snapshot(&chat_doc)
@@ -179,7 +182,11 @@ async fn local_work_imports_into_synced_profile_once() {
 
     // Journal + resume budget carried over.
     let (journal, resume) = journal_paths(
-        &dir.path().join("orgs").join("org1").join("user1").join("journals"),
+        &dir.path()
+            .join("orgs")
+            .join("org1")
+            .join("user1")
+            .join("journals"),
         &chat_doc,
     );
     assert!(journal.is_file(), "journal copied");
@@ -232,6 +239,194 @@ async fn import_without_local_profile_is_a_clean_no_op() {
     assert_eq!((imported_chats, imported_spaces), (0, 0));
 
     synced.shutdown().await;
+}
+
+/// Read the summary WITHOUT asserting a clean run (the failure-injection tests
+/// need the errors).
+fn raw_summary(events: &[ImportEvent]) -> (usize, usize, Vec<String>) {
+    match events.last().expect("summary event") {
+        ImportEvent::Summary {
+            imported_chats,
+            skipped_chats,
+            errors,
+            ..
+        } => (*imported_chats, *skipped_chats, errors.clone()),
+        other => panic!("last event must be a summary, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn per_item_failures_surface_in_the_summary_and_leave_the_row_retryable() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (_device, chat_doc, chat_bare) = seed_local(dir.path()).await;
+
+    let synced = assemble(EngineProfile::synced(dir.path(), "org1", "user1"));
+
+    // Injected failure: the target journals DIRECTORY is replaced by a file,
+    // so the journal copy fails for the one chat that has a journal
+    // (chat-doc); the journal-less chat-bare is untouched.
+    let target_journals = dir
+        .path()
+        .join("orgs")
+        .join("org1")
+        .join("user1")
+        .join("journals");
+    std::fs::remove_dir_all(&target_journals).expect("clear journals dir");
+    std::fs::write(&target_journals, b"obstruction").expect("plant journals obstruction");
+
+    let events = run_import(&synced);
+    let (imported, _skipped, errors) = raw_summary(&events);
+    assert_eq!(imported, 1, "the healthy chat still imports");
+    assert_eq!(
+        errors.len(),
+        1,
+        "the failure is reported, not swallowed: {errors:?}"
+    );
+    assert!(errors[0].contains(&chat_doc), "{errors:?}");
+
+    // The failed chat's ROW must not exist — structural idempotence makes the
+    // retry pick it up again instead of skipping a half-imported chat.
+    assert!(
+        synced
+            .workspace
+            .chat(&chat_doc)
+            .expect("read chat")
+            .is_none(),
+        "failed chat must stay pending for retry"
+    );
+    assert!(
+        synced
+            .workspace
+            .chat(&chat_bare)
+            .expect("read chat")
+            .is_some()
+    );
+
+    // Retry after clearing the obstruction: only the failed chat imports.
+    std::fs::remove_file(&target_journals).expect("clear obstruction");
+    let events = run_import(&synced);
+    let (imported, skipped, errors) = raw_summary(&events);
+    assert!(errors.is_empty(), "retry is clean: {errors:?}");
+    assert_eq!((imported, skipped), (1, 1));
+
+    synced.shutdown().await;
+}
+
+#[tokio::test]
+async fn corrupt_marker_is_moved_aside_not_clobbered() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (..) = seed_local(dir.path()).await;
+
+    std::fs::write(dir.path().join("local-import.json"), b"{ not json").expect("plant corrupt");
+
+    let synced = assemble(EngineProfile::synced(dir.path(), "org1", "user1"));
+    let events = run_import(&synced);
+    let (_, _, errors) = raw_summary(&events);
+    assert!(
+        errors.is_empty(),
+        "a corrupt OLD marker fails nothing: {errors:?}"
+    );
+
+    // Evidence preserved, fresh marker valid, grant re-armed.
+    assert!(
+        dir.path().join("local-import.json.corrupt").is_file(),
+        "corrupt bytes moved aside"
+    );
+    assert!(
+        marker_grants_read_root(dir.path(), "org1", "user1").is_some(),
+        "rebuilt marker grants the uploads root"
+    );
+    synced.shutdown().await;
+}
+
+#[tokio::test]
+async fn marker_persistence_failure_is_an_import_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (..) = seed_local(dir.path()).await;
+
+    // The marker path itself is a directory: the atomic rename must fail and
+    // the failure must reach the summary — a grant that only lives in memory
+    // breaks imported attachments on the next restart.
+    std::fs::create_dir_all(dir.path().join("local-import.json")).expect("plant marker dir");
+
+    let synced = assemble(EngineProfile::synced(dir.path(), "org1", "user1"));
+    let events = run_import(&synced);
+    let (imported, _, errors) = raw_summary(&events);
+    assert_eq!(imported, 2, "data still imports");
+    assert!(
+        errors.iter().any(|e| e.contains("import marker")),
+        "marker failure must be reported: {errors:?}"
+    );
+    synced.shutdown().await;
+}
+
+#[tokio::test]
+async fn spaces_only_profile_imports_its_spaces() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let local = assemble(EngineProfile::local(dir.path()).expect("local profile"));
+    let device = local.device_id.clone();
+    local
+        .workspace
+        .create_space(
+            "space-only",
+            &device,
+            "/tmp/proj",
+            Some("Project".into()),
+            false,
+        )
+        .expect("create space");
+    local.shutdown().await;
+    drop(local);
+
+    let synced = assemble(EngineProfile::synced(dir.path(), "org1", "user1"));
+    let status = synced
+        .local_import
+        .as_ref()
+        .expect("importer")
+        .status()
+        .expect("status");
+    assert_eq!((status.available_chats, status.available_spaces), (0, 1));
+
+    let events = run_import(&synced);
+    match events.last().expect("summary") {
+        ImportEvent::Summary {
+            imported_spaces,
+            errors,
+            ..
+        } => {
+            assert!(errors.is_empty(), "{errors:?}");
+            assert_eq!(*imported_spaces, 1);
+        }
+        other => panic!("expected summary, got {other:?}"),
+    }
+    assert!(
+        synced
+            .workspace
+            .space("space-only")
+            .expect("read space")
+            .is_some()
+    );
+    synced.shutdown().await;
+}
+
+#[tokio::test]
+async fn marker_keeps_one_entry_per_account() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (..) = seed_local(dir.path()).await;
+
+    let first = assemble(EngineProfile::synced(dir.path(), "org1", "user1"));
+    run_import(&first);
+    first.shutdown().await;
+    drop(first);
+
+    // A second account on the same device imports too; its marker entry must
+    // not erase the first account's grant.
+    let second = assemble(EngineProfile::synced(dir.path(), "org2", "user2"));
+    run_import(&second);
+    second.shutdown().await;
+
+    assert!(marker_grants_read_root(dir.path(), "org1", "user1").is_some());
+    assert!(marker_grants_read_root(dir.path(), "org2", "user2").is_some());
 }
 
 #[tokio::test]
