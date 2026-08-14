@@ -433,7 +433,26 @@ impl Transcript {
             return gpui::Empty.into_any_element();
         }
         let tick_rows: Vec<usize> = pairs.iter().map(|(_, row)| *row).collect();
-        let top_row = self.list_state().logical_scroll_top().item_ix;
+        // Active detection reads from the READING line, not the raw clip top:
+        // the titlebar overlays the list, so a row whose top sits within that
+        // chrome band is what you're reading — the sliver of the previous row
+        // above it is behind the blur. Concretely, the own-turn hold parks the
+        // newest prompt exactly at the chrome inset, and crediting the row at
+        // the raw clip top kept the PREVIOUS tick lit for the whole runway
+        // (user report). Walk forward over measured rows whose tops are at or
+        // above the reading line; unmeasured rows (None bounds) stop the walk,
+        // leaving the raw top row — the pre-fix behavior.
+        let mut top_row = self.list_state().logical_scroll_top().item_ix;
+        let read_top = f32::from(self.list_state().viewport_bounds().top())
+            + crate::transcript::OWN_SEND_TOP_INSET_PX
+            + 0.5;
+        while let Some(bounds) = self.list_state().bounds_for_item(top_row + 1) {
+            if f32::from(bounds.top()) <= read_top {
+                top_row += 1;
+            } else {
+                break;
+            }
+        }
         let active = active_tick(&tick_rows, top_row);
         let hover = self.rail_hover();
         let theme = Theme::of(cx).clone();

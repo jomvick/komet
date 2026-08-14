@@ -113,7 +113,7 @@ pub const GLIDE_MAX_VIEWPORTS: f32 = 2.5;
 /// A freshly-sent prompt rests this far below the transcript viewport's top.
 /// The titlebar overlays the full-height list, so its height is part of the
 /// inset; the extra 10px matches the first row's breathing room.
-const OWN_SEND_TOP_INSET_PX: f32 = Theme::TITLEBAR_HEIGHT + 10.0;
+pub(crate) const OWN_SEND_TOP_INSET_PX: f32 = Theme::TITLEBAR_HEIGHT + 10.0;
 /// Epsilon of extra height under the reservation. The runway ends AT the
 /// app's bottom — this is not scroll room (24px of it read as a janky
 /// overshoot-and-fight zone, user report) — it exists only to keep the held
@@ -3228,6 +3228,7 @@ impl Transcript {
                         .toggled_at
                         .is_some_and(|at| at.elapsed() < FOLD_TWEEN_WINDOW);
                 let toggle_key = key.clone();
+                let group_key = row_id.clone();
                 let mut card = div()
                     .my(px((CHIP_HEIGHT - CHIP_CARD_HEIGHT) / 2.0))
                     .ml(px(12.0))
@@ -3252,6 +3253,23 @@ impl Transcript {
                                 entry.open = Some(!currently_open);
                                 entry.epoch += 1;
                                 entry.toggled_at = Some(Instant::now());
+                                // Arm the GROUP body's height tween too (open
+                                // state untouched): the body's height is
+                                // analytic over the final detail state, so
+                                // without a tween the row snaps to the target
+                                // height while the card is still mid-tween —
+                                // content below teleported on expand and the
+                                // shrinking card clipped on collapse (user
+                                // report). `open_height` was computed with
+                                // the detail still in its pre-click state,
+                                // which is exactly the tween's start; both
+                                // tweens share the click instant and the
+                                // RESIZE curve, so the row tracks the card's
+                                // bottom edge frame-for-frame.
+                                let group = this.folds.entry(group_key.clone()).or_default();
+                                group.from = open_height;
+                                group.epoch += 1;
+                                group.toggled_at = Some(Instant::now());
                                 cx.notify();
                             }))
                             .child(chip_header(tool, open, theme)),
