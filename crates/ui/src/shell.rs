@@ -1175,6 +1175,27 @@ impl Shell {
         }
     }
 
+    /// Pan the surface-tab strip by a wheel delta — the chips' occluding
+    /// hitboxes forward here (vertical wheel maps to x: the strip only
+    /// scrolls one axis, same courtesy as gpui's own fallback).
+    fn scroll_right_tabs(
+        &mut self,
+        event: &gpui::ScrollWheelEvent,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        let delta = event.delta.pixel_delta(window.line_height());
+        let step = if delta.x != px(0.0) { delta.x } else { delta.y };
+        if step == px(0.0) {
+            return;
+        }
+        let mut offset = self.right_tab_scroll.offset();
+        offset.x += step;
+        // The tracked div's prepaint clamps to the real extent next frame.
+        self.right_tab_scroll.set_offset(offset);
+        cx.notify();
+    }
+
     /// Track the hovered drop slot mid-drag (the terminal drawer's
     /// `update_drag_over`, ported: epoch bumps restart the slide tween).
     fn update_right_tab_drag_over(&mut self, from: usize, over: usize, cx: &mut Context<Self>) {
@@ -3976,6 +3997,10 @@ impl Shell {
         // scrollable").
         let mut strip = div()
             .h_full()
+            // flex_none: the row is a flex ITEM of the scroller — without it
+            // taffy may shrink it to fit and the scroller never measures
+            // overflow (no scroll, no fade — user report).
+            .flex_none()
             .flex()
             .flex_row()
             .items_center()
@@ -4038,6 +4063,14 @@ impl Shell {
                     .gap(px(3.0))
                     .cursor_pointer()
                     .occlude()
+                    // Occlusion (the titlebar drag-region carve-out) blocks
+                    // the scroller's built-in wheel handling while the
+                    // pointer is over a chip — forward the delta by hand.
+                    .on_scroll_wheel(cx.listener(
+                        |this, event: &gpui::ScrollWheelEvent, window, cx| {
+                            this.scroll_right_tabs(event, window, cx);
+                        },
+                    ))
                     .on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
                         window.prevent_default()
                     })
@@ -4174,6 +4207,11 @@ impl Shell {
             ))
             .on_hover(motion::hover_listener(plus_fade))
             .occlude()
+            .on_scroll_wheel(cx.listener(
+                |this, event: &gpui::ScrollWheelEvent, window, cx| {
+                    this.scroll_right_tabs(event, window, cx);
+                },
+            ))
             .on_mouse_down(
                 gpui::MouseButton::Left,
                 cx.listener(|this, _, window, _| {
