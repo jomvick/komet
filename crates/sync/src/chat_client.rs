@@ -618,8 +618,8 @@ impl Actor {
                     let _ = self.events.send(ChatEvent::Disconnected);
                     if ready.is_some() {
                         if let Some(ready) = ready.take() {
-                            let _ =
-                                ready.send(Err(SyncError::Protocol("chat2 handshake failed".into())));
+                            let _ = ready
+                                .send(Err(SyncError::Protocol("chat2 handshake failed".into())));
                         }
                         return;
                     }

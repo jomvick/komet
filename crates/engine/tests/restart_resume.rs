@@ -100,35 +100,34 @@ impl Harness for RecordingHarness {
                 false
             }
         };
-        let events: Vec<Result<AgentEvent, HarnessError>> =
-            if fail {
-                vec![Ok(AgentEvent::Done {
-                    status: DoneStatus::Errored,
+        let events: Vec<Result<AgentEvent, HarnessError>> = if fail {
+            vec![Ok(AgentEvent::Done {
+                status: DoneStatus::Errored,
+                result: None,
+                error: Some("Recording exited unexpectedly (exit code 1): boom".into()),
+                session_id: None,
+            })]
+        } else {
+            vec![
+                Ok(AgentEvent::SessionStarted {
+                    harness: HarnessId::Mock,
+                    model: "mock-1".into(),
+                    tools: vec![],
+                    cwd: request.cwd.clone(),
+                    session_id: self.session_id.clone(),
+                    assistant_message_id: "a-1".into(),
+                }),
+                Ok(AgentEvent::TextDelta {
+                    text: format!("ack: {}", request.prompt),
+                }),
+                Ok(AgentEvent::Done {
+                    status: DoneStatus::Completed,
                     result: None,
-                    error: Some("Recording exited unexpectedly (exit code 1): boom".into()),
-                    session_id: None,
-                })]
-            } else {
-                vec![
-                    Ok(AgentEvent::SessionStarted {
-                        harness: HarnessId::Mock,
-                        model: "mock-1".into(),
-                        tools: vec![],
-                        cwd: request.cwd.clone(),
-                        session_id: self.session_id.clone(),
-                        assistant_message_id: "a-1".into(),
-                    }),
-                    Ok(AgentEvent::TextDelta {
-                        text: format!("ack: {}", request.prompt),
-                    }),
-                    Ok(AgentEvent::Done {
-                        status: DoneStatus::Completed,
-                        result: None,
-                        error: None,
-                        session_id: Some(self.session_id.clone()),
-                    }),
-                ]
-            };
+                    error: None,
+                    session_id: Some(self.session_id.clone()),
+                }),
+            ]
+        };
         Ok(futures::stream::iter(events).boxed())
     }
 }

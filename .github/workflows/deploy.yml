@@ -66,7 +66,7 @@ jobs:
         working-directory: edge
         run: npx wrangler deploy
 
-  # Static landing page (komet.komet.sh) — assets-only worker, no build step.
+  # Static landing page (komet.sh) — assets-only worker, no build step.
   landing:
     runs-on: ubuntu-latest
     env:

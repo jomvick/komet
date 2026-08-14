@@ -9,7 +9,7 @@
 //! releases published before the manifest existed.
 //!
 //! Install kinds and their update paths:
-//! - **Managed** (`~/.komet-native/app/<ver>` + `current` symlink — the curl|sh
+//! - **Managed** (`~/.komet/app/<ver>` + `current` symlink — the curl|sh
 //!   installer): download the headless tarball into a new versioned dir, flip
 //!   the symlink, restart the service. Same flow the installer script performs,
 //!   natively.
@@ -164,7 +164,7 @@ fn http_client() -> anyhow::Result<reqwest::Client> {
 /// How this binary was installed — decides the update path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InstallKind {
-    /// `~/.komet-native/app/<ver>/komet` behind the `current` symlink
+    /// `~/.komet/app/<ver>/komet` behind the `current` symlink
     /// (curl|sh installer / a previous `komet update`).
     Managed { app_root: PathBuf },
     /// Running out of a macOS `.app` bundle.
@@ -184,7 +184,7 @@ pub fn detect_install() -> InstallKind {
 fn detect_install_from(exe: &Path, home: Option<&Path>) -> InstallKind {
     if let Some(home) = home {
         // `current_exe` resolves the `current` symlink to the versioned dir.
-        let app_root = home.join(".komet-native").join("app");
+        let app_root = home.join(".komet").join("app");
         if exe.starts_with(&app_root) {
             return InstallKind::Managed { app_root };
         }
@@ -357,10 +357,10 @@ pub fn restart_service() -> anyhow::Result<()> {
         let uid = String::from_utf8_lossy(&output.stdout).trim().to_string();
         run(
             "launchctl",
-            &["kickstart", "-k", &format!("gui/{uid}/sh.komet.komet")],
+            &["kickstart", "-k", &format!("gui/{uid}/sh.komet.app")],
         )
     } else {
-        run("systemctl", &["--user", "restart", "komet-native.service"])
+        run("systemctl", &["--user", "restart", "komet.service"])
     }
 }
 
@@ -369,9 +369,7 @@ pub fn restart_service() -> anyhow::Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Download + unpack the app tarball into `{data_dir}/updates/<ver>/Komet.app`
-/// (idempotent). The payload keeps this legacy internal name so installed
-/// Komet builds can update into Komet without a bootstrap release. Returns the
-/// staged bundle path.
+/// (idempotent). Returns the staged bundle path.
 pub async fn stage_mac_app(
     edge_url: &str,
     manifest: &Manifest,
@@ -513,25 +511,58 @@ pub type QuiescentCheck = Arc<dyn Fn() -> bool + Send + Sync>;
 pub struct Updater {
     edge_url: String,
     status_tx: Arc<watch::Sender<UpdateStatus>>,
+    check_tx: Arc<watch::Sender<u64>>,
     quiescent: Option<QuiescentCheck>,
+    /// Flips to true exactly once; the check loop selects against it so
+    /// cancellation lands at any await point (no tokio-util in this crate).
+    shutdown_tx: Arc<watch::Sender<bool>>,
+    check_task: Arc<std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl Updater {
     /// Spawn the check loop (must run on a tokio runtime).
     pub fn spawn(edge_url: String, quiescent: Option<QuiescentCheck>) -> Self {
         let (status_tx, _) = watch::channel(UpdateStatus::initial());
+        let (check_tx, _) = watch::channel(0);
+        let (shutdown_tx, _) = watch::channel(false);
         let updater = Self {
             edge_url,
             status_tx: Arc::new(status_tx),
+            check_tx: Arc::new(check_tx),
             quiescent,
+            shutdown_tx: Arc::new(shutdown_tx),
+            check_task: Arc::new(std::sync::Mutex::new(None)),
         };
         let for_loop = updater.clone();
-        tokio::spawn(async move { for_loop.check_loop().await });
+        let task = tokio::spawn(async move { for_loop.check_loop().await });
+        *updater.check_task.lock().unwrap() = Some(task);
         updater
+    }
+
+    /// Stop the check loop and wait for it to exit — a replaced runtime must
+    /// not keep polling `{edge}/releases` (or auto-applying) in the background.
+    /// Idempotent, and callable from any clone.
+    pub async fn shutdown(&self) {
+        let _ = self.shutdown_tx.send(true);
+        let task = self
+            .check_task
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .take();
+        if let Some(task) = task {
+            let _ = task.await;
+        }
     }
 
     pub fn watch(&self) -> watch::Receiver<UpdateStatus> {
         self.status_tx.subscribe()
+    }
+
+    /// Wake the release checker immediately, for example when authentication
+    /// recovers after the process started offline.
+    pub fn check_now(&self) {
+        self.check_tx
+            .send_modify(|epoch| *epoch = epoch.wrapping_add(1));
     }
 
     fn quiescent_now(&self) -> bool {
@@ -539,15 +570,33 @@ impl Updater {
     }
 
     async fn check_loop(&self) {
-        tokio::time::sleep(CHECK_INITIAL_DELAY).await;
-        loop {
-            let ok = self.check_once().await;
-            if ok && self.status_tx.borrow().update_available && auto_update_enabled() {
-                if let InstallKind::Managed { .. } = detect_install() {
-                    self.auto_apply_when_idle().await;
+        let mut shutdown = self.shutdown_tx.subscribe();
+        // Shutdown must cut the loop at ANY await point — including mid
+        // `check_once()` / `auto_apply_when_idle()` HTTP — so the whole body
+        // races the flag rather than checking it between iterations.
+        tokio::select! {
+            _ = shutdown.wait_for(|stop| *stop) => {}
+            _ = async {
+                let mut checks = self.check_tx.subscribe();
+                tokio::select! {
+                    _ = tokio::time::sleep(CHECK_INITIAL_DELAY) => {}
+                    _ = checks.changed() => {}
                 }
-            }
-            tokio::time::sleep(if ok { CHECK_INTERVAL } else { CHECK_RETRY }).await;
+                loop {
+                    let ok = self.check_once().await;
+                    if ok
+                        && self.status_tx.borrow().update_available
+                        && auto_update_enabled()
+                        && let InstallKind::Managed { .. } = detect_install()
+                    {
+                        self.auto_apply_when_idle().await;
+                    }
+                    tokio::select! {
+                        _ = tokio::time::sleep(if ok { CHECK_INTERVAL } else { CHECK_RETRY }) => {}
+                        _ = checks.changed() => {}
+                    }
+                }
+            } => {}
         }
     }
 
@@ -673,11 +722,11 @@ mod tests {
     fn install_kind_detection() {
         assert_eq!(
             detect_install_from(
-                Path::new("/home/u/.komet-native/app/0.1.1/komet"),
+                Path::new("/home/u/.komet/app/0.1.1/komet"),
                 Some(Path::new("/home/u")),
             ),
             InstallKind::Managed {
-                app_root: PathBuf::from("/home/u/.komet-native/app")
+                app_root: PathBuf::from("/home/u/.komet/app")
             }
         );
         assert_eq!(

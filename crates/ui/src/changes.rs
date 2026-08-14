@@ -1170,7 +1170,10 @@ impl Changes {
             }
             let result = engine
                 .client()
-                .call(methods::GET_CHECKOUT_DIFF, serde_json::Value::Object(params))
+                .call(
+                    methods::GET_CHECKOUT_DIFF,
+                    serde_json::Value::Object(params),
+                )
                 .await;
             this.update(cx, |changes, cx| {
                 if changes.scoped_inflight.as_deref() != Some(key.as_str()) {
@@ -1319,9 +1322,7 @@ impl Changes {
                 .await;
             this.update(cx, |changes, cx| {
                 // Late results for a superseded diff are re-checked by key.
-                let current = changes
-                    .active_diff(cx)
-                    .map(|d| changes.parse_key(&d));
+                let current = changes.active_diff(cx).map(|d| changes.parse_key(&d));
                 if current.as_deref() != Some(key.as_str()) {
                     return;
                 }
@@ -1690,11 +1691,7 @@ impl Changes {
                 let Some(file_diff) = files.get(file as usize) else {
                     return gpui::Empty.into_any_element();
                 };
-                let fold = self
-                    .folds
-                    .get(&file_diff.path)
-                    .copied()
-                    .unwrap_or_default();
+                let fold = self.folds.get(&file_diff.path).copied().unwrap_or_default();
                 self.render_file_header(file as usize, file_diff, &fold, &theme, cx)
             }
             DiffRow::Notice { file, notice } => files
@@ -1731,19 +1728,12 @@ impl Changes {
                     .unwrap_or(&[]);
                 diff_line_row(line, tokens, &theme, gutter_width(file_diff))
             }
-            DiffRow::BodyPad { .. } => div()
-                .w_full()
-                .h(px(BODY_BOTTOM_PAD))
-                .into_any_element(),
+            DiffRow::BodyPad { .. } => div().w_full().h(px(BODY_BOTTOM_PAD)).into_any_element(),
             DiffRow::FoldingBody { file } => {
                 let Some(file_diff) = files.get(file as usize) else {
                     return gpui::Empty.into_any_element();
                 };
-                let fold = self
-                    .folds
-                    .get(&file_diff.path)
-                    .copied()
-                    .unwrap_or_default();
+                let fold = self.folds.get(&file_diff.path).copied().unwrap_or_default();
                 let highlight = self.request_highlight(file_diff, &parsed_key, cx);
                 let (from, to) = (fold.from, fold.to);
                 // Only the revealable slice is built — the tween never pays
@@ -1754,10 +1744,7 @@ impl Changes {
                 if fold.animating() {
                     clipped
                         .with_animation(
-                            SharedString::from(format!(
-                                "fold-{}-{}",
-                                file_diff.path, fold.epoch
-                            )),
+                            SharedString::from(format!("fold-{}-{}", file_diff.path, fold.epoch)),
                             COLLAPSE.animation(),
                             move |el, t| el.h(px(motion::lerp(from, to, t))),
                         )
@@ -2033,12 +2020,13 @@ impl Changes {
                 .gap(px(2.0))
                 .children(history_fetch_button)
                 .child(
-                    Self::header_button("history-refresh", crate::icons::REFRESH, &theme)
-                        .on_click(cx.listener(|this, _, _, cx| {
+                    Self::header_button("history-refresh", crate::icons::REFRESH, &theme).on_click(
+                        cx.listener(|this, _, _, cx| {
                             cx.stop_propagation();
                             this.history_pane(cx)
                                 .update(cx, |history, cx| history.refresh(cx));
-                        })),
+                        }),
+                    ),
                 )
                 .into_any_element()
         } else {
@@ -2077,11 +2065,8 @@ impl Changes {
                 // The 2px row gap every other menu carries — rows straight on
                 // the card abutted, adjacent washes read as one slab (user
                 // report).
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(2.0))
-                    .children(DiffScope::ALL.into_iter().enumerate().map(|(ix, scope)| {
+                div().flex().flex_col().gap(px(2.0)).children(
+                    DiffScope::ALL.into_iter().enumerate().map(|(ix, scope)| {
                         popover::menu_row(
                             theme,
                             scope == current,
@@ -2092,23 +2077,16 @@ impl Changes {
                             this.set_scope(scope, cx);
                             this.close_scope_menu(cx);
                         }))
-                        .child(
-                            div()
-                                .flex_1()
-                                .child(SharedString::from(scope.label())),
-                        )
-                    })),
+                        .child(div().flex_1().child(SharedString::from(scope.label())))
+                    }),
+                ),
             )
             .into_any_element()
     }
 
     /// `{branch} → {base ⌄}` — which ref the branch scope compares against
     /// (t3code's ref strip), inlined into the pane header. Branch scope only.
-    fn render_ref_selector(
-        &mut self,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
+    fn render_ref_selector(&mut self, theme: &Theme, cx: &mut Context<Self>) -> Option<AnyElement> {
         if self.scope != DiffScope::Branch {
             return None;
         }
@@ -2118,10 +2096,7 @@ impl Changes {
             .selected_chat_row()
             .and_then(|chat| chat.branch.clone())
             .unwrap_or_else(|| "HEAD".to_string());
-        let base = self
-            .base_ref
-            .clone()
-            .unwrap_or_else(|| "…".to_string());
+        let base = self.base_ref.clone().unwrap_or_else(|| "…".to_string());
         // Even truncation: taffy shrinks flex items ∝ factor × basis, and the
         // default factor of 1 splits the deficit proportionally to content —
         // a long branch stayed near-whole while a short base ("main") read as
@@ -2296,9 +2271,9 @@ impl Changes {
         popover::popover_card(theme)
             .w(px(240.0))
             .track_focus(&focus)
-            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
-                this.ref_menu_key(event, cx)
-            }))
+            .on_key_down(
+                cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| this.ref_menu_key(event, cx)),
+            )
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_ref_menu(cx)))
             .flex()
             .flex_col()
@@ -2705,7 +2680,7 @@ impl Render for Changes {
                     .text_color(theme.text_faint)
                     .child(SharedString::from(clean_message(scope, base.as_deref())))
                     .into_any_element(),
-                    DiffPhase::List => {
+                DiffPhase::List => {
                     if self.parsed.is_some() {
                         div()
                             .flex_1()
@@ -2955,10 +2930,7 @@ rename to new_name.rs
         // body_height stays consistent with what actually renders.
         assert_eq!(
             body_height(&file),
-            NOTICE_HEIGHT
-                + 2.0 * HUNK_HEADER_HEIGHT
-                + 6.0 * DIFF_LINE_HEIGHT
-                + BODY_BOTTOM_PAD
+            NOTICE_HEIGHT + 2.0 * HUNK_HEADER_HEIGHT + 6.0 * DIFF_LINE_HEIGHT + BODY_BOTTOM_PAD
         );
 
         // A cap below the first hunk's length drops later hunks entirely.
@@ -2994,11 +2966,14 @@ rename to new_name.rs
         file.max_line = 9999;
         assert!(gutter_width(&file) > GUTTER_WIDTH);
         file.max_line = 27404;
-        assert!(gutter_width(&file) > gutter_width(&{
-            let mut f = file.clone();
-            f.max_line = 9999;
-            f
-        }));
+        assert!(
+            gutter_width(&file)
+                > gutter_width(&{
+                    let mut f = file.clone();
+                    f.max_line = 9999;
+                    f
+                })
+        );
 
         // Truncation refits the gutter to what actually renders: the first
         // 3 lines are ctx(1,1) / del(2,·) / add(·,2) — max line 2.
@@ -3140,9 +3115,8 @@ rename to new_name.rs
 
     #[test]
     fn base_ref_defaults_to_repo_default_then_main() {
-        let branches = |names: &[&str]| -> Vec<String> {
-            names.iter().map(|n| n.to_string()).collect()
-        };
+        let branches =
+            |names: &[&str]| -> Vec<String> { names.iter().map(|n| n.to_string()).collect() };
         // Engine order puts the repo default first — take it when it isn't
         // the checked-out branch itself.
         let b = branches(&["main", "feature"]);

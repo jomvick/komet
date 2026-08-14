@@ -1,6 +1,6 @@
 # Komet for iOS
 
-A native SwiftUI viewport onto the komet-native mesh. The phone is a **peer
+A native SwiftUI viewport onto the komet mesh. The phone is a **peer
 device**: it joins the same Loro CRDT rooms as every other device (workspace
 doc + per-chat session docs over the edge's Durable Objects), renders the
 mirrors, and drives remote engines through the durable command queue. No

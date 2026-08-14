@@ -14,7 +14,6 @@
 //! gate (plus "can't disable the last enabled harness") where the state
 //! lives, so a raced or stale toggle self-corrects from the RPC reply.
 
-
 use gpui::{
     AnyElement, Context, Entity, IntoElement, Render, SharedString, Task, Window, div, prelude::*,
     px,
@@ -312,13 +311,17 @@ impl HarnessesPage {
                                     .child(SharedString::from("You")),
                             )
                         })
-                        .child(div().size(px(6.0)).rounded_full().flex_none().bg(
-                            if is_local {
-                                emerald
-                            } else {
-                                crate::theme::ink(0.2)
-                            },
-                        ))
+                        .child(
+                            div()
+                                .size(px(6.0))
+                                .rounded_full()
+                                .flex_none()
+                                .bg(if is_local {
+                                    emerald
+                                } else {
+                                    crate::theme::ink(0.2)
+                                }),
+                        )
                 }))
                 .into_any_element();
             trigger = trigger.child(popover::anchored_menu("harnesses-device-menu", menu, None));
@@ -395,11 +398,10 @@ impl HarnessesPage {
                         widgets::toggle_switch(&theme, enabled)
                             .id(("harness-toggle", ix))
                             .when(interactive, |el| {
-                                el.cursor_pointer().on_click(cx.listener(
-                                    move |this, _, _, cx| {
+                                el.cursor_pointer()
+                                    .on_click(cx.listener(move |this, _, _, cx| {
                                         this.toggle(harness, !enabled, cx);
-                                    },
-                                ))
+                                    }))
                             }),
                     )
                     .into_any_element()
@@ -441,7 +443,9 @@ impl Render for HarnessesPage {
             }
             Loadable::Ready(_) => {
                 let rows = self.rows(cx);
-                widgets::section_card(&theme).children(rows).into_any_element()
+                widgets::section_card(&theme)
+                    .children(rows)
+                    .into_any_element()
             }
         };
         let error = self

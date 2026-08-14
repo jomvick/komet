@@ -1410,7 +1410,9 @@ async fn real_claude_debug_steer_trace() {
             let ev = ev.expect("stream event");
             let t = started.elapsed();
             match &ev {
-                AgentEvent::TextDelta { text } => println!("{t:?} TEXT {:?}", &text[..text.len().min(40)]),
+                AgentEvent::TextDelta { text } => {
+                    println!("{t:?} TEXT {:?}", &text[..text.len().min(40)])
+                }
                 other => println!("{t:?} {other:?}"),
             }
             if matches!(ev, AgentEvent::TextDelta { .. })
@@ -1428,7 +1430,10 @@ async fn real_claude_debug_steer_trace() {
         println!("{:?} <<< stream ended", started.elapsed());
     })
     .await;
-    println!("{:?} === test done (timeout means strand)", started.elapsed());
+    println!(
+        "{:?} === test done (timeout means strand)",
+        started.elapsed()
+    );
 }
 
 /// The injection cost frame must never settle a steered turn: the fixture
@@ -1497,9 +1502,14 @@ async fn autonomous_turn_ended_extension_settles_between_prompts() {
     let events = run_to_end(&harness(), request("scenario:autonomous-end"), controls).await;
 
     let d = dones(&events);
-    assert_eq!(d.len(), 2, "prompt turn + autonomous turn, no third: {events:?}");
+    assert_eq!(
+        d.len(),
+        2,
+        "prompt turn + autonomous turn, no third: {events:?}"
+    );
     assert!(
-        d.iter().all(|(s, e)| *s == DoneStatus::Completed && e.is_none()),
+        d.iter()
+            .all(|(s, e)| *s == DoneStatus::Completed && e.is_none()),
         "{events:?}"
     );
 
@@ -1514,9 +1524,7 @@ async fn autonomous_turn_ended_extension_settles_between_prompts() {
         .unwrap();
     let background = events
         .iter()
-        .position(
-            |e| matches!(e, AgentEvent::TextDelta { text } if text == "background finished"),
-        )
+        .position(|e| matches!(e, AgentEvent::TextDelta { text } if text == "background finished"))
         .expect("self-continued output surfaces: {events:?}");
     assert!(
         first_done < background && background < last_done,

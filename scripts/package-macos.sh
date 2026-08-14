@@ -66,8 +66,7 @@ NOTARIZE=false
 if $NOTARIZE; then
   # Staple the bundle BEFORE tarring it: the auto-updater swaps the .app with
   # no dmg involved, so the tarball copy must carry its own ticket to pass
-  # Gatekeeper offline. The ticket lives inside the bundle, so the tarball's
-  # Komet.app → Komet.app rename below doesn't disturb it.
+  # Gatekeeper offline.
   ZIP="$OUT_DIR/komet-notarize.zip"
   ditto -c -k --keepParent "$APP" "$ZIP"
   notarize "$ZIP"
@@ -75,10 +74,8 @@ if $NOTARIZE; then
   xcrun stapler staple "$APP"
 fi
 
-# The auto-updater artifact: keep the historical Komet.app path inside the
-# tarball so already-installed Komet builds can consume the first Komet
-# release. The DMG still presents Komet.app to new installs.
-tar -czf "$APP_TARBALL" -s '/^Komet\.app/Komet.app/' -C "$OUT_DIR" Komet.app
+# The auto-updater artifact.
+tar -czf "$APP_TARBALL" -C "$OUT_DIR" Komet.app
 echo "packaged: $APP_TARBALL"
 
 # The dmg presents the classic drag-into-Applications layout over the

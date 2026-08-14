@@ -11,13 +11,13 @@
 
 use gpui::{AnyElement, App, EntityId, IntoElement, ParentElement, SharedString, Styled, div, px};
 
-use crate::motion::{self, KOMET_PULSE, GRADIENT_SPIN, PULSE_STAGGER, SPLASH_OUT};
+use crate::motion::{self, GRADIENT_SPIN, PULSE_STAGGER, SPLASH_OUT, KOMET_PULSE};
 use crate::theme::Theme;
 
 // Shared with the terminal viewport (`komet_proto::motion`) so both animate the
 // same loaders from the same numbers.
 pub use komet_proto::motion::{
-    KOMET_CELLS, MARK_CELLS, MARK_SPREAD, MATRIX_SIDE, mark_cell_stagger,
+    MARK_CELLS, MARK_SPREAD, MATRIX_SIDE, KOMET_CELLS, mark_cell_stagger,
 };
 
 /// The animated komet mark (komet-loader.tsx `KometLoader`): the full logo

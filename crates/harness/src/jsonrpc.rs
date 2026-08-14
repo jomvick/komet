@@ -143,9 +143,7 @@ fn response_id(id: &Value) -> Option<i64> {
     if let Some(s) = id.as_str() {
         return s.parse().ok();
     }
-    id.as_f64()
-        .filter(|f| f.fract() == 0.0)
-        .map(|f| f as i64)
+    id.as_f64().filter(|f| f.fract() == 0.0).map(|f| f as i64)
 }
 
 /// Parse stdout lines: responses resolve the pending map, everything else is

@@ -16,6 +16,7 @@
 //! handler works through the relay untouched (the port of komet's `device-room-host.ts`).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -186,6 +187,21 @@ pub fn device_room_ws_url(
 #[async_trait]
 pub trait TokenSource: Send + Sync + 'static {
     async fn token(&self) -> Option<String>;
+
+    /// Changes whenever credentials become available or are replaced. Long-lived
+    /// supervisors use this to retry immediately instead of waiting for backoff.
+    fn subscribe(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        None
+    }
+}
+
+async fn token_changed(changes: &mut Option<tokio::sync::watch::Receiver<u64>>) {
+    match changes {
+        Some(changes) => {
+            let _ = changes.changed().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
 }
 
 /// A fixed token (dev mode / tests).
@@ -247,6 +263,7 @@ impl HostRelay {
     ) -> Self {
         let task = tokio::spawn(async move {
             let mut wake = komet_sync::wake::subscribe();
+            let mut token_changes = config.token.subscribe();
             // Fast-rejoin bookkeeping: the edge DO periodically ends healthy
             // host sessions (hibernation/deploys). Every second the host is
             // away, client dials bounce with "readiness check failed" (user
@@ -264,7 +281,26 @@ impl HostRelay {
                         &token,
                     );
                     let started = tokio::time::Instant::now();
-                    let outcome = host_session(&url, &service, &on_nudge).await;
+                    let outcome = {
+                        let session = host_session(&url, &service, &on_nudge);
+                        tokio::pin!(session);
+                        loop {
+                            tokio::select! {
+                                outcome = &mut session => break outcome,
+                                _ = token_changed(&mut token_changes) => {
+                                    // Token rotations keep a healthy socket alive. Sign-out is
+                                    // different: dropping the session closes the authenticated
+                                    // socket and every virtual RPC connection immediately.
+                                    if config.token.token().await.is_none() {
+                                        tracing::info!(
+                                            "device-room: credentials removed; closing host session"
+                                        );
+                                        break Ok(());
+                                    }
+                                }
+                            }
+                        }
+                    };
                     let healthy = started.elapsed() >= HOST_HEALTHY_SESSION;
                     match outcome {
                         Ok(()) => {
@@ -288,6 +324,7 @@ impl HostRelay {
                     _ = tokio::time::sleep(delay + jitter()) => {}
                     // Wake = redial NOW (the old socket died with the suspend).
                     _ = wake.recv() => { delay = HOST_REJOIN_MIN; }
+                    _ = token_changed(&mut token_changes) => { delay = HOST_REJOIN_MIN; }
                 }
             }
         });
@@ -647,6 +684,7 @@ struct DialState {
 /// so the next call re-dials.
 pub struct LinkCache {
     config: LinkCacheConfig,
+    revoked: AtomicBool,
     links: Mutex<HashMap<String, Arc<DeviceLink>>>,
     dial_state: Mutex<HashMap<String, DialState>>,
     dial_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
@@ -656,6 +694,7 @@ impl LinkCache {
     pub fn new(config: LinkCacheConfig) -> Arc<Self> {
         let cache = Arc::new(Self {
             config,
+            revoked: AtomicBool::new(false),
             links: Mutex::new(HashMap::new()),
             dial_state: Mutex::new(HashMap::new()),
             dial_locks: Mutex::new(HashMap::new()),
@@ -668,11 +707,38 @@ impl LinkCache {
             let weak = Arc::downgrade(&cache);
             tokio::spawn(async move {
                 let mut wake = komet_sync::wake::subscribe();
-                while wake.recv().await.is_ok() {
-                    let Some(cache) = weak.upgrade() else { return };
-                    lock(&cache.links).clear();
-                    lock(&cache.dial_state).clear();
-                    tracing::info!("peer: links + cooldowns cleared after wake");
+                let mut token_changes = weak
+                    .upgrade()
+                    .and_then(|cache| cache.config.token.subscribe());
+                loop {
+                    tokio::select! {
+                        result = wake.recv() => {
+                            if result.is_err() { return; }
+                            let Some(cache) = weak.upgrade() else { return };
+                            lock(&cache.links).clear();
+                            lock(&cache.dial_state).clear();
+                            tracing::info!("peer: links + cooldowns cleared after wake");
+                        }
+                        _ = token_changed(&mut token_changes) => {
+                            let Some(cache) = weak.upgrade() else { return };
+                            let signed_out = cache.config.token.token().await.is_none();
+                            if signed_out {
+                                // Cached clients were authenticated when their sockets
+                                // opened. Revocation must close them even though the
+                                // server has not independently reaped those sockets yet.
+                                cache.revoked.store(true, Ordering::Release);
+                                lock(&cache.links).clear();
+                            } else {
+                                cache.revoked.store(false, Ordering::Release);
+                            }
+                            lock(&cache.dial_state).clear();
+                            if signed_out {
+                                tracing::info!("peer: credentials removed; links closed");
+                            } else {
+                                tracing::info!("peer: dial cooldowns cleared after token refresh");
+                            }
+                        }
+                    }
                 }
             });
         }
@@ -686,6 +752,9 @@ impl LinkCache {
     /// window should ride over it, not error (user report: refs/folders
     /// "unstable" vs the old app).
     pub async fn client(self: &Arc<Self>, device_id: &str) -> Result<Arc<RpcClient>, RpcError> {
+        if self.revoked.load(Ordering::Acquire) {
+            return Err(RpcError::Transport("not signed in".into()));
+        }
         // Fast path outside any lock.
         if let Some(link) = self.cached(device_id) {
             return Ok(link.client());
@@ -715,7 +784,12 @@ impl LinkCache {
             match self.dial(device_id).await {
                 Ok(link) => {
                     lock(&self.dial_state).remove(device_id);
-                    lock(&self.links).insert(device_id.to_string(), link.clone());
+                    let mut links = lock(&self.links);
+                    if self.revoked.load(Ordering::Acquire) {
+                        return Err(RpcError::Transport("not signed in".into()));
+                    }
+                    links.insert(device_id.to_string(), link.clone());
+                    drop(links);
                     self.spawn_evictor(device_id.to_string(), &link);
                     tracing::info!(device = %device_id, "peer: connected via device room");
                     return Ok(link.client());
@@ -735,6 +809,14 @@ impl LinkCache {
     /// Drop a cached link after a failed RPC so the next call re-dials.
     pub fn invalidate(&self, device_id: &str) {
         lock(&self.links).remove(device_id);
+    }
+
+    /// Close every authenticated peer socket. Future dials still consult the
+    /// live token provider and therefore remain disabled while signed out.
+    pub fn disconnect_all(&self) {
+        self.revoked.store(true, Ordering::Release);
+        lock(&self.links).clear();
+        lock(&self.dial_state).clear();
     }
 
     /// Data-driven cooldown reset: called when out-of-band evidence says the

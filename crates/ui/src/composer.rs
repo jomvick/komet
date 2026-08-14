@@ -3151,10 +3151,7 @@ pub enum ComposerEvent {
     /// A prompt was sent optimistically — give the transcript its exact row
     /// identity so it can anchor the prompt at the top with the reply's
     /// reserved space below it.
-    Sent {
-        chat_id: String,
-        message_id: String,
-    },
+    Sent { chat_id: String, message_id: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

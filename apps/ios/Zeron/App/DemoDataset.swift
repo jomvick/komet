@@ -34,7 +34,7 @@ final class DemoDataset {
         let vps = DeviceRow(id: "dev-vps", name: "hetzner-01", platform: "linux",
                             lastSeenAt: now - 600_000, createdAt: now - 86_400_000 * 12)
         let komet = Space(id: "space-komet", deviceId: "dev-mac",
-                          path: "/Users/dev/komet-native", name: nil, gitDetected: true,
+                          path: "/Users/dev/komet", name: nil, gitDetected: true,
                           gitCheckedAt: now, checkoutId: nil, createdAt: now - 86_400_000 * 9)
         let edge = Space(id: "space-edge", deviceId: "dev-vps",
                          path: "/srv/deploys/edge", name: nil, gitDetected: true,
@@ -47,7 +47,7 @@ final class DemoDataset {
 
         let chats = [
             Chat(id: "chat-veil", deviceId: "dev-mac", title: "Streaming veil on transcript rows",
-                 archived: false, cwd: "/Users/dev/.komet-native/worktrees/komet-native-veil-fade",
+                 archived: false, cwd: "/Users/dev/.komet/worktrees/komet-veil-fade",
                  branch: "veil-fade", checkoutId: nil,
                  config: claude, lastMessagePreview: "Porting the paint-only fade…",
                  lastMessageAt: now - 40_000, createdAt: now - 3_600_000,
@@ -95,8 +95,8 @@ final class DemoDataset {
     static let fileTree: [String: [String]] = [
         "/Users/dev": ["Documents", "Downloads", "Projects", "scratch"],
         "/Users/dev/Documents": ["notes", "specs"],
-        "/Users/dev/Projects": ["komet-native", "dotfiles", "blog", "playground"],
-        "/Users/dev/Projects/komet-native": ["apps", "crates", "docs", "edge"],
+        "/Users/dev/Projects": ["komet", "dotfiles", "blog", "playground"],
+        "/Users/dev/Projects/komet": ["apps", "crates", "docs", "edge"],
         "/Users/dev/Projects/blog": ["content", "public"],
         "/srv": ["deploys", "backups"],
         "/srv/deploys": ["edge", "landing"],
@@ -106,7 +106,7 @@ final class DemoDataset {
         deviceId == "dev-vps" ? "/srv" : "/Users/dev"
     }
 
-    private static let repoNames: Set<String> = ["komet-native", "dotfiles", "blog", "playground", "edge", "landing"]
+    private static let repoNames: Set<String> = ["komet", "dotfiles", "blog", "playground", "edge", "landing"]
 
     func listFolders(deviceId: String, path: String) -> FolderListing {
         let entries = (Self.fileTree[path] ?? []).map { name in
@@ -120,11 +120,11 @@ final class DemoDataset {
     func listRefs(spacePath: String) -> [RepoRef] {
         if let cached = refsByPath[spacePath] { return cached }
         let seeded: [RepoRef]
-        if spacePath.contains("komet-native") {
+        if spacePath.contains("komet") {
             seeded = [
                 RepoRef(name: "main", current: true, worktreePath: nil),
                 RepoRef(name: "veil-fade", current: false,
-                        worktreePath: "/Users/dev/.komet-native/worktrees/komet-native-veil-fade"),
+                        worktreePath: "/Users/dev/.komet/worktrees/komet-veil-fade"),
                 RepoRef(name: "feature/diff-pane", current: false, worktreePath: nil),
                 RepoRef(name: "fix/tool-colors", current: false, worktreePath: nil),
             ]
@@ -149,7 +149,7 @@ final class DemoDataset {
 
     func createWorktree(spacePath: String, base: String) -> String {
         let slug = base.replacingOccurrences(of: "/", with: "-")
-        let path = "/Users/dev/.komet-native/worktrees/\((spacePath as NSString).lastPathComponent)-\(slug)"
+        let path = "/Users/dev/.komet/worktrees/\((spacePath as NSString).lastPathComponent)-\(slug)"
         var refs = listRefs(spacePath: spacePath)
         if let ix = refs.firstIndex(where: { $0.name == base }), refs[ix].worktreePath == nil {
             refs[ix].worktreePath = path

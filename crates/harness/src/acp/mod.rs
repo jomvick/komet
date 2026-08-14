@@ -1107,7 +1107,7 @@ fn initialize_params(harness: HarnessId) -> Value {
     json!({
         "protocolVersion": 1,
         "clientInfo": {
-            "name": "komet-native",
+            "name": "komet",
             "title": "Komet",
             "version": env!("CARGO_PKG_VERSION"),
         },

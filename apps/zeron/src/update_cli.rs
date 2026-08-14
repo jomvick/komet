@@ -60,7 +60,7 @@ pub async fn update(edge_url: &str, check_only: bool) -> anyhow::Result<()> {
         InstallKind::Unmanaged => {
             bail!(
                 "this binary is not update-managed (source build or hand-copied).\n\
-                 Linux: curl -fsSL https://komet.komet.sh/install.sh | sh\n\
+                 Linux: curl -fsSL https://komet.sh/install.sh | sh\n\
                  macOS: download the new Komet.app dmg, or rebuild from source."
             )
         }

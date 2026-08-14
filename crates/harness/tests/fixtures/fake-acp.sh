@@ -19,7 +19,7 @@ update() { # $1 = update json object body
 read -r line || exit 1 # initialize
 has "$line" '"method":"initialize"' || exit 1
 has "$line" '"protocolVersion":1' || exit 1
-has "$line" '"name":"komet-native"' || exit 1
+has "$line" '"name":"komet"' || exit 1
 has "$line" '"readTextFile":false' || exit 1
 emit "{\"id\":$(rid "$line"),\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{\"loadSession\":true,\"_meta\":{\"availableCommands\":[{\"name\":\"compact\",\"description\":\"Compact the session\"},{\"name\":\"goal\",\"description\":\"Set a goal\",\"input\":{\"hint\":\"the goal\"}}]}},\"_meta\":{\"steering\":{\"supported\":true}}}}"
 

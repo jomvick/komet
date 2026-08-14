@@ -76,7 +76,8 @@ struct FixedFetcher {
 
 impl CheckpointFetcher for FixedFetcher {
     fn fetch(&self) -> BoxFuture<'static, Result<Vec<u8>, SyncError>> {
-        self.calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let bytes = self.bytes.clone();
         Box::pin(async move { Ok(bytes) })
     }
@@ -273,7 +274,11 @@ async fn contained_frontier_skips_the_checkpoint_download() {
             serde_json::json!({"headSeq": 8, "seqFloor": 5, "checkpointSeq": 5,
                 "checkpointSize": 160_000, "rowCount": 3, "rowBytes": 900}),
             &[1, 2, 3],
-            vec![(6, "dev-b", vec![6]), (7, "dev-b", vec![7]), (8, "dev-b", vec![8])],
+            vec![
+                (6, "dev-b", vec![6]),
+                (7, "dev-b", vec![7]),
+                (8, "dev-b", vec![8]),
+            ],
             false,
         )
         .await;
@@ -380,7 +385,11 @@ async fn unacked_pushes_survive_reconnect_and_acks_retire_them() {
 
     client.enqueue_update(vec![0xd1]);
     let first_batch = s1.await.unwrap();
-    assert_eq!(client.stats().pending_pushes, 1, "unacked batch stays queued");
+    assert_eq!(
+        client.stats().pending_pushes,
+        1,
+        "unacked batch stays queued"
+    );
 
     // Second session: same handshake, then the replayed push gets acked.
     let s2 = tokio::spawn({
@@ -400,7 +409,10 @@ async fn unacked_pushes_survive_reconnect_and_acks_retire_them() {
         }
     });
     let (replayed_batch, _keep_alive) = s2.await.unwrap();
-    assert_eq!(replayed_batch, first_batch, "reconnect replays the same batch id");
+    assert_eq!(
+        replayed_batch, first_batch,
+        "reconnect replays the same batch id"
+    );
 
     // Ack lands asynchronously — wait for the pending queue to drain.
     let mut events = client.events();
@@ -598,7 +610,11 @@ async fn server_reset_is_counted_and_head_seq_stays_honest() {
             serde_json::json!({"headSeq": 3, "seqFloor": 0, "checkpointSeq": 0,
                 "checkpointSize": 0, "rowCount": 3, "rowBytes": 30}),
             &[],
-            vec![(1, "dev-b", vec![1]), (2, "dev-b", vec![2]), (3, "dev-b", vec![3])],
+            vec![
+                (1, "dev-b", vec![1]),
+                (2, "dev-b", vec![2]),
+                (3, "dev-b", vec![3]),
+            ],
             false,
         )
         .await;

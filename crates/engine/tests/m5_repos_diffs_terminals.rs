@@ -571,8 +571,11 @@ async fn turn_diff_captures_only_changes_since_snapshot() {
     assert!(clean.files.is_empty());
 
     // The "turn" edits one file and adds another.
-    std::fs::write(repo_dir.join("pre.txt"), "before the turn\nedited in turn\n")
-        .expect("edit pre.txt");
+    std::fs::write(
+        repo_dir.join("pre.txt"),
+        "before the turn\nedited in turn\n",
+    )
+    .expect("edit pre.txt");
     std::fs::write(repo_dir.join("turn.txt"), "made this turn\n").expect("turn.txt");
     let turn = capture_turn_diff(&repos, &repo_dir, &turn_tree)
         .await
