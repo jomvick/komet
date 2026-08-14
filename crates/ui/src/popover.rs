@@ -294,11 +294,12 @@ pub fn classify_key(key: &str, cmd: bool, ctrl: bool) -> MenuKey {
 // ---------------------------------------------------------------------------
 
 /// The floating-menu surface (komet `.glass-surface` + `menuSurface`):
-/// `rounded-xl border border-white/[0.1] p-1` over the frosted glass tint.
-/// gpui has no backdrop blur at the pinned rev, so the glass
-/// (`oklch(0.33 0 0 / 34%)` over blurred dark content) is approximated with
-/// the near-opaque tone it composites to on the dark panels (~#161616), plus
-/// the same hairline + baked-in shadow.
+/// `rounded-xl border border-white/[0.1] p-1` over the frosted glass tint —
+/// the real recipe now that the fork paints backdrop blur: the
+/// [`Theme::glass_overlay`] tint (`oklch(0.33 0 0 / 34%)` on dark) over the
+/// [`crate::frost::MENU_BLUR`] blur from the mount helpers below, plus the
+/// same hairline + baked-in shadow. Opaque platforms keep the near-opaque
+/// tone the reference composites to on the dark panels (~#161616).
 pub fn popover_card(theme: &Theme) -> gpui::Div {
     let card = div()
         .border_1()
@@ -360,7 +361,7 @@ fn exit_progress(since: std::time::Instant) -> f32 {
 /// primitive ignores `element_opacity`, so without this the glass slab would
 /// hold full strength through the fade and pop off at unmount.
 fn frosted_menu(exit: Option<f32>, content: AnyElement) -> AnyElement {
-    let blur = 16.0 * (1.0 - exit.unwrap_or(0.0));
+    let blur = crate::frost::MENU_BLUR * (1.0 - exit.unwrap_or(0.0));
     crate::frost::frosted(12.0, blur, content).into_any_element()
 }
 
@@ -579,7 +580,7 @@ pub fn modal(
     viewport: gpui::Size<Pixels>,
     card: AnyElement,
 ) -> AnyElement {
-    let card = crate::frost::frosted(12.0, 16.0, card).into_any_element();
+    let card = crate::frost::frosted(12.0, crate::frost::MENU_BLUR, card).into_any_element();
     gpui::deferred(
         gpui::anchored()
             .position(gpui::point(px(0.0), px(0.0)))
