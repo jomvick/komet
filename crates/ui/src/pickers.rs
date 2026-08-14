@@ -405,6 +405,9 @@ pub struct Pickers {
     model_scroll: gpui::ScrollHandle,
     /// Shared search / URL / name input, reused across popovers.
     search: Entity<ComposerInput>,
+    /// One-shot mute for the next Edited event's highlight reset — armed by
+    /// [`Self::toggle`]'s programmatic clear (see the subscription).
+    search_reset_muted: bool,
     focus: FocusHandle,
     /// `KOMET_OPEN_PICKER` boot: keep claiming focus until it sticks, so
     /// keyboard nav drives the data-side-opened popover (headless rigs have
@@ -430,20 +433,21 @@ impl Pickers {
         let search = cx.new(|cx| ComposerInput::new("Search…", cx));
         let search_events = cx.subscribe(&search, |this: &mut Self, _, event, cx| match event {
             ComposerInputEvent::Edited => {
-                // Typing in the filter resets the highlight — but only the
-                // Branch picker HAS a filter. `set_text` emits Edited on
-                // programmatic clears too, and this subscription runs AFTER
-                // `toggle` returns, so an unscoped reset clobbers the
-                // just-anchored selected-model row back to 0 (regression:
-                // the top row wore a second highlight again).
-                if this.open_kind() == Some(PickerKind::Branch) {
-                    this.active = 0;
-                }
-                // The model picker filters too: typing re-homes the
-                // highlight and the scroll to the top of the results.
-                if this.open_kind() == Some(PickerKind::HarnessModel) {
-                    this.active = 0;
-                    this.model_scroll.set_offset(gpui::Point::default());
+                // Typing in a filter resets the highlight to the top of the
+                // fresh results. `set_text` emits Edited on programmatic
+                // clears too, and this subscription runs AFTER `toggle`
+                // returns — an unmuted reset clobbers the just-anchored
+                // selected row back to 0, leaving the top row wearing a
+                // second highlight next to the selection (user report;
+                // `toggle` arms the mute right before its clear).
+                if !std::mem::take(&mut this.search_reset_muted) {
+                    if this.open_kind() == Some(PickerKind::Branch) {
+                        this.active = 0;
+                    }
+                    if this.open_kind() == Some(PickerKind::HarnessModel) {
+                        this.active = 0;
+                        this.model_scroll.set_offset(gpui::Point::default());
+                    }
                 }
                 cx.notify();
             }
@@ -552,6 +556,7 @@ impl Pickers {
             active: 0,
             model_scroll: gpui::ScrollHandle::new(),
             search,
+            search_reset_muted: false,
             focus: cx.focus_handle(),
             boot_focus_pending: boot_open.is_some(),
             load_task: None,
@@ -766,11 +771,13 @@ impl Pickers {
             return;
         }
         self.open.open(kind);
+        // Clearing stale text emits Edited AFTER this function returns —
+        // mute that one event so its reset can't clobber the highlight
+        // anchored below (the no-op clear is also skipped for the same
+        // reason).
+        self.search_reset_muted = !self.search.read(cx).text().is_empty();
         self.search.update(cx, |input, cx| {
             input.set_placeholder("Search…", cx);
-            // Skip the no-op clear: `set_text` emits Edited unconditionally,
-            // and the Branch arm of the subscription above would reset the
-            // highlight this function is about to anchor.
             if !input.text().is_empty() {
                 input.set_text("", cx);
             }
@@ -1475,14 +1482,11 @@ impl Pickers {
         self.defaults.toggle_favorite(harness, model);
         self.save_defaults();
         // Starring REORDERS the list (stars float to the top / leave the
-        // favorites view) — the keyboard highlight follows the clicked row
-        // to its new index, else it strands on whatever slid into the old
-        // one and paints a second highlight (user report).
-        self.active = self
-            .visible_model_rows(cx)
-            .iter()
-            .position(|row| row.harness == harness && row.model.id == model)
-            .unwrap_or_else(|| self.selected_model_index(cx));
+        // favorites view) — re-home the keyboard highlight onto the SELECTED
+        // row so exactly one row reads highlighted afterwards. Following the
+        // starred row instead left its cursor wash next to the selected
+        // row's ring: "two highlighted rows" (user report, twice).
+        self.active = self.selected_model_index(cx);
         cx.notify();
     }
 
@@ -2719,8 +2723,11 @@ impl Pickers {
                     })
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.model_rail = ModelRail::Favorites;
-                        this.active = 0;
+                        // Anchor on the selected row when it's starred, else
+                        // the top — never a stray second highlight.
+                        this.active = this.selected_model_index(cx);
                         this.model_scroll.set_offset(gpui::Point::default());
+                        this.model_scroll.scroll_to_item(this.active);
                         cx.notify();
                     }))
                     .child(
@@ -2837,19 +2844,24 @@ impl Pickers {
                         .items_center()
                         .gap(px(10.0))
                         .cursor_pointer();
-                    // Selected and keyboard-highlighted must read as two
-                    // DIFFERENT treatments: identical washes made every
-                    // reorder (starring floats rows) look like two selected
-                    // rows (user report).
+                    // ONE moving highlight (t3/Base-UI combobox): hovering
+                    // moves the keyboard cursor instead of painting its own
+                    // wash, so hover + arrow cursor can never wear two
+                    // washes at once. Selection is the distinct stronger
+                    // treatment (wash + ring).
                     if is_selected {
                         el = el
                             .bg(crate::theme::card_selected_bg())
                             .shadow(crate::theme::card_selected_shadows());
                     } else if is_active {
                         el = el.bg(crate::theme::ink(0.05));
-                    } else {
-                        el = el.hover(|s| s.bg(crate::theme::ink(0.06)));
                     }
+                    el = el.on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                        if *hovered && this.active != ix {
+                            this.active = ix;
+                            cx.notify();
+                        }
+                    }));
                     el = el
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.activate_model_index(ix, cx);
