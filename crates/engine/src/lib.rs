@@ -229,7 +229,6 @@ impl EngineCore {
         let uploads = Uploads::from_root_with_fallback(
             profile.uploads_root(),
             legacy_uploads_root.as_deref(),
-            edge.clone(),
         );
         let agent_accounts = AgentAccounts::new(AgentAccountsConfig::detect(data_dir));
         sessions.set_titles(TitleGenerator::new(
@@ -430,7 +429,6 @@ impl EngineCore {
         if let Some(updater) = updater {
             updater.shutdown().await;
         }
-        self.uploads.shutdown().await;
         self.diff_sync.shutdown().await;
         self.spaces_sync.shutdown().await;
         self.doc_host.shutdown_workers().await;
