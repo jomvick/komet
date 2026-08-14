@@ -1175,27 +1175,6 @@ impl Shell {
         }
     }
 
-    /// Pan the surface-tab strip by a wheel delta — the chips' occluding
-    /// hitboxes forward here (vertical wheel maps to x: the strip only
-    /// scrolls one axis, same courtesy as gpui's own fallback).
-    fn scroll_right_tabs(
-        &mut self,
-        event: &gpui::ScrollWheelEvent,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) {
-        let delta = event.delta.pixel_delta(window.line_height());
-        let step = if delta.x != px(0.0) { delta.x } else { delta.y };
-        if step == px(0.0) {
-            return;
-        }
-        let mut offset = self.right_tab_scroll.offset();
-        offset.x += step;
-        // The tracked div's prepaint clamps to the real extent next frame.
-        self.right_tab_scroll.set_offset(offset);
-        cx.notify();
-    }
-
     /// Track the hovered drop slot mid-drag (the terminal drawer's
     /// `update_drag_over`, ported: epoch bumps restart the slide tween).
     fn update_right_tab_drag_over(&mut self, from: usize, over: usize, cx: &mut Context<Self>) {
@@ -3991,20 +3970,20 @@ impl Shell {
             .right_tab_drag
             .as_ref()
             .map(|d| (d.from, d.over, d.epoch, d.prev_over));
-        // Content row sized to its chips; the SCROLLER wraps it (the markdown
-        // tables' proven overflow-x shape — a flex container that is itself
-        // the scroller never overflowed, user report: "still not
-        // scrollable").
+        // The old session-tab strip's proven scroll shape: the flex row IS
+        // the scroller (id + overflow_x_scroll + track_scroll), wrapped in a
+        // relative min_w_0 region below; drop math runs in CONTENT
+        // coordinates (viewport-relative x plus the scrolled-off width).
+        let scroll_for_drag = self.right_tab_scroll.clone();
         let mut strip = div()
-            .h_full()
-            // flex_none: the row is a flex ITEM of the scroller — without it
-            // taffy may shrink it to fit and the scroller never measures
-            // overflow (no scroll, no fade — user report).
-            .flex_none()
+            .id("right-surface-strip")
             .flex()
             .flex_row()
             .items_center()
             .gap(px(4.0))
+            .min_w_0()
+            .overflow_x_scroll()
+            .track_scroll(&self.right_tab_scroll)
             .on_drag_move::<RightTabDrag>(cx.listener(
                 move |this, event: &gpui::DragMoveEvent<RightTabDrag>, _, cx| {
                     let payload = event.drag(cx);
@@ -4012,11 +3991,9 @@ impl Shell {
                         return;
                     }
                     let from = payload.from;
-                    // The listener rides the CONTENT row, whose bounds shift
-                    // with the scroll — its left edge is already content
-                    // space, no offset compensation.
-                    let rel_x =
-                        f32::from(event.event.position.x) - f32::from(event.bounds.left());
+                    let rel_x = f32::from(event.event.position.x)
+                        - f32::from(event.bounds.left())
+                        - f32::from(scroll_for_drag.offset().x);
                     let over = crate::terminal::panel::drop_index(rel_x, CHIP_SLOT, count);
                     this.update_right_tab_drag_over(from, over, cx);
                 },
@@ -4062,15 +4039,14 @@ impl Shell {
                     .items_center()
                     .gap(px(3.0))
                     .cursor_pointer()
-                    .occlude()
-                    // Occlusion (the titlebar drag-region carve-out) blocks
-                    // the scroller's built-in wheel handling while the
-                    // pointer is over a chip — forward the delta by hand.
-                    .on_scroll_wheel(cx.listener(
-                        |this, event: &gpui::ScrollWheelEvent, window, cx| {
-                            this.scroll_right_tabs(event, window, cx);
-                        },
-                    ))
+                    // The old session-tab strip's solved carve-out: NOT
+                    // `.occlude()` — a BlockMouse hitbox ends the hit test,
+                    // so the scroll container behind the tabs never saw
+                    // wheel events and an overflowing strip could not be
+                    // scrolled (tabs tile the whole region). ExceptScroll
+                    // keeps the titlebar drag-region carve-out and lets the
+                    // strip scroll.
+                    .block_mouse_except_scroll()
                     .on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
                         window.prevent_default()
                     })
@@ -4206,12 +4182,7 @@ impl Shell {
                 crate::theme::wash(0.11),
             ))
             .on_hover(motion::hover_listener(plus_fade))
-            .occlude()
-            .on_scroll_wheel(cx.listener(
-                |this, event: &gpui::ScrollWheelEvent, window, cx| {
-                    this.scroll_right_tabs(event, window, cx);
-                },
-            ))
+            .block_mouse_except_scroll()
             .on_mouse_down(
                 gpui::MouseButton::Left,
                 cx.listener(|this, _, window, _| {
@@ -4284,19 +4255,62 @@ impl Shell {
             ));
         }
         strip = strip.child(plus);
-        // Scroller + a glass edge-fade at whichever side has hidden overflow
-        // (the sidebar's per-glyph gradient recipe, horizontal).
-        let scroller = div()
-            .id("right-surface-strip")
+        // Edge fades on whichever side hides tabs (offset from the LAST
+        // frame — the lag is invisible; the old session-tab strip's exact
+        // recipe). Glass: per-glyph EdgeFade scope; opaque: painted
+        // gradients in the shell surface tone.
+        const FADE_WIDTH: f32 = 36.0;
+        let scrolled = -f32::from(self.right_tab_scroll.offset().x);
+        let max_scroll = f32::from(self.right_tab_scroll.max_offset().x);
+        let fade_left = scrolled > 1.0;
+        let fade_right = scrolled < max_scroll - 1.0;
+        let glass = theme.is_glass();
+        let bar_bg = theme.surface;
+        let region = div()
+            .relative()
+            .min_w_0()
             .size_full()
-            .overflow_x_scroll()
-            .track_scroll(&self.right_tab_scroll)
-            .child(strip);
-        crate::edge_fade::edge_faded(18.0, false, false, scroller)
-            .fade_left(true)
-            .fade_right(true)
-            .fade_overflow_x(&self.right_tab_scroll)
-            .into_any_element()
+            .flex()
+            .items_center()
+            .child(strip)
+            .when(fade_left && !glass, |el| {
+                el.child(
+                    div()
+                        .absolute()
+                        .left_0()
+                        .top_0()
+                        .bottom_0()
+                        .w(px(FADE_WIDTH))
+                        .bg(gpui::linear_gradient(
+                            90.0,
+                            gpui::linear_color_stop(bar_bg, 0.0),
+                            gpui::linear_color_stop(bar_bg.opacity(0.0), 1.0),
+                        )),
+                )
+            })
+            .when(fade_right && !glass, |el| {
+                el.child(
+                    div()
+                        .absolute()
+                        .right_0()
+                        .top_0()
+                        .bottom_0()
+                        .w(px(FADE_WIDTH))
+                        .bg(gpui::linear_gradient(
+                            270.0,
+                            gpui::linear_color_stop(bar_bg, 0.0),
+                            gpui::linear_color_stop(bar_bg.opacity(0.0), 1.0),
+                        )),
+                )
+            });
+        if glass {
+            crate::edge_fade::edge_faded(FADE_WIDTH, false, false, region)
+                .fade_left(fade_left)
+                .fade_right(fade_right)
+                .into_any_element()
+        } else {
+            region.into_any_element()
+        }
     }
 
     /// Toggle the changes-panel takeover (the header's expand button, t3code
