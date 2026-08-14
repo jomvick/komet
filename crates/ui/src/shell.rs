@@ -3880,13 +3880,19 @@ impl Shell {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .text_color(theme.text_muted.opacity(0.5))
                             .hover(|s| s.bg(crate::theme::wash(0.10)))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
                                 this.close_right_surface(surface, window, cx);
                             }))
-                            .child(icon(icons::CLOSE).size(px(9.0))),
+                            .child(
+                                // Color on the SVG itself — gpui svgs don't
+                                // inherit the parent's text color (the ✕
+                                // painted blank, user report).
+                                icon(icons::CLOSE)
+                                    .size(px(9.0))
+                                    .text_color(theme.text_muted.opacity(0.6)),
+                            ),
                     ),
             );
         }

@@ -1349,10 +1349,14 @@ impl Render for TerminalPanel {
         if self.drag.is_some() && !cx.has_active_drag() {
             self.drag = None;
         }
+        // Embedded, the RIGHT PANE's own surface shows through — a second
+        // fill here stacked another shade on the pane (user report); the
+        // drawer keeps its own tone.
+        let panel_bg: Option<gpui::Hsla> = (!self.embedded).then(|| terminal_panel_bg(&theme));
         let Some(chat) = self.selected_chat(cx) else {
             return div()
                 .size_full()
-                .bg(terminal_panel_bg(&theme))
+                .when_some(panel_bg, |el, bg| el.bg(bg))
                 .flex()
                 .items_center()
                 .justify_center()
@@ -1371,7 +1375,7 @@ impl Render for TerminalPanel {
             .size_full()
             .flex()
             .flex_col()
-            .bg(terminal_panel_bg(&theme))
+            .when_some(panel_bg, |el, bg| el.bg(bg))
             .children(tab_bar)
             .child(
                 div()
