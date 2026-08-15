@@ -3542,12 +3542,15 @@ fn user_bubble_text(
         .into_any_element()
 }
 
-/// The transcript ErrorChip — an exact port of komet chat-view.tsx
-/// `ErrorChip`: a 34px row (`rounded-[10px] border border-red-400/[0.16]
+/// The transcript ErrorChip — a port of komet chat-view.tsx `ErrorChip`
+/// (34px-minimum row, `rounded-[10px] border border-red-400/[0.16]
 /// bg-red-400/[0.05] px-2 text-[12px]`) with a 20px red-washed tile holding a
 /// 12px DangerTriangle (`bg-red-400/[0.12] text-red-300/80`), a medium
-/// "Error" label, then the human message truncating at `text-foreground/80` —
-/// a subtle red-tinted wash, never a bare red-stroke box.
+/// "Error" label, then the human message at `text-foreground/80` — a subtle
+/// red-tinted wash, never a bare red-stroke box. Unlike the web port, the
+/// message WRAPS instead of truncating: startup-crash errors carry the
+/// agent's exit status and stderr, and a one-line ellipsis was exactly what
+/// made komet/komet#95 undiagnosable from the screenshot.
 fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
     let red_300 = theme.danger_muted; // tailwind red-300
     let danger = theme.danger; // red-400
@@ -3556,7 +3559,7 @@ fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
         .w_full()
         .child(
             div()
-                .h(px(34.0))
+                .min_h(px(34.0))
                 .w_full()
                 .flex()
                 .items_center()
@@ -3567,6 +3570,7 @@ fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
                 .border_color(danger.opacity(0.16))
                 .bg(danger.opacity(0.05))
                 .px(px(8.0))
+                .py(px(7.0))
                 .text_size(px(12.0))
                 .child(
                     div()
@@ -3594,7 +3598,6 @@ fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
                     div()
                         .min_w_0()
                         .flex_1()
-                        .truncate()
                         .text_color(theme.text.opacity(0.8))
                         .child(message),
                 ),
