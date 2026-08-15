@@ -146,10 +146,48 @@ Following the existing per-agent test pattern:
 - `OPENCODE_EXECUTABLE` fixture points at a fake binary so tests never depend
   on a real opencode install.
 
+## Post-review correction (same day, user report)
+
+The wire-first design hit a real failure: the 10s model-discovery timeout was
+busted by opencode's cold Node boot under the app's concurrent boot prefetch
+(measured ~13s with four harness probes in parallel on a mid-2010s laptop).
+Because opencode has no static fallback, a timed-out probe silently returned an
+empty list — and the picker rendered that as an eternal loading skeleton
+(user report: "opencode doesn't show models, the picker seems frozen").
+
+- `AcpAgentSpec` gained `model_discovery_timeout: Option<Duration>` (default
+  10s); `opencode_spec()` sets 30s. Catalog-backed specs keep the default.
+- `models()` now propagates a discovery ERROR for wire-only harnesses (no
+  static catalog) instead of swallowing it — the picker shows its Retry row.
+- The picker renders a loaded-but-empty model list as a "No models available
+  for this agent" note instead of the eternal skeleton.
+
+## Second correction (same day, user report: "loading and response is too slow")
+
+Even with the 30s budget, the model picker stayed slow: the discovery cache
+was in-memory only, so EVERY app launch re-probed every agent (opencode's
+cold Node boot again — measured ~13s under the 4-way boot prefetch).
+
+- `HarnessRegistry` gained a persistent `{data_dir}/model-cache.json`
+  (per-harness `{discoveredAtMs, models}`), loaded at engine boot.
+- `registry.models(id)` serves stale-while-revalidate: a fresh-enough entry
+  returns instantly WITHOUT resolving the harness (the picker renders before
+  any agent boots), re-probing in the background at most once/hour to keep
+  the file warm; an empty/failed wire probe falls back to the cached list
+  before the harness's own answer (error for wire-only harnesses).
+- `LIST_MODELS` and the titling cheapest-model lookup route through the
+  registry cache.
+- Prompt-turn failures now classify the known provider families into
+  actionable messages instead of raw protocol strings: credit exhaustion
+  ("Out of credits for this model — top up the provider account or switch
+  to another model.") and rate limits ("Rate limited by the model provider
+  — wait a moment and try again."); anything else keeps the raw detail.
+
 ## Explicitly out of scope
 
 - No account/login integration (auth via `opencode auth login`).
-- No static model catalog (wire-first only).
+- No static model catalog (wire-first only — the 30s probe budget + error
+  surfacing keep the wire honest without one).
 - No mode-specific UI (build/plan surfaces only via the generic config-option
   picker).
 - No changes to `models_from_session`, `find_on_paths`, `resolve_launch`,
