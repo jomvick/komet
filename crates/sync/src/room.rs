@@ -198,7 +198,7 @@ pub enum RoomEvent {
 }
 
 /// Live sync introspection for one room — the data behind the engine's
-/// `SyncStatus` RPC and `zeron sync`. Every 2026-08 incident was debugged
+/// `SyncStatus` RPC and `komet sync`. Every 2026-08 incident was debugged
 /// blind because none of this was observable at runtime.
 #[derive(Debug, Clone, Default)]
 pub struct RoomStatsSnapshot {
@@ -548,7 +548,7 @@ impl RoomClient {
         let _ = self.redial.try_send(());
     }
 
-    /// Live counters/clocks for this room (SyncStatus RPC / `zeron sync`).
+    /// Live counters/clocks for this room (SyncStatus RPC / `komet sync`).
     pub fn stats(&self) -> RoomStatsSnapshot {
         self.stats.snapshot()
     }
@@ -1034,7 +1034,7 @@ impl Session {
             match &message {
                 ProtocolMessage::Ack { status, .. } => {
                     // Only an Ok ack means the write LANDED. Counting every
-                    // ack made `zeron sync` read "acked 0s ago" while the
+                    // ack made `komet sync` read "acked 0s ago" while the
                     // server rejected every single update for hours
                     // (2026-08-04 latched-session incident) — the one
                     // counter built to expose that wedge was hiding it.

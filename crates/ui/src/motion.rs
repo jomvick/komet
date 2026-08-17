@@ -1,4 +1,4 @@
-//! Animation kit — the zeron motion catalog as reusable helpers over gpui
+//! Animation kit — the komet motion catalog as reusable helpers over gpui
 //! [`Animation`]/[`AnimationExt`].
 //!
 //! Catalog (docs/research/feature-inventory.md §1.12):
@@ -7,7 +7,7 @@
 //! - `menu-in`   0.14s scale 0.96 + translateY −2 (popovers)
 //! - `dialog-in` 0.18s scale 0.96→1
 //! - `splash-out` 0.5s opacity + translateY −6, 0.15s delay
-//! - `zeron-pulse` 2.4s staggered cell opacity 0.08→1, scale 0.9→1 (loaders)
+//! - `komet-pulse` 2.4s staggered cell opacity 0.08→1, scale 0.9→1 (loaders)
 //! - `gradient-spin-pulse` 750ms per-cell phase wave (working indicator)
 //! - 200ms ease-out width/height transitions (sidebar/panes)
 //!
@@ -41,16 +41,8 @@ pub use gpui::AnimationExt;
 // Pulse clock — throttled drive for the repeating loaders
 // ---------------------------------------------------------------------------
 
-/// Repeat-tick interval for the pulse/spinner loaders (~30fps).
-///
-/// The loaders used to run as gpui `with_animation(...repeating...)` elements,
-/// which request a redraw every display frame for as long as they are mounted
-/// — one Working session row pinned the whole window at 120Hz (measured 36%
-/// CPU on an M-series laptop, with the always-hot Metal pipeline holding
-/// hundreds of MB of graphics buffers). A shared 30fps clock is visually
-/// equivalent for these chunky cell waves at a quarter of the redraws, and a
 /// window with no spinner mounted schedules nothing at all.
-const PULSE_TICK: Duration = Duration::from_millis(33);
+const PULSE_TICK: Duration = Duration::from_millis(16);
 
 /// How long a view stays on the tick list after its last spinner paint. One
 /// lease outlives a few missed frames; an unmounted spinner stops renewing and
@@ -115,6 +107,47 @@ pub fn pulse_delta(spec: &MotionSpec, view: EntityId, cx: &mut App) -> f32 {
         .detach();
     }
     phase
+}
+
+/// Register a view to receive continuous re-render notifications from the pulse clock.
+pub fn pulse_lease(view: EntityId, cx: &mut App) {
+    if cx.reduce_motion() {
+        return;
+    }
+    let clock = cx.default_global::<PulseClock>();
+    clock.leases.insert(view, Instant::now() + PULSE_LEASE);
+    if !clock.running {
+        clock.running = true;
+        cx.spawn(async move |cx| {
+            loop {
+                cx.background_executor().timer(PULSE_TICK).await;
+                let parked = cx.update(|cx| {
+                    let clock = cx.default_global::<PulseClock>();
+                    let now = Instant::now();
+                    clock.leases.retain(|_, until| *until > now);
+                    if clock.leases.is_empty() {
+                        clock.running = false;
+                        return true;
+                    }
+                    let views: Vec<EntityId> = clock.leases.keys().copied().collect();
+                    for view in views {
+                        cx.notify(view);
+                    }
+                    false
+                });
+                if parked {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+}
+
+/// Elapsed time in seconds from the shared pulse clock epoch.
+pub fn pulse_time(cx: &mut App) -> f32 {
+    let clock = cx.default_global::<PulseClock>();
+    clock.epoch.elapsed().as_secs_f32()
 }
 
 // ---------------------------------------------------------------------------
@@ -207,7 +240,7 @@ impl CubicBezier {
     }
 }
 
-/// zeron's signature entrance curve — CSS `cubic-bezier(0.16, 1, 0.3, 1)`.
+/// komet's signature entrance curve — CSS `cubic-bezier(0.16, 1, 0.3, 1)`.
 pub const EASE_OUT_EXPO: CubicBezier = CubicBezier::new(0.16, 1.0, 0.3, 1.0);
 /// CSS `ease-out` — width/height transitions.
 pub const EASE_OUT: CubicBezier = CubicBezier::new(0.0, 0.0, 0.58, 1.0);
@@ -306,13 +339,13 @@ pub const CHEVRON: MotionSpec = MotionSpec::new(200, EASE);
 /// scroll, a fixed-duration gentle ease, never percent-of-remaining).
 pub const SCROLL_GLIDE: MotionSpec = MotionSpec::new(500, EASE_IN_OUT);
 /// Tailwind's default transition curve — CSS `cubic-bezier(0.4, 0, 0.2, 1)`
-/// (`transition-colors` et al. carry it unless overridden; zeron never does).
+/// (`transition-colors` et al. carry it unless overridden; komet never does).
 pub const EASE_TAILWIND: CubicBezier = CubicBezier::new(0.4, 0.0, 0.2, 1.0);
 /// CSS `transition-colors` default: 150ms over [`EASE_TAILWIND`] — the temporal
 /// blend every interactive hover wash rides in the original.
 pub const HOVER_FADE: MotionSpec = MotionSpec::new(150, EASE_TAILWIND);
-/// Zeron loader pulse period: 2.4s.
-pub const ZERON_PULSE: MotionSpec = MotionSpec::new(2400, EASE);
+/// Komet loader pulse period: 2.4s.
+pub const KOMET_PULSE: MotionSpec = MotionSpec::new(2400, EASE);
 /// Gradient matrix spinner wave period: 750ms.
 pub const GRADIENT_SPIN: MotionSpec = MotionSpec::new(750, EASE);
 
@@ -339,7 +372,7 @@ where
 }
 
 /// Popover entrance: fade + translateY −2→0 over [`MENU_IN`].
-/// (zeron also scales 0.96→1; divs have no scale transform in gpui — approximated.)
+/// (komet also scales 0.96→1; divs have no scale transform in gpui — approximated.)
 pub fn menu_in<E>(id: impl Into<ElementId>, element: E) -> AnimationElement<E>
 where
     E: Styled + IntoElement + 'static,
@@ -391,10 +424,10 @@ where
 // Loader math (pure; rendered by crate::loaders)
 // ---------------------------------------------------------------------------
 
-/// Zeron-pulse floor opacity.
-// The loader constants and math live in `zeron_proto::motion` (pure phase
+/// Komet-pulse floor opacity.
+// The loader constants and math live in `komet_proto::motion` (pure phase
 // functions); this crate animates them with gpui.
-pub use zeron_proto::motion::{
+pub use komet_proto::motion::{
     PULSE_MIN_OPACITY, PULSE_MIN_SCALE, PULSE_STAGGER, gspin_opacity, pulse_opacity, pulse_scale,
     pulse_wave, staggered_phase,
 };
@@ -417,7 +450,7 @@ pub fn lerp(from: f32, to: f32, t: f32) -> f32 {
 // ---------------------------------------------------------------------------
 //
 // gpui `.hover()` styles snap by construction — the style applies the frame
-// the pointer enters. The original zeron puts Tailwind `transition-colors`
+// the pointer enters. The original komet puts Tailwind `transition-colors`
 // (150ms, cubic-bezier(0.4, 0, 0.2, 1)) on every interactive wash, so hover
 // states FADE. This is the manual-drive tween for that (the shell `WidthTween`
 // pattern — never `with_animation`, whose element-id-keyed clock replays on
@@ -613,14 +646,14 @@ pub fn hover_blend(key: &str, rest: Hsla, hover: Hsla) -> Hsla {
 // Reduced motion
 // ---------------------------------------------------------------------------
 
-/// Dev/measurement knob (`ZERON_MOTION_SCALE`, default 1): stretches every
-/// catalog timeline by this factor — e.g. `ZERON_MOTION_SCALE=10` slows the
+/// Dev/measurement knob (`KOMET_MOTION_SCALE`, default 1): stretches every
+/// catalog timeline by this factor — e.g. `KOMET_MOTION_SCALE=10` slows the
 /// 200ms pane tweens to 2s so screenshot bursts can sample the geometry
 /// per frame. Read once; never set in production.
 pub fn speed_scale() -> f32 {
     static SCALE: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
     *SCALE.get_or_init(|| {
-        std::env::var("ZERON_MOTION_SCALE")
+        std::env::var("KOMET_MOTION_SCALE")
             .ok()
             .and_then(|v| v.parse::<f32>().ok())
             .filter(|s| s.is_finite())
@@ -750,7 +783,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_timings_match_zeron() {
+    fn catalog_timings_match_komet() {
         assert_eq!(FADE_IN.duration_ms, 500);
         assert_eq!(FADE_QUICK.duration_ms, 150);
         assert_eq!(MENU_IN.duration_ms, 140);
@@ -760,7 +793,7 @@ mod tests {
         assert_eq!(TAB_SLIDE.duration_ms, 150);
         assert_eq!(COLLAPSE.duration_ms, 180);
         assert_eq!(CHEVRON.duration_ms, 200);
-        assert_eq!(ZERON_PULSE.duration_ms, 2400);
+        assert_eq!(KOMET_PULSE.duration_ms, 2400);
         assert_eq!(GRADIENT_SPIN.duration_ms, 750);
         assert_eq!(EASE_OUT_EXPO, CubicBezier::new(0.16, 1.0, 0.3, 1.0));
     }

@@ -1,5 +1,5 @@
 //! Sticky composer defaults — the new-chat "remember my last picks" store
-//! (zeron parity: localStorage `zeron.composer.defaults:v1`, defaults.ts).
+//! (komet parity: localStorage `komet.composer.defaults:v1`, defaults.ts).
 //!
 //! A small JSON file beside `ui-settings.json` (that file is the shell's and
 //! is saved debounced from its own boot-time copy, so the composer keeps its
@@ -14,11 +14,11 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use zeron_proto::{HarnessId, ReasoningLevel};
+use komet_proto::{HarnessId, ReasoningLevel};
 
 const FILE_NAME: &str = "composer-defaults.json";
 
-/// Remembered model per harness — id plus display label, mirroring zeron's
+/// Remembered model per harness — id plus display label, mirroring komet's
 /// `modelByHarness` storing the full `Model` object "so the pill never flashes
 /// a raw id or 'Default'".
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -44,7 +44,7 @@ pub struct ComposerDefaults {
     pub harness: Option<HarnessId>,
     /// Last model picked, per harness (restored on harness switch).
     pub model_by_harness: HashMap<HarnessId, RememberedModel>,
-    /// Last reasoning level picked (global, like zeron's `reasoning` key).
+    /// Last reasoning level picked (global, like komet's `reasoning` key).
     pub reasoning: Option<ReasoningLevel>,
     /// Every model label ever seen (id → label), fed from catalog loads.
     /// The chip's fallback while a harness's list is still loading — a
@@ -97,7 +97,7 @@ impl ComposerDefaults {
         self.model_by_harness.get(&harness)
     }
 
-    /// Remember a pick (zeron `saveDefaults({ harness, modelByHarness })`).
+    /// Remember a pick (komet `saveDefaults({ harness, modelByHarness })`).
     pub fn remember_model(&mut self, harness: HarnessId, id: String, label: String) {
         self.harness = Some(harness);
         self.model_by_harness

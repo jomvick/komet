@@ -39,7 +39,7 @@ struct SessionView: View {
                     .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { viewWidth = $0 }
             } else {
                 VStack(spacing: 12) {
-                    ZeronPulse()
+                    KometPulse()
                     Text("Opening session…")
                         .font(Theme.sans(12))
                         .foregroundStyle(Theme.textFaint)

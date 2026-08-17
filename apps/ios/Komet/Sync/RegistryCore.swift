@@ -6,7 +6,7 @@
 // The registry stores CURRENT STATE ONLY: a row is a bag of fields, each
 // field carries the HLC of its last write, and a write applies iff its clock
 // beats the stored one. The shared conformance vectors live in
-// ZeronTests/RegistryCoreTests.swift — keep all three languages in sync.
+// KometTests/RegistryCoreTests.swift — keep all three languages in sync.
 
 import Foundation
 

@@ -4,7 +4,7 @@
 //! tested, not asserted.
 
 use super::*;
-use zeron_proto::{HarnessId, SandboxLevel, SessionStatus};
+use komet_proto::{HarnessId, SandboxLevel, SessionStatus};
 
 fn ts(ms: i64) -> DateTime<Utc> {
     DateTime::from_timestamp_millis(ms).unwrap_or(DateTime::UNIX_EPOCH)

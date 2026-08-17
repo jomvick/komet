@@ -4,9 +4,9 @@
 //! user's npm state in the hot path: a cold cache meant a multi-minute
 //! download while the chat showed "Working", and a broken one meant npm dying
 //! before the adapter ever ran — silently, with an errno-encoded exit code
-//! (254 = ENOENT, the zeronsh/comet#95 crash) that surfaced as an opaque
+//! (254 = ENOENT, the kometsh/comet#95 crash) that surfaced as an opaque
 //! "harness protocol error". Instead, pinned adapter packages are installed
-//! ONCE into a zeron-owned prefix (`~/.zeron/adapters/<pkg>/<version>`, own
+//! ONCE into a komet-owned prefix (`~/.komet/adapters/<pkg>/<version>`, own
 //! npm cache beside it, so a root-owned or read-only `~/.npm` can't break
 //! us), and every subsequent launch spawns `node <entry>` directly — no npm
 //! anywhere near a chat turn.
@@ -56,17 +56,17 @@ impl NpmPin {
     }
 }
 
-const OK_MARKER: &str = ".zeron-install-ok";
+const OK_MARKER: &str = ".komet-install-ok";
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// `$ZERON_ADAPTERS_DIR`, else `~/.zeron/adapters`.
+/// `$KOMET_ADAPTERS_DIR`, else `~/.komet/adapters`.
 fn adapters_root() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("ZERON_ADAPTERS_DIR").filter(|d| !d.is_empty()) {
+    if let Some(dir) = std::env::var_os("KOMET_ADAPTERS_DIR").filter(|d| !d.is_empty()) {
         return Some(PathBuf::from(dir));
     }
     std::env::var_os("HOME")
         .filter(|h| !h.is_empty())
-        .map(|h| PathBuf::from(h).join(".zeron").join("adapters"))
+        .map(|h| PathBuf::from(h).join(".komet").join("adapters"))
 }
 
 fn install_dir(pin: &NpmPin) -> Option<PathBuf> {
@@ -240,7 +240,7 @@ async fn install_into(
     // A bare manifest keeps npm from walking up into a user project.
     std::fs::write(tmp_dir.join("package.json"), "{\"private\":true}\n")?;
     tracing::info!(
-        target: "zeron_harness::adapter_install",
+        target: "komet_harness::adapter_install",
         package = %pin.spec(),
         dir = %tmp_dir.display(),
         "installing ACP adapter"

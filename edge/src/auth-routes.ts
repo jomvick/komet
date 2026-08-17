@@ -1,5 +1,5 @@
 /**
- * The /auth/* HTTP surface absorbed from zeron's apps/server:
+ * The /auth/* HTTP surface absorbed from komet's apps/server:
  *
  *  - POST /auth/exchange     — WorkOS code → tokens (see `workos.ts`).
  *  - POST /auth/refresh      — WorkOS refresh → fresh tokens (org-scopable).
@@ -135,7 +135,7 @@ const cliPage = (body: string): string => `<!doctype html>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <meta name="robots" content="noindex" />
-<title>Zeron — sign in</title>
+<title>Komet — sign in</title>
 <style>
   body { margin: 0; min-height: 100vh; display: grid; place-items: center;
          background: #0a0a0a; color: #ededed;
@@ -161,7 +161,7 @@ const html = (body: string, status = 200): Response =>
 /**
  * The hosted OAuth callback for headless (paste-code) sign-in. Registered as a
  * WorkOS redirect URI; it does NOT exchange the code — it renders `state.code`
- * for the user to paste into the device that started the flow (`zeron login`),
+ * for the user to paste into the device that started the flow (`komet login`),
  * where the exchange runs so the tokens land on that machine. The state half
  * must match the pending sign-in there, so the paste is CSRF-checked at the
  * same point the loopback flow is.

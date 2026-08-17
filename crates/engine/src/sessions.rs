@@ -1,7 +1,7 @@
 //! SessionsEngine — per-chat agent runs: dispatch, steering, interrupts, input bridging,
 //! journal + broadcast fan-out, and 120ms coalesced doc streaming.
 //!
-//! Pragmatic port of zeron's `sessions.ts` (spec: feature-inventory §3.2):
+//! Pragmatic port of komet's `sessions.ts` (spec: feature-inventory §3.2):
 //! - every `AgentEvent` is (a) appended to the on-disk run journal, (b) broadcast to
 //!   in-process subscribers, (c) folded via `fold_event_into_parts` and diffed into the
 //!   chat's `SessionDoc` through `SegmentWriter` on a coalesced `STREAM_COMMIT_MS` timer;
@@ -10,7 +10,7 @@
 //! - a `Steered` event splits the assistant entry at the exact boundary;
 //! - recovery (interrupt or a stale journal at boot) stamps the streaming entry `aborted`.
 //!
-//! Scope notes: sessions are keyed by chat id (one live run per chat). Zeron's pulse
+//! Scope notes: sessions are keyed by chat id (one live run per chat). Komet's pulse
 //! loop is ported as the 15s liveness heartbeat in `drive_run`; its stall watchdog is
 //! deliberately NOT ported (rejected in review — agents may legitimately wait on
 //! something for far longer than any timeout, and a live child IS the working signal).
@@ -24,12 +24,12 @@ use chrono::Utc;
 use futures::StreamExt;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
-use zeron_doc::{
+use komet_doc::{
     DocError, MessagePart, MessageRole, MessageStatus, STREAM_COMMIT_MS, SegmentWriter, SessionDoc,
     fold_event_into_parts, sanitize_tool_call,
 };
-use zeron_harness::{CancellationToken, Harness, RunControls, SteerMessage};
-use zeron_proto::{
+use komet_harness::{CancellationToken, Harness, RunControls, SteerMessage};
+use komet_proto::{
     AgentEvent, DoneStatus, HarnessId, RunRequest, Session, SessionStatus, UserInputAnswer,
     UserInputQuestion,
 };
@@ -59,7 +59,7 @@ type PendingInputs = Arc<Mutex<HashMap<String, oneshot::Sender<Vec<UserInputAnsw
 
 /// A harness-native session id plus the cwd it was created under. Harness
 /// session stores are cwd-scoped (claude keys conversations by project
-/// directory — zeron sessions.ts:563 "harness session stores are keyed by
+/// directory — komet sessions.ts:563 "harness session stores are keyed by
 /// cwd"), so resume is only injected for runs launched from the same cwd.
 #[derive(Debug, Clone)]
 struct HarnessSessionRef {
@@ -113,9 +113,11 @@ struct Inner {
     last_requests: Mutex<HashMap<String, RunRequest>>,
     /// Harness-native session ids per chat (resume continuity across turns) —
     /// the live-process cache over the durable copy on the workspace chat row
-    /// (zeron kept the same pair on `chats.harness_session_id`). An empty
+    /// (komet kept the same pair on `chats.harness_session_id`). An empty
     /// session id is the "do not resume" tombstone after a rejected resume.
     harness_sessions: Mutex<HashMap<String, HarnessSessionRef>>,
+    /// Cumulative context & token usage metrics per chat id.
+    usage_stats: Mutex<HashMap<String, komet_proto::ContextUsageStats>>,
     /// Auto-titler for untitled chats (wired at engine assembly; absent in bare tests).
     titles: OnceLock<crate::titles::TitleGenerator>,
     /// Fired with `(chat_id, cwd)` when a user prompt starts a turn (fresh
@@ -155,10 +157,16 @@ impl SessionsEngine {
                 sessions_tx,
                 last_requests: Mutex::new(HashMap::new()),
                 harness_sessions: Mutex::new(HashMap::new()),
+                usage_stats: Mutex::new(HashMap::new()),
                 titles: OnceLock::new(),
                 turn_listener: OnceLock::new(),
             }),
         }
+    }
+
+    /// Retrieve context & token usage metrics for a chat session.
+    pub fn usage_for(&self, chat_id: &str) -> Option<komet_proto::ContextUsageStats> {
+        lock(&self.inner.usage_stats).get(chat_id).cloned()
     }
 
     /// Wire the doc host (called once at engine assembly; the two services are mutually
@@ -218,7 +226,7 @@ impl SessionsEngine {
         lock(&self.inner.statuses).values().any(|s| {
             matches!(
                 s.status,
-                zeron_proto::SessionStatus::Working | zeron_proto::SessionStatus::AwaitingInput
+                komet_proto::SessionStatus::Working | komet_proto::SessionStatus::AwaitingInput
             )
         })
     }
@@ -256,7 +264,7 @@ impl SessionsEngine {
     ///
     /// - The user message entry is written to the doc immediately (id = `message_id`).
     /// - A live steerable run receives the prompt as its next turn via the mailbox
-    ///   (zeron's persistent-session routing); otherwise any live run is interrupted
+    ///   (komet's persistent-session routing); otherwise any live run is interrupted
     ///   first — never two runtimes driving one chat.
     pub async fn dispatch(
         &self,
@@ -360,7 +368,7 @@ impl SessionsEngine {
         let user_id = message_id.unwrap_or_else(new_id);
         handle.write_user_message(&user_id, &request.prompt, now_ms())?;
 
-        // Engine-owned resume (zeron sessions.ts:736 — every dispatch read the
+        // Engine-owned resume (komet sessions.ts:736 — every dispatch read the
         // chat's stored harness session): callers always send `resume: None`;
         // the engine threads the chat's prior harness session back in so a new
         // process (app restart) continues the same harness conversation. The
@@ -531,7 +539,7 @@ impl SessionsEngine {
         let Some((run_id, token, cancel, pending)) = target else {
             return Ok(false);
         };
-        // Unpark any blocked question FIRST (mirrors zeron: harness teardown can await a
+        // Unpark any blocked question FIRST (mirrors komet: harness teardown can await a
         // parked question callback — a run stuck on a question would deadlock the stop).
         let parked: Vec<_> = lock(&pending).drain().map(|(_, tx)| tx).collect();
         for tx in parked {
@@ -581,7 +589,7 @@ impl SessionsEngine {
     /// with a VISIBLE "Run interrupted by engine restart" error part, close the
     /// journal with a synthetic `Done{interrupted}` — and then PICK THE RUN BACK
     /// UP: a fresh crashed turn with revival budget left is re-dispatched against
-    /// the remembered harness session (zeron: "not just eulogized";
+    /// the remembered harness session (komet: "not just eulogized";
     /// `MAX_AUTO_RESUME` = 3 consecutive revivals, fresh = crashed < 12h ago).
     pub fn recover_stale(&self) -> Result<usize, EngineError> {
         const MAX_AUTO_RESUME: u32 = 3;
@@ -597,7 +605,7 @@ impl SessionsEngine {
             // Harness continuity first: the crashed run's session id may only
             // exist in the journal (the debounced workspace-row write may
             // never have landed) — remember it so the revived run resumes the
-            // same harness conversation (zeron recoverDraft, sessions.ts:538).
+            // same harness conversation (komet recoverDraft, sessions.ts:538).
             if let Some((session_id, cwd)) = self.inner.journal_harness_session(&chat_id) {
                 self.inner
                     .remember_harness_session(&chat_id, &session_id, &cwd);
@@ -662,7 +670,7 @@ impl SessionsEngine {
                 let request = sessions
                     .last_request(&chat_id)
                     .or_else(|| host.request_from_chat_row(&chat_id, &prompt_text))
-                    // Last resort: the journal's own cwd (zeron's draft config)
+                    // Last resort: the journal's own cwd (komet's draft config)
                     // — a crash can predate the debounced workspace-row write.
                     .or_else(|| {
                         let (_, cwd) = sessions.inner.journal_harness_session(&chat_id)?;
@@ -673,7 +681,7 @@ impl SessionsEngine {
                             reasoning: None,
                             model_options: Default::default(),
                             cwd,
-                            sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+                            sandbox: komet_proto::SandboxLevel::WorkspaceWrite,
                             auto_approve: false,
                             attachments: Vec::new(),
                             resume: None,
@@ -727,6 +735,35 @@ impl SessionsEngine {
 impl Inner {
     /// Journal + broadcast one event (the two unconditional legs of the pipeline).
     fn publish(&self, chat_id: &str, event: &AgentEvent) -> u64 {
+        match event {
+            AgentEvent::SessionStarted { model, .. } => {
+                let mut usage_stats = lock(&self.usage_stats);
+                let default_limit = komet_proto::default_context_limit_for_model(model);
+                usage_stats
+                    .entry(chat_id.to_string())
+                    .or_insert_with(|| komet_proto::ContextUsageStats::new(default_limit));
+            }
+            AgentEvent::Usage {
+                input_tokens,
+                cached_input_tokens,
+                output_tokens,
+                reasoning_tokens,
+                context_limit,
+            } => {
+                let mut usage_stats = lock(&self.usage_stats);
+                let entry = usage_stats
+                    .entry(chat_id.to_string())
+                    .or_insert_with(|| komet_proto::ContextUsageStats::new(context_limit.unwrap_or(200_000)));
+                entry.ingest(
+                    *input_tokens,
+                    *cached_input_tokens,
+                    *output_tokens,
+                    *reasoning_tokens,
+                    *context_limit,
+                );
+            }
+            _ => {}
+        }
         let seq = match self.journal.append(chat_id, event) {
             Ok(seq) => seq,
             Err(err) => {
@@ -844,7 +881,7 @@ impl Inner {
 
     /// Record the chat's harness-native session id (and its cwd): live-process
     /// cache plus the durable workspace chat row — the row is what survives an
-    /// engine restart (zeron sessions.ts:1039).
+    /// engine restart (komet sessions.ts:1039).
     fn remember_harness_session(&self, chat_id: &str, session_id: &str, cwd: &str) {
         if session_id.is_empty() {
             return;
@@ -869,7 +906,7 @@ impl Inner {
     // yields a fresh session whose SessionStarted overwrites the row.
 
     /// The session id to resume for a run in `chat_id` launching from `cwd`
-    /// (zeron sessions.ts:736, looked up on every dispatch):
+    /// (komet sessions.ts:736, looked up on every dispatch):
     /// live-process cache → workspace chat row → journal scan (the crash path
     /// where the debounced row write never landed — SessionStarted/Done events
     /// are journaled per event, flushed immediately). Cwd-gated throughout:
@@ -1133,12 +1170,12 @@ async fn drive_run(
     // so the gate still catches real crashes. touch_session throttles at 10s.
     let mut live_heartbeat = tokio::time::interval(std::time::Duration::from_secs(15));
     live_heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    // PERSISTENT SESSION (zeron runsBySession): a completed turn on a
+    // PERSISTENT SESSION (komet runsBySession): a completed turn on a
     // steerable harness parks here instead of ending the run — the child and
     // its steering mailbox stay warm, and the next user message (dispatch
     // routes into a live run) starts the next turn with zero respawn/resume
     // latency. `Some(when)` = idle since then; the 30-min reaper below ends
-    // a session nobody comes back to (zeron SESSION_IDLE_MS).
+    // a session nobody comes back to (komet SESSION_IDLE_MS).
     const SESSION_IDLE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
     let mut idle_since: Option<tokio::time::Instant> = None;
     let steerable = harness.supports_steering();
@@ -1153,9 +1190,9 @@ async fn drive_run(
     // segment finalized Complete, status Idle, child and mailbox warm. A
     // false trip (the agent was quietly waiting on something invisible)
     // costs a status dip: the parked-resume path below re-arms Working the
-    // moment output flows again, and nothing is lost. `ZERON_TURN_QUIESCE_MS`
+    // moment output flows again, and nothing is lost. `KOMET_TURN_QUIESCE_MS`
     // overrides the window; 0 disables.
-    let quiesce_after: Option<std::time::Duration> = match std::env::var("ZERON_TURN_QUIESCE_MS")
+    let quiesce_after: Option<std::time::Duration> = match std::env::var("KOMET_TURN_QUIESCE_MS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
     {
@@ -1173,11 +1210,11 @@ async fn drive_run(
     // so the default 120s window read as 2min of stuck-Working after every
     // background notification (user report 2026-08-13). The in-flight
     // fold gate below still protects running tools; reasoning heartbeats
-    // push the window during real thinking. `ZERON_SELF_TURN_QUIESCE_MS`
+    // push the window during real thinking. `KOMET_SELF_TURN_QUIESCE_MS`
     // overrides; 0 falls back to the normal window. An explicit
-    // `ZERON_TURN_QUIESCE_MS=0` still disables the watchdog entirely.
+    // `KOMET_TURN_QUIESCE_MS=0` still disables the watchdog entirely.
     let self_quiesce_after: Option<std::time::Duration> =
-        match std::env::var("ZERON_SELF_TURN_QUIESCE_MS")
+        match std::env::var("KOMET_SELF_TURN_QUIESCE_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
         {
@@ -1210,7 +1247,7 @@ async fn drive_run(
                 inner.touch_session(&chat_id);
                 continue;
             }
-            // Idle reaper (zeron SESSION_IDLE_MS): a parked persistent session
+            // Idle reaper (komet SESSION_IDLE_MS): a parked persistent session
             // nobody returned to in 30 minutes releases its child. The turn
             // was finalized at Done, so this end is clean — no aborted stamp.
             _ = tokio::time::sleep_until(
@@ -1291,7 +1328,7 @@ async fn drive_run(
                 && steerable
                 && !folded.iter().any(|p| match p {
                     MessagePart::Tool { id, resolved: false, .. } => {
-                        id != zeron_proto::LIVE_PLAN_TOOL_ID
+                        id != komet_proto::LIVE_PLAN_TOOL_ID
                     }
                     MessagePart::Input { resolved: false, .. } => true,
                     _ => false,
@@ -1390,7 +1427,7 @@ async fn drive_run(
                 ) || matches!(
                     &event,
                     AgentEvent::ToolCall { id, .. }
-                        if id == zeron_proto::LIVE_PLAN_TOOL_ID || !seen_tools.contains(id)
+                        if id == komet_proto::LIVE_PLAN_TOOL_ID || !seen_tools.contains(id)
                 ));
             if self_continued {
                 tracing::info!(
@@ -1459,8 +1496,8 @@ async fn drive_run(
             // treating its reappearance after a park/steer reset as a stale
             // echo dropped the todo list for the rest of the run — from the
             // first boundary on, plans never rendered again.
-            AgentEvent::ToolCall { id, .. } if id == zeron_proto::LIVE_PLAN_TOOL_ID => {}
-            AgentEvent::ToolResult { id, .. } if id == zeron_proto::LIVE_PLAN_TOOL_ID => {}
+            AgentEvent::ToolCall { id, .. } if id == komet_proto::LIVE_PLAN_TOOL_ID => {}
+            AgentEvent::ToolResult { id, .. } if id == komet_proto::LIVE_PLAN_TOOL_ID => {}
             AgentEvent::ToolCall { id, .. } => {
                 if !in_segment(&folded, id) && seen_tools.contains(id) {
                     continue;
@@ -1597,7 +1634,7 @@ async fn drive_run(
 
         inner.publish(&chat_id, &event);
 
-        // Defensive rule from zeron: a mid-run SessionStarted re-emission (Claude SDK
+        // Defensive rule from komet: a mid-run SessionStarted re-emission (Claude SDK
         // background re-invocations) must not wipe the segment being written.
         let skip_fold = matches!(&event, AgentEvent::SessionStarted { .. }) && !folded.is_empty();
         if !skip_fold {
@@ -1605,7 +1642,7 @@ async fn drive_run(
             // R2 sidecar PARKED (2026-08-10, product call): the fold's
             // summary/stats ARE the doc's whole record — no refs stamped, no
             // uploads. Full outputs survive only in the host's local run
-            // journal. To reintroduce: `zeron_doc::sidecar_payload(&event)`
+            // journal. To reintroduce: `komet_doc::sidecar_payload(&event)`
             // → `apply_sidecar_refs` → `doc_host.upload_tool_sidecar`, all
             // still in place and tested.
         }

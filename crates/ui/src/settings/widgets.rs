@@ -1,7 +1,7 @@
 //! Shared scaffolding for the settings pages — the original's page rhythm
 //! (`mx-auto max-w-3xl px-6 pb-16 pt-8`), section cards, row layout, badges
 //! and small buttons, so every page reads as the same product surface
-//! (zeron settings.devices.tsx / settings.agents.tsx / settings.archived.tsx).
+//! (komet settings.devices.tsx / settings.agents.tsx / settings.archived.tsx).
 
 use gpui::{AnyElement, SharedString, div, prelude::*, px};
 
@@ -21,7 +21,7 @@ pub fn page_column() -> gpui::Div {
 }
 
 /// Page headline row: `flex items-baseline gap-2.5` — `text-base font-semibold`
-/// title + `text-[13px]` count sharing a baseline (zeron settings.devices.tsx).
+/// title + `text-[13px]` count sharing a baseline (komet settings.devices.tsx).
 pub fn page_header(theme: &Theme, title: &str, count: Option<usize>) -> gpui::Div {
     div()
         .flex()
@@ -270,7 +270,7 @@ pub fn badge_active(theme: &Theme, label: impl Into<SharedString>) -> gpui::Div 
         .child(label.into())
 }
 
-/// Display-only toggle switch (zeron branch-picker.tsx `Toggle`): an 18×32
+/// Display-only toggle switch (komet branch-picker.tsx `Toggle`): an 18×32
 /// pill whose knob slides right and track flips white when on. State is owned
 /// by the parent row — the caller adds `.id(..)` and `.on_click(..)`.
 pub fn toggle_switch(theme: &Theme, on: bool) -> gpui::Div {

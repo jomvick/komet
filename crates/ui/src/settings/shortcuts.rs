@@ -44,7 +44,7 @@ pub struct ShortcutsPage {
     keymap: KeymapConfig,
     recording: Option<ShortcutId>,
     /// A rejected record attempt ("{Combo} is already assigned to {label}.") —
-    /// conflicts never persist; they're refused at record time, as in zeron.
+    /// conflicts never persist; they're refused at record time, as in komet.
     conflict_notice: Option<SharedString>,
     focus: FocusHandle,
     // The page never talks RPC; state is kept for parity with sibling pages
@@ -89,7 +89,7 @@ impl ShortcutsPage {
             RecordOutcome::Ignored => {}
             RecordOutcome::Set(combo) => {
                 // A combo already bound elsewhere is REFUSED, naming the owner
-                // (zeron settings.shortcuts.tsx: "… is already assigned to …").
+                // (komet settings.shortcuts.tsx: "… is already assigned to …").
                 if let Some(owner) = conflict_owner(&self.keymap, recording, &combo) {
                     self.conflict_notice = Some(
                         format!(
@@ -120,7 +120,7 @@ pub fn conflict_owner(keymap: &KeymapConfig, id: ShortcutId, combo: &str) -> Opt
         .find(|&other| other != id && keymap.get(other) == combo)
 }
 
-/// One-line purpose copy per shortcut (zeron lib/shortcuts.ts
+/// One-line purpose copy per shortcut (komet lib/shortcuts.ts
 /// `SHORTCUT_DEFINITIONS` descriptions, verbatim).
 fn description(id: ShortcutId) -> &'static str {
     match id {
@@ -147,7 +147,7 @@ impl Render for ShortcutsPage {
             } else {
                 display_combo(&combo).into()
             };
-            // zeron settings.shortcuts.tsx row: min-h-[72px] px-5 gap-5, label
+            // komet settings.shortcuts.tsx row: min-h-[72px] px-5 gap-5, label
             // + description left, Reset (only when modified), then the combo
             // chip — recording inverts it to white-on-black.
             div()
@@ -236,7 +236,7 @@ impl Render for ShortcutsPage {
         });
 
         // Helper line stays in the muted tone even for a rejected conflict —
-        // the message names the specific clash (zeron settings.shortcuts.tsx).
+        // the message names the specific clash (komet settings.shortcuts.tsx).
         let helper: SharedString = if recording.is_some() {
             "Press Escape to cancel.".into()
         } else if let Some(notice) = self.conflict_notice.clone() {
@@ -356,7 +356,7 @@ mod tests {
 
     #[test]
     fn conflicting_records_are_refused() {
-        // zeron parity: a combo bound elsewhere is refused at record time (the
+        // komet parity: a combo bound elsewhere is refused at record time (the
         // helper names the owner) — conflicts never persist into the keymap.
         let keymap = KeymapConfig::default();
         let RecordOutcome::Set(combo) = record_key("b", true, false, false, false) else {

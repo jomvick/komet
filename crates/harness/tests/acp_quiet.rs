@@ -1,4 +1,4 @@
-//! Blanket dropped-reply settle (`ZERON_ACP_QUIET_SETTLE_MS`), tested with
+//! Blanket dropped-reply settle (`KOMET_ACP_QUIET_SETTLE_MS`), tested with
 //! the GROK spec so no adapter-specific evidence (Claude's cost frame,
 //! `noRunningTurn` steering reasons) is in play — this is the path every ACP
 //! agent gets. Own test binary: the env knob is process-global, and every
@@ -11,8 +11,8 @@ use std::time::Duration;
 use futures::StreamExt;
 use tokio::sync::{mpsc, oneshot};
 
-use zeron_harness::{AcpHarness, CancellationToken, Harness, RunControls, SteerMessage};
-use zeron_proto::{
+use komet_harness::{AcpHarness, CancellationToken, Harness, RunControls, SteerMessage};
+use komet_proto::{
     AgentEvent, DoneStatus, RunRequest, SandboxLevel, UserInputAnswer, UserInputQuestion,
 };
 
@@ -23,7 +23,7 @@ fn init_env() {
     ONCE.call_once(|| {
         // SAFETY: set before any harness runs in this test process; all
         // tests in this binary share the one value.
-        unsafe { std::env::set_var("ZERON_ACP_QUIET_SETTLE_MS", QUIET_MS.to_string()) };
+        unsafe { std::env::set_var("KOMET_ACP_QUIET_SETTLE_MS", QUIET_MS.to_string()) };
     });
 }
 

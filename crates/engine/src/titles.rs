@@ -1,18 +1,18 @@
 //! Chat auto-titling — after the first user+assistant exchange completes on an
-//! untitled chat, name it with the harness's cheapest model (port of zeron's
+//! untitled chat, name it with the harness's cheapest model (port of komet's
 //! `generateTitle` in `sessions.ts`).
 //!
 //! Flow (fire-and-forget from the run task; every failure is a silent skip with
 //! tracing — a title must never fail or delay a run):
 //! 1. skip when the chat already has a title (or has no workspace row);
 //! 2. pick the run harness's cheapest model (small-tier name heuristic, else the
-//!    last listed model — zeron's `cheapestModel`);
+//!    last listed model — komet's `cheapestModel`);
 //! 3. run a one-shot, non-streaming-collected titling prompt through the
 //!    [`Harness`] trait (read-only sandbox, minimal reasoning, auto-approve),
-//!    retrying on zeron's short backoff ladder; fall back to the prompt's first
+//!    retrying on komet's short backoff ladder; fall back to the prompt's first
 //!    words when every attempt produces nothing;
 //! 4. re-check the title (a user rename during generation wins);
-//! 5. when the chat sits in a zeron worktree (`zeron/<name>` branch), rename the
+//! 5. when the chat sits in a komet worktree (`komet/<name>` branch), rename the
 //!    branch from the title and update the chat's branch row;
 //! 6. `rename_chat` in the workspace doc.
 
@@ -20,8 +20,8 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 
-use zeron_harness::{CancellationToken, RunControls, SteerMessage};
-use zeron_proto::{
+use komet_harness::{CancellationToken, RunControls, SteerMessage};
+use komet_proto::{
     AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
     UserInputAnswer, UserInputQuestion,
 };
@@ -32,7 +32,7 @@ use crate::repos::Repos;
 use crate::workspace_host::WorkspaceHost;
 
 /// Throwaway title runs are cheap but still cross a process boundary — retry a
-/// couple of times with a short backoff before falling back (zeron's ladder).
+/// couple of times with a short backoff before falling back (komet's ladder).
 const RETRY_DELAYS_MS: &[u64] = &[250, 1_000];
 
 struct Inner {
@@ -114,9 +114,9 @@ impl TitleGenerator {
         }
 
         // Rename the worktree branch when the chat still sits on its original
-        // zeron/<name> branch (guards live inside rename_worktree_branch).
+        // komet/<name> branch (guards live inside rename_worktree_branch).
         if let (Some(chat_cwd), Some(branch)) = (&latest.cwd, &latest.branch)
-            && branch.starts_with("zeron/")
+            && branch.starts_with("komet/")
         {
             match self
                 .inner
@@ -202,7 +202,7 @@ impl TitleGenerator {
     }
 }
 
-/// The cheapest model a harness offers (zeron's `cheapestModel` heuristic):
+/// The cheapest model a harness offers (komet's `cheapestModel` heuristic):
 /// prefer a small-tier name (haiku/mini/nano/flash/small/lite), else the last
 /// listed model; `None` when the catalog is empty (harness picks its default).
 fn cheapest_model(models: &[Model]) -> Option<String> {
@@ -232,7 +232,7 @@ fn clean_title(raw: &str) -> String {
 /// Drive one titling run through the harness: no steering, questions resolved
 /// empty immediately (a titling prompt must never block on input).
 async fn collect_text(
-    harness: &dyn zeron_harness::Harness,
+    harness: &dyn komet_harness::Harness,
     request: RunRequest,
 ) -> Result<String, EngineError> {
     let (steer_tx, steer_rx) = tokio::sync::mpsc::channel::<SteerMessage>(1);
@@ -272,7 +272,7 @@ async fn collect_text(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zeron_proto::Model;
+    use komet_proto::Model;
 
     fn model(id: &str, label: &str) -> Model {
         Model {

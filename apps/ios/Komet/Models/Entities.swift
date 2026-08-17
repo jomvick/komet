@@ -203,7 +203,7 @@ struct MessageEntry: Identifiable, Hashable {
 
 // MARK: - Folder browsing (add-space palette data)
 
-/// zeron-proto FolderListing (entities.rs:225): the device's answer to
+/// komet-proto FolderListing (entities.rs:225): the device's answer to
 /// ListFolders. Dotfiles are pre-filtered and entries are capped at 500 by
 /// the engine; the parent path is computed client-side.
 struct FolderEntry: Codable, Hashable {
@@ -232,7 +232,7 @@ enum CheckoutKind {
     case newWorktree
 }
 
-/// zeron-proto RepoRef (entities.rs:193): one selectable ref from ListRefs.
+/// komet-proto RepoRef (entities.rs:193): one selectable ref from ListRefs.
 struct RepoRef: Codable, Hashable, Identifiable {
     var name: String
     var current: Bool = false
@@ -245,7 +245,7 @@ struct RepoRef: Codable, Hashable, Identifiable {
 
 let commandDefaultTtlMs: Int64 = 86_400_000
 
-/// zeron-proto RunRequest (agent.rs:81). `reasoning` is lowercase
+/// komet-proto RunRequest (agent.rs:81). `reasoning` is lowercase
 /// ("high"/"xhigh"/…), `sandbox` kebab-case ("workspace-write"), harness ids
 /// kebab-case ("claude-code").
 struct RunRequest: Codable {

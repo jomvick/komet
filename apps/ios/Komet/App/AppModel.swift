@@ -22,7 +22,7 @@ final class AppModel {
     private var config: AppConfig?
 
     // Persisted connection settings.
-    @ObservationIgnored @AppStorage("edgeURL") var edgeURLString = "https://edge.zeron.sh"
+    @ObservationIgnored @AppStorage("edgeURL") var edgeURLString = "https://edge.komet.sh"
     @ObservationIgnored @AppStorage("authMode") var authModeRaw = AppConfig.Mode.workos.rawValue
     @ObservationIgnored @AppStorage("userId") var storedUserId = ""
     @ObservationIgnored @AppStorage("orgId") var storedOrgId = ""

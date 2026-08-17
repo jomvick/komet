@@ -1,19 +1,19 @@
 [package]
-name = "zeron"
+name = "komet"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
 [[bin]]
-name = "zeron"
+name = "komet"
 path = "src/main.rs"
 
 [dependencies]
-zeron-engine.workspace = true
-zeron-rpc.workspace = true
-zeron-ui.workspace = true
-zeron-update.workspace = true
+komet-engine.workspace = true
+komet-rpc.workspace = true
+komet-ui.workspace = true
+komet-update.workspace = true
 tokio.workspace = true
 clap.workspace = true
 mimalloc.workspace = true

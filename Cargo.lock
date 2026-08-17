@@ -3497,6 +3497,227 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 
 [[package]]
+name = "komet"
+version = "0.2.2"
+dependencies = [
+ "anyhow",
+ "clap",
+ "komet-engine",
+ "komet-rpc",
+ "komet-ui",
+ "komet-update",
+ "libc",
+ "mimalloc",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "komet-doc"
+version = "0.2.2"
+dependencies = [
+ "chrono",
+ "komet-proto",
+ "loro",
+ "serde",
+ "serde_json",
+ "similar",
+ "thiserror 2.0.19",
+ "tracing",
+]
+
+[[package]]
+name = "komet-engine"
+version = "0.2.2"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64",
+ "chrono",
+ "futures",
+ "gethostname",
+ "ignore",
+ "komet-doc",
+ "komet-harness",
+ "komet-proto",
+ "komet-rpc",
+ "komet-sync",
+ "komet-update",
+ "libc",
+ "loro",
+ "notify",
+ "portable-pty",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "tokio-tungstenite",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "komet-harness"
+version = "0.2.2"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "base64",
+ "futures",
+ "komet-proto",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "komet-proto"
+version = "0.2.2"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "uuid",
+]
+
+[[package]]
+name = "komet-rpc"
+version = "0.2.2"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "futures",
+ "komet-doc",
+ "komet-proto",
+ "komet-sync",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "komet-sync"
+version = "0.2.2"
+dependencies = [
+ "chrono",
+ "futures",
+ "komet-doc",
+ "komet-proto",
+ "loro",
+ "loro-protocol",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "komet-syntax"
+version = "0.2.2"
+dependencies = [
+ "thiserror 2.0.19",
+ "tree-sitter",
+ "tree-sitter-bash",
+ "tree-sitter-c",
+ "tree-sitter-c-sharp",
+ "tree-sitter-containerfile",
+ "tree-sitter-cpp",
+ "tree-sitter-css",
+ "tree-sitter-go",
+ "tree-sitter-highlight",
+ "tree-sitter-html",
+ "tree-sitter-java",
+ "tree-sitter-javascript",
+ "tree-sitter-json",
+ "tree-sitter-kotlin-ng",
+ "tree-sitter-lua",
+ "tree-sitter-make",
+ "tree-sitter-md",
+ "tree-sitter-nix",
+ "tree-sitter-php",
+ "tree-sitter-python",
+ "tree-sitter-ruby",
+ "tree-sitter-rust",
+ "tree-sitter-sequel",
+ "tree-sitter-swift",
+ "tree-sitter-toml-ng",
+ "tree-sitter-typescript",
+ "tree-sitter-yaml",
+]
+
+[[package]]
+name = "komet-ui"
+version = "0.2.2"
+dependencies = [
+ "alacritty_terminal",
+ "anyhow",
+ "async-trait",
+ "base64",
+ "chrono",
+ "futures",
+ "gpui",
+ "gpui_platform",
+ "gpui_tokio",
+ "komet-doc",
+ "komet-engine",
+ "komet-harness",
+ "komet-proto",
+ "komet-rpc",
+ "komet-syntax",
+ "komet-update",
+ "objc",
+ "pulldown-cmark",
+ "serde",
+ "serde_json",
+ "sha2",
+ "similar",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "unicode-segmentation",
+ "uuid",
+]
+
+[[package]]
+name = "komet-update"
+version = "0.2.2"
+dependencies = [
+ "anyhow",
+ "futures",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "kqueue"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9094,227 +9315,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
-]
-
-[[package]]
-name = "zeron"
-version = "0.2.2"
-dependencies = [
- "anyhow",
- "clap",
- "libc",
- "mimalloc",
- "serde_json",
- "tempfile",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "zeron-engine",
- "zeron-rpc",
- "zeron-ui",
- "zeron-update",
-]
-
-[[package]]
-name = "zeron-doc"
-version = "0.2.2"
-dependencies = [
- "chrono",
- "loro",
- "serde",
- "serde_json",
- "similar",
- "thiserror 2.0.19",
- "tracing",
- "zeron-proto",
-]
-
-[[package]]
-name = "zeron-engine"
-version = "0.2.2"
-dependencies = [
- "anyhow",
- "async-trait",
- "base64",
- "chrono",
- "futures",
- "gethostname",
- "ignore",
- "libc",
- "loro",
- "notify",
- "portable-pty",
- "reqwest",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "thiserror 2.0.19",
- "tokio",
- "tokio-tungstenite",
- "tokio-util",
- "tracing",
- "uuid",
- "zeron-doc",
- "zeron-harness",
- "zeron-proto",
- "zeron-rpc",
- "zeron-sync",
- "zeron-update",
-]
-
-[[package]]
-name = "zeron-harness"
-version = "0.2.2"
-dependencies = [
- "anyhow",
- "async-trait",
- "base64",
- "futures",
- "libc",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.19",
- "tokio",
- "tokio-util",
- "tracing",
- "uuid",
- "zeron-proto",
-]
-
-[[package]]
-name = "zeron-proto"
-version = "0.2.2"
-dependencies = [
- "chrono",
- "serde",
- "serde_json",
- "uuid",
-]
-
-[[package]]
-name = "zeron-rpc"
-version = "0.2.2"
-dependencies = [
- "anyhow",
- "async-trait",
- "futures",
- "serde",
- "serde_json",
- "thiserror 2.0.19",
- "tokio",
- "tokio-tungstenite",
- "tracing",
- "uuid",
- "zeron-doc",
- "zeron-proto",
- "zeron-sync",
-]
-
-[[package]]
-name = "zeron-sync"
-version = "0.2.2"
-dependencies = [
- "chrono",
- "futures",
- "loro",
- "loro-protocol",
- "reqwest",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.19",
- "tokio",
- "tokio-tungstenite",
- "tracing",
- "uuid",
- "zeron-doc",
- "zeron-proto",
-]
-
-[[package]]
-name = "zeron-syntax"
-version = "0.2.2"
-dependencies = [
- "thiserror 2.0.19",
- "tree-sitter",
- "tree-sitter-bash",
- "tree-sitter-c",
- "tree-sitter-c-sharp",
- "tree-sitter-containerfile",
- "tree-sitter-cpp",
- "tree-sitter-css",
- "tree-sitter-go",
- "tree-sitter-highlight",
- "tree-sitter-html",
- "tree-sitter-java",
- "tree-sitter-javascript",
- "tree-sitter-json",
- "tree-sitter-kotlin-ng",
- "tree-sitter-lua",
- "tree-sitter-make",
- "tree-sitter-md",
- "tree-sitter-nix",
- "tree-sitter-php",
- "tree-sitter-python",
- "tree-sitter-ruby",
- "tree-sitter-rust",
- "tree-sitter-sequel",
- "tree-sitter-swift",
- "tree-sitter-toml-ng",
- "tree-sitter-typescript",
- "tree-sitter-yaml",
-]
-
-[[package]]
-name = "zeron-ui"
-version = "0.2.2"
-dependencies = [
- "alacritty_terminal",
- "anyhow",
- "async-trait",
- "base64",
- "chrono",
- "futures",
- "gpui",
- "gpui_platform",
- "gpui_tokio",
- "objc",
- "pulldown-cmark",
- "serde",
- "serde_json",
- "sha2",
- "similar",
- "tempfile",
- "tokio",
- "tracing",
- "unicode-segmentation",
- "uuid",
- "zeron-doc",
- "zeron-engine",
- "zeron-harness",
- "zeron-proto",
- "zeron-rpc",
- "zeron-syntax",
- "zeron-update",
-]
-
-[[package]]
-name = "zeron-update"
-version = "0.2.2"
-dependencies = [
- "anyhow",
- "futures",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "tempfile",
- "tokio",
- "tracing",
 ]
 
 [[package]]

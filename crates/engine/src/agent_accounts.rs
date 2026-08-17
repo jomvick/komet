@@ -1,5 +1,5 @@
 //! AgentAccounts — the Claude Code / Codex CLI logins on this device
-//! (feature-inventory §3.7 "Agent accounts"; port of zeron's `agent-accounts.ts`).
+//! (feature-inventory §3.7 "Agent accounts"; port of komet's `agent-accounts.ts`).
 //!
 //! Each CLI stores exactly one live login:
 //!
@@ -24,7 +24,7 @@
 //!    until its loopback callback lands.
 //!
 //! Usage probes: both providers expose the rate-limit view their own CLIs render
-//! (`/usage` in Claude Code, `/status` in Codex). Unlike zeron (fetch on every
+//! (`/usage` in Claude Code, `/status` in Codex). Unlike komet (fetch on every
 //! list, 60s cache), native only hits the network when `force_usage` is set —
 //! the default list stays offline-fast and deterministic; the UI passes
 //! `forceUsage` on page mount/refresh. Cached results (60s TTL) are served to
@@ -42,7 +42,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use zeron_proto::{
+use komet_proto::{
     AgentAccount, AgentAccountWarning, AgentAccountsSnapshot, AgentAuthKind, AgentLoginMode,
     AgentLoginPoll, AgentLoginStart, AgentLoginStatus, AgentUsageWindow, HarnessId,
 };
@@ -132,7 +132,7 @@ struct SlotProfile {
     auth_kind: AgentAuthKind,
 }
 
-/// One saved login (`{slotId}.json`), same field surface as zeron's slot files.
+/// One saved login (`{slotId}.json`), same field surface as komet's slot files.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Slot {
@@ -858,7 +858,7 @@ impl AgentAccounts {
         }
     }
 
-    /// Lazy TTL sweep (zeron uses a background fiber; native reaps on the next
+    /// Lazy TTL sweep (komet uses a background fiber; native reaps on the next
     /// accounts call — same bound, no standing task).
     fn sweep_flows(&self) {
         let stale: Vec<String> = lock(&self.inner.flows)

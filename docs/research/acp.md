@@ -6,12 +6,12 @@
   app-server — over the shared `crates/harness/src/jsonrpc.rs` client (promoted
   from `codex/rpc.rs`). Wire types are hand-rolled tolerant serde against raw
   `Value`s (house style, verified against `agent-client-protocol-schema` 1.3.0),
-  NOT the official SDK crates: zeron keeps its own child-lifecycle hardening
+  NOT the official SDK crates: komet keeps its own child-lifecycle hardening
   (StderrTail, SIGTERM→SIGKILL, PATH composition) and shell-script test
   fixtures, and drives raw updates the SDK's `ActiveSession` abstraction hides.
 - First registered agent: **Grok Build** (`grok agent stdio`), xAI's native ACP
   agent (npm `@xai-official/grok`, ACP registry id `grok-build`). Auth: browser
-  OAuth or `XAI_API_KEY`; zeron passes env through. `GROK_EXECUTABLE` overrides
+  OAuth or `XAI_API_KEY`; komet passes env through. `GROK_EXECUTABLE` overrides
   resolution (tests point it at `tests/fixtures/fake-acp.sh`).
 - **claude/codex converted to ACP too** (2026-08-08, wing's call: "keep things
   clean"): `AcpHarness::claude()` via `@agentclientprotocol/claude-agent-acp`
@@ -21,7 +21,7 @@
   catalogs (models, effort clamping, Ultrathink prefix) survive as spec inputs.
   Accepted deltas: Claude steering is now priority-`now` pre-emption (adapter
   semantics) instead of step-boundary stdin; sandbox policy control is
-  adapter-owned; zeron-specific settings ride config options where advertised
+  adapter-owned; komet-specific settings ride config options where advertised
   (mode → bypassPermissions, model via family-alias matching — the claude
   adapter advertises SDK aliases like `opus[1m]`/`sonnet`/`haiku` —
   fastMode/thinking as booleans) and are silently skipped elsewhere
@@ -43,8 +43,8 @@
   managed-install fallback; requires the pi CLI itself,
   `@earendil-works/pi-coding-agent`; `PI_ACP_EXECUTABLE` overrides). Models
   ride pi's own provider config (catalog advertises a `default` pass-through
-  entry); thinking ladder minimal→max maps onto zeron's levels via the
-  generic `thought_level` preference ladder ("off" has no zeron tier).
+  entry); thinking ladder minimal→max maps onto komet's levels via the
+  generic `thought_level` preference ladder ("off" has no komet tier).
 - **ACP is the source of truth for model lists** (2026-08-08; preference
   order inverted 2026-08-09): `models()` runs a short-lived probe
   (initialize → `session/new`, the `discover_commands` pattern) and reads
@@ -97,7 +97,7 @@
   session response's advertised `configOptions` (category `model` /
   `thought_level`, matched to advertised value ids, skipped when current,
   never fatal). Grok's effort ladder in the picker is Low/Medium/High →
-  `low`/`medium`/`high`; other zeron levels degrade down a preference ladder
+  `low`/`medium`/`high`; other komet levels degrade down a preference ladder
   (`config_option_sets`).
 - Steering: `_session/steering` extension when
   `initialize._meta.steering.supported` (org adapters); request carries
@@ -124,14 +124,14 @@
 ## Managed adapter installs (2026-08-15)
 - The `npx -y <pinned>` fallback put every user's npm state in the chat hot
   path and was the root of the "harness protocol error … exit code 254" class
-  of report (zeronsh/comet#95): npm encodes fatal fs errors as `256 - errno`
+  of report (kometsh/comet#95): npm encodes fatal fs errors as `256 - errno`
   exits (254 = ENOENT, 243 = EACCES — npm/cli#4838), often with no stderr,
   and a cold `npx` could also stall a first chat for minutes while it
   downloaded the adapter's dependency tree (claude-agent-acp's is ~570MB).
 - Replaced by `adapter_install`: pinned packages install ONCE into
-  `~/.zeron/adapters/<pkg>/<version>` (`$ZERON_ADAPTERS_DIR` overrides) with
-  a zeron-owned npm cache beside them, atomically (tmp dir + bin-entry
-  verification + `.zeron-install-ok` marker + rename), then every launch is
+  `~/.komet/adapters/<pkg>/<version>` (`$KOMET_ADAPTERS_DIR` overrides) with
+  a komet-owned npm cache beside them, atomically (tmp dir + bin-entry
+  verification + `.komet-install-ok` marker + rename), then every launch is
   `node <entry>` directly. Discovery probes never block on npm (background
   install + static-catalog fallback); `run()` blocks, and install failures
   carry npm's full output plus the decoded errno. The engine prewarms

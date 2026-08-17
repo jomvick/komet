@@ -97,9 +97,9 @@ struct MiniSpinner: View {
     }
 }
 
-/// zeron-pulse loading row: 5 cells, cosine wave, stagger 0.15/2.4
+/// komet-pulse loading row: 5 cells, cosine wave, stagger 0.15/2.4
 /// (loaders.rs:91).
-struct ZeronPulse: View {
+struct KometPulse: View {
     var cellSize: CGFloat = 6
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
@@ -108,7 +108,7 @@ struct ZeronPulse: View {
             let t = timeline.date.timeIntervalSinceReferenceDate
             HStack(spacing: cellSize / 2) {
                 ForEach(0..<5, id: \.self) { ix in
-                    let phase = (t / Motion.zeronPulsePeriod - Double(ix) * (0.15 / 2.4))
+                    let phase = (t / Motion.kometPulsePeriod - Double(ix) * (0.15 / 2.4))
                         .truncatingRemainder(dividingBy: 1)
                     let wave = (1 - cos(phase * 2 * .pi)) / 2
                     RoundedRectangle(cornerRadius: cellSize * 0.25)

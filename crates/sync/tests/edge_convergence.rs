@@ -5,16 +5,16 @@
 //! `edge/` with AUTH_MODE=dev). Run with:
 //!
 //! ```sh
-//! ZERON_EDGE_WS=ws://127.0.0.1:8787 cargo test -p zeron-sync -- --ignored
+//! KOMET_EDGE_WS=ws://127.0.0.1:8787 cargo test -p komet-sync -- --ignored
 //! ```
 //!
-//! `ZERON_EDGE_TOKEN` overrides the dev bearer (defaults to `sync-it-user`;
+//! `KOMET_EDGE_TOKEN` overrides the dev bearer (defaults to `sync-it-user`;
 //! both clients must share it — chat rooms are claim-on-first-join owned).
 
 use std::time::Duration;
 
-use zeron_doc::{MessagePart, MessageRole, SessionDoc, SessionMessageEntry};
-use zeron_sync::RoomClient;
+use komet_doc::{MessagePart, MessageRole, SessionDoc, SessionMessageEntry};
+use komet_sync::RoomClient;
 
 async fn wait_until(mut condition: impl FnMut() -> bool) {
     tokio::time::timeout(Duration::from_secs(30), async {
@@ -45,11 +45,11 @@ fn text_message(id: &str, device: &str, text: &str) -> SessionMessageEntry {
 }
 
 #[tokio::test]
-#[ignore = "requires a live edge: set ZERON_EDGE_WS (e.g. ws://127.0.0.1:8787)"]
+#[ignore = "requires a live edge: set KOMET_EDGE_WS (e.g. ws://127.0.0.1:8787)"]
 async fn two_session_docs_converge_through_a_real_room() {
-    let base = std::env::var("ZERON_EDGE_WS")
-        .expect("set ZERON_EDGE_WS to the edge origin, e.g. ws://127.0.0.1:8787");
-    let token = std::env::var("ZERON_EDGE_TOKEN").unwrap_or_else(|_| "sync-it-user".to_string());
+    let base = std::env::var("KOMET_EDGE_WS")
+        .expect("set KOMET_EDGE_WS to the edge origin, e.g. ws://127.0.0.1:8787");
+    let token = std::env::var("KOMET_EDGE_TOKEN").unwrap_or_else(|_| "sync-it-user".to_string());
     let chat_id = format!("it-{}", uuid::Uuid::new_v4().simple());
     let url = format!("{base}/session/{chat_id}/ws?token={token}");
 

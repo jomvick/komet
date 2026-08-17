@@ -739,7 +739,7 @@ pub fn join_continuation_entries(entries: Vec<SessionMessageEntry>) -> Vec<Sessi
 
 /// Incremental streaming writer for one assistant entry.
 ///
-/// Port of zeron's `DocSegmentWriter` diff discipline: called with the *folded* parts of the
+/// Port of komet's `DocSegmentWriter` diff discipline: called with the *folded* parts of the
 /// live segment (from `fold_event_into_parts`) at each commit tick, it diffs against what's in
 /// the doc and writes only the delta:
 /// - trailing text growth → `LoroText` append (RLE-merged),
@@ -968,7 +968,7 @@ pub fn materialize_tail(
 mod tests {
     use super::*;
     use crate::parts::fold_event_into_parts;
-    use zeron_proto::{AgentEvent, ToolCall};
+    use komet_proto::{AgentEvent, ToolCall};
 
     fn user_entry(id: &str, text: &str) -> SessionMessageEntry {
         SessionMessageEntry {
@@ -1151,7 +1151,7 @@ mod tests {
                 id: "t1".into(),
                 is_error: false,
                 output: Some("total 0\nmore lines".into()),
-                diff: Some(zeron_proto::ToolDiff {
+                diff: Some(komet_proto::ToolDiff {
                     path: "/w/a.rs".into(),
                     old_text: Some("old\n".into()),
                     new_text: "new\n".into(),
@@ -1207,7 +1207,7 @@ mod tests {
                 is_error: false,
                 resolved: true,
                 output: Some("full inline output\nline 2".into()),
-                diff: Some(zeron_proto::ToolDiff {
+                diff: Some(komet_proto::ToolDiff {
                     path: "/w/a.rs".into(),
                     old_text: Some("old".into()),
                     new_text: "new".into(),

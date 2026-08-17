@@ -4,7 +4,7 @@
 //! ## EngineHandle
 //! The UI talks the same typed RPC whether the engine is in-process or a separate
 //! daemon (ARCHITECTURE §1). [`EngineHandle::bootstrap`] probes the localhost IPC
-//! port, mirroring zeron: if an engine is listening it connects over WebSocket
+//! port, mirroring komet: if an engine is listening it connects over WebSocket
 //! ([`RemoteEngine`]); otherwise it embeds one via [`EngineCore::assemble`] and an
 //! in-memory RPC transport ([`InProcessEngine`]) — same envelopes, same dispatch.
 //!
@@ -27,12 +27,12 @@ use gpui::{App, Context, Entity, Task};
 use gpui_tokio::Tokio;
 use serde::de::DeserializeOwned;
 
-use zeron_doc::{SessionMessageEntry, TranscriptDesync, TranscriptFrame};
-use zeron_engine::{Engine, EngineConfig, EngineRuntime, InstanceLock, rpc::AuthRpc};
-use zeron_proto::{
+use komet_doc::{SessionMessageEntry, TranscriptDesync, TranscriptFrame};
+use komet_engine::{Engine, EngineConfig, EngineRuntime, InstanceLock, rpc::AuthRpc};
+use komet_proto::{
     AuthState, Chat, ChatIndicator, Device, EngineInfo, HarnessId, Session, Space, WorkspaceScope,
 };
-use zeron_rpc::{RpcClient, RpcError, RpcReply, RpcService, connect_ws, memory_client, methods};
+use komet_rpc::{RpcClient, RpcError, RpcReply, RpcService, connect_ws, memory_client, methods};
 
 // ---------------------------------------------------------------------------
 // Engine handle
@@ -41,7 +41,7 @@ use zeron_rpc::{RpcClient, RpcError, RpcReply, RpcService, connect_ws, memory_cl
 /// Everything needed to reach (or start) an engine.
 #[derive(Debug, Clone)]
 pub struct EngineBootConfig {
-    /// Data directory for the embedded engine (`~/.zeron`).
+    /// Data directory for the embedded engine (`~/.komet`).
     pub data_dir: PathBuf,
     /// Localhost IPC port to probe / serve.
     pub ipc_port: u16,
@@ -287,7 +287,7 @@ impl EngineHandle {
         //
         // Best-effort — losing the bind race with another engine costs other
         // viewports, not this one.
-        let ipc_task = match zeron_engine::serve_ipc(engine_config.ipc_port, service).await {
+        let ipc_task = match komet_engine::serve_ipc(engine_config.ipc_port, service).await {
             Ok(task) => Some(task),
             Err(err) => {
                 tracing::warn!(
@@ -495,10 +495,10 @@ async fn query_engine_info(client: &RpcClient) -> Result<EngineInfo, RpcError> {
 // ---------------------------------------------------------------------------
 
 // The frontend-agnostic derivations (sort orders, staleness gating, sidebar
-// grouping, the boot gate, relative times) live in `zeron_proto::view`, pure
+// grouping, the boot gate, relative times) live in `komet_proto::view`, pure
 // and with their own test suite. Re-exported here because every call site in
 // this crate reads them as `state::…`.
-pub use zeron_proto::view::{
+pub use komet_proto::view::{
     ChatGroup, ConnectionStatus, GatePhase, Indicator, SESSION_STALE_MS, attention_rank,
     chat_location, display_status, effective_indicator, format_time_ago, gate_phase, group_chats,
     parse_auth_state, project_label, sort_active, sort_chats, sort_spaces, sort_tabs,
@@ -610,7 +610,9 @@ pub struct AppState {
     /// the engine serves it — views degrade gracefully).
     pub local_device_id: Option<String>,
     /// Latest `UpdateStatus` frame — drives the sidebar update strip.
-    pub update: Option<zeron_update::UpdateStatus>,
+    pub update: Option<komet_update::UpdateStatus>,
+    /// Cumulative context & token usage metrics per chat id.
+    pub context_usage: HashMap<String, komet_proto::ContextUsageStats>,
     /// Data directory (`ui-settings.json`, `composer-defaults.json`); set at
     /// bootstrap so child views can persist small preference files.
     pub data_dir: Option<PathBuf>,
@@ -644,6 +646,7 @@ impl AppState {
             pending_sends: HashMap::new(),
             local_device_id: None,
             update: None,
+            context_usage: HashMap::new(),
             data_dir: None,
             engine: None,
             watch_tasks: Vec::new(),
@@ -700,7 +703,7 @@ impl AppState {
     /// Optimistic local echo of a `setChatConfig` mutate: stamp the row now so
     /// the chips update on click; the next chats watch frame carries the same
     /// value once the engine applies the LWW write.
-    pub fn apply_chat_config(&mut self, chat_id: &str, config: zeron_proto::ChatConfig) {
+    pub fn apply_chat_config(&mut self, chat_id: &str, config: komet_proto::ChatConfig) {
         if let Some(chat) = self.chats.iter_mut().find(|c| c.id == chat_id) {
             chat.config = Some(config);
         }
@@ -735,8 +738,48 @@ impl AppState {
             .map(|s| s.id.clone())
     }
 
-    pub fn apply_update(&mut self, status: zeron_update::UpdateStatus) {
+    pub fn apply_update(&mut self, status: komet_update::UpdateStatus) {
         self.update = Some(status);
+    }
+
+    pub fn apply_context_usage(&mut self, chat_id: &str, stats: komet_proto::ContextUsageStats) {
+        self.context_usage.insert(chat_id.to_string(), stats);
+    }
+
+    /// Derives or returns the current context usage metrics for the selected chat.
+    pub fn current_context_usage(&self) -> komet_proto::ContextUsageStats {
+        if let Some(chat_id) = &self.selected_chat {
+            if let Some(stats) = self.context_usage.get(chat_id) {
+                return stats.clone();
+            }
+        }
+        let model_name = self
+            .selected_chat_row()
+            .and_then(|c| c.config.as_ref())
+            .and_then(|cfg| cfg.model.as_deref())
+            .unwrap_or("claude-3-7-sonnet");
+        let limit = komet_proto::default_context_limit_for_model(model_name);
+        let mut stats = komet_proto::ContextUsageStats::new(limit);
+
+        let mut total_chars: usize = 0;
+        for entry in &self.transcript {
+            for part in &entry.parts {
+                match part {
+                    komet_doc::MessagePart::Text { text, .. } => {
+                        total_chars += text.len();
+                    }
+                    komet_doc::MessagePart::Tool { output, .. } => {
+                        if let Some(out) = output {
+                            total_chars += out.len();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let estimated_tokens = (total_chars / 4) as u64;
+        stats.input_tokens = estimated_tokens;
+        stats
     }
 
     pub fn apply_auth(&mut self, auth: AuthState) {
@@ -752,7 +795,7 @@ impl AppState {
     }
 
     /// The signed-in user, if the engine reports one.
-    pub fn auth_user(&self) -> Option<&zeron_proto::UserProfile> {
+    pub fn auth_user(&self) -> Option<&komet_proto::UserProfile> {
         match self.auth.as_ref()? {
             AuthState::SignedIn { user, .. } | AuthState::NeedsOrganization { user } => Some(user),
             AuthState::SignedOut => None,
@@ -776,7 +819,7 @@ impl AppState {
         &mut self,
         frame: TranscriptFrame,
     ) -> Result<(), TranscriptDesync> {
-        zeron_doc::apply_transcript_frame(&mut self.transcript, frame)?;
+        komet_doc::apply_transcript_frame(&mut self.transcript, frame)?;
         if let Some(chat_id) = self.selected_chat.as_deref()
             && let Some(echoes) = self.echoes.get_mut(chat_id)
         {
@@ -1503,10 +1546,10 @@ fn spawn_transcript_watch(
 mod tests {
     use super::*;
     use chrono::TimeDelta;
-    use zeron_engine::{EngineCore, default_registry};
+    use komet_engine::{EngineCore, default_registry};
     // `SessionStatus` is only needed to build the fixtures below — the module
-    // itself derives everything through `zeron_proto::view`.
-    use zeron_proto::{SessionStatus, UserProfile};
+    // itself derives everything through `komet_proto::view`.
+    use komet_proto::{SessionStatus, UserProfile};
 
     /// A localhost port that was just free (bind :0, read, drop).
     async fn free_port() -> u16 {
@@ -1580,7 +1623,7 @@ mod tests {
     async fn remote_viewport_treats_legacy_daemon_as_ready() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let server = tokio::spawn(zeron_rpc::serve_ws_listener(
+        let server = tokio::spawn(komet_rpc::serve_ws_listener(
             listener,
             Arc::new(LegacyIdentityRpc),
         ));
@@ -1648,7 +1691,7 @@ mod tests {
     #[tokio::test]
     async fn bootstrap_reports_local_assembly_failure_before_returning_a_handle() {
         let dir = tempfile::tempdir().unwrap();
-        zeron_engine::EngineProfile::local(dir.path()).unwrap();
+        komet_engine::EngineProfile::local(dir.path()).unwrap();
         std::fs::create_dir(dir.path().join("profiles")).unwrap();
         std::fs::write(dir.path().join("profiles/local"), b"not a directory").unwrap();
         let port = free_port().await;
@@ -1696,7 +1739,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let (state_tx, state_rx) = tokio::sync::watch::channel(DeferredEngineState::Waiting);
-        let server = tokio::spawn(zeron_rpc::serve_ws_listener(
+        let server = tokio::spawn(komet_rpc::serve_ws_listener(
             listener,
             Arc::new(DeferredIdentityRpc {
                 engine_info: EngineInfo {
@@ -1970,7 +2013,7 @@ mod tests {
 
     #[tokio::test]
     async fn bootstrap_connects_when_daemon_is_listening() {
-        // Stand in for `zeron headless`: an engine served over the WS IPC port.
+        // Stand in for `komet headless`: an engine served over the WS IPC port.
         let daemon_dir = tempfile::tempdir().unwrap();
         let core = EngineCore::assemble(
             daemon_dir.path(),
@@ -1981,7 +2024,7 @@ mod tests {
         .unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        tokio::spawn(zeron_rpc::serve_ws_listener(listener, core.rpc_service()));
+        tokio::spawn(komet_rpc::serve_ws_listener(listener, core.rpc_service()));
 
         let ui_dir = tempfile::tempdir().unwrap();
         let handle = EngineHandle::bootstrap(EngineBootConfig {
@@ -2079,7 +2122,7 @@ mod tests {
     fn user_entry(id: &str) -> SessionMessageEntry {
         SessionMessageEntry {
             id: id.into(),
-            role: zeron_doc::MessageRole::User,
+            role: komet_doc::MessageRole::User,
             parts: Vec::new(),
             created_at: 0,
             device_id: "dev".into(),
@@ -2376,12 +2419,12 @@ mod tests {
     fn apply_chat_config_stamps_the_row() {
         let mut state = AppState::new();
         state.apply_chats(vec![chat("a", 0, None), chat("b", 1, None)]);
-        let config = zeron_proto::ChatConfig {
+        let config = komet_proto::ChatConfig {
             harness: HarnessId::ClaudeCode,
             model: Some("claude-fable-5".into()),
-            reasoning: Some(zeron_proto::ReasoningLevel::XHigh),
+            reasoning: Some(komet_proto::ReasoningLevel::XHigh),
             model_options: serde_json::Map::new(),
-            sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+            sandbox: komet_proto::SandboxLevel::WorkspaceWrite,
         };
         state.apply_chat_config("a", config.clone());
         assert_eq!(
@@ -2400,12 +2443,12 @@ mod tests {
         // Unknown chat: no-op, no panic.
         state.apply_chat_config(
             "missing",
-            zeron_proto::ChatConfig {
+            komet_proto::ChatConfig {
                 harness: HarnessId::ClaudeCode,
                 model: None,
                 reasoning: None,
                 model_options: serde_json::Map::new(),
-                sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+                sandbox: komet_proto::SandboxLevel::WorkspaceWrite,
             },
         );
     }
@@ -2426,7 +2469,7 @@ mod tests {
         state.selected_chat = Some("c1".into());
         let echo = SessionMessageEntry {
             id: "m1".into(),
-            role: zeron_doc::MessageRole::User,
+            role: komet_doc::MessageRole::User,
             parts: vec![],
             created_at: 0,
             device_id: "local".into(),
@@ -2588,8 +2631,8 @@ mod tests {
 
     #[test]
     fn project_labels_from_cwd() {
-        assert_eq!(project_label(Some("/home/w/dev/zeron")), "zeron");
-        assert_eq!(project_label(Some("/home/w/dev/zeron/")), "zeron");
+        assert_eq!(project_label(Some("/home/w/dev/komet")), "komet");
+        assert_eq!(project_label(Some("/home/w/dev/komet/")), "komet");
         assert_eq!(project_label(None), "No project");
         assert_eq!(project_label(Some("   ")), "No project");
         assert_eq!(project_label(Some("/")), "/");
@@ -2599,22 +2642,22 @@ mod tests {
     fn grouped_sidebar_preserves_recency_order() {
         // Input is sidebar-sorted (most recent first).
         let chats = [
-            chat_with_cwd("a", 9, Some("/dev/zeron")),
+            chat_with_cwd("a", 9, Some("/dev/komet")),
             chat_with_cwd("b", 8, Some("/dev/zed")),
-            chat_with_cwd("c", 7, Some("/dev/zeron")),
+            chat_with_cwd("c", 7, Some("/dev/komet")),
             chat_with_cwd("d", 6, None),
         ];
         let groups = group_chats(chats.iter());
         let labels: Vec<&str> = groups.iter().map(|g| g.label.as_str()).collect();
         // Groups ordered by their most recent chat; rows keep order.
-        assert_eq!(labels, ["zeron", "zed", "No project"]);
-        let zeron_ids: Vec<&str> = groups[0].chats.iter().map(|c| c.id.as_str()).collect();
-        assert_eq!(zeron_ids, ["a", "c"]);
+        assert_eq!(labels, ["komet", "zed", "No project"]);
+        let komet_ids: Vec<&str> = groups[0].chats.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(komet_ids, ["a", "c"]);
         assert!(group_chats(std::iter::empty()).is_empty());
     }
 
     #[test]
-    fn relative_times_match_zeron_format() {
+    fn relative_times_match_komet_format() {
         let now = Utc::now();
         let ago = |secs: i64| now - chrono::Duration::seconds(secs);
         assert_eq!(format_time_ago(ago(0), now), "now");
@@ -2639,10 +2682,10 @@ mod tests {
     #[test]
     fn chat_location_joins_project_and_branch() {
         let mut c = chat_with_cwd("x", 1, Some("/home/w/dev/soccertcg"));
-        c.branch = Some("zeron/rebalance".into());
+        c.branch = Some("komet/rebalance".into());
         assert_eq!(
             chat_location(&c).as_deref(),
-            Some("soccertcg · zeron/rebalance")
+            Some("soccertcg · komet/rebalance")
         );
         c.branch = None;
         assert_eq!(chat_location(&c).as_deref(), Some("soccertcg"));

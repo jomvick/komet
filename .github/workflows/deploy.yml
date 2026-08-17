@@ -5,7 +5,7 @@ name: deploy
 # gracefully until the CLOUDFLARE_API_TOKEN secret is configured (until then:
 # `npm -C edge run deploy` from a wrangler-authenticated machine).
 #
-# The token needs: Workers Scripts (edit), Workers Routes (edit) on zeron.sh,
+# The token needs: Workers Scripts (edit), Workers Routes (edit) on komet.sh,
 # Workers R2 Storage (edit). Account id is pinned in edge/wrangler.jsonc.
 
 on:
@@ -66,7 +66,7 @@ jobs:
         working-directory: edge
         run: npx wrangler deploy
 
-  # Static landing page (zeron.sh) — assets-only worker, no build step.
+  # Static landing page (komet.sh) — assets-only worker, no build step.
   landing:
     runs-on: ubuntu-latest
     env:
@@ -98,7 +98,7 @@ jobs:
         working-directory: apps/landing
         run: npx wrangler@4 deploy
 
-  # www.zeron.sh → zeron.sh 301 (see apps/www-redirect/wrangler.jsonc).
+  # www.komet.sh → komet.sh 301 (see apps/www-redirect/wrangler.jsonc).
   www-redirect:
     runs-on: ubuntu-latest
     env:

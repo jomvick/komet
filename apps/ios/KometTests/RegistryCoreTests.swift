@@ -4,7 +4,7 @@
 // crates/doc/src/registry.rs (cargo test); change all three together.
 
 import XCTest
-@testable import Zeron
+@testable import Komet
 
 private func hlc(_ ms: Int64, _ device: String = "dev-a", _ counter: UInt32 = 0) -> Hlc {
     encodeHlc(ms: ms, counter: counter, device: device)

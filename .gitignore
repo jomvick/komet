@@ -2,6 +2,8 @@
 **/*.rs.bk
 # Local-only scratch space — holds signing/notary credentials, never commit.
 /ignore/
+# Freebuff tool state — never commit.
+/.freebuff/
 *.pdb
 .DS_Store
 .env

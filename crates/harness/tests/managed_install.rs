@@ -1,19 +1,19 @@
 //! Real-world E2E for the managed adapter install: with no `codex-acp`
 //! binary anywhere, `run()` must npm-install the pinned adapter into
-//! `$ZERON_ADAPTERS_DIR`, spawn it via node, and reach SessionStarted (the
+//! `$KOMET_ADAPTERS_DIR`, spawn it via node, and reach SessionStarted (the
 //! full initialize → session/new handshake) — the exact path that used to be
-//! `npx -y` at chat time (zeronsh/comet#95).
+//! `npx -y` at chat time (kometsh/comet#95).
 //!
 //! Ignored: needs network, npm, and the codex CLI on the machine. Run with
-//! `cargo test -p zeron-harness --test managed_install -- --ignored`.
+//! `cargo test -p komet-harness --test managed_install -- --ignored`.
 //!
-//! Single-test binary: it mutates ZERON_ADAPTERS_DIR process-wide.
+//! Single-test binary: it mutates KOMET_ADAPTERS_DIR process-wide.
 
 use futures::StreamExt;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use zeron_harness::{AcpHarness, Harness, RunControls};
-use zeron_proto::{AgentEvent, RunRequest};
+use komet_harness::{AcpHarness, Harness, RunControls};
+use komet_proto::{AgentEvent, RunRequest};
 
 #[tokio::test]
 #[ignore = "network + npm + codex CLI; installs the pinned adapter for real"]
@@ -21,7 +21,7 @@ async fn managed_install_reaches_session_started() {
     let adapters = tempfile::tempdir().unwrap();
     // SAFETY: single-test binary — nothing else reads env concurrently.
     unsafe {
-        std::env::set_var("ZERON_ADAPTERS_DIR", adapters.path());
+        std::env::set_var("KOMET_ADAPTERS_DIR", adapters.path());
         std::env::remove_var("CODEX_ACP_EXECUTABLE");
     }
 
@@ -40,7 +40,7 @@ async fn managed_install_reaches_session_started() {
         reasoning: None,
         model_options: serde_json::Map::new(),
         cwd: std::env::temp_dir().display().to_string(),
-        sandbox: zeron_proto::SandboxLevel::WorkspaceWrite,
+        sandbox: komet_proto::SandboxLevel::WorkspaceWrite,
         auto_approve: true,
         attachments: Vec::new(),
         resume: None,
@@ -89,5 +89,5 @@ async fn managed_install_reaches_session_started() {
         .next()
         .expect("a pinned version dir")
         .path();
-    assert!(version_dir.join(".zeron-install-ok").exists());
+    assert!(version_dir.join(".komet-install-ok").exists());
 }

@@ -6,20 +6,20 @@
 //!   base ids (`auto-smart`) plus real config options (`optimize_for`,
 //!   `effort`, `fast`, `thinking`, `context`).
 //!
-//! Zeron opts into parameterized mode. Auto's Intelligence / Balance / Cost
+//! Komet opts into parameterized mode. Auto's Intelligence / Balance / Cost
 //! tiers are the `optimize_for` select advertised on the session. HTML effort
 //! badges still appear on some display names and are stripped.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
-use zeron_proto::{Model, ModelOption, ModelOptionChoice, ReasoningLevel};
+use komet_proto::{Model, ModelOption, ModelOptionChoice, ReasoningLevel};
 
 /// Strip Cursor's effort-badge HTML from a model name and return the plain
 /// label plus the badge text when present.
 ///
 /// The badge is a muted High/Medium/Low chip in Cursor's own UI — not markup
-/// Zeron can render — so callers put it on the description subline (or fold
+/// Komet can render — so callers put it on the description subline (or fold
 /// it into a Reasoning ladder when the family has multiple variants).
 pub(crate) fn clean_label(name: &str) -> (String, Option<String>) {
     let mut badges = Vec::new();
@@ -346,7 +346,7 @@ fn looks_parameterized(models: &[Model]) -> bool {
     exploded * 2 < models.len()
 }
 
-/// Rewrite the wire model list into Zeron's picker shape.
+/// Rewrite the wire model list into Komet's picker shape.
 pub(crate) fn enrich_models(models: Vec<Model>, session: &Value) -> Vec<Model> {
     let options = config_options(session);
     let mode_current = option_current(options, "mode");
@@ -560,7 +560,7 @@ pub(crate) fn pick_model_id(
         .map(|id| (*id).to_owned())
 }
 
-/// Preference-ordered effort tokens for a Zeron reasoning pick, used when
+/// Preference-ordered effort tokens for a Komet reasoning pick, used when
 /// resolving a Cursor family variant.
 pub(crate) fn effort_tokens(level: ReasoningLevel) -> Vec<&'static str> {
     let primary = effort_for_level(level);
@@ -576,7 +576,7 @@ pub(crate) fn effort_tokens(level: ReasoningLevel) -> Vec<&'static str> {
 mod tests {
     use super::*;
     use serde_json::json;
-    use zeron_proto::Model;
+    use komet_proto::Model;
 
     #[test]
     fn clean_label_strips_span_badges_without_duplicating() {

@@ -19,9 +19,9 @@ use gpui::{
     px,
 };
 
-use zeron_engine::registry::{HarnessDescriptor, descriptor_enabled};
-use zeron_proto::HarnessId;
-use zeron_rpc::methods;
+use komet_engine::registry::{HarnessDescriptor, descriptor_enabled};
+use komet_proto::HarnessId;
+use komet_rpc::methods;
 
 use crate::pickers::visible_harnesses;
 use crate::popover::{self, Loadable};

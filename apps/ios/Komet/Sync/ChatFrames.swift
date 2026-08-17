@@ -2,7 +2,7 @@
 // edge/src/chat-frames.ts. Binary WS frames:
 // `[type u8][headerLen u32 LE][header JSON][payload]`. Headers are tiny JSON;
 // payloads are opaque bytes (Loro updates, the checkpoint frontier). The
-// layout tests in ZeronTests pin the same vectors as the Rust/TS suites —
+// layout tests in KometTests pin the same vectors as the Rust/TS suites —
 // change all three together.
 
 import Foundation

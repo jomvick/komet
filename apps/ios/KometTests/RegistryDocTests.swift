@@ -2,7 +2,7 @@
 // HLC clock (task-specific tests beyond the shared conformance vectors).
 
 import XCTest
-@testable import Zeron
+@testable import Komet
 
 final class RegistryDocPersistenceTests: XCTestCase {
     func testPersistenceBlobRoundTrips() throws {

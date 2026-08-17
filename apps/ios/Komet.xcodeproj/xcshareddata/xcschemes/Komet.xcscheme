@@ -15,9 +15,9 @@
             <BuildableReference
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "A1000000000000000000T001"
-               BuildableName = "Zeron.app"
-               BlueprintName = "Zeron"
-               ReferencedContainer = "container:Zeron.xcodeproj">
+               BuildableName = "Komet.app"
+               BlueprintName = "Komet"
+               ReferencedContainer = "container:Komet.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
       </BuildActionEntries>
@@ -33,9 +33,9 @@
             <BuildableReference
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "A2000000000000000000T001"
-               BuildableName = "ZeronTests.xctest"
-               BlueprintName = "ZeronTests"
-               ReferencedContainer = "container:Zeron.xcodeproj">
+               BuildableName = "KometTests.xctest"
+               BlueprintName = "KometTests"
+               ReferencedContainer = "container:Komet.xcodeproj">
             </BuildableReference>
          </TestableReference>
       </Testables>
@@ -55,9 +55,9 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "A1000000000000000000T001"
-            BuildableName = "Zeron.app"
-            BlueprintName = "Zeron"
-            ReferencedContainer = "container:Zeron.xcodeproj">
+            BuildableName = "Komet.app"
+            BlueprintName = "Komet"
+            ReferencedContainer = "container:Komet.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
    </LaunchAction>

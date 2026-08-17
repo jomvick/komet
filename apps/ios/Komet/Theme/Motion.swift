@@ -16,7 +16,7 @@ enum Motion {
 
     // WorkingIndicator wave period (GRADIENT_SPIN) and loader pulse.
     static let gradientSpinPeriod: Double = 0.75
-    static let zeronPulsePeriod: Double = 2.4
+    static let kometPulsePeriod: Double = 2.4
 
     /// WorkingIndicator flavour words (transcript.rs:795), rotated every 7s,
     /// seeded per chat.

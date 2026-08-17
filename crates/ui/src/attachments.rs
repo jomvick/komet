@@ -3,7 +3,7 @@
 //! transport that rides the prompt, the transcript read-back cache, and the
 //! full-size preview lightbox.
 //!
-//! Ports of zeron's `composer/use-attachments.ts` (staging/upload),
+//! Ports of komet's `composer/use-attachments.ts` (staging/upload),
 //! `control/message-attachments.ts` (the `withAttachments` /
 //! `parseUserMessageImages` text transport — attachment refs are embedded in
 //! the user message's plain text, which is exactly what persists in the doc),
@@ -25,11 +25,11 @@ use gpui::{
 
 use crate::state::EngineHandle;
 use crate::theme::ink;
-use zeron_rpc::methods;
+use komet_rpc::methods;
 
 /// use-attachments.ts `MAX_ATTACHMENT_BYTES`.
 pub const MAX_ATTACHMENT_BYTES: u64 = 24 * 1024 * 1024;
-/// Base64 chars per `UploadChunk` (zeron state.ts `UPLOAD_CHUNK` — sized for
+/// Base64 chars per `UploadChunk` (komet state.ts `UPLOAD_CHUNK` — sized for
 /// the relay when the target device is remote).
 pub const UPLOAD_CHUNK_B64_CHARS: usize = 60_000;
 /// state.ts `MAX_ATTACHMENT_READ_CHUNKS` — bounds the read-back loop.
@@ -92,7 +92,7 @@ fn name_from_path(path: &str) -> String {
 
 /// Find the refs trailer: a blank line, then a line starting (case-insensitive)
 /// with `Attached images (local files` and ending `):`. Returns
-/// `(body_end, refs_start)` byte offsets — the tolerant equivalent of zeron's
+/// `(body_end, refs_start)` byte offsets — the tolerant equivalent of komet's
 /// `ATTACHED_IMAGES_RE`.
 fn find_refs_marker(content: &str) -> Option<(usize, usize)> {
     let lower = content.to_ascii_lowercase();
@@ -372,7 +372,7 @@ pub struct LoadedAttachmentImage {
 }
 
 /// `ReadAttachmentChunk` loop: 45KB base64 chunks until `done` (bounded, with
-/// the same stuck-offset guard as zeron's `readAttachmentImage`).
+/// the same stuck-offset guard as komet's `readAttachmentImage`).
 pub async fn read_attachment_image(
     engine: &EngineHandle,
     executor: &BackgroundExecutor,

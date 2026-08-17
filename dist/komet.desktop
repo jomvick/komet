@@ -1,12 +1,12 @@
 [Desktop Entry]
 Type=Application
-Name=Zeron
+Name=Komet
 GenericName=Coding Agent Controller
 Comment=Multi-device controller for coding agents
-Exec=zeron
-TryExec=zeron
-Icon=zeron
+Exec=komet
+TryExec=komet
+Icon=komet
 Terminal=false
 Categories=Development;Utility;
 Keywords=agent;claude;codex;ai;coding;
-StartupWMClass=zeron
+StartupWMClass=komet

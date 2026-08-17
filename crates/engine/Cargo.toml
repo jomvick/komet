@@ -1,17 +1,17 @@
 [package]
-name = "zeron-engine"
+name = "komet-engine"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
 [dependencies]
-zeron-proto.workspace = true
-zeron-doc.workspace = true
-zeron-sync.workspace = true
-zeron-harness.workspace = true
-zeron-rpc.workspace = true
-zeron-update.workspace = true
+komet-proto.workspace = true
+komet-doc.workspace = true
+komet-sync.workspace = true
+komet-harness.workspace = true
+komet-rpc.workspace = true
+komet-update.workspace = true
 loro.workspace = true
 tokio.workspace = true
 futures.workspace = true
@@ -38,4 +38,4 @@ ignore.workspace = true
 tempfile.workspace = true
 tokio-tungstenite.workspace = true
 # In-process registry server for the two-engine workspace integration tests.
-zeron-sync = { workspace = true, features = ["mock-server"] }
+komet-sync = { workspace = true, features = ["mock-server"] }

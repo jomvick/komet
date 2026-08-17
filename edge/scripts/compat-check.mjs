@@ -1,8 +1,8 @@
-// Cross-language compat gate: a snapshot written by the Rust `zeron-doc` crate must load in
+// Cross-language compat gate: a snapshot written by the Rust `komet-doc` crate must load in
 // loro-crdt JS and materialize the same tail shape the edge serves.
 //
 // Usage: node scripts/compat-check.mjs <snapshot-path>
-// (Generate the snapshot with: cargo run -p zeron-doc --example gen_fixture -- /tmp/fixture.loro)
+// (Generate the snapshot with: cargo run -p komet-doc --example gen_fixture -- /tmp/fixture.loro)
 
 import { readFileSync } from "node:fs";
 import { LoroDoc } from "loro-crdt";

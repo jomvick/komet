@@ -10,7 +10,7 @@ members = [
     "crates/update",
     "crates/ui",
     "crates/syntax",
-    "apps/zeron",
+    "apps/komet",
 ]
 
 [workspace.package]
@@ -20,15 +20,15 @@ license = "MIT"
 publish = false
 
 [workspace.dependencies]
-zeron-proto = { path = "crates/proto" }
-zeron-doc = { path = "crates/doc" }
-zeron-sync = { path = "crates/sync" }
-zeron-harness = { path = "crates/harness" }
-zeron-engine = { path = "crates/engine" }
-zeron-rpc = { path = "crates/rpc" }
-zeron-update = { path = "crates/update" }
-zeron-ui = { path = "crates/ui" }
-zeron-syntax = { path = "crates/syntax" }
+komet-proto = { path = "crates/proto" }
+komet-doc = { path = "crates/doc" }
+komet-sync = { path = "crates/sync" }
+komet-harness = { path = "crates/harness" }
+komet-engine = { path = "crates/engine" }
+komet-rpc = { path = "crates/rpc" }
+komet-update = { path = "crates/update" }
+komet-ui = { path = "crates/ui" }
+komet-syntax = { path = "crates/syntax" }
 
 # CRDT
 loro = "1.13"
@@ -46,7 +46,7 @@ loro-protocol = "0.3"
 # sidebar); a6c1ad5 adds BackdropBlur + horizontal EdgeFade + glass fixes;
 # 9b672fa bounds renderer GPU memory (region-sized backdrop blur scratch,
 # idle release of blur/path intermediates, instance pool shrink,
-# ZERON_GPU_STATS=1 diagnostics); b687328 adds ImageSource::evict (frees
+# KOMET_GPU_STATS=1 diagnostics); b687328 adds ImageSource::evict (frees
 # sprite-atlas tiles — remove_asset alone leaked them, see
 # attachments::flush_evicted); ac135eb adds device memory to the stats line;
 # f596cde fixes destination alpha on transparent windows (Porter-Duff OVER,

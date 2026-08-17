@@ -21,14 +21,14 @@ use tokio_tungstenite::tungstenite::handshake::server::{
     Request as WsRequest, Response as WsResponse,
 };
 
-use zeron_doc::SessionCommandPayload;
-use zeron_engine::{EngineCore, HarnessRegistry};
-use zeron_harness::{Harness, HarnessError, RunControls};
-use zeron_proto::{
+use komet_doc::SessionCommandPayload;
+use komet_engine::{EngineCore, HarnessRegistry};
+use komet_harness::{Harness, HarnessError, RunControls};
+use komet_proto::{
     AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
     SteeringMode,
 };
-use zeron_rpc::{
+use komet_rpc::{
     DeviceFrameHeader, LinkCache, LinkCacheConfig, StaticToken, decode_device_frame,
     encode_device_frame, methods,
 };
@@ -214,7 +214,7 @@ async fn target_device_id_routes_over_the_relay() {
         .write_user_message("m-b-1", "hello from B", 1_000)
         .expect("write user message");
 
-    let client = zeron_rpc::memory_client(core_a.rpc_service());
+    let client = komet_rpc::memory_client(core_a.rpc_service());
 
     // Our own id in targetDeviceId: handled locally, no forward.
     let local = client
@@ -373,7 +373,7 @@ async fn terminal_stream_proxies_over_the_relay() {
         LinkCacheConfig::new(relay_url.clone(), Arc::new(StaticToken("test-user".into())));
     link_config.probe_timeout = Duration::from_secs(5);
     core_a.set_links(LinkCache::new(link_config));
-    let client = zeron_rpc::memory_client(core_a.rpc_service());
+    let client = komet_rpc::memory_client(core_a.rpc_service());
 
     // OpenTerminal forwards to B once the relay session is up.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
@@ -460,7 +460,7 @@ async fn terminal_stream_proxies_over_the_relay() {
 async fn remote_target_without_links_fails_clearly() {
     let dirs = tempfile::tempdir().expect("tempdir");
     let core = assemble(&dirs.path().join("solo"), "device-solo");
-    let client = zeron_rpc::memory_client(core.rpc_service());
+    let client = komet_rpc::memory_client(core.rpc_service());
     let err = client
         .call(
             methods::LIST_HARNESSES,

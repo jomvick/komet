@@ -5,7 +5,7 @@ Status: Approved (brainstorming) — implementation order: harness + proto first
 
 ## Summary
 
-Add the opencode CLI as a supported agent in zeron/comet, driven over the
+Add the opencode CLI as a supported agent in komet/comet, driven over the
 Agent Client Protocol. opencode ships a **native ACP server** (`opencode acp`,
 JSON-RPC stdio), so no external adapter is needed — the same shape as Cursor,
 Grok and Hermes, which are also native ACP.
@@ -89,8 +89,8 @@ registry.register_lazy(
         installed: true,
         enabled: None,
     },
-    Box::new(|| zeron_harness::AcpHarness::opencode().installed()),
-    Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::opencode()) as Arc<dyn Harness>)),
+    Box::new(|| komet_harness::AcpHarness::opencode().installed()),
+    Box::new(|| Ok(Arc::new(komet_harness::AcpHarness::opencode()) as Arc<dyn Harness>)),
 );
 ```
 
@@ -99,7 +99,7 @@ coverage (`HarnessId::OpenCode` added to the expected vectors).
 
 ### 4. Auth — no integration
 
-opencode has no zeron account. The Accounts page does **not** list it; the
+opencode has no komet account. The Accounts page does **not** list it; the
 `provider_icon` match in `crates/ui/src/settings/accounts.rs` already has a
 `_ =>` fallback, so **no change** is required there. Auth is managed by
 opencode (`opencode auth login`).

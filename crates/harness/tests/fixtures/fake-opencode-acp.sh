@@ -1,5 +1,5 @@
 #!/bin/sh
-# Fake opencode ACP server for zeron-harness tests.
+# Fake opencode ACP server for komet-harness tests.
 #
 # Mimes the real `opencode acp` wire: initialize with NO `_session/steering`
 # extension (opencode delivers at turn boundaries), then session/new
@@ -21,7 +21,7 @@ update() { # $1 = update json object body
 read -r line || exit 1 # initialize
 has "$line" '"method":"initialize"' || exit 1
 has "$line" '"protocolVersion":1' || exit 1
-has "$line" '"name":"zeron"' || exit 1
+has "$line" '"name":"komet"' || exit 1
 has "$line" '"readTextFile":false' || exit 1
 # No `_meta.steering` — opencode has no steering extension; steers arrive as
 # plain session/prompt at turn boundaries.
@@ -35,7 +35,7 @@ if has "$line" '"method":"session/new"'; then
   # opencode's advertised state: model select (OpenCode Zen, current differs
   # from the probe's default to force a set) + mode select (build/plan), no
   # thought_level. The mode option rides as a Traits select only when the run
-  # selects it; opencode's own defaults match zeron's (build, no prompts).
+  # selects it; opencode's own defaults match komet's (build, no prompts).
   emit "{\"id\":$(rid "$line"),\"result\":{\"sessionId\":\"s-op\",\"configOptions\":[{\"id\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":\"opencode/big-pickle\",\"options\":[{\"value\":\"opencode/big-pickle\",\"name\":\"Big Pickle\"},{\"value\":\"opencode/smol\",\"name\":\"Smol\"}]},{\"id\":\"mode\",\"name\":\"Mode\",\"category\":\"mode\",\"type\":\"select\",\"currentValue\":\"build\",\"options\":[{\"value\":\"build\",\"name\":\"Build\"},{\"value\":\"plan\",\"name\":\"Plan\"}]}]}}"
 else
   exit 1

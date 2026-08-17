@@ -135,7 +135,7 @@ mod tests {
     use super::*;
     use crate::schema::{MessageRole, SessionMessageEntry};
     use crate::{MessageStatus, SessionCommandEntry, SessionCommandPayload};
-    use zeron_proto::{ToolCall, ToolDiff};
+    use komet_proto::{ToolCall, ToolDiff};
 
     /// ~4KB of varied output — repeated text would compress away inside the
     /// Loro snapshot and hide the size win the assertion checks.

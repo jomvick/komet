@@ -1,4 +1,4 @@
-//! zeron-ui — the gpui viewport. Shell, sidebar, conversation, composer, terminal,
+//! komet-ui — the gpui viewport. Shell, sidebar, conversation, composer, terminal,
 //! diff pane.
 //!
 //! Design: ARCHITECTURE.md §4; animation catalog docs/research/feature-inventory.md
@@ -6,21 +6,25 @@
 //!
 //! M3a foundation:
 //! - [`theme`] — always-dark monochrome theme (oklch-derived neutrals), a gpui Global;
-//! - [`motion`] — the zeron animation catalog over gpui `Animation` + cubic-bezier;
+//! - [`motion`] — the komet animation catalog over gpui `Animation` + cubic-bezier;
 //! - [`state`] — `AppState` entity + `EngineHandle` (connect-or-embed engine);
 //! - [`settings`] — persisted pane widths/collapse flags;
 //! - [`shell`] — sidebar + main panel + right-pane scaffold + gate;
-//! - [`loaders`] — zeron pulse loader, gradient spinner, boot splash.
+//! - [`loaders`] — komet pulse loader, gradient spinner, boot splash.
 
 pub mod app_menus;
 pub mod appearance;
 pub mod attachments;
+pub mod blobatar;
 pub mod changes;
 pub mod composer;
+pub mod context_usage;
 pub mod edge_fade;
+pub mod files;
 pub mod frost;
 pub mod history;
 pub mod icons;
+pub mod komet_avatar;
 pub mod loaders;
 pub mod markdown;
 pub mod motion;
@@ -35,6 +39,7 @@ pub mod state;
 pub mod syntax_cache;
 pub mod terminal;
 pub mod theme;
+pub mod thinking_orbs;
 pub mod transcript;
 
 use std::borrow::Cow;
@@ -73,10 +78,10 @@ fn register_fonts(cx: &App) {
 }
 
 pub use state::EngineBootConfig;
-pub use zeron_proto::HarnessId;
+pub use komet_proto::HarnessId;
 
 /// Everything the headed binary passes in (config/env resolution lives in
-/// `apps/zeron`, not here).
+/// `apps/komet`, not here).
 #[derive(Debug, Clone)]
 pub struct UiConfig {
     /// Data directory — engine stores + `ui-settings.json`.
@@ -192,7 +197,7 @@ pub fn run_app(config: UiConfig) {
 /// root view. Called at boot and again from `on_reopen` if the dock icon is
 /// clicked after ⌘W closed the window.
 fn open_main_window(state: gpui::Entity<state::AppState>, boot: EngineBootConfig, cx: &mut App) {
-    // zeron window geometry: 1320×880, min 900×600 (feature-inventory §1.1).
+    // komet window geometry: 1320×880, min 900×600 (feature-inventory §1.1).
     let bounds = Bounds::centered(None, size(px(1320.), px(880.)), cx);
     cx.open_window(
         WindowOptions {
@@ -231,7 +236,7 @@ fn open_main_window(state: gpui::Entity<state::AppState>, boot: EngineBootConfig
             // — if these two ever disagree, vibrancy dies on the first theme
             // change and never comes back.
             window_background: theme::Theme::of(cx).window_background_appearance(),
-            app_id: Some("zeron".into()),
+            app_id: Some("komet".into()),
             ..Default::default()
         },
         move |window, cx| {

@@ -20,7 +20,7 @@ import os
 /// Sync must never fail silently (2026-07-31: a send that never left the
 /// device was indistinguishable from a working one — `try?` all the way
 /// down). Visible in Console.app / `log stream` under this subsystem.
-let roomLog = Logger(subsystem: "sh.zeron.Zeron", category: "sync")
+let roomLog = Logger(subsystem: "sh.komet.Komet", category: "sync")
 
 enum ChatRoomEvent: Sendable {
     /// Joined (or re-joined) and the initial catch-up (checkpoint if needed +

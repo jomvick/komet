@@ -3,7 +3,7 @@
 // codecs must stay byte-compatible; change all suites together.
 
 import XCTest
-@testable import Zeron
+@testable import Komet
 
 final class ChatFramesTests: XCTestCase {
     func testPinsTheWireLayout() {

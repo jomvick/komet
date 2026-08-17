@@ -1,5 +1,5 @@
-//! zeron — headed by default; `zeron headless` runs the engine alone. Both start
-//! local-only without credentials. `zeron login` and `zeron logout` select the
+//! komet — headed by default; `komet headless` runs the engine alone. Both start
+//! local-only without credentials. `komet login` and `komet logout` select the
 //! profile used by the next engine start without mutating a live runtime.
 
 mod auth_cli;
@@ -9,7 +9,7 @@ mod update_cli;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "zeron", about = "Multi-device controller for coding agents")]
+#[command(name = "komet", about = "Multi-device controller for coding agents")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -28,7 +28,7 @@ enum Command {
     /// Live sync introspection from the running engine: per-room connection
     /// state, last pushed-frame/ack ages, rejoin/probe/resync counters.
     Sync,
-    /// Manage `zeron headless` as a background service (launchd / systemd --user).
+    /// Manage `komet headless` as a background service (launchd / systemd --user).
     Daemon {
         #[command(subcommand)]
         command: DaemonCommand,
@@ -43,7 +43,7 @@ enum Command {
 
 #[derive(Subcommand)]
 enum DaemonCommand {
-    /// Install, enable, and start the service (captures ZERON_* env).
+    /// Install, enable, and start the service (captures KOMET_* env).
     Install,
     /// Stop and remove the service.
     Uninstall,
@@ -57,29 +57,29 @@ enum DaemonCommand {
     Status,
 }
 
-/// Production edge (Cloudflare Worker + Durable Objects on the zeron.sh zone).
-/// `ZERON_EDGE_URL` overrides (local dev / self-hosting).
-const DEFAULT_EDGE_URL: &str = "https://edge.zeron.sh";
+/// Production edge (Cloudflare Worker + Durable Objects on the komet.sh zone).
+/// `KOMET_EDGE_URL` overrides (local dev / self-hosting).
+const DEFAULT_EDGE_URL: &str = "https://edge.komet.sh";
 
 /// Production WorkOS AuthKit client id — public knowledge (it appears in every
-/// authorize URL), so baking it in is safe. Overridden by `ZERON_WORKOS_CLIENT_ID`;
-/// set it to the empty string — or set a dev bearer via `ZERON_EDGE_TOKEN` — to
+/// authorize URL), so baking it in is safe. Overridden by `KOMET_WORKOS_CLIENT_ID`;
+/// set it to the empty string — or set a dev bearer via `KOMET_EDGE_TOKEN` — to
 /// force dev-mode auth instead.
 const DEFAULT_WORKOS_CLIENT_ID: &str = "client_01KWD0EAKZKD50YCQJNYSRE4BY";
 
 fn edge_url_from_env() -> String {
-    std::env::var("ZERON_EDGE_URL")
+    std::env::var("KOMET_EDGE_URL")
         .ok()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| DEFAULT_EDGE_URL.into())
 }
 
 /// WorkOS client id resolution: explicit env wins (empty string = dev mode);
-/// otherwise a `ZERON_EDGE_TOKEN` dev bearer keeps dev mode (smoke tests,
+/// otherwise a `KOMET_EDGE_TOKEN` dev bearer keeps dev mode (smoke tests,
 /// local wrangler); otherwise the baked production client id makes optional
 /// sync available while a bare start remains local-only.
 fn workos_client_id_from_env(edge_token: &Option<String>) -> Option<String> {
-    match std::env::var("ZERON_WORKOS_CLIENT_ID") {
+    match std::env::var("KOMET_WORKOS_CLIENT_ID") {
         Ok(v) if v.trim().is_empty() => None,
         Ok(v) => Some(v),
         Err(_) if edge_token.is_some() => None,
@@ -146,7 +146,7 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Headless) => {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(async {
-                let engine = zeron_engine::Engine::new(engine_config_from_env());
+                let engine = komet_engine::Engine::new(engine_config_from_env());
                 engine.run().await
             })
         }
@@ -179,22 +179,22 @@ fn main() -> anyhow::Result<()> {
             DaemonCommand::Status => daemon::status(),
         },
         None => {
-            let edge_token = std::env::var("ZERON_EDGE_TOKEN").ok();
-            // Headed: the UI probes ZERON_IPC_PORT and connects to a running
+            let edge_token = std::env::var("KOMET_EDGE_TOKEN").ok();
+            // Headed: the UI probes KOMET_IPC_PORT and connects to a running
             // daemon, or embeds the engine in-process (ARCHITECTURE §1).
-            zeron_ui::run_app(zeron_ui::UiConfig {
-                data_dir: std::env::var_os("ZERON_DATA_DIR")
+            komet_ui::run_app(komet_ui::UiConfig {
+                data_dir: std::env::var_os("KOMET_DATA_DIR")
                     .map(std::path::PathBuf::from)
                     .unwrap_or_else(dirs_data_dir),
-                ipc_port: std::env::var("ZERON_IPC_PORT")
+                ipc_port: std::env::var("KOMET_IPC_PORT")
                     .ok()
                     .and_then(|p| p.parse().ok())
                     .unwrap_or(27654),
                 edge_url: edge_url_from_env(),
                 workos_client_id: workos_client_id_from_env(&edge_token),
                 edge_token,
-                org_id: std::env::var("ZERON_ORG_ID").ok(),
-                default_harness: zeron_ui::HarnessId::ClaudeCode,
+                org_id: std::env::var("KOMET_ORG_ID").ok(),
+                default_harness: komet_ui::HarnessId::ClaudeCode,
             });
             Ok(())
         }
@@ -204,22 +204,22 @@ fn main() -> anyhow::Result<()> {
 /// The env-resolved engine configuration shared by `headless`, `login`,
 /// `logout`, and `status` — one resolution so the CLI auth commands always
 /// operate on the exact session the daemon will load.
-fn engine_config_from_env() -> zeron_engine::EngineConfig {
+fn engine_config_from_env() -> komet_engine::EngineConfig {
     // Dev-mode bearer (no WorkOS): an explicit token enables sync.
-    let edge_token = std::env::var("ZERON_EDGE_TOKEN").ok();
-    zeron_engine::EngineConfig {
-        data_dir: std::env::var_os("ZERON_DATA_DIR")
+    let edge_token = std::env::var("KOMET_EDGE_TOKEN").ok();
+    komet_engine::EngineConfig {
+        data_dir: std::env::var_os("KOMET_DATA_DIR")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(dirs_data_dir),
         edge_url: edge_url_from_env(),
-        ipc_port: std::env::var("ZERON_IPC_PORT")
+        ipc_port: std::env::var("KOMET_IPC_PORT")
             .ok()
             .and_then(|p| p.parse().ok())
             .unwrap_or(27654),
         default_harness: harness_from_env(),
-        // WorkOS mode: the signed-in session's org wins; ZERON_ORG_ID (dev
+        // WorkOS mode: the signed-in session's org wins; KOMET_ORG_ID (dev
         // default "dev-org") scopes the workspace room otherwise.
-        org_id: std::env::var("ZERON_ORG_ID").ok(),
+        org_id: std::env::var("KOMET_ORG_ID").ok(),
         // Real auth against production by default; see
         // `workos_client_id_from_env` for the dev-mode escape hatches.
         workos_client_id: workos_client_id_from_env(&edge_token),
@@ -227,24 +227,24 @@ fn engine_config_from_env() -> zeron_engine::EngineConfig {
     }
 }
 
-/// `ZERON_HARNESS` (kebab-case id) picks the default harness for chats without a
+/// `KOMET_HARNESS` (kebab-case id) picks the default harness for chats without a
 /// config row — `mock` powers the e2e smoke; default `claude-code`.
-fn harness_from_env() -> zeron_engine::HarnessId {
-    match std::env::var("ZERON_HARNESS").as_deref().map(str::trim) {
-        Ok("mock") => zeron_engine::HarnessId::Mock,
-        Ok("codex") => zeron_engine::HarnessId::Codex,
-        Ok("cursor") => zeron_engine::HarnessId::Cursor,
-        Ok("grok") => zeron_engine::HarnessId::Grok,
-        Ok("hermes") => zeron_engine::HarnessId::Hermes,
-        Ok("opencode") => zeron_engine::HarnessId::OpenCode,
-        Ok("pi") => zeron_engine::HarnessId::Pi,
-        _ => zeron_engine::HarnessId::ClaudeCode,
+fn harness_from_env() -> komet_engine::HarnessId {
+    match std::env::var("KOMET_HARNESS").as_deref().map(str::trim) {
+        Ok("mock") => komet_engine::HarnessId::Mock,
+        Ok("codex") => komet_engine::HarnessId::Codex,
+        Ok("cursor") => komet_engine::HarnessId::Cursor,
+        Ok("grok") => komet_engine::HarnessId::Grok,
+        Ok("hermes") => komet_engine::HarnessId::Hermes,
+        Ok("opencode") => komet_engine::HarnessId::OpenCode,
+        Ok("pi") => komet_engine::HarnessId::Pi,
+        _ => komet_engine::HarnessId::ClaudeCode,
     }
 }
 
 fn dirs_data_dir() -> std::path::PathBuf {
     let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME not set"));
-    let dir = home.join(".zeron");
+    let dir = home.join(".komet");
     // One-shot 0.2.0 migration: adopt the pre-rename data dir (sign-in,
     // device identity, prefs) instead of starting fresh.
     if !dir.exists() {
@@ -256,17 +256,17 @@ fn dirs_data_dir() -> std::path::PathBuf {
     dir
 }
 
-/// `zeron sync`: dial the running engine's IPC and print per-room sync state.
+/// `komet sync`: dial the running engine's IPC and print per-room sync state.
 /// The introspection surface every 2026-08 incident was missing — "is this
 /// device's workspace room actually receiving?" as a one-liner.
 async fn sync_cli(ipc_port: u16) -> anyhow::Result<()> {
-    let client = zeron_rpc::connect_ws(&format!("ws://127.0.0.1:{ipc_port}"))
+    let client = komet_rpc::connect_ws(&format!("ws://127.0.0.1:{ipc_port}"))
         .await
         .map_err(|e| {
-            anyhow::anyhow!("no engine listening on 127.0.0.1:{ipc_port} ({e}) — is zeron running?")
+            anyhow::anyhow!("no engine listening on 127.0.0.1:{ipc_port} ({e}) — is komet running?")
         })?;
     let status = client
-        .call(zeron_rpc::methods::SYNC_STATUS, serde_json::json!({}))
+        .call(komet_rpc::methods::SYNC_STATUS, serde_json::json!({}))
         .await
         .map_err(|e| anyhow::anyhow!("SyncStatus failed: {e}"))?;
     let now = status.get("nowMs").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -344,7 +344,7 @@ async fn sync_cli(ipc_port: u16) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// `{data_dir}/logs/zeron-{mode}.log`, previous launch preserved as `.old`.
+/// `{data_dir}/logs/komet-{mode}.log`, previous launch preserved as `.old`.
 /// Headed and headless are separate files so an embedded-engine app and a
 /// daemon on the same machine never interleave writes.
 ///
@@ -355,10 +355,10 @@ async fn sync_cli(ipc_port: u16) -> anyhow::Result<()> {
 /// second unlinked it entirely, and the daemon spent the rest of the incident
 /// logging to an orphaned inode (an entire day of sync diagnostics gone at
 /// the exact moment they were needed). A launch that finds the canonical file
-/// locked logs to `zeron-{mode}.{pid}.log` instead; the next lock-holding
+/// locked logs to `komet-{mode}.{pid}.log` instead; the next lock-holding
 /// launch sweeps pid-suffixed files older than a week.
 fn open_log_file(mode: &str) -> Option<std::fs::File> {
-    let dir = std::env::var_os("ZERON_DATA_DIR")
+    let dir = std::env::var_os("KOMET_DATA_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(dirs_data_dir)
         .join("logs");
@@ -368,7 +368,7 @@ fn open_log_file(mode: &str) -> Option<std::fs::File> {
 /// Dir-parameterized body of [`open_log_file`] (unit-testable without env).
 fn open_log_file_in(dir: &std::path::Path, mode: &str) -> Option<std::fs::File> {
     std::fs::create_dir_all(dir).ok()?;
-    let path = dir.join(format!("zeron-{mode}.log"));
+    let path = dir.join(format!("komet-{mode}.log"));
     #[cfg(unix)]
     {
         use std::os::unix::io::AsRawFd;
@@ -385,7 +385,7 @@ fn open_log_file_in(dir: &std::path::Path, mode: &str) -> Option<std::fs::File> 
         if rc != 0 {
             // A live process owns the canonical log — leave it alone.
             return std::fs::File::create(
-                dir.join(format!("zeron-{mode}.{}.log", std::process::id())),
+                dir.join(format!("komet-{mode}.{}.log", std::process::id())),
             )
             .ok();
         }
@@ -394,7 +394,7 @@ fn open_log_file_in(dir: &std::path::Path, mode: &str) -> Option<std::fs::File> 
         // to rotate — the probe itself created the empty file.)
         drop(existing);
         if preexisting {
-            let _ = std::fs::rename(&path, dir.join(format!("zeron-{mode}.log.old")));
+            let _ = std::fs::rename(&path, dir.join(format!("komet-{mode}.log.old")));
         }
         let file = std::fs::File::create(&path).ok()?;
         unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
@@ -403,7 +403,7 @@ fn open_log_file_in(dir: &std::path::Path, mode: &str) -> Option<std::fs::File> 
     }
     #[cfg(not(unix))]
     {
-        let _ = std::fs::rename(&path, dir.join(format!("zeron-{mode}.log.old")));
+        let _ = std::fs::rename(&path, dir.join(format!("komet-{mode}.log.old")));
         std::fs::File::create(&path).ok()
     }
 }
@@ -418,14 +418,14 @@ mod log_file_tests {
         let dir = dir.path();
         // First launch owns the canonical file and keeps writing.
         let first = open_log_file_in(dir, "headed").expect("first log");
-        assert!(dir.join("zeron-headed.log").is_file());
+        assert!(dir.join("komet-headed.log").is_file());
         // Second launch while the first is alive: canonical file untouched,
         // pid-suffixed overflow file instead (the 2026-08-04 clobber).
         let second = open_log_file_in(dir, "headed").expect("second log");
-        let pid_path = dir.join(format!("zeron-headed.{}.log", std::process::id()));
+        let pid_path = dir.join(format!("komet-headed.{}.log", std::process::id()));
         assert!(pid_path.is_file(), "expected pid-suffixed overflow log");
         assert!(
-            !dir.join("zeron-headed.log.old").exists(),
+            !dir.join("komet-headed.log.old").exists(),
             "live canonical log must not be rotated away"
         );
         drop(second);
@@ -433,21 +433,21 @@ mod log_file_tests {
         drop(first);
         let third = open_log_file_in(dir, "headed").expect("third log");
         assert!(
-            dir.join("zeron-headed.log.old").is_file(),
+            dir.join("komet-headed.log.old").is_file(),
             "rotation resumes"
         );
         drop(third);
     }
 }
 
-/// Delete `zeron-{mode}.{pid}.log` overflow files older than a week — they
+/// Delete `komet-{mode}.{pid}.log` overflow files older than a week — they
 /// only exist when a second instance raced a live one for the canonical log.
 #[cfg(unix)]
 fn sweep_stale_pid_logs(dir: &std::path::Path, mode: &str) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
-    let prefix = format!("zeron-{mode}.");
+    let prefix = format!("komet-{mode}.");
     let week = std::time::Duration::from_secs(7 * 24 * 60 * 60);
     for entry in entries.flatten() {
         let name = entry.file_name();

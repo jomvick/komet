@@ -46,7 +46,7 @@ use tokio::io::AsyncBufReadExt;
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
-use zeron_proto::{
+use komet_proto::{
     AgentEvent, DoneStatus, HarnessId, Model, ModelOption, ModelOptionChoice, ReasoningLevel,
     RunRequest, SlashCommand, SteeringMode, UserInputAnswer, UserInputQuestion,
 };
@@ -97,7 +97,7 @@ struct AcpAgentSpec {
     /// (opencode's Zen models measured ~2m of quiet mid-thought before a
     /// false Done, 2026-08-15) sets a generous window — the settle stays
     /// armed as a net for genuinely lost replies, just slower to trip.
-    /// `ZERON_ACP_QUIET_SETTLE_MS` still overrides (0 disables).
+    /// `KOMET_ACP_QUIET_SETTLE_MS` still overrides (0 disables).
     quiet_settle_timeout: Option<Duration>,
     steering_mode: SteeringMode,
     /// Effort ladder surfaced in the picker; applied per session via the
@@ -186,7 +186,7 @@ fn claude_spec() -> AcpAgentSpec {
             dirs
         },
         install_hint: "claude-agent-acp (searched PATH, the login shell's PATH, npm \
-             global bins, and fnm/nvm/volta/pnpm/bun install dirs; zeron installs \
+             global bins, and fnm/nvm/volta/pnpm/bun install dirs; komet installs \
              the pinned @agentclientprotocol/claude-agent-acp automatically when \
              npm is available; install npm/node, or \
              `npm install -g @agentclientprotocol/claude-agent-acp`, or set \
@@ -228,7 +228,7 @@ fn codex_spec() -> AcpAgentSpec {
         cli_executable: "codex",
         cli_extra_paths: || npm_global_bins("codex"),
         install_hint: "codex-acp (searched PATH, the login shell's PATH, npm global \
-             bins, and fnm/nvm/volta/pnpm/bun install dirs; zeron installs the \
+             bins, and fnm/nvm/volta/pnpm/bun install dirs; komet installs the \
              pinned @agentclientprotocol/codex-acp automatically when npm is \
              available; install npm/node, or \
              `npm install -g @agentclientprotocol/codex-acp`, or set \
@@ -468,7 +468,7 @@ fn pi_spec() -> AcpAgentSpec {
         cli_executable: "pi",
         cli_extra_paths: || npm_global_bins("pi"),
         install_hint: "pi-acp (searched PATH, the login shell's PATH, npm global bins, \
-             and fnm/nvm/volta/pnpm/bun install dirs; zeron installs the pinned \
+             and fnm/nvm/volta/pnpm/bun install dirs; komet installs the pinned \
              pi-acp automatically when npm is available — the pi CLI itself is \
              still required, `npm install -g --ignore-scripts \
              @earendil-works/pi-coding-agent`; set PI_ACP_EXECUTABLE to override)",
@@ -495,7 +495,7 @@ fn pi_spec() -> AcpAgentSpec {
         },
         // The adapter has no `_session/steering` extension: turn boundaries.
         steering_mode: SteeringMode::TurnBoundary,
-        // pi's thinking ladder (minimal→max; its extra "off" tier has no zeron
+        // pi's thinking ladder (minimal→max; its extra "off" tier has no komet
         // equivalent and is left to the agent default).
         reasoning_levels: &[
             ReasoningLevel::Minimal,
@@ -557,7 +557,7 @@ fn opencode_spec() -> AcpAgentSpec {
         // premature Done — "Musing… 2m 4s" then cut (2026-08-15 user report),
         // same shape as the Claude exemption but not structural. A generous
         // window keeps the dropped-reply net armed (slower to trip, no
-        // cost-frame equivalent); `ZERON_ACP_QUIET_SETTLE_MS=0` fully disables
+        // cost-frame equivalent); `KOMET_ACP_QUIET_SETTLE_MS=0` fully disables
         // for verification.
         quiet_settle_timeout: Some(Duration::from_secs(120)),
         // No `_session/steering` extension: steers deliver at turn boundaries.
@@ -596,12 +596,12 @@ pub fn prewarm_managed_adapters() {
         handle.spawn(async move {
             match crate::adapter_install::ensure_installed(pin, bin_name, display_name).await {
                 Ok(entry) => tracing::info!(
-                    target: "zeron_harness::adapter_install",
+                    target: "komet_harness::adapter_install",
                     adapter = %entry.display(),
                     "prewarmed {display_name} ACP adapter"
                 ),
                 Err(e) => tracing::warn!(
-                    target: "zeron_harness::adapter_install",
+                    target: "komet_harness::adapter_install",
                     "prewarm of the {display_name} ACP adapter failed: {e}"
                 ),
             }
@@ -796,7 +796,7 @@ impl AcpHarness {
                             .await
                             {
                                 tracing::warn!(
-                                    target: "zeron_harness::adapter_install",
+                                    target: "komet_harness::adapter_install",
                                     "background adapter install failed: {e}"
                                 );
                             }
@@ -843,7 +843,7 @@ impl AcpHarness {
             tokio::spawn(async move {
                 let mut lines = tokio::io::BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
-                    tracing::debug!(target: "zeron_harness::acp", "stderr: {line}");
+                    tracing::debug!(target: "komet_harness::acp", "stderr: {line}");
                     tail.push(&line);
                 }
             });
@@ -969,7 +969,7 @@ impl AcpHarness {
     }
 }
 
-/// Map an advertised `thought_level` value id onto zeron's ladder.
+/// Map an advertised `thought_level` value id onto komet's ladder.
 fn reasoning_from_value(value: &str) -> Option<ReasoningLevel> {
     match norm_id(value).as_str() {
         "minimal" => Some(ReasoningLevel::Minimal),
@@ -1144,12 +1144,12 @@ fn models_from_session(session_response: &Value, catalog: &[Model]) -> Vec<Model
 }
 
 /// A session config option surfaced as a Traits-dropdown section. Mode is
-/// zeron's own (forced to the no-prompts choice), model rides the model rows,
+/// komet's own (forced to the no-prompts choice), model rides the model rows,
 /// and thought_level is the Reasoning ladder — everything else the agent
 /// advertises (fast mode, collaboration mode, agent persona, …) passes
 /// through. `currentValue` doubles as the default: it is the state the
 /// session opens in. Booleans render as an off/on select, mirroring the
-/// catalogs (zeron never declares the boolean config capability, so adapters
+/// catalogs (komet never declares the boolean config capability, so adapters
 /// send selects, but handle the shape defensively).
 fn trait_from_config_option(option: &Value) -> Option<ModelOption> {
     if matches!(
@@ -1359,12 +1359,12 @@ fn initialize_params(harness: HarnessId) -> Value {
     json!({
         "protocolVersion": 1,
         "clientInfo": {
-            "name": "zeron",
-            "title": "Zeron",
+            "name": "komet",
+            "title": "Komet",
             "version": env!("CARGO_PKG_VERSION"),
         },
         // Declined: agents fall back to their own fs/terminal access, which
-        // is what zeron wants — the working tree is the source of truth for
+        // is what komet wants — the working tree is the source of truth for
         // the diff pane, and commands belong to the agent's own sandbox.
         "clientCapabilities": capabilities,
     })
@@ -1613,11 +1613,39 @@ fn usage_from_response(res: &Result<Value, HarnessError>) -> Option<AgentEvent> 
             .find_map(|k| usage.get(*k))
             .and_then(Value::as_u64)
     };
-    let input = count(&["inputTokens", "input_tokens"]);
-    let output = count(&["outputTokens", "output_tokens"]);
+    let input = count(&["inputTokens", "input_tokens", "promptTokens", "prompt_tokens"]);
+    let cached = count(&[
+        "cachedInputTokens",
+        "cached_input_tokens",
+        "cacheReadInputTokens",
+        "cache_read_input_tokens",
+        "cachedTokens",
+        "cached_tokens",
+    ]);
+    let output = count(&["outputTokens", "output_tokens", "completionTokens", "completion_tokens"]);
+    let reasoning = count(&[
+        "reasoningTokens",
+        "reasoning_tokens",
+        "reasoningOutputTokens",
+        "reasoning_output_tokens",
+        "thinkingTokens",
+        "thinking_tokens",
+    ]);
+    let context_limit = count(&[
+        "contextLimit",
+        "context_limit",
+        "contextWindow",
+        "context_window",
+        "contextWindowLimit",
+        "context_window_limit",
+    ]);
+
     (input.is_some() || output.is_some()).then(|| AgentEvent::Usage {
         input_tokens: input.unwrap_or(0),
+        cached_input_tokens: cached.unwrap_or(0),
         output_tokens: output.unwrap_or(0),
+        reasoning_tokens: reasoning.unwrap_or(0),
+        context_limit,
     })
 }
 
@@ -1691,7 +1719,7 @@ fn prompt_turn(
 
 /// Answer a server→client request. Permission requests are auto-accepted with
 /// the agent's preferred allow option — parity with the claude harness's
-/// bypassPermissions and the codex harness's approvalPolicy "never" (zeron
+/// bypassPermissions and the codex harness's approvalPolicy "never" (komet
 /// sessions run unattended). Everything else (fs, terminal, elicitation) was
 /// declined at initialize, so a stray request gets method-not-found rather
 /// than wedging the agent.
@@ -1735,7 +1763,7 @@ fn handle_server_request(
             cursor_todo_events(params, CURSOR_TODOS_CHIP)
         }
         // Subagent tasks run inside cursor-agent; this only reports one
-        // finished. Image generation has nowhere to land in a zeron session.
+        // finished. Image generation has nowhere to land in a komet session.
         CURSOR_TASK => {
             client.respond(&id, json!({ "outcome": { "outcome": "completed" } }));
             Vec::new()
@@ -1743,12 +1771,12 @@ fn handle_server_request(
         CURSOR_GENERATE_IMAGE => {
             client.respond(
                 &id,
-                json!({ "outcome": { "outcome": "rejected", "reason": "zeron cannot render generated images" } }),
+                json!({ "outcome": { "outcome": "rejected", "reason": "Komet cannot render generated images" } }),
             );
             Vec::new()
         }
         _ => {
-            tracing::debug!(target: "zeron_harness::acp", "unhandled server request: {method}");
+            tracing::debug!(target: "komet_harness::acp", "unhandled server request: {method}");
             client.respond_error(&id, -32601, &format!("unsupported method: {method}"));
             Vec::new()
         }
@@ -1860,7 +1888,7 @@ fn handle_server_request_live(
 
 /// Cursor's ACP extension methods (`https://cursor.com/docs/cli/acp`).
 /// `ask_question` and `create_plan` BLOCK the agent until answered, so every
-/// one of these gets a response even when zeron has nothing to do with it.
+/// one of these gets a response even when komet has nothing to do with it.
 const CURSOR_ASK_QUESTION: &str = "cursor/ask_question";
 const CURSOR_CREATE_PLAN: &str = "cursor/create_plan";
 const CURSOR_UPDATE_TODOS: &str = "cursor/update_todos";
@@ -1917,8 +1945,8 @@ fn ask_cursor_questions(
     });
 }
 
-/// One `cursor/ask_question` entry: the zeron-side question plus what is
-/// needed to answer it — the wire id, and the label→optionId table (zeron's
+/// One `cursor/ask_question` entry: the komet-side question plus what is
+/// needed to answer it — the wire id, and the label→optionId table (komet's
 /// input bridge speaks labels, cursor expects option ids).
 struct CursorQuestion {
     wire_id: String,
@@ -1951,14 +1979,14 @@ fn cursor_questions(params: &Value) -> Vec<CursorQuestion> {
                     Some((label.to_owned(), oid.to_owned()))
                 })
                 .collect();
-            // An option-less question has no answer zeron could send back.
+            // An option-less question has no answer komet could send back.
             if choices.is_empty() {
                 return None;
             }
             Some(CursorQuestion {
                 wire_id,
                 question: UserInputQuestion {
-                    // Zeron-minted: cursor's ids ("q1") repeat across turns.
+                    // Komet-minted: cursor's ids ("q1") repeat across turns.
                     id: new_message_id(),
                     header: header.to_owned(),
                     question: q
@@ -1980,7 +2008,7 @@ fn cursor_questions(params: &Value) -> Vec<CursorQuestion> {
 
 /// Chosen labels → the `answered` outcome. Nothing recognisable coming back
 /// (dropped resolver, unknown labels) degrades to `cancelled` so the agent
-/// unblocks without zeron inventing a pick.
+/// unblocks without komet inventing a pick.
 fn cursor_answer_outcome(asked: &[CursorQuestion], answers: &[UserInputAnswer]) -> Value {
     let picked: Vec<Value> = asked
         .iter()
@@ -2149,7 +2177,7 @@ async fn run_session(session: Session) {
                 // A missing/foreign session falls back to a fresh one.
                 Err(e) => {
                     tracing::debug!(
-                        target: "zeron_harness::acp",
+                        target: "komet_harness::acp",
                         "session/load failed (starting fresh): {e}"
                     );
                     let new = request_draining(
@@ -2224,7 +2252,7 @@ async fn run_session(session: Session) {
                     }
                     Err(e) => {
                         tracing::debug!(
-                            target: "zeron_harness::acp",
+                            target: "komet_harness::acp",
                             "session/set_config_option model rejected (agent default runs): {e}"
                         );
                     }
@@ -2258,7 +2286,7 @@ async fn run_session(session: Session) {
             .await
             {
                 tracing::debug!(
-                    target: "zeron_harness::acp",
+                    target: "komet_harness::acp",
                     "session/set_config_option {config_id}={payload} rejected (agent default runs): {e}"
                 );
             }
@@ -2307,7 +2335,7 @@ async fn run_session(session: Session) {
                             None => e.to_string(),
                         },
                     };
-                    tracing::warn!(target: "zeron_harness::acp", %error, "agent setup failed");
+                    tracing::warn!(target: "komet_harness::acp", %error, "agent setup failed");
                     let _ = event_tx
                         .send(Ok(AgentEvent::Done {
                             status: DoneStatus::Errored,
@@ -2443,11 +2471,11 @@ async fn run_session(session: Session) {
     // settled live turns mid-thought with a premature Done ("Musing… 2m 4s"
     // then cut, 2026-08-15 user report). `quiet_settle_timeout` calibrates
     // the window per spec.
-    // `ZERON_ACP_QUIET_SETTLE_MS` overrides; 0 disables.
+    // `KOMET_ACP_QUIET_SETTLE_MS` overrides; 0 disables.
     let quiet_settle: Option<Duration> = if cost_hint_enabled {
         None
     } else {
-        match std::env::var("ZERON_ACP_QUIET_SETTLE_MS")
+        match std::env::var("KOMET_ACP_QUIET_SETTLE_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
         {
@@ -2662,7 +2690,7 @@ async fn run_session(session: Session) {
                         && is_turn_end_cost_update(&params, &session_id)
                     {
                         tracing::debug!(
-                            target: "zeron_harness::acp",
+                            target: "komet_harness::acp",
                             "turn-end cost update observed with the prompt \
                              unsettled; arming fast settle"
                         );
@@ -2775,7 +2803,7 @@ async fn run_session(session: Session) {
                         .to_owned(),
                     Err(e) => {
                         tracing::debug!(
-                            target: "zeron_harness::acp",
+                            target: "komet_harness::acp",
                             "_session/steering failed (redelivering): {e}"
                         );
                         // Failed calls redeliver like a lost turn-end race.
@@ -2874,7 +2902,7 @@ async fn run_session(session: Session) {
                         == Some("noRunningTurn")
                     {
                         tracing::warn!(
-                            target: "zeron_harness::acp",
+                            target: "komet_harness::acp",
                             "steering answered noRunningTurn with a prompt \
                              outstanding; arming starved-turn recovery"
                         );
@@ -2967,7 +2995,7 @@ async fn run_session(session: Session) {
                 && open_questions.load(std::sync::atomic::Ordering::SeqCst) == 0 =>
             {
                 tracing::warn!(
-                    target: "zeron_harness::acp",
+                    target: "komet_harness::acp",
                     quiet_ms = quiet_settle.unwrap_or_default().as_millis() as u64,
                     "turn quiet past the settle window with completed output; \
                      treating the prompt response as dropped"
@@ -2990,7 +3018,7 @@ async fn run_session(session: Session) {
             ), if starve_deadline.is_some() && turn.is_some() && !interrupted => {
                 starve_deadline = None;
                 tracing::warn!(
-                    target: "zeron_harness::acp",
+                    target: "komet_harness::acp",
                     "prompt response missing past turn-end evidence; settling \
                      the dead turn (and promoting any queued steer)"
                 );
@@ -3072,7 +3100,7 @@ async fn run_session(session: Session) {
                         // merged turn really ends. Only adapters with no
                         // verified turn-end frame pay the cancel.
                         tracing::info!(
-                            target: "zeron_harness::acp",
+                            target: "komet_harness::acp",
                             "steer into a self-continuing session; cancelling \
                              the unowned turn before prompting"
                         );
@@ -3191,7 +3219,7 @@ async fn run_session(session: Session) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zeron_proto::{TodoItem, ToolCall};
+    use komet_proto::{TodoItem, ToolCall};
 
     #[test]
     fn opencode_gets_a_generous_model_discovery_budget() {
@@ -3582,7 +3610,7 @@ mod tests {
 
     /// `cursor/ask_question` carries several questions at once, each with its
     /// own labelled options — the round trip must answer with OPTION IDS,
-    /// keyed by cursor's wire ids, not the labels zeron showed the user.
+    /// keyed by cursor's wire ids, not the labels komet showed the user.
     #[test]
     fn cursor_questions_round_trip_labels_back_to_option_ids() {
         let asked = cursor_questions(&json!({
@@ -3616,7 +3644,7 @@ mod tests {
         assert_eq!(asked[0].question.options, vec!["Agent", "Plan"]);
         assert!(!asked[0].question.multi_select);
         assert!(asked[1].question.multi_select);
-        // Cursor's repeatable ids never leak into zeron's question ids.
+        // Cursor's repeatable ids never leak into komet's question ids.
         assert_ne!(asked[0].question.id, "q1");
 
         let answers = vec![
@@ -3702,7 +3730,7 @@ mod tests {
         // A plan lands on its own chip, so the two never overwrite each other.
         let planned = cursor_notification_events(CURSOR_CREATE_PLAN, &todos);
         assert_eq!(chip_id(&planned), CURSOR_PLAN_CHIP);
-        // Everything else is noise zeron has nothing to render for.
+        // Everything else is noise komet has nothing to render for.
         assert!(cursor_notification_events(CURSOR_TASK, &todos).is_empty());
         assert!(cursor_notification_events(CURSOR_GENERATE_IMAGE, &todos).is_empty());
         assert!(cursor_notification_events("cursor/unknown", &todos).is_empty());

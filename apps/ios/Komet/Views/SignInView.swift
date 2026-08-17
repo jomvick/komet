@@ -1,6 +1,6 @@
 // Sign-in — the OAuth authorization-code flow against WorkOS AuthKit, with
 // the secret-bearing exchange delegated to the edge (`POST /auth/exchange`).
-// The zeron mark on black, one white button — the old mobile app's Gate.
+// The komet mark on black, one white button — the old mobile app's Gate.
 //
 // Endpoints are fixed to production (the old app's rule: mobile always talks
 // to prod; a stale override once broke sign-in in the worst ghost way).
@@ -10,10 +10,10 @@ import SwiftUI
 
 /// Production cloud endpoints — mirrors edge/wrangler.jsonc.
 enum Endpoints {
-    static let edgeURL = URL(string: "https://edge.zeron.sh")!
+    static let edgeURL = URL(string: "https://edge.komet.sh")!
     static let workosClientId = "client_01KWD0EAKZKD50YCQJNYSRE4BY"
     static let workosAPIBase = "https://api.workos.com"
-    static let callbackScheme = "zeron"
+    static let callbackScheme = "komet"
 
     static func authorizeURL(state: String) -> URL {
         var components = URLComponents(string: "\(workosAPIBase)/user_management/authorize")!
@@ -42,10 +42,10 @@ struct SignInView: View {
                 Spacer()
 
                 VStack(spacing: 24) {
-                    ZeronMark()
+                    KometMark()
                         .frame(width: 72, height: 72)
                     VStack(spacing: 6) {
-                        Text("Zeron")
+                        Text("Komet")
                             .font(Theme.sans(28, weight: .semibold))
                             .kerning(-0.5)
                             .foregroundStyle(Theme.text)
@@ -64,7 +64,7 @@ struct SignInView: View {
                                 ProgressView()
                                     .tint(Theme.bg)
                             } else {
-                                Text("Log in to Zeron")
+                                Text("Log in to Komet")
                                     .font(Theme.sans(15, weight: .semibold))
                                     .foregroundStyle(Theme.bg)
                             }
@@ -92,7 +92,7 @@ struct SignInView: View {
         }
     }
 
-    /// The AuthKit code flow: system browser session → zeron://callback with
+    /// The AuthKit code flow: system browser session → komet://callback with
     /// code + state → exchange on the edge.
     private func signIn() {
         busy = true
@@ -230,10 +230,10 @@ struct OrgPickerView: View {
     }
 }
 
-/// The actual zeron mark — the desktop's 34-cell logo
-/// (crates/ui/assets/icons/zeron-logo.svg), cells scaled from its 820×940
+/// The actual komet mark — the desktop's 34-cell logo
+/// (crates/ui/assets/icons/komet-logo.svg), cells scaled from its 820×940
 /// viewbox and tinted by `color`.
-struct ZeronMark: View {
+struct KometMark: View {
     var color: Color = Theme.text
 
     /// (x, y) of each 100×100 rx16 cell in the 820×940 viewbox.
@@ -247,19 +247,19 @@ struct ZeronMark: View {
     ]
 
     var body: some View {
-        ZeronMarkShape()
+        KometMarkShape()
             .fill(color)
             .aspectRatio(820 / 940, contentMode: .fit)
     }
 }
 
-struct ZeronMarkShape: Shape {
+struct KometMarkShape: Shape {
     func path(in rect: CGRect) -> Path {
         var path = Path()
         let scale = min(rect.width / 820, rect.height / 940)
         let dx = rect.minX + (rect.width - 820 * scale) / 2
         let dy = rect.minY + (rect.height - 940 * scale) / 2
-        for (x, y) in ZeronMark.cells {
+        for (x, y) in KometMark.cells {
             let cell = CGRect(x: dx + x * scale, y: dy + y * scale,
                               width: 100 * scale, height: 100 * scale)
             path.addRoundedRect(in: cell, cornerSize: CGSize(width: 16 * scale, height: 16 * scale))

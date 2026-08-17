@@ -1,6 +1,6 @@
 //! Native menu bar + app-level window actions (macOS-first).
 //!
-//! zeron never called `cx.set_menus`, so on macOS `NSApp.mainMenu` stayed nil:
+//! komet never called `cx.set_menus`, so on macOS `NSApp.mainMenu` stayed nil:
 //! no app menu, no ⌘Q quit, and nothing for the auto-hidden system menu bar to
 //! reveal on hover (gpui only calls `setMainMenu_` from `set_menus` —
 //! gpui_macos/src/platform.rs `fn set_menus`). Structure ported from zed's
@@ -18,7 +18,7 @@ use crate::appearance::{self, AppearanceMode};
 use crate::composer;
 
 actions!(
-    zeron,
+    komet,
     [
         About,
         Quit,
@@ -44,7 +44,7 @@ pub fn init(cx: &mut App) {
     cx.on_action(|_: &Hide, cx| cx.hide());
     cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
     cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
-    // Window verbs route to the active window. zeron is single-window, so a
+    // Window verbs route to the active window. komet is single-window, so a
     // global handler suffices where zed registers these per-workspace
     // (crates/zed/src/zed.rs `register_action(Minimize/Zoom)`).
     cx.on_action(|_: &Minimize, cx| with_active_window(cx, |window| window.minimize_window()));
@@ -63,7 +63,7 @@ fn with_active_window(cx: &mut App, f: impl FnOnce(&mut Window)) {
     }
 }
 
-/// ⌘Q / "Quit Zeron". `cx.quit()` runs the platform's standard quit routine,
+/// ⌘Q / "Quit Komet". `cx.quit()` runs the platform's standard quit routine,
 /// which invokes gpui `App::shutdown` — that fires the `on_app_quit` observers
 /// registered in `run_app` (embedded-engine drain: live runs + doc snapshot
 /// flush) with gpui's shutdown timeout before the process exits. Same graceful
@@ -95,7 +95,7 @@ fn macos_key_bindings() -> Vec<KeyBinding> {
     ]
 }
 
-/// The zeron menu bar. macOS renders this natively; mac-only entries are gated
+/// The komet menu bar. macOS renders this natively; mac-only entries are gated
 /// at runtime (`cfg!`) so the whole module compiles and tests on Linux.
 pub fn app_menus() -> Vec<Menu> {
     let macos = cfg!(target_os = "macos");
@@ -104,23 +104,23 @@ pub fn app_menus() -> Vec<Menu> {
     // what we pass, but gpui still wants a name.
     let mut app_items = vec![
         // Placeholder until a real about dialog exists (explicitly disabled).
-        MenuItem::action("About Zeron", About).disabled(true),
+        MenuItem::action("About Komet", About).disabled(true),
         MenuItem::separator(),
     ];
     if macos {
         app_items.extend([
             MenuItem::os_submenu("Services", SystemMenuType::Services),
             MenuItem::separator(),
-            MenuItem::action("Hide Zeron", Hide),
+            MenuItem::action("Hide Komet", Hide),
             MenuItem::action("Hide Others", HideOthers),
             MenuItem::action("Show All", ShowAll),
             MenuItem::separator(),
         ]);
     }
-    app_items.push(MenuItem::action("Quit Zeron", Quit));
+    app_items.push(MenuItem::action("Quit Komet", Quit));
 
     let mut menus = vec![
-        Menu::new("Zeron").items(app_items),
+        Menu::new("Komet").items(app_items),
         // Standard clipboard verbs tied to the composer's existing actions via
         // their native selectors (`OsAction` → cut:/copy:/paste:/selectAll:),
         // so the OS Edit menu routes through the responder chain to the focused
@@ -176,11 +176,11 @@ mod tests {
     #[test]
     fn app_menu_ends_with_quit() {
         let menus = app_menus();
-        assert_eq!(menus[0].name.as_ref(), "Zeron");
+        assert_eq!(menus[0].name.as_ref(), "Komet");
         let Some(MenuItem::Action { name, action, .. }) = menus[0].items.last() else {
             panic!("last app-menu item must be an action");
         };
-        assert_eq!(name.as_ref(), "Quit Zeron");
+        assert_eq!(name.as_ref(), "Quit Komet");
         assert_eq!(action.name(), Quit.name());
     }
 

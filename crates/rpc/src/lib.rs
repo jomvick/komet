@@ -1,8 +1,8 @@
-//! zeron-rpc — the typed control plane (UiRpc / ControlRpc) over WebSocket + in-memory
+//! komet-rpc — the typed control plane (UiRpc / ControlRpc) over WebSocket + in-memory
 //! transports, plus the device-room relay transport ({s,k,to,from} frames — [`device_room`]).
 //!
 //! Framing: ndjson envelopes, one JSON object per WebSocket text message (or per line on
-//! byte transports), matching the shape of zeron's Effect RPC without the Effect runtime:
+//! byte transports), matching the shape of komet's Effect RPC without the Effect runtime:
 //!
 //! - client → server: `{id, method, params}` to invoke, `{id, cancel: true}` to stop a stream;
 //! - server → client: `{id, ok}` / `{id, err}` for unary calls,
@@ -45,7 +45,7 @@ pub mod methods {
     /// app foregrounded). No params; IPC-only. Each room ignores the hint
     /// unless it has been broadcast-quiet ≥30s, so this is cheap to spam.
     pub const PROBE_SYNC: &str = "ProbeSync";
-    /// Live sync introspection (`zeron sync` / debug surfaces): per-room
+    /// Live sync introspection (`komet sync` / debug surfaces): per-room
     /// connection state, last pushed-frame/ack ages, rejoin/probe/resync
     /// counters for the workspace room and every open chat doc. No params;
     /// IPC-only.
@@ -132,6 +132,8 @@ pub mod methods {
     /// Download + apply the newest release on the target device (symlink-managed
     /// installs; the service restart is scheduled after the reply flushes).
     pub const APPLY_UPDATE: &str = "ApplyUpdate";
+    /// Retrieve context & token usage metrics for a session thread.
+    pub const GET_CONTEXT_USAGE: &str = "GetContextUsage";
 }
 
 #[derive(Debug, thiserror::Error)]

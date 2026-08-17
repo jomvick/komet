@@ -1,5 +1,5 @@
 /**
- * Tail materialization — vendored verbatim from zeron's
+ * Tail materialization — vendored verbatim from komet's
  * packages/session-doc/src/schema.ts (`readMessageEntries` /
  * `materializeTail`), minus the loro-mirror schema those functions do not
  * depend on. The DO reads the doc's plain JSON shape directly; no Mirror.

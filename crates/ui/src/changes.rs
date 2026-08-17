@@ -32,8 +32,8 @@ use gpui::{
     SharedString, Subscription, Task, Window, div, font, list, prelude::*, px,
 };
 
-use zeron_proto::{Chat, CheckoutDiff, GitHistoryCommit};
-use zeron_rpc::methods;
+use komet_proto::{Chat, CheckoutDiff, GitHistoryCommit};
+use komet_rpc::methods;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::history::{GitHistory, GitHistoryCount, GitHistoryEvent, GitHistoryFetchButton};
@@ -42,7 +42,7 @@ use crate::motion::{self, AnimationExt as _, CHEVRON, COLLAPSE};
 use crate::popover::{self, Popup};
 use crate::state::{AppState, EngineHandle};
 use crate::theme::Theme;
-use zeron_syntax::LanguageId as Lang;
+use komet_syntax::LanguageId as Lang;
 
 // ---------------------------------------------------------------------------
 // Layout numbers (analytic — they drive the fold tween)
@@ -97,8 +97,8 @@ pub struct SourceLineRef {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DiffHighlights {
-    pub old: Option<Arc<zeron_syntax::HighlightedDocument>>,
-    pub new: Option<Arc<zeron_syntax::HighlightedDocument>>,
+    pub old: Option<Arc<komet_syntax::HighlightedDocument>>,
+    pub new: Option<Arc<komet_syntax::HighlightedDocument>>,
 }
 
 impl DiffHighlights {
@@ -129,7 +129,7 @@ impl DiffHighlights {
         }
     }
 
-    pub fn spans(&self, line: &DiffLine) -> &[zeron_syntax::HighlightSpan] {
+    pub fn spans(&self, line: &DiffLine) -> &[komet_syntax::HighlightSpan] {
         let Some(source_ref) = self.source_ref(line) else {
             return &[];
         };
@@ -638,7 +638,7 @@ fn excerpt_side(
     side: SourceSide,
     language: Lang,
     path: &str,
-) -> Option<Arc<zeron_syntax::HighlightedDocument>> {
+) -> Option<Arc<komet_syntax::HighlightedDocument>> {
     let max_line = file
         .hunks
         .iter()
@@ -673,7 +673,7 @@ fn excerpt_side(
             .map(|(_, text)| *text)
             .collect::<Vec<_>>()
             .join("\n");
-        let document = zeron_syntax::highlight(zeron_syntax::HighlightRequest {
+        let document = komet_syntax::highlight(komet_syntax::HighlightRequest {
             source: &source,
             path: Some(path),
             fence_tag: None,
@@ -683,14 +683,14 @@ fn excerpt_side(
             lines[number as usize - 1] = spans;
         }
     }
-    Some(Arc::new(zeron_syntax::HighlightedDocument {
+    Some(Arc::new(komet_syntax::HighlightedDocument {
         language,
         lines,
     }))
 }
 
 fn excerpt_highlights(file: &FileDiff, language: Lang) -> Option<DiffHighlights> {
-    if !zeron_syntax::supports_language(language) {
+    if !komet_syntax::supports_language(language) {
         return None;
     }
     let old = if file.status == FileStatus::Added {
@@ -711,7 +711,7 @@ fn excerpt_highlights(file: &FileDiff, language: Lang) -> Option<DiffHighlights>
     Some(DiffHighlights { old, new })
 }
 
-fn sources_match_patch(file: &FileDiff, response: &zeron_proto::CheckoutFileDiffText) -> bool {
+fn sources_match_patch(file: &FileDiff, response: &komet_proto::CheckoutFileDiffText) -> bool {
     let old = response
         .old_text
         .as_deref()
@@ -744,7 +744,7 @@ fn sources_match_patch(file: &FileDiff, response: &zeron_proto::CheckoutFileDiff
 fn full_highlights(
     file: &FileDiff,
     language: Lang,
-    response: &zeron_proto::CheckoutFileDiffText,
+    response: &komet_proto::CheckoutFileDiffText,
 ) -> Option<DiffHighlights> {
     if response.stale
         || response.binary
@@ -754,7 +754,7 @@ fn full_highlights(
         return None;
     }
     let parse = |source: &str, path: &str| {
-        zeron_syntax::highlight(zeron_syntax::HighlightRequest {
+        komet_syntax::highlight(komet_syntax::HighlightRequest {
             source,
             path: Some(path),
             fence_tag: None,
@@ -773,7 +773,7 @@ fn full_highlights(
         Some(source) => Some(parse(source, &file.path)?),
         None => None,
     };
-    if old.is_none() && new.is_none() && zeron_syntax::supports_language(language) {
+    if old.is_none() && new.is_none() && komet_syntax::supports_language(language) {
         return None;
     }
     Some(DiffHighlights { old, new })
@@ -1380,7 +1380,7 @@ impl Changes {
                 changes.scoped_inflight = None;
                 match result.and_then(|value| {
                     serde_json::from_value::<CheckoutDiff>(value)
-                        .map_err(|e| zeron_rpc::RpcError::Failed(e.to_string()))
+                        .map_err(|e| komet_rpc::RpcError::Failed(e.to_string()))
                 }) {
                     Ok(diff) => {
                         changes.scoped = Some(diff);
@@ -1813,7 +1813,7 @@ impl Changes {
         parsed_key: &str,
         cx: &mut Context<Self>,
     ) -> Option<Arc<DiffHighlights>> {
-        let lang = zeron_syntax::language_for_path(&file.path)?;
+        let lang = komet_syntax::language_for_path(&file.path)?;
         let fingerprint = hash64(&[parsed_key, &file.path]);
         if let Some(slot) = self.highlights.get(&file.path)
             && slot.fingerprint == fingerprint
@@ -1825,7 +1825,7 @@ impl Changes {
                 DiffHighlightState::Pending | DiffHighlightState::Plain => None,
             };
         }
-        if !zeron_syntax::supports_language(lang) {
+        if !komet_syntax::supports_language(lang) {
             self.highlights.insert(
                 file.path.clone(),
                 HighlightSlot {
@@ -1877,7 +1877,7 @@ impl Changes {
         let fetch_path = path.clone();
         let fetch_task = match (active, engine) {
             (Some(diff), Some(engine)) => Some(cx.spawn(async move |this, cx| {
-                let request = zeron_proto::GetCheckoutFileDiffTextRequest {
+                let request = komet_proto::GetCheckoutFileDiffTextRequest {
                     checkout_id: diff.checkout_id,
                     cwd: diff.cwd,
                     path: fetch_path.clone(),
@@ -1903,7 +1903,7 @@ impl Changes {
                     .await
                     .ok()
                     .and_then(|value| {
-                        serde_json::from_value::<zeron_proto::CheckoutFileDiffText>(value).ok()
+                        serde_json::from_value::<komet_proto::CheckoutFileDiffText>(value).ok()
                     });
                 let highlights = match response {
                     Some(response) => {
@@ -2043,7 +2043,7 @@ impl Changes {
         let adds = file.additions;
         let dels = file.deletions;
 
-        // Chevron (zeron checkout-diff-sidebar): chevron-right closed,
+        // Chevron (komet checkout-diff-sidebar): chevron-right closed,
         // chevron-down open; gpui divs have no rotation transform at the
         // pinned rev, so the glyph swap crossfades over the same 200 ms.
         let chevron_icon = if collapsed {
@@ -2660,7 +2660,7 @@ fn hunk_header_row(header: &str, theme: &Theme) -> AnyElement {
 /// paint-only syntax runs.
 fn diff_line_row(
     line: &DiffLine,
-    spans: &[zeron_syntax::HighlightSpan],
+    spans: &[komet_syntax::HighlightSpan],
     theme: &Theme,
     gutter_px: f32,
 ) -> AnyElement {
@@ -2790,7 +2790,7 @@ fn diff_line_row(
 
 /// The expanded body of one file section: notices, hunk headers, +/-/context
 /// lines with a coloured accent bar, dual line-number gutters, a marker
-/// column, and paint-only syntax runs (zeron checkout-diff-sidebar).
+/// column, and paint-only syntax runs (komet checkout-diff-sidebar).
 /// Shared with the transcript's tool-diff detail blocks — the same component
 /// renders a checkout diff section and an inline ACP tool diff. (The changes
 /// pane itself virtualizes these rows individually; this stacked form serves
@@ -2911,7 +2911,7 @@ impl Render for Changes {
                 } else if message.contains("unknown method") {
                     (
                         SharedString::from(
-                            "This chat's device is running an older Zeron — update it to view branch and turn diffs",
+                            "This chat's device is running an older Komet — update it to view branch and turn diffs",
                         ),
                         false,
                     )
@@ -2944,13 +2944,14 @@ impl Render for Changes {
                     .items_center()
                     .justify_center()
                     .gap(px(Theme::SPACE_SM))
-                    .child(crate::loaders::gradient_spinner(
-                        "changes-preparing",
-                        &theme,
-                        3.0,
-                        cx.entity_id(),
-                        cx,
-                    ))
+                    .child(
+                        crate::thinking_orbs::ThinkingOrb::new(
+                            crate::thinking_orbs::OrbState::Solving,
+                            24.0,
+                        )
+                        .speed(1.25)
+                        .driven(cx.entity_id(), cx),
+                    )
                     .child(
                         div()
                             .text_size(px(12.0))
@@ -2988,13 +2989,14 @@ impl Render for Changes {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .child(crate::loaders::gradient_spinner(
-                                "changes-parsing",
-                                &theme,
-                                3.0,
-                                cx.entity_id(),
-                                cx,
-                            ))
+                            .child(
+                                crate::thinking_orbs::ThinkingOrb::new(
+                                    crate::thinking_orbs::OrbState::Shaping,
+                                    24.0,
+                                )
+                                .speed(1.25)
+                                .driven(cx.entity_id(), cx),
+                            )
                             .into_any_element()
                     }
                 }
@@ -3353,7 +3355,7 @@ rename to new_name.rs
         assert_eq!(diff_phase(Some(&full)), DiffPhase::List);
         // Engine may report files without patch text (truncation edge).
         let mut summarized = diff("co", "d", "/w", "");
-        summarized.files.push(zeron_proto::DiffFileSummary {
+        summarized.files.push(komet_proto::DiffFileSummary {
             path: "x".into(),
             old_path: None,
             status: "modified".into(),
@@ -3494,7 +3496,7 @@ rename to new_name.rs
         let new_source = "fn new() {\n    let value = 2;\n}\n";
         let parse = |source| {
             Arc::new(
-                zeron_syntax::highlight(zeron_syntax::HighlightRequest {
+                komet_syntax::highlight(komet_syntax::HighlightRequest {
                     source,
                     path: Some("src/lib.rs"),
                     fence_tag: None,
@@ -3549,13 +3551,13 @@ rename to new_name.rs
             highlights
                 .spans(&deleted)
                 .iter()
-                .any(|span| span.kind == zeron_syntax::HighlightKind::Function)
+                .any(|span| span.kind == komet_syntax::HighlightKind::Function)
         );
         assert!(
             highlights
                 .spans(&added)
                 .iter()
-                .any(|span| span.kind == zeron_syntax::HighlightKind::Function)
+                .any(|span| span.kind == komet_syntax::HighlightKind::Function)
         );
     }
 
@@ -3607,13 +3609,13 @@ rename to new_name.rs
             highlights
                 .spans(deleted)
                 .iter()
-                .any(|span| span.kind == zeron_syntax::HighlightKind::Comment)
+                .any(|span| span.kind == komet_syntax::HighlightKind::Comment)
         );
         assert!(
             highlights
                 .spans(added)
                 .iter()
-                .any(|span| span.kind == zeron_syntax::HighlightKind::Comment)
+                .any(|span| span.kind == komet_syntax::HighlightKind::Comment)
         );
     }
 
@@ -3646,7 +3648,7 @@ rename to new_name.rs
             deletions: 1,
             max_line: 1,
         };
-        let response = zeron_proto::CheckoutFileDiffText {
+        let response = komet_proto::CheckoutFileDiffText {
             diff_checksum: "sum".into(),
             old_text: Some("let old = 1;\n".into()),
             new_text: Some("different snapshot\n".into()),

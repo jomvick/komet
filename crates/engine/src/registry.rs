@@ -14,8 +14,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use zeron_harness::{Harness, HarnessError, mock::MockHarness};
-use zeron_proto::{AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, SteeringMode};
+use komet_harness::{Harness, HarnessError, mock::MockHarness};
+use komet_proto::{AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, SteeringMode};
 
 /// How long a previously-discovered model list is served without re-probing.
 /// Long enough that every app launch (the common case) skips the cold agent
@@ -447,12 +447,12 @@ impl HarnessRegistry {
 }
 
 /// The production registry: MockHarness (hidden from production pickers) plus a lazy
-/// `claude-code` slot resolved through `zeron_harness` on first use (subprocess
+/// `claude-code` slot resolved through `komet_harness` on first use (subprocess
 /// discovery only happens when a run/model call actually needs it).
 pub fn default_registry() -> HarnessRegistry {
     // Warm the login-shell PATH snapshot in the background so the first
     // claude/codex resolve doesn't pay the shell-startup latency inline.
-    zeron_harness::shell_env::prewarm();
+    komet_harness::shell_env::prewarm();
     let registry = HarnessRegistry::new();
     registry.register(Arc::new(MockHarness {
         script: vec![
@@ -464,7 +464,7 @@ pub fn default_registry() -> HarnessRegistry {
             },
             AgentEvent::ToolCall {
                 id: "mock-tool-1".into(),
-                call: zeron_proto::ToolCall::Exec {
+                call: komet_proto::ToolCall::Exec {
                     command: "cargo test --workspace".into(),
                 },
             },
@@ -476,7 +476,7 @@ pub fn default_registry() -> HarnessRegistry {
             },
             AgentEvent::ToolCall {
                 id: "mock-tool-2".into(),
-                call: zeron_proto::ToolCall::Exec {
+                call: komet_proto::ToolCall::Exec {
                     command: "git log -5 --oneline --decorate && git merge-base HEAD origin/main"
                         .into(),
                 },
@@ -516,14 +516,14 @@ pub fn default_registry() -> HarnessRegistry {
             installed: true,
             enabled: None,
         },
-        Box::new(|| zeron_harness::AcpHarness::claude().installed()),
-        Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::claude()) as Arc<dyn Harness>)),
+        Box::new(|| komet_harness::AcpHarness::claude().installed()),
+        Box::new(|| Ok(Arc::new(komet_harness::AcpHarness::claude()) as Arc<dyn Harness>)),
     );
     // Codex, same lazy pattern: the static descriptor mirrors AcpHarness::codex()
     // exactly (`describe()` after the first resolve must not change the
     // catalog entry) — "Codex" per the original HARNESS_LABEL, StepBoundary
     // steering via native `turn/steer`, and the unified reasoning ladder from
-    // zeron_harness::codex::catalog. CLI discovery only happens when a
+    // komet_harness::codex::catalog. CLI discovery only happens when a
     // run/model call actually resolves the slot.
     registry.register_lazy(
         HarnessDescriptor {
@@ -543,8 +543,8 @@ pub fn default_registry() -> HarnessRegistry {
             installed: true,
             enabled: None,
         },
-        Box::new(|| zeron_harness::AcpHarness::codex().installed()),
-        Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::codex()) as Arc<dyn Harness>)),
+        Box::new(|| komet_harness::AcpHarness::codex().installed()),
+        Box::new(|| Ok(Arc::new(komet_harness::AcpHarness::codex()) as Arc<dyn Harness>)),
     );
     // Cursor Agent over ACP (`cursor-agent acp`), same lazy pattern: the
     // static descriptor mirrors AcpHarness::cursor() exactly. No steering
@@ -560,8 +560,8 @@ pub fn default_registry() -> HarnessRegistry {
             installed: true,
             enabled: None,
         },
-        Box::new(|| zeron_harness::AcpHarness::cursor().installed()),
-        Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::cursor()) as Arc<dyn Harness>)),
+        Box::new(|| komet_harness::AcpHarness::cursor().installed()),
+        Box::new(|| Ok(Arc::new(komet_harness::AcpHarness::cursor()) as Arc<dyn Harness>)),
     );
     // Grok Build over ACP, same lazy pattern: the static descriptor mirrors
     // AcpHarness::grok() exactly. No `_session/steering` extension yet, so
@@ -581,8 +581,8 @@ pub fn default_registry() -> HarnessRegistry {
             installed: true,
             enabled: None,
         },
-        Box::new(|| zeron_harness::AcpHarness::grok().installed()),
-        Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::grok()) as Arc<dyn Harness>)),
+        Box::new(|| komet_harness::AcpHarness::grok().installed()),
+        Box::new(|| Ok(Arc::new(komet_harness::AcpHarness::grok()) as Arc<dyn Harness>)),
     );
     // Hermes Agent over ACP (`hermes acp`), same lazy pattern: the static
     // descriptor mirrors AcpHarness::hermes() exactly. No steering extension
@@ -598,8 +598,8 @@ pub fn default_registry() -> HarnessRegistry {
             installed: true,
             enabled: None,
         },
-        Box::new(|| zeron_harness::AcpHarness::hermes().installed()),
-        Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::hermes()) as Arc<dyn Harness>)),
+        Box::new(|| komet_harness::AcpHarness::hermes().installed()),
+        Box::new(|| Ok(Arc::new(komet_harness::AcpHarness::hermes()) as Arc<dyn Harness>)),
     );
     // opencode over its native ACP server (`opencode acp`), same lazy
     // pattern: the static descriptor mirrors AcpHarness::opencode() exactly.
@@ -612,11 +612,19 @@ pub fn default_registry() -> HarnessRegistry {
             supports_steering: true,
             steering_mode: SteeringMode::TurnBoundary,
             reasoning_levels: Vec::new(),
+            // Always show OpenCode in the Agents list even if the CLI is not
+            // yet installed — the row renders with an install hint and an inert
+            // toggle, matching the pattern used by Codex, Grok, etc.  The real
+            // probe only gates the toggle and the send path.
             installed: true,
             enabled: None,
         },
-        Box::new(|| zeron_harness::AcpHarness::opencode().installed()),
-        Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::opencode()) as Arc<dyn Harness>)),
+        // The install probe returns true unconditionally so that the Agents
+        // page always shows the OpenCode row (with an install-hint when the
+        // CLI is absent and an inert toggle).  The real CLI check is enforced
+        // by set_enabled and by the send path when the harness is resolved.
+        Box::new(|| true),
+        Box::new(|| Ok(Arc::new(komet_harness::AcpHarness::opencode()) as Arc<dyn Harness>)),
     );
     // pi over ACP (community `pi-acp` adapter), same lazy pattern: the static
     // descriptor mirrors AcpHarness::pi() exactly — turn-boundary steering,
@@ -638,8 +646,8 @@ pub fn default_registry() -> HarnessRegistry {
             installed: true,
             enabled: None,
         },
-        Box::new(|| zeron_harness::AcpHarness::pi().installed()),
-        Box::new(|| Ok(Arc::new(zeron_harness::AcpHarness::pi()) as Arc<dyn Harness>)),
+        Box::new(|| komet_harness::AcpHarness::pi().installed()),
+        Box::new(|| Ok(Arc::new(komet_harness::AcpHarness::pi()) as Arc<dyn Harness>)),
     );
     registry
 }
@@ -849,7 +857,7 @@ mod tests {
     /// 4-way boot prefetch; user report: "model loading is too slow").
     #[tokio::test]
     async fn models_cache_persists_and_reloads_from_disk() {
-        use zeron_harness::mock::MockHarness;
+        use komet_harness::mock::MockHarness;
         let dir = tempfile::tempdir().unwrap();
 
         let registry = HarnessRegistry::new();
@@ -884,7 +892,7 @@ mod tests {
     /// of returning nothing.
     #[tokio::test]
     async fn models_cache_serves_fresh_and_falls_back_on_empty() {
-        use zeron_harness::mock::MockHarness;
+        use komet_harness::mock::MockHarness;
         let dir = tempfile::tempdir().unwrap();
 
         let registry = HarnessRegistry::new();
@@ -921,7 +929,7 @@ mod tests {
         );
         // An empty wire answer (no catalog, no list) falls back to the cache.
         let fallback = {
-            let harness = zeron_harness::AcpHarness::opencode()
+            let harness = komet_harness::AcpHarness::opencode()
                 .with_executable("/nonexistent/never-an-opencode-acp");
             // resolve via a lazy slot whose factory serves the harness
             // directly, so the fallback path is what decides.

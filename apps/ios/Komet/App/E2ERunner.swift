@@ -1,5 +1,5 @@
 // Headless e2e rig — launch with `-e2e` (plus a local wrangler dev edge and a
-// `zeron headless` engine in dev mode) and the app exercises the full live
+// `komet headless` engine in dev mode) and the app exercises the full live
 // stack with no taps: workspace room backfill, device-relay RPCs, space/chat
 // creation, the command plane, and session-room streaming. Results append to
 // Documents/e2e.log for the harness to read via simctl.

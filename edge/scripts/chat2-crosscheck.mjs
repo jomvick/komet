@@ -87,8 +87,8 @@ await peer.wait(FRAME.ack);
 // ── run the real Rust client ────────────────────────────────────────────────
 const out = execFileSync(
   "cargo",
-  ["run", "-q", "-p", "zeron-sync", "--example", "chat2_live", "--", base, chat, user, "rust-dev"],
-  { cwd: "/home/ubuntu/GitHub/zeron", encoding: "utf8", timeout: 120000 }
+  ["run", "-q", "-p", "komet-sync", "--example", "chat2_live", "--", base, chat, user, "rust-dev"],
+  { cwd: "/home/ubuntu/GitHub/komet", encoding: "utf8", timeout: 120000 }
 );
 const result = JSON.parse(out.split("\n").find((l) => l.startsWith("RESULT:")).slice(7));
 console.log("rust client:", JSON.stringify(result));

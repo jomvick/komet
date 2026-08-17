@@ -51,10 +51,10 @@ enable coverage to include `HarnessId::OpenCode`.
 
 ### Step 7 — verify
 - `cargo build` (workspace).
-- `cargo test -p zeron-harness -p zeron-engine` (plus any crate the new code
+- `cargo test -p komet-harness -p komet-engine` (plus any crate the new code
   touches). Check for a lint/typecheck command (clippy) and run it.
 
 ## Verification commands (repo conventions — confirm names before running)
 - Build: `cargo build` (workspace).
-- Tests: `cargo test -p zeron-proto -p zeron-harness -p zeron-engine -p zeron-ui`.
+- Tests: `cargo test -p komet-proto -p komet-harness -p komet-engine -p komet-ui`.
 - Lint: `cargo clippy --workspace` if configured.

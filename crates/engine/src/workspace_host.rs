@@ -25,9 +25,9 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use chrono::Utc;
 use tokio::sync::watch;
 
-use zeron_doc::{DeletedSpace, REGISTRY_DOC_ID, RegistryDoc, WorkspaceDoc};
-use zeron_proto::{Chat, ChatConfig, Device, Session, Space};
-use zeron_sync::{DocsStore, RegistryClient, RegistryTuning};
+use komet_doc::{DeletedSpace, REGISTRY_DOC_ID, RegistryDoc, WorkspaceDoc};
+use komet_proto::{Chat, ChatConfig, Device, Session, Space};
+use komet_sync::{DocsStore, RegistryClient, RegistryTuning};
 
 use crate::doc_host::EdgeConfig;
 use crate::{EngineError, now_ms};
@@ -76,7 +76,7 @@ pub(crate) async fn token_changed(changes: &mut Option<tokio::sync::watch::Recei
     }
 }
 
-async fn token_revoked(token: &Option<Arc<dyn zeron_rpc::TokenSource>>) -> bool {
+async fn token_revoked(token: &Option<Arc<dyn komet_rpc::TokenSource>>) -> bool {
     match token {
         Some(token) => token.token().await.is_none(),
         // Fixed test/dev URLs have no revocable credential source.
@@ -305,21 +305,21 @@ impl WorkspaceHost {
     /// server through this. Production always goes through [`Self::join_room`].
     #[doc(hidden)]
     pub fn connect_registry_url(&self, url: &str) {
-        self.spawn_join(Arc::new(zeron_sync::StaticUrl(url.to_string())), None, None);
+        self.spawn_join(Arc::new(komet_sync::StaticUrl(url.to_string())), None, None);
     }
 
     fn spawn_join(
         &self,
-        url: Arc<dyn zeron_sync::UrlProvider>,
+        url: Arc<dyn komet_sync::UrlProvider>,
         mut token_changes: Option<tokio::sync::watch::Receiver<u64>>,
-        token: Option<Arc<dyn zeron_rpc::TokenSource>>,
+        token: Option<Arc<dyn komet_rpc::TokenSource>>,
     ) {
         let org_id = self.inner.config.org_id.clone();
         let reg = self.inner.reg.clone();
         let device_id = self.inner.config.device_id.clone();
         let weak = Arc::downgrade(&self.inner);
         tokio::spawn(async move {
-            let mut wake = zeron_sync::wake::subscribe();
+            let mut wake = komet_sync::wake::subscribe();
             // `RegistryClient` only self-reconnects AFTER a first successful
             // join; an INITIAL failure (a 500 from an overloaded DO, a token
             // racing a refresh, an edge deploy) must not end this task and
@@ -362,16 +362,16 @@ impl WorkspaceHost {
                         loop {
                             tokio::select! {
                                 event = events.recv() => match event {
-                                    Ok(zeron_sync::RegistryEvent::Applied)
-                                    | Ok(zeron_sync::RegistryEvent::Connected) => {
+                                    Ok(komet_sync::RegistryEvent::Applied)
+                                    | Ok(komet_sync::RegistryEvent::Connected) => {
                                         let Some(inner) = weak.upgrade() else { return };
                                         inner.bump_changed();
                                     }
-                                    Ok(zeron_sync::RegistryEvent::Presence) => {
+                                    Ok(komet_sync::RegistryEvent::Presence) => {
                                         let Some(inner) = weak.upgrade() else { return };
                                         inner.publish();
                                     }
-                                    Ok(zeron_sync::RegistryEvent::Disconnected) => {}
+                                    Ok(komet_sync::RegistryEvent::Disconnected) => {}
                                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                                 },
@@ -444,9 +444,9 @@ impl WorkspaceHost {
         }
     }
 
-    /// Registry room introspection for SyncStatus / `zeron sync`.
+    /// Registry room introspection for SyncStatus / `komet sync`.
     /// `None` = no room yet (edge-less, or the initial join is still retrying).
-    pub fn sync_status(&self) -> Option<zeron_sync::RoomStatsSnapshot> {
+    pub fn sync_status(&self) -> Option<komet_sync::RoomStatsSnapshot> {
         lock(&self.inner.room).as_ref().map(|room| room.stats())
     }
 
@@ -889,7 +889,7 @@ impl WorkspaceHost {
         Ok(self.mutate(|doc| doc.set_chat_archived(chat_id, archived))?)
     }
 
-    /// LWW full-config replace on the chat row (zeron `SetChatConfig` — the
+    /// LWW full-config replace on the chat row (komet `SetChatConfig` — the
     /// composer's mid-session model/reasoning/options changes). Returns false
     /// when the chat doesn't exist.
     pub fn set_chat_config(&self, chat_id: &str, config: &ChatConfig) -> Result<bool, EngineError> {

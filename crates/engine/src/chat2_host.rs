@@ -1,6 +1,6 @@
 //! chat2 host wiring (docs/chat2-sync.md C3): the engine-side implementations
-//! of [`zeron_sync::chat_client::ChatDocSink`] and
-//! [`zeron_sync::chat_client::CheckpointFetcher`], binding a
+//! of [`komet_sync::chat_client::ChatDocSink`] and
+//! [`komet_sync::chat_client::CheckpointFetcher`], binding a
 //! [`crate::doc_host::ChatDocHandle`]'s live doc to a chat2 room.
 //!
 //! The C2 rule is enforced HERE: every sink method persists doc content AND
@@ -11,9 +11,9 @@
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
-use zeron_doc::SessionDoc;
-use zeron_sync::chat_client::{ChatDocSink, CheckpointFetcher};
-use zeron_sync::{DocsStore, SyncError};
+use komet_doc::SessionDoc;
+use komet_sync::chat_client::{ChatDocSink, CheckpointFetcher};
+use komet_sync::{DocsStore, SyncError};
 
 use crate::doc_host::EdgeConfig;
 

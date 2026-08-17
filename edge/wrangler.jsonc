@@ -1,5 +1,5 @@
 {
-  // Zeron edge: per-session + per-workspace Loro sync DOs, per-device
+  // Komet edge: per-session + per-workspace Loro sync DOs, per-device
   // relay DOs, R2 blobs, and the absorbed WorkOS auth routes.
   // Design: loro-sessions §2 (topology), §3 (persistence), §6.1 (diff
   // sidecar), §8 (device-room streams), §1.2 (R2 attachments), §3.3 (R2
@@ -15,18 +15,18 @@
   "compatibility_date": "2026-07-01",
   "account_id": "b57dde68ee5964dccc025437b5478a5b",
   "workers_dev": true,
-  // Public hostname on the zeron.sh zone, plus the install surface carved out
+  // Public hostname on the komet.sh zone, plus the install surface carved out
   // of the landing host: path routes beat the landing worker's custom
-  // domain, so `curl -fsSL https://zeron.sh/install.sh | sh` installs Zeron
-  // while the rest of zeron.sh serves the landing page.
+  // domain, so `curl -fsSL https://komet.sh/install.sh | sh` installs Komet
+  // while the rest of komet.sh serves the landing page.
   "routes": [
-    { "pattern": "edge.zeron.sh", "custom_domain": true },
-    { "pattern": "zeron.sh/install.sh", "zone_name": "zeron.sh" },
-    { "pattern": "zeron.sh/releases/*", "zone_name": "zeron.sh" },
+    { "pattern": "edge.komet.sh", "custom_domain": true },
+    { "pattern": "komet.sh/install.sh", "zone_name": "komet.sh" },
+    { "pattern": "komet.sh/releases/*", "zone_name": "komet.sh" },
     // Legacy comet hostnames — keep until 0.1.x clients are gone.
-    { "pattern": "edge.comet.zeron.sh", "custom_domain": true },
-    { "pattern": "comet.zeron.sh/install.sh", "zone_name": "zeron.sh" },
-    { "pattern": "comet.zeron.sh/releases/*", "zone_name": "zeron.sh" }
+    { "pattern": "edge.comet.komet.sh", "custom_domain": true },
+    { "pattern": "comet.komet.sh/install.sh", "zone_name": "komet.sh" },
+    { "pattern": "comet.komet.sh/releases/*", "zone_name": "komet.sh" }
   ],
   // Serve src/install.sh as a string (the /install.sh route).
   "rules": [{ "type": "Text", "globs": ["**/*.sh"], "fallthrough": true }],

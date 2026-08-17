@@ -9,7 +9,7 @@
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
-use zeron_harness::AcpHarness;
+use komet_harness::AcpHarness;
 
 fn write_executable(path: &Path, body: &str) {
     std::fs::write(path, body).unwrap();
@@ -51,10 +51,10 @@ async fn cli_on_login_shell_path_only_is_resolved() {
         std::env::remove_var("CLAUDE_ACP_EXECUTABLE");
         std::env::remove_var("HERMES_EXECUTABLE");
         std::env::remove_var("PI_ACP_EXECUTABLE");
-        std::env::remove_var("ZERON_NO_LOGIN_SHELL");
+        std::env::remove_var("KOMET_NO_LOGIN_SHELL");
     }
 
-    let snapshot = zeron_harness::shell_env::login_shell_path().expect("snapshot captured");
+    let snapshot = komet_harness::shell_env::login_shell_path().expect("snapshot captured");
     let snapshot = snapshot.to_string_lossy();
     assert!(
         snapshot.starts_with(&format!("{}:", shell_bin.display())),

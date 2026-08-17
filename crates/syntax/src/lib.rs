@@ -1,4 +1,4 @@
-//! Syntax-highlighting contracts shared by Zeron's desktop surfaces.
+//! Syntax-highlighting contracts shared by Komet's desktop surfaces.
 //!
 //! This crate intentionally has no UI, RPC, or engine dependencies. Public
 //! ranges are byte offsets relative to one UTF-8 source line.
@@ -378,7 +378,7 @@ fn injected_languages(parent: LanguageId) -> Vec<LanguageId> {
 
 fn rust_configuration() -> Result<HighlightConfiguration, HighlightError> {
     // The upstream Rust query groups numbers and booleans as
-    // `constant.builtin`. Zeron preserves those structural roles separately.
+    // `constant.builtin`. Komet preserves those structural roles separately.
     let highlights = tree_sitter_rust::HIGHLIGHTS_QUERY
         .replace(
             "(boolean_literal) @constant.builtin",
@@ -1038,11 +1038,11 @@ fn build(value: usize) -> Widget {
             (LanguageId::Json, "a.json", "{\"value\": 42}"),
             (LanguageId::Jsonc, "a.jsonc", "{\"value\": 42}"),
             (LanguageId::Bash, "run.sh", "echo \"hello\""),
-            (LanguageId::Toml, "Cargo.toml", "name = \"zeron\""),
+            (LanguageId::Toml, "Cargo.toml", "name = \"komet\""),
             (LanguageId::Markdown, "README.md", "# Heading\n\n`code`"),
             (LanguageId::Html, "index.html", "<main id=\"app\"></main>"),
             (LanguageId::Css, "app.css", ".app { color: red; }"),
-            (LanguageId::Yaml, "app.yml", "name: zeron"),
+            (LanguageId::Yaml, "app.yml", "name: komet"),
             (LanguageId::C, "main.c", "int main(void) { return 0; }"),
             (LanguageId::Cpp, "main.cpp", "int main() { return 0; }"),
             (LanguageId::CSharp, "App.cs", "class App { int Value = 1; }"),

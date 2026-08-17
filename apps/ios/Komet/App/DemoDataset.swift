@@ -33,8 +33,8 @@ final class DemoDataset {
                             lastSeenAt: now, createdAt: now - 86_400_000 * 30)
         let vps = DeviceRow(id: "dev-vps", name: "hetzner-01", platform: "linux",
                             lastSeenAt: now - 600_000, createdAt: now - 86_400_000 * 12)
-        let zeron = Space(id: "space-zeron", deviceId: "dev-mac",
-                          path: "/Users/dev/zeron", name: nil, gitDetected: true,
+        let komet = Space(id: "space-komet", deviceId: "dev-mac",
+                          path: "/Users/dev/komet", name: nil, gitDetected: true,
                           gitCheckedAt: now, checkoutId: nil, createdAt: now - 86_400_000 * 9)
         let edge = Space(id: "space-edge", deviceId: "dev-vps",
                          path: "/srv/deploys/edge", name: nil, gitDetected: true,
@@ -47,21 +47,21 @@ final class DemoDataset {
 
         let chats = [
             Chat(id: "chat-veil", deviceId: "dev-mac", title: "Streaming veil on transcript rows",
-                 archived: false, cwd: "/Users/dev/.zeron/worktrees/zeron-veil-fade",
+                 archived: false, cwd: "/Users/dev/.komet/worktrees/komet-veil-fade",
                  branch: "veil-fade", checkoutId: nil,
                  config: claude, lastMessagePreview: "Porting the paint-only fade…",
                  lastMessageAt: now - 40_000, createdAt: now - 3_600_000,
-                 spaceId: zeron.id, lastSeenAt: now),
+                 spaceId: komet.id, lastSeenAt: now),
             Chat(id: "chat-picker", deviceId: "dev-mac", title: "Model picker catalog sync",
-                 archived: false, cwd: zeron.path, branch: "main", checkoutId: nil,
+                 archived: false, cwd: komet.path, branch: "main", checkoutId: nil,
                  config: claude, lastMessagePreview: "Which device owns the catalog?",
                  lastMessageAt: now - 120_000, createdAt: now - 7_200_000,
-                 spaceId: zeron.id, lastSeenAt: now - 130_000),
+                 spaceId: komet.id, lastSeenAt: now - 130_000),
             Chat(id: "chat-tabs", deviceId: "dev-mac", title: "Tool group header colors",
-                 archived: false, cwd: zeron.path, branch: "main", checkoutId: nil,
+                 archived: false, cwd: komet.path, branch: "main", checkoutId: nil,
                  config: codex, lastMessagePreview: "Done — failed children stay quiet.",
                  lastMessageAt: now - 900_000, createdAt: now - 86_400_000,
-                 spaceId: zeron.id, lastSeenAt: now - 3_600_000),
+                 spaceId: komet.id, lastSeenAt: now - 3_600_000),
             Chat(id: "chat-deploy", deviceId: "dev-vps", title: "Wrangler deploy hygiene",
                  archived: false, cwd: edge.path, branch: nil, checkoutId: nil,
                  config: claude, lastMessagePreview: "Hibernation-safe flush timer",
@@ -69,10 +69,10 @@ final class DemoDataset {
                  spaceId: edge.id, lastSeenAt: now - 86_400_000),
             // Archived — populate the shelf under the active list.
             Chat(id: "chat-oklch", deviceId: "dev-mac", title: "OKLCH conversion drift",
-                 archived: true, cwd: zeron.path, branch: "main", checkoutId: nil,
+                 archived: true, cwd: komet.path, branch: "main", checkoutId: nil,
                  config: claude, lastMessagePreview: "Gamma encode matches now.",
                  lastMessageAt: now - 86_400_000 * 3, createdAt: now - 86_400_000 * 4,
-                 spaceId: zeron.id, lastSeenAt: now - 86_400_000 * 3),
+                 spaceId: komet.id, lastSeenAt: now - 86_400_000 * 3),
             Chat(id: "chat-presence", deviceId: "dev-vps", title: "Presence beat coalescing",
                  archived: true, cwd: edge.path, branch: nil, checkoutId: nil,
                  config: codex, lastMessagePreview: "Batched to one beat per 25s.",
@@ -86,7 +86,7 @@ final class DemoDataset {
                                       status: .awaitingInput, startedAt: now - 400_000,
                                       updatedAt: now - 10_000),
         ]
-        return DemoDataset(devices: [mac, vps], spaces: [zeron, edge],
+        return DemoDataset(devices: [mac, vps], spaces: [komet, edge],
                            chats: chats, sessions: sessions)
     }
 
@@ -95,8 +95,8 @@ final class DemoDataset {
     static let fileTree: [String: [String]] = [
         "/Users/dev": ["Documents", "Downloads", "Projects", "scratch"],
         "/Users/dev/Documents": ["notes", "specs"],
-        "/Users/dev/Projects": ["zeron", "dotfiles", "blog", "playground"],
-        "/Users/dev/Projects/zeron": ["apps", "crates", "docs", "edge"],
+        "/Users/dev/Projects": ["komet", "dotfiles", "blog", "playground"],
+        "/Users/dev/Projects/komet": ["apps", "crates", "docs", "edge"],
         "/Users/dev/Projects/blog": ["content", "public"],
         "/srv": ["deploys", "backups"],
         "/srv/deploys": ["edge", "landing"],
@@ -106,7 +106,7 @@ final class DemoDataset {
         deviceId == "dev-vps" ? "/srv" : "/Users/dev"
     }
 
-    private static let repoNames: Set<String> = ["zeron", "dotfiles", "blog", "playground", "edge", "landing"]
+    private static let repoNames: Set<String> = ["komet", "dotfiles", "blog", "playground", "edge", "landing"]
 
     func listFolders(deviceId: String, path: String) -> FolderListing {
         let entries = (Self.fileTree[path] ?? []).map { name in
@@ -120,11 +120,11 @@ final class DemoDataset {
     func listRefs(spacePath: String) -> [RepoRef] {
         if let cached = refsByPath[spacePath] { return cached }
         let seeded: [RepoRef]
-        if spacePath.contains("zeron") {
+        if spacePath.contains("komet") {
             seeded = [
                 RepoRef(name: "main", current: true, worktreePath: nil),
                 RepoRef(name: "veil-fade", current: false,
-                        worktreePath: "/Users/dev/.zeron/worktrees/zeron-veil-fade"),
+                        worktreePath: "/Users/dev/.komet/worktrees/komet-veil-fade"),
                 RepoRef(name: "feature/diff-pane", current: false, worktreePath: nil),
                 RepoRef(name: "fix/tool-colors", current: false, worktreePath: nil),
             ]
@@ -149,7 +149,7 @@ final class DemoDataset {
 
     func createWorktree(spacePath: String, base: String) -> String {
         let slug = base.replacingOccurrences(of: "/", with: "-")
-        let path = "/Users/dev/.zeron/worktrees/\((spacePath as NSString).lastPathComponent)-\(slug)"
+        let path = "/Users/dev/.komet/worktrees/\((spacePath as NSString).lastPathComponent)-\(slug)"
         var refs = listRefs(spacePath: spacePath)
         if let ix = refs.firstIndex(where: { $0.name == base }), refs[ix].worktreePath == nil {
             refs[ix].worktreePath = path
@@ -201,8 +201,8 @@ final class DemoDataset {
                     > The curve is `1 − (1−p)^1.6` — fast attack, soft landing.
                     """),
                     .tool(id: "tool1", call: RenderToolCall(tag: "readFile", fields: ["path": "crates/ui/src/markdown/veil.rs"]), isError: false, resolved: true),
-                    .tool(id: "tool2", call: RenderToolCall(tag: "editFile", fields: ["path": "Zeron/Transcript/Veil.swift"]), isError: false, resolved: true),
-                    .tool(id: "tool3", call: RenderToolCall(tag: "exec", fields: ["command": "xcodebuild -scheme Zeron build"]), isError: false, resolved: true),
+                    .tool(id: "tool2", call: RenderToolCall(tag: "editFile", fields: ["path": "Komet/Transcript/Veil.swift"]), isError: false, resolved: true),
+                    .tool(id: "tool3", call: RenderToolCall(tag: "exec", fields: ["command": "xcodebuild -scheme Komet build"]), isError: false, resolved: true),
                     .text(id: "t1", text: """
                     Implementation lands in `Veil.swift`:
 
@@ -245,7 +245,7 @@ final class DemoDataset {
                 ], createdAt: now - 1_000_000, deviceId: "ios-demo", status: .complete, continuationOf: nil),
                 MessageEntry(id: "m2", role: .assistant, parts: [
                     .tool(id: "tool1", call: RenderToolCall(tag: "search", fields: ["pattern": "group_header_color"]), isError: false, resolved: true),
-                    .tool(id: "tool2", call: RenderToolCall(tag: "exec", fields: ["command": "cargo test -p zeron-ui tool_group"]), isError: true, resolved: true),
+                    .tool(id: "tool2", call: RenderToolCall(tag: "exec", fields: ["command": "cargo test -p komet-ui tool_group"]), isError: true, resolved: true),
                     .tool(id: "tool3", call: RenderToolCall(tag: "editFile", fields: ["path": "crates/ui/src/shell/transcript.rs"]), isError: false, resolved: true),
                     .text(id: "t0", text: "Done — the header keeps `text_muted` even on failure; only the chip label and the summary segment (\"1 failed\") pick up `danger`. Matches the desktop fix in `1749890`."),
                 ], createdAt: now - 950_000, deviceId: "dev-mac", status: .complete, continuationOf: nil),

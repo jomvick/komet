@@ -12,8 +12,8 @@ use gpui::{
     PathBuilder, Render, SharedString, Subscription, Task, Window, canvas, container_query, div,
     list, point, prelude::*, px,
 };
-use zeron_proto::{GitHistoryCommit, GitHistoryPage, GitHistoryRef, GitHistoryRefKind};
-use zeron_rpc::methods;
+use komet_proto::{GitHistoryCommit, GitHistoryPage, GitHistoryRef, GitHistoryRefKind};
+use komet_rpc::methods;
 
 use crate::state::AppState;
 use crate::theme::Theme;
@@ -413,12 +413,12 @@ impl Render for GitHistoryFetchButton {
                     })
             })
             .child(if fetching {
-                crate::loaders::mini_gradient_spinner(
-                    "history-fetch-all-spinner",
-                    1.75,
-                    cx.entity_id(),
-                    cx,
+                crate::thinking_orbs::ThinkingOrb::new(
+                    crate::thinking_orbs::OrbState::Connecting,
+                    14.0,
                 )
+                .speed(1.25)
+                .driven(cx.entity_id(), cx)
                 .into_any_element()
             } else {
                 crate::icons::icon(crate::icons::CLOUD)
@@ -684,7 +684,7 @@ impl GitHistory {
                 history.loading = false;
                 match result.and_then(|value| {
                     serde_json::from_value::<GitHistoryPage>(value)
-                        .map_err(|error| zeron_rpc::RpcError::Failed(error.to_string()))
+                        .map_err(|error| komet_rpc::RpcError::Failed(error.to_string()))
                 }) {
                     Ok(page) => {
                         let old_commit_count = history.commits.len();
@@ -1210,13 +1210,14 @@ impl Render for GitHistory {
                 .items_center()
                 .justify_center()
                 .gap(px(8.0))
-                .child(crate::loaders::gradient_spinner(
-                    "history-loading",
-                    &theme,
-                    3.0,
-                    cx.entity_id(),
-                    cx,
-                ))
+                .child(
+                    crate::thinking_orbs::ThinkingOrb::new(
+                        crate::thinking_orbs::OrbState::Searching,
+                        24.0,
+                    )
+                    .speed(1.25)
+                    .driven(cx.entity_id(), cx),
+                )
                 .child(
                     div()
                         .text_size(px(12.0))

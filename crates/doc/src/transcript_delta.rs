@@ -6,7 +6,7 @@
 //! fallback when a diff would approach transcript size) or the changed
 //! entries only — during streaming that is one entry per tick.
 //!
-//! Both viewports share this module (the `zeron_proto::view` rule: derivations
+//! Both viewports share this module (the `komet_proto::view` rule: derivations
 //! that must not diverge per surface live in one place).
 
 use serde::{Deserialize, Serialize};

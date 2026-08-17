@@ -1,11 +1,11 @@
-// Zeron for iOS — a viewport onto the zeron mesh. The phone is a peer
+// Komet for iOS — a viewport onto the komet mesh. The phone is a peer
 // device: it joins the workspace and session doc rooms and drives remote
 // engines through the durable command queue.
 
 import SwiftUI
 
 @main
-struct ZeronApp: App {
+struct KometApp: App {
     @State private var model = AppModel()
     @Environment(\.scenePhase) private var scenePhase
 

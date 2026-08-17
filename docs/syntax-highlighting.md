@@ -1,6 +1,6 @@
 # Syntax highlighting
 
-Desktop syntax highlighting lives in the pure `zeron-syntax` crate. It detects
+Desktop syntax highlighting lives in the pure `komet-syntax` crate. It detects
 languages, runs pinned Tree-sitter grammars and queries, and returns sorted,
 non-overlapping UTF-8 byte spans relative to each source line. The UI resolves
 those neutral `HighlightKind` values through `Theme::syntax`; parser code never
@@ -25,7 +25,7 @@ any visible-line mismatch discards the full result atomically.
 4. Add a minimal distinctive fixture to the query-load table. If the language
    supports injections, register only known child parsers and keep unknown
    injected languages plain.
-5. Run `cargo test -p zeron-syntax`, UI Markdown/Changes tests, the ignored
+5. Run `cargo test -p komet-syntax`, UI Markdown/Changes tests, the ignored
    diagnostic benchmark when parser cost changes, and the workspace checks.
 
 Do not add language-specific parsing to a renderer. Unknown languages, binaries,

@@ -1,5 +1,5 @@
 // Attachments — the iOS port of crates/ui/src/attachments.rs (itself a port
-// of zeron's use-attachments.ts / message-attachments.ts): composer staging,
+// of komet's use-attachments.ts / message-attachments.ts): composer staging,
 // the chunked upload to the chat's host device, the plain-text attachment-ref
 // transport that rides the prompt, the transcript read-back cache, and the
 // full-size preview lightbox.

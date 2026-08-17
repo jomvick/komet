@@ -8,14 +8,14 @@
 //!   background thread: `afplay` (macOS), PowerShell `Media.SoundPlayer`
 //!   (Windows), first of `paplay`/`pw-play`/`aplay`/`ffplay`/`mpv` (Linux —
 //!   WAV, so even bare ALSA `aplay` decodes it);
-//! - `ZERON_DISABLE_SOUND` env kill-switch + the `soundEnabled` ui-setting;
+//! - `KOMET_DISABLE_SOUND` env kill-switch + the `soundEnabled` ui-setting;
 //! - failures are logged and swallowed — a missing player must never bother
 //!   the session flow.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-const DISABLE_ENV: &str = "ZERON_DISABLE_SOUND";
+const DISABLE_ENV: &str = "KOMET_DISABLE_SOUND";
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 static SOUND_DONE: &[u8] = include_bytes!("../assets/sounds/done.wav");
@@ -58,7 +58,7 @@ fn play_bytes(data: &[u8]) -> Result<(), String> {
 
 fn temp_path() -> PathBuf {
     let id = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir().join(format!("zeron-sound-{}-{id}.wav", std::process::id()))
+    std::env::temp_dir().join(format!("komet-sound-{}-{id}.wav", std::process::id()))
 }
 
 #[cfg(target_os = "macos")]
@@ -148,7 +148,7 @@ fn run_checked(program: &str, args: &[&str], path: &Path) -> Result<(), String> 
 // Transition mapping (pure — herdr's notification_sound_for_state_change)
 // ---------------------------------------------------------------------------
 
-use zeron_proto::SessionStatus;
+use komet_proto::SessionStatus;
 
 /// Which chime (if any) a session-status transition deserves. Same-state
 /// updates never chime; a question always chimes; a completion chimes on the

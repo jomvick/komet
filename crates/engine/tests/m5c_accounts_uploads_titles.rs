@@ -13,13 +13,13 @@ use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL;
 
-use zeron_engine::{
+use komet_engine::{
     AgentAccounts, AgentAccountsConfig, EngineCore, HarnessRegistry, Repos, Uploads,
     worktree_branch_from_title,
 };
-use zeron_harness::mock::MockHarness;
-use zeron_proto::{AgentAccountsSnapshot, AgentEvent, DoneStatus, HarnessId, SandboxLevel};
-use zeron_rpc::methods;
+use komet_harness::mock::MockHarness;
+use komet_proto::{AgentAccountsSnapshot, AgentEvent, DoneStatus, HarnessId, SandboxLevel};
+use komet_rpc::methods;
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -489,7 +489,7 @@ async fn uploads_chunk_commit_readback_and_jail() {
         .read_chunk(&outside.to_string_lossy(), 0, &[tmp.path().to_path_buf()])
         .expect("cwd-rooted read");
     assert_eq!(BASE64.decode(&ok.data).expect("data"), b"nope");
-    // Non-image extensions are refused even inside the jail (zeron parity).
+    // Non-image extensions are refused even inside the jail (komet parity).
     let text = PathBuf::from(uploads.dir()).join("notes.txt");
     std::fs::create_dir_all(uploads.dir()).expect("uploads dir");
     std::fs::write(&text, b"text").expect("txt");
@@ -558,7 +558,7 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
         .set_chat_branch(chat_id, &worktree.branch)
         .expect("set branch");
 
-    let request = zeron_proto::RunRequest {
+    let request = komet_proto::RunRequest {
         prompt: "please fix the login flow".into(),
         harness: None,
         model: None,
@@ -586,7 +586,7 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
     .await;
     assert_eq!(chat.title.as_deref(), Some("Fix Login Flow"));
     // Branch renamed from the title, chat row updated to match.
-    assert_eq!(chat.branch.as_deref(), Some("zeron/fix-login-flow"));
+    assert_eq!(chat.branch.as_deref(), Some("komet/fix-login-flow"));
     let head = tokio::process::Command::new("git")
         .args(["branch", "--show-current"])
         .current_dir(&worktree.path)
@@ -595,14 +595,14 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
         .expect("git");
     assert_eq!(
         String::from_utf8_lossy(&head.stdout).trim(),
-        "zeron/fix-login-flow"
+        "komet/fix-login-flow"
     );
 
     // A titled chat is never re-titled: rename, run again, title sticks.
     core.workspace
         .rename_chat(chat_id, "My Custom Name")
         .expect("rename");
-    let request = zeron_proto::RunRequest {
+    let request = komet_proto::RunRequest {
         prompt: "another request".into(),
         harness: None,
         model: None,
@@ -642,7 +642,7 @@ async fn rename_worktree_branch_guards_and_collisions() {
 
     // Guard: expected branch mismatch → no-op, returns the actual branch.
     let unchanged = repos
-        .rename_worktree_branch(wt_path, "zeron/not-this-one", "Some Title")
+        .rename_worktree_branch(wt_path, "komet/not-this-one", "Some Title")
         .await
         .expect("guarded");
     assert_eq!(unchanged, wt.branch);
@@ -652,15 +652,15 @@ async fn rename_worktree_branch_guards_and_collisions() {
         .rename_worktree_branch(wt_path, &wt.branch, "Add Dark Mode!")
         .await
         .expect("renamed");
-    assert_eq!(renamed, "zeron/add-dark-mode");
+    assert_eq!(renamed, "komet/add-dark-mode");
 
-    // Already renamed → the guard (branch no longer zeron/<folder>) makes any
+    // Already renamed → the guard (branch no longer komet/<folder>) makes any
     // further title rename a no-op.
     let again = repos
-        .rename_worktree_branch(wt_path, "zeron/add-dark-mode", "Different Title")
+        .rename_worktree_branch(wt_path, "komet/add-dark-mode", "Different Title")
         .await
         .expect("second rename");
-    assert_eq!(again, "zeron/add-dark-mode");
+    assert_eq!(again, "komet/add-dark-mode");
 
     // Collision: a second worktree whose title slug already exists gets the
     // stable hash suffix.
@@ -673,20 +673,20 @@ async fn rename_worktree_branch_guards_and_collisions() {
         .await
         .expect("suffixed rename");
     assert!(
-        renamed2.starts_with("zeron/add-dark-mode-")
-            && renamed2.len() == "zeron/add-dark-mode-".len() + 6,
+        renamed2.starts_with("komet/add-dark-mode-")
+            && renamed2.len() == "komet/add-dark-mode-".len() + 6,
         "suffixed: {renamed2}"
     );
 
     // Slug edge cases.
     assert_eq!(
         worktree_branch_from_title("  Fix `Login` Flow!  "),
-        "zeron/fix-login-flow"
+        "komet/fix-login-flow"
     );
-    assert_eq!(worktree_branch_from_title("***"), "zeron/update");
+    assert_eq!(worktree_branch_from_title("***"), "komet/update");
     assert_eq!(
         worktree_branch_from_title("Cafe's Dark Mode"),
-        "zeron/cafes-dark-mode"
+        "komet/cafes-dark-mode"
     );
 }
 
@@ -698,7 +698,7 @@ async fn rename_worktree_branch_guards_and_collisions() {
 async fn rpc_dispatch_for_m5c_methods() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let core = assemble_with_mock(&tmp.path().join("data"), Vec::new());
-    let client = zeron_rpc::memory_client(core.rpc_service());
+    let client = komet_rpc::memory_client(core.rpc_service());
 
     // Uploads: chunk → commit → readback over the wire.
     let payload = b"fake png bytes".to_vec();
