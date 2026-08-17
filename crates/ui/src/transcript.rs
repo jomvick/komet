@@ -2669,6 +2669,11 @@ impl Transcript {
         } else {
             flavour_word(flavour_seed(&chat_id), elapsed_secs)
         };
+        let orb_state = if sending {
+            crate::thinking_orbs::OrbState::Listening
+        } else {
+            crate::thinking_orbs::OrbState::from_flavour_word(word)
+        };
         let theme = Theme::of(cx).clone();
         Some(
             div()
@@ -2678,13 +2683,11 @@ impl Transcript {
                 .gap(px(Theme::SPACE_SM))
                 .pt(px(10.0))
                 .text_size(px(11.0))
-                .child(crate::loaders::gradient_spinner(
-                    "working-indicator",
-                    &theme,
-                    2.5,
-                    cx.entity_id(),
-                    cx,
-                ))
+                .child(
+                    crate::thinking_orbs::ThinkingOrb::new(orb_state, 20.0)
+                        .speed(1.25)
+                        .driven(cx.entity_id(), cx),
+                )
                 .child(
                     div()
                         .text_size(px(12.0))
@@ -3550,7 +3553,7 @@ fn user_bubble_text(
 /// red-tinted wash, never a bare red-stroke box. Unlike the web port, the
 /// message WRAPS instead of truncating: startup-crash errors carry the
 /// agent's exit status and stderr, and a one-line ellipsis was exactly what
-/// made komet/komet#95 undiagnosable from the screenshot.
+/// made kometsh/komet#95 undiagnosable from the screenshot.
 fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
     let red_300 = theme.danger_muted; // tailwind red-300
     let danger = theme.danger; // red-400

@@ -1613,11 +1613,39 @@ fn usage_from_response(res: &Result<Value, HarnessError>) -> Option<AgentEvent> 
             .find_map(|k| usage.get(*k))
             .and_then(Value::as_u64)
     };
-    let input = count(&["inputTokens", "input_tokens"]);
-    let output = count(&["outputTokens", "output_tokens"]);
+    let input = count(&["inputTokens", "input_tokens", "promptTokens", "prompt_tokens"]);
+    let cached = count(&[
+        "cachedInputTokens",
+        "cached_input_tokens",
+        "cacheReadInputTokens",
+        "cache_read_input_tokens",
+        "cachedTokens",
+        "cached_tokens",
+    ]);
+    let output = count(&["outputTokens", "output_tokens", "completionTokens", "completion_tokens"]);
+    let reasoning = count(&[
+        "reasoningTokens",
+        "reasoning_tokens",
+        "reasoningOutputTokens",
+        "reasoning_output_tokens",
+        "thinkingTokens",
+        "thinking_tokens",
+    ]);
+    let context_limit = count(&[
+        "contextLimit",
+        "context_limit",
+        "contextWindow",
+        "context_window",
+        "contextWindowLimit",
+        "context_window_limit",
+    ]);
+
     (input.is_some() || output.is_some()).then(|| AgentEvent::Usage {
         input_tokens: input.unwrap_or(0),
+        cached_input_tokens: cached.unwrap_or(0),
         output_tokens: output.unwrap_or(0),
+        reasoning_tokens: reasoning.unwrap_or(0),
+        context_limit,
     })
 }
 
@@ -1743,7 +1771,7 @@ fn handle_server_request(
         CURSOR_GENERATE_IMAGE => {
             client.respond(
                 &id,
-                json!({ "outcome": { "outcome": "rejected", "reason": "komet cannot render generated images" } }),
+                json!({ "outcome": { "outcome": "rejected", "reason": "Komet cannot render generated images" } }),
             );
             Vec::new()
         }

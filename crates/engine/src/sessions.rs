@@ -116,6 +116,8 @@ struct Inner {
     /// (komet kept the same pair on `chats.harness_session_id`). An empty
     /// session id is the "do not resume" tombstone after a rejected resume.
     harness_sessions: Mutex<HashMap<String, HarnessSessionRef>>,
+    /// Cumulative context & token usage metrics per chat id.
+    usage_stats: Mutex<HashMap<String, komet_proto::ContextUsageStats>>,
     /// Auto-titler for untitled chats (wired at engine assembly; absent in bare tests).
     titles: OnceLock<crate::titles::TitleGenerator>,
     /// Fired with `(chat_id, cwd)` when a user prompt starts a turn (fresh
@@ -155,10 +157,16 @@ impl SessionsEngine {
                 sessions_tx,
                 last_requests: Mutex::new(HashMap::new()),
                 harness_sessions: Mutex::new(HashMap::new()),
+                usage_stats: Mutex::new(HashMap::new()),
                 titles: OnceLock::new(),
                 turn_listener: OnceLock::new(),
             }),
         }
+    }
+
+    /// Retrieve context & token usage metrics for a chat session.
+    pub fn usage_for(&self, chat_id: &str) -> Option<komet_proto::ContextUsageStats> {
+        lock(&self.inner.usage_stats).get(chat_id).cloned()
     }
 
     /// Wire the doc host (called once at engine assembly; the two services are mutually
@@ -727,6 +735,35 @@ impl SessionsEngine {
 impl Inner {
     /// Journal + broadcast one event (the two unconditional legs of the pipeline).
     fn publish(&self, chat_id: &str, event: &AgentEvent) -> u64 {
+        match event {
+            AgentEvent::SessionStarted { model, .. } => {
+                let mut usage_stats = lock(&self.usage_stats);
+                let default_limit = komet_proto::default_context_limit_for_model(model);
+                usage_stats
+                    .entry(chat_id.to_string())
+                    .or_insert_with(|| komet_proto::ContextUsageStats::new(default_limit));
+            }
+            AgentEvent::Usage {
+                input_tokens,
+                cached_input_tokens,
+                output_tokens,
+                reasoning_tokens,
+                context_limit,
+            } => {
+                let mut usage_stats = lock(&self.usage_stats);
+                let entry = usage_stats
+                    .entry(chat_id.to_string())
+                    .or_insert_with(|| komet_proto::ContextUsageStats::new(context_limit.unwrap_or(200_000)));
+                entry.ingest(
+                    *input_tokens,
+                    *cached_input_tokens,
+                    *output_tokens,
+                    *reasoning_tokens,
+                    *context_limit,
+                );
+            }
+            _ => {}
+        }
         let seq = match self.journal.append(chat_id, event) {
             Ok(seq) => seq,
             Err(err) => {

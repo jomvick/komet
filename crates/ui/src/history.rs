@@ -413,12 +413,12 @@ impl Render for GitHistoryFetchButton {
                     })
             })
             .child(if fetching {
-                crate::loaders::mini_gradient_spinner(
-                    "history-fetch-all-spinner",
-                    1.75,
-                    cx.entity_id(),
-                    cx,
+                crate::thinking_orbs::ThinkingOrb::new(
+                    crate::thinking_orbs::OrbState::Connecting,
+                    14.0,
                 )
+                .speed(1.25)
+                .driven(cx.entity_id(), cx)
                 .into_any_element()
             } else {
                 crate::icons::icon(crate::icons::CLOUD)
@@ -1210,13 +1210,14 @@ impl Render for GitHistory {
                 .items_center()
                 .justify_center()
                 .gap(px(8.0))
-                .child(crate::loaders::gradient_spinner(
-                    "history-loading",
-                    &theme,
-                    3.0,
-                    cx.entity_id(),
-                    cx,
-                ))
+                .child(
+                    crate::thinking_orbs::ThinkingOrb::new(
+                        crate::thinking_orbs::OrbState::Searching,
+                        24.0,
+                    )
+                    .speed(1.25)
+                    .driven(cx.entity_id(), cx),
+                )
                 .child(
                     div()
                         .text_size(px(12.0))

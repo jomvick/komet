@@ -133,6 +133,12 @@ icon_assets![
     (STAR, "star"),
     (STAR_BOLD, "star-bold"),
     (KOMET_LOGO, "komet-logo"),
+    // Blobatar animated avatar layers
+    (BLOBATAR_BODY, "blobatar-body"),
+    (BLOBATAR_EYE, "blobatar-eye"),
+    (BLOBATAR_EYE_WINK, "blobatar-eye-wink"),
+    (BLOBATAR_MOUTH, "blobatar-mouth"),
+    (BLOBATAR_BLUSH, "blobatar-blush"),
     // Harness brand marks (icons.tsx).
     (CLAUDE_MARK, "claude-mark"),
     (OPENAI_MARK, "openai-mark"),

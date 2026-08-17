@@ -41,16 +41,8 @@ pub use gpui::AnimationExt;
 // Pulse clock — throttled drive for the repeating loaders
 // ---------------------------------------------------------------------------
 
-/// Repeat-tick interval for the pulse/spinner loaders (~30fps).
-///
-/// The loaders used to run as gpui `with_animation(...repeating...)` elements,
-/// which request a redraw every display frame for as long as they are mounted
-/// — one Working session row pinned the whole window at 120Hz (measured 36%
-/// CPU on an M-series laptop, with the always-hot Metal pipeline holding
-/// hundreds of MB of graphics buffers). A shared 30fps clock is visually
-/// equivalent for these chunky cell waves at a quarter of the redraws, and a
 /// window with no spinner mounted schedules nothing at all.
-const PULSE_TICK: Duration = Duration::from_millis(33);
+const PULSE_TICK: Duration = Duration::from_millis(16);
 
 /// How long a view stays on the tick list after its last spinner paint. One
 /// lease outlives a few missed frames; an unmounted spinner stops renewing and
@@ -115,6 +107,47 @@ pub fn pulse_delta(spec: &MotionSpec, view: EntityId, cx: &mut App) -> f32 {
         .detach();
     }
     phase
+}
+
+/// Register a view to receive continuous re-render notifications from the pulse clock.
+pub fn pulse_lease(view: EntityId, cx: &mut App) {
+    if cx.reduce_motion() {
+        return;
+    }
+    let clock = cx.default_global::<PulseClock>();
+    clock.leases.insert(view, Instant::now() + PULSE_LEASE);
+    if !clock.running {
+        clock.running = true;
+        cx.spawn(async move |cx| {
+            loop {
+                cx.background_executor().timer(PULSE_TICK).await;
+                let parked = cx.update(|cx| {
+                    let clock = cx.default_global::<PulseClock>();
+                    let now = Instant::now();
+                    clock.leases.retain(|_, until| *until > now);
+                    if clock.leases.is_empty() {
+                        clock.running = false;
+                        return true;
+                    }
+                    let views: Vec<EntityId> = clock.leases.keys().copied().collect();
+                    for view in views {
+                        cx.notify(view);
+                    }
+                    false
+                });
+                if parked {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+}
+
+/// Elapsed time in seconds from the shared pulse clock epoch.
+pub fn pulse_time(cx: &mut App) -> f32 {
+    let clock = cx.default_global::<PulseClock>();
+    clock.epoch.elapsed().as_secs_f32()
 }
 
 // ---------------------------------------------------------------------------

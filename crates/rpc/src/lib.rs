@@ -132,6 +132,8 @@ pub mod methods {
     /// Download + apply the newest release on the target device (symlink-managed
     /// installs; the service restart is scheduled after the reply flushes).
     pub const APPLY_UPDATE: &str = "ApplyUpdate";
+    /// Retrieve context & token usage metrics for a session thread.
+    pub const GET_CONTEXT_USAGE: &str = "GetContextUsage";
 }
 
 #[derive(Debug, thiserror::Error)]

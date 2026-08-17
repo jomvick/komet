@@ -2944,13 +2944,14 @@ impl Render for Changes {
                     .items_center()
                     .justify_center()
                     .gap(px(Theme::SPACE_SM))
-                    .child(crate::loaders::gradient_spinner(
-                        "changes-preparing",
-                        &theme,
-                        3.0,
-                        cx.entity_id(),
-                        cx,
-                    ))
+                    .child(
+                        crate::thinking_orbs::ThinkingOrb::new(
+                            crate::thinking_orbs::OrbState::Solving,
+                            24.0,
+                        )
+                        .speed(1.25)
+                        .driven(cx.entity_id(), cx),
+                    )
                     .child(
                         div()
                             .text_size(px(12.0))
@@ -2988,13 +2989,14 @@ impl Render for Changes {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .child(crate::loaders::gradient_spinner(
-                                "changes-parsing",
-                                &theme,
-                                3.0,
-                                cx.entity_id(),
-                                cx,
-                            ))
+                            .child(
+                                crate::thinking_orbs::ThinkingOrb::new(
+                                    crate::thinking_orbs::OrbState::Shaping,
+                                    24.0,
+                                )
+                                .speed(1.25)
+                                .driven(cx.entity_id(), cx),
+                            )
                             .into_any_element()
                     }
                 }

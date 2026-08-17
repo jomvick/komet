@@ -15,12 +15,16 @@
 pub mod app_menus;
 pub mod appearance;
 pub mod attachments;
+pub mod blobatar;
 pub mod changes;
 pub mod composer;
+pub mod context_usage;
 pub mod edge_fade;
+pub mod files;
 pub mod frost;
 pub mod history;
 pub mod icons;
+pub mod komet_avatar;
 pub mod loaders;
 pub mod markdown;
 pub mod motion;
@@ -35,6 +39,7 @@ pub mod state;
 pub mod syntax_cache;
 pub mod terminal;
 pub mod theme;
+pub mod thinking_orbs;
 pub mod transcript;
 
 use std::borrow::Cow;

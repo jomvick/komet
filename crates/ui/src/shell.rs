@@ -28,6 +28,7 @@ use komet_rpc::methods;
 
 use crate::changes::{Changes, ChangesEvent};
 use crate::composer::{Composer, ComposerEvent, ComposerInput, ComposerInputEvent};
+use crate::files::FilesPanel;
 use crate::icons::{self, icon};
 use crate::loaders;
 use crate::motion::{self, AnimationExt as _, MotionSpec, RESIZE, SPLASH_OUT, TAB_SLIDE};
@@ -207,6 +208,7 @@ pub enum RightSurface {
     Picker,
     Diff(u64),
     Terminal(u64),
+    Files(u64),
 }
 
 /// Per-chat panel open flags (komet parity: `sessionPanels` — the terminal and
@@ -780,6 +782,9 @@ pub struct Shell {
     /// Event hookups for [`Self::diffs`] (History rows opening commit tabs).
     diff_subs: std::collections::HashMap<u64, Subscription>,
     diff_seq: u64,
+    /// Files explorer surfaces by id (interactive project tree).
+    files: std::collections::HashMap<u64, Entity<FilesPanel>>,
+    files_seq: u64,
     /// Ordered surface tabs per panel key (drag-reorderable; stale entries —
     /// closed terminals/diffs — are skipped at read time).
     right_tabs: std::collections::HashMap<String, Vec<RightSurface>>,
@@ -1022,6 +1027,8 @@ impl Shell {
             diffs: std::collections::HashMap::new(),
             diff_subs: std::collections::HashMap::new(),
             diff_seq: 0,
+            files: std::collections::HashMap::new(),
+            files_seq: 0,
             right_tabs: std::collections::HashMap::new(),
             right_tab_drag: None,
             right_tab_scroll: gpui::ScrollHandle::new(),
@@ -1447,6 +1454,10 @@ impl Shell {
                     // Contextual title (user request): the pane's scope
                     // label, or the pinned commit's subject.
                     .map(|changes| (*surface, changes.read(cx).tab_title())),
+                RightSurface::Files(id) => self
+                    .files
+                    .get(id)
+                    .map(|files| (*surface, files.read(cx).tab_title())),
                 RightSurface::Terminal(tab) => terminals
                     .iter()
                     .find(|(k, _, _)| k == tab)
@@ -1525,9 +1536,29 @@ impl Shell {
                     changes.update(cx, |changes, cx| changes.ensure_content(cx));
                 }
             }
+            RightSurface::Files(id) => {
+                if let Some(files) = self.files.get(&id).cloned() {
+                    files.update(cx, |files, cx| files.ensure_root(cx));
+                }
+            }
             RightSurface::Picker => {}
         }
         cx.notify();
+    }
+
+    /// The picker's Files card / the `+` menu's Files row: opens a project
+    /// file tree explorer surface tab.
+    fn add_files_surface(&mut self, cx: &mut Context<Self>) {
+        let files = cx.new(|cx| FilesPanel::new(self.state.clone(), cx));
+        self.files_seq += 1;
+        let id = self.files_seq;
+        self.files.insert(id, files);
+        let key = self.panel_key(cx);
+        self.right_tabs
+            .entry(key)
+            .or_default()
+            .push(RightSurface::Files(id));
+        self.set_right_active(RightSurface::Files(id), cx);
     }
 
     /// The picker's Git card / the `+` menu's Diff row: every click opens a
@@ -1602,6 +1633,9 @@ impl Shell {
                 // Dropping the entity tears down its diff watch.
                 self.diffs.remove(&id);
                 self.diff_subs.remove(&id);
+            }
+            RightSurface::Files(id) => {
+                self.files.remove(&id);
             }
             RightSurface::Terminal(tab) => {
                 let panel = self.right_terminal_panel(cx);
@@ -3258,16 +3292,18 @@ impl Shell {
                                 .child(branch),
                         )
                     })
-                    // Working rows animate the spinner at the row's
+                    // Working rows animate the orb at the row's
                     // bottom-right (the status word keeps its dot up top).
                     .when(status == komet_proto::ChatIndicator::Working, |el| {
                         el.child(div().flex_1())
-                            .child(loaders::mini_gradient_spinner(
-                                format!("chat-working-{id}"),
-                                2.0,
-                                cx.entity_id(),
-                                cx,
-                            ))
+                            .child(
+                                crate::thinking_orbs::ThinkingOrb::new(
+                                    crate::thinking_orbs::OrbState::Working,
+                                    14.0,
+                                )
+                                .speed(1.25)
+                                .driven(cx.entity_id(), cx),
+                            )
                     }),
             )
             .into_any_element()
@@ -4448,12 +4484,11 @@ impl Shell {
                         .flex()
                         .flex_col()
                         .items_center()
-                        .child(
-                            icon(icons::KOMET_LOGO)
-                                .w(px(41.9))
-                                .h(px(48.0))
-                                .text_color(theme.text.opacity(0.09)),
-                        )
+                        .child(crate::blobatar::blobatar(
+                            "onboarding-blobatar",
+                            64.0,
+                            Some(theme.text.opacity(0.85)),
+                        ))
                         .child(
                             div()
                                 .mt(px(24.0))
@@ -4502,14 +4537,11 @@ impl Shell {
                         .flex()
                         .flex_col()
                         .items_center()
-                        .child(
-                            icon(icons::KOMET_LOGO)
-                                .w(px(41.9))
-                                .h(px(48.0))
-                                // 0.09 read as barely-there on the glass
-                                // backdrop (user report).
-                                .text_color(theme.text.opacity(0.2)),
-                        )
+                        .child(crate::blobatar::blobatar(
+                            "new-chat-blobatar",
+                            64.0,
+                            Some(theme.text.opacity(0.85)),
+                        ))
                         .child(div().mt(px(16.0)).child(selectors))
                         .child(
                             div()
@@ -4849,13 +4881,14 @@ impl Shell {
                 .child(SharedString::from("Run failed"))
                 .into_any_element(),
             Indicator::None if sending => strip
-                .child(loaders::gradient_spinner(
-                    "sending-indicator",
-                    &theme,
-                    2.5,
-                    cx.entity_id(),
-                    cx,
-                ))
+                .child(
+                    crate::thinking_orbs::ThinkingOrb::new(
+                        crate::thinking_orbs::OrbState::Listening,
+                        20.0,
+                    )
+                    .speed(1.25)
+                    .driven(cx.entity_id(), cx),
+                )
                 .child(
                     div()
                         .text_size(px(12.0))
@@ -4908,6 +4941,11 @@ impl Shell {
                     // the resolved surface (fallbacks can move it).
                     panel.update(cx, |panel, cx| panel.select_tab_by_key(tab, cx));
                     panel.into_any_element()
+                }
+                RightSurface::Files(id) if self.files.contains_key(&id) => {
+                    let files = self.files.get(&id).cloned().expect("checked");
+                    files.update(cx, |files, cx| files.ensure_root(cx));
+                    files.into_any_element()
                 }
                 _ => self.render_surface_picker(cx),
             }
@@ -5049,6 +5087,13 @@ impl Shell {
                                     }),
                                 ),
                             )
+                            .child(
+                                row("surface-card-files", icons::DOCUMENT, "Files").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.add_files_surface(cx);
+                                    }),
+                                ),
+                            )
                             // Git only where there IS git — the pane itself
                             // no longer gates on it (terminals work anywhere).
                             .when(self.space_git_detected(cx), |el| {
@@ -5087,8 +5132,7 @@ impl Shell {
             .text_center()
             .child(
                 icon(icons::KOMET_LOGO)
-                    .w(px(31.4))
-                    .h(px(36.0))
+                    .size(px(36.0))
                     .text_color(theme.text),
             )
             .child(
@@ -5232,6 +5276,7 @@ impl Shell {
             let is_active = surface == active;
             let icon_path = match surface {
                 RightSurface::Diff(_) => icons::GIT_BRANCH,
+                RightSurface::Files(_) => icons::DOCUMENT,
                 _ => icons::TERMINAL,
             };
             // t3 tab hover: the surface icon swaps IN PLACE for the close ✕
@@ -5440,6 +5485,20 @@ impl Shell {
                                 .child(SharedString::from("Terminal")),
                         )
                         .child(
+                            popover::menu_row(&theme, false, "right-plus-files")
+                                .id("right-plus-files-row")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.add_files_surface(cx);
+                                    this.close_right_plus(cx);
+                                }))
+                                .child(
+                                    icon(icons::DOCUMENT)
+                                        .size(px(13.0))
+                                        .text_color(theme.text_muted),
+                                )
+                                .child(SharedString::from("Files")),
+                        )
+                        .child(
                             popover::menu_row(&theme, false, "right-plus-diff")
                                 .id("right-plus-diff-row")
                                 .on_click(cx.listener(|this, _, _, cx| {
@@ -5576,12 +5635,11 @@ impl Shell {
                 .flex_col()
                 .items_center()
                 .text_center()
-                .child(
-                    icon(icons::KOMET_LOGO)
-                        .w(px(31.4))
-                        .h(px(36.0))
-                        .text_color(theme.text),
-                )
+                .child(crate::blobatar::blobatar(
+                    "signin-blobatar",
+                    48.0,
+                    Some(theme.text),
+                ))
                 .child(
                     div()
                         .mt(px(24.0))
@@ -5762,12 +5820,11 @@ impl Shell {
             .shadow_lg()
             .flex()
             .flex_col()
-            .child(
-                icon(icons::KOMET_LOGO)
-                    .w(px(24.4))
-                    .h(px(28.0))
-                    .text_color(theme.text),
-            )
+            .child(crate::blobatar::blobatar(
+                "org-blobatar",
+                36.0,
+                Some(theme.text),
+            ))
             .child(
                 div()
                     .mt(px(20.0))
@@ -6898,6 +6955,8 @@ mod tests {
         assert_eq!(panels.get("b").right_active, RightSurface::Picker);
         panels.update("a", |p| p.right_active = RightSurface::Terminal(7));
         assert_eq!(panels.get("a").right_active, RightSurface::Terminal(7));
+        panels.update("a", |p| p.right_active = RightSurface::Files(42));
+        assert_eq!(panels.get("a").right_active, RightSurface::Files(42));
     }
 
     // ---- sidebar resort FLIP diff (§1.6) ----

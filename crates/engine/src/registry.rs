@@ -612,10 +612,18 @@ pub fn default_registry() -> HarnessRegistry {
             supports_steering: true,
             steering_mode: SteeringMode::TurnBoundary,
             reasoning_levels: Vec::new(),
+            // Always show OpenCode in the Agents list even if the CLI is not
+            // yet installed — the row renders with an install hint and an inert
+            // toggle, matching the pattern used by Codex, Grok, etc.  The real
+            // probe only gates the toggle and the send path.
             installed: true,
             enabled: None,
         },
-        Box::new(|| komet_harness::AcpHarness::opencode().installed()),
+        // The install probe returns true unconditionally so that the Agents
+        // page always shows the OpenCode row (with an install-hint when the
+        // CLI is absent and an inert toggle).  The real CLI check is enforced
+        // by set_enabled and by the send path when the harness is resolved.
+        Box::new(|| true),
         Box::new(|| Ok(Arc::new(komet_harness::AcpHarness::opencode()) as Arc<dyn Harness>)),
     );
     // pi over ACP (community `pi-acp` adapter), same lazy pattern: the static

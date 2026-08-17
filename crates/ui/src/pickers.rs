@@ -366,6 +366,8 @@ pub enum PickerKind {
     Checkout,
     HarnessModel,
     Traits,
+    /// Real-time context window and token usage telemetry popover.
+    ContextUsage,
     /// New-session canvas only: which project the session mints into. A pick
     /// re-keys everything project-derived (refs, harness/model catalogs) via
     /// the state observer.
@@ -503,6 +505,7 @@ impl Pickers {
         let boot_open = match std::env::var("KOMET_OPEN_PICKER").ok().as_deref() {
             Some("model") => Some(PickerKind::HarnessModel),
             Some("traits") => Some(PickerKind::HarnessModel),
+            Some("context") | Some("usage") => Some(PickerKind::ContextUsage),
             Some("branch") => Some(PickerKind::Branch),
             Some("checkout") => Some(PickerKind::Checkout),
             Some("project") => Some(PickerKind::Space),
@@ -801,6 +804,7 @@ impl Pickers {
             },
             PickerKind::Branch => self.selected_ref_index(cx),
             PickerKind::HarnessModel | PickerKind::Traits => self.selected_model_index(cx),
+            PickerKind::ContextUsage => 0,
             PickerKind::Space => self.selected_space_index(cx),
             PickerKind::Device => self.selected_device_index(cx),
         };
@@ -855,8 +859,8 @@ impl Pickers {
                 self.ensure_harnesses(true, cx);
                 self.prefetch_models(cx);
             }
-            // Projects and devices are already synced state — nothing to load.
-            PickerKind::Space | PickerKind::Device => {}
+            // Projects, devices, and context usage are already synced state — nothing to load.
+            PickerKind::Space | PickerKind::Device | PickerKind::ContextUsage => {}
         }
         cx.notify();
     }
@@ -1943,6 +1947,7 @@ impl Pickers {
                     // mouse-only.
                     Some(PickerKind::HarnessModel) => self.model_rows_len(cx),
                     Some(PickerKind::Traits) => 0, // merged into HarnessModel
+                    Some(PickerKind::ContextUsage) => 0,
                     Some(PickerKind::Space) => self.filtered_space_rows(cx).len(),
                     Some(PickerKind::Device) => self.filtered_device_rows(cx).len(),
                     None => 0,
@@ -1995,6 +2000,7 @@ impl Pickers {
             PickerKind::Checkout => "picker-checkout",
             PickerKind::HarnessModel => "picker-model",
             PickerKind::Traits => "picker-traits",
+            PickerKind::ContextUsage => "picker-context-usage",
             PickerKind::Space => "picker-space",
             PickerKind::Device => "picker-device",
         };
@@ -2448,8 +2454,8 @@ impl Pickers {
                             this.models.clear();
                             this.ensure_harnesses(false, cx);
                         }
-                        // Projects/devices load nothing; no retry surface exists.
-                        PickerKind::Space | PickerKind::Device => {}
+                        // Projects/devices/context load nothing; no retry surface exists.
+                        PickerKind::Space | PickerKind::Device | PickerKind::ContextUsage => {}
                     }))
                     .child(SharedString::from("Retry")),
             )
@@ -3533,12 +3539,21 @@ impl Render for Pickers {
                     self.popover_frame_flush(240.0, content, cx),
                 ))
             }
+            Some(PickerKind::ContextUsage) => {
+                let stats = self.state.read(cx).current_context_usage();
+                let theme = Theme::of(cx).clone();
+                let content = crate::context_usage::render_context_popover(&stats, &theme);
+                Some((
+                    PickerKind::ContextUsage,
+                    self.popover_frame_flush(290.0, content, cx),
+                ))
+            }
             None => None,
         };
 
         // Left cluster: empty — the device/project pickers live in the
         // composer FOOTER row alongside checkout + ref.
-        // Right cluster: agent+model and traits — the composer appends
+        // Right cluster: agent+model, traits, and context usage circle — the composer appends
         // attach + send after this element (komet composer-actions.tsx
         // arrangement).
         let left = div()
@@ -3578,6 +3593,30 @@ impl Render for Pickers {
                 cx,
             )
         });
+        let context_stats = self.state.read(cx).current_context_usage();
+        let is_context_open = self.open_kind() == Some(PickerKind::ContextUsage);
+        let context_chip = div()
+            .id("context-usage-chip")
+            .flex()
+            .items_center()
+            .justify_center()
+            .px(px(6.0))
+            .py(px(4.0))
+            .rounded_lg()
+            .cursor_pointer()
+            .hover(|s| s.bg(theme.element_hover))
+            .when(is_context_open, |s| s.bg(theme.element_active))
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    this.toggle(PickerKind::ContextUsage, window, cx);
+                }),
+            )
+            .child(crate::context_usage::render_context_ring(
+                &context_stats,
+                &theme,
+            ));
+
         let right = div()
             .flex()
             .flex_row()
@@ -3601,7 +3640,14 @@ impl Render for Pickers {
                     "traits-popover",
                     closing,
                 )
-            }));
+            }))
+            .child(attach_overlay_end(
+                context_chip,
+                &mut overlay,
+                PickerKind::ContextUsage,
+                "context-popover",
+                closing,
+            ));
         div()
             .w_full()
             .min_w_0()

@@ -611,6 +611,8 @@ pub struct AppState {
     pub local_device_id: Option<String>,
     /// Latest `UpdateStatus` frame — drives the sidebar update strip.
     pub update: Option<komet_update::UpdateStatus>,
+    /// Cumulative context & token usage metrics per chat id.
+    pub context_usage: HashMap<String, komet_proto::ContextUsageStats>,
     /// Data directory (`ui-settings.json`, `composer-defaults.json`); set at
     /// bootstrap so child views can persist small preference files.
     pub data_dir: Option<PathBuf>,
@@ -644,6 +646,7 @@ impl AppState {
             pending_sends: HashMap::new(),
             local_device_id: None,
             update: None,
+            context_usage: HashMap::new(),
             data_dir: None,
             engine: None,
             watch_tasks: Vec::new(),
@@ -737,6 +740,46 @@ impl AppState {
 
     pub fn apply_update(&mut self, status: komet_update::UpdateStatus) {
         self.update = Some(status);
+    }
+
+    pub fn apply_context_usage(&mut self, chat_id: &str, stats: komet_proto::ContextUsageStats) {
+        self.context_usage.insert(chat_id.to_string(), stats);
+    }
+
+    /// Derives or returns the current context usage metrics for the selected chat.
+    pub fn current_context_usage(&self) -> komet_proto::ContextUsageStats {
+        if let Some(chat_id) = &self.selected_chat {
+            if let Some(stats) = self.context_usage.get(chat_id) {
+                return stats.clone();
+            }
+        }
+        let model_name = self
+            .selected_chat_row()
+            .and_then(|c| c.config.as_ref())
+            .and_then(|cfg| cfg.model.as_deref())
+            .unwrap_or("claude-3-7-sonnet");
+        let limit = komet_proto::default_context_limit_for_model(model_name);
+        let mut stats = komet_proto::ContextUsageStats::new(limit);
+
+        let mut total_chars: usize = 0;
+        for entry in &self.transcript {
+            for part in &entry.parts {
+                match part {
+                    komet_doc::MessagePart::Text { text, .. } => {
+                        total_chars += text.len();
+                    }
+                    komet_doc::MessagePart::Tool { output, .. } => {
+                        if let Some(out) = output {
+                            total_chars += out.len();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let estimated_tokens = (total_chars / 4) as u64;
+        stats.input_tokens = estimated_tokens;
+        stats
     }
 
     pub fn apply_auth(&mut self, auth: AuthState) {

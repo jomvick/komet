@@ -49,6 +49,6 @@ On macOS: use the desktop release, or build `komet` from source and run `komet d
 
 ---
 
-Developing or curious how it works? [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/komet/komet) or check out [ARCHITECTURE.md](ARCHITECTURE.md).
+Developing or curious how it works? [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/kometsh/komet) or check out [ARCHITECTURE.md](ARCHITECTURE.md).
 
 Licensed under the [MIT License](LICENSE).

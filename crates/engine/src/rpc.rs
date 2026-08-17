@@ -813,6 +813,7 @@ fn forwardable(method: &str) -> bool {
             // Updates report/apply on the device whose binary they concern.
             | methods::UPDATE_STATUS
             | methods::APPLY_UPDATE
+            | methods::GET_CONTEXT_USAGE
     )
 }
 
@@ -1052,6 +1053,11 @@ impl RpcService for EngineRpc {
                 Ok(RpcReply::Stream(doc_messages_stream(
                     handle.watch_messages(),
                 )))
+            }
+            methods::GET_CONTEXT_USAGE => {
+                let p: ChatParams = parse_params(params)?;
+                let usage = self.sessions.usage_for(&p.chat_id);
+                RpcReply::value(&usage)
             }
             methods::PROBE_SYNC => {
                 self.workspace.probe();

@@ -2,7 +2,7 @@
 //! binary anywhere, `run()` must npm-install the pinned adapter into
 //! `$KOMET_ADAPTERS_DIR`, spawn it via node, and reach SessionStarted (the
 //! full initialize → session/new handshake) — the exact path that used to be
-//! `npx -y` at chat time (komet/komet#95).
+//! `npx -y` at chat time (kometsh/komet#95).
 //!
 //! Ignored: needs network, npm, and the codex CLI on the machine. Run with
 //! `cargo test -p komet-harness --test managed_install -- --ignored`.
