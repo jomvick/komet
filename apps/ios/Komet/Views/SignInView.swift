@@ -2,8 +2,10 @@
 // the secret-bearing exchange delegated to the edge (`POST /auth/exchange`).
 // The komet mark on black, one white button — the old mobile app's Gate.
 //
-// Endpoints are fixed to production (the old app's rule: mobile always talks
-// to prod; a stale override once broke sign-in in the worst ghost way).
+// Komet is 100% local-only by default: no WorkOS client id is baked in, so
+// the sign-in button reports that sync isn't configured instead of opening a
+// browser session. Multi-device sync is a future feature — set
+// `KOMET_WORKOS_CLIENT_ID` in Info.plist to re-enable it.
 
 import AuthenticationServices
 import SwiftUI
@@ -11,20 +13,27 @@ import SwiftUI
 /// Production cloud endpoints — mirrors edge/wrangler.jsonc.
 enum Endpoints {
     static let edgeURL = URL(string: "https://edge.komet.sh")!
-    static let workosClientId = "client_01KWD0EAKZKD50YCQJNYSRE4BY"
+    /// WorkOS AuthKit client id — read from Info.plist (`KOMET_WORKOS_CLIENT_ID`).
+    /// Missing or empty = local-only mode (no sign-in, no WorkOS calls).
+    static var workosClientId: String? {
+        guard let value = Bundle.main.object(forInfoDictionaryKey: "KOMET_WORKOS_CLIENT_ID") as? String,
+              !value.isEmpty else { return nil }
+        return value
+    }
     static let workosAPIBase = "https://api.workos.com"
     static let callbackScheme = "komet"
 
-    static func authorizeURL(state: String) -> URL {
+    static func authorizeURL(state: String) -> URL? {
+        guard let clientId = workosClientId else { return nil }
         var components = URLComponents(string: "\(workosAPIBase)/user_management/authorize")!
         components.queryItems = [
             URLQueryItem(name: "response_type", value: "code"),
-            URLQueryItem(name: "client_id", value: workosClientId),
+            URLQueryItem(name: "client_id", value: clientId),
             URLQueryItem(name: "redirect_uri", value: "\(callbackScheme)://callback"),
             URLQueryItem(name: "provider", value: "authkit"),
             URLQueryItem(name: "state", value: state),
         ]
-        return components.url!
+        return components.url
     }
 }
 
@@ -98,7 +107,14 @@ struct SignInView: View {
         busy = true
         error = nil
         let state = UUID().uuidString
-        authSession.start(url: Endpoints.authorizeURL(state: state),
+        guard let url = Endpoints.authorizeURL(state: state) else {
+            busy = false
+            // Local-only default: no WorkOS client id configured, so there is
+            // no account to sign in to (mirrors the desktop engine's dev mode).
+            error = "Komet runs fully local — sync is not configured yet."
+            return
+        }
+        authSession.start(url: url,
                           callbackScheme: Endpoints.callbackScheme) { result in
             Task { @MainActor in
                 switch result {

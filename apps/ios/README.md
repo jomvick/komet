@@ -24,6 +24,11 @@ desktop's pulldown-cmark config).
 
 ### Connecting
 
+Komet is 100% local-only by default: the WorkOS client id is read from the
+`KOMET_WORKOS_CLIENT_ID` Info.plist key, which is empty — so sign-in reports
+"sync is not configured" instead of opening a browser session. Set the key to
+your WorkOS AuthKit client id to re-enable multi-device sync later.
+
 - **WorkOS**: enter the edge URL, open the sign-in page on any device, paste
   the code it shows (`/auth/exchange`), pick an org (`/auth/refresh` re-scopes
   the token with the `org_id` claim).

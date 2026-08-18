@@ -559,7 +559,6 @@ impl SyncFlow {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AccountMenuAction {
-    EnableSync,
     SyncInProgress,
     /// Postponed switch wizard (or legacy restart fallback) — reopen it.
     RestartPending,
@@ -671,7 +670,7 @@ fn local_work_phrase(chats: usize, spaces: usize) -> Option<String> {
 fn account_menu_action(scope: Option<WorkspaceScope>, flow: SyncFlow) -> Option<AccountMenuAction> {
     match scope {
         Some(WorkspaceScope::Local) => match flow {
-            SyncFlow::Idle => Some(AccountMenuAction::EnableSync),
+            SyncFlow::Idle => None,
             SyncFlow::Enabling | SyncFlow::Canceling => Some(AccountMenuAction::SyncInProgress),
             SyncFlow::SwitchOffer { .. } | SyncFlow::RestartPending { .. } => {
                 Some(AccountMenuAction::RestartPending)
@@ -3295,15 +3294,14 @@ impl Shell {
                     // Working rows animate the orb at the row's
                     // bottom-right (the status word keeps its dot up top).
                     .when(status == komet_proto::ChatIndicator::Working, |el| {
-                        el.child(div().flex_1())
-                            .child(
-                                crate::thinking_orbs::ThinkingOrb::new(
-                                    crate::thinking_orbs::OrbState::Working,
-                                    14.0,
-                                )
-                                .speed(1.25)
-                                .driven(cx.entity_id(), cx),
+                        el.child(div().flex_1()).child(
+                            crate::thinking_orbs::ThinkingOrb::new(
+                                crate::thinking_orbs::OrbState::Working,
+                                14.0,
                             )
+                            .speed(1.25)
+                            .driven(cx.entity_id(), cx),
+                        )
                     }),
             )
             .into_any_element()
@@ -3771,18 +3769,6 @@ impl Shell {
                 )
                 .when_some(action, |menu, action| {
                     let row = match action {
-                        AccountMenuAction::EnableSync => {
-                            popover::menu_row(theme, false, "user-menu-enable-sync")
-                                .id("user-menu-enable-sync")
-                                .on_click(cx.listener(|this, _, _, cx| this.start_sign_in(cx)))
-                                .child(
-                                    icon(icons::GLOBAL)
-                                        .size(px(16.0))
-                                        .text_color(theme.text_muted),
-                                )
-                                .child(SharedString::from("Enable sync"))
-                                .into_any_element()
-                        }
                         AccountMenuAction::SyncInProgress => {
                             popover::menu_row(theme, false, "user-menu-sync-progress")
                                 .id("user-menu-sync-progress")
@@ -3885,37 +3871,6 @@ impl Shell {
         let work_phrase = local_work_phrase(local_chats, local_spaces);
 
         let card = match self.sync_flow {
-            SyncFlow::Enabling => popover::dialog_card(&theme)
-                .child(popover::dialog_title(&theme, "Enable sync"))
-                .child(
-                    div().mt(px(6.0)).child(popover::dialog_body(
-                        &theme,
-                        "Finish signing in in your browser. Komet will keep using this local workspace until you quit and reopen.",
-                    )),
-                )
-                .child(
-                    div()
-                        .mt(px(16.0))
-                        .flex()
-                        .flex_row()
-                        .justify_end()
-                        .gap(px(8.0))
-                        .child(
-                            popover::btn_ghost(&theme, "Cancel", "sync-enable-cancel")
-                                .id("sync-enable-cancel")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.cancel_auth_setup(cx)
-                                })),
-                        )
-                        .child(
-                            popover::btn_primary(&theme, "Open browser again")
-                                .id("sync-enable-open-browser")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.start_sign_in(cx)
-                                })),
-                        ),
-                )
-                .into_any_element(),
             SyncFlow::Canceling => popover::dialog_card(&theme)
                 .child(popover::dialog_title(&theme, "Canceling sync setup…"))
                 .child(
@@ -4214,6 +4169,7 @@ impl Shell {
                 )
                 .into_any_element(),
             SyncFlow::Idle
+            | SyncFlow::Enabling
             | SyncFlow::SwitchOffer { notice_open: false }
             | SyncFlow::ImportFailed { notice_open: false }
             | SyncFlow::RestartPending { notice_open: false }
@@ -6602,7 +6558,7 @@ mod tests {
     fn account_actions_follow_the_attached_workspace_scope() {
         assert_eq!(
             account_menu_action(Some(WorkspaceScope::Local), SyncFlow::Idle),
-            Some(AccountMenuAction::EnableSync)
+            None
         );
         assert_eq!(
             account_menu_action(Some(WorkspaceScope::Synced), SyncFlow::Idle),

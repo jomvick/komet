@@ -1,16 +1,21 @@
 # komet — Architecture
 
-A ground-up native rewrite of [komet](../komet) — a multi-device controller for coding agents
-(Claude Code / Codex) — in Rust, with a gpui UI. Fresh app; no backwards compatibility required.
+A native controller for coding agents (Claude Code, Codex, Cursor, Grok, Hermes, OpenCode, Pi) —
+Rust engine + gpui UI, single binary. **100% local by default**: no account, no login
+screen, no network calls. Multi-device sync is built (Loro CRDT docs through Cloudflare Durable
+Objects) but **disabled by default** — see "Multi-device sync (future)" in the README.
 
-**Pillars (from the goal):**
-- Optional sync uses Loro CRDT docs (loro-mirror model) through Cloudflare Durable Objects; the same docs persist locally when sync is disabled.
+**Pillars:**
+- Local-first: every device runs a small engine that stores sessions on that device; the same
+  Loro CRDT docs persist locally when sync is disabled.
+- Optional sync uses Loro CRDT docs (loro-mirror model) through Cloudflare Durable Objects;
+  the `edge/` worker and WorkOS auth routes exist but stay dormant until configured.
 - Durable Objects stay **TypeScript** (decision + evidence: `docs/research/durable-objects-language.md`).
   Everything device-side is Rust.
-- Feature parity with komet **except token-usage display** (poor fit for CRDTs; excluded).
+- Token-usage display is excluded (poor fit for CRDTs).
 - Frontend is **gpui** (pinned Zed rev). Virtualization + markdown techniques ported from
   **mugen + pretext** (`docs/research/mugen-pretext.md`).
-- One binary, **headed or headless**. Smooth transitions/animations matching the original
+- One binary, **headed or headless**. Smooth transitions/animations
   (catalog in `docs/research/feature-inventory.md` §1.12).
 
 ## 1. Topology (unchanged shape, new materials)
@@ -57,6 +62,13 @@ The engine never re-resolves an open store because `AuthState` changed. This pre
 | Explicit non-empty dev bearer | `Development` | Enabled |
 
 `komet login` and `komet logout` operate on `session.json` while the engine is stopped. Login selects `Synced` for the next start; logout selects `Local` for the next start. The UI may update live authentication status, but the active `WorkspaceScope` still changes only after restart.
+
+**Current default (local-only):** no WorkOS client id ships in the binary (`KOMET_WORKOS_CLIENT_ID`
+empty → `None`), so every start resolves to the "WorkOS disabled without a dev bearer" row —
+`Development` scope, no account, no login screen, zero network calls. `komet login` reports
+"dev mode — there is nothing to sign in to". To enable the synced profile later: deploy the
+`edge/` worker, set a real client id via `KOMET_WORKOS_CLIENT_ID` (and `KOMET_EDGE_URL` for a
+self-hosted edge), then the startup table above applies as written.
 
 The resolved profile selects the session snapshots, registry snapshot, run journals, and attachment cache that may contain workspace data:
 
@@ -130,23 +142,28 @@ komet/
     sync/         komet-sync     # loro room client (join/VV backfill/fragments/backoff),
                                  # ephemeral presence, DocsStore (SQLite snapshots +
                                  # processed-command ledger)
-    harness/      komet-harness  # Harness trait + claude-code (stream-json subprocess),
-                                 # codex (app-server JSON-RPC), mock; steering mailbox,
+    harness/      komet-harness  # Harness trait over the ACP protocol (claude/codex/cursor/
+                                 # grok/hermes/pi/opencode via org-maintained
+                                 # adapters + managed npm install), mock; steering mailbox,
                                  # requestInput, models/reasoning/options catalogs
     engine/       komet-engine   # sessions engine (pub/sub, run journal, recovery, stall
                                  # watchdog), doc host + command executor, repos/worktrees,
                                  # checkout-diff sync, terminals (portable-pty), uploads,
                                  # agent accounts (cred swap), auth (WorkOS via edge),
-                                 # device-room host/peers, identity
+                                 # device-room host/peers, identity, single-instance lock
     rpc/          komet-rpc      # UiRpc/ControlRpc: typed req/resp/stream over WS (tokio-
                                  # tungstenite) + in-memory transport; device-room virtual
                                  # sockets ({s,k,to,from} frames)
     ui/           komet-ui       # gpui app: shell, sidebar, conversation, composer,
                                  # terminal view, diff pane, settings, animation kit
+    syntax/       komet-syntax   # tree-sitter syntax highlighting contracts (paint-only
+                                 # token runs; no UI/RPC/engine deps)
+    update/       komet-update   # self-update: versioned dirs + `current` symlink, service
+                                 # restart, macOS app-bundle staging (macOS + Linux only)
   apps/
     komet/                       # the binary (headed default, `headless` subcommand)
-  edge/                          # TypeScript Worker + DOs (ported from komet/apps/edge,
-                                 # + auth-exchange routes absorbed from apps/server)
+    ios/                         # native Swift client (separate from the Rust workspace)
+  edge/                          # TypeScript Worker + DOs (auth, rooms, R2)
   docs/                          # this file + research reports
 ```
 
@@ -211,10 +228,14 @@ Direct ports of komet behaviors (spec: feature-inventory §3):
   segments at 120ms commits, drain commands host-only with processed-ledger idempotence, publish
   diff sidecar, presence); warm-open recent chats (14d/cap 30); nudge-driven cold open; SQLite
   snapshot store.
-- **Harness** (research pending — `docs/research/harness.md`): trait mirroring komet's
-  `HarnessShape`; Claude Code via `claude` CLI stream-json in/out (control protocol for
-  permissions/AskUserQuestion→requestInput, resume, steering); Codex via app-server JSON-RPC or
-  `codex exec --json`; model/reasoning/option catalogs ported from `packages/harness`.
+- **Harness** (`docs/research/harness.md`, protocol decision `docs/research/acp.md`): every
+  agent speaks the **ACP protocol** through an org-maintained adapter (`claude-agent-acp`,
+  `codex-acp`, `pi-acp`, …) — one shared `AcpHarness` with per-agent
+  specs (executable, npm package, model/reasoning/option catalogs, steering mode, quiet-settle
+  behavior). Adapters install once via npm, lazily on first use (`adapter_install.rs`), or
+  resolve from PATH / npm global bins / login-shell PATH (`shell_env.rs`); a `mock` harness
+  covers tests. The bespoke stream-json (Claude) and app-server JSON-RPC (Codex) harnesses
+  were retired with the ACP conversion — those modules now hold static model catalogs.
 - **Repos/diffs**: git2 or `git` subprocess (subprocess — matches komet, avoids libgit2 edge
   cases); worktrees under `~/.komet/worktrees`; fs watchers (`notify`) + 2min repair; diff
   capture (patch + numstat + untracked, 3MiB cap, sha256) → workspace registry summary + DO diff
@@ -222,7 +243,8 @@ Direct ports of komet behaviors (spec: feature-inventory §3):
 - **Agent accounts**: credential-slot swap (macOS Keychain via `security-framework`, files
   elsewhere), plan labels, usage probes, paste-code/browser-poll OAuth flows.
 - **Auth**: WorkOS through edge routes (`/auth/exchange`, `/auth/refresh`, orgs); loopback
-  callback server headed, paste-code headless; dev mode (no key ⇒ bearer = configured user id).
+  callback server headed, paste-code headless. Default is **no WorkOS key** ⇒ pure local
+  `Development` scope; setting `KOMET_WORKOS_CLIENT_ID` re-enables the synced profile.
 
 ## 6. Edge plan (TypeScript, `edge/`)
 
@@ -241,8 +263,9 @@ per `docs/research/durable-objects-language.md`.
   `WatchUsage`). Rate-limit meters on agent accounts are *kept* (separate concern; probed from
   CLIs, not CRDT-synced).
 - **Changed**: Postgres entity sync/server → workspace registry + edge; Electron/React/mugen → gpui with
-  ported techniques; Node harness SDKs → subprocess protocols; WebRTC → device-room relay (komet
-  had already made this move); mobile app → out of scope for this repo.
+  ported techniques; Node harness SDKs → ACP adapter protocols; WebRTC → device-room relay.
+- **Mobile**: a native Swift client lives in `apps/ios/` (separate from the Rust workspace; same
+  local-first default — the WorkOS client id is read from Info.plist and empty by default).
 - **Kept verbatim**: session-doc schema shape + constants, command ledger rules, edge DO design,
   render-parts privacy policy, UX behaviors and animation timings.
 
@@ -264,13 +287,14 @@ Status legend: ✅ shipped · 🟡 shipped with named gaps (see `docs/PARITY.md`
   two headless engines against a real edge — B queues a run into the chat doc, the durable
   nudge wakes host A, A executes (mock harness), transcript + session status sync back to B.
 - 🟡 **M5 Full surface** — terminals, diff pane, repo/branch/folder pickers + worktrees,
-  agent accounts UI, settings (devices/shortcuts/archived), Codex harness. Gaps: composer
-  attachment UI (engine upload RPCs exist), Cursor harness.
+  agent accounts UI, settings (devices/shortcuts/archived), Codex + Cursor + Grok + Hermes +
+  OpenCode + Pi harnesses. Gaps: composer attachment UI (engine upload RPCs exist).
 - 🟡 **M6 Polish** — wire reconciliation (proto AuthState on the wire, `LocalDevice`),
   two-device e2e smoke, keyboard map, clippy/fmt sweep, Linux packaging
   (`scripts/package-linux.sh` + release profile), macOS bundling config (`dist/macos/`,
-  not executed — needs a Mac). Gaps: prefers-reduced-motion, engine hardening
-  (instance lock, watchdogs), edge production deploy.
+  not executed — needs a Mac). Gaps: edge production deploy (sync dormant until then),
+  Windows packaging — the workspace already cross-compiles for `x86_64-pc-windows-gnu`
+  (UI included), but daemon, updater, credential ACLs and packaging are still unix-oriented.
 
 ## 9. Open questions (tracked, non-blocking)
 

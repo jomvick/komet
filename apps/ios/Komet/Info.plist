@@ -68,5 +68,9 @@
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>
+	<!-- Local-only by default: empty = no sign-in, no WorkOS calls. Set this to
+	     your WorkOS AuthKit client id to re-enable multi-device sync. -->
+	<key>KOMET_WORKOS_CLIENT_ID</key>
+	<string></string>
 </dict>
 </plist>
