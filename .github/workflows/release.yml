@@ -2,7 +2,9 @@ name: release
 
 # Build release artifacts and publish them:
 #   - Linux headless tarballs (x86_64 + aarch64) via scripts/package-linux.sh
+#   - Linux AppImages (x86_64 + aarch64) via scripts/package-appimage.sh
 #   - macOS dmg (Apple silicon) via scripts/package-macos.sh
+#   - Windows portable exe + msi installer via scripts/package-windows.sh
 # then create a GitHub Release AND upload everything to the
 # `komet-native-releases` R2 bucket (served at komet.sh/releases/* for
 # `curl -fsSL https://komet.sh/install.sh | sh`), bumping latest.txt.
@@ -41,12 +43,20 @@ jobs:
       - name: rust toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
-      - name: package
+      - name: package tarball
         run: scripts/package-linux.sh
+      - name: package AppImage
+        run: |
+          # appimagetool runs with --appimage-extract-and-run, so no FUSE
+          # kernel module is needed — only the squashfs tooling it shells out to.
+          sudo apt-get install -y -qq squashfs-tools desktop-file-utils zsync
+          scripts/package-appimage.sh
       - uses: actions/upload-artifact@v4
         with:
           name: linux-${{ runner.arch }}
-          path: target/package/*.tar.gz
+          path: |
+            target/package/*.tar.gz
+            target/package/*.AppImage
           if-no-files-found: error
 
   # Heads-up: the macOS cfg paths (Keychain in agent_accounts.rs) have never
@@ -113,9 +123,32 @@ jobs:
             target/package/*.tar.gz
           if-no-files-found: error
 
+  # Signing is optional: without WINDOWS_CERT_P12 the exe and msi ship
+  # unsigned (SmartScreen warns on first run).
+  windows:
+    runs-on: windows-latest
+    env:
+      WINDOWS_CERT_P12: ${{ secrets.WINDOWS_CERT_P12 }}
+      WINDOWS_CERT_PASSWORD: ${{ secrets.WINDOWS_CERT_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: rust toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: package exe + msi
+        shell: bash
+        run: scripts/package-windows.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-x86_64
+          path: |
+            target/package/*.exe
+            target/package/*.msi
+          if-no-files-found: error
+
   publish:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [linux, macos]
+    needs: [linux, macos, windows]
     runs-on: ubuntu-latest
     env:
       # `secrets` is not a valid context in step `if:` expressions — surface

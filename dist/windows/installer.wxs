@@ -1,0 +1,69 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  WiX v4/v5 definition for the Komet MSI (built by scripts/package-windows.sh).
+  Installs komet.exe into "Program Files\Komet", puts it on the machine PATH,
+  adds a Start Menu shortcut and the standard uninstall entry. The Windows
+  service is not registered by the installer: run `komet daemon install` so the
+  service runs under the invoking user's account.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+    Name="Komet"
+    Manufacturer="Komet"
+    Version="$(var.Version)"
+    UpgradeCode="c0173f36-d37f-4c4f-9e59-195a8d7fb728"
+    Scope="perMachine"
+    Compressed="yes">
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of Komet is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="KometIcon" SourceFile="$(var.KometExe)" />
+    <Property Id="ARPPRODUCTICON" Value="KometIcon" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/jomvick/komet" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="Komet" />
+    </StandardDirectory>
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="KometMenuFolder" Name="Komet" />
+    </StandardDirectory>
+
+    <ComponentGroup Id="KometBinaries" Directory="INSTALLFOLDER">
+      <Component Id="KometExe" Guid="4e631836-9829-42e0-a783-49600d13d60e">
+        <File Id="KometExeFile" Name="komet.exe" Source="$(var.KometExe)" KeyPath="yes" />
+        <Environment
+          Id="KometPath"
+          Name="PATH"
+          Value="[INSTALLFOLDER]"
+          Action="set"
+          Part="last"
+          System="yes"
+          Permanent="no" />
+      </Component>
+    </ComponentGroup>
+
+    <ComponentGroup Id="KometShortcuts" Directory="KometMenuFolder">
+      <Component Id="KometStartMenuShortcut" Guid="*">
+        <Shortcut
+          Id="KometShortcut"
+          Name="Komet"
+          Target="[INSTALLFOLDER]komet.exe"
+          WorkingDirectory="INSTALLFOLDER" />
+        <RemoveFolder Id="RemoveKometMenuFolder" On="uninstall" />
+        <RegistryValue
+          Root="HKCU"
+          Key="Software\Komet"
+          Name="shortcut"
+          Type="integer"
+          Value="1"
+          KeyPath="yes" />
+      </Component>
+    </ComponentGroup>
+
+    <Feature Id="Main" Title="Komet">
+      <ComponentGroupRef Id="KometBinaries" />
+      <ComponentGroupRef Id="KometShortcuts" />
+    </Feature>
+  </Package>
+</Wix>

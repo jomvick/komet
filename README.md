@@ -13,6 +13,8 @@ komet status
 
 The installer starts the daemon immediately and keeps it running across reboots. No sign-in or sync configuration is required.
 
+Prefer a portable build? Grab the `.AppImage` from the [GitHub release](https://github.com/jomvick/komet/releases), `chmod +x` it and run it — nothing is installed system-wide.
+
 Day-to-day:
 
 ```bash
@@ -46,12 +48,12 @@ On macOS: use the desktop release, or build `komet` from source and run `komet d
 
 ## Install on Windows
 
-Download the latest `.msi` installer from the [GitHub release](https://github.com/opencode/komet/releases) and run it — it installs `komet.exe` into `Program Files\Komet`, registers uninstall keys, and optionally installs the `Komet` Windows service (running as the logged-in user). A standalone `komet.exe` portable executable is also available in the release assets; no service is registered for the portable variant.
+Download the latest `.msi` installer from the [GitHub release](https://github.com/jomvick/komet/releases) and run it — it installs `komet.exe` into `Program Files\Komet`, adds it to `PATH` and registers uninstall keys. A standalone `komet.exe` portable executable is also available in the release assets.
 
-To install the service from the command line:
+The `Komet` Windows service (running as the logged-in user) is not registered by the installer; add it with:
 
 ```powershell
-c:\Program Files\Komet\komet.exe --service
+komet daemon install
 ```
 
 or equivalently via `sc`:
