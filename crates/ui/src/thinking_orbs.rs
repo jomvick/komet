@@ -463,12 +463,7 @@ fn solve_cycle(time: f32, count: usize, slot_dur: f32, rest: f32) -> (Vec<f32>, 
     (amount, active)
 }
 
-fn apply_moves(
-    mut pt: [f32; 3],
-    moves: &[Move],
-    amount: &[f32],
-    active: i32,
-) -> ([f32; 3], bool) {
+fn apply_moves(mut pt: [f32; 3], moves: &[Move], amount: &[f32], active: i32) -> ([f32; 3], bool) {
     let mut in_active = false;
     for (i, mv) in moves.iter().enumerate() {
         if amount[i] <= 0.0 {
@@ -680,8 +675,7 @@ fn frame_web(size: f32, t: f32, speed_mul: f32, count_mul: f32, size_mul: f32) -
                     w: (0.8 * proximity * rs).max(0.5),
                 });
 
-                let sig_phase =
-                    (time * 0.6 + hash_d(i as f32, j as f32) * 10.0).rem_euclid(1.0);
+                let sig_phase = (time * 0.6 + hash_d(i as f32, j as f32) * 10.0).rem_euclid(1.0);
                 let px = sx1 + (sx2 - sx1) * sig_phase;
                 let py = sy1 + (sy2 - sy1) * sig_phase;
                 let pz = sz1 + (sz2 - sz1) * sig_phase;
@@ -764,8 +758,7 @@ fn frame_braid(size: f32, t: f32, speed_mul: f32, count_mul: f32, size_mul: f32)
             let py = u * r_sphere * breathing;
             let pz = angle.sin() * f;
 
-            let (sx, sy, sz) =
-                project_point(px, py, pz, time * 0.4, 0.3, cx, cy, 1.0);
+            let (sx, sy, sz) = project_point(px, py, pz, time * 0.4, 0.3, cx, cy, 1.0);
             let depth = (sz / r_sphere + 1.0) / 2.0;
 
             dots.push(Dot {
@@ -842,8 +835,7 @@ fn frame_ribbon(size: f32, t: f32, speed_mul: f32, count_mul: f32, size_mul: f32
             let py = by + vy * lane_offset * r_sphere;
             let pz = bz + vz * lane_offset * r_sphere;
 
-            let (sx, sy, sz) =
-                project_point(px, py, pz, time * 0.1, 0.3, cx, cy, 1.0);
+            let (sx, sy, sz) = project_point(px, py, pz, time * 0.1, 0.3, cx, cy, 1.0);
             let depth = (sz / r_sphere + 1.0) / 2.0;
 
             dots.push(Dot {

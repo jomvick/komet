@@ -751,9 +751,9 @@ impl Inner {
                 context_limit,
             } => {
                 let mut usage_stats = lock(&self.usage_stats);
-                let entry = usage_stats
-                    .entry(chat_id.to_string())
-                    .or_insert_with(|| komet_proto::ContextUsageStats::new(context_limit.unwrap_or(200_000)));
+                let entry = usage_stats.entry(chat_id.to_string()).or_insert_with(|| {
+                    komet_proto::ContextUsageStats::new(context_limit.unwrap_or(200_000))
+                });
                 entry.ingest(
                     *input_tokens,
                     *cached_input_tokens,

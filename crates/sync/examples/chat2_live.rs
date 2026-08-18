@@ -12,9 +12,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, Mutex};
 
 use futures::future::BoxFuture;
-use loro::{ExportMode, LoroDoc, VersionVector};
 use komet_sync::SyncError;
 use komet_sync::chat_client::{ChatClient, ChatDocSink, CheckpointFetcher};
+use loro::{ExportMode, LoroDoc, VersionVector};
 
 struct DocSink {
     doc: Mutex<LoroDoc>,

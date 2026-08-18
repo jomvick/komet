@@ -33,12 +33,7 @@ pub fn render_context_ring(stats: &ContextUsageStats, theme: &Theme) -> AnyEleme
         .border_1()
         .border_color(theme.border)
         .bg(theme.surface)
-        .child(
-            div()
-                .size(px(inner_size))
-                .rounded_full()
-                .bg(ring_color),
-        )
+        .child(div().size(px(inner_size)).rounded_full().bg(ring_color))
         .into_any_element()
 }
 
@@ -130,11 +125,7 @@ pub fn render_context_popover(stats: &ContextUsageStats, theme: &Theme) -> AnyEl
                         .items_center()
                         .justify_between()
                         .text_xs()
-                        .child(
-                            div()
-                                .text_color(theme.text_muted)
-                                .child("Compacts at"),
-                        )
+                        .child(div().text_color(theme.text_muted).child("Compacts at"))
                         .child(
                             div()
                                 .font_family(theme.font_mono.clone())
@@ -178,7 +169,11 @@ pub fn render_context_popover(stats: &ContextUsageStats, theme: &Theme) -> AnyEl
                     format_tokens(stats.cached_input_tokens),
                     theme,
                 ))
-                .child(usage_row("Output", format_tokens(stats.output_tokens), theme))
+                .child(usage_row(
+                    "Output",
+                    format_tokens(stats.output_tokens),
+                    theme,
+                ))
                 .child(usage_row(
                     "Reasoning output (included)",
                     format_tokens(stats.reasoning_tokens),
