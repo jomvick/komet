@@ -735,10 +735,10 @@ impl Engine {
             core.set_updater(updater);
         }
         tracing::info!(device_id = %core.device_id, "engine core assembled");
-        // Managed ACP adapters install in the background at boot (agents
-        // whose CLI is present but whose adapter isn't yet), so a first chat
-        // never waits on — or dies inside — an npm run.
-        komet_harness::acp::prewarm_managed_adapters();
+        // Managed ACP adapters are NOT pre-installed at boot: installing them
+        // fetches from the npm registry, which would break the app's
+        // local-only (no-network) guarantee. They install lazily on first use
+        // (see `harness::acp::adapter_install`) and stay cached afterwards.
 
         let host_relay = edge.as_ref().map(|edge| {
             let links = komet_rpc::LinkCache::new(komet_rpc::LinkCacheConfig::new(

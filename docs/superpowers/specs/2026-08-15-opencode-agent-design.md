@@ -5,7 +5,7 @@ Status: Approved (brainstorming) — implementation order: harness + proto first
 
 ## Summary
 
-Add the opencode CLI as a supported agent in komet/comet, driven over the
+Add the opencode CLI as a supported agent in komet, driven over the
 Agent Client Protocol. opencode ships a **native ACP server** (`opencode acp`,
 JSON-RPC stdio), so no external adapter is needed — the same shape as Cursor,
 Grok and Hermes, which are also native ACP.

@@ -4,29 +4,23 @@
   // Design: loro-sessions §2 (topology), §3 (persistence), §6.1 (diff
   // sidecar), §8 (device-room streams), §1.2 (R2 attachments), §3.3 (R2
   // backups); ARCHITECTURE.md §6.
-  // NOTE: the worker name and R2 bucket names keep the historical "comet"
-  // prefix on purpose — Durable Object storage is bound to the script name,
-  // so renaming the worker would orphan every session/registry/chat room.
+  // NOTE: Durable Object storage is bound to the worker name — if the old
+  // `comet-native-edge` worker was ever deployed to this account, this rename
+  // starts fresh (previous session/registry/chat rooms are orphaned).
   "$schema": "node_modules/wrangler/config-schema.json",
   // Deployed by .github/workflows/deploy.yml on pushes to main that touch
   // edge/ (CLOUDFLARE_API_TOKEN repo secret).
-  "name": "comet-native-edge",
+  "name": "komet-native-edge",
   "main": "src/index.ts",
   "compatibility_date": "2026-07-01",
   "account_id": "b57dde68ee5964dccc025437b5478a5b",
   "workers_dev": true,
-  // Public hostname on the komet.sh zone, plus the install surface carved out
-  // of the landing host: path routes beat the landing worker's custom
-  // domain, so `curl -fsSL https://komet.sh/install.sh | sh` installs Komet
-  // while the rest of komet.sh serves the landing page.
+  // Public hostname on the komet.sh zone, plus the install surface:
+  // `curl -fsSL https://komet.sh/install.sh | sh` installs Komet.
   "routes": [
     { "pattern": "edge.komet.sh", "custom_domain": true },
     { "pattern": "komet.sh/install.sh", "zone_name": "komet.sh" },
-    { "pattern": "komet.sh/releases/*", "zone_name": "komet.sh" },
-    // Legacy comet hostnames — keep until 0.1.x clients are gone.
-    { "pattern": "edge.comet.komet.sh", "custom_domain": true },
-    { "pattern": "comet.komet.sh/install.sh", "zone_name": "komet.sh" },
-    { "pattern": "comet.komet.sh/releases/*", "zone_name": "komet.sh" }
+    { "pattern": "komet.sh/releases/*", "zone_name": "komet.sh" }
   ],
   // Serve src/install.sh as a string (the /install.sh route).
   "rules": [{ "type": "Text", "globs": ["**/*.sh"], "fallthrough": true }],
@@ -64,12 +58,12 @@
   "r2_buckets": [
     {
       "binding": "BLOBS",
-      "bucket_name": "comet-native-blobs"
+      "bucket_name": "komet-native-blobs"
     },
     {
       // Release artifacts for /releases/* (curl-install + dmg downloads).
       "binding": "RELEASES",
-      "bucket_name": "comet-native-releases"
+      "bucket_name": "komet-native-releases"
     }
   ],
   "vars": {

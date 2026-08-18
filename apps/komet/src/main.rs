@@ -57,15 +57,9 @@ enum DaemonCommand {
     Status,
 }
 
-/// Production edge (Cloudflare Worker + Durable Objects on the komet.sh zone).
-/// `KOMET_EDGE_URL` overrides (local dev / self-hosting).
+/// Production edge URL used when sync is enabled — overridden by `KOMET_EDGE_URL`
+/// (local dev / self-hosting). Unused while the app runs local-only.
 const DEFAULT_EDGE_URL: &str = "https://edge.komet.sh";
-
-/// Production WorkOS AuthKit client id — public knowledge (it appears in every
-/// authorize URL), so baking it in is safe. Overridden by `KOMET_WORKOS_CLIENT_ID`;
-/// set it to the empty string — or set a dev bearer via `KOMET_EDGE_TOKEN` — to
-/// force dev-mode auth instead.
-const DEFAULT_WORKOS_CLIENT_ID: &str = "client_01KWD0EAKZKD50YCQJNYSRE4BY";
 
 fn edge_url_from_env() -> String {
     std::env::var("KOMET_EDGE_URL")
@@ -74,16 +68,19 @@ fn edge_url_from_env() -> String {
         .unwrap_or_else(|| DEFAULT_EDGE_URL.into())
 }
 
-/// WorkOS client id resolution: explicit env wins (empty string = dev mode);
-/// otherwise a `KOMET_EDGE_TOKEN` dev bearer keeps dev mode (smoke tests,
-/// local wrangler); otherwise the baked production client id makes optional
-/// sync available while a bare start remains local-only.
+/// WorkOS client id resolution: the app is 100% local-only by default, so a
+/// bare start has no client id — dev mode, no account, no login screen, no
+/// network calls. Sync is a future feature: set `KOMET_WORKOS_CLIENT_ID` to a
+/// real WorkOS AuthKit client id (and `KOMET_EDGE_URL` to point at your own
+/// edge deployment) to re-enable it. The empty string, or a dev bearer via
+/// `KOMET_EDGE_TOKEN`, keeps dev mode explicitly.
 fn workos_client_id_from_env(edge_token: &Option<String>) -> Option<String> {
     match std::env::var("KOMET_WORKOS_CLIENT_ID") {
         Ok(v) if v.trim().is_empty() => None,
         Ok(v) => Some(v),
         Err(_) if edge_token.is_some() => None,
-        Err(_) => Some(DEFAULT_WORKOS_CLIENT_ID.into()),
+        // Local-only default: sync disabled.
+        Err(_) => None,
     }
 }
 
@@ -243,17 +240,13 @@ fn harness_from_env() -> komet_engine::HarnessId {
 }
 
 fn dirs_data_dir() -> std::path::PathBuf {
-    let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("HOME not set"));
-    let dir = home.join(".komet");
-    // One-shot 0.2.0 migration: adopt the pre-rename data dir (sign-in,
-    // device identity, prefs) instead of starting fresh.
-    if !dir.exists() {
-        let old = home.join(".comet-native");
-        if old.exists() && std::fs::rename(&old, &dir).is_ok() {
-            eprintln!("migrated data dir {} -> {}", old.display(), dir.display());
-        }
-    }
-    dir
+    // Windows has no HOME (USERPROFILE instead) — same fallback chain as
+    // the engine's home_dir().
+    let home = std::env::var_os("HOME")
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|s| !s.is_empty()))
+        .expect("HOME not set");
+    std::path::PathBuf::from(home).join(".komet")
 }
 
 /// `komet sync`: dial the running engine's IPC and print per-room sync state.

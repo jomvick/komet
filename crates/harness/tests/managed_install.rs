@@ -2,7 +2,7 @@
 //! binary anywhere, `run()` must npm-install the pinned adapter into
 //! `$KOMET_ADAPTERS_DIR`, spawn it via node, and reach SessionStarted (the
 //! full initialize → session/new handshake) — the exact path that used to be
-//! `npx -y` at chat time (kometsh/comet#95).
+//! `npx -y` at chat time (the known npm fatal-fs-error case).
 //!
 //! Ignored: needs network, npm, and the codex CLI on the machine. Run with
 //! `cargo test -p komet-harness --test managed_install -- --ignored`.
@@ -10,10 +10,10 @@
 //! Single-test binary: it mutates KOMET_ADAPTERS_DIR process-wide.
 
 use futures::StreamExt;
-use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 use komet_harness::{AcpHarness, Harness, RunControls};
 use komet_proto::{AgentEvent, RunRequest};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
 #[ignore = "network + npm + codex CLI; installs the pinned adapter for real"]

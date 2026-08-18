@@ -178,8 +178,8 @@ async fn handle(mut stream: tokio::net::TcpStream, state: Arc<StubState>) {
             let org = state.exchange_org.lock().expect("lock").clone();
             let token = fake_jwt(ttl, (!org.is_empty()).then_some(org.as_str()));
             let response = serde_json::json!({
-                "user": { "id": "user_1", "email": "w@example.com",
-                          "firstName": "Wing", "lastName": "Test" },
+                "user": { "id": "user_1", "email": "user@example.com",
+                          "firstName": "Test", "lastName": "User" },
                 "accessToken": token,
                 "refreshToken": format!("refresh-{n}"),
             });
@@ -271,12 +271,12 @@ async fn wait_for<T: Clone + PartialEq>(
 async fn dev_mode_is_signed_in_with_configured_bearer() {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut config = AuthConfig::new("http://127.0.0.1:1", dir.path());
-    config.dev_user_id = "wing-dev".into();
+    config.dev_user_id = "test-dev".into();
     let auth = Auth::new(config);
     assert!(!auth.workos_enabled());
     assert!(!auth.loaded_workos_session());
-    assert!(matches!(auth.state(), AuthState::SignedIn { user, .. } if user.id == "wing-dev"));
-    assert_eq!(auth.access_token().await.as_deref(), Some("wing-dev"));
+    assert!(matches!(auth.state(), AuthState::SignedIn { user, .. } if user.id == "test-dev"));
+    assert_eq!(auth.access_token().await.as_deref(), Some("test-dev"));
     // Dev sign-in mirrors the TS service: a no-op URL, CompleteSignIn accepted.
     assert_eq!(auth.start_sign_in().await.expect("dev sign-in"), "");
     auth.complete_sign_in("whatever")
@@ -321,7 +321,7 @@ async fn headless_flow_exchanges_pasted_code_and_gates_on_org() {
     );
     assert_eq!(edge.state.exchanges.load(Ordering::SeqCst), 1);
     assert!(
-        matches!(auth.state(), AuthState::NeedsOrganization { user } if user.email == "w@example.com")
+        matches!(auth.state(), AuthState::NeedsOrganization { user } if user.email == "user@example.com")
     );
 
     // Session persisted 0600 with the exchange's refresh token.
@@ -417,7 +417,7 @@ async fn revoked_refresh_token_signs_out() {
     // A persisted session whose refresh token the edge rejects with a definitive 4xx.
     std::fs::write(
         dir.path().join("session.json"),
-        r#"{"refreshToken":"dead","user":{"id":"user_1","email":"w@example.com"},"orgId":"org_1"}"#,
+        r#"{"refreshToken":"dead","user":{"id":"user_1","email":"user@example.com"},"orgId":"org_1"}"#,
     )
     .expect("seed session");
     let auth = Auth::new(workos_config(&edge.url(), dir.path()));
@@ -445,7 +445,7 @@ async fn offline_refresh_loop_backs_off_without_revoking_session() {
     let session_file = dir.path().join("session.json");
     std::fs::write(
         &session_file,
-        r#"{"refreshToken":"offline","user":{"id":"user_1","email":"w@example.com"},"orgId":"org_1"}"#,
+        r#"{"refreshToken":"offline","user":{"id":"user_1","email":"user@example.com"},"orgId":"org_1"}"#,
     )
     .expect("seed session");
     let auth = Auth::new(workos_config(&edge.url(), dir.path()));
@@ -496,7 +496,7 @@ async fn loopback_callback_completes_headed_sign_in() {
     wait_for(&mut state_rx, |s| s.is_signed_in()).await;
     assert_eq!(edge.state.exchanges.load(Ordering::SeqCst), 1);
     assert!(
-        matches!(auth.state(), AuthState::SignedIn { org_id: Some(org), user } if org == "org_1" && user.name.as_deref() == Some("Wing Test"))
+        matches!(auth.state(), AuthState::SignedIn { org_id: Some(org), user } if org == "org_1" && user.name.as_deref() == Some("Test User"))
     );
 }
 

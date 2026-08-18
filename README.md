@@ -2,8 +2,6 @@
 
 Control your coding agents (Claude Code, Codex, Cursor, Grok, Hermes, OpenCode, Pi) locally by default, with optional multi-device sync.
 
-![Komet driving a Claude Code session with a live branch diff sidebar](apps/landing/public/assets/app-screenshot.jpg)
-
 Every device runs a small engine that stores sessions on that device. A new installation starts in local-only mode without an account or a network connection.
 
 ## Install and run locally (Linux)
@@ -23,32 +21,31 @@ komet update      # update to the latest release
 komet daemon start|stop|restart|status
 ```
 
-## Optional multi-device sync
+## Multi-device sync (future)
 
-Sign in only when you want to open your account's synced workspace. Authentication changes the profile selected by the next engine start, so stop the daemon before changing it:
+Komet currently runs **100% locally**: no account, no login screen, no network
+calls. Every session, attachment and diff stays on the machine that created it.
 
-```bash
-komet daemon stop
-komet login
-komet daemon start
-```
+Multi-device sync is part of the app's roadmap. The codebase already contains
+the building blocks — the `edge/` sync worker (Loro CRDT rooms, device relays,
+R2 attachments) and the WorkOS auth routes — but they are disabled by default.
+To enable sync later:
 
-You can then start an agent on one synced device and follow or drive it from another. An always-on machine such as a VPS can keep those agents working after you close your laptop.
+1. Deploy the `edge/` worker to your own Cloudflare account and create a WorkOS
+   AuthKit app (set the real client id in `edge/wrangler.jsonc`).
+2. Run the engine with `KOMET_WORKOS_CLIENT_ID=<your client id>`, and
+   `KOMET_EDGE_URL=<your edge host>` if you self-host instead of using the
+   default edge endpoint.
 
-Signing in does not upload, move, or import existing local sessions. Local sessions and their attachments remain under the local profile and reappear when you return to local-only mode:
-
-```bash
-komet daemon stop
-komet logout
-komet daemon start
-```
-
-`komet login` and `komet logout` refuse to modify credentials while an engine owns the data directory. The desktop app follows the same next-restart profile boundary.
+With sync enabled you could start an agent on one device and follow or drive it
+from another; an always-on machine such as a VPS can keep those agents working
+after you close your laptop. Until then, `komet login` just reports
+"dev mode — there is nothing to sign in to" and the app never leaves the machine.
 
 On macOS: use the desktop release, or build `komet` from source and run `komet daemon install` to install the launchd service.
 
 ---
 
-Developing or curious how it works? [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/kometsh/comet) or check out [ARCHITECTURE.md](ARCHITECTURE.md).
+Developing or curious how it works? Check out [ARCHITECTURE.md](ARCHITECTURE.md).
 
 Licensed under the [MIT License](LICENSE).

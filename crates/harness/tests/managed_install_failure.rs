@@ -1,4 +1,4 @@
-//! The kometsh/comet#95 condition, reproduced: npm dying silently with an
+//! The npm fatal-fs-error condition, reproduced: npm dying silently with an
 //! errno-encoded exit (254 = ENOENT — npm/cli#4838) during the adapter
 //! fallback. The old `npx -y` path surfaced this as "harness protocol error:
 //! initialize: app-server exited before responding; Codex exited unexpectedly
@@ -11,10 +11,10 @@
 
 use std::os::unix::fs::PermissionsExt;
 
-use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 use komet_harness::{AcpHarness, Harness, HarnessError, RunControls};
 use komet_proto::{RunRequest, SandboxLevel};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
 async fn silent_npm_enoent_death_surfaces_decoded_error() {

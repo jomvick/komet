@@ -3,7 +3,7 @@
   // isolated R2 bucket, workers.dev only. Delete the worker + bucket after
   // testing (scripts/chat2-e2e teardown). NOT the production config.
   "$schema": "node_modules/wrangler/config-schema.json",
-  "name": "comet-native-edge-chat2test2",
+  "name": "komet-native-edge-chat2test2",
   "main": "src/index.ts",
   "compatibility_date": "2026-07-01",
   "account_id": "b57dde68ee5964dccc025437b5478a5b",
@@ -26,8 +26,8 @@
     { "tag": "v3", "new_sqlite_classes": ["ChatRoom"] }
   ],
   "r2_buckets": [
-    { "binding": "BLOBS", "bucket_name": "comet-native-blobs-chat2test" },
-    { "binding": "RELEASES", "bucket_name": "comet-native-blobs-chat2test" }
+    { "binding": "BLOBS", "bucket_name": "komet-native-blobs-chat2test" },
+    { "binding": "RELEASES", "bucket_name": "komet-native-blobs-chat2test" }
   ],
   "vars": {
     "WORKOS_CLIENT_ID": "client_01KWD0EAKZKD50YCQJNYSRE4BY",

@@ -954,10 +954,10 @@ mod tests {
     #[test]
     fn bare_urls_autolink() {
         assert_eq!(
-            only_link("PR is updated: https://github.com/kometsh/comet/pull/31\n"),
+            only_link("PR is updated: https://github.com/jomvick/komet/pull/31\n"),
             Some((
-                "https://github.com/kometsh/comet/pull/31".into(),
-                "https://github.com/kometsh/comet/pull/31".into()
+                "https://github.com/jomvick/komet/pull/31".into(),
+                "https://github.com/jomvick/komet/pull/31".into()
             ))
         );
         assert_eq!(

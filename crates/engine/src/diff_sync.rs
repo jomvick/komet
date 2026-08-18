@@ -1183,7 +1183,7 @@ pub async fn capture_commit_diff(
     if tracked.truncated {
         let boundary = patch.rfind('\n').unwrap_or(0);
         patch.truncate(boundary);
-        patch.push_str("\n# Comet diff truncated\n");
+        patch.push_str("\n# Komet diff truncated\n");
     }
     let additions: u32 = files.iter().map(|f| f.additions).sum();
     let deletions: u32 = files.iter().map(|f| f.deletions).sum();

@@ -4,7 +4,7 @@
 //! user's npm state in the hot path: a cold cache meant a multi-minute
 //! download while the chat showed "Working", and a broken one meant npm dying
 //! before the adapter ever ran — silently, with an errno-encoded exit code
-//! (254 = ENOENT, the kometsh/comet#95 crash) that surfaced as an opaque
+//! (254 = ENOENT — the known npm fatal-fs-error encoding) that surfaced as an opaque
 //! "harness protocol error". Instead, pinned adapter packages are installed
 //! ONCE into a komet-owned prefix (`~/.komet/adapters/<pkg>/<version>`, own
 //! npm cache beside it, so a root-owned or read-only `~/.npm` can't break
@@ -343,6 +343,9 @@ mod tests {
         assert_eq!(pin.dir_name(), "pi-acp");
     }
 
+    // npm maps errno → exit code as `errno << 8` on unix only; the
+    // simulation below can't be built on Windows.
+    #[cfg(unix)]
     #[test]
     fn npm_errno_exits_are_decoded() {
         use std::os::unix::process::ExitStatusExt;

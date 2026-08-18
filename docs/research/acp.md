@@ -124,7 +124,7 @@
 ## Managed adapter installs (2026-08-15)
 - The `npx -y <pinned>` fallback put every user's npm state in the chat hot
   path and was the root of the "harness protocol error … exit code 254" class
-  of report (kometsh/comet#95): npm encodes fatal fs errors as `256 - errno`
+  of report: npm encodes fatal fs errors as `256 - errno`
   exits (254 = ENOENT, 243 = EACCES — npm/cli#4838), often with no stderr,
   and a cold `npx` could also stall a first chat for minutes while it
   downloaded the adapter's dependency tree (claude-agent-acp's is ~570MB).

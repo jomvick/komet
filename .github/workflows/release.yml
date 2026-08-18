@@ -4,7 +4,7 @@ name: release
 #   - Linux headless tarballs (x86_64 + aarch64) via scripts/package-linux.sh
 #   - macOS dmg (Apple silicon) via scripts/package-macos.sh
 # then create a GitHub Release AND upload everything to the
-# `comet-native-releases` R2 bucket (served at komet.sh/releases/* for
+# `komet-native-releases` R2 bucket (served at komet.sh/releases/* for
 # `curl -fsSL https://komet.sh/install.sh | sh`), bumping latest.txt.
 #
 # Trigger: push a tag `v<version>` matching the workspace version in
@@ -142,7 +142,7 @@ jobs:
         if: env.CLOUDFLARE_API_TOKEN != ''
         run: |
           for f in dist/*; do
-            npx wrangler@4 r2 object put "comet-native-releases/$(basename "$f")" \
+            npx wrangler@4 r2 object put "komet-native-releases/$(basename "$f")" \
               --file "$f" --remote
           done
           # manifest.json: version + per-artifact sha256 — the auto-updater
@@ -155,8 +155,8 @@ jobs:
               '.files[$name] = {sha256: $sha}' <<<"$manifest")
           done
           printf '%s' "$manifest" > manifest.json
-          npx wrangler@4 r2 object put comet-native-releases/manifest.json \
+          npx wrangler@4 r2 object put komet-native-releases/manifest.json \
             --file manifest.json --remote
           printf '%s' "$VERSION" > latest.txt
-          npx wrangler@4 r2 object put comet-native-releases/latest.txt \
+          npx wrangler@4 r2 object put komet-native-releases/latest.txt \
             --file latest.txt --remote

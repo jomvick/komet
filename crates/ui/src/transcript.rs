@@ -3553,7 +3553,7 @@ fn user_bubble_text(
 /// red-tinted wash, never a bare red-stroke box. Unlike the web port, the
 /// message WRAPS instead of truncating: startup-crash errors carry the
 /// agent's exit status and stderr, and a one-line ellipsis was exactly what
-/// made kometsh/comet#95 undiagnosable from the screenshot.
+/// made the npm fatal-fs-error case undiagnosable from the screenshot.
 fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
     let red_300 = theme.danger_muted; // tailwind red-300
     let danger = theme.danger; // red-400

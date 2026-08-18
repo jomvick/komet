@@ -6,15 +6,15 @@
 //! - Collapsible directories with lazy recursive folder loading (`ListFolders`).
 //! - Instant fuzzy search / filtering (`SearchFiles`).
 //! - File path copying to clipboard.
-//! - Polished design matching the Comet UI aesthetics and theme tokens.
+//! - Polished design matching the Komet UI aesthetics and theme tokens.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, App, Context, Entity, FocusHandle, Focusable,
-    ScrollHandle, SharedString, Subscription, Task, Window, div, prelude::*, px,
+    AnyElement, App, Context, Entity, FocusHandle, Focusable, ScrollHandle, SharedString,
+    Subscription, Task, Window, div, prelude::*, px,
 };
 
 use komet_proto::{FileSearchMatch, FolderListing};
@@ -44,7 +44,7 @@ pub struct FilesPanel {
     search_task: Option<Task<()>>,
     load_task: Option<Task<()>>,
     sub_tasks: HashMap<String, Task<()>>,
-    
+
     // State
     root_path: Option<String>,
     device_id: Option<String>,
@@ -132,7 +132,8 @@ impl FilesPanel {
         };
 
         if let Some((root, device)) = resolved {
-            let changed = self.root_path.as_deref() != Some(root.as_str()) || self.device_id != device;
+            let changed =
+                self.root_path.as_deref() != Some(root.as_str()) || self.device_id != device;
             if changed || self.root_entries.is_empty() {
                 self.root_path = Some(root);
                 self.device_id = device;
@@ -166,7 +167,10 @@ impl FilesPanel {
             if let (Some(target), Some(local_id)) = (&device_id, &local)
                 && local_id != target
             {
-                params.insert("targetDeviceId".into(), serde_json::Value::String(target.clone()));
+                params.insert(
+                    "targetDeviceId".into(),
+                    serde_json::Value::String(target.clone()),
+                );
             }
 
             let result = engine
@@ -209,7 +213,13 @@ impl FilesPanel {
         cx.notify();
     }
 
-    fn toggle_folder(&mut self, path: String, rel_path: String, depth: usize, cx: &mut Context<Self>) {
+    fn toggle_folder(
+        &mut self,
+        path: String,
+        rel_path: String,
+        depth: usize,
+        cx: &mut Context<Self>,
+    ) {
         if self.expanded_paths.contains(&path) {
             self.expanded_paths.remove(&path);
             cx.notify();
@@ -223,7 +233,13 @@ impl FilesPanel {
         cx.notify();
     }
 
-    fn load_sub_folder(&mut self, dir_path: String, rel_prefix: String, child_depth: usize, cx: &mut Context<Self>) {
+    fn load_sub_folder(
+        &mut self,
+        dir_path: String,
+        rel_prefix: String,
+        child_depth: usize,
+        cx: &mut Context<Self>,
+    ) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
@@ -240,7 +256,10 @@ impl FilesPanel {
             if let (Some(target), Some(local_id)) = (&device_id, &local)
                 && local_id != target
             {
-                params.insert("targetDeviceId".into(), serde_json::Value::String(target.clone()));
+                params.insert(
+                    "targetDeviceId".into(),
+                    serde_json::Value::String(target.clone()),
+                );
             }
 
             let result = engine
@@ -320,7 +339,9 @@ impl FilesPanel {
         self.search_loading = true;
 
         self.search_task = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(Duration::from_millis(60)).await;
+            cx.background_executor()
+                .timer(Duration::from_millis(60))
+                .await;
 
             let mut params = serde_json::Map::new();
             params.insert("root".into(), serde_json::Value::String(root));
@@ -329,7 +350,10 @@ impl FilesPanel {
             if let (Some(target), Some(local_id)) = (&device_id, &local)
                 && local_id != target
             {
-                params.insert("targetDeviceId".into(), serde_json::Value::String(target.clone()));
+                params.insert(
+                    "targetDeviceId".into(),
+                    serde_json::Value::String(target.clone()),
+                );
             }
 
             let result = engine
@@ -436,11 +460,7 @@ impl FilesPanel {
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.refresh(cx);
                             }))
-                            .child(
-                                icon(icons::REFRESH)
-                                    .size(px(13.0))
-                                    .text_color(text_muted),
-                            ),
+                            .child(icon(icons::REFRESH).size(px(13.0)).text_color(text_muted)),
                     ),
             )
             // Filter search input
@@ -457,20 +477,25 @@ impl FilesPanel {
                     .flex_row()
                     .items_center()
                     .gap(px(6.0))
-                    .child(
-                        icon(icons::MAGNIFER)
-                            .size(px(13.0))
-                            .text_color(text_muted),
-                    )
+                    .child(icon(icons::MAGNIFER).size(px(13.0)).text_color(text_muted))
                     .child(div().flex_1().min_w_0().child(self.search.clone())),
             )
             .into_any_element()
     }
 
-    fn render_node_row(&self, node: &FileNode, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    fn render_node_row(
+        &self,
+        node: &FileNode,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let is_expanded = self.expanded_paths.contains(&node.path);
         let is_loading = self.loading_paths.contains(&node.path);
-        let text_color = if node.is_dir { theme.text } else { theme.text_muted };
+        let text_color = if node.is_dir {
+            theme.text
+        } else {
+            theme.text_muted
+        };
         let node_path = node.path.clone();
         let rel_path = node.rel_path.clone();
         let depth = node.depth;
@@ -537,11 +562,11 @@ impl FilesPanel {
                     }),
             )
             // Icon
-            .child(
-                icon(node_icon)
-                    .size(px(14.0))
-                    .text_color(if is_dir { theme.accent } else { theme.text_muted }),
-            )
+            .child(icon(node_icon).size(px(14.0)).text_color(if is_dir {
+                theme.accent
+            } else {
+                theme.text_muted
+            }))
             // Name
             .child(
                 div()
@@ -612,11 +637,11 @@ impl FilesPanel {
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.on_file_click(&rel_path, window, cx);
             }))
-            .child(
-                icon(file_icon)
-                    .size(px(14.0))
-                    .text_color(if is_dir { theme.accent } else { theme.text_muted }),
-            )
+            .child(icon(file_icon).size(px(14.0)).text_color(if is_dir {
+                theme.accent
+            } else {
+                theme.text_muted
+            }))
             .child(
                 div()
                     .flex_1()

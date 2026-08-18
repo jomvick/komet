@@ -37,8 +37,8 @@ loro = "1.13"
 # frames, cross-checked by its js_snapshots tests).
 loro-protocol = "0.3"
 
-# gpui — the wingleeio/zed fork: upstream f14fea9 + commits on
-# `comet/edge-fade-horizontal` (tip of `comet/line-wrap-closing-punctuation`
+# gpui — the wingleeio/zed fork: upstream f14fea9 + commits on the fork's
+# `edge-fade-horizontal` branch (tip of `line-wrap-closing-punctuation`
 # + 5d1f83d horizontal per-pixel EdgeFade for quads/images; rebase when bumping the
 # upstream rev): a6bf17c fixes BOTH wrap-rule copies (LineWrapper +
 # line_layout's shaped-text duplicate); 14baea0 adds the EdgeFade primitive
