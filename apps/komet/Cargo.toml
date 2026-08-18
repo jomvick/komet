@@ -25,3 +25,7 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.8"
+winreg = "0.55"

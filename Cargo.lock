@@ -3498,7 +3498,7 @@ checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 
 [[package]]
 name = "komet"
-version = "0.2.2"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -3513,11 +3513,13 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "windows-service",
+ "winreg 0.55.0",
 ]
 
 [[package]]
 name = "komet-doc"
-version = "0.2.2"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "komet-proto",
@@ -3531,7 +3533,7 @@ dependencies = [
 
 [[package]]
 name = "komet-engine"
-version = "0.2.2"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3562,11 +3564,12 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
 name = "komet-harness"
-version = "0.2.2"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3582,11 +3585,12 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
 name = "komet-proto"
-version = "0.2.2"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "serde",
@@ -3596,7 +3600,7 @@ dependencies = [
 
 [[package]]
 name = "komet-rpc"
-version = "0.2.2"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3615,7 +3619,7 @@ dependencies = [
 
 [[package]]
 name = "komet-sync"
-version = "0.2.2"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "futures",
@@ -3637,7 +3641,7 @@ dependencies = [
 
 [[package]]
 name = "komet-syntax"
-version = "0.2.2"
+version = "1.0.0"
 dependencies = [
  "thiserror 2.0.19",
  "tree-sitter",
@@ -3671,7 +3675,7 @@ dependencies = [
 
 [[package]]
 name = "komet-ui"
-version = "0.2.2"
+version = "1.0.0"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -3704,7 +3708,7 @@ dependencies = [
 
 [[package]]
 name = "komet-update"
-version = "0.2.2"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "futures",
@@ -8463,6 +8467,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "widestring"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72069c3113ab32ab29e5584db3c6ec55d416895e60715417b5b883a357c3e471"
+
+[[package]]
 name = "winapi"
 version = "0.3.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8731,6 +8741,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7781fa89eaf60850ac3d2da7af8e5242a5ea78d1a11c49bf2910bb5a73853eb5"
 dependencies = [
  "windows-link 0.2.1",
+]
+
+[[package]]
+name = "windows-service"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "857224b3b211c6f3616921f081ee54721ee3ad2ace2fac6a6337e032f7b4dcf2"
+dependencies = [
+ "bitflags 2.13.1",
+ "widestring",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

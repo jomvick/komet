@@ -11,6 +11,10 @@ use clap::{Parser, Subcommand};
 #[derive(Parser)]
 #[command(name = "komet", about = "Multi-device controller for coding agents")]
 struct Cli {
+    /// Internal: run as the Windows service (invoked by the SCM via the
+    /// `--service` launch argument set at `komet daemon install`).
+    #[arg(long, hide = true)]
+    service: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -92,13 +96,18 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    // Service mode re-applies the environment captured at install time (SCM
+    // starts services with a minimal env) BEFORE logging init reads it.
+    if cli.service {
+        daemon::load_persisted_env();
+    }
     // Long-running modes log at info, one-shot CLI commands at warn (RUST_LOG
     // overrides either).
     // loro's internal block-encode diagnostics log at info and flood
     // journald on every snapshot export — enough to fill a disk on a
     // long-running headless host. Quiet them by default (RUST_LOG still
     // overrides the whole filter).
-    let long_running = matches!(&cli.command, None | Some(Command::Headless));
+    let long_running = cli.service || matches!(&cli.command, None | Some(Command::Headless));
     let default_filter = if long_running {
         "info,loro_internal=warn,loro=warn"
     } else {
@@ -112,7 +121,9 @@ fn main() -> anyhow::Result<()> {
     // the engine logs the exact failure line. One file per launch, previous
     // launch kept as `.old`.
     let log_file = if long_running {
-        let mode = if cli.command.is_some() {
+        let mode = if cli.service {
+            "headless"
+        } else if cli.command.is_some() {
             "headless"
         } else {
             "headed"
@@ -137,6 +148,11 @@ fn main() -> anyhow::Result<()> {
                 .init(),
             None => registry.init(),
         }
+    }
+
+    // Hidden SCM entry point; blocks until the service stops.
+    if cli.service {
+        return daemon::run_as_windows_service();
     }
 
     match cli.command {

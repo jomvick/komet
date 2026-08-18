@@ -1,8 +1,8 @@
 //! `komet daemon …` — install/manage `komet headless` as a background service:
 //! a systemd **user** unit on Linux (the VPS deployment target), a launchd
-//! LaunchAgent on macOS. The unit runs the current executable with the
-//! `KOMET_*` environment captured at install time, so
-//! `KOMET_EDGE_URL=… komet daemon install` bakes that override in.
+//! LaunchAgent on macOS, a native Windows service on Windows. The unit runs
+//! the current executable with the `KOMET_*` environment captured at install
+//! time, so `KOMET_EDGE_URL=… komet daemon install` bakes that override in.
 //!
 //! Auth is decoupled: without a saved session the service remains up on the
 //! local-only profile. `komet login` and a service restart opt into sync.
@@ -12,10 +12,39 @@ use std::process::Command;
 
 use anyhow::{Context, bail};
 
+/// Windows service-manager implementation. Declared unconditionally: the
+/// `cfg!(target_os = "windows")` branches below are type-checked on every
+/// platform, so the module (and its non-Windows stubs) must exist everywhere.
+mod win;
+
 const LAUNCHD_LABEL: &str = "sh.komet.app";
 /// Same unit name the curl|sh installer (`edge/src/install.sh`) writes, so
 /// `komet daemon …` manages that installation rather than a competing copy.
 const SYSTEMD_UNIT: &str = "komet.service";
+
+/// Windows service key name (SCM database) and the registry service subkey.
+const SERVICE_NAME: &str = "Komet";
+
+/// SCM entry point for the hidden `--service` flag (see `win`).
+#[cfg(target_os = "windows")]
+pub fn run_as_windows_service() -> anyhow::Result<()> {
+    win::run_as_windows_service()
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn run_as_windows_service() -> anyhow::Result<()> {
+    bail!("--service is only used internally by the Windows service manager")
+}
+
+/// Re-apply the env persisted at install to the process environment before
+/// anything reads it (logging filter, engine config).
+#[cfg(target_os = "windows")]
+pub fn load_persisted_env() {
+    win::load_persisted_env();
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn load_persisted_env() {}
 
 /// Environment captured into the unit file. `PATH` is always included (the
 /// engine spawns harness CLIs like `claude`, which service managers' minimal
@@ -66,6 +95,9 @@ pub fn install(data_dir: &Path) -> anyhow::Result<()> {
         println!(
             "For start-at-boot without an active login session (VPS): loginctl enable-linger $USER"
         );
+    } else if cfg!(target_os = "windows") {
+        win::install(&exe, &env)?;
+        println!("Installed and started the {SERVICE_NAME} service.");
     } else {
         bail!("komet daemon is only supported on macOS (launchd) and Linux (systemd)");
     }
@@ -107,6 +139,12 @@ pub fn uninstall() -> anyhow::Result<()> {
             }
             Err(err) => return Err(err.into()),
         }
+    } else if cfg!(target_os = "windows") {
+        if win::uninstall()? {
+            println!("Removed the {SERVICE_NAME} service.");
+        } else {
+            println!("Not installed.");
+        }
     } else {
         bail!("komet daemon is only supported on macOS (launchd) and Linux (systemd)");
     }
@@ -128,6 +166,10 @@ pub fn start() -> anyhow::Result<()> {
         run("launchctl", &["kickstart", &launchd_service_target()?])?;
     } else if cfg!(target_os = "linux") {
         run("systemctl", &["--user", "start", SYSTEMD_UNIT])?;
+    } else if cfg!(target_os = "windows") {
+        if !win::start()? {
+            bail!("not installed — run `komet daemon install` first");
+        }
     } else {
         bail!("komet daemon is only supported on macOS (launchd) and Linux (systemd)");
     }
@@ -141,6 +183,8 @@ pub fn stop() -> anyhow::Result<()> {
         run("launchctl", &["bootout", &launchd_service_target()?])?;
     } else if cfg!(target_os = "linux") {
         run("systemctl", &["--user", "stop", SYSTEMD_UNIT])?;
+    } else if cfg!(target_os = "windows") {
+        win::stop()?;
     } else {
         bail!("komet daemon is only supported on macOS (launchd) and Linux (systemd)");
     }
@@ -163,6 +207,10 @@ pub fn restart() -> anyhow::Result<()> {
         Ok(())
     } else if cfg!(target_os = "linux") {
         run("systemctl", &["--user", "restart", SYSTEMD_UNIT])?;
+        println!("Restarted.");
+        Ok(())
+    } else if cfg!(target_os = "windows") {
+        win::restart()?;
         println!("Restarted.");
         Ok(())
     } else {
@@ -207,6 +255,9 @@ pub fn status() -> anyhow::Result<()> {
             .args(["--user", "--no-pager", "status", SYSTEMD_UNIT])
             .status()
             .context("running systemctl")?;
+        Ok(())
+    } else if cfg!(target_os = "windows") {
+        win::status()?;
         Ok(())
     } else {
         bail!("komet daemon is only supported on macOS (launchd) and Linux (systemd)");

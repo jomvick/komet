@@ -60,7 +60,7 @@ const CLAUDE_PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
 const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "windows"))]
 const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
 
 const USAGE_TTL: Duration = Duration::from_secs(60);
@@ -942,7 +942,11 @@ impl AgentAccounts {
         {
             return keychain::read_credentials().await;
         }
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "windows")]
+        {
+            return wincred::read_credentials().await;
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         (None, None)
     }
 
@@ -957,6 +961,14 @@ impl AgentAccounts {
             // when no credentials FILE exists (the file wins when present).
             if !self.inner.config.claude_creds_file().exists() {
                 return keychain::write_credentials(&json).await;
+            }
+        }
+        #[cfg(target_os = "windows")]
+        {
+            // Mirror of the macOS branch: the Credential Manager is the
+            // fallback store, so the file wins when present.
+            if !self.inner.config.claude_creds_file().exists() {
+                return wincred::write_credentials(&json).await;
             }
         }
         std::fs::create_dir_all(&self.inner.config.claude_config_dir)?;
@@ -1285,6 +1297,105 @@ mod keychain {
                 }
             )))
         }
+    }
+}
+
+// ── Windows Credential Manager (compiled only on Windows) ───────────────────
+//
+// Claude Code stores its credentials in the Windows Credential Manager under
+// the target `Claude Code-credentials` (the same service name the macOS
+// Keychain module uses), account = the current username. We talk to it with
+// `CredReadW`/`CredWriteW` (windows-sys) directly — reads need no extra
+// authorization and writes update in place. `.credentials.json` remains the
+// primary store; this is the fallback when no credentials file exists.
+#[cfg(target_os = "windows")]
+mod wincred {
+    use super::*;
+
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::Security::Credentials::{
+        CredFree, CredReadW, CredWriteW, CREDENTIALW, CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC,
+    };
+
+    fn target() -> Vec<u16> {
+        KEYCHAIN_SERVICE
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    fn account() -> String {
+        std::env::var("USERNAME").unwrap_or_else(|_| "unknown".into())
+    }
+
+    pub(super) async fn read_credentials() -> (Option<serde_json::Value>, Option<String>) {
+        let target = target();
+        let mut cred: *mut CREDENTIALW = std::ptr::null_mut();
+        // SAFETY: `target` stays alive for the call and is read-only; on
+        // success `cred` points to a heap-allocated credential we must
+        // release with CredFree.
+        let ok = unsafe { CredReadW(target.as_ptr(), CRED_TYPE_GENERIC, 0, &mut cred) };
+        if ok == 0 || cred.is_null() {
+            return (None, None);
+        }
+        let parsed = unsafe {
+            // SAFETY: `cred` is valid for CredentialBlobSize bytes of
+            // CredentialBlob (CredReadW guarantees it); we copy out before
+            // freeing. A null blob with size 0 means an empty payload, which
+            // is not a valid credential object.
+            let size = (*cred).CredentialBlobSize as usize;
+            let parsed = if size == 0 {
+                None
+            } else {
+                serde_json::from_slice(std::slice::from_raw_parts((*cred).CredentialBlob, size))
+                    .ok()
+                    .filter(serde_json::Value::is_object)
+            };
+            CredFree(cred as *const std::ffi::c_void);
+            parsed
+        };
+        match parsed {
+            Some(creds) => (Some(creds), None),
+            None => (
+                None,
+                Some("The Claude Code Credential Manager entry could not be parsed.".into()),
+            ),
+        }
+    }
+
+    pub(super) async fn write_credentials(json: &str) -> Result<(), EngineError> {
+        let target = target();
+        let account = account();
+        let mut target_wide = target;
+        let mut user_wide: Vec<u16> = account.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut blob: Vec<u8> = json.as_bytes().to_vec();
+
+        let cred = CREDENTIALW {
+            Flags: 0,
+            Type: CRED_TYPE_GENERIC,
+            TargetName: target_wide.as_mut_ptr(),
+            Comment: std::ptr::null_mut(),
+            LastWritten: FILETIME {
+                dwLowDateTime: 0,
+                dwHighDateTime: 0,
+            },
+            CredentialBlobSize: blob.len() as u32,
+            CredentialBlob: blob.as_mut_ptr(),
+            Persist: CRED_PERSIST_LOCAL_MACHINE,
+            AttributeCount: 0,
+            Attributes: std::ptr::null_mut(),
+            TargetAlias: std::ptr::null_mut(),
+            UserName: user_wide.as_mut_ptr(),
+        };
+        // SAFETY: every pointer in `cred` is valid for the duration of the
+        // call; CredWriteW copies the data synchronously.
+        let ok = unsafe { CredWriteW(&cred, 0) };
+        if ok == 0 {
+            return Err(EngineError::Other(
+                "Windows Credential Manager write failed (last Win32 error)".into(),
+            ));
+        }
+        Ok(())
     }
 }
 
