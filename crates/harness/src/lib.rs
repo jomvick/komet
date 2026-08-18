@@ -268,7 +268,43 @@ pub(crate) fn send_signal(pid: u32, signal: Signal) {
     }
 }
 
-#[cfg(not(unix))]
-pub(crate) fn send_signal(_pid: u32, _signal: Signal) {
-    // No SIGTERM off unix; `start_kill`/`kill_on_drop` handle termination.
+#[cfg(windows)]
+pub(crate) fn send_signal(pid: u32, signal: Signal) {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Console::{GenerateConsoleCtrlEvent, CTRL_C_EVENT};
+    use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+
+    // SAFETY: we touch a pid we spawned and have not yet reaped. OpenProcess
+    // with PROCESS_TERMINATE lets us both send a console Ctrl+C (when the
+    // child shares a console and is its own process group) and fall back to a
+    // hard TerminateProcess for SIGTERM, plus SIGKILL directly.
+    let mut handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+    if handle == INVALID_HANDLE_VALUE {
+        handle = std::ptr::null_mut();
+    }
+    fn terminate(handle: windows_sys::Win32::Foundation::HANDLE) {
+        // SAFETY: `handle` is valid (non-null, open with PROCESS_TERMINATE).
+        unsafe {
+            if !handle.is_null() {
+                TerminateProcess(handle, 1);
+            }
+        }
+    }
+    match signal {
+        // SIGTERM: graceful Ctrl+C when the child has a console and is a
+        // process group leader; otherwise hard-terminate.
+        Signal::Term => {
+            let sent = unsafe { GenerateConsoleCtrlEvent(CTRL_C_EVENT, pid) };
+            if sent == 0 {
+                terminate(handle);
+            }
+        }
+        Signal::Kill => terminate(handle),
+    }
+    // SAFETY: closing the handle we opened above.
+    unsafe {
+        if !handle.is_null() {
+            CloseHandle(handle);
+        }
+    }
 }

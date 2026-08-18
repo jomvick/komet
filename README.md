@@ -44,6 +44,38 @@ after you close your laptop. Until then, `komet login` just reports
 
 On macOS: use the desktop release, or build `komet` from source and run `komet daemon install` to install the launchd service.
 
+## Install on Windows
+
+Download the latest `.msi` installer from the [GitHub release](https://github.com/opencode/komet/releases) and run it — it installs `komet.exe` into `Program Files\Komet`, registers uninstall keys, and optionally installs the `Komet` Windows service (running as the logged-in user). A standalone `komet.exe` portable executable is also available in the release assets; no service is registered for the portable variant.
+
+To install the service from the command line:
+
+```powershell
+c:\Program Files\Komet\komet.exe --service
+```
+
+or equivalently via `sc`:
+
+```powershell
+sc create Komet binPath= "\"c:\Program Files\Komet\komet.exe\" --service"
+```
+
+Day-to-day management:
+
+```powershell
+komet daemon start
+komet daemon stop
+komet daemon restart
+komet daemon status
+```
+
+## Install and run locally (Linux)
+
+```bash
+curl -fsSL https://komet.sh/install.sh | sh
+komet status
+```
+
 ---
 
 Developing or curious how it works? Check out [ARCHITECTURE.md](ARCHITECTURE.md).

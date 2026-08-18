@@ -22,5 +22,9 @@ tracing.workspace = true
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+# OpenProcess / TerminateProcess for graceful + hard child shutdown.
+windows-sys = { version = "0.59", features = ["Win32_System_Threading", "Win32_System_Console", "Win32_Foundation"] }
+
 [dev-dependencies]
 tempfile.workspace = true

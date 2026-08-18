@@ -39,3 +39,7 @@ tempfile.workspace = true
 tokio-tungstenite.workspace = true
 # In-process registry server for the two-engine workspace integration tests.
 komet-sync = { workspace = true, features = ["mock-server"] }
+
+[target.'cfg(windows)'.dependencies]
+# CredReadW / CredWriteW for the Windows Credential Manager fallback store.
+windows-sys = { version = "0.59", features = ["Win32_Security_Credentials", "Win32_Foundation"] }

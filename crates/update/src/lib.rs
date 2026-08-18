@@ -341,6 +341,18 @@ pub fn apply_headless(app_root: &Path, version: &str) -> anyhow::Result<()> {
         std::fs::rename(&tmp, app_root.join("current")).context("swapping current symlink")?;
         Ok(())
     }
+    #[cfg(windows)]
+    {
+        // Design doc (l.331-347): Windows branch — download the MSI and run
+        // `msiexec /i <file> /qn /norestart`, wait for exit; no symlink swap.
+        // The managed-install path does not apply to MSI-based installs on Windows
+        // (detect_install returns Unmanaged), so this branch is kept for future
+        // upgrade-path compatibility. In the meantime, inform the user.
+        bail!(
+            "Windows managed installs use MSI; updates are driven by the Komet UI. \
+             See the design doc for the planned MSI upgrade path."
+        );
+    }
     #[cfg(not(unix))]
     {
         let _ = (app_root, version);
@@ -454,8 +466,20 @@ pub fn relaunch_app_after_exit(bundle: &Path) {
             tracing::error!(error = %err, "failed to spawn the relauncher");
         }
     }
+    #[cfg(windows)]
+    {
+        // Design doc: Windows branch — `cmd /c start "" "<exe>"`.
+        // bundle on Windows is the exe path; start it detached.
+        let _ = (bundle);
+        let exe = bundle.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let _ = std::process::Command::new("cmd")
+            .args(["/c", "start", "", exe])
+            .spawn();
+    }
     #[cfg(not(unix))]
-    let _ = bundle;
+    {
+        let _ = bundle;
+    }
 }
 
 // ---------------------------------------------------------------------------
