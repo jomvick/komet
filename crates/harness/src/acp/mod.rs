@@ -957,7 +957,9 @@ impl AcpHarness {
             Ok::<Vec<Model>, HarnessError>(models)
         };
         let result = tokio::time::timeout(
-            self.spec.model_discovery_timeout.unwrap_or(Duration::from_secs(10)),
+            self.spec
+                .model_discovery_timeout
+                .unwrap_or(Duration::from_secs(10)),
             discovery,
         )
         .await;
@@ -1613,7 +1615,12 @@ fn usage_from_response(res: &Result<Value, HarnessError>) -> Option<AgentEvent> 
             .find_map(|k| usage.get(*k))
             .and_then(Value::as_u64)
     };
-    let input = count(&["inputTokens", "input_tokens", "promptTokens", "prompt_tokens"]);
+    let input = count(&[
+        "inputTokens",
+        "input_tokens",
+        "promptTokens",
+        "prompt_tokens",
+    ]);
     let cached = count(&[
         "cachedInputTokens",
         "cached_input_tokens",
@@ -1622,7 +1629,12 @@ fn usage_from_response(res: &Result<Value, HarnessError>) -> Option<AgentEvent> 
         "cachedTokens",
         "cached_tokens",
     ]);
-    let output = count(&["outputTokens", "output_tokens", "completionTokens", "completion_tokens"]);
+    let output = count(&[
+        "outputTokens",
+        "output_tokens",
+        "completionTokens",
+        "completion_tokens",
+    ]);
     let reasoning = count(&[
         "reasoningTokens",
         "reasoning_tokens",
@@ -1681,11 +1693,22 @@ fn friendly_prompt_error(err: &HarnessError) -> String {
     let raw = err.to_string();
     let lower = raw.to_lowercase();
     let credit = [
-        "credit", "quota", "insufficient balance", "billing", "payment", "top up",
-        "out of credits", "balance", "402",
+        "credit",
+        "quota",
+        "insufficient balance",
+        "billing",
+        "payment",
+        "top up",
+        "out of credits",
+        "balance",
+        "402",
     ];
     let rate = [
-        "rate limit", "too many requests", "throttl", "try again later", "retry after",
+        "rate limit",
+        "too many requests",
+        "throttl",
+        "try again later",
+        "retry after",
         "429",
     ];
     if credit.iter().any(|k| lower.contains(k)) {
@@ -3264,10 +3287,19 @@ mod tests {
         // Provider-side failures surface as `session/prompt: <message>`; the
         // known families must read as actionable notes, not transport errors.
         let cases = [
-            ("session/prompt: rate limit exceeded, please try again later", "Rate limited"),
+            (
+                "session/prompt: rate limit exceeded, please try again later",
+                "Rate limited",
+            ),
             ("session/prompt: too many requests (429)", "Rate limited"),
-            ("session/prompt: insufficient credits, please top up", "Out of credits"),
-            ("session/prompt: quota exceeded for the free tier", "Out of credits"),
+            (
+                "session/prompt: insufficient credits, please top up",
+                "Out of credits",
+            ),
+            (
+                "session/prompt: quota exceeded for the free tier",
+                "Out of credits",
+            ),
             ("session/prompt: payment required (402)", "Out of credits"),
             ("session/prompt: you are out of credits", "Out of credits"),
         ];

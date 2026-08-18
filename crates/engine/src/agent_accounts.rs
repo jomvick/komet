@@ -1314,7 +1314,7 @@ mod wincred {
 
     use windows_sys::Win32::Foundation::FILETIME;
     use windows_sys::Win32::Security::Credentials::{
-        CredFree, CredReadW, CredWriteW, CREDENTIALW, CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC,
+        CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC, CREDENTIALW, CredFree, CredReadW, CredWriteW,
     };
 
     fn target() -> Vec<u16> {

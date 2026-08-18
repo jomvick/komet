@@ -262,13 +262,13 @@ impl HarnessRegistry {
                         if let Ok(fresh) = harness.models().await
                             && !fresh.is_empty()
                         {
-                            cache
-                                .lock()
-                                .unwrap_or_else(PoisonError::into_inner)
-                                .insert(id, CachedModels {
+                            cache.lock().unwrap_or_else(PoisonError::into_inner).insert(
+                                id,
+                                CachedModels {
                                     discovered_at_ms: crate::now_ms(),
                                     models: fresh.clone(),
-                                });
+                                },
+                            );
                             if let Some(path) = path {
                                 let file = ModelsCacheFile {
                                     entries: cache
@@ -879,11 +879,7 @@ mod tests {
         reloaded.load_prefs(dir.path());
         reloaded.load_models_cache(dir.path());
         let cached = reloaded.models(HarnessId::Mock).await;
-        let ids: Vec<String> = cached
-            .unwrap()
-            .into_iter()
-            .map(|m| m.id)
-            .collect();
+        let ids: Vec<String> = cached.unwrap().into_iter().map(|m| m.id).collect();
         assert_eq!(ids, vec!["mock-1", "mock-fable-5"]);
     }
 

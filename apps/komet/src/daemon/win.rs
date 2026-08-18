@@ -19,18 +19,14 @@ use std::ffi::OsString;
 #[cfg(target_os = "windows")]
 use std::path::Path;
 #[cfg(target_os = "windows")]
-use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(target_os = "windows")]
 use std::sync::Arc;
+#[cfg(target_os = "windows")]
+use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(target_os = "windows")]
 use std::time::Duration;
 
 #[cfg(target_os = "windows")]
 use anyhow::{Context, bail};
-#[cfg(target_os = "windows")]
-use winreg::enums::HKEY_LOCAL_MACHINE;
-#[cfg(target_os = "windows")]
-use winreg::RegKey;
 #[cfg(target_os = "windows")]
 use windows_service::service::{
     Service, ServiceAccess, ServiceControl, ServiceControlAccept, ServiceErrorControl,
@@ -40,6 +36,10 @@ use windows_service::service::{
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
 #[cfg(target_os = "windows")]
 use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
+#[cfg(target_os = "windows")]
+use winreg::RegKey;
+#[cfg(target_os = "windows")]
+use winreg::enums::HKEY_LOCAL_MACHINE;
 
 #[cfg(target_os = "windows")]
 use super::{CAPTURED_ENV, SERVICE_NAME};
@@ -49,8 +49,7 @@ use super::{CAPTURED_ENV, SERVICE_NAME};
 const DISPLAY_NAME: &str = "Komet headless engine";
 #[cfg(target_os = "windows")]
 #[cfg(target_os = "windows")]
-const ENV_REGISTRY_PATH: &str =
-    r"SYSTEM\CurrentControlSet\Services\Komet\Parameters\Environment";
+const ENV_REGISTRY_PATH: &str = r"SYSTEM\CurrentControlSet\Services\Komet\Parameters\Environment";
 /// How long to wait for a StopPending → Stopped transition before giving up.
 #[cfg(target_os = "windows")]
 #[cfg(target_os = "windows")]
@@ -62,7 +61,8 @@ windows_service::define_windows_service!(ffi_service_main, service_main);
 #[cfg(target_os = "windows")]
 #[cfg(target_os = "windows")]
 fn manager(access: ServiceManagerAccess) -> anyhow::Result<ServiceManager> {
-    ServiceManager::local_computer(None::<&str>, access).context("opening the service control manager")
+    ServiceManager::local_computer(None::<&str>, access)
+        .context("opening the service control manager")
 }
 
 #[cfg(target_os = "windows")]
@@ -78,13 +78,15 @@ pub fn install(exe: &Path, env: &[(String, String)]) -> anyhow::Result<()> {
         let _ = service.delete();
     }
 
-    let (account_name, account_password, local_system) = match std::env::var("KOMET_SERVICE_PASSWORD")
-    {
-        Ok(password) if !password.trim().is_empty() => {
-            (Some(service_account_name()?.into()), Some(password.into()), false)
-        }
-        _ => (None, None, true),
-    };
+    let (account_name, account_password, local_system) =
+        match std::env::var("KOMET_SERVICE_PASSWORD") {
+            Ok(password) if !password.trim().is_empty() => (
+                Some(service_account_name()?.into()),
+                Some(password.into()),
+                false,
+            ),
+            _ => (None, None, true),
+        };
 
     let info = ServiceInfo {
         name: SERVICE_NAME.into(),
@@ -133,9 +135,10 @@ fn service_account_name() -> anyhow::Result<String> {
 #[cfg(target_os = "windows")]
 pub fn uninstall() -> anyhow::Result<bool> {
     let manager = manager(ServiceManagerAccess::CONNECT)?;
-    let Ok(service) =
-        manager.open_service(SERVICE_NAME, ServiceAccess::STOP | ServiceAccess::DELETE | ServiceAccess::QUERY_STATUS)
-    else {
+    let Ok(service) = manager.open_service(
+        SERVICE_NAME,
+        ServiceAccess::STOP | ServiceAccess::DELETE | ServiceAccess::QUERY_STATUS,
+    ) else {
         return Ok(false);
     };
     let _ = stop_and_wait(&service);
@@ -150,7 +153,9 @@ pub fn start() -> anyhow::Result<bool> {
     let Ok(service) = manager.open_service(SERVICE_NAME, ServiceAccess::START) else {
         return Ok(false);
     };
-    service.start(&[] as &[OsString]).context("starting the service")?;
+    service
+        .start(&[] as &[OsString])
+        .context("starting the service")?;
     Ok(true)
 }
 
@@ -158,7 +163,10 @@ pub fn start() -> anyhow::Result<bool> {
 pub fn stop() -> anyhow::Result<()> {
     let manager = manager(ServiceManagerAccess::CONNECT)?;
     let service = manager
-        .open_service(SERVICE_NAME, ServiceAccess::STOP | ServiceAccess::QUERY_STATUS)
+        .open_service(
+            SERVICE_NAME,
+            ServiceAccess::STOP | ServiceAccess::QUERY_STATUS,
+        )
         .with_context(|| format!("opening {SERVICE_NAME} (not installed?)"))?;
     stop_and_wait(&service)?;
     Ok(())
@@ -176,7 +184,9 @@ pub fn restart() -> anyhow::Result<()> {
     if service.query_status()?.current_state != ServiceState::Stopped {
         stop_and_wait(&service)?;
     }
-    service.start(&[] as &[OsString]).context("restarting the service")?;
+    service
+        .start(&[] as &[OsString])
+        .context("restarting the service")?;
     Ok(())
 }
 
@@ -324,8 +334,8 @@ fn service_main(_arguments: Vec<OsString>) {
     // The engine owns its tokio runtime; run it on a dedicated thread so the
     // service main can drive the stop handshake without blocking it.
     let engine_thread = std::thread::spawn(|| -> anyhow::Result<()> {
-        let runtime = tokio::runtime::Runtime::new()
-            .with_context(|| "failed to start the engine runtime")?;
+        let runtime =
+            tokio::runtime::Runtime::new().with_context(|| "failed to start the engine runtime")?;
         runtime.block_on(async {
             let engine = komet_engine::Engine::new(crate::engine_config_from_env());
             engine.run().await

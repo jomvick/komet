@@ -271,8 +271,8 @@ pub(crate) fn send_signal(pid: u32, signal: Signal) {
 #[cfg(windows)]
 pub(crate) fn send_signal(pid: u32, signal: Signal) {
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::System::Console::{GenerateConsoleCtrlEvent, CTRL_C_EVENT};
-    use windows_sys::Win32::System::Threading::{OpenProcess, TerminateProcess, PROCESS_TERMINATE};
+    use windows_sys::Win32::System::Console::{CTRL_C_EVENT, GenerateConsoleCtrlEvent};
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
 
     // SAFETY: we touch a pid we spawned and have not yet reaped. OpenProcess
     // with PROCESS_TERMINATE lets us both send a console Ctrl+C (when the

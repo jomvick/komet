@@ -12,8 +12,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde_json::Value;
 use komet_proto::{Model, ModelOption, ModelOptionChoice, ReasoningLevel};
+use serde_json::Value;
 
 /// Strip Cursor's effort-badge HTML from a model name and return the plain
 /// label plus the badge text when present.
@@ -575,8 +575,8 @@ pub(crate) fn effort_tokens(level: ReasoningLevel) -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
     use komet_proto::Model;
+    use serde_json::json;
 
     #[test]
     fn clean_label_strips_span_badges_without_duplicating() {

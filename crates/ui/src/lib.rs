@@ -77,8 +77,8 @@ fn register_fonts(cx: &App) {
     }
 }
 
-pub use state::EngineBootConfig;
 pub use komet_proto::HarnessId;
+pub use state::EngineBootConfig;
 
 /// Everything the headed binary passes in (config/env resolution lives in
 /// `apps/komet`, not here).

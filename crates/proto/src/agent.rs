@@ -350,7 +350,11 @@ pub struct ContextUsageStats {
 
 impl ContextUsageStats {
     pub fn new(context_limit: u64) -> Self {
-        let limit = if context_limit == 0 { 200_000 } else { context_limit };
+        let limit = if context_limit == 0 {
+            200_000
+        } else {
+            context_limit
+        };
         Self {
             input_tokens: 0,
             cached_input_tokens: 0,
@@ -383,7 +387,14 @@ impl ContextUsageStats {
     }
 
     /// Ingest a new usage event into the session's cumulative metrics.
-    pub fn ingest(&mut self, input: u64, cached: u64, output: u64, reasoning: u64, limit: Option<u64>) {
+    pub fn ingest(
+        &mut self,
+        input: u64,
+        cached: u64,
+        output: u64,
+        reasoning: u64,
+        limit: Option<u64>,
+    ) {
         if input > 0 {
             self.input_tokens = self.input_tokens.saturating_add(input);
         }
@@ -408,9 +419,13 @@ impl ContextUsageStats {
 /// Helper to estimate default context limits from model names.
 pub fn default_context_limit_for_model(model_name: &str) -> u64 {
     let lower = model_name.to_lowercase();
-    if lower.contains("gemini-1.5") || lower.contains("gemini-2.0") || lower.contains("gemini-2.5") {
+    if lower.contains("gemini-1.5") || lower.contains("gemini-2.0") || lower.contains("gemini-2.5")
+    {
         1_000_000
-    } else if lower.contains("claude-3-7") || lower.contains("claude-3-5") || lower.contains("claude-3") {
+    } else if lower.contains("claude-3-7")
+        || lower.contains("claude-3-5")
+        || lower.contains("claude-3")
+    {
         200_000
     } else if lower.contains("deepseek") {
         128_000
@@ -512,8 +527,14 @@ mod tests {
 
     #[test]
     fn default_context_limit_detection() {
-        assert_eq!(default_context_limit_for_model("claude-3-7-sonnet"), 200_000);
-        assert_eq!(default_context_limit_for_model("gemini-2.0-flash"), 1_000_000);
+        assert_eq!(
+            default_context_limit_for_model("claude-3-7-sonnet"),
+            200_000
+        );
+        assert_eq!(
+            default_context_limit_for_model("gemini-2.0-flash"),
+            1_000_000
+        );
         assert_eq!(default_context_limit_for_model("deepseek-v3"), 128_000);
         assert_eq!(default_context_limit_for_model("gpt-4o"), 128_000);
     }
