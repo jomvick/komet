@@ -13,7 +13,7 @@
 # client-id configuration needed. Overrides (if any) go in ~/.komet/env.
 set -eu
 
-BASE="${KOMET_BASE_URL:-https://github.com/jomvick/komet/releases/download/v1.0.0}"
+GITHUB="https://github.com/jomvick/komet/releases/latest/download"
 
 # --- platform ---------------------------------------------------------------
 os="$(uname -s)"
@@ -22,7 +22,7 @@ case "$os" in
   Linux) plat=linux ;;
   Darwin)
     echo "komet install: on macOS, download the desktop app instead:" >&2
-    echo "  $BASE/komet-1.0.0-macos-arm64.dmg" >&2
+    echo "  $GITHUB/komet-macos-arm64.dmg" >&2
     exit 1
     ;;
   *)
@@ -39,19 +39,35 @@ case "$arch" in
     ;;
 esac
 
-# --- download ----------------------------------------------------------------
-file="komet-1.0.0-$plat-$arch.tar.gz"
+# --- resolve version ---------------------------------------------------------
+# GitHub /releases/latest/download redirects to the latest tag's assets.
+# We resolve the final URL to extract the version for directory naming.
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+
+file="komet-$plat-$arch.tar.gz"
+url="$GITHUB/$file"
+
+echo "resolving latest komet version…"
+http_code=$(curl -fsSL -o "$tmp/$file" -w "%{http_code}" "$url" 2>/dev/null) || true
+
+if [ "$http_code" = "404" ] || [ ! -s "$tmp/$file" ]; then
+  echo "komet install: no release asset found for $plat-$arch" >&2
+  echo "  build from source instead — see README.md" >&2
+  exit 1
+fi
+
+# Extract version from tarball filename inside (first entry)
+ver="$(tar -tzf "$tmp/$file" 2>/dev/null | head -1 | sed 's|komet-\([^/]*\)/.*|\1|' || echo "latest")"
+
 data_root="$HOME/.komet"
 app_root="$data_root/app"
-dest="$app_root/1.0.0"
+dest="$app_root/$ver"
 
 if [ -x "$dest/komet" ]; then
-  echo "komet 1.0.0 already downloaded — relinking."
+  echo "komet $ver already downloaded — relinking."
 else
-  tmp="$(mktemp -d)"
-  trap 'rm -rf "$tmp"' EXIT
-  echo "downloading komet 1.0.0 ($plat-$arch)…"
-  curl -fSL --progress-bar "$BASE/$file" -o "$tmp/$file"
+  echo "installing komet $ver ($plat-$arch)…"
   mkdir -p "$dest"
   tar -xzf "$tmp/$file" -C "$dest" --strip-components=1
 fi
@@ -105,7 +121,7 @@ case ":$PATH:" in
 esac
 
 echo ""
-echo "✓ komet 1.0.0 installed$path_hint"
+echo "✓ komet $ver installed$path_hint"
 echo ""
 case "$service" in
   running)
