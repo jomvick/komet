@@ -7,7 +7,7 @@ Every device runs a small engine that stores sessions on that device. A new inst
 ## Install and run locally (Linux)
 
 ```bash
-curl -fsSL https://tinyurl.com/2acc4mgv | sh
+curl -fsSL https://raw.githubusercontent.com/jomvick/komet/main/edge/src/install.sh | sh
 komet status
 ```
 
