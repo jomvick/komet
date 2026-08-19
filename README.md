@@ -4,7 +4,9 @@ Control your coding agents (Claude Code, Codex, Cursor, Grok, Hermes, OpenCode, 
 
 Every device runs a small engine that stores sessions on that device. A new installation starts in local-only mode without an account or a network connection.
 
-## Install and run locally (Linux)
+## Install
+
+### Linux
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/jomvick/komet/main/edge/src/install.sh | sh
@@ -17,17 +19,16 @@ Day-to-day:
 
 ```bash
 komet status      # local/synced mode and engine status
-komet update      # update to the latest release
 komet daemon start|stop|restart|status
 ```
 
-## Install on macOS
+### macOS
 
-Download the `.dmg` from the [GitHub release](https://github.com/jomvick/komet/releases/tag/v1.0.0), or build from source and run `komet daemon install` to install the launchd service.
+Download the `.dmg` from the [latest release](https://github.com/jomvick/komet/releases/latest), or build from source and run `komet daemon install` to install the launchd service.
 
-## Install on Windows
+### Windows
 
-Download the latest `.msi` installer from the [GitHub release](https://github.com/jomvick/komet/releases/tag/v1.0.0) and run it — it installs `komet.exe` into `Program Files\Komet`, adds it to `PATH` and registers uninstall keys. A standalone `komet.exe` portable executable is also available in the release assets.
+Download the latest `.msi` installer from the [latest release](https://github.com/jomvick/komet/releases/latest) and run it — it installs `komet.exe` into `Program Files\Komet`, adds it to `PATH` and registers uninstall keys. A standalone portable executable is also available.
 
 The `Komet` Windows service (running as the logged-in user) is not registered by the installer; add it with:
 
@@ -44,36 +45,21 @@ sc create Komet binPath= "\"c:\Program Files\Komet\komet.exe\" --service"
 Day-to-day management:
 
 ```powershell
-komet daemon start
-komet daemon stop
-komet daemon restart
-komet daemon status
+komet daemon start|stop|restart|status
 ```
 
-## Install from source
-
-### Linux
+### From source
 
 ```bash
-# Fedora / RHEL
-sudo dnf install gcc g++ pkg-config wayland-devel libX11-devel libxkbcommon-devel fontconfig-devel
+# Linux dependencies
+# Fedora:  sudo dnf install gcc g++ pkg-config wayland-devel libX11-devel libxkbcommon-devel fontconfig-devel
+# Ubuntu:  sudo apt install gcc g++ pkg-config libwayland-dev libx11-dev libxkbcommon-dev libfontconfig-dev
+# Arch:    sudo pacman -S gcc pkg-config wayland libx11 libxkbcommon fontconfig
 
-# Ubuntu / Debian
-sudo apt install gcc g++ pkg-config libwayland-dev libx11-dev libxkbcommon-dev libfontconfig-dev
-
-# Arch
-sudo pacman -S gcc pkg-config wayland libx11 libxkbcommon fontconfig
-```
-
-You also need the [Rust stable toolchain](https://rustup.rs/):
-
-```bash
+# Rust toolchain
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-```
 
-Then:
-
-```bash
+# Build
 git clone https://github.com/jomvick/komet.git
 cd komet
 cargo build --release -p komet
