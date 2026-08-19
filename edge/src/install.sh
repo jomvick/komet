@@ -1,7 +1,7 @@
 #!/bin/sh
 # Komet (native) headless installer.
 #
-#   curl -fsSL https://komet.sh/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/jomvick/komet/main/edge/src/install.sh | sh
 #
 # Installs the self-contained native binary (no runtime deps) to
 # ~/.komet/app, puts `komet` on PATH, and runs it as a local-only
@@ -13,7 +13,7 @@
 # client-id configuration needed. Overrides (if any) go in ~/.komet/env.
 set -eu
 
-BASE="${KOMET_BASE_URL:-https://komet.sh}"
+BASE="${KOMET_BASE_URL:-https://github.com/jomvick/komet/releases/download/v1.0.0}"
 
 # --- platform ---------------------------------------------------------------
 os="$(uname -s)"
@@ -22,7 +22,7 @@ case "$os" in
   Linux) plat=linux ;;
   Darwin)
     echo "komet install: on macOS, download the desktop app instead:" >&2
-    echo "  $BASE/releases/latest.txt → $BASE/releases/komet-<version>-macos-arm64.dmg" >&2
+    echo "  $BASE/komet-1.0.0-macos-arm64.dmg" >&2
     exit 1
     ;;
   *)
@@ -40,20 +40,18 @@ case "$arch" in
 esac
 
 # --- download ----------------------------------------------------------------
-ver="$(curl -fsSL "$BASE/releases/latest.txt" | tr -d '[:space:]')"
-[ -n "$ver" ] || { echo "komet install: could not resolve latest version" >&2; exit 1; }
-file="komet-$ver-$plat-$arch.tar.gz"
+file="komet-1.0.0-$plat-$arch.tar.gz"
 data_root="$HOME/.komet"
 app_root="$data_root/app"
-dest="$app_root/$ver"
+dest="$app_root/1.0.0"
 
 if [ -x "$dest/komet" ]; then
-  echo "komet $ver already downloaded — relinking."
+  echo "komet 1.0.0 already downloaded — relinking."
 else
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT
-  echo "downloading komet $ver ($plat-$arch)…"
-  curl -fSL --progress-bar "$BASE/releases/$file" -o "$tmp/$file"
+  echo "downloading komet 1.0.0 ($plat-$arch)…"
+  curl -fSL --progress-bar "$BASE/$file" -o "$tmp/$file"
   mkdir -p "$dest"
   tar -xzf "$tmp/$file" -C "$dest" --strip-components=1
 fi
@@ -107,7 +105,7 @@ case ":$PATH:" in
 esac
 
 echo ""
-echo "✓ komet $ver installed$path_hint"
+echo "✓ komet 1.0.0 installed$path_hint"
 echo ""
 case "$service" in
   running)
