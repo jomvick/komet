@@ -4,51 +4,81 @@ Control your coding agents (Claude Code, Codex, Cursor, Grok, Hermes, OpenCode, 
 
 Every device runs a small engine that stores sessions on that device. A new installation starts in local-only mode without an account or a network connection.
 
-## Install and run locally (Linux)
+## Install from source (Linux)
+
+### 1. Install dependencies
 
 ```bash
-curl -fsSL https://komet.sh/install.sh | sh
-komet status
+# Fedora / RHEL
+sudo dnf install gcc g++ pkg-config wayland-devel libX11-devel libxkbcommon-devel fontconfig-devel
+
+# Ubuntu / Debian
+sudo apt install gcc g++ pkg-config libwayland-dev libx11-dev libxkbcommon-dev libfontconfig-dev
+
+# Arch
+sudo pacman -S gcc pkg-config wayland libx11 libxkbcommon fontconfig
 ```
 
-The installer starts the daemon immediately and keeps it running across reboots. No sign-in or sync configuration is required.
+You also need the [Rust stable toolchain](https://rustup.rs/):
 
-Prefer a portable build? Grab the `.AppImage` from the [GitHub release](https://github.com/jomvick/komet/releases), `chmod +x` it and run it — nothing is installed system-wide.
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+### 2. Build and install
+
+```bash
+git clone https://github.com/jomvick/komet.git
+cd komet
+cargo build --release -p komet
+
+# Install to ~/.local/bin
+mkdir -p ~/.local/bin
+cp target/release/komet ~/.local/bin/komet
+```
+
+Make sure `~/.local/bin` is on your `PATH`.
+
+### 3. Run
+
+```bash
+komet            # headed mode (opens the GUI)
+komet headless   # engine only (for remote control from another device)
+```
+
+The engine runs locally-first by default — no account, no network calls.
 
 Day-to-day:
 
 ```bash
 komet status      # local/synced mode and engine status
-komet update      # update to the latest release
+komet daemon install   # install as a systemd user service (Linux)
 komet daemon start|stop|restart|status
 ```
 
-## Multi-device sync (future)
+Prefer a portable build? Grab the `.AppImage` from the [GitHub release](https://github.com/jomvick/komet/releases), `chmod +x` it and run it — nothing is installed system-wide.
 
-Komet currently runs **100% locally**: no account, no login screen, no network
-calls. Every session, attachment and diff stays on the machine that created it.
+## Install on macOS
 
-Multi-device sync is part of the app's roadmap. The codebase already contains
-the building blocks — the `edge/` sync worker (Loro CRDT rooms, device relays,
-R2 attachments) and the WorkOS auth routes — but they are disabled by default.
-To enable sync later:
+Build from source following the same steps above (Xcode command-line tools provide the C toolchain; install Wayland/X11 deps via Homebrew if needed, or use the desktop app bundle when available).
 
-1. Deploy the `edge/` worker to your own Cloudflare account and create a WorkOS
-   AuthKit app (set the real client id in `edge/wrangler.jsonc`).
-2. Run the engine with `KOMET_WORKOS_CLIENT_ID=<your client id>`, and
-   `KOMET_EDGE_URL=<your edge host>` if you self-host instead of using the
-   default edge endpoint.
+Alternatively, install as a launchd service:
 
-With sync enabled you could start an agent on one device and follow or drive it
-from another; an always-on machine such as a VPS can keep those agents working
-after you close your laptop. Until then, `komet login` just reports
-"dev mode — there is nothing to sign in to" and the app never leaves the machine.
-
-On macOS: use the desktop release, or build `komet` from source and run `komet daemon install` to install the launchd service.
+```bash
+komet daemon install
+```
 
 ## Install on Windows
 
-Download the latest `.msi` installer from the [GitHub release](https://github.com/jomvick/komet/releases) and run it — it installs `komet.exe` into `Program Files\Komet`, adds it to `PATH` and registers uninstall keys. A standalone `komet.exe` portable executable is also available in the release assets.
+Build from source with the Rust toolchain installed:
+
+```powershell
+git clone https://github.com/jomvick/komet.git
+cd komet
+cargo build --release -p komet
+```
+
+Or download the latest `.msi` installer from the [GitHub release](https://github.com/jomvick/komet/releases) and run it — it installs `komet.exe` into `Program Files\Komet`, adds it to `PATH` and registers uninstall keys. A standalone `komet.exe` portable executable is also available in the release assets.
 
 The `Komet` Windows service (running as the logged-in user) is not registered by the installer; add it with:
 
@@ -71,12 +101,16 @@ komet daemon restart
 komet daemon status
 ```
 
-## Install and run locally (Linux)
+## Multi-device sync (future)
 
-```bash
-curl -fsSL https://komet.sh/install.sh | sh
-komet status
-```
+Komet currently runs **100% locally**: no account, no login screen, no network calls. Every session, attachment and diff stays on the machine that created it.
+
+Multi-device sync is part of the app's roadmap. The codebase already contains the building blocks — the `edge/` sync worker (Loro CRDT rooms, device relays, R2 attachments) and the WorkOS auth routes — but they are disabled by default. To enable sync later:
+
+1. Deploy the `edge/` worker to your own Cloudflare account and create a WorkOS AuthKit app (set the real client id in `edge/wrangler.jsonc`).
+2. Run the engine with `KOMET_WORKOS_CLIENT_ID=<your client id>`, and `KOMET_EDGE_URL=<your edge host>` if you self-host instead of using the default edge endpoint.
+
+With sync enabled you could start an agent on one device and follow or drive it from another; an always-on machine such as a VPS can keep those agents working after you close your laptop. Until then, `komet login` just reports "dev mode — there is nothing to sign in to" and the app never leaves the machine.
 
 ---
 
