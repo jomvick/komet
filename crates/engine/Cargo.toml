@@ -1,0 +1,45 @@
+[package]
+name = "komet-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+komet-proto.workspace = true
+komet-doc.workspace = true
+komet-sync.workspace = true
+komet-harness.workspace = true
+komet-rpc.workspace = true
+komet-update.workspace = true
+loro.workspace = true
+tokio.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rusqlite.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+notify.workspace = true
+portable-pty.workspace = true
+base64 = "0.22"
+libc.workspace = true
+gethostname.workspace = true
+tokio-util = { workspace = true, features = ["rt"] }
+sha2.workspace = true
+reqwest.workspace = true
+ignore.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio-tungstenite.workspace = true
+# In-process registry server for the two-engine workspace integration tests.
+komet-sync = { workspace = true, features = ["mock-server"] }
+
+[target.'cfg(windows)'.dependencies]
+# CredReadW / CredWriteW for the Windows Credential Manager fallback store.
+windows-sys = { version = "0.59", features = ["Win32_Security_Credentials", "Win32_Foundation"] }

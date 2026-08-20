@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Komet
+GenericName=Coding Agent Controller
+Comment=Multi-device controller for coding agents
+Exec=komet
+TryExec=komet
+Icon=komet
+Terminal=false
+Categories=Development;Utility;
+Keywords=agent;claude;codex;ai;coding;
+StartupWMClass=komet
