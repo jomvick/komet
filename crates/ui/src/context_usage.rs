@@ -4,13 +4,20 @@
 //! compaction limits, and token breakdowns (input, cached input, output, reasoning).
 
 use gpui::{
-    AnyElement, IntoElement, ParentElement, SharedString, Styled, div, hsla, prelude::*, px,
+    AnyElement, IntoElement, ParentElement, PathBuilder, SharedString, Styled, canvas, div, point,
+    hsla, px,
 };
 use komet_proto::{ContextUsageStats, format_tokens};
 
 use crate::theme::Theme;
 
+const RING_DIAMETER: f32 = 16.0;
+const RING_STROKE: f32 = 1.5;
+const RING_INNER_RADIUS: f32 = (RING_DIAMETER / 2.0) - RING_STROKE;
+
 /// Render the circular context usage ring indicator (trigger widget).
+/// Draws a proper progress arc ring using GPUI's canvas, starting at 12 o'clock
+/// and sweeping clockwise proportionally to the context ratio.
 pub fn render_context_ring(stats: &ContextUsageStats, theme: &Theme) -> AnyElement {
     let ratio = stats.context_ratio();
     let ring_color = if ratio >= 0.90 {
@@ -21,25 +28,49 @@ pub fn render_context_ring(stats: &ContextUsageStats, theme: &Theme) -> AnyEleme
         theme.text_muted
     };
 
-    let inner_size = (10.0 * ratio).max(2.0);
+    canvas(
+        move |_bounds, _window, _cx| (),
+        move |bounds, _, window, cx| {
+            let theme = Theme::of(cx);
+            let center_x = f32::from(bounds.origin.x) + f32::from(bounds.size.width) / 2.0;
+            let center_y = f32::from(bounds.origin.y) + f32::from(bounds.size.height) / 2.0;
+            let radius = RING_INNER_RADIUS;
 
-    div()
-        .id("context-usage-ring")
-        .size(px(16.0))
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded_full()
-        .border_1()
-        .border_color(theme.border)
-        .bg(theme.surface)
-        .child(
-            div()
-                .size(px(inner_size))
-                .rounded_full()
-                .bg(ring_color),
-        )
-        .into_any_element()
+            // Draw the ring track (full circle stroke)
+            let mut track_path = PathBuilder::stroke(px(RING_STROKE));
+            track_path.move_to(point(px(center_x + radius * 0.0), px(center_y + radius * -1.0)));
+            // Approximate full circle with 32 line segments
+            for i in 0..=32 {
+                let angle = std::f32::consts::PI * 2.0 * i as f32 / 32.0;
+                let x = center_x + radius * angle.cos();
+                let y = center_y + radius * angle.sin();
+                track_path.line_to(point(px(x), px(y)));
+            }
+            track_path.close();
+            if let Ok(built) = track_path.build() {
+                window.paint_path(built, theme.border);
+            }
+
+            // Draw the progress arc, starting at 12 o'clock (-90°) and sweeping clockwise
+            let mut progress_path = PathBuilder::stroke(px(RING_STROKE * 2.0));
+            let start_angle = -std::f32::consts::PI / 2.0; // 12 o'clock
+            let end_angle = start_angle + ratio * std::f32::consts::PI * 2.0;
+            let segments = 32;
+            progress_path.move_to(point(px(center_x + radius * start_angle.cos()), px(center_y + radius * start_angle.sin())));
+            for i in 1..=segments {
+                let t = i as f32 / segments as f32;
+                let angle = start_angle + (end_angle - start_angle) * t;
+                let x = center_x + radius * angle.cos();
+                let y = center_y + radius * angle.sin();
+                progress_path.line_to(point(px(x), px(y)));
+            }
+            if let Ok(built) = progress_path.build() {
+                window.paint_path(built, ring_color);
+            }
+        },
+    )
+    .size(px(RING_DIAMETER))
+    .into_any_element()
 }
 
 /// Render the detailed Context Popover matching the reference UI.
