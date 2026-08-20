@@ -1,0 +1,119 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/proto",
+    "crates/doc",
+    "crates/sync",
+    "crates/harness",
+    "crates/engine",
+    "crates/rpc",
+    "crates/update",
+    "crates/ui",
+    "crates/syntax",
+    "apps/komet",
+]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+komet-proto = { path = "crates/proto" }
+komet-doc = { path = "crates/doc" }
+komet-sync = { path = "crates/sync" }
+komet-harness = { path = "crates/harness" }
+komet-engine = { path = "crates/engine" }
+komet-rpc = { path = "crates/rpc" }
+komet-update = { path = "crates/update" }
+komet-ui = { path = "crates/ui" }
+komet-syntax = { path = "crates/syntax" }
+
+# CRDT
+loro = "1.13"
+# Wire protocol for the SessionRoom DO rooms — official Rust twin of the npm
+# `loro-protocol` package the TS edge speaks (same monorepo, byte-identical
+# frames, cross-checked by its js_snapshots tests).
+loro-protocol = "0.3"
+
+# gpui — the wingleeio/zed fork: upstream f14fea9 + commits on the fork's
+# `edge-fade-horizontal` branch (tip of `line-wrap-closing-punctuation`
+# + 5d1f83d horizontal per-pixel EdgeFade for quads/images; rebase when bumping the
+# upstream rev): a6bf17c fixes BOTH wrap-rule copies (LineWrapper +
+# line_layout's shaped-text duplicate); 14baea0 adds the EdgeFade primitive
+# (Window::with_edge_fade — per-primitive scroll-edge fades for the glass
+# sidebar); a6c1ad5 adds BackdropBlur + horizontal EdgeFade + glass fixes;
+# 9b672fa bounds renderer GPU memory (region-sized backdrop blur scratch,
+# idle release of blur/path intermediates, instance pool shrink,
+# KOMET_GPU_STATS=1 diagnostics); b687328 adds ImageSource::evict (frees
+# sprite-atlas tiles — remove_asset alone leaked them, see
+# attachments::flush_evicted); ac135eb adds device memory to the stats line;
+# f596cde fixes destination alpha on transparent windows (Porter-Duff OVER,
+# not additive); 53518c0 merges the edge-fade line: per-edge fade bands +
+# per-pixel EdgeFade for quads/images (true fade-into-glass), and
+# object-fit Cover cropping via atlas-tile UVs so image corner radii hold;
+# 8a8954c switches the macOS blurred view to UnderWindowBackground (macOS 26
+# stopped vending CABackdropLayer for Selection — window blur went dead).
+gpui = { git = "https://github.com/wingleeio/zed", rev = "5d1f83d9f27a19bec1fb241dc33b42238af9cf8d" }
+gpui_platform = { git = "https://github.com/wingleeio/zed", rev = "5d1f83d9f27a19bec1fb241dc33b42238af9cf8d", features = [
+    "wayland",
+    "x11",
+    "font-kit",
+    "runtime_shaders",
+] }
+gpui_tokio = { git = "https://github.com/wingleeio/zed", rev = "5d1f83d9f27a19bec1fb241dc33b42238af9cf8d" }
+
+# diffs
+similar = "2"
+
+# async / net
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+libc = "0.2"
+gethostname = "1"
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures = "0.3"
+async-trait = "0.1"
+
+# serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# storage
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# misc
+# Global allocator for the binaries: returns freed pages to the OS. System
+# malloc (macOS libmalloc especially) retains the churn high-water mark as
+# permanent RSS - measured as the top residency cause in docs/memory-plan.md.
+mimalloc = "0.1"
+anyhow = "1"
+tempfile = "3"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+chrono = { version = "0.4", features = ["serde"] }
+sha2 = "0.10"
+notify = "7"
+portable-pty = "0.8"
+alacritty_terminal = "0.26"
+pulldown-cmark = "0.12"
+unicode-segmentation = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+ignore = "0.4"
+
+[profile.release]
+# Distribution profile (scripts/package-linux.sh): thin LTO buys most of fat
+# LTO's size/speed win at a fraction of the link time; strip debug symbols.
+lto = "thin"
+strip = "symbols"
+
+[profile.dev]
+# gpui is slow unoptimized; match zed's approach for deps
+opt-level = 0
+
+[profile.dev.package."*"]
+opt-level = 2
