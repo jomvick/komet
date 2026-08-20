@@ -761,13 +761,14 @@ impl Pickers {
     }
 
     fn toggle(&mut self, kind: PickerKind, window: &mut Window, cx: &mut Context<Self>) {
-        // A press that found this picker open closes it — the card's
-        // `on_mouse_down_out` already began the close on that same press,
-        // so by click time the popup reads as closed and a plain toggle
-        // would reopen it. A press while a DIFFERENT picker is open doesn't
-        // count (see note_trigger_press_matching): that click switches.
+        // A press that found this picker open used to close it — but the
+        // trigger chip must stay clickable even while its popover is
+        // mounted. Clicking the active chip is now a no-op; the picker
+        // stays open and the user dismisses it by clicking outside or
+        // pressing Escape. A press while a DIFFERENT picker is open still
+        // switches (see note_trigger_press_matching).
         let pressed_open = self.open.take_press_was_open();
-        if self.open_kind() == Some(kind) || pressed_open {
+        if self.open_kind() == Some(kind) && !pressed_open {
             self.animate_close(cx);
             cx.notify();
             return;
@@ -2293,11 +2294,59 @@ impl Pickers {
                     SharedString::from(label),
                     &theme,
                 ));
+
+            // Context usage ring (interactive — opens the usage popover).
+            let closing = self.open.closing_since();
+            let context_stats = self.state.read(cx).current_context_usage();
+            let is_context_open = self.open_kind() == Some(PickerKind::ContextUsage);
+            let context_chip = div()
+                .id("context-usage-ring")
+                .flex()
+                .items_center()
+                .justify_center()
+                .px(px(4.0))
+                .py(px(2.0))
+                .rounded_lg()
+                .cursor_pointer()
+                .hover(|s| s.bg(theme.element_hover))
+                .when(is_context_open, |s| s.bg(theme.element_active))
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(|this, _, window, cx| {
+                        this.toggle(PickerKind::ContextUsage, window, cx);
+                    }),
+                )
+                .child(crate::context_usage::render_context_ring(
+                    &context_stats,
+                    &theme,
+                ));
+            let mut overlay: Option<(PickerKind, AnyElement)> =
+                if self.mounted_kind() == Some(PickerKind::ContextUsage) {
+                    let stats = self.state.read(cx).current_context_usage();
+                    let popover_theme = Theme::of(cx).clone();
+                    let content =
+                        crate::context_usage::render_context_popover(&stats, &popover_theme);
+                    Some((
+                        PickerKind::ContextUsage,
+                        self.popover_frame_flush(290.0, content, cx),
+                    ))
+                } else {
+                    None
+                };
+
             let right = div()
                 .flex()
                 .flex_row()
                 .items_center()
                 .min_w_0()
+                .gap(px(4.0))
+                .child(attach_overlay_end(
+                    context_chip,
+                    &mut overlay,
+                    PickerKind::ContextUsage,
+                    "context-popover",
+                    closing,
+                ))
                 .child(Self::footer_label(
                     crate::icons::GIT_BRANCH,
                     chat.branch
@@ -2327,6 +2376,16 @@ impl Pickers {
                 let content = self.render_checkout_popover(cx);
                 Some((PickerKind::Checkout, self.popover_frame(224.0, content, cx)))
             }
+            Some(PickerKind::ContextUsage) => {
+                let stats = self.state.read(cx).current_context_usage();
+                let popover_theme = Theme::of(cx).clone();
+                let content =
+                    crate::context_usage::render_context_popover(&stats, &popover_theme);
+                Some((
+                    PickerKind::ContextUsage,
+                    self.popover_frame_flush(290.0, content, cx),
+                ))
+            }
             // Space/Device popovers mount on the canvas selectors
             // (`render_target_selectors`), not here.
             _ => None,
@@ -2353,6 +2412,30 @@ impl Pickers {
             &theme,
             cx,
         );
+        // Context usage ring (interactive — opens the usage popover).
+        let context_stats = self.state.read(cx).current_context_usage();
+        let is_context_open = self.open_kind() == Some(PickerKind::ContextUsage);
+        let context_chip = div()
+            .id("context-usage-ring")
+            .flex()
+            .items_center()
+            .justify_center()
+            .px(px(4.0))
+            .py(px(2.0))
+            .rounded_lg()
+            .cursor_pointer()
+            .hover(|s| s.bg(theme.element_hover))
+            .when(is_context_open, |s| s.bg(theme.element_active))
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, window, cx| {
+                    this.toggle(PickerKind::ContextUsage, window, cx);
+                }),
+            )
+            .child(crate::context_usage::render_context_ring(
+                &context_stats,
+                &theme,
+            ));
         // Checkout on the left edge, ref on the right — the row's
         // justify_between splits them (user request).
         let left = div()
@@ -2372,6 +2455,14 @@ impl Pickers {
             .flex_row()
             .items_center()
             .min_w_0()
+            .gap(px(4.0))
+            .child(attach_overlay_end(
+                context_chip,
+                &mut overlay,
+                PickerKind::ContextUsage,
+                "context-popover",
+                closing,
+            ))
             .child(attach_overlay_end(
                 ref_chip,
                 &mut overlay,
@@ -3520,7 +3611,8 @@ impl Render for Pickers {
             Some(PickerKind::Branch)
             | Some(PickerKind::Checkout)
             | Some(PickerKind::Space)
-            | Some(PickerKind::Device) => None,
+            | Some(PickerKind::Device)
+            | Some(PickerKind::ContextUsage) => None,
             Some(PickerKind::HarnessModel) => {
                 let content = self.render_harness_model_popover(cx);
                 Some((
@@ -3539,23 +3631,15 @@ impl Render for Pickers {
                     self.popover_frame_flush(240.0, content, cx),
                 ))
             }
-            Some(PickerKind::ContextUsage) => {
-                let stats = self.state.read(cx).current_context_usage();
-                let theme = Theme::of(cx).clone();
-                let content = crate::context_usage::render_context_popover(&stats, &theme);
-                Some((
-                    PickerKind::ContextUsage,
-                    self.popover_frame_flush(290.0, content, cx),
-                ))
-            }
+            // ContextUsage popover mounts on the footer's context chip.
             None => None,
         };
 
         // Left cluster: empty — the device/project pickers live in the
         // composer FOOTER row alongside checkout + ref.
-        // Right cluster: agent+model, traits, and context usage circle — the composer appends
+        // Right cluster: agent+model and traits — the composer appends
         // attach + send after this element (komet composer-actions.tsx
-        // arrangement).
+        // arrangement). The context usage ring lives in the footer.
         let left = div()
             .flex()
             .flex_row()
@@ -3593,30 +3677,6 @@ impl Render for Pickers {
                 cx,
             )
         });
-        let context_stats = self.state.read(cx).current_context_usage();
-        let is_context_open = self.open_kind() == Some(PickerKind::ContextUsage);
-        let context_chip = div()
-            .id("context-usage-chip")
-            .flex()
-            .items_center()
-            .justify_center()
-            .px(px(6.0))
-            .py(px(4.0))
-            .rounded_lg()
-            .cursor_pointer()
-            .hover(|s| s.bg(theme.element_hover))
-            .when(is_context_open, |s| s.bg(theme.element_active))
-            .on_mouse_down(
-                gpui::MouseButton::Left,
-                cx.listener(|this, _, window, cx| {
-                    this.toggle(PickerKind::ContextUsage, window, cx);
-                }),
-            )
-            .child(crate::context_usage::render_context_ring(
-                &context_stats,
-                &theme,
-            ));
-
         let right = div()
             .flex()
             .flex_row()
@@ -3640,14 +3700,7 @@ impl Render for Pickers {
                     "traits-popover",
                     closing,
                 )
-            }))
-            .child(attach_overlay_end(
-                context_chip,
-                &mut overlay,
-                PickerKind::ContextUsage,
-                "context-popover",
-                closing,
-            ));
+            }));
         div()
             .w_full()
             .min_w_0()

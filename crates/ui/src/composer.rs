@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 use gpui::{
     AnyTooltip, App, BorderStyle, Bounds, ClipboardEntry, ClipboardItem, Context, CursorStyle,
     DispatchPhase, ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle,
-    Focusable, GlobalElementId, KeyBinding, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent,
+    Focusable, GlobalElementId, InteractiveElement, KeyBinding, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, ObjectFit, PaintQuad, PathPromptOptions, Pixels, Point,
     ScrollWheelEvent, SharedString, Style, StyledImage as _, Subscription, Task, TextRun,
     TextStyle, UTF16Selection, UnderlineStyle, Window, WrappedLine, actions, div, fill, img, point,
@@ -5538,6 +5538,28 @@ impl Render for Composer {
                         .pt(px(4.0))
                         .pb(px(10.0))
                         .child(div().flex_1().min_w_0().child(self.pickers.clone()))
+                        .child(
+                            div()
+                                .id("composer-access-mode")
+                                .flex_none()
+                                .text_size(px(12.0))
+                                .text_color(theme.text_muted)
+                                .cursor_pointer()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    let next = match this.state.read(cx).access_mode {
+                                        komet_proto::AccessMode::FullAccess => komet_proto::AccessMode::ReadOnly,
+                                        komet_proto::AccessMode::ReadOnly => komet_proto::AccessMode::Sandboxed,
+                                        komet_proto::AccessMode::Sandboxed => komet_proto::AccessMode::FullAccess,
+                                    };
+                                    this.state.update(cx, |state, _| state.access_mode = next);
+                                    cx.notify();
+                                }))
+                                .child(match self.state.read(cx).access_mode {
+                                    komet_proto::AccessMode::FullAccess => "Full access",
+                                    komet_proto::AccessMode::ReadOnly => "Read only",
+                                    komet_proto::AccessMode::Sandboxed => "Sandboxed",
+                                })
+                        )
                         .child(attach)
                         .child(send_button),
                 )
@@ -5592,6 +5614,28 @@ impl Render for Composer {
                                 .relative()
                                 .top(px(-cluster_dy))
                                 .child(div().flex_none().child(self.pickers.clone()))
+                                .child(
+                                    div()
+                                        .id("composer-access-mode")
+                                        .flex_none()
+                                        .text_size(px(12.0))
+                                        .text_color(theme.text_muted)
+                                        .cursor_pointer()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            let next = match this.state.read(cx).access_mode {
+                                                komet_proto::AccessMode::FullAccess => komet_proto::AccessMode::ReadOnly,
+                                                komet_proto::AccessMode::ReadOnly => komet_proto::AccessMode::Sandboxed,
+                                                komet_proto::AccessMode::Sandboxed => komet_proto::AccessMode::FullAccess,
+                                            };
+                                            this.state.update(cx, |state, _| state.access_mode = next);
+                                            cx.notify();
+                                        }))
+                                        .child(match self.state.read(cx).access_mode {
+                                            komet_proto::AccessMode::FullAccess => "Full access",
+                                            komet_proto::AccessMode::ReadOnly => "Read only",
+                                            komet_proto::AccessMode::Sandboxed => "Sandboxed",
+                                        })
+                                )
                                 .child(attach)
                                 .child(send_button),
                         ),

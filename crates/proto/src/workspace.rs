@@ -22,6 +22,32 @@ pub struct EngineInfo {
     pub workspace_scope: WorkspaceScope,
 }
 
+/// Mode d'accès utilisateur partagé entre le démon et l'interface cliente.
+///
+/// - `FullAccess` : Tous les contrôleurs sont autorisés.
+/// - `ReadOnly` : Lecture seule, pas de modifications.
+/// - `Sandboxed` : Environnement isolé avec restrictions.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum AccessMode {
+    FullAccess,
+    ReadOnly,
+    Sandboxed,
+}
+
+/// État global du workspace partagé entre le démon et l'interface cliente.
+///
+/// Ce struct est synchronisé via le canal IPC (Unix socket / WebSocket)
+/// et reflété dans l'interface GPUI via le contexte global.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceState {
+    pub project_name: String,
+    pub environment: String,
+    pub git_branch: String,
+    pub access_mode: AccessMode,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

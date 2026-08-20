@@ -13,3 +13,4 @@ pub mod workspace;
 pub use agent::*;
 pub use entities::*;
 pub use workspace::*;
+pub use workspace::{AccessMode, WorkspaceState};
