@@ -6,18 +6,77 @@
 //! longer read or written.
 
 use super::*;
+use crate::settings::RememberedNavigation;
 
 impl Shell {
-    /// Boot landing: the most recently active visible chat once the first
-    /// chats frame has synced (manual selection wins; no chats → the
-    /// new-session canvas shows).
+    /// Boot landing: remembered navigation per device (waku parity) takes
+    /// priority when the referenced session/project still exists; otherwise
+    /// falls back to the most recently active visible chat.
     pub(super) fn boot_select_chat(&mut self, cx: &mut Context<Self>) {
-        let first = {
+        let should_run = {
             let state = self.state.read(cx);
-            if !state.chats_synced || state.selected_chat.is_some() || state.auto_selected {
-                return;
+            state.chats_synced && state.selected_chat.is_none() && !state.auto_selected
+        };
+        if !should_run {
+            return;
+        }
+
+        // Try remembered navigation for the current device (pruned like open_tabs).
+        let device_id = self.state.read(cx).local_device_id.clone();
+        if let Some(device_id) = device_id {
+            if let Some(nav) = self.settings.last_session_by_device.get(&device_id).cloned() {
+                match nav {
+                    RememberedNavigation::Session { id } => {
+                        let (exists, space_ok) = {
+                            let state = self.state.read(cx);
+                            let chat = state.chats.iter().find(|c| c.id == id);
+                            let exists = chat.is_some_and(|c| !c.archived);
+                            let space_ok = match chat.and_then(|c| c.space_id.as_deref()) {
+                                Some(sid) => state.space_row(sid).is_some(),
+                                None => true,
+                            };
+                            (exists, space_ok)
+                        };
+                        if exists && space_ok {
+                            self.state
+                                .update(cx, |s, cx| s.select_chat(Some(id.clone()), cx));
+                            return;
+                        }
+                        // Stale session -> prune and fall through to recency.
+                        self.settings.last_session_by_device.remove(&device_id);
+                        self.schedule_save(cx);
+                    }
+                    RememberedNavigation::NewTask { project_id } => {
+                        let valid = match &project_id {
+                            None => true,
+                            Some(pid) => self.state.read(cx).space_row(pid).is_some(),
+                        };
+                        if valid {
+                            self.state.update(cx, |s, cx| {
+                                s.select_space(project_id.clone(), cx);
+                                // Ensure we stay on the new-task canvas.
+                                if s.selected_chat.is_some() {
+                                    s.select_chat(None, cx);
+                                } else {
+                                    // select_chat(None) is a no-op if already None (keeps auto_selected false),
+                                    // so set it explicitly to prevent recency fallback on next call.
+                                    s.auto_selected = true;
+                                }
+                                cx.notify();
+                            });
+                            return;
+                        }
+                        self.settings.last_session_by_device.remove(&device_id);
+                        self.schedule_save(cx);
+                    }
+                }
             }
-            state
+        }
+
+        // Fallback: most recently active visible chat (recency).
+        let first = {
+            self.state
+                .read(cx)
                 .overview_chats(Utc::now())
                 .first()
                 .map(|(_, c)| c.id.clone())
@@ -119,8 +178,7 @@ impl Shell {
         // entity; expand + close shell-side). It lives up here because the
         // titlebar overlay owns this band's hit-testing: controls mounted in
         // the pane itself would sit under the drag region and never see a
-        // click. Closed, it is just the stable open/close toggle. Hidden on
-        // the new-session canvas (user request) — nothing to diff yet.
+        // click. Closed, it is just the stable open/close toggle.
         let takeover = !on_canvas && self.right_pane_open(cx) && self.right_pane_expanded;
         // In takeover the title hides and the strip owns the whole band, so
         // the row's left inset pulls back to the sidebar seam — the title
@@ -146,9 +204,7 @@ impl Shell {
         } else {
             content_left
         };
-        let trailing: Option<gpui::AnyElement> = if on_canvas {
-            None
-        } else if self.right_pane_open(cx) {
+        let trailing: Option<gpui::AnyElement> = if self.right_pane_open(cx) {
             let right_now = self.eval_tween(self.right_tween, self.right_target(cx));
             let pr = titlebar_right_padding(cfg!(target_os = "windows"), Theme::SPACE_LG);
             // The row's own left padding is part of its content box: a strip

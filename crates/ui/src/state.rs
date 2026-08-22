@@ -1312,6 +1312,18 @@ impl AppState {
         })
         .detach();
     }
+
+    // ---- file editor helpers ----
+
+    /// Read a file's text content from the local filesystem.
+    pub fn load_file_content(&self, path: &str) -> Result<String, String> {
+        std::fs::read_to_string(path).map_err(|e| e.to_string())
+    }
+
+    /// Write text content to a file on the local filesystem.
+    pub fn save_file_content(&self, path: &str, content: &str) -> Result<(), String> {
+        std::fs::write(path, content).map_err(|e| e.to_string())
+    }
 }
 
 /// Observe assembly after an early attach (cloud onboarding or another viewport

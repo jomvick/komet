@@ -5,10 +5,23 @@
 //! Corrupt or missing files fall back to defaults; loaded values are clamped so a
 //! hand-edited file can't wedge the layout.
 
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+
+/// Last visited location per device (waku parity: `navigation-memory.ts`).
+/// Persisted in `ui-settings.json` as `lastSessionByDevice`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RememberedNavigation {
+    Session { id: String },
+    NewTask {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        project_id: Option<String>,
+    },
+}
 
 pub mod accounts;
 pub mod appearance;
@@ -55,6 +68,10 @@ pub struct UiSettings {
     /// also the new-tab default when the sidebar filter is "All".
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_space_id: Option<String>,
+    /// Last navigation per device (device id -> session or new-task).
+    /// Pruned against existing chats/spaces like `open_tabs` (see `Shell::prune_remembered_navigation`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub last_session_by_device: HashMap<String, RememberedNavigation>,
     /// Open session tabs in visual order (drag-reorder edits in place).
     /// Device-local: a tab is a local viewport onto the synced session list —
     /// closing one never archives the session. Ids of archived/deleted chats
@@ -103,6 +120,7 @@ impl Default for UiSettings {
             sidebar_collapsed: false,
             sidebar_grouped: false,
             last_space_id: None,
+            last_session_by_device: HashMap::new(),
             open_tabs: None,
             space_filter: None,
             tab_order: std::collections::HashMap::new(),
@@ -368,6 +386,20 @@ mod tests {
             sidebar_collapsed: true,
             sidebar_grouped: true,
             last_space_id: Some("space-1".into()),
+            last_session_by_device: HashMap::from([
+                (
+                    "device-1".to_string(),
+                    RememberedNavigation::Session {
+                        id: "sess-1".into(),
+                    },
+                ),
+                (
+                    "device-2".to_string(),
+                    RememberedNavigation::NewTask {
+                        project_id: Some("space-1".into()),
+                    },
+                ),
+            ]),
             open_tabs: Some(vec!["b".to_string(), "a".to_string()]),
             space_filter: Some("space-1".into()),
             tab_order: std::collections::HashMap::from([(

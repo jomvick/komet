@@ -9,16 +9,16 @@
 //! are paint-local and never move surrounding layout. Reduced motion snaps every
 //! cell to its rest state automatically (gpui `reduce_motion`).
 
-use gpui::{AnyElement, App, EntityId, IntoElement, ParentElement, SharedString, Styled, div, px};
 use crate::icons;
+use gpui::{AnyElement, App, EntityId, IntoElement, ParentElement, SharedString, Styled, div, px};
 
-use crate::motion::{self, GRADIENT_SPIN, PULSE_STAGGER, SPLASH_OUT, KOMET_PULSE};
+use crate::motion::{self, GRADIENT_SPIN, KOMET_PULSE, PULSE_STAGGER, SPLASH_OUT};
 use crate::theme::Theme;
 
 // Shared with the terminal viewport (`komet_proto::motion`) so both animate the
 // same loaders from the same numbers.
 pub use komet_proto::motion::{
-    MARK_CELLS, MARK_SPREAD, MATRIX_SIDE, KOMET_CELLS, mark_cell_stagger,
+    KOMET_CELLS, MARK_CELLS, MARK_SPREAD, MATRIX_SIDE, mark_cell_stagger,
 };
 
 /// The animated komet mark (komet-loader.tsx `KometLoader`): the full logo
@@ -114,10 +114,7 @@ pub use komet_proto::motion::{GSPIN_DIM, GSPIN_ROW_TINTS};
 pub use crate::thinking_orbs::{Dot, Line, OrbFrame, OrbState, ThinkingOrb, thinking_orb};
 
 /// Inline mini thinking orb for status-dot / session row slots.
-pub fn mini_thinking_orb(
-    state: OrbState,
-    size_px: f32,
-) -> ThinkingOrb {
+pub fn mini_thinking_orb(state: OrbState, size_px: f32) -> ThinkingOrb {
     ThinkingOrb::new(state, size_px)
 }
 

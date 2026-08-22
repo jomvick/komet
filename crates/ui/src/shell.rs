@@ -28,7 +28,8 @@ use komet_rpc::methods;
 
 use crate::changes::{Changes, ChangesEvent};
 use crate::composer::{Composer, ComposerEvent, ComposerInput, ComposerInputEvent};
-use crate::files::FilesPanel;
+use crate::file_editor::FileEditorPanel;
+use crate::files::{FilesPanel, FilesPanelEvent};
 use crate::icons::{self, icon};
 use crate::loaders;
 use crate::motion::{self, AnimationExt as _, MotionSpec, RESIZE, SPLASH_OUT, TAB_SLIDE};
@@ -42,8 +43,9 @@ use crate::settings::harnesses::HarnessesPage;
 use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
 use crate::settings::{
-    KeymapConfig, RIGHT_PANE_DEFAULT, RIGHT_PANE_MAX, RIGHT_PANE_MIN, SAVE_DEBOUNCE_MS,
-    SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, TERMINAL_DEFAULT_HEIGHT, UiSettings, platform_combo,
+    KeymapConfig, RememberedNavigation, RIGHT_PANE_DEFAULT, RIGHT_PANE_MAX, RIGHT_PANE_MIN,
+    SAVE_DEBOUNCE_MS, SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, TERMINAL_DEFAULT_HEIGHT,
+    UiSettings, platform_combo,
 };
 use crate::state::{
     AppState, ConnectionStatus, EngineBootConfig, EngineMode, GatePhase, Indicator, OrgRow,
@@ -52,6 +54,12 @@ use crate::state::{
 use crate::terminal::panel::{TerminalPanel, ToggleTerminal, clamp_terminal_height};
 use crate::theme::Theme;
 use crate::transcript::{self, Transcript};
+
+/// Wider floor for the right pane while it shows the Files+FileEditor split
+/// (tree column + content column side by side) — below this the content
+/// column left after the fixed-width tree is too narrow to read. See
+/// `Shell::right_target`/`files_split_active`.
+const SPLIT_RIGHT_PANE_MIN: f32 = 560.0;
 
 mod spaces;
 mod tabs;
@@ -120,6 +128,7 @@ pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
     }
     cx.clear_key_bindings();
     crate::composer::init(cx);
+    crate::file_editor::init(cx);
     // Fixed app-level shortcuts (⌘Q quit, ⌘W close, ⌘M minimize, ⌘H hide) —
     // these back the native menu key equivalents and must survive keymap
     // re-application.
@@ -209,6 +218,7 @@ pub enum RightSurface {
     Diff(u64),
     Terminal(u64),
     Files(u64),
+    FileEditor(u64),
 }
 
 /// Per-chat panel open flags (komet parity: `sessionPanels` — the terminal and
@@ -783,7 +793,11 @@ pub struct Shell {
     diff_seq: u64,
     /// Files explorer surfaces by id (interactive project tree).
     files: std::collections::HashMap<u64, Entity<FilesPanel>>,
+    files_subs: std::collections::HashMap<u64, Subscription>,
     files_seq: u64,
+    /// File editor surfaces by id (opened file contents with dirty tracking).
+    file_editors: std::collections::HashMap<u64, Entity<FileEditorPanel>>,
+    file_editor_seq: u64,
     /// Ordered surface tabs per panel key (drag-reorderable; stale entries —
     /// closed terminals/diffs — are skipped at read time).
     right_tabs: std::collections::HashMap<String, Vec<RightSurface>>,
@@ -1027,7 +1041,10 @@ impl Shell {
             diff_subs: std::collections::HashMap::new(),
             diff_seq: 0,
             files: std::collections::HashMap::new(),
+            files_subs: std::collections::HashMap::new(),
             files_seq: 0,
+            file_editors: std::collections::HashMap::new(),
+            file_editor_seq: 0,
             right_tabs: std::collections::HashMap::new(),
             right_tab_drag: None,
             right_tab_scroll: gpui::ScrollHandle::new(),
@@ -1265,6 +1282,14 @@ impl Shell {
         // Boot landing: the most recent session once the first chats frame
         // syncs (manual selection wins).
         self.boot_select_chat(cx);
+        // Prune stale remembered destinations (like open_tabs pruning).
+        if self.prune_remembered_navigation(cx) {
+            self.schedule_save(cx);
+        }
+        // Keep NewTask remembered project in sync while staying on the canvas.
+        if self.active_chat.is_empty() {
+            self.remember_current_navigation(cx);
+        }
         // Heal a dangling sidebar filter (space deleted, possibly elsewhere):
         // fall back to "All" rather than filtering everything out.
         if state.read(cx).spaces_synced
@@ -1304,6 +1329,7 @@ impl Shell {
             {
                 changes.update(cx, |changes, cx| changes.ensure_content(cx));
             }
+            self.remember_current_navigation(cx);
         }
         match state.read(cx).connection {
             ConnectionStatus::Ready => {
@@ -1365,11 +1391,13 @@ impl Shell {
 
     /// Whether the right pane shows. NOT gated on git any more: the pane is
     /// a surface HOST now (terminals work in any space), so only the Git
-    /// surface rows check `space_git_detected`. Still hidden on the
-    /// new-session canvas, where the titlebar carries no toggle to close it
-    /// again (an earlier user request).
+    /// surface rows check `space_git_detected`. Also available on the
+    /// new-session canvas now (user request, reversing an earlier one) —
+    /// `panel_key` already keys canvas state under `space-canvas:{id}`, so
+    /// per-panel storage (tabs, changes_open, right_active) works
+    /// identically whether or not a chat is active.
     fn right_pane_open(&self, cx: &App) -> bool {
-        !self.active_chat.is_empty() && self.panels.get(&self.panel_key(cx)).changes_open
+        self.panels.get(&self.panel_key(cx)).changes_open
     }
 
     /// The current chat's terminal flag (per-session, in-memory).
@@ -1387,8 +1415,33 @@ impl Shell {
             let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
             (self.viewport_width - sidebar_now).max(RIGHT_PANE_MIN)
         } else {
-            self.settings.right_pane_width
+            // The Files+FileEditor split (render_right_pane) spends a fixed
+            // 220px on the tree column; below SPLIT_RIGHT_PANE_MIN total, the
+            // remaining content column is too narrow to read (user report:
+            // truncated/wrapped-to-nothing file preview). Only the split
+            // needs the wider floor — Diff/Terminal/a lone FileEditor stay at
+            // the normal minimum, and a user's wider manual resize always wins
+            // via `.max`.
+            let min = if self.files_split_active(cx) {
+                SPLIT_RIGHT_PANE_MIN
+            } else {
+                RIGHT_PANE_MIN
+            };
+            self.settings.right_pane_width.max(min)
         }
+    }
+
+    /// Whether `render_right_pane` will draw the tree+content split for the
+    /// panel key ~as `right_target` sees it: a Files surface tab exists
+    /// alongside whichever surface is active, and that active surface isn't
+    /// the tree itself (matches the `files_panel` condition in
+    /// `render_right_pane` by construction, not a duplicated match).
+    fn files_split_active(&self, cx: &App) -> bool {
+        !matches!(self.resolved_right_active(cx), RightSurface::Files(_))
+            && self
+                .right_surface_rows(cx)
+                .iter()
+                .any(|(s, _)| matches!(s, RightSurface::Files(_)))
     }
 
     fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
@@ -1457,6 +1510,10 @@ impl Shell {
                     .files
                     .get(id)
                     .map(|files| (*surface, files.read(cx).tab_title())),
+                RightSurface::FileEditor(id) => self
+                    .file_editors
+                    .get(id)
+                    .map(|editor| (*surface, editor.read(cx).tab_title())),
                 RightSurface::Terminal(tab) => terminals
                     .iter()
                     .find(|(k, _, _)| k == tab)
@@ -1540,6 +1597,11 @@ impl Shell {
                     files.update(cx, |files, cx| files.ensure_root(cx));
                 }
             }
+            RightSurface::FileEditor(id) => {
+                if let Some(editor) = self.file_editors.get(&id).cloned() {
+                    editor.update(cx, |editor, cx| editor.ensure_content(cx));
+                }
+            }
             RightSurface::Picker => {}
         }
         cx.notify();
@@ -1548,16 +1610,77 @@ impl Shell {
     /// The picker's Files card / the `+` menu's Files row: opens a project
     /// file tree explorer surface tab.
     fn add_files_surface(&mut self, cx: &mut Context<Self>) {
+        if let Some((surface, _)) = self.right_surface_rows(cx).into_iter().find(|(s, _)| matches!(s, RightSurface::Files(_))) {
+            self.set_right_active(surface, cx);
+            return;
+        }
         let files = cx.new(|cx| FilesPanel::new(self.state.clone(), cx));
         self.files_seq += 1;
         let id = self.files_seq;
+        let sub = cx.subscribe(&files, move |this: &mut Self, _, event, cx| match event {
+            FilesPanelEvent::OpenFile(path) => {
+                this.open_file_in_panel(path.clone(), cx);
+            }
+        });
         self.files.insert(id, files);
+        self.files_subs.insert(id, sub);
         let key = self.panel_key(cx);
         self.right_tabs
             .entry(key)
             .or_default()
             .push(RightSurface::Files(id));
         self.set_right_active(RightSurface::Files(id), cx);
+    }
+
+    /// Open a file in the right panel with VS Code-style preview tab behavior:
+    /// - If the file is already open in a FileEditor tab, switch to it.
+    /// - If the active tab is a non-dirty FileEditor, reuse it for the new file.
+    /// - Otherwise, open a new FileEditor tab.
+    fn open_file_in_panel(&mut self, path: String, cx: &mut Context<Self>) {
+        let key = self.panel_key(cx);
+
+        // Check if this file is already open in any non-dirty FileEditor tab.
+        if let Some(existing_id) = self.file_editors.iter().find_map(|(id, editor)| {
+            if editor.read(cx).file_path() == path && !editor.read(cx).is_dirty() {
+                Some(*id)
+            } else {
+                None
+            }
+        }) {
+            // Switch to the existing tab.
+            self.set_right_active(RightSurface::FileEditor(existing_id), cx);
+            // Update the editor's content to the requested file.
+            if let Some(editor) = self.file_editors.get(&existing_id) {
+                editor.update(cx, |editor, cx| {
+                    editor.load_file(path, cx);
+                });
+            }
+            return;
+        }
+
+        // If the active tab is a non-dirty preview FileEditor, reuse it.
+        let active = self.resolved_right_active(cx);
+        if let RightSurface::FileEditor(active_id) = active {
+            if let Some(editor) = self.file_editors.get(&active_id) {
+                if !editor.read(cx).is_dirty() && !editor.read(cx).is_pinned() {
+                    editor.update(cx, |editor, cx| {
+                        editor.load_file(path, cx);
+                    });
+                    return;
+                }
+            }
+        }
+
+        // Otherwise, open a new FileEditor tab.
+        let editor = cx.new(|cx| FileEditorPanel::new(self.state.clone(), path.clone(), cx));
+        self.file_editor_seq += 1;
+        let id = self.file_editor_seq;
+        self.file_editors.insert(id, editor);
+        self.right_tabs
+            .entry(key)
+            .or_default()
+            .push(RightSurface::FileEditor(id));
+        self.set_right_active(RightSurface::FileEditor(id), cx);
     }
 
     /// The picker's Git card / the `+` menu's Diff row: every click opens a
@@ -1635,6 +1758,10 @@ impl Shell {
             }
             RightSurface::Files(id) => {
                 self.files.remove(&id);
+                self.files_subs.remove(&id);
+            }
+            RightSurface::FileEditor(id) => {
+                self.file_editors.remove(&id);
             }
             RightSurface::Terminal(tab) => {
                 let panel = self.right_terminal_panel(cx);
@@ -1780,6 +1907,65 @@ impl Shell {
                 })
                 .await;
         }));
+    }
+
+    /// Record the current navigation for the active device (session or new-task).
+    fn remember_current_navigation(&mut self, cx: &mut Context<Self>) {
+        let Some(device_id) = self.state.read(cx).local_device_id.clone() else {
+            return;
+        };
+        let nav = if self.active_chat.is_empty() {
+            let state = self.state.read(cx);
+            let project_id = if state.no_project {
+                None
+            } else {
+                state.selected_space.clone()
+            };
+            RememberedNavigation::NewTask { project_id }
+        } else {
+            RememberedNavigation::Session {
+                id: self.active_chat.clone(),
+            }
+        };
+        if self.settings.last_session_by_device.get(&device_id) != Some(&nav) {
+            self.settings
+                .last_session_by_device
+                .insert(device_id, nav);
+            self.schedule_save(cx);
+        }
+    }
+
+    /// Prune stale remembered entries (archived/deleted sessions, deleted projects)
+    /// — same rule as `open_tabs` pruning against the doc.
+    fn prune_remembered_navigation(&mut self, cx: &mut Context<Self>) -> bool {
+        let mut to_remove = Vec::new();
+        for (device_id, nav) in &self.settings.last_session_by_device {
+            let keep = match nav {
+                RememberedNavigation::Session { id } => {
+                    let state = self.state.read(cx);
+                    let chat = state.chats.iter().find(|c| &c.id == id);
+                    match chat {
+                        Some(c) if !c.archived => match &c.space_id {
+                            Some(sid) => state.space_row(sid).is_some(),
+                            None => true,
+                        },
+                        _ => false,
+                    }
+                }
+                RememberedNavigation::NewTask { project_id } => match project_id {
+                    None => true,
+                    Some(pid) => self.state.read(cx).space_row(pid).is_some(),
+                },
+            };
+            if !keep {
+                to_remove.push(device_id.clone());
+            }
+        }
+        let pruned = !to_remove.is_empty();
+        for id in to_remove {
+            self.settings.last_session_by_device.remove(&id);
+        }
+        pruned
     }
 
     fn retry_engine(&mut self, cx: &mut Context<Self>) {
@@ -2794,7 +2980,11 @@ impl Shell {
             .children(self.titlebar_spacer(12.0))
             .child(window_control_button(
                 "toggle-sidebar",
-                icons::SIDEBAR_MINIMALISTIC_LEFT,
+                if self.settings.sidebar_collapsed {
+                    icons::SIDEBAR_MINIMALISTIC
+                } else {
+                    icons::SIDEBAR_MINIMALISTIC_LEFT
+                },
                 &theme,
                 cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)),
             ))
@@ -4862,9 +5052,12 @@ impl Shell {
     /// terminal, or the "Open a surface" picker when no tabs exist.
     fn render_right_pane(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
-        let bg = theme.bg;
+        // Match the sidebar tone: the right pane reads as the same glass
+        // surface as the session list instead of a darker `bg`.
+        let bg = theme.glass();
         let content: AnyElement = if self.right_pane_open(cx) {
-            match self.resolved_right_active(cx) {
+            let active = self.resolved_right_active(cx);
+            let main: AnyElement = match active {
                 RightSurface::Diff(id) if self.diffs.contains_key(&id) => {
                     let changes = self.diffs.get(&id).cloned().expect("checked");
                     // Idempotent — also covers a persisted-open pane on boot.
@@ -4903,7 +5096,69 @@ impl Shell {
                     files.update(cx, |files, cx| files.ensure_root(cx));
                     files.into_any_element()
                 }
+                RightSurface::FileEditor(id) if self.file_editors.contains_key(&id) => {
+                    let editor = self.file_editors.get(&id).cloned().expect("checked");
+                    editor.update(cx, |editor, cx| editor.ensure_content(cx));
+                    editor.update(cx, |editor, cx| editor.render(&theme, cx))
+                }
                 _ => self.render_surface_picker(cx),
+            };
+            // Tree companion: unlike the old FileEditor-only inline split,
+            // this now wraps ANY active surface (Diff/Terminal/FileEditor/
+            // picker) whenever a Files tab exists for this chat — matching
+            // VS Code's explorer, which stays put regardless of which editor
+            // tab is focused (user request). Skipped only when the tree
+            // itself IS the active surface, so it's never shown twice.
+            let files_panel = if matches!(active, RightSurface::Files(_)) {
+                None
+            } else {
+                self.right_tabs.get(&self.panel_key(cx)).and_then(|tabs| {
+                    tabs.iter().find_map(|s| match s {
+                        RightSurface::Files(fid) => self.files.get(fid).cloned(),
+                        _ => None,
+                    })
+                })
+            };
+            match files_panel {
+                Some(files) => {
+                    // Two independent-looking panels (own bg/border/rounded
+                    // corners each, separated by a gap) rather than one
+                    // merged block split by a hairline — user request: the
+                    // file editor should read as its own container, not as
+                    // fused into the explorer's box.
+                    div()
+                        .flex()
+                        .flex_row()
+                        .size_full()
+                        .gap(px(8.0))
+                        .p(px(8.0))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .h_full()
+                                .rounded(px(8.0))
+                                .overflow_hidden()
+                                .border_1()
+                                .border_color(theme.border)
+                                .bg(theme.bg)
+                                .child(main),
+                        )
+                        .child(
+                            div()
+                                .w(px(240.0))
+                                .flex_none()
+                                .h_full()
+                                .rounded(px(8.0))
+                                .overflow_hidden()
+                                .border_1()
+                                .border_color(theme.border)
+                                .bg(theme.glass())
+                                .child(files),
+                        )
+                        .into_any_element()
+                }
+                None => main,
             }
         } else {
             gpui::Empty.into_any_element()
@@ -4926,11 +5181,7 @@ impl Shell {
             // clipped into unreachability — user-reported dead resize),
             // overlapping the panel's left border.
             .left(px(0.0));
-        let panel_bg = if theme.is_glass() {
-            bg.opacity(0.4)
-        } else {
-            bg
-        };
+        let panel_bg = bg;
         let panel = div()
             .size_full()
             .flex()
@@ -5233,6 +5484,7 @@ impl Shell {
             let icon_path = match surface {
                 RightSurface::Diff(_) => icons::GIT_BRANCH,
                 RightSurface::Files(_) => icons::DOCUMENT,
+                RightSurface::FileEditor(_) => icons::PEN,
                 _ => icons::TERMINAL,
             };
             // t3 tab hover: the surface icon swaps IN PLACE for the close ✕
@@ -5243,17 +5495,18 @@ impl Shell {
             let chip = div()
                 .id(("right-surface-tab", ix))
                 .group(group.clone())
-                .h(px(24.0))
+                .h(px(34.0))
                 .w(px(CHIP_W))
                 .flex_none()
-                .pl(px(4.0))
-                .pr(px(8.0))
-                .rounded(px(6.0))
+                .pl(px(8.0))
+                .pr(px(4.0))
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap(px(3.0))
+                .gap(px(5.0))
                 .cursor_pointer()
+                .border_b_2()
+                .border_color(if is_active { theme.accent } else { gpui::transparent_black() })
                 // The old session-tab strip's solved carve-out: NOT
                 // `.occlude()` — a BlockMouse hitbox ends the hit test,
                 // so the scroll container behind the tabs never saw
@@ -5265,9 +5518,9 @@ impl Shell {
                 .on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
                     window.prevent_default()
                 })
-                .when(is_active, |el| el.bg(crate::theme::wash(0.10)))
+                .when(is_active, |el| el.bg(crate::theme::wash(0.06)))
                 .when(!is_active, |el| {
-                    el.hover(|s| s.bg(crate::theme::wash(0.06)))
+                    el.hover(|s| s.bg(crate::theme::wash(0.04)))
                 })
                 .on_click(cx.listener(move |this, _, _, cx| {
                     cx.stop_propagation();
@@ -5292,61 +5545,33 @@ impl Shell {
                         cx.new(|_| SurfaceTabGhost { title })
                     },
                 )
+                .child(icon(icon_path).size(px(13.0)).text_color(if is_active { theme.text } else { theme.text_muted.opacity(0.7) }))
                 .child(
-                    // Leading slot: icon normally, ✕ on tab hover — two
-                    // stacked layers opacity-swapped by the group hover.
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .truncate()
+                        .text_size(px(12.0))
+                        .text_color(if is_active { theme.text } else { theme.text_muted })
+                        .child(title),
+                )
+                .child(
                     div()
                         .id(("right-surface-close", ix))
                         .flex_none()
                         .size(px(18.0))
-                        .rounded(px(4.0))
-                        .relative()
+                        .rounded(px(3.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .opacity(0.0)
+                        .group_hover(group.clone(), |s| s.opacity(1.0))
                         .hover(|s| s.bg(crate::theme::wash(0.12)))
                         .on_click(cx.listener(move |this, _, window, cx| {
                             cx.stop_propagation();
                             this.close_right_surface(surface, window, cx);
                         }))
-                        .child(
-                            div()
-                                .absolute()
-                                .inset_0()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .group_hover(group.clone(), |s| s.opacity(0.0))
-                                .child(icon(icon_path).size(px(12.0)).text_color(if is_active {
-                                    theme.text_muted
-                                } else {
-                                    theme.text_muted.opacity(0.7)
-                                })),
-                        )
-                        .child(
-                            div()
-                                .absolute()
-                                .inset_0()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .opacity(0.0)
-                                .group_hover(group.clone(), |s| s.opacity(1.0))
-                                .child(
-                                    icon(icons::CLOSE)
-                                        .size(px(12.0))
-                                        .text_color(theme.text_muted),
-                                ),
-                        ),
-                )
-                .child(
-                    div()
-                        .min_w_0()
-                        .truncate()
-                        .text_size(px(11.5))
-                        .text_color(if is_active {
-                            theme.text
-                        } else {
-                            theme.text_muted
-                        })
-                        .child(title),
+                        .child(icon(icons::CLOSE).size(px(10.0)).text_color(theme.text_muted)),
                 );
             // Sliding transform while a sibling drags over (the terminal
             // drawer's exact recipe): animate 150ms between committed
@@ -6375,6 +6600,7 @@ impl Render for Shell {
                 // under the header and fade out at its edge. Columns that
                 // must NOT underlap (sidebar content, the changes panel,
                 // settings) pad themselves down by the titlebar height.
+                let explorer: AnyElement = Empty.into_any_element();
                 let page = div()
                     .size_full()
                     .relative()
@@ -6385,6 +6611,7 @@ impl Render for Shell {
                             .flex_row()
                             .child(sidebar)
                             .child(sidebar_seam)
+                            .child(explorer)
                             .child(card)
                             .child(right),
                     )
