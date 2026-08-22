@@ -4,8 +4,8 @@
 //! compaction limits, and token breakdowns (input, cached input, output, reasoning).
 
 use gpui::{
-    AnyElement, IntoElement, ParentElement, PathBuilder, SharedString, Styled, canvas, div, point,
-    hsla, px,
+    AnyElement, IntoElement, ParentElement, PathBuilder, SharedString, Styled, canvas, div, hsla,
+    point, px,
 };
 use komet_proto::{ContextUsageStats, format_tokens};
 
@@ -38,7 +38,10 @@ pub fn render_context_ring(stats: &ContextUsageStats, theme: &Theme) -> AnyEleme
 
             // Draw the ring track (full circle stroke)
             let mut track_path = PathBuilder::stroke(px(RING_STROKE));
-            track_path.move_to(point(px(center_x + radius * 0.0), px(center_y + radius * -1.0)));
+            track_path.move_to(point(
+                px(center_x + radius * 0.0),
+                px(center_y + radius * -1.0),
+            ));
             // Approximate full circle with 32 line segments
             for i in 0..=32 {
                 let angle = std::f32::consts::PI * 2.0 * i as f32 / 32.0;
@@ -56,7 +59,10 @@ pub fn render_context_ring(stats: &ContextUsageStats, theme: &Theme) -> AnyEleme
             let start_angle = -std::f32::consts::PI / 2.0; // 12 o'clock
             let end_angle = start_angle + ratio * std::f32::consts::PI * 2.0;
             let segments = 32;
-            progress_path.move_to(point(px(center_x + radius * start_angle.cos()), px(center_y + radius * start_angle.sin())));
+            progress_path.move_to(point(
+                px(center_x + radius * start_angle.cos()),
+                px(center_y + radius * start_angle.sin()),
+            ));
             for i in 1..=segments {
                 let t = i as f32 / segments as f32;
                 let angle = start_angle + (end_angle - start_angle) * t;
@@ -161,11 +167,7 @@ pub fn render_context_popover(stats: &ContextUsageStats, theme: &Theme) -> AnyEl
                         .items_center()
                         .justify_between()
                         .text_xs()
-                        .child(
-                            div()
-                                .text_color(theme.text_muted)
-                                .child("Compacts at"),
-                        )
+                        .child(div().text_color(theme.text_muted).child("Compacts at"))
                         .child(
                             div()
                                 .font_family(theme.font_mono.clone())
@@ -209,7 +211,11 @@ pub fn render_context_popover(stats: &ContextUsageStats, theme: &Theme) -> AnyEl
                     format_tokens(stats.cached_input_tokens),
                     theme,
                 ))
-                .child(usage_row("Output", format_tokens(stats.output_tokens), theme))
+                .child(usage_row(
+                    "Output",
+                    format_tokens(stats.output_tokens),
+                    theme,
+                ))
                 .child(usage_row(
                     "Reasoning output (included)",
                     format_tokens(stats.reasoning_tokens),

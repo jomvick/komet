@@ -1,0 +1,125 @@
+@import "tailwindcss";
+
+:root {
+  /* Surfaces — sampled straight from komet's crates/ui/src/theme.rs (dark) */
+  --ink: #060606;       /* bg — main panel */
+  --charcoal: #0d0d0d;  /* surface — shell / sidebar */
+  --ash: #161616;       /* surface_card */
+  --slate: #1c1c1c;     /* surface_dialog */
+  --graphite: #262626;  /* surface_overlay / raised */
+
+  /* Text */
+  --paper: #ececec;     /* text ~neutral-200 */
+  --mist: #b5b5b5;      /* text_muted ~neutral-400 */
+  --fog: #8d8d8d;       /* text_faint ~neutral-500 */
+  --dim: #989898;       /* text_dim */
+
+  /* Hairlines */
+  --hairline: rgba(255, 255, 255, 0.08);
+  --hairline-strong: rgba(255, 255, 255, 0.14);
+
+  /* Accents — same oklch sources as the app (indigo-400, red-400, amber-400,
+     emerald-400, pink-400, violet-300) */
+  --signal: #7c86ff;      /* accent — indigo-400 */
+  --signal-strong: #6d6ef5; /* accent_strong — indigo-500 */
+  --ember: #ff6467;       /* danger — red-400 */
+  --amber: #ffb900;       /* warning — amber-400 */
+  --moss: #34e39a;        /* success — emerald-400 */
+  --busy: #f472b6;        /* busy — pink-400 */
+  --violet: #c4b5fd;      /* code_text — violet-300 */
+
+  --radius-panel: 10px;
+  --radius-control: 6px;
+  --radius-bubble: 16px;
+}
+
+@theme inline {
+  --color-ink: var(--ink);
+  --color-charcoal: var(--charcoal);
+  --color-ash: var(--ash);
+  --color-slate: var(--slate);
+  --color-graphite: var(--graphite);
+  --color-paper: var(--paper);
+  --color-mist: var(--mist);
+  --color-fog: var(--fog);
+  --color-dim: var(--dim);
+  --color-signal: var(--signal);
+  --color-signal-strong: var(--signal-strong);
+  --color-ember: var(--ember);
+  --color-amber: var(--amber);
+  --color-moss: var(--moss);
+  --color-busy: var(--busy);
+  --color-violet: var(--violet);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+* {
+  border-color: var(--hairline);
+}
+
+html {
+  color-scheme: dark;
+}
+
+body {
+  background: var(--ink);
+  color: var(--paper);
+  font-family: var(--font-geist-sans), Helvetica, Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection {
+  background: rgba(124, 134, 255, 0.35);
+  color: var(--paper);
+}
+
+.font-mono {
+  font-family: var(--font-geist-mono), ui-monospace, monospace;
+}
+
+/* Frost / glass — same recipe family as Theme::glass_overlay */
+.glass {
+  background: rgba(20, 20, 20, 0.55);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+}
+
+.hairline {
+  border: 1px solid var(--hairline);
+}
+
+.noise {
+  background-image: url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI2MCIgaGVpZ2h0PSI2MCI+PGZpbHRlciBpZD0nbicgeD0nMCcgeT0nMCc+PGZlVHVyYnVsZW5jZSB0eXBlPSdmcmFjdGFsTm9pc2UnIGJhc2VGcmVxdWVuY3k9JzAuOScgbnVtT2N0YXZlcz0nMicgc3RpdGNoVGlsZXM9J3N0aXRjaCcvPjxmZUNvbG9yTWF0cml4IHR5cGU9J3NhdHVyYXRlJyB2YWx1ZXM9JzAnLz48L2ZpbHRlcj48cmVjdCB3aWR0aD0nMTAwJScgaGVpZ2h0PScxMDAlJyBmaWx0ZXI9J3VybCgjbiknIG9wYWNpdHk9JzAuMDUnLz48L3N2Zz4=");
+}
+
+@keyframes blink {
+  0%, 49% { opacity: 1; }
+  50%, 100% { opacity: 0; }
+}
+.caret-blink {
+  animation: blink 1s step-end infinite;
+}
+
+@keyframes drift {
+  0% { transform: translate3d(0,0,0) scale(1); }
+  50% { transform: translate3d(2%, -3%, 0) scale(1.05); }
+  100% { transform: translate3d(0,0,0) scale(1); }
+}
+.drift {
+  animation: drift 18s ease-in-out infinite;
+}
+
+@keyframes marquee {
+  from { transform: translateX(0); }
+  to { transform: translateX(-50%); }
+}
+.marquee {
+  animation: marquee 28s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .drift, .marquee, .caret-blink {
+    animation: none !important;
+  }
+}

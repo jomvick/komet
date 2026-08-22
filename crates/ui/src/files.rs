@@ -6,6 +6,7 @@
 //! - Collapsible directories with lazy recursive folder loading (`ListFolders`).
 //! - Instant fuzzy search / filtering (`SearchFiles`).
 //! - File path copying to clipboard.
+//! - File opening in editor tabs (VS Code-style preview tabs).
 //! - Polished design matching the Komet UI aesthetics and theme tokens.
 
 use std::collections::{HashMap, HashSet};
@@ -24,6 +25,13 @@ use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::icons::{self, icon};
 use crate::state::AppState;
 use crate::theme::Theme;
+
+/// Events emitted by the FilesPanel to its host (the shell).
+#[derive(Debug, Clone)]
+pub enum FilesPanelEvent {
+    /// A file was clicked — open it in the editor.
+    OpenFile(String),
+}
 
 /// A single node in the file explorer tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,6 +72,8 @@ pub struct FilesPanel {
     copied_path: Option<(String, Instant)>,
     scroll_handle: ScrollHandle,
 }
+
+impl gpui::EventEmitter<FilesPanelEvent> for FilesPanel {}
 
 impl FilesPanel {
     pub fn new(state: gpui::Entity<AppState>, cx: &mut Context<Self>) -> Self {
@@ -378,6 +388,11 @@ impl FilesPanel {
     }
 
     fn on_file_click(&mut self, rel_path: &str, _window: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(FilesPanelEvent::OpenFile(rel_path.to_string()));
+        cx.notify();
+    }
+
+    fn on_copy_path(&mut self, rel_path: &str, cx: &mut Context<Self>) {
         cx.write_to_clipboard(gpui::ClipboardItem::new_string(rel_path.to_string()));
         self.copied_path = Some((rel_path.to_string(), Instant::now()));
         cx.notify();
@@ -406,7 +421,7 @@ impl FilesPanel {
     pub fn render_header(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let text_muted = theme.text_muted;
         let border = theme.border;
-        let bg = theme.bg;
+        let bg = theme.glass();
 
         let root_label = self
             .root_path
@@ -418,12 +433,11 @@ impl FilesPanel {
             .w_full()
             .flex()
             .flex_col()
-            .border_b_1()
-            .border_color(border)
             .bg(bg)
-            .p(px(8.0))
-            .gap(px(8.0))
-            // Project root bar
+            .px(px(8.0))
+            .py(px(6.0))
+            .gap(px(6.0))
+            // VS Code EXPLORER header
             .child(
                 div()
                     .w_full()
@@ -433,35 +447,35 @@ impl FilesPanel {
                     .justify_between()
                     .child(
                         div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(6.0))
-                            .child(
-                                icon(icons::FOLDER_WITH_FILES)
-                                    .size(px(14.0))
-                                    .text_color(theme.accent),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(12.0))
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .text_color(theme.text)
-                                    .child(SharedString::from(root_label)),
-                            ),
+                            .text_size(px(11.0))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme.text)
+                            .child(SharedString::from("EXPLORER")),
                     )
                     .child(
                         div()
                             .id("files-refresh-btn")
                             .p(px(3.0))
-                            .rounded(px(4.0))
+                            .rounded(px(3.0))
                             .cursor_pointer()
-                            .hover(|s| s.bg(theme.element_hover))
+                            .hover(|s| s.bg(theme.glass_hover()))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.refresh(cx);
                             }))
-                            .child(icon(icons::REFRESH).size(px(13.0)).text_color(text_muted)),
+                            .child(icon(icons::REFRESH).size(px(11.0)).text_color(text_muted)),
                     ),
+            )
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(4.0))
+                    .text_size(px(11.0))
+                    .text_color(theme.text_muted)
+                    .child(icon(icons::ALT_ARROW_DOWN).size(px(10.0)).text_color(text_muted))
+                    .child(SharedString::from(root_label.to_uppercase())),
             )
             // Filter search input
             .child(
@@ -498,10 +512,11 @@ impl FilesPanel {
         };
         let node_path = node.path.clone();
         let rel_path = node.rel_path.clone();
+        let rel_for_copy = rel_path.clone();
         let depth = node.depth;
         let is_dir = node.is_dir;
 
-        let indent = px(14.0 * depth as f32 + 6.0);
+        let indent = px(8.0 * depth as f32 + 8.0);
 
         let chevron_icon = if is_expanded {
             icons::ALT_ARROW_DOWN
@@ -529,16 +544,18 @@ impl FilesPanel {
         div()
             .id(row_id)
             .w_full()
-            .h(px(26.0))
+            .h(px(22.0))
             .pl(indent)
-            .pr(px(8.0))
-            .rounded(px(4.0))
+            .pr(px(6.0))
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(5.0))
+            .gap(px(4.0))
             .cursor_pointer()
             .hover(|s| s.bg(theme.element_hover))
+            .when(depth > 0, |d| {
+                d.border_l_1().border_color(gpui::rgba(0xffffff0a))
+            })
             .on_click(cx.listener(move |this, _, window, cx| {
                 if is_dir {
                     this.toggle_folder(node_path.clone(), rel_path.clone(), depth, cx);
@@ -561,18 +578,14 @@ impl FilesPanel {
                         )
                     }),
             )
-            // Icon
-            .child(icon(node_icon).size(px(14.0)).text_color(if is_dir {
-                theme.accent
-            } else {
-                theme.text_muted
-            }))
+            // Icon per file type
+            .child(icon(node_icon).size(px(12.0)).text_color(if is_dir { theme.accent } else { theme.text_muted }))
             // Name
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
-                    .text_size(px(12.0))
+                    .text_size(px(11.5))
                     .text_color(text_color)
                     .line_clamp(1)
                     .child(SharedString::from(node.name.clone())),
@@ -596,6 +609,21 @@ impl FilesPanel {
                         .text_size(px(9.5))
                         .text_color(theme.accent)
                         .child(SharedString::from("Copied")),
+                )
+            })
+            .when(!is_dir, |d| {
+                d.child(
+                    div()
+                        .id(SharedString::from(format!("copy-{}", rel_for_copy)))
+                        .px(px(4.0))
+                        .py(px(1.0))
+                        .rounded(px(3.0))
+                        .hover(|s| s.bg(theme.element_active))
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.on_copy_path(&rel_for_copy, cx);
+                        }))
+                        .child(icon(icons::COPY).size(px(10.0)).text_color(theme.text_muted)),
                 )
             })
             .into_any_element()
@@ -676,7 +704,8 @@ impl Focusable for FilesPanel {
 impl Render for FilesPanel {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
-        let bg = theme.bg;
+        // Match the shell panels: same glass tone as the sidebar/right pane.
+        let bg = theme.glass();
 
         // Auto-heal if root hasn't been loaded
         if self.root_path.is_none() || self.root_entries.is_empty() && !self.loading_root {

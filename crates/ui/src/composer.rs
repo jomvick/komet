@@ -16,11 +16,11 @@ use std::time::{Duration, Instant};
 use gpui::{
     AnyTooltip, App, BorderStyle, Bounds, ClipboardEntry, ClipboardItem, Context, CursorStyle,
     DispatchPhase, ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle,
-    Focusable, GlobalElementId, InteractiveElement, KeyBinding, KeyDownEvent, LayoutId, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ObjectFit, PaintQuad, PathPromptOptions, Pixels, Point,
-    ScrollWheelEvent, SharedString, Style, StyledImage as _, Subscription, Task, TextRun,
-    TextStyle, UTF16Selection, UnderlineStyle, Window, WrappedLine, actions, div, fill, img, point,
-    prelude::*, px, quad, relative, size,
+    Focusable, GlobalElementId, InteractiveElement, KeyBinding, KeyDownEvent, LayoutId,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, PaintQuad,
+    PathPromptOptions, Pixels, Point, ScrollWheelEvent, SharedString, Style, StyledImage as _,
+    Subscription, Task, TextRun, TextStyle, UTF16Selection, UnderlineStyle, Window, WrappedLine,
+    actions, div, fill, img, point, prelude::*, px, quad, relative, size,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -1305,6 +1305,24 @@ pub struct ComposerInput {
     /// Created once when Waiting promotes; retaining this entity preserves
     /// GPUI's global animation state across prepaint frames.
     mention_tooltip_view: Option<Entity<MentionPathTooltip>>,
+    /// Tree-sitter highlight document for the file editor surface (`None`
+    /// for the chat composer and all other `ComposerInput` uses). When set,
+    /// `layout_text` colors runs from this instead of the mention-chip
+    /// projection — mutually exclusive with `mentions_enabled`, which the
+    /// file editor never turns on (see `refresh_projection`).
+    syntax_doc: Option<komet_syntax::HighlightedDocument>,
+    /// Height cap for `ComposerTextElement`'s intrinsic layout, in px.
+    /// Defaults to the chat composer's `TEXTAREA_MAX - TEXTAREA_PAD_V` (a
+    /// deliberately small autogrow ceiling — a chat message rarely runs
+    /// past a few lines). The file editor overrides this to something much
+    /// larger via `set_max_content_height` so a full file isn't clipped to
+    /// that same ~240px chat-sized box; `ComposerTextElement::request_layout`
+    /// additionally clamps against the parent's actual available height
+    /// when it's known (a flex_1 container reports one, an auto-height chat
+    /// wrapper generally doesn't), so a large override still triggers the
+    /// input's own internal scroll instead of silently overflowing past the
+    /// pane and getting clipped by the parent's `overflow_hidden`.
+    max_content_height: f32,
 }
 
 impl ComposerInput {
@@ -1359,7 +1377,34 @@ impl ComposerInput {
             mention_tooltip_popup: None,
             mention_tooltip_task: None,
             mention_tooltip_view: None,
+            syntax_doc: None,
+            max_content_height: TEXTAREA_MAX - TEXTAREA_PAD_V,
         }
+    }
+
+    /// Raise (or lower) the intrinsic layout's height cap past the chat
+    /// composer's default ~240px — the file editor calls this with a large
+    /// value (e.g. `f32::MAX`) so it isn't bound by that chat-sized ceiling.
+    /// `ComposerTextElement::request_layout` still clamps against the real
+    /// available height from the parent when GPUI reports one (a flex_1
+    /// container does), so this doesn't cause unbounded overflow — it just
+    /// stops the fixed 240px value from being the binding constraint.
+    pub fn set_max_content_height(&mut self, max: f32, cx: &mut Context<Self>) {
+        self.max_content_height = max;
+        cx.notify();
+    }
+
+    /// Set (or clear) the Tree-sitter highlight document painted over this
+    /// input's text. Only meaningful while `mentions_enabled` is false (the
+    /// file editor's usage) — sets both simultaneously would be ambiguous
+    /// about which coloring wins, so callers should pick one per input.
+    pub fn set_syntax_doc(
+        &mut self,
+        doc: Option<komet_syntax::HighlightedDocument>,
+        cx: &mut Context<Self>,
+    ) {
+        self.syntax_doc = doc;
+        cx.notify();
     }
 
     /// Reset the caret blink phase (solid again) — called on every edit and
@@ -2490,6 +2535,35 @@ impl ComposerInput {
                 .collect()
             }
             _ if is_placeholder => vec![run_for(display.len(), false, false)],
+            _ if self.syntax_doc.is_some() => {
+                // File editor path: color from Tree-sitter spans instead of
+                // mention chips. `display == self.content` byte-for-byte
+                // here (mentions_enabled is false whenever syntax_doc is
+                // set, so refresh_projection never rewrites the text — see
+                // its doc comment), so zipping the raw lines against
+                // `doc.lines` by index is safe: no offset remapping needed,
+                // unlike the marked_range/mention branches above which must
+                // go through `projection.raw_to_display`.
+                let doc = self.syntax_doc.as_ref().expect("checked by guard");
+                let theme = Theme::of(cx);
+                let mono = gpui::font(theme.font_mono.clone());
+                let mut runs = Vec::new();
+                for (i, line) in display.split('\n').enumerate() {
+                    let spans: &[komet_syntax::HighlightSpan] =
+                        doc.lines.get(i).map(|v| v.as_slice()).unwrap_or(&[]);
+                    runs.extend(crate::markdown::render::runs_for_syntax_line_with_plain(
+                        line,
+                        spans,
+                        &mono,
+                        style.color,
+                        theme,
+                    ));
+                    if i + 1 < display.split('\n').count() {
+                        runs.push(run_for(1, false, false)); // the '\n' itself
+                    }
+                }
+                runs
+            }
             _ => {
                 let mut runs = Vec::new();
                 let mut at = 0;
@@ -2803,7 +2877,27 @@ impl gpui::Element for ComposerTextElement {
                 let content_height = input.update(cx, |input, cx| {
                     input.layout_text(width, &text_style, window, cx)
                 });
-                size(width, px(content_height.min(max_content)))
+                // Clamp to whichever is tighter: the input's own declared
+                // ceiling (`max_content`, 240px for the chat composer, a
+                // large override for the file editor) or the real available
+                // height from the parent when GPUI reports one — a flex_1
+                // container does, the chat composer's auto-height wrapper
+                // generally doesn't. Without this second clamp, a large
+                // `max_content` override would size the element past its
+                // flex_1 parent's actual bounds: `clamp_scroll` then sees a
+                // `bounds.size.height` equal to the full (unclamped) content
+                // height, `input_max_scroll` computes zero, and internal
+                // scrolling never engages — the excess just gets silently
+                // cut off by the parent's `overflow_hidden` instead of
+                // scrolling. Reading `available.height` here is what makes
+                // the file editor's box actually fill and scroll instead of
+                // rendering a short, stuck-at-the-top box in a mostly blank
+                // pane (the bug this comment is fixing).
+                let cap = match available.height {
+                    gpui::AvailableSpace::Definite(h) => f32::from(h).min(max_content),
+                    _ => max_content,
+                };
+                size(width, px(content_height.min(cap)))
             });
         (layout_id, ())
     }
@@ -3134,9 +3228,11 @@ impl Render for ComposerInput {
             .font_family(theme.font_sans.clone())
             .child(ComposerTextElement {
                 input: cx.entity(),
-                // Internal scrolling once content exceeds the 260px textarea
-                // box minus its `pt-4 pb-1` padding.
-                max_content_height: TEXTAREA_MAX - TEXTAREA_PAD_V,
+                // Internal scrolling once content exceeds this input's
+                // configured ceiling (see `max_content_height`'s doc comment
+                // — the chat composer's default vs. the file editor's
+                // override).
+                max_content_height: self.max_content_height,
             })
     }
 }
@@ -3351,6 +3447,7 @@ pub struct Composer {
     /// Set on every session/route change: flips committed before this instant
     /// SNAP instead of morphing (see [`ROUTE_SNAP_MS`]).
     route_snap_until: Option<Instant>,
+    escape_stop_armed_at: Option<Instant>,
     _observe: Subscription,
     _pickers_observe: Subscription,
     _input_events: Subscription,
@@ -3450,6 +3547,7 @@ impl Composer {
             last_rendered_height: 0.0,
             morph_clock: Instant::now(),
             route_snap_until: None,
+            escape_stop_armed_at: None,
             _observe: observe,
             _pickers_observe: pickers_observe,
             _input_events: input_events,
@@ -4784,6 +4882,35 @@ impl Composer {
         }));
     }
 
+    fn press_escape_stop(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.run_live(cx) {
+            self.escape_stop_armed_at = None;
+            return false;
+        }
+        let now = Instant::now();
+        if let Some(armed) = self.escape_stop_armed_at {
+            if now.duration_since(armed) < Duration::from_secs(3) {
+                self.escape_stop_armed_at = None;
+                self.interrupt(cx);
+                return true;
+            }
+        }
+        self.escape_stop_armed_at = Some(now);
+        false
+    }
+
+    #[allow(dead_code)]
+    fn is_escape_stop_armed(&self) -> bool {
+        self.escape_stop_armed_at.is_some()
+    }
+
+    fn mention_escape(&mut self, _: &MentionEscape, _: &mut Window, cx: &mut Context<Self>) {
+        if self.press_escape_stop(cx) {
+            return;
+        }
+        cx.propagate();
+    }
+
     // ---- wizard glue ----
 
     fn wizard_select(&mut self, option_ix: usize, cx: &mut Context<Self>) {
@@ -5324,6 +5451,7 @@ impl Render for Composer {
             .gap(px(Theme::SPACE_SM))
             .px(px(Theme::SPACE_LG))
             .pb(px(Theme::SPACE_LG))
+            .on_action(cx.listener(Self::mention_escape))
             .when_some(failure, |el, message| {
                 // komet composer.tsx `Notice` (matches the transcript
                 // ErrorChip palette): `flex items-start gap-2 rounded-xl
@@ -5547,9 +5675,15 @@ impl Render for Composer {
                                 .cursor_pointer()
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     let next = match this.state.read(cx).access_mode {
-                                        komet_proto::AccessMode::FullAccess => komet_proto::AccessMode::ReadOnly,
-                                        komet_proto::AccessMode::ReadOnly => komet_proto::AccessMode::Sandboxed,
-                                        komet_proto::AccessMode::Sandboxed => komet_proto::AccessMode::FullAccess,
+                                        komet_proto::AccessMode::FullAccess => {
+                                            komet_proto::AccessMode::ReadOnly
+                                        }
+                                        komet_proto::AccessMode::ReadOnly => {
+                                            komet_proto::AccessMode::Sandboxed
+                                        }
+                                        komet_proto::AccessMode::Sandboxed => {
+                                            komet_proto::AccessMode::FullAccess
+                                        }
                                     };
                                     this.state.update(cx, |state, _| state.access_mode = next);
                                     cx.notify();
@@ -5558,7 +5692,7 @@ impl Render for Composer {
                                     komet_proto::AccessMode::FullAccess => "Full access",
                                     komet_proto::AccessMode::ReadOnly => "Read only",
                                     komet_proto::AccessMode::Sandboxed => "Sandboxed",
-                                })
+                                }),
                         )
                         .child(attach)
                         .child(send_button),
@@ -5623,18 +5757,25 @@ impl Render for Composer {
                                         .cursor_pointer()
                                         .on_click(cx.listener(|this, _, _, cx| {
                                             let next = match this.state.read(cx).access_mode {
-                                                komet_proto::AccessMode::FullAccess => komet_proto::AccessMode::ReadOnly,
-                                                komet_proto::AccessMode::ReadOnly => komet_proto::AccessMode::Sandboxed,
-                                                komet_proto::AccessMode::Sandboxed => komet_proto::AccessMode::FullAccess,
+                                                komet_proto::AccessMode::FullAccess => {
+                                                    komet_proto::AccessMode::ReadOnly
+                                                }
+                                                komet_proto::AccessMode::ReadOnly => {
+                                                    komet_proto::AccessMode::Sandboxed
+                                                }
+                                                komet_proto::AccessMode::Sandboxed => {
+                                                    komet_proto::AccessMode::FullAccess
+                                                }
                                             };
-                                            this.state.update(cx, |state, _| state.access_mode = next);
+                                            this.state
+                                                .update(cx, |state, _| state.access_mode = next);
                                             cx.notify();
                                         }))
                                         .child(match self.state.read(cx).access_mode {
                                             komet_proto::AccessMode::FullAccess => "Full access",
                                             komet_proto::AccessMode::ReadOnly => "Read only",
                                             komet_proto::AccessMode::Sandboxed => "Sandboxed",
-                                        })
+                                        }),
                                 )
                                 .child(attach)
                                 .child(send_button),

@@ -2320,19 +2320,19 @@ impl Pickers {
                     &context_stats,
                     &theme,
                 ));
-            let mut overlay: Option<(PickerKind, AnyElement)> =
-                if self.mounted_kind() == Some(PickerKind::ContextUsage) {
-                    let stats = self.state.read(cx).current_context_usage();
-                    let popover_theme = Theme::of(cx).clone();
-                    let content =
-                        crate::context_usage::render_context_popover(&stats, &popover_theme);
-                    Some((
-                        PickerKind::ContextUsage,
-                        self.popover_frame_flush(290.0, content, cx),
-                    ))
-                } else {
-                    None
-                };
+            let mut overlay: Option<(PickerKind, AnyElement)> = if self.mounted_kind()
+                == Some(PickerKind::ContextUsage)
+            {
+                let stats = self.state.read(cx).current_context_usage();
+                let popover_theme = Theme::of(cx).clone();
+                let content = crate::context_usage::render_context_popover(&stats, &popover_theme);
+                Some((
+                    PickerKind::ContextUsage,
+                    self.popover_frame_flush(290.0, content, cx),
+                ))
+            } else {
+                None
+            };
 
             let right = div()
                 .flex()
@@ -2379,8 +2379,7 @@ impl Pickers {
             Some(PickerKind::ContextUsage) => {
                 let stats = self.state.read(cx).current_context_usage();
                 let popover_theme = Theme::of(cx).clone();
-                let content =
-                    crate::context_usage::render_context_popover(&stats, &popover_theme);
+                let content = crate::context_usage::render_context_popover(&stats, &popover_theme);
                 Some((
                     PickerKind::ContextUsage,
                     self.popover_frame_flush(290.0, content, cx),
