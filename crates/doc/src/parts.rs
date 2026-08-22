@@ -341,6 +341,22 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
         AgentEvent::AssistantMessageCompleted { .. }
         | AgentEvent::Usage { .. }
         | AgentEvent::AvailableCommands { .. } => {}
+        // Only ever reaches this function already unwrapped from a Subagent
+        // frame by the caller — see the variant's own doc comment: "never
+        // emitted untagged". There's no MessagePart shape yet for a
+        // user-role text segment distinct from TextDelta's
+        // running-append-to-tail story (it needs to close the current text
+        // part rather than extend it), so this is a deliberate no-op rather
+        // than a guess at that shape — flagging it here instead of silently
+        // wiring something that might not match what the subagent-viz UI
+        // actually expects once it lands.
+        AgentEvent::UserMessage { .. } => {}
+        // Routed to the subagent's own doc/parts vec by the caller (the
+        // engine unwraps `event` and re-enters this function with the
+        // subagent's own accumulator per `parent_tool_use_id`) — never
+        // folded into the parent's parts directly. Same treatment as
+        // AvailableCommands above.
+        AgentEvent::Subagent { .. } => {}
     }
 }
 

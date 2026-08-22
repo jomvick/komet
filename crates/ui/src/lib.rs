@@ -97,7 +97,7 @@ pub struct UiConfig {
     pub org_id: Option<String>,
     /// WorkOS client id; `Some` makes the embedded headed engine require a
     /// production session before opening identity-scoped stores.
-    pub workos_client_id: Option<String>,
+    pub sync_token: Option<String>,
     /// Harness for doc-command runs until per-chat config lands (M4).
     pub default_harness: HarnessId,
 }
@@ -110,7 +110,7 @@ impl UiConfig {
             edge_url: self.edge_url.clone(),
             edge_token: self.edge_token.clone(),
             org_id: self.org_id.clone(),
-            workos_client_id: self.workos_client_id.clone(),
+            sync_token: self.sync_token.clone(),
             default_harness: self.default_harness,
         }
     }

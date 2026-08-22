@@ -21,6 +21,13 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Self-hosted sync server (v1 shared-secret)
+    SyncServer {
+        #[arg(long, default_value = "8787")]
+        port: u16,
+    },
+    /// Generate a sync token for self-hosting
+    SyncInit,
     /// Run the engine without a UI (local-only unless a saved session enables sync).
     Headless,
     /// Sign in and enable sync on the next engine start.
@@ -72,21 +79,7 @@ fn edge_url_from_env() -> String {
         .unwrap_or_else(|| DEFAULT_EDGE_URL.into())
 }
 
-/// WorkOS client id resolution: the app is 100% local-only by default, so a
-/// bare start has no client id — dev mode, no account, no login screen, no
-/// network calls. Sync is a future feature: set `KOMET_WORKOS_CLIENT_ID` to a
-/// real WorkOS AuthKit client id (and `KOMET_EDGE_URL` to point at your own
-/// edge deployment) to re-enable it. The empty string, or a dev bearer via
-/// `KOMET_EDGE_TOKEN`, keeps dev mode explicitly.
-fn workos_client_id_from_env(edge_token: &Option<String>) -> Option<String> {
-    match std::env::var("KOMET_WORKOS_CLIENT_ID") {
-        Ok(v) if v.trim().is_empty() => None,
-        Ok(v) => Some(v),
-        Err(_) if edge_token.is_some() => None,
-        // Local-only default: sync disabled.
-        Err(_) => None,
-    }
-}
+
 
 /// mimalloc: system malloc (macOS libmalloc especially) never returns the
 /// streaming churn's high-water pages, so transient allocation became
@@ -156,6 +149,21 @@ fn main() -> anyhow::Result<()> {
     }
 
     match cli.command {
+        Some(Command::SyncInit) => {
+            use std::fmt::Write;
+            let mut token = String::new();
+            for b in uuid::Uuid::new_v4().as_bytes() { let _ = write!(token, "{b:02x}"); }
+            println!("KOMET_SYNC_TOKEN={token}");
+            println!("KOMET_EDGE_URL=http://YOUR_VPS_IP:8787");
+            println!("\nSur chaque device: export KOMET_SYNC_TOKEN={token} KOMET_EDGE_URL=http://YOUR_VPS_IP:8787");
+            return Ok(());
+        }
+        Some(Command::SyncServer { port }) => {
+            let runtime = tokio::runtime::Runtime::new()?;
+            let token = std::env::var("KOMET_SYNC_TOKEN").ok();
+            let data_dir = std::env::var_os("KOMET_DATA_DIR").map(std::path::PathBuf::from).unwrap_or_else(dirs_data_dir);
+            return runtime.block_on(komet_sync_server::serve(data_dir, token, port));
+        }
         Some(Command::Headless) => {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(async {
@@ -192,9 +200,6 @@ fn main() -> anyhow::Result<()> {
             DaemonCommand::Status => daemon::status(),
         },
         None => {
-            let edge_token = std::env::var("KOMET_EDGE_TOKEN").ok();
-            // Headed: the UI probes KOMET_IPC_PORT and connects to a running
-            // daemon, or embeds the engine in-process (ARCHITECTURE §1).
             komet_ui::run_app(komet_ui::UiConfig {
                 data_dir: std::env::var_os("KOMET_DATA_DIR")
                     .map(std::path::PathBuf::from)
@@ -204,8 +209,8 @@ fn main() -> anyhow::Result<()> {
                     .and_then(|p| p.parse().ok())
                     .unwrap_or(27654),
                 edge_url: edge_url_from_env(),
-                workos_client_id: workos_client_id_from_env(&edge_token),
-                edge_token,
+                edge_token: None,
+                sync_token: std::env::var("KOMET_SYNC_TOKEN").ok(),
                 org_id: std::env::var("KOMET_ORG_ID").ok(),
                 default_harness: komet_ui::HarnessId::ClaudeCode,
             });
@@ -218,25 +223,19 @@ fn main() -> anyhow::Result<()> {
 /// `logout`, and `status` — one resolution so the CLI auth commands always
 /// operate on the exact session the daemon will load.
 fn engine_config_from_env() -> komet_engine::EngineConfig {
-    // Dev-mode bearer (no WorkOS): an explicit token enables sync.
-    let edge_token = std::env::var("KOMET_EDGE_TOKEN").ok();
     komet_engine::EngineConfig {
         data_dir: std::env::var_os("KOMET_DATA_DIR")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(dirs_data_dir),
         edge_url: edge_url_from_env(),
+        edge_token: std::env::var("KOMET_EDGE_TOKEN").ok(),
+        sync_token: std::env::var("KOMET_SYNC_TOKEN").ok(),
         ipc_port: std::env::var("KOMET_IPC_PORT")
             .ok()
             .and_then(|p| p.parse().ok())
             .unwrap_or(27654),
         default_harness: harness_from_env(),
-        // WorkOS mode: the signed-in session's org wins; KOMET_ORG_ID (dev
-        // default "dev-org") scopes the workspace room otherwise.
         org_id: std::env::var("KOMET_ORG_ID").ok(),
-        // Real auth against production by default; see
-        // `workos_client_id_from_env` for the dev-mode escape hatches.
-        workos_client_id: workos_client_id_from_env(&edge_token),
-        edge_token,
     }
 }
 
@@ -249,7 +248,7 @@ fn harness_from_env() -> komet_engine::HarnessId {
         Ok("cursor") => komet_engine::HarnessId::Cursor,
         Ok("grok") => komet_engine::HarnessId::Grok,
         Ok("hermes") => komet_engine::HarnessId::Hermes,
-        Ok("opencode") => komet_engine::HarnessId::OpenCode,
+        Ok("opencode") => komet_engine::HarnessId::Opencode,
         Ok("pi") => komet_engine::HarnessId::Pi,
         _ => komet_engine::HarnessId::ClaudeCode,
     }

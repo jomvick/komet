@@ -52,7 +52,7 @@ pub struct EngineBootConfig {
     /// Workspace org override for explicit dev-mode runs.
     pub org_id: Option<String>,
     /// WorkOS client id for production authentication.
-    pub workos_client_id: Option<String>,
+    pub sync_token: Option<String>,
     /// Harness for doc-command runs until per-chat config lands (M4).
     pub default_harness: HarnessId,
 }
@@ -238,7 +238,7 @@ impl EngineHandle {
             ipc_port: config.ipc_port,
             default_harness: config.default_harness,
             org_id: config.org_id,
-            workos_client_id: config.workos_client_id,
+            sync_token: config.sync_token,
         };
 
         // Own the data dir before opening anything under it or binding IPC —
@@ -619,6 +619,7 @@ pub struct AppState {
     pub workspace_state: Option<komet_proto::WorkspaceState>,
     pub access_mode: komet_proto::AccessMode,
     engine: Option<EngineHandle>,
+    boot_config: Option<EngineBootConfig>,
     watch_tasks: Vec<Task<()>>,
     transcript_task: Option<Task<()>>,
 }
@@ -653,6 +654,7 @@ impl AppState {
             workspace_state: None,
             access_mode: komet_proto::AccessMode::FullAccess,
             engine: None,
+            boot_config: None,
             watch_tasks: Vec::new(),
             transcript_task: None,
             auto_selected: false,
@@ -1119,15 +1121,68 @@ impl AppState {
 
     // ---- gpui glue ----
 
+    /// Schedule a reconnect using the stored boot config (daemon died or was
+    /// replaced). Guarded: only one reconnect runs at a time, and only from a
+    /// previously-Remote or Failed state — InProcess engines are already local.
+    fn schedule_reconnect(&mut self, cx: &mut Context<Self>) {
+        if self.connection == ConnectionStatus::Connecting {
+            return;
+        }
+        let Some(config) = self.boot_config.clone() else {
+            return;
+        };
+        // Tear down stale remote watches before re-probing; `attach_engine`
+        // will recreate them.
+        self.watch_tasks.clear();
+        self.transcript_task = None;
+        // Keep transcript etc. until new engine attaches — avoid flash.
+        self.connection = ConnectionStatus::Connecting;
+        // Drop the dead engine handle so `attach_engine` can replace it cleanly.
+        // Shutdown is best-effort (remote daemon is already gone).
+        if let Some(old) = self.engine.take() {
+            let old = old;
+            cx.spawn(async move |_, _| old.shutdown().await).detach();
+        }
+        cx.notify();
+        // Re-use the existing bootstrap path (probe → remote-or-embed). We
+        // need an `App` context, but we only have `Context<Self>` here — spawn
+        // via gpui_tokio's `Tokio` handle and then hop back to gpui for the
+        // state update, mirroring `bootstrap`.
+        let state = cx.entity().clone();
+        cx.spawn(async move |_, cx| {
+            // Small delay to let a restarting daemon bind the port.
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(500))
+                .await;
+            let boot = Tokio::spawn(cx, EngineHandle::bootstrap(config));
+            let outcome = match boot.await {
+                Ok(Ok(handle)) => Ok(handle),
+                Ok(Err(err)) => Err(format!("{err:#}")),
+                Err(join_err) => Err(join_err.to_string()),
+            };
+            state.update(cx, |s, cx| match outcome {
+                Ok(handle) => s.attach_engine(handle, cx),
+                Err(message) => {
+                    tracing::error!(%message, "engine reconnect failed");
+                    s.connection = ConnectionStatus::Failed(message);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     /// Kick off (or retry) the engine bootstrap: probe → connect-or-embed on
     /// tokio, then attach subscriptions. Safe to call again after `Failed`.
     pub fn bootstrap(state: Entity<AppState>, config: EngineBootConfig, cx: &mut App) {
         let data_dir = config.data_dir.clone();
+        let boot_config = config.clone();
         state.update(cx, |s, cx| {
             s.connection = ConnectionStatus::Connecting;
             s.workspace_scope = None;
             s.auth = None;
             s.data_dir = Some(data_dir);
+            s.boot_config = Some(boot_config);
             cx.notify();
         });
         let boot = Tokio::spawn(cx, EngineHandle::bootstrap(config));
@@ -1352,6 +1407,10 @@ fn spawn_deferred_engine_watch(
     }))
 }
 
+fn is_connection_error(err: &RpcError) -> bool {
+    matches!(err, RpcError::Closed | RpcError::Transport(_))
+}
+
 /// Chats watch. Boot selection is the shell's job (it lands on the first
 /// restored open tab, device-local state this entity can't see); this task
 /// only pumps frames.
@@ -1370,7 +1429,15 @@ fn spawn_chats_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<(
             {
                 Ok(rx) => rx,
                 Err(err) => {
+                    let is_conn = is_connection_error(&err);
                     tracing::debug!(error = %err, "chats watch unavailable; retrying");
+                    if is_conn {
+                        let _ = this.update(cx, |state, cx| {
+                            tracing::warn!("engine connection lost (chats watch); reconnecting");
+                            state.schedule_reconnect(cx);
+                        });
+                        return;
+                    }
                     if this.update(cx, |_, _| {}).is_err() {
                         return;
                     }
@@ -1424,7 +1491,15 @@ fn spawn_watch<T: DeserializeOwned + 'static>(
             {
                 Ok(rx) => rx,
                 Err(err) => {
+                    let is_conn = is_connection_error(&err);
                     tracing::debug!(method, error = %err, "watch unavailable; retrying");
+                    if is_conn {
+                        let _ = this.update(cx, |state, cx| {
+                            tracing::warn!(method, "engine connection lost; reconnecting");
+                            state.schedule_reconnect(cx);
+                        });
+                        return;
+                    }
                     if this.update(cx, |_, _| {}).is_err() {
                         return;
                     }
@@ -1508,7 +1583,15 @@ fn spawn_transcript_watch(
             {
                 Ok(rx) => rx,
                 Err(err) => {
+                    let is_conn = is_connection_error(&err);
                     tracing::warn!(%chat_id, error = %err, "transcript watch failed; retrying");
+                    if is_conn {
+                        let _ = this.update(cx, |state, cx| {
+                            tracing::warn!(%chat_id, "engine connection lost (transcript); reconnecting");
+                            state.schedule_reconnect(cx);
+                        });
+                        return;
+                    }
                     if this.update(cx, |_, _| {}).is_err() {
                         return;
                     }
@@ -1618,7 +1701,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_daemon_identity_falls_back_to_synced_scope() {
+    async fn legacy_daemon_identity_remains_usable() {
         let client = memory_client(Arc::new(LegacyIdentityRpc));
 
         let info = query_engine_info(&client).await.unwrap();
@@ -1631,7 +1714,7 @@ mod tests {
                 Some(info.workspace_scope),
                 Some(&AuthState::SignedOut),
             ),
-            GatePhase::SignIn
+            GatePhase::Ready
         );
     }
 
@@ -1650,7 +1733,7 @@ mod tests {
             edge_url: "http://127.0.0.1:1".into(),
             edge_token: None,
             org_id: None,
-            workos_client_id: None,
+            sync_token: None,
             default_harness: HarnessId::Mock,
         })
         .await
@@ -1680,7 +1763,7 @@ mod tests {
             edge_url: "http://127.0.0.1:1".into(),
             edge_token: None, // offline
             org_id: None,
-            workos_client_id: None,
+            sync_token: None,
             default_harness: HarnessId::Mock,
         })
         .await
@@ -1718,7 +1801,7 @@ mod tests {
             edge_url: "http://127.0.0.1:1".into(),
             edge_token: None,
             org_id: None,
-            workos_client_id: Some("client_test".into()),
+            sync_token: Some("client_test".into()),
             default_harness: HarnessId::Mock,
         })
         .await
@@ -1773,7 +1856,7 @@ mod tests {
             edge_url: "http://127.0.0.1:1".into(),
             edge_token: None,
             org_id: None,
-            workos_client_id: None,
+            sync_token: None,
             default_harness: HarnessId::Mock,
         })
         .await
@@ -1811,7 +1894,7 @@ mod tests {
             edge_url: "http://127.0.0.1:1".into(),
             edge_token: None, // offline
             org_id: None,
-            workos_client_id: None,
+            sync_token: None,
             default_harness: HarnessId::Mock,
         })
         .await
@@ -1853,7 +1936,7 @@ mod tests {
             edge_url: "http://127.0.0.1:1".into(),
             edge_token: None, // offline
             org_id: None,
-            workos_client_id: None,
+            sync_token: None,
             default_harness: HarnessId::Mock,
         };
         let (a, b) = tokio::join!(
@@ -1913,7 +1996,7 @@ mod tests {
             edge_url: "http://127.0.0.1:1".into(),
             edge_token: None,
             org_id: None,
-            workos_client_id: None,
+            sync_token: None,
             default_harness: HarnessId::Mock,
         })
         .await
@@ -1940,7 +2023,7 @@ mod tests {
             edge_url: "http://127.0.0.1:1".into(),
             edge_token: None,
             org_id: None,
-            workos_client_id: Some("client_test".into()),
+            sync_token: Some("client_test".into()),
             default_harness: HarnessId::Mock,
         })
         .await
@@ -1991,7 +2074,7 @@ mod tests {
             edge_url: "http://127.0.0.1:1".into(),
             edge_token: None,
             org_id: None,
-            workos_client_id: Some("client_test".into()),
+            sync_token: Some("client_test".into()),
             default_harness: HarnessId::Mock,
         })
         .await
@@ -2049,7 +2132,7 @@ mod tests {
             edge_url: "http://127.0.0.1:1".into(),
             edge_token: None,
             org_id: None,
-            workos_client_id: None,
+            sync_token: None,
             default_harness: HarnessId::Mock,
         })
         .await
@@ -2528,11 +2611,6 @@ mod tests {
 
     #[test]
     fn gate_phases() {
-        let user = UserProfile {
-            id: "u".into(),
-            email: "w@example.com".into(),
-            name: None,
-        };
         assert_eq!(
             gate_phase(&ConnectionStatus::Connecting, None, None),
             GatePhase::Loading
@@ -2555,27 +2633,23 @@ mod tests {
                 Some(WorkspaceScope::Synced),
                 Some(&AuthState::SignedOut),
             ),
-            GatePhase::SignIn
+            GatePhase::Ready
         );
         assert_eq!(
             gate_phase(
                 &ConnectionStatus::Ready,
                 Some(WorkspaceScope::Synced),
-                Some(&AuthState::SignedIn {
-                    user: user.clone(),
-                    org_id: None
-                })
+                None
             ),
             GatePhase::Ready
         );
-        // No org yet → org gate.
         assert_eq!(
             gate_phase(
                 &ConnectionStatus::Ready,
                 Some(WorkspaceScope::Synced),
-                Some(&AuthState::NeedsOrganization { user })
+                Some(&AuthState::SignedOut)
             ),
-            GatePhase::OrgGate
+            GatePhase::Ready
         );
     }
 

@@ -154,94 +154,33 @@ pub enum GatePhase {
     Ready,
 }
 
-/// Missing scope is treated as synced. Current engines always publish
-/// [`WorkspaceScope`] before becoming ready, while old daemons are deliberately
-/// kept behind the account gate instead of being mistaken for local runtimes.
+/// Komet is local-first: once an engine is reachable, the shell is usable.
+///
+/// Authentication is not an application gate. Self-hosted synchronization is
+/// configured separately with a token, and an old daemon that does not report
+/// its scope must remain usable rather than being sent to the retired WorkOS
+/// sign-in flow.
 pub fn gate_phase(
     connection: &ConnectionStatus,
-    workspace_scope: Option<WorkspaceScope>,
-    auth: Option<&AuthState>,
+    _workspace_scope: Option<WorkspaceScope>,
+    _auth: Option<&AuthState>,
 ) -> GatePhase {
     match connection {
         ConnectionStatus::Connecting => GatePhase::Loading,
         ConnectionStatus::Failed(err) => GatePhase::Failed(err.clone()),
-        ConnectionStatus::Ready => match workspace_scope.unwrap_or(WorkspaceScope::Synced) {
-            WorkspaceScope::Local | WorkspaceScope::Development => GatePhase::Ready,
-            WorkspaceScope::Synced => match auth {
-                Some(AuthState::NeedsOrganization { .. }) => GatePhase::OrgGate,
-                Some(AuthState::SignedIn { .. }) => GatePhase::Ready,
-                Some(AuthState::SignedOut) | None => GatePhase::SignIn,
-            },
-        },
+        ConnectionStatus::Ready => GatePhase::Ready,
     }
 }
 
 #[cfg(test)]
 mod gate_tests {
     use super::*;
-    use crate::UserProfile;
 
-    fn user() -> UserProfile {
-        UserProfile {
-            id: "user-1".into(),
-            email: "user@example.com".into(),
-            name: None,
+    #[test]
+    fn ready_engine_never_requires_legacy_authentication() {
+        for scope in [None, Some(WorkspaceScope::Local), Some(WorkspaceScope::Synced), Some(WorkspaceScope::Development)] {
+            assert_eq!(gate_phase(&ConnectionStatus::Ready, scope, None), GatePhase::Ready);
         }
-    }
-
-    #[test]
-    fn workspace_scope_controls_the_auth_gate() {
-        assert_eq!(
-            gate_phase(
-                &ConnectionStatus::Ready,
-                Some(WorkspaceScope::Local),
-                Some(&AuthState::SignedOut),
-            ),
-            GatePhase::Ready
-        );
-        assert_eq!(
-            gate_phase(
-                &ConnectionStatus::Ready,
-                Some(WorkspaceScope::Synced),
-                Some(&AuthState::SignedOut),
-            ),
-            GatePhase::SignIn
-        );
-        assert_eq!(
-            gate_phase(
-                &ConnectionStatus::Ready,
-                Some(WorkspaceScope::Synced),
-                Some(&AuthState::NeedsOrganization { user: user() }),
-            ),
-            GatePhase::OrgGate
-        );
-    }
-
-    #[test]
-    fn development_and_local_never_use_the_workos_gate() {
-        for scope in [WorkspaceScope::Local, WorkspaceScope::Development] {
-            for auth in [
-                AuthState::SignedOut,
-                AuthState::NeedsOrganization { user: user() },
-                AuthState::SignedIn {
-                    user: user(),
-                    org_id: Some("org-1".into()),
-                },
-            ] {
-                assert_eq!(
-                    gate_phase(&ConnectionStatus::Ready, Some(scope), Some(&auth)),
-                    GatePhase::Ready
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn missing_scope_falls_back_to_a_synced_gate() {
-        assert_eq!(
-            gate_phase(&ConnectionStatus::Ready, None, None),
-            GatePhase::SignIn
-        );
     }
 }
 

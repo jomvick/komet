@@ -2361,6 +2361,13 @@ impl DocHost {
             auto_approve: false,
             attachments: Vec::new(),
             resume: None,
+            // This rebuilds the config for a STEER/resume on an already-
+            // established chat (dead-run fallback) — `chat.cwd` is already
+            // the directory that turn's original worktree (if any) resolved
+            // to, so this must never mint a NEW worktree on top of it.
+            // `ChatConfig` also carries no worktree field to recover from
+            // even if we wanted to.
+            worktree: None,
         })
     }
 

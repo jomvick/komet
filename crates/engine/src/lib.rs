@@ -100,8 +100,7 @@ pub struct EngineConfig {
     /// Workspace-doc org (`ws/{orgId}` room). `None` = `$KOMET_ORG_ID` or the dev default.
     /// In WorkOS mode the signed-in session's org wins.
     pub org_id: Option<String>,
-    /// WorkOS client id — enables real auth; `None` = dev mode (bearer = `edge_token`).
-    pub workos_client_id: Option<String>,
+    pub sync_token: Option<String>,
 }
 
 /// The assembled engine core — also constructible without the IPC server for tests
@@ -556,18 +555,7 @@ impl Engine {
     /// installations must be able to start locally without network access.
     pub async fn build_auth(config: &EngineConfig) -> Auth {
         let mut auth_config = AuthConfig::new(config.edge_url.clone(), config.data_dir.clone());
-        auth_config.workos_client_id = config.workos_client_id.clone();
-        if let Ok(base) = std::env::var("KOMET_WORKOS_API_BASE")
-            && !base.trim().is_empty()
-        {
-            auth_config.workos_api_base = base;
-        }
-        auth_config.callback_port = Some(
-            std::env::var("KOMET_CALLBACK_PORT")
-                .ok()
-                .and_then(|p| p.parse().ok())
-                .unwrap_or(27641),
-        );
+        auth_config.sync_token = config.sync_token.clone().or_else(|| std::env::var("KOMET_SYNC_TOKEN").ok());
         if let Some(token) = &config.edge_token {
             auth_config.dev_user_id = token.clone();
         }

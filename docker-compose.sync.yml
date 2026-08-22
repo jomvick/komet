@@ -1,0 +1,11 @@
+services:
+  komet-sync:
+    build:
+      context: .
+      dockerfile: crates/sync-server/Dockerfile
+    ports: ["8787:8787"]
+    volumes: ["./data-sync:/data"]
+    environment:
+      KOMET_SYNC_TOKEN: ${KOMET_SYNC_TOKEN:-}
+      KOMET_SYNC_PORT: 8787
+    restart: unless-stopped

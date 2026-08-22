@@ -685,6 +685,11 @@ impl SessionsEngine {
                             auto_approve: false,
                             attachments: Vec::new(),
                             resume: None,
+                            // Auto-resume after an engine restart: reconnects
+                            // to the journal's already-existing `cwd` — must
+                            // never mint a fresh worktree on top of a session
+                            // that already has one (or doesn't need one).
+                            worktree: None,
                         })
                     });
                 let Some(mut request) = request else {

@@ -172,10 +172,11 @@ pub enum SettingsSection {
     Notifications,
     Shortcuts,
     Archived,
+    Sync,
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 7] = [
+    pub const ALL: [SettingsSection; 8] = [
         SettingsSection::Devices,
         SettingsSection::Harnesses,
         SettingsSection::Agents,
@@ -183,6 +184,7 @@ impl SettingsSection {
         SettingsSection::Notifications,
         SettingsSection::Shortcuts,
         SettingsSection::Archived,
+        SettingsSection::Sync,
     ];
 
     /// Sidebar + header label (komet settings-sidebar.tsx SECTIONS / __root.tsx
@@ -196,6 +198,7 @@ impl SettingsSection {
             SettingsSection::Notifications => "Notifications",
             SettingsSection::Shortcuts => "Shortcuts",
             SettingsSection::Archived => "Archived sessions",
+            SettingsSection::Sync => "Sync",
         }
     }
 }
@@ -2152,6 +2155,7 @@ impl Shell {
                     None => Empty.into_any_element(),
                 }
             }
+            SettingsSection::Sync => crate::settings::sync::render_sync_settings(cx),
         }
     }
 
@@ -3114,6 +3118,7 @@ impl Shell {
             SettingsSection::Notifications => icons::BELL,
             SettingsSection::Shortcuts => icons::KEYBOARD,
             SettingsSection::Archived => icons::ARCHIVE_MINIMALISTIC,
+            SettingsSection::Sync => icons::GLOBAL,
         };
         // Match the user's dragged sidebar width — the pane container clips to
         // it, so a hardcoded default here left hover washes stopping short of
@@ -6719,7 +6724,7 @@ mod tests {
             edge_url: "http://127.0.0.1:1".into(),
             edge_token: None,
             org_id: None,
-            workos_client_id: Some("client_test".into()),
+            sync_token: Some("client_test".into()),
             default_harness: komet_proto::HarnessId::Mock,
         };
         let synced = crate::state::EngineHandle::bootstrap(boot.clone())
