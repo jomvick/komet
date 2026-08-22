@@ -1597,7 +1597,7 @@ async fn autonomous_turn_ended_extension_settles_between_prompts() {
 #[test]
 fn opencode_descriptor_surface_matches_registry_expectations() {
     let opencode = AcpHarness::opencode();
-    assert_eq!(opencode.id(), HarnessId::OpenCode);
+    assert_eq!(opencode.id(), HarnessId::Opencode);
     assert_eq!(opencode.display_name(), "OpenCode");
     // opencode has no `_session/steering` extension; steers are delivered as
     // plain session/prompts at turn boundaries (the no-extension path).

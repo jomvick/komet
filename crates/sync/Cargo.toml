@@ -32,3 +32,6 @@ komet-proto.workspace = true
 tempfile.workspace = true
 # `start_paused` virtual-clock tests (the 2026-07-30 sync-stall regressions).
 tokio = { workspace = true, features = ["test-util"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"

@@ -181,6 +181,10 @@ impl TitleGenerator {
                 auto_approve: true,
                 attachments: Vec::new(),
                 resume: None,
+                // A throwaway titling completion runs directly in the
+                // chat's existing cwd — it never materializes its own
+                // worktree.
+                worktree: None,
             };
             match collect_text(harness.as_ref(), request).await {
                 Ok(raw) => {

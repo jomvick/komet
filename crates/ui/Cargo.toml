@@ -31,6 +31,7 @@ chrono.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 sha2.workspace = true
+nucleo-matcher = "0.3.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc = "0.2"

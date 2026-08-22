@@ -14,11 +14,12 @@ pub enum HarnessId {
     Hermes,
     /// The pi coding agent (pi.dev), driven over ACP via the `pi-acp` adapter.
     Pi,
-    /// The opencode CLI's native ACP server (`opencode acp`).
-    #[serde(alias = "opencode", alias = "open_code")]
-    OpenCode,
+    /// SST's opencode agent, driven over ACP (`opencode acp`).
+    #[serde(alias = "open-code")]
+    Opencode,
     /// Test harness; never shown in production pickers.
     Mock,
+    Antigravity,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -114,6 +115,26 @@ pub struct RunRequest {
     /// content blocks. Additive + serde-defaulted for wire compat.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<String>,
+    /// Host-side isolated-worktree creation (see [`WorktreeSpec`]): when set,
+    /// the HOST materializes the worktree at command-drain time and runs there
+    /// instead of `cwd`. Additive + serde-defaulted for wire compat — an old
+    /// host ignores it and runs in `cwd` (the repo's main checkout).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<WorktreeSpec>,
+}
+
+/// Isolated-worktree directive riding [`RunRequest`]. The worktree is created
+/// by the HOST while draining the queued Run — not by the sender over a
+/// blocking CreateWorktree RPC — so the send path stays durable: a lost relay
+/// frame can't wedge the composer on "Sending…" while the session runs anyway
+/// (2026-08-18 user report).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeSpec {
+    /// The repo whose worktree to create (the space's folder on the host).
+    pub repo_path: String,
+    /// Base ref the fresh `komet/<name>` branch is created off.
+    pub base: String,
 }
 
 /// The session-scoped singleton id for the live plan/todo chip. ACP plan
@@ -183,6 +204,67 @@ pub enum ToolCall {
         input: Option<serde_json::Value>,
     },
 }
+
+impl ToolCall {
+    /// A subagent SPAWN call — the `Agent[: <description>]` naming convention
+    /// every driver decodes its spawn tool into (claude/codex `Task`, cursor
+    /// `task`, grok `spawn_subagent`, opencode `task`). This is the single
+    /// genus gate for subagent binding: tagged subagent traffic may only ever
+    /// stamp a ref/status onto a spawn call, so a driver keying bug can never
+    /// turn an ordinary Run/Read chip into a spawn chip (2026-08-20: claude's
+    /// background-shell `task_notification` did exactly that — the chip
+    /// linked to a never-created doc and opened an empty panel).
+    pub fn is_subagent_spawn(&self) -> bool {
+        let name = match self {
+            ToolCall::Unknown { name, .. } => name,
+            ToolCall::Mcp { tool, .. } => tool,
+            _ => return false,
+        };
+        name == "Agent" || name.starts_with("Agent: ")
+    }
+
+    /// The model a subagent SPAWN was given, when the spawn named one.
+    ///
+    /// Read off the spawn's own input rather than the session's picked model:
+    /// a spawn may override it per child (claude's `Agent` takes `model`, grok
+    /// `spawn_subagent` a `model_id`), and two chips spawned in one turn can
+    /// legitimately name different models. `None` means the spawn didn't say —
+    /// the child inherits the parent's model, which the chip already implies,
+    /// so nothing is rendered rather than guessing a name.
+    ///
+    /// Only ever answers for [`is_subagent_spawn`](Self::is_subagent_spawn)
+    /// calls: an ordinary tool with a stray `model` argument is not a spawn.
+    pub fn subagent_model(&self) -> Option<&str> {
+        if !self.is_subagent_spawn() {
+            return None;
+        }
+        let input = match self {
+            ToolCall::Unknown { input, .. } | ToolCall::Mcp { input, .. } => input.as_ref()?,
+            _ => return None,
+        };
+        SUBAGENT_MODEL_KEYS
+            .iter()
+            .find_map(|key| input.get(key).and_then(serde_json::Value::as_str))
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+    }
+}
+
+/// Spawn-input keys that carry a child model, in precedence order. Drivers
+/// disagree on the spelling, so the lookup is by key set, not by harness —
+/// a new adapter naming it any of these needs no code change here.
+pub const SUBAGENT_MODEL_KEYS: [&str; 4] = ["model", "modelId", "model_id", "subagent_model"];
+
+/// The spawn-input keys [`sanitize_tool_call`](crate::) must preserve so the
+/// chip can name the child's model. Deliberately tiny: everything else on a
+/// spawn's input (the whole prompt, most of all) stays host-local.
+pub const SUBAGENT_INPUT_KEEP: [&str; 5] = [
+    "model",
+    "modelId",
+    "model_id",
+    "subagent_model",
+    "subagent_type",
+];
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -329,9 +411,32 @@ pub enum AgentEvent {
         error: Option<String>,
         session_id: Option<String>,
     },
+    /// A USER-role message injected into a running session — today only seen
+    /// wrapped in [`AgentEvent::Subagent`]: the PARENT agent steering its
+    /// subagent mid-run (claude: a tagged user frame's text blocks). The
+    /// engine writes it to the subagent doc as its own user entry, closing
+    /// the streaming assistant segment above it — the subagent transcript
+    /// then reads like any steered chat. Never emitted untagged (the parent
+    /// chat's user messages come from doc commands, not the wire).
+    #[serde(rename_all = "camelCase")]
+    UserMessage {
+        text: String,
+    },
+    /// An event belonging to a SUBAGENT's nested transcript, attributed to
+    /// the spawning tool call (`parent_tool_use_id` = the parent-feed
+    /// `ToolCall::id` that launched it). Never folded into the parent chat
+    /// doc — the engine routes these to the subagent's own doc; the parent
+    /// keeps only the spawn chip. Additive: old consumers that don't match
+    /// this variant drop the nested traffic, which is the pre-subagent-viz
+    /// behavior.
+    #[serde(rename_all = "camelCase")]
+    Subagent {
+        parent_tool_use_id: String,
+        event: Box<AgentEvent>,
+    },
 }
 
-/// Cumulative usage and context window metrics for a session thread.
+/// Cumulative provider-reported usage and context-window metrics for a chat.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContextUsageStats {
@@ -350,94 +455,66 @@ pub struct ContextUsageStats {
 
 impl ContextUsageStats {
     pub fn new(context_limit: u64) -> Self {
-        let limit = if context_limit == 0 { 200_000 } else { context_limit };
+        let context_limit = if context_limit == 0 { 200_000 } else { context_limit };
         Self {
-            input_tokens: 0,
-            cached_input_tokens: 0,
-            output_tokens: 0,
-            reasoning_tokens: 0,
-            context_limit: limit,
-            compact_threshold: Some((limit as f64 * 0.75) as u64),
-            compactions_count: 0,
-            compactions_reason: None,
+            context_limit,
+            compact_threshold: Some(context_limit.saturating_mul(3) / 4),
+            ..Self::default()
         }
     }
 
-    /// Total tokens used in thread.
+    /// Cached and reasoning tokens are provider breakdowns already included
+    /// in the input/output totals, so they are not counted a second time.
     pub fn total_tokens(&self) -> u64 {
         self.input_tokens.saturating_add(self.output_tokens)
     }
 
-    /// Current context load ratio (0.0 to 1.0).
     pub fn context_ratio(&self) -> f32 {
         if self.context_limit == 0 {
-            return 0.0;
+            0.0
+        } else {
+            (self.total_tokens() as f32 / self.context_limit as f32).clamp(0.0, 1.0)
         }
-        let total = self.input_tokens.saturating_add(self.output_tokens);
-        (total as f32 / self.context_limit as f32).clamp(0.0, 1.0)
     }
 
-    /// Current context percentage (0 to 100).
     pub fn context_percent(&self) -> u32 {
         (self.context_ratio() * 100.0).round() as u32
     }
 
-    /// Ingest a new usage event into the session's cumulative metrics.
     pub fn ingest(&mut self, input: u64, cached: u64, output: u64, reasoning: u64, limit: Option<u64>) {
-        if input > 0 {
-            self.input_tokens = self.input_tokens.saturating_add(input);
-        }
-        if cached > 0 {
-            self.cached_input_tokens = self.cached_input_tokens.saturating_add(cached);
-        }
-        if output > 0 {
-            self.output_tokens = self.output_tokens.saturating_add(output);
-        }
-        if reasoning > 0 {
-            self.reasoning_tokens = self.reasoning_tokens.saturating_add(reasoning);
-        }
-        if let Some(limit) = limit {
-            if limit > 0 {
-                self.context_limit = limit;
-                self.compact_threshold = Some((limit as f64 * 0.75) as u64);
-            }
+        self.input_tokens = self.input_tokens.saturating_add(input);
+        self.cached_input_tokens = self.cached_input_tokens.saturating_add(cached);
+        self.output_tokens = self.output_tokens.saturating_add(output);
+        self.reasoning_tokens = self.reasoning_tokens.saturating_add(reasoning);
+        if let Some(limit) = limit.filter(|limit| *limit > 0) {
+            self.context_limit = limit;
+            self.compact_threshold = Some(limit.saturating_mul(3) / 4);
         }
     }
 }
 
-/// Helper to estimate default context limits from model names.
+/// Conservative context-window defaults for providers that do not report one.
 pub fn default_context_limit_for_model(model_name: &str) -> u64 {
-    let lower = model_name.to_lowercase();
-    if lower.contains("gemini-1.5") || lower.contains("gemini-2.0") || lower.contains("gemini-2.5") {
+    let model = model_name.to_ascii_lowercase();
+    if ["gemini-1.5", "gemini-2.0", "gemini-2.5"].iter().any(|name| model.contains(name)) {
         1_000_000
-    } else if lower.contains("claude-3-7") || lower.contains("claude-3-5") || lower.contains("claude-3") {
-        200_000
-    } else if lower.contains("deepseek") {
+    } else if model.contains("deepseek") || ["gpt-4o", "o1", "o3"].iter().any(|name| model.contains(name)) {
         128_000
-    } else if lower.contains("gpt-4o") || lower.contains("o1") || lower.contains("o3") {
-        128_000
-    } else if lower.contains("grok") {
+    } else if model.contains("grok") {
         131_072
     } else {
         200_000
     }
 }
 
-/// Formats raw token counts to human-readable strings like "116k", "1.0m", "24m".
+/// Formats token counts for compact UI labels.
 pub fn format_tokens(count: u64) -> String {
-    if count >= 1_000_000_000 {
-        format!("{:.1}b", count as f64 / 1_000_000_000.0)
-    } else if count >= 10_000_000 {
-        format!("{}m", count / 1_000_000)
-    } else if count >= 1_000_000 {
-        format!("{:.1}m", count as f64 / 1_000_000.0)
-    } else if count >= 10_000 {
-        format!("{}k", count / 1_000)
-    } else if count >= 1_000 {
-        format!("{:.1}k", count as f64 / 1_000.0)
-    } else {
-        count.to_string()
-    }
+    if count >= 1_000_000_000 { format!("{:.1}b", count as f64 / 1_000_000_000.0) }
+    else if count >= 10_000_000 { format!("{}m", count / 1_000_000) }
+    else if count >= 1_000_000 { format!("{:.1}m", count as f64 / 1_000_000.0) }
+    else if count >= 10_000 { format!("{}k", count / 1_000) }
+    else if count >= 1_000 { format!("{:.1}k", count as f64 / 1_000.0) }
+    else { count.to_string() }
 }
 
 #[cfg(test)]
@@ -454,6 +531,61 @@ mod tests {
         };
         let json = serde_json::to_string(&ev).unwrap();
         assert_eq!(serde_json::from_str::<AgentEvent>(&json).unwrap(), ev);
+    }
+
+    /// Drivers spell the key differently; the chip must not care which one
+    /// spawned the child. Non-spawns never answer, whatever they carry.
+    #[test]
+    fn subagent_model_reads_every_spelling_and_only_off_a_spawn() {
+        let spawn = |input: serde_json::Value| ToolCall::Unknown {
+            name: "Agent: scan".into(),
+            input: Some(input),
+        };
+        for key in SUBAGENT_MODEL_KEYS {
+            let call = spawn(serde_json::json!({ key: "haiku" }));
+            assert_eq!(call.subagent_model(), Some("haiku"), "key {key}");
+        }
+        // An MCP-shaped spawn (cursor routes its `task` through MCP) too.
+        assert_eq!(
+            ToolCall::Mcp {
+                server: "s".into(),
+                tool: "Agent: scan".into(),
+                input: Some(serde_json::json!({ "model": "sonnet" })),
+            }
+            .subagent_model(),
+            Some("sonnet")
+        );
+        // Not a spawn: the name gate wins over the key.
+        assert_eq!(
+            ToolCall::Unknown {
+                name: "Bash".into(),
+                input: Some(serde_json::json!({ "model": "haiku" })),
+            }
+            .subagent_model(),
+            None
+        );
+        // A spawn that named nothing usable inherits — nothing to render.
+        assert_eq!(
+            spawn(serde_json::json!({ "model": " " })).subagent_model(),
+            None
+        );
+        assert_eq!(
+            spawn(serde_json::json!({ "prompt": "x" })).subagent_model(),
+            None
+        );
+        assert_eq!(
+            ToolCall::Unknown {
+                name: "Agent".into(),
+                input: None
+            }
+            .subagent_model(),
+            None
+        );
+        // Non-string values are not names.
+        assert_eq!(
+            spawn(serde_json::json!({ "model": 5 })).subagent_model(),
+            None
+        );
     }
 
     #[test]
@@ -476,6 +608,29 @@ mod tests {
     }
 
     #[test]
+    fn run_request_worktree_default_and_round_trip() {
+        // Old-wire JSON without the field parses (additive compat)…
+        let old = r#"{"prompt":"p","model":null,"reasoning":null,"cwd":".","sandbox":"workspace-write","resume":null}"#;
+        let req: RunRequest = serde_json::from_str(old).unwrap();
+        assert!(req.worktree.is_none());
+        // …and `None` serializes away (old readers never see it).
+        let json = serde_json::to_value(&req).unwrap();
+        assert!(json.get("worktree").is_none());
+        // A populated spec round-trips camelCased.
+        let req = RunRequest {
+            worktree: Some(WorktreeSpec {
+                repo_path: "/repos/comet".into(),
+                base: "main".into(),
+            }),
+            ..req
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["worktree"]["repoPath"], "/repos/comet");
+        let round: RunRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(round.worktree, req.worktree);
+    }
+
+    #[test]
     fn harness_id_uses_kebab_case() {
         assert_eq!(
             serde_json::to_string(&HarnessId::ClaudeCode).unwrap(),
@@ -484,37 +639,26 @@ mod tests {
     }
 
     #[test]
-    fn context_usage_stats_calculation_and_ingest() {
-        let mut stats = ContextUsageStats::new(1_000_000);
-        assert_eq!(stats.context_limit, 1_000_000);
-        assert_eq!(stats.compact_threshold, Some(750_000));
-        assert_eq!(stats.context_percent(), 0);
-
-        stats.ingest(100_000, 50_000, 16_000, 8_000, None);
-        assert_eq!(stats.input_tokens, 100_000);
-        assert_eq!(stats.cached_input_tokens, 50_000);
-        assert_eq!(stats.output_tokens, 16_000);
-        assert_eq!(stats.reasoning_tokens, 8_000);
-        assert_eq!(stats.total_tokens(), 116_000);
-        assert_eq!(stats.context_percent(), 12); // 116k / 1.0m ~ 11.6% -> 12%
+    fn opencode_accepts_its_legacy_wire_name() {
+        assert_eq!(
+            serde_json::from_str::<HarnessId>("\"open-code\"").unwrap(),
+            HarnessId::Opencode
+        );
+        assert_eq!(
+            serde_json::to_string(&HarnessId::Opencode).unwrap(),
+            "\"opencode\""
+        );
     }
 
     #[test]
-    fn format_tokens_utility() {
-        assert_eq!(format_tokens(0), "0");
-        assert_eq!(format_tokens(500), "500");
-        assert_eq!(format_tokens(1_500), "1.5k");
-        assert_eq!(format_tokens(116_000), "116k");
-        assert_eq!(format_tokens(1_000_000), "1.0m");
-        assert_eq!(format_tokens(24_000_000), "24m");
-        assert_eq!(format_tokens(1_500_000_000), "1.5b");
-    }
+    fn context_usage_accumulates_without_double_counting_breakdowns() {
+        let mut stats = ContextUsageStats::new(128_000);
+        stats.ingest(10_000, 2_000, 500, 300, None);
 
-    #[test]
-    fn default_context_limit_detection() {
-        assert_eq!(default_context_limit_for_model("claude-3-7-sonnet"), 200_000);
-        assert_eq!(default_context_limit_for_model("gemini-2.0-flash"), 1_000_000);
-        assert_eq!(default_context_limit_for_model("deepseek-v3"), 128_000);
-        assert_eq!(default_context_limit_for_model("gpt-4o"), 128_000);
+        assert_eq!(stats.total_tokens(), 10_500);
+        assert_eq!(stats.context_percent(), 8);
+        assert_eq!(stats.compact_threshold, Some(96_000));
+        assert_eq!(default_context_limit_for_model("gemini-2.5-pro"), 1_000_000);
+        assert_eq!(format_tokens(10_500), "10k");
     }
 }

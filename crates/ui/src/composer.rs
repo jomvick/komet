@@ -4814,6 +4814,7 @@ impl Composer {
                             auto_approve: false,
                             resume: None,
                             attachments: attachment_paths,
+                            worktree: None,
                         },
                         message_id: message_id.clone(),
                     }

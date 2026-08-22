@@ -21,26 +21,24 @@ komet update      # update to the latest release
 komet daemon start|stop|restart|status
 ```
 
-## Multi-device sync (future)
+## Multi-device sync (self-hosted)
 
-Komet currently runs **100% locally**: no account, no login screen, no network
-calls. Every session, attachment and diff stays on the machine that created it.
+Komet runs **100% locally** by default. To sync between devices, self-host `komet-sync`:
 
-Multi-device sync is part of the app's roadmap. The codebase already contains
-the building blocks — the `edge/` sync worker (Loro CRDT rooms, device relays,
-R2 attachments) and the WorkOS auth routes — but they are disabled by default.
-To enable sync later:
+```bash
+komet sync-init                          # prints KOMET_SYNC_TOKEN
+docker compose -f docker-compose.sync.yml up -d  # on your VPS
+# or locally: KOMET_SYNC_TOKEN=xxx komet sync-server
+```
 
-1. Deploy the `edge/` worker to your own Cloudflare account and create a WorkOS
-   AuthKit app (set the real client id in `edge/wrangler.jsonc`).
-2. Run the engine with `KOMET_WORKOS_CLIENT_ID=<your client id>`, and
-   `KOMET_EDGE_URL=<your edge host>` if you self-host instead of using the
-   default edge endpoint.
+Then on each device:
+```bash
+export KOMET_EDGE_URL=http://YOUR_VPS:8787
+export KOMET_SYNC_TOKEN=xxx
+komet
+```
 
-With sync enabled you could start an agent on one device and follow or drive it
-from another; an always-on machine such as a VPS can keep those agents working
-after you close your laptop. Until then, `komet login` just reports
-"dev mode — there is nothing to sign in to" and the app never leaves the machine.
+See `docs/self-hosted-sync.md` for details. Legacy Cloudflare/WorkOS `edge/` is deprecated.
 
 On macOS: use the desktop release, or build `komet` from source and run `komet daemon install` to install the launchd service.
 

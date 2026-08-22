@@ -15,7 +15,7 @@ pub struct MockHarness {
     pub script: Vec<AgentEvent>,
 }
 
-/// The scripted question set for the `KOMET_MOCK_QUESTION` variant (exercises
+/// The scripted question set for the `ZERON_MOCK_QUESTION` variant (exercises
 /// the QuestionPanel end-to-end: single-select page, multi-select page).
 fn question_script() -> Vec<UserInputQuestion> {
     vec![
@@ -91,22 +91,22 @@ impl Harness for MockHarness {
         _request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
-        // Optional pacing knob for demos/manual testing: `KOMET_MOCK_DELAY_MS`
+        // Optional pacing knob for demos/manual testing: `ZERON_MOCK_DELAY_MS`
         // spaces the scripted events out so live-run UI states (working
         // indicator, streaming fade, trailing tool-group auto-open) are
         // observable. Unset (the default, and in tests) streams instantly.
-        let delay_ms = std::env::var("KOMET_MOCK_DELAY_MS")
+        let delay_ms = std::env::var("ZERON_MOCK_DELAY_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(0);
         let delay = std::time::Duration::from_millis(delay_ms);
 
-        // Dev/testing knob: `KOMET_MOCK_QUESTION=1` swaps in a run that asks
+        // Dev/testing knob: `ZERON_MOCK_QUESTION=1` swaps in a run that asks
         // the user questions mid-stream via `controls.request_input` (the
         // engine mints the request id, emits `InputRequested`, and resolves it
         // from the `RespondInput` doc command) — the only data-side way to put
         // the QuestionPanel on screen.
-        let question_mode = std::env::var("KOMET_MOCK_QUESTION")
+        let question_mode = std::env::var("ZERON_MOCK_QUESTION")
             .ok()
             .is_some_and(|v| !v.is_empty() && v != "0");
         if question_mode {
@@ -154,26 +154,26 @@ impl Harness for MockHarness {
             return Ok(stream.boxed());
         }
 
-        // Dev/testing knob: `KOMET_MOCK_REPEAT=N` loops the script body N times
+        // Dev/testing knob: `ZERON_MOCK_REPEAT=N` loops the script body N times
         // before the final Done — long single-reply streams for frame-cost /
         // smoothness measurement (the terminal `Done` is emitted exactly once,
         // at the very end).
-        let repeat = std::env::var("KOMET_MOCK_REPEAT")
+        let repeat = std::env::var("ZERON_MOCK_REPEAT")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(1)
             .max(1);
-        // Dev/testing knob: `KOMET_MOCK_ERROR=1` appends a scripted error
+        // Dev/testing knob: `ZERON_MOCK_ERROR=1` appends a scripted error
         // before the terminal Done — the only data-side way to put the
         // transcript ErrorChip on screen with the mock harness.
-        let mock_error = std::env::var("KOMET_MOCK_ERROR")
+        let mock_error = std::env::var("ZERON_MOCK_ERROR")
             .ok()
             .is_some_and(|v| !v.is_empty() && v != "0");
-        // Dev/testing knob: `KOMET_MOCK_TABLE=1` appends scripted GFM tables
+        // Dev/testing knob: `ZERON_MOCK_TABLE=1` appends scripted GFM tables
         // before the terminal Done — a plain 3-column grid plus a wide/uneven
         // one (long prose cell beside short cells, mixed alignment) for
         // table-styling checks against the reference app.
-        let mock_table = std::env::var("KOMET_MOCK_TABLE")
+        let mock_table = std::env::var("ZERON_MOCK_TABLE")
             .ok()
             .is_some_and(|v| !v.is_empty() && v != "0");
         let done_ix = self
@@ -185,10 +185,10 @@ impl Harness for MockHarness {
         let error_event = mock_error.then(|| AgentEvent::Error {
             message: "Claude usage limit reached — try again after the limit resets.".into(),
         });
-        // Dev/testing knob: `KOMET_MOCK_CODE=1` appends rust + ts code blocks
+        // Dev/testing knob: `ZERON_MOCK_CODE=1` appends rust + ts code blocks
         // (keywords, strings, numbers, comments) plus inline code — for
         // syntax-palette and inline-code styling checks against the reference.
-        let mock_code = std::env::var("KOMET_MOCK_CODE")
+        let mock_code = std::env::var("ZERON_MOCK_CODE")
             .ok()
             .is_some_and(|v| !v.is_empty() && v != "0");
         let code_event = mock_code.then(|| AgentEvent::TextDelta {
@@ -228,11 +228,11 @@ impl Harness for MockHarness {
                 | Sync | Session-room fan-out | 18ms |\n\n"
                 .into(),
         });
-        // Dev/testing knob: `KOMET_MOCK_MEND=1` appends a link/list-heavy
+        // Dev/testing knob: `ZERON_MOCK_MEND=1` appends a link/list-heavy
         // passage — bold-led list items, inline links, emphasis, strikethrough
         // — the shapes whose half-streamed markers the display mend
         // (crates/ui markdown/mend.rs) must hold steady while streaming.
-        let mock_mend = std::env::var("KOMET_MOCK_MEND")
+        let mock_mend = std::env::var("ZERON_MOCK_MEND")
             .ok()
             .is_some_and(|v| !v.is_empty() && v != "0");
         let mend_event = mock_mend.then(|| AgentEvent::TextDelta {
@@ -247,6 +247,187 @@ impl Harness for MockHarness {
             )
             .into(),
         });
+        // Dev/testing knob: `ZERON_MOCK_SUBAGENT=1` appends two spawn chips
+        // whose nested traffic arrives as tagged `AgentEvent::Subagent`
+        // events — the only data-side way to put spawn chips (running → done)
+        // AND their openable subagent docs on screen with the mock harness.
+        // The second subagent finishes after a beat of nested activity, so a
+        // paced run (`ZERON_MOCK_DELAY_MS`) holds a Running chip long enough
+        // to observe.
+        let mock_subagent = std::env::var("ZERON_MOCK_SUBAGENT")
+            .ok()
+            .is_some_and(|v| !v.is_empty() && v != "0");
+        let subagent_events = mock_subagent
+            .then(|| {
+                let tag = |parent: &str, event: AgentEvent| AgentEvent::Subagent {
+                    parent_tool_use_id: parent.into(),
+                    event: Box::new(event),
+                };
+                let spawn = |id: &str, description: &str, prompt: &str| AgentEvent::ToolCall {
+                    id: id.into(),
+                    // The claude-driver spawn shape: `Agent: {description}`
+                    // with the task in the input (names the chip AND the tab).
+                    call: komet_proto::ToolCall::Unknown {
+                        name: format!("Agent: {description}"),
+                        input: Some(serde_json::json!({
+                            "description": description,
+                            "prompt": prompt,
+                        })),
+                    },
+                };
+                let resolve = |id: &str| AgentEvent::ToolResult {
+                    id: id.into(),
+                    is_error: false,
+                    output: None,
+                    diff: None,
+                };
+                let done = AgentEvent::Done {
+                    status: DoneStatus::Completed,
+                    result: None,
+                    error: None,
+                    session_id: None,
+                };
+                vec![
+                    AgentEvent::TextDelta {
+                        text: "\n### Subagent check\n\nFanning out two scouts before the fold rewrite.\n\n".into(),
+                    },
+                    spawn(
+                        "mock-sub-1",
+                        "Audit the fold path",
+                        "Read crates/doc and list every call site of fold_event_into_parts, checking each holds the byte cap.",
+                    ),
+                    spawn(
+                        "mock-sub-2",
+                        "Verify the commit cadence",
+                        "Measure the 120ms coalesced commit cadence under a scripted delta burst.",
+                    ),
+                    // The spawn prompts seed each subagent's opening user
+                    // entry (like the claude driver's Task-prompt seeding).
+                    tag(
+                        "mock-sub-1",
+                        AgentEvent::UserMessage {
+                            text: "Read crates/doc and list every call site of fold_event_into_parts, checking each holds the byte cap.".into(),
+                        },
+                    ),
+                    tag(
+                        "mock-sub-2",
+                        AgentEvent::UserMessage {
+                            text: "Measure the 120ms coalesced commit cadence under a scripted delta burst.".into(),
+                        },
+                    ),
+                    tag(
+                        "mock-sub-1",
+                        AgentEvent::TextDelta {
+                            text: "Scanning `crates/doc` for fold call sites.\n\n".into(),
+                        },
+                    ),
+                    tag(
+                        "mock-sub-1",
+                        AgentEvent::ToolCall {
+                            id: "sub1-grep".into(),
+                            call: komet_proto::ToolCall::Exec {
+                                command: "grep -rn fold_event_into_parts crates".into(),
+                            },
+                        },
+                    ),
+                    tag("mock-sub-1", resolve("sub1-grep")),
+                    tag(
+                        "mock-sub-1",
+                        AgentEvent::TextDelta {
+                            text: "Three call sites: the live fold, the rebuild, and the subagent sink — every one applies the byte cap before persisting.".into(),
+                        },
+                    ),
+                    resolve("mock-sub-1"),
+                    tag("mock-sub-1", done.clone()),
+                    // A steer AFTER the subagent settled (claude's queued
+                    // SendMessage shape): resurrects the chip and reopens
+                    // the frozen transcript for the resumed segment.
+                    tag(
+                        "mock-sub-1",
+                        AgentEvent::UserMessage {
+                            text: "One more: confirm the rebuild path holds the byte cap too."
+                                .into(),
+                        },
+                    ),
+                    tag(
+                        "mock-sub-1",
+                        AgentEvent::TextDelta {
+                            text: "Rebuild path checked — same cap, applied before persisting."
+                                .into(),
+                        },
+                    ),
+                    tag("mock-sub-1", done.clone()),
+                    tag(
+                        "mock-sub-2",
+                        AgentEvent::TextDelta {
+                            text: "Driving a 2k-delta burst through the writer.\n\n".into(),
+                        },
+                    ),
+                    tag(
+                        "mock-sub-2",
+                        AgentEvent::ToolCall {
+                            id: "sub2-burst".into(),
+                            call: komet_proto::ToolCall::Exec {
+                                command: "cargo test -p komet-doc cadence_burst -- --nocapture".into(),
+                            },
+                        },
+                    ),
+                    resolve("mock-sub-2"),
+                    tag("mock-sub-2", resolve("sub2-burst")),
+                    tag(
+                        "mock-sub-2",
+                        AgentEvent::TextDelta {
+                            text: "Commits land on the 120ms cadence; no commit carried more than one burst.".into(),
+                        },
+                    ),
+                    // A parent→subagent steer: splits the transcript into a
+                    // user entry + fresh assistant segment (like the claude
+                    // driver's tagged user text blocks).
+                    tag(
+                        "mock-sub-2",
+                        AgentEvent::UserMessage {
+                            text: "Also verify the cadence holds while a steer lands mid-burst.".into(),
+                        },
+                    ),
+                    tag(
+                        "mock-sub-2",
+                        AgentEvent::TextDelta {
+                            text: "Re-running with a mid-burst steer injected.\n\n".into(),
+                        },
+                    ),
+                    tag(
+                        "mock-sub-2",
+                        AgentEvent::ToolCall {
+                            id: "sub2-steer-burst".into(),
+                            call: komet_proto::ToolCall::Exec {
+                                command: "cargo test -p komet-doc cadence_steer -- --nocapture"
+                                    .into(),
+                            },
+                        },
+                    ),
+                    tag("mock-sub-2", resolve("sub2-steer-burst")),
+                    tag(
+                        "mock-sub-2",
+                        AgentEvent::TextDelta {
+                            text: "Watching the commit log while the burst drains: ".into(),
+                        },
+                    ),
+                    tag("mock-sub-2", AgentEvent::TextDelta { text: "batch 1 clean, ".into() }),
+                    tag("mock-sub-2", AgentEvent::TextDelta { text: "batch 2 clean, ".into() }),
+                    tag("mock-sub-2", AgentEvent::TextDelta { text: "batch 3 clean, ".into() }),
+                    tag("mock-sub-2", AgentEvent::TextDelta { text: "batch 4 clean, ".into() }),
+                    tag("mock-sub-2", AgentEvent::TextDelta { text: "batch 5 clean — ".into() }),
+                    tag(
+                        "mock-sub-2",
+                        AgentEvent::TextDelta {
+                            text: "every window under 120ms.\n\nSteer landed between commits; the cadence held.".into(),
+                        },
+                    ),
+                    tag("mock-sub-2", done),
+                ]
+            })
+            .into_iter()
+            .flatten();
         // With the code knob, also exercise a MULTILINE Exec command — the
         // round-9 chip breaker shape ("set -e\nfixture_in_original=0"): the
         // Run chip must stay one 30px line.
@@ -275,6 +456,7 @@ impl Harness for MockHarness {
             .take(body.len() * repeat)
             .cloned()
             .chain(code_tool_events)
+            .chain(subagent_events)
             .chain(code_event)
             .chain(table_event)
             .chain(mend_event)
@@ -282,12 +464,12 @@ impl Harness for MockHarness {
             .chain(tail.iter().cloned())
             .map(Ok)
             .collect();
-        // Dev/testing knob: `KOMET_MOCK_CHARS=N` re-chunks every TextDelta
-        // into N-char deltas, so `KOMET_MOCK_DELAY_MS` paces *characters*
+        // Dev/testing knob: `ZERON_MOCK_CHARS=N` re-chunks every TextDelta
+        // into N-char deltas, so `ZERON_MOCK_DELAY_MS` paces *characters*
         // instead of whole scripted blocks — delta boundaries then land inside
         // inline markers and links, which is the streaming shape real
         // harnesses produce and the display mend exists for.
-        let chunk_chars = std::env::var("KOMET_MOCK_CHARS")
+        let chunk_chars = std::env::var("ZERON_MOCK_CHARS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&n| n > 0);
@@ -311,12 +493,27 @@ impl Harness for MockHarness {
                 })
                 .collect(),
         };
-        if delay_ms == 0 {
+        // Dev/testing knob: `ZERON_MOCK_SUBAGENT_DELAY_MS` paces TAGGED
+        // (subagent) events on their own clock — the parent turn settles at
+        // `ZERON_MOCK_DELAY_MS` speed while the background subagents stream
+        // on slowly, which is exactly the eager-done shape live tabs are
+        // observed under (and the only way a rig click can reliably land
+        // inside a subagent's streaming window).
+        let sub_delay_ms = std::env::var("ZERON_MOCK_SUBAGENT_DELAY_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok());
+        if delay_ms == 0 && sub_delay_ms.is_none() {
             return Ok(futures::stream::iter(events).boxed());
         }
         Ok(futures::stream::iter(events)
             .then(move |event| async move {
-                tokio::time::sleep(delay).await;
+                let pause = match (&event, sub_delay_ms) {
+                    (Ok(AgentEvent::Subagent { .. }), Some(ms)) => {
+                        std::time::Duration::from_millis(ms)
+                    }
+                    _ => delay,
+                };
+                tokio::time::sleep(pause).await;
                 event
             })
             .boxed())

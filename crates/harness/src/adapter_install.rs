@@ -4,7 +4,7 @@
 //! user's npm state in the hot path: a cold cache meant a multi-minute
 //! download while the chat showed "Working", and a broken one meant npm dying
 //! before the adapter ever ran — silently, with an errno-encoded exit code
-//! (254 = ENOENT — the known npm fatal-fs-error encoding) that surfaced as an opaque
+//! (254 = ENOENT, the kometsh/comet#95 crash) that surfaced as an opaque
 //! "harness protocol error". Instead, pinned adapter packages are installed
 //! ONCE into a komet-owned prefix (`~/.komet/adapters/<pkg>/<version>`, own
 //! npm cache beside it, so a root-owned or read-only `~/.npm` can't break
@@ -59,9 +59,9 @@ impl NpmPin {
 const OK_MARKER: &str = ".komet-install-ok";
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// `$KOMET_ADAPTERS_DIR`, else `~/.komet/adapters`.
+/// `$ZERON_ADAPTERS_DIR`, else `~/.komet/adapters`.
 fn adapters_root() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("KOMET_ADAPTERS_DIR").filter(|d| !d.is_empty()) {
+    if let Some(dir) = std::env::var_os("ZERON_ADAPTERS_DIR").filter(|d| !d.is_empty()) {
         return Some(PathBuf::from(dir));
     }
     std::env::var_os("HOME")
@@ -227,6 +227,90 @@ pub(crate) async fn ensure_installed(
     })
 }
 
+/// A komet-owned shim script materialized INSIDE a managed install dir, for
+/// SDK packages with no bin entry (`@cursor/sdk`): the shim resolves the SDK
+/// from the sibling `node_modules`. Returns the shim path when the install is
+/// complete AND the shim contents match this build (a comet upgrade that
+/// changes the shim rewrites it in place).
+pub(crate) fn installed_shim(pin: &NpmPin, shim_name: &str, contents: &str) -> Option<PathBuf> {
+    let dir = install_dir(pin)?;
+    if !dir.join(OK_MARKER).exists() {
+        return None;
+    }
+    let shim = dir.join(shim_name);
+    match std::fs::read_to_string(&shim) {
+        Ok(existing) if existing == contents => Some(shim),
+        _ => {
+            std::fs::write(&shim, contents).ok()?;
+            Some(shim)
+        }
+    }
+}
+
+/// Like [`ensure_installed`], for a package consumed as a LIBRARY by a
+/// komet-owned shim rather than through a bin entry. Installs the pin once,
+/// writes `contents` as `<install-dir>/<shim_name>`, and returns the shim
+/// path (spawn it via [`launch_for_entry`]).
+pub(crate) async fn ensure_installed_shim(
+    pin: NpmPin,
+    display_name: &str,
+    shim_name: &str,
+    contents: &str,
+) -> Result<PathBuf, HarnessError> {
+    if let Some(shim) = installed_shim(&pin, shim_name, contents) {
+        return Ok(shim);
+    }
+    let _guard = install_lock().lock().await;
+    if let Some(shim) = installed_shim(&pin, shim_name, contents) {
+        return Ok(shim);
+    }
+
+    let Some(npm) = find_npm() else {
+        return Err(HarnessError::NotInstalled(format!(
+            "npm (required to install the {display_name} SDK {}; searched \
+             PATH, the login shell's PATH, and fnm/nvm/volta/pnpm/bun install dirs)",
+            pin.spec()
+        )));
+    };
+    let root = adapters_root().ok_or_else(|| {
+        HarnessError::Install("cannot locate an adapters directory (HOME is unset)".into())
+    })?;
+    let final_dir = install_dir(&pin).expect("root resolved");
+    let tmp_dir = root.join(format!(
+        ".tmp-{}-{}-{}",
+        pin.dir_name(),
+        pin.version,
+        std::process::id()
+    ));
+    let cache_dir = root.join(".npm-cache");
+    let install = install_into(&npm, &pin, &tmp_dir, &cache_dir, display_name).await;
+    if let Err(e) = install {
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        return Err(e);
+    }
+    std::fs::write(tmp_dir.join(shim_name), contents)?;
+    std::fs::write(tmp_dir.join(OK_MARKER), pin.version)?;
+    if let Some(parent) = final_dir.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if std::fs::rename(&tmp_dir, &final_dir).is_err() {
+        // Lost a cross-process race (or a stale dir): keep whatever is in
+        // place if it's complete, else replace it.
+        if !final_dir.join(OK_MARKER).exists() {
+            let _ = std::fs::remove_dir_all(&final_dir);
+            std::fs::rename(&tmp_dir, &final_dir)?;
+        } else {
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+        }
+    }
+    installed_shim(&pin, shim_name, contents).ok_or_else(|| {
+        HarnessError::Install(format!(
+            "install of {} finished but its shim did not resolve",
+            pin.spec()
+        ))
+    })
+}
+
 async fn install_into(
     npm: &Path,
     pin: &NpmPin,
@@ -343,9 +427,6 @@ mod tests {
         assert_eq!(pin.dir_name(), "pi-acp");
     }
 
-    // npm maps errno → exit code as `errno << 8` on unix only; the
-    // simulation below can't be built on Windows.
-    #[cfg(unix)]
     #[test]
     fn npm_errno_exits_are_decoded() {
         use std::os::unix::process::ExitStatusExt;

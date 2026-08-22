@@ -262,13 +262,13 @@ impl HarnessRegistry {
                         if let Ok(fresh) = harness.models().await
                             && !fresh.is_empty()
                         {
-                            cache
-                                .lock()
-                                .unwrap_or_else(PoisonError::into_inner)
-                                .insert(id, CachedModels {
+                            cache.lock().unwrap_or_else(PoisonError::into_inner).insert(
+                                id,
+                                CachedModels {
                                     discovered_at_ms: crate::now_ms(),
                                     models: fresh.clone(),
-                                });
+                                },
+                            );
                             if let Some(path) = path {
                                 let file = ModelsCacheFile {
                                     entries: cache
@@ -504,8 +504,8 @@ pub fn default_registry() -> HarnessRegistry {
             name: "Claude Code".into(),
             supports_steering: true,
             steering_mode: SteeringMode::StepBoundary,
-            // Must mirror AcpHarness::claude()'s spec exactly — the
-            // descriptor-stability rule (see the codex test below).
+            // Must mirror the native Claude harness exactly — the
+            // descriptor-stability rule (see the Codex test below).
             reasoning_levels: vec![
                 ReasoningLevel::Low,
                 ReasoningLevel::Medium,
@@ -516,10 +516,10 @@ pub fn default_registry() -> HarnessRegistry {
             installed: true,
             enabled: None,
         },
-        Box::new(|| komet_harness::AcpHarness::claude().installed()),
-        Box::new(|| Ok(Arc::new(komet_harness::AcpHarness::claude()) as Arc<dyn Harness>)),
+        Box::new(|| komet_harness::ClaudeHarness::new().installed()),
+        Box::new(|| Ok(Arc::new(komet_harness::ClaudeHarness::new()) as Arc<dyn Harness>)),
     );
-    // Codex, same lazy pattern: the static descriptor mirrors AcpHarness::codex()
+    // Codex, same lazy pattern: the static descriptor mirrors CodexHarness
     // exactly (`describe()` after the first resolve must not change the
     // catalog entry) — "Codex" per the original HARNESS_LABEL, StepBoundary
     // steering via native `turn/steer`, and the unified reasoning ladder from
@@ -543,11 +543,11 @@ pub fn default_registry() -> HarnessRegistry {
             installed: true,
             enabled: None,
         },
-        Box::new(|| komet_harness::AcpHarness::codex().installed()),
-        Box::new(|| Ok(Arc::new(komet_harness::AcpHarness::codex()) as Arc<dyn Harness>)),
+        Box::new(|| komet_harness::CodexHarness::new().installed()),
+        Box::new(|| Ok(Arc::new(komet_harness::CodexHarness::new()) as Arc<dyn Harness>)),
     );
-    // Cursor Agent over ACP (`cursor-agent acp`), same lazy pattern: the
-    // static descriptor mirrors AcpHarness::cursor() exactly. No steering
+    // Cursor Agent over the native SDK shim, same lazy pattern: the static
+    // descriptor mirrors CursorHarness exactly. No mid-turn steering
     // extension (turn boundaries) and no effort ladder — Cursor bakes effort
     // into the model id's bracket suffix instead of a `thought_level` option.
     registry.register_lazy(
@@ -560,8 +560,8 @@ pub fn default_registry() -> HarnessRegistry {
             installed: true,
             enabled: None,
         },
-        Box::new(|| komet_harness::AcpHarness::cursor().installed()),
-        Box::new(|| Ok(Arc::new(komet_harness::AcpHarness::cursor()) as Arc<dyn Harness>)),
+        Box::new(|| komet_harness::CursorHarness::new().installed()),
+        Box::new(|| Ok(Arc::new(komet_harness::CursorHarness::new()) as Arc<dyn Harness>)),
     );
     // Grok Build over ACP, same lazy pattern: the static descriptor mirrors
     // AcpHarness::grok() exactly. No `_session/steering` extension yet, so
@@ -607,7 +607,7 @@ pub fn default_registry() -> HarnessRegistry {
     // boundaries with an empty reasoning ladder.
     registry.register_lazy(
         HarnessDescriptor {
-            id: HarnessId::OpenCode,
+            id: HarnessId::Opencode,
             name: "OpenCode".into(),
             supports_steering: true,
             steering_mode: SteeringMode::TurnBoundary,
@@ -648,6 +648,25 @@ pub fn default_registry() -> HarnessRegistry {
         },
         Box::new(|| komet_harness::AcpHarness::pi().installed()),
         Box::new(|| Ok(Arc::new(komet_harness::AcpHarness::pi()) as Arc<dyn Harness>)),
+    );
+    // Google Antigravity CLI (`agy`) uses its documented headless NDJSON
+    // protocol; it is discovered lazily like the other local agents.
+    registry.register_lazy(
+        HarnessDescriptor {
+            id: HarnessId::Antigravity,
+            name: "Antigravity".into(),
+            supports_steering: false,
+            steering_mode: SteeringMode::TurnBoundary,
+            reasoning_levels: vec![
+                ReasoningLevel::Low,
+                ReasoningLevel::Medium,
+                ReasoningLevel::High,
+            ],
+            installed: true,
+            enabled: None,
+        },
+        Box::new(|| komet_harness::AntigravityHarness::new().installed()),
+        Box::new(|| Ok(Arc::new(komet_harness::AntigravityHarness::new()) as Arc<dyn Harness>)),
     );
     registry
 }
@@ -705,8 +724,9 @@ mod tests {
                 HarnessId::Cursor,
                 HarnessId::Grok,
                 HarnessId::Hermes,
-                HarnessId::OpenCode,
-                HarnessId::Pi
+                HarnessId::Opencode,
+                HarnessId::Pi,
+                HarnessId::Antigravity,
             ]
         );
         assert!(registry.resolve(HarnessId::Mock).is_ok());
@@ -740,8 +760,8 @@ mod tests {
         assert_eq!(hermes.display_name(), "Hermes");
         assert_eq!(hermes.steering_mode(), SteeringMode::TurnBoundary);
         assert!(hermes.reasoning_levels().is_empty());
-        let opencode = registry.resolve(HarnessId::OpenCode).unwrap();
-        assert_eq!(opencode.id(), HarnessId::OpenCode);
+        let opencode = registry.resolve(HarnessId::Opencode).unwrap();
+        assert_eq!(opencode.id(), HarnessId::Opencode);
         assert_eq!(opencode.display_name(), "OpenCode");
         assert_eq!(opencode.steering_mode(), SteeringMode::TurnBoundary);
         assert!(opencode.reasoning_levels().is_empty());
@@ -758,6 +778,18 @@ mod tests {
                 ReasoningLevel::High,
                 ReasoningLevel::XHigh,
                 ReasoningLevel::Max
+            ]
+        );
+        let antigravity = registry.resolve(HarnessId::Antigravity).unwrap();
+        assert_eq!(antigravity.id(), HarnessId::Antigravity);
+        assert_eq!(antigravity.display_name(), "Antigravity CLI");
+        assert_eq!(antigravity.steering_mode(), SteeringMode::TurnBoundary);
+        assert_eq!(
+            antigravity.reasoning_levels(),
+            &[
+                ReasoningLevel::Low,
+                ReasoningLevel::Medium,
+                ReasoningLevel::High
             ]
         );
     }
@@ -879,11 +911,7 @@ mod tests {
         reloaded.load_prefs(dir.path());
         reloaded.load_models_cache(dir.path());
         let cached = reloaded.models(HarnessId::Mock).await;
-        let ids: Vec<String> = cached
-            .unwrap()
-            .into_iter()
-            .map(|m| m.id)
-            .collect();
+        let ids: Vec<String> = cached.unwrap().into_iter().map(|m| m.id).collect();
         assert_eq!(ids, vec!["mock-1", "mock-fable-5"]);
     }
 
@@ -915,7 +943,7 @@ mod tests {
         // Fallback: a wire-first harness whose probe advertises nothing
         // keeps the previously-cached list rather than emptying the picker.
         registry.models_cache_entries().insert(
-            HarnessId::OpenCode,
+            HarnessId::Opencode,
             CachedModels {
                 discovered_at_ms: crate::now_ms(),
                 models: vec![Model {
@@ -937,7 +965,7 @@ mod tests {
             reg.register(Arc::new(harness) as Arc<dyn Harness>);
             // Seed the same cache entry the parent holds.
             *reg.models_cache_entries() = registry.models_cache_entries().clone();
-            reg.models(HarnessId::OpenCode).await
+            reg.models(HarnessId::Opencode).await
         };
         assert_eq!(
             fallback.unwrap()[0].id,

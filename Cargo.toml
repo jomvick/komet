@@ -10,6 +10,7 @@ members = [
     "crates/update",
     "crates/ui",
     "crates/syntax",
+    "crates/sync-server",
     "apps/komet",
 ]
 
@@ -29,6 +30,7 @@ komet-rpc = { path = "crates/rpc" }
 komet-update = { path = "crates/update" }
 komet-ui = { path = "crates/ui" }
 komet-syntax = { path = "crates/syntax" }
+komet-sync-server = { path = "crates/sync-server" }
 
 # CRDT
 loro = "1.13"
