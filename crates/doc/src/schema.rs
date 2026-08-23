@@ -90,6 +90,13 @@ struct DocPartJson {
     /// Per-file diff stats (additive).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     diff_stats: Option<serde_json::Value>,
+    /// Subagent lifecycle fields (schema parity with `MessagePart::Tool`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    subagent_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    subagent_status: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    subagent_tail: Option<String>,
 }
 
 /// App parts → doc part json (mirror of `toDocParts`).
@@ -112,6 +119,9 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             output_bytes,
             diff_ref,
             diff_stats,
+            subagent_ref,
+            subagent_status,
+            subagent_tail,
         } => DocPartJson {
             id: id.clone(),
             kind: "tool".into(),
@@ -125,6 +135,12 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             output_bytes: *output_bytes,
             diff_ref: diff_ref.clone(),
             diff_stats: diff_stats.as_ref().map(serde_json::to_value).transpose()?,
+            subagent_ref: subagent_ref.clone(),
+            subagent_status: subagent_status
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()?,
+            subagent_tail: subagent_tail.clone(),
             ..Default::default()
         },
         MessagePart::Input {
@@ -163,6 +179,11 @@ fn from_doc_part(p: DocPartJson) -> MessagePart {
                 output_bytes: p.output_bytes,
                 diff_ref: p.diff_ref,
                 diff_stats: p.diff_stats.and_then(|s| serde_json::from_value(s).ok()),
+                subagent_ref: p.subagent_ref,
+                subagent_status: p
+                    .subagent_status
+                    .and_then(|s| serde_json::from_value(s).ok()),
+                subagent_tail: p.subagent_tail,
             },
             None => MessagePart::Text {
                 id: p.id,
@@ -699,6 +720,9 @@ fn salvage_part(part: &serde_json::Value, entry_id: &str, ix: usize) -> Option<M
             output_bytes: None,
             diff_ref: None,
             diff_stats: None,
+            subagent_ref: None,
+            subagent_status: None,
+            subagent_tail: None,
         });
     }
     if let Some(message) = obj.get("message").and_then(|x| x.as_str()) {
@@ -1216,6 +1240,9 @@ mod tests {
                 output_bytes: None,
                 diff_ref: None,
                 diff_stats: None,
+                subagent_ref: None,
+                subagent_status: None,
+                subagent_tail: None,
             }],
             created_at: 1,
             device_id: "dev-a".into(),

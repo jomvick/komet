@@ -221,21 +221,17 @@ impl Harness for AntigravityHarness {
                                             if tx.send(Ok(AgentEvent::ToolResult { id, is_error, output: info.get("output").and_then(Value::as_str).map(str::to_owned), diff: None })).await.is_err() { break; }
                                         }
                                     }
-                                    if let Some(usage) = step.get("usage") {
-                                        if tx.send(Ok(usage_event(usage))).await.is_err() { break; }
-                                    }
+                                    if let Some(usage) = step.get("usage")
+                                        && tx.send(Ok(usage_event(usage))).await.is_err() { break; }
                                 }
                                 Some("result") => {
                                     let result = frame.get("result").unwrap_or(&Value::Null);
                                     session_id = result.get("conversation_id").and_then(Value::as_str).map(str::to_owned).or(session_id);
-                                    if !saw_text {
-                                        if let Some(text) = result.get("response").and_then(Value::as_str).filter(|text| !text.is_empty()) {
-                                            if tx.send(Ok(AgentEvent::TextDelta { text: text.to_owned() })).await.is_err() { break; }
-                                        }
-                                    }
-                                    if let Some(usage) = result.get("usage") {
-                                        if tx.send(Ok(usage_event(usage))).await.is_err() { break; }
-                                    }
+                                    if !saw_text
+                                        && let Some(text) = result.get("response").and_then(Value::as_str).filter(|text| !text.is_empty())
+                                            && tx.send(Ok(AgentEvent::TextDelta { text: text.to_owned() })).await.is_err() { break; }
+                                    if let Some(usage) = result.get("usage")
+                                        && tx.send(Ok(usage_event(usage))).await.is_err() { break; }
                                     let success = result.get("status").and_then(Value::as_str) == Some("SUCCESS");
                                     let event = AgentEvent::Done {
                                         status: if success { DoneStatus::Completed } else { DoneStatus::Errored },

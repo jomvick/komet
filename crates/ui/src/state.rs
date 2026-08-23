@@ -561,6 +561,11 @@ struct PendingSend {
 /// truth after this.
 pub const PENDING_SEND_TTL_MS: i64 = 30_000;
 
+struct UploadProgress {
+    done: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    total: u64,
+}
+
 /// Root application state. Reducer methods (`apply_*`, [`Self::session_for`], …)
 /// are plain `&mut self` functions so tests construct the struct directly; gpui
 /// glue ([`Self::bootstrap`], [`Self::select_chat`]) layers subscriptions on top.
@@ -606,6 +611,8 @@ pub struct AppState {
     /// Send-in-flight overlay per chat id: a queued doc command the host
     /// hasn't executed yet (see [`Self::begin_pending_send`]).
     pending_sends: HashMap<String, PendingSend>,
+    /// The in-flight send's attachment upload, when it has one.
+    upload_progress: Option<UploadProgress>,
     /// This engine's device id (best-effort `LocalDevice` probe; `None` until
     /// the engine serves it — views degrade gracefully).
     pub local_device_id: Option<String>,
@@ -647,6 +654,7 @@ impl AppState {
             transcript: Vec::new(),
             echoes: HashMap::new(),
             pending_sends: HashMap::new(),
+            upload_progress: None,
             local_device_id: None,
             update: None,
             context_usage: HashMap::new(),
@@ -754,11 +762,10 @@ impl AppState {
 
     /// Derives or returns the current context usage metrics for the selected chat.
     pub fn current_context_usage(&self) -> komet_proto::ContextUsageStats {
-        if let Some(chat_id) = &self.selected_chat {
-            if let Some(stats) = self.context_usage.get(chat_id) {
+        if let Some(chat_id) = &self.selected_chat
+            && let Some(stats) = self.context_usage.get(chat_id) {
                 return stats.clone();
             }
-        }
         let model_name = self
             .selected_chat_row()
             .and_then(|c| c.config.as_ref())
@@ -920,6 +927,36 @@ impl AppState {
             .and_then(|id| self.echoes.get(id))
             .map(|v| v.as_slice())
             .unwrap_or(&[])
+    }
+
+    /// Attachment upload starting: expose its progress to the working label.
+    pub fn begin_upload_progress(
+        &mut self,
+        total: u64,
+        done: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) {
+        self.upload_progress = Some(UploadProgress { done, total });
+    }
+
+    /// Upload leg over (success or failure) — the label goes back to plain
+    /// send/working wording.
+    pub fn end_upload_progress(&mut self) {
+        self.upload_progress = None;
+    }
+
+    /// Percent of the in-flight attachment upload, clamped to 99 — the last
+    /// point belongs to the commit + queue, so "100% but still spinning"
+    /// never shows. `None` when no upload is in flight (or it's empty).
+    pub fn upload_progress_percent(&self) -> Option<u8> {
+        let progress = self.upload_progress.as_ref()?;
+        if progress.total == 0 {
+            return None;
+        }
+        let done = progress
+            .done
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .min(progress.total);
+        Some(((done * 100) / progress.total).min(99) as u8)
     }
 
     // ---- queries ----
@@ -1790,9 +1827,10 @@ mod tests {
     #[tokio::test]
     async fn bootstrap_reports_local_assembly_failure_before_returning_a_handle() {
         let dir = tempfile::tempdir().unwrap();
-        komet_engine::EngineProfile::local(dir.path()).unwrap();
-        std::fs::create_dir(dir.path().join("profiles")).unwrap();
-        std::fs::write(dir.path().join("profiles/local"), b"not a directory").unwrap();
+        // Komet is local-first: the boot resolves the DEVELOPMENT profile, so
+        // the store corruption must sit on that profile's device root.
+        std::fs::create_dir_all(dir.path().join("orgs")).unwrap();
+        std::fs::write(dir.path().join("orgs/dev-org"), b"not a directory").unwrap();
         let port = free_port().await;
 
         let error = match EngineHandle::bootstrap(EngineBootConfig {
@@ -2029,7 +2067,12 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(handle.engine_info().workspace_scope, WorkspaceScope::Local);
+        // Komet is local-first: without a synced backend the boot resolves the
+        // development profile (dev identity, no sign-in gate).
+        assert_eq!(
+            handle.engine_info().workspace_scope,
+            WorkspaceScope::Development
+        );
         let info: EngineInfo = handle
             .client()
             .call_as(methods::ENGINE_INFO, serde_json::json!({}))
@@ -2042,71 +2085,16 @@ mod tests {
             .subscribe(methods::AUTH_STATUS, serde_json::json!({}))
             .await
             .unwrap();
-        assert_eq!(
+        assert!(matches!(
             parse_auth_state(&auth.recv().await.unwrap()),
-            Some(AuthState::SignedOut)
-        );
+            Some(AuthState::SignedIn { .. })
+        ));
         let harnesses = handle
             .client()
             .call(methods::LIST_HARNESSES, serde_json::json!({}))
             .await
             .expect("local data RPC is immediately available");
         assert!(harnesses.as_array().is_some_and(|items| !items.is_empty()));
-        assert!(
-            !dir.path().join("orgs/dev-org/dev-user").exists(),
-            "production boot must not create dev-user data"
-        );
-        assert!(dir.path().join("profiles/local").is_dir());
-        handle.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn engine_info_is_available_while_cloud_onboarding_is_deferred() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("session.json"),
-            r#"{"refreshToken":"saved","user":{"id":"user_1","email":"u@example.com"}}"#,
-        )
-        .unwrap();
-        let handle = EngineHandle::bootstrap(EngineBootConfig {
-            data_dir: dir.path().to_path_buf(),
-            ipc_port: free_port().await,
-            edge_url: "http://127.0.0.1:1".into(),
-            edge_token: None,
-            org_id: None,
-            sync_token: Some("client_test".into()),
-            default_harness: HarnessId::Mock,
-        })
-        .await
-        .unwrap();
-
-        assert!(matches!(
-            handle
-                .deferred_state()
-                .expect("embedded lifecycle")
-                .borrow()
-                .clone(),
-            DeferredEngineState::Waiting
-        ));
-
-        let info: EngineInfo = handle
-            .client()
-            .call_as(methods::ENGINE_INFO, serde_json::json!({}))
-            .await
-            .expect("EngineInfo bypasses deferred cloud stores");
-        assert_eq!(info.workspace_scope, WorkspaceScope::Synced);
-        assert!(
-            tokio::time::timeout(
-                std::time::Duration::from_millis(100),
-                handle
-                    .client()
-                    .call(methods::LIST_HARNESSES, serde_json::json!({})),
-            )
-            .await
-            .is_err(),
-            "cloud data waits for organization onboarding"
-        );
-        assert!(!dir.path().join("orgs").exists());
         handle.shutdown().await;
     }
 

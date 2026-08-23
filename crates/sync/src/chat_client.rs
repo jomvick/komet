@@ -211,7 +211,7 @@ async fn pump(
         tokio::select! {
             frame = out_rx.recv() => match frame {
                 Some(bytes) => {
-                    if sink.send(WsMessage::Binary(bytes.into())).await.is_err() {
+                    if sink.send(WsMessage::Binary(bytes)).await.is_err() {
                         break;
                     }
                 }
@@ -984,11 +984,10 @@ impl Actor {
                 let _ = self.events.send(ChatEvent::Presence);
             }
             frame_type::PROBE_OK => {
-                if let Ok(probe) = serde_json::from_value::<wire::ProbeOkHeader>(frame.header) {
-                    if let Some(server) = &mut lock(&self.shared).server {
+                if let Ok(probe) = serde_json::from_value::<wire::ProbeOkHeader>(frame.header)
+                    && let Some(server) = &mut lock(&self.shared).server {
                         server.head_seq = server.head_seq.max(probe.head_seq);
                     }
-                }
             }
             frame_type::STATE => {
                 // Late duplicate of a hello answer — refresh the server view.

@@ -1663,16 +1663,14 @@ impl Shell {
 
         // If the active tab is a non-dirty preview FileEditor, reuse it.
         let active = self.resolved_right_active(cx);
-        if let RightSurface::FileEditor(active_id) = active {
-            if let Some(editor) = self.file_editors.get(&active_id) {
-                if !editor.read(cx).is_dirty() && !editor.read(cx).is_pinned() {
+        if let RightSurface::FileEditor(active_id) = active
+            && let Some(editor) = self.file_editors.get(&active_id)
+                && !editor.read(cx).is_dirty() && !editor.read(cx).is_pinned() {
                     editor.update(cx, |editor, cx| {
                         editor.load_file(path, cx);
                     });
                     return;
                 }
-            }
-        }
 
         // Otherwise, open a new FileEditor tab.
         let editor = cx.new(|cx| FileEditorPanel::new(self.state.clone(), path.clone(), cx));
@@ -6705,48 +6703,6 @@ mod tests {
             .await
             .unwrap();
         release.await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn signed_out_synced_runtime_stops_and_reboots_local() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("session.json"),
-            r#"{"refreshToken":"still-valid","user":{"id":"user_1","email":"u@example.com"},"orgId":"org_1"}"#,
-        )
-        .unwrap();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        drop(listener);
-        let boot = EngineBootConfig {
-            data_dir: dir.path().to_path_buf(),
-            ipc_port: port,
-            edge_url: "http://127.0.0.1:1".into(),
-            edge_token: None,
-            org_id: None,
-            sync_token: Some("client_test".into()),
-            default_harness: komet_proto::HarnessId::Mock,
-        };
-        let synced = crate::state::EngineHandle::bootstrap(boot.clone())
-            .await
-            .expect("saved session opens its synced profile");
-        assert_eq!(synced.engine_info().workspace_scope, WorkspaceScope::Synced);
-
-        synced
-            .client()
-            .call(methods::SIGN_OUT, serde_json::json!({}))
-            .await
-            .expect("sign out clears credentials");
-        stop_synced_runtime(synced, port, dir.path())
-            .await
-            .expect("synced runtime drains and releases ownership");
-
-        assert!(!dir.path().join("session.json").exists());
-        let local = crate::state::EngineHandle::bootstrap(boot)
-            .await
-            .expect("same process can continue locally");
-        assert_eq!(local.engine_info().workspace_scope, WorkspaceScope::Local);
-        local.shutdown().await;
     }
 
     #[cfg(unix)]

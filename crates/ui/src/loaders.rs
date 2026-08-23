@@ -10,7 +10,10 @@
 //! cell to its rest state automatically (gpui `reduce_motion`).
 
 use crate::icons;
-use gpui::{AnyElement, App, EntityId, IntoElement, ParentElement, SharedString, Styled, div, px};
+use gpui::{
+    AnyElement, App, EntityId, IntoElement, ParentElement, PathBuilder, SharedString, Styled, canvas,
+    div, point, px,
+};
 
 use crate::motion::{self, GRADIENT_SPIN, KOMET_PULSE, PULSE_STAGGER, SPLASH_OUT};
 use crate::theme::Theme;
@@ -139,6 +142,67 @@ pub fn mini_gradient_spinner(
 ) -> impl IntoElement {
     let size = (cell_px * 5.0).max(14.0);
     ThinkingOrb::new(OrbState::Working, size).driven(view, cx)
+}
+
+/// Stroke width of [`upload_progress_ring`].
+const RING_STROKE: f32 = 2.5;
+/// Polyline segments for a full circle — plenty for a ≤40px ring.
+const RING_SEGMENTS: f32 = 64.0;
+
+/// Radial upload-progress ring with the percent centered — overlaid on a
+/// sending echo's attachment thumbnail while its bytes cross the relay.
+/// A faint full track plus a bright arc growing clockwise from 12 o'clock.
+pub fn upload_progress_ring(percent: u8, diameter: f32) -> AnyElement {
+    let frac = f32::from(percent.min(100)) / 100.0;
+    let ring = canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            let center = bounds.center();
+            let radius = diameter / 2.0 - RING_STROKE;
+            let mut paint_arc = |sweep: f32, color: gpui::Hsla| {
+                if sweep <= 0.0 {
+                    return;
+                }
+                let steps = ((RING_SEGMENTS * sweep).ceil() as usize).max(2);
+                let at = |i: usize| {
+                    // Clockwise from 12 o'clock.
+                    let theta = -std::f32::consts::FRAC_PI_2
+                        + std::f32::consts::TAU * sweep * (i as f32 / steps as f32);
+                    point(
+                        center.x + px(radius * theta.cos()),
+                        center.y + px(radius * theta.sin()),
+                    )
+                };
+                let mut builder = PathBuilder::stroke(px(RING_STROKE));
+                builder.move_to(at(0));
+                for i in 1..=steps {
+                    builder.line_to(at(i));
+                }
+                if let Ok(path) = builder.build() {
+                    window.paint_path(path, color);
+                }
+            };
+            paint_arc(1.0, gpui::hsla(0.0, 0.0, 1.0, 0.22));
+            paint_arc(frac, gpui::hsla(0.0, 0.0, 1.0, 0.95));
+        },
+    )
+    .absolute()
+    .inset_0();
+    div()
+        .relative()
+        .size(px(diameter))
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(ring)
+        .child(
+            div()
+                .text_size(px(9.0))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(gpui::hsla(0.0, 0.0, 1.0, 0.95))
+                .child(SharedString::from(format!("{percent}%"))),
+        )
+        .into_any_element()
 }
 
 /// Full-window boot splash: the Komet SVG mark centered on the frosted glass

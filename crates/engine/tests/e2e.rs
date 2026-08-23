@@ -36,6 +36,7 @@ fn run_request(prompt: &str) -> RunRequest {
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: true,
         attachments: Vec::new(),
+        worktree: None,
         resume: None,
     }
 }
@@ -412,13 +413,17 @@ async fn interrupt_stamps_streaming_entry_aborted() {
         SessionCommandPayload::Interrupt {},
     );
 
+    // Wait for the ASSISTANT entry to stamp Aborted AND the command to settle Applied.
     wait_for(
         || {
-            entries(&core)
+            let aborted = entries(&core)
                 .iter()
-                .any(|e| e.status == Some(MessageStatus::Aborted))
+                .any(|e| e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Aborted));
+            let applied = command_status(&core, "cmd-int-1")
+                == Some((SessionCommandStatus::Applied, None));
+            aborted && applied
         },
-        "aborted stamp",
+        "aborted stamp and command applied",
     )
     .await;
 
@@ -1210,9 +1215,9 @@ async fn interrupt_unblocks_a_run_awaiting_input() {
     );
     wait_for(
         || {
-            entries_now(&core)
-                .iter()
-                .any(|e| e.status == Some(MessageStatus::Aborted))
+            entries_now(&core).iter().any(|e| {
+                e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Aborted)
+            })
         },
         "entry stamped aborted",
     )
@@ -1658,6 +1663,7 @@ async fn real_claude_sees_uploaded_image_inline() {
         sandbox: SandboxLevel::WorkspaceWrite,
         auto_approve: false,
         attachments: vec![path],
+        worktree: None,
         resume: None,
     };
     core.doc_host

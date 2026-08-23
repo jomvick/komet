@@ -472,14 +472,20 @@ mod tests {
             usage_event(&json!({"tokenUsage": {"last": {"inputTokens": 42, "outputTokens": 7}}})),
             Some(AgentEvent::Usage {
                 input_tokens: 42,
-                output_tokens: 7
+                output_tokens: 7,
+                cached_input_tokens: 0,
+                reasoning_tokens: 0,
+                context_limit: None,
             })
         );
         assert_eq!(
             usage_event(&json!({"token_usage": {"last": {"input_tokens": 1, "output_tokens": 2}}})),
             Some(AgentEvent::Usage {
                 input_tokens: 1,
-                output_tokens: 2
+                output_tokens: 2,
+                cached_input_tokens: 0,
+                reasoning_tokens: 0,
+                context_limit: None,
             })
         );
         assert_eq!(usage_event(&json!({})), None);

@@ -370,6 +370,15 @@ case "$promptline" in
   emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
   ;;
 
+*scenario:prompt-stall*)
+  # Session boilerplate, then silence — the REAL wedge signature. opencode
+  # emits available_commands_update on every session (provider dead or not),
+  # so the watchdog must not count it as turn progress: exactly this frame
+  # used to disarm the watchdog for the whole turn (found live, 1.18.18).
+  emit "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"$SID\",\"update\":{\"sessionUpdate\":\"available_commands_update\",\"availableCommands\":[{\"name\":\"init\",\"description\":\"guided AGENTS.md setup\"}]}}}"
+  exec sleep 60
+  ;;
+
 *)
   emit "{\"id\":$pid,\"result\":{\"stopReason\":\"refusal\"}}"
   ;;
