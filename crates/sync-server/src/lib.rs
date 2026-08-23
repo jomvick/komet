@@ -86,7 +86,7 @@ async fn handle_socket(state: AppState, room: String, socket: WebSocket) {
 
     // replay history
     for frame in history {
-        let _ = sender.send(Message::Binary(frame.into())).await;
+        let _ = sender.send(Message::Binary(frame)).await;
     }
 
     let tx2 = tx.clone();
@@ -113,7 +113,7 @@ async fn handle_socket(state: AppState, room: String, socket: WebSocket) {
     // send task: forward broadcasts
     let mut send_task = tokio::spawn(async move {
         while let Ok(data) = rx.recv().await {
-            if sender.send(Message::Binary(data.into())).await.is_err() {
+            if sender.send(Message::Binary(data)).await.is_err() {
                 break;
             }
         }

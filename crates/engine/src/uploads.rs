@@ -232,9 +232,15 @@ impl Uploads {
                 .flatten()
                 .filter_map(|f| f.metadata().ok()?.modified().ok())
                 .max();
+            // An empty dir is NOT free to reclaim: `append` creates the dir
+            // before writing the first chunk, and parallel chunk uploads run
+            // 3-wide — a sibling's sweep landing in that window deleted the
+            // dir out from under the first write (v0.2.12 "Couldn't stage the
+            // attachment locally"). Judge an empty dir by its own age.
+            let newest = newest.or_else(|| entry.metadata().ok()?.modified().ok());
             let expired = match newest {
                 Some(at) => at.elapsed().map(|age| age > STAGING_TTL).unwrap_or(false),
-                None => true, // empty dir — reclaim
+                None => false,
             };
             if expired {
                 let _ = std::fs::remove_dir_all(entry.path());
@@ -370,6 +376,33 @@ mod tests {
         assert_eq!(sanitize("../../etc/passwd"), "passwd");
         assert_eq!(sanitize("my photo (1).png"), "my_photo__1_.png");
         assert_eq!(sanitize(""), "upload");
+    }
+
+    #[test]
+    fn sweep_spares_a_fresh_empty_staging_dir() {
+        use std::time::Duration;
+        // The parallel-chunk race: uploader A has created its staging dir but
+        // not yet written chunk 0 when uploader B's sweep runs. The empty dir
+        // must survive; only an ABANDONED empty dir (older than the TTL) goes.
+        let dir = tempfile::tempdir().unwrap();
+        let uploads = Uploads::from_root(dir.path());
+        let racing = dir.path().join("tmp").join("upload-racing");
+        std::fs::create_dir_all(&racing).unwrap();
+
+        uploads
+            .append("upload-other", &BASE64.encode(b"aGk="), Some(0))
+            .unwrap();
+        assert!(racing.exists(), "fresh empty staging dir was reclaimed");
+
+        let stale = std::time::SystemTime::now() - (STAGING_TTL + Duration::from_secs(60));
+        std::fs::File::open(&racing)
+            .unwrap()
+            .set_modified(stale)
+            .unwrap();
+        uploads
+            .append("upload-other", &BASE64.encode(b"aGk="), Some(0))
+            .unwrap();
+        assert!(!racing.exists(), "abandoned empty staging dir must be swept");
     }
 
     #[test]

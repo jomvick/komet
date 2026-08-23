@@ -1065,6 +1065,9 @@ async fn rpc_dispatch_for_m5_methods() {
     // EngineCore's Repos resolves the worktree root from the env; keep test
     // worktrees out of $HOME. (Process-global — this is the only test that sets it.)
     unsafe { std::env::set_var("KOMET_WORKTREES_DIR", tmp.path().join("worktrees")) };
+    // Pin a bare shell: a login-shell profile that prints a banner (fastfetch,
+    // motd…) consumes the early stdin write and the probe echo never runs.
+    unsafe { std::env::set_var("SHELL", "/bin/sh") };
     let core = assemble(&tmp.path().join("data"));
     let client = komet_rpc::memory_client(core.rpc_service());
 

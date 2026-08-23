@@ -40,7 +40,7 @@ pub fn render_context_ring(stats: &ContextUsageStats, theme: &Theme) -> AnyEleme
             let mut track_path = PathBuilder::stroke(px(RING_STROKE));
             track_path.move_to(point(
                 px(center_x + radius * 0.0),
-                px(center_y + radius * -1.0),
+                px(center_y + -radius),
             ));
             // Approximate full circle with 32 line segments
             for i in 0..=32 {

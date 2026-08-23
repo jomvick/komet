@@ -110,6 +110,17 @@ pub enum MessageStatus {
     Aborted,
 }
 
+/// Lifecycle of a spawned subagent, carried on its spawn chip. Ported from
+/// Comet (zeronsh/comet) alongside the fold logic below — Komet had no
+/// equivalent before this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SubagentStatus {
+    Running,
+    Done,
+    Failed,
+}
+
 /// One rendered part of an assistant message.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
@@ -150,6 +161,23 @@ pub enum MessagePart {
         /// Per-file diff stats (additive replacement for inline `diff`).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         diff_stats: Option<Vec<ToolDiffStat>>,
+        /// Reserved in the schema alongside `subagent_status`/`subagent_tail`
+        /// (Comet's upstream shape) — the fold below matches a spawn chip by
+        /// its own `id == parent_tool_use_id` plus `call.is_subagent_spawn()`,
+        /// so this field isn't read by that path; kept for schema parity.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subagent_ref: Option<String>,
+        /// Current lifecycle of the spawned subagent (see [`SubagentStatus`]).
+        /// `None` until the first lifecycle-bearing event arrives.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subagent_status: Option<SubagentStatus>,
+        /// Reserved for a live text tail on the spawn chip — tried and
+        /// rejected upstream (rewriting the chip per delta batch bloated the
+        /// parent doc's oplog for the whole subagent run and read as
+        /// distracting mid-stream fragments), kept in the schema so docs
+        /// that carry it from elsewhere still deserialize.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subagent_tail: Option<String>,
     },
     #[serde(rename_all = "camelCase")]
     Input {
@@ -254,6 +282,9 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                     output_bytes: None,
                     diff_ref: None,
                     diff_stats: None,
+                    subagent_ref: None,
+                    subagent_status: None,
+                    subagent_tail: None,
                 });
             }
         }
@@ -336,27 +367,65 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                 });
             }
         }
+        // Subagent-attributed CONTENT belongs to the subagent's own doc (the
+        // engine routes it there); the parent doc keeps only the spawn chip —
+        // which this refreshes in place: LIFECYCLE ONLY. Ported from Comet
+        // (zeronsh/comet, commit 454a1dd "subagent steers: durable across
+        // harnesses") — Komet had a no-op here before this (the schema
+        // fields didn't exist yet either; see `subagent_status` above).
+        AgentEvent::Subagent {
+            parent_tool_use_id,
+            event,
+        } => {
+            let status = match event.as_ref() {
+                AgentEvent::Done { status, .. } => Some(match status {
+                    komet_proto::DoneStatus::Errored => SubagentStatus::Failed,
+                    _ => SubagentStatus::Done,
+                }),
+                // A steer RESURRECTS a settled chip — it announces more work
+                // (claude: a queued SendMessage relaunches the agent), so
+                // this is the one event allowed past the no-regress guard.
+                AgentEvent::UserMessage { .. } => Some(SubagentStatus::Running),
+                _ => None,
+            };
+            for p in out.iter_mut() {
+                if let MessagePart::Tool {
+                    id,
+                    call,
+                    subagent_status,
+                    ..
+                } = p
+                    && id == parent_tool_use_id
+                    // Genus gate: only a SPAWN call ever carries subagent
+                    // lifecycle. A driver keying bug decorating an ordinary
+                    // chip (e.g. a background shell settling through the
+                    // subagent subtype) must not flip its status.
+                    && call.is_subagent_spawn()
+                {
+                    match status {
+                        Some(s) => *subagent_status = Some(s),
+                        // Any tagged traffic proves the subagent is live;
+                        // never regress a terminal state.
+                        None if !matches!(
+                            subagent_status,
+                            Some(SubagentStatus::Done) | Some(SubagentStatus::Failed)
+                        ) =>
+                        {
+                            *subagent_status = Some(SubagentStatus::Running);
+                        }
+                        None => {}
+                    }
+                }
+            }
+        }
         // AvailableCommands feeds the engine's per-harness command cache, not
-        // the transcript.
+        // the transcript. UserMessage becomes its own doc ENTRY (the
+        // engine's subagent sink writes it), never a part of the assistant
+        // message.
         AgentEvent::AssistantMessageCompleted { .. }
         | AgentEvent::Usage { .. }
-        | AgentEvent::AvailableCommands { .. } => {}
-        // Only ever reaches this function already unwrapped from a Subagent
-        // frame by the caller — see the variant's own doc comment: "never
-        // emitted untagged". There's no MessagePart shape yet for a
-        // user-role text segment distinct from TextDelta's
-        // running-append-to-tail story (it needs to close the current text
-        // part rather than extend it), so this is a deliberate no-op rather
-        // than a guess at that shape — flagging it here instead of silently
-        // wiring something that might not match what the subagent-viz UI
-        // actually expects once it lands.
-        AgentEvent::UserMessage { .. } => {}
-        // Routed to the subagent's own doc/parts vec by the caller (the
-        // engine unwraps `event` and re-enters this function with the
-        // subagent's own accumulator per `parent_tool_use_id`) — never
-        // folded into the parent's parts directly. Same treatment as
-        // AvailableCommands above.
-        AgentEvent::Subagent { .. } => {}
+        | AgentEvent::AvailableCommands { .. }
+        | AgentEvent::UserMessage { .. } => {}
     }
 }
 
@@ -646,6 +715,9 @@ mod tests {
                 output_bytes: None,
                 diff_ref: None,
                 diff_stats: None,
+                subagent_ref: None,
+                subagent_status: None,
+                subagent_tail: None,
             },
         ];
         let chunks = split_parts(&parts);

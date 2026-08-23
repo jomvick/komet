@@ -539,17 +539,20 @@ impl SessionsEngine {
         let Some((run_id, token, cancel, pending)) = target else {
             return Ok(false);
         };
-        // Unpark any blocked question FIRST (mirrors komet: harness teardown can await a
+        // Engine-side grace deadline FIRST: the run task must observe
+        // `interrupted` before any teardown it triggers can end the stream,
+        // or a harness that closes on its emptied question callback would be
+        // misclassified as "stream ended without Done" (Errored) instead of
+        // settling Interrupted.
+        let _ = cancel.send(true);
+        // Unpark any blocked question (mirrors komet: harness teardown can await a
         // parked question callback — a run stuck on a question would deadlock the stop).
         let parked: Vec<_> = lock(&pending).drain().map(|(_, tx)| tx).collect();
         for tx in parked {
             let _ = tx.send(Vec::new());
         }
-        // Harness-level interrupt (protocol + child teardown) …
+        // Harness-level interrupt (protocol + child teardown).
         token.cancel();
-        // … plus the engine-side grace deadline in the run task, so a harness that
-        // ignores its token still settles with a synthesized Done{interrupted}.
-        let _ = cancel.send(true);
         // Bounded settle wait (the run task appends Done + stamps `aborted`).
         for _ in 0..500 {
             if !self.is_live(chat_id, &run_id) {
@@ -998,6 +1001,9 @@ fn render_parts(parts: &[MessagePart]) -> Vec<MessagePart> {
                 output_bytes,
                 diff_ref,
                 diff_stats,
+                subagent_ref,
+                subagent_status,
+                subagent_tail,
             } => MessagePart::Tool {
                 id: id.clone(),
                 call: sanitize_tool_call(call),
@@ -1013,6 +1019,9 @@ fn render_parts(parts: &[MessagePart]) -> Vec<MessagePart> {
                 output_bytes: *output_bytes,
                 diff_ref: diff_ref.clone(),
                 diff_stats: diff_stats.clone(),
+                subagent_ref: subagent_ref.clone(),
+                subagent_status: *subagent_status,
+                subagent_tail: subagent_tail.clone(),
             },
             other => other.clone(),
         })

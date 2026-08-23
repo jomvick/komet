@@ -238,9 +238,7 @@ fn visible_ref_count(refs: &[GitHistoryRef], available_width: f32) -> usize {
             .iter()
             .map(estimated_ref_badge_width)
             .sum::<f32>();
-        let overflow = (hidden > 0)
-            .then(|| estimated_ref_overflow_width(hidden))
-            .unwrap_or_default();
+        let overflow = if hidden > 0 { estimated_ref_overflow_width(hidden) } else { Default::default() };
         let gaps = item_count.saturating_sub(1) as f32 * HISTORY_REF_GAP;
         if badges + overflow + gaps <= available_width {
             visible = count;

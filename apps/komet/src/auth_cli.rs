@@ -232,7 +232,7 @@ mod tests {
             ipc_port: 0,
             default_harness: HarnessId::Mock,
             org_id: None,
-            workos_client_id: Some("client_test".into()),
+            sync_token: None,
         }
     }
 
@@ -282,31 +282,5 @@ mod tests {
             assert!(error.contains("while an engine is running"));
             assert!(error.contains("stop it first"));
         }
-    }
-
-    #[tokio::test]
-    async fn logout_makes_the_next_engine_start_local() {
-        let dir = tempfile::tempdir().unwrap();
-        let config = config(dir.path());
-        let session = dir.path().join("session.json");
-        std::fs::write(
-            &session,
-            r#"{"refreshToken":"refresh-1","user":{"id":"user-1","email":"user@example.com"},"orgId":"org-1"}"#,
-        )
-        .unwrap();
-        let before = Engine::build_auth(&config).await;
-        assert_eq!(
-            Engine::initial_workspace_scope(&before),
-            WorkspaceScope::Synced
-        );
-
-        logout(config.clone()).await.unwrap();
-
-        assert!(!session.exists());
-        let after = Engine::build_auth(&config).await;
-        assert_eq!(
-            Engine::initial_workspace_scope(&after),
-            WorkspaceScope::Local
-        );
     }
 }

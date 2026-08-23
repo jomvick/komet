@@ -1,19 +1,19 @@
-//! Real-world E2E for the managed adapter install: with no `codex-acp`
+//! Real-world E2E for the managed adapter install: with no `pi-acp`
 //! binary anywhere, `run()` must npm-install the pinned adapter into
-//! `$KOMET_ADAPTERS_DIR`, spawn it via node, and reach SessionStarted (the
+//! `$ZERON_ADAPTERS_DIR`, spawn it via node, and reach SessionStarted (the
 //! full initialize → session/new handshake) — the exact path that used to be
-//! `npx -y` at chat time (the known npm fatal-fs-error case).
+//! `npx -y` at chat time (zeronsh/comet#95).
 //!
-//! Ignored: needs network, npm, and the codex CLI on the machine. Run with
-//! `cargo test -p komet-harness --test managed_install -- --ignored`.
+//! Ignored: needs network, npm, and the pi CLI on the machine. Run with
+//! `cargo test -p zeron-harness --test managed_install -- --ignored`.
 //!
-//! Single-test binary: it mutates KOMET_ADAPTERS_DIR process-wide.
+//! Single-test binary: it mutates ZERON_ADAPTERS_DIR process-wide.
 
 use futures::StreamExt;
-use komet_harness::{AcpHarness, Harness, RunControls};
-use komet_proto::{AgentEvent, RunRequest};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use komet_harness::{AcpHarness, Harness, RunControls};
+use komet_proto::{AgentEvent, RunRequest};
 
 #[tokio::test]
 #[ignore = "network + npm + codex CLI; installs the pinned adapter for real"]
@@ -21,11 +21,11 @@ async fn managed_install_reaches_session_started() {
     let adapters = tempfile::tempdir().unwrap();
     // SAFETY: single-test binary — nothing else reads env concurrently.
     unsafe {
-        std::env::set_var("KOMET_ADAPTERS_DIR", adapters.path());
-        std::env::remove_var("CODEX_ACP_EXECUTABLE");
+        std::env::set_var("ZERON_ADAPTERS_DIR", adapters.path());
+        std::env::remove_var("PI_ACP_EXECUTABLE");
     }
 
-    let harness = AcpHarness::codex();
+    let harness = AcpHarness::pi();
     let (_steer_tx, steering) = mpsc::channel(1);
     let interrupt = CancellationToken::new();
     let controls = RunControls {
@@ -43,6 +43,7 @@ async fn managed_install_reaches_session_started() {
         sandbox: komet_proto::SandboxLevel::WorkspaceWrite,
         auto_approve: true,
         attachments: Vec::new(),
+        worktree: None,
         resume: None,
     };
 
@@ -82,12 +83,12 @@ async fn managed_install_reaches_session_started() {
 
     // The install landed in the managed dir (not the user's npm state) and
     // is marked complete, so the next launch skips npm entirely.
-    let root = adapters.path().join("agentclientprotocol__codex-acp");
+    let root = adapters.path().join("agentclientprotocol__pi-acp");
     let version_dir = std::fs::read_dir(&root)
         .expect("managed install dir exists")
         .flatten()
         .next()
         .expect("a pinned version dir")
         .path();
-    assert!(version_dir.join(".komet-install-ok").exists());
+    assert!(version_dir.join(".zeron-install-ok").exists());
 }

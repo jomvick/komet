@@ -2,7 +2,7 @@
 //! background checker + `ApplyUpdate`), the CLI (`komet update`), and the UI
 //! (the sidebar update strip + macOS bundle swap).
 //!
-//! Release layout (see `.github/workflows/release.yml` and `edge/src/install.sh`):
+//! Release layout (see `.github/workflows/release.yml`):
 //! artifacts live in the `komet-native-releases` R2 bucket, served pre-auth at
 //! `{edge}/releases/*`. `manifest.json` carries the latest version plus a
 //! sha256 per artifact; `latest.txt` (version only) remains as the fallback for

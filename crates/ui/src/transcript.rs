@@ -1927,7 +1927,7 @@ impl Transcript {
                     // The legal rest zone below the hold is the epsilon plus
                     // rounding; anything deeper is a transient-collision sink
                     // and rubber-bands back.
-                    err > 0.5 || err < -(OWN_SEND_SCROLL_SLACK_PX + 2.0)
+                    !(-(OWN_SEND_SCROLL_SLACK_PX + 2.0)..=0.5).contains(&err)
                 }
                 // Bounds vanish in the glued representation (dissolved
                 // above, so at most for this one frame) and through splice
@@ -2025,8 +2025,7 @@ impl Transcript {
             }
             self.own_turn_last_tick = None;
         } else if anchored
-            && err <= OWN_SEND_GLIDE_SNAP_PX
-            && err >= -(OWN_SEND_SCROLL_SLACK_PX + 2.0)
+            && (-(OWN_SEND_SCROLL_SLACK_PX + 2.0)..=OWN_SEND_GLIDE_SNAP_PX).contains(&err)
         {
             // At the hold — or resting inside the slack under it (a restick
             // that fired at the true bottom): land WITHOUT pulling the view
@@ -2575,6 +2574,11 @@ impl Transcript {
             .pt(px(4.0));
         for (aix, att) in atts.iter().enumerate() {
             let state = self.attachment_state(&device_ids, &att.path, cx);
+            let sending =
+                att.path.starts_with("pending://") || att.path.starts_with("pending/");
+            let uploading = sending
+                .then(|| self.state.read(cx).upload_progress_percent())
+                .flatten();
             let frame = div()
                 .flex_none()
                 .w(px(ATT_THUMB_W))
@@ -2600,7 +2604,13 @@ impl Transcript {
                         }))
                         .child(
                             img(image.image.clone())
-                                .size_full()
+                                // EXPLICIT dims, not size_full: img layout
+                                // honors the intrinsic aspect ratio over a
+                                // percent height, so size_full let a tall photo
+                                // grow past the frame and the rectangular overflow
+                                // clip squared the bottom corners.
+                                .w(px(ATT_THUMB_W - 2.0))
+                                .h(px(ATT_THUMB_H - 2.0))
                                 // The IMG needs its own radii: the frame's
                                 // rounding only clips rectangularly, so the
                                 // sprite must round its own corners (7 = the
@@ -2608,6 +2618,33 @@ impl Transcript {
                                 .rounded(px(7.0))
                                 .object_fit(ObjectFit::Cover),
                         )
+                        .when(sending, |el| {
+                            let pulse = motion::pulse_wave(motion::pulse_delta(
+                                &motion::KOMET_PULSE,
+                                cx.entity_id(),
+                                cx,
+                            ));
+                            let indicator: AnyElement = match uploading {
+                                Some(pct) => crate::loaders::upload_progress_ring(pct, 34.0),
+                                None => crate::loaders::mini_gradient_spinner(
+                                    format!("att-sending-{row_id}-{aix}"),
+                                    3.0,
+                                    cx.entity_id(),
+                                    cx,
+                                )
+                                .into_any_element(),
+                            };
+                            el.child(
+                                div()
+                                    .absolute()
+                                    .inset_0()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .bg(gpui::hsla(0.0, 0.0, 0.0, 0.38 + 0.05 * pulse))
+                                    .child(indicator),
+                            )
+                        })
                         .into_any_element()
                 }
                 // Errored/unavailable: the dashed "missing" thumb.
@@ -3834,6 +3871,18 @@ fn chip_header_row(tool: &ToolItem, chevron: Option<bool>, theme: &Theme) -> gpu
                 })
                 .child(SharedString::from(detail)),
         )
+        .when_some(tool.call.subagent_model(), |row, model| {
+            row.child(
+                div()
+                    .flex_none()
+                    .h(px(18.0))
+                    .flex()
+                    .items_center()
+                    .text_size(px(11.0))
+                    .text_color(theme.text_faint)
+                    .child(SharedString::from(model.to_owned())),
+            )
+        })
         .when_some(chevron, |row, open| {
             // Output/diff affordance: a chevron tile matching the group
             // header's, flipped while the detail body is open.
@@ -4242,6 +4291,9 @@ mod tests {
             output_bytes: None,
             diff_ref: None,
             diff_stats: None,
+            subagent_ref: None,
+            subagent_status: None,
+            subagent_tail: None,
         }
     }
 

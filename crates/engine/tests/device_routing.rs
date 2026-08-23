@@ -307,6 +307,7 @@ async fn target_device_id_routes_over_the_relay() {
             sandbox: SandboxLevel::WorkspaceWrite,
             auto_approve: true,
             attachments: Vec::new(),
+            worktree: None,
             resume: None,
         },
         message_id: "m-a-1".into(),
@@ -344,6 +345,12 @@ async fn terminal_stream_proxies_over_the_relay() {
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD as BASE64;
 
+    // Pin a bare shell: a login-shell profile that prints a banner (fastfetch,
+    // motd…) consumes the early stdin write and the probe echo never runs.
+    // SAFETY: single-test binary for the terminal path — nothing else reads SHELL.
+    unsafe {
+        std::env::set_var("SHELL", "/bin/sh");
+    }
     let (relay_url, _relay) = fake_device_room().await;
     let dirs = tempfile::tempdir().expect("tempdir");
     let cwd = dirs.path().join("work");

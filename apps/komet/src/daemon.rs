@@ -18,8 +18,11 @@ use anyhow::{Context, bail};
 mod win;
 
 const LAUNCHD_LABEL: &str = "sh.komet.app";
-/// Same unit name the curl|sh installer (`edge/src/install.sh`) writes, so
-/// `komet daemon …` manages that installation rather than a competing copy.
+/// Unit name written by `komet daemon install`. Comet's curl|sh installer
+/// (`edge/src/install.sh`) used to write this same name so the two paths
+/// wouldn't fight over the unit; that installer no longer exists in Komet
+/// (the `edge` crate was dropped), so `komet daemon install` is the sole
+/// owner now.
 const SYSTEMD_UNIT: &str = "komet.service";
 
 /// Windows service key name (SCM database) and the registry service subkey.
@@ -452,15 +455,12 @@ mod tests {
         assert!(unit.contains("WantedBy=default.target"));
     }
 
-    #[test]
-    fn curl_installer_always_starts_the_local_capable_service() {
-        let installer = include_str!("../../../edge/src/install.sh");
-        assert!(!installer.contains("session.json"));
-        assert!(installer.contains("StartLimitIntervalSec=60\n"));
-        assert!(installer.contains("StartLimitBurst=5\n"));
-        assert!(installer.contains("systemctl --user enable komet"));
-        assert!(installer.contains("systemctl --user restart komet"));
-    }
+    // The curl|sh installer (edge/src/install.sh) shipped a duplicate unit
+    // spec that this test cross-checked against `render_systemd_unit`. The
+    // `edge` crate was removed as part of Komet's local-first divergence from
+    // Comet, so the installer no longer exists — `komet daemon install` is
+    // now the only path that writes the unit, and `systemd_unit_shape` above
+    // already covers its shape directly.
 
     #[test]
     fn installed_exe_uses_the_current_symlink() {

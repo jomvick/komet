@@ -246,49 +246,6 @@ pub fn match_rank(query: &str, label: &str) -> Option<usize> {
     }
 }
 
-/// Fuzzy subsequence score: lower is better. Returns `None` if the query
-/// characters cannot all be found in order inside `candidate`. A contiguous
-/// hit always wins; subsequence matches earn bonuses for consecutive hits
-/// and for word-start positions (after whitespace or `_/. # -`).
-pub fn fuzzy_score(query: &str, candidate: &str) -> Option<usize> {
-    let query = query.trim().to_lowercase();
-    if query.is_empty() {
-        return Some(0);
-    }
-    let candidate = candidate.to_lowercase();
-
-    // Fast path: contiguous substring beats any subsequence score.
-    if let Some(pos) = candidate.find(&query) {
-        return Some(pos);
-    }
-
-    let mut score = 0usize;
-    let mut prev_end = None;
-
-    for ch in query.chars() {
-        let found = candidate[score..].find(ch)?;
-        let absolute = score + found;
-        score = absolute + ch.len_utf8();
-
-        // Bonus for consecutive matches.
-        if prev_end == Some(absolute) {
-            score = score.saturating_sub(2);
-        }
-
-        // Bonus for word-start after common delimiters.
-        if absolute > 0 {
-            let before = &candidate[..absolute];
-            if before.ends_with(|c: char| c.is_whitespace() || matches!(c, '_' | '/' | '.' | '#' | '-')) {
-                score = score.saturating_sub(3);
-            }
-        }
-
-        prev_end = Some(score);
-    }
-
-    Some(score)
-}
-
 /// Filter + rank labels for a search query: prefix matches first, then
 /// substring matches, stable within each rank. Returns indices into `labels`.
 pub fn filter_indices<S: AsRef<str>>(query: &str, labels: &[S]) -> Vec<usize> {
@@ -1126,30 +1083,9 @@ mod tests {
         assert_eq!(match_rank("", "anything"), Some(1));
     }
 
-    #[test]
-    fn fuzzy_score_contiguous_wins() {
-        assert_eq!(fuzzy_score("cmp", "crates/ui/src/composer.rs"), Some(11));
-        assert_eq!(fuzzy_score("rs", "crates/ui/src/composer.rs"), Some(25));
-    }
 
-    #[test]
-    fn fuzzy_score_subsequence() {
-        assert_eq!(fuzzy_score("cmp rs", "crates/ui/src/composer.rs"), Some(11));
-        assert_eq!(fuzzy_score("composer crates", "crates/ui/src/composer.rs"), Some(11));
-    }
 
-    #[test]
-    fn fuzzy_score_bonuses() {
-        // Consecutive char bonus.
-        assert_eq!(fuzzy_score("aa", "caaab"), Some(1));
-        // Word-start bonus after '/'.
-        assert_eq!(fuzzy_score("sr", "crates/ui/src/composer.rs"), Some(16));
-    }
 
-    #[test]
-    fn fuzzy_score_no_match() {
-        assert_eq!(fuzzy_score("xyz", "crates/ui/src/composer.rs"), None);
-    }
 
     #[test]
     fn key_classification() {

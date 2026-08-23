@@ -122,7 +122,7 @@ pub const CARET_BLINK_MS: u64 = 500;
 /// through the first half-period (typing bursts never blink — each keystroke
 /// resets the phase), then alternating.
 pub fn caret_visible(ms_since_activity: u64) -> bool {
-    (ms_since_activity / CARET_BLINK_MS) % 2 == 0
+    (ms_since_activity / CARET_BLINK_MS).is_multiple_of(2)
 }
 
 /// Auto-grow: content height for a wrapped-line count.
@@ -2620,8 +2620,8 @@ impl ComposerInput {
     /// Keep the cursor visible when content exceeds the element height.
     fn clamp_scroll(&mut self, element_height: f32) -> bool {
         let previous = self.scroll_top;
-        if self.follow_cursor {
-            if let Some(cursor) = self.point_for_index(self.cursor_offset()) {
+        if self.follow_cursor
+            && let Some(cursor) = self.point_for_index(self.cursor_offset()) {
                 self.scroll_top = input_scroll_offset_for_cursor(
                     self.scroll_top,
                     f32::from(cursor.y),
@@ -2630,7 +2630,6 @@ impl ComposerInput {
                     element_height,
                 );
             }
-        }
         self.scroll_top = self
             .scroll_top
             .clamp(0.0, input_max_scroll(self.content_height, element_height));
@@ -3699,7 +3698,14 @@ impl Composer {
                             }))
                             .child(
                                 img(att.image.clone())
-                                    .size_full()
+                                    // EXPLICIT dims, not size_full: img layout
+                                    // honors the image's intrinsic aspect
+                                    // ratio over a percent height, so size_full let a
+                                    // tall photo grow past the frame — the
+                                    // rectangular overflow clip then squared
+                                    // the bottom corners.
+                                    .w(px(STRIP_THUMB - 2.0))
+                                    .h(px(STRIP_THUMB - 2.0))
                                     // Own radii — the frame's rounding only
                                     // clips rectangularly (7 = 8 - border).
                                     .rounded(px(7.0))
@@ -4575,10 +4581,12 @@ impl Composer {
         let echo_text = attachments::with_attachments(&text, &echo_paths);
         for (path, att) in echo_paths.iter().zip(&staged) {
             attachments::seed_attachment(&device_id, path, &att.name, att.image.clone());
+            attachments::seed_attachment_alias(&device_id, &att.id, &att.name, att.image.clone());
             if let Some(local) = local_device_id.as_deref()
                 && local != device_id
             {
                 attachments::seed_attachment(local, path, &att.name, att.image.clone());
+                attachments::seed_attachment_alias(local, &att.id, &att.name, att.image.clone());
             }
         }
 
@@ -4624,6 +4632,73 @@ impl Composer {
         let err_message_id = message_id.clone();
         self.send_task = Some(cx.spawn(async move |this, cx| {
             let result: Result<(), String> = async {
+                // Attachments stage FIRST — before the chat row or anything
+                // else exists. A staging failure aborts with NOTHING created,
+                // instead of stranding a just-minted empty chat with the
+                // message gone (the "failed to stage → empty transcript"
+                // report). Stage on the host device (sequential — the chunks
+                // share one channel), then thread the refs into the prompt
+                // text (`with_attachments`, the persisted transport) and the
+                // paths onto the Run request (inline image blocks).
+                let mut content = text.clone();
+                let mut attachment_paths: Vec<String> = Vec::new();
+                if !staged.is_empty() {
+                    for att in &staged {
+                        match attachments::upload_attachment(
+                            &engine,
+                            cx.background_executor(),
+                            host_device_id.as_deref(),
+                            att,
+                        )
+                        .await
+                        {
+                            Ok(path) => attachment_paths.push(path),
+                            Err(err) => {
+                                tracing::warn!(name = %att.name, error = %err, "attachment upload failed");
+                                return Err(
+                                    "Couldn't upload the attachment — the device may be offline."
+                                        .to_string(),
+                                );
+                            }
+                        }
+                    }
+                    // Seed the transcript cache from local bytes so the sent
+                    // bubble's thumbnails never round-trip (seedTranscript-
+                    // Attachment in the original send path).
+                    let seed_device = host_device_id.clone().unwrap_or_else(|| device_id.clone());
+                    for (path, att) in attachment_paths.iter().zip(&staged) {
+                        attachments::seed_attachment(&seed_device, path, &att.name, att.image.clone());
+                        if seed_device != device_id {
+                            attachments::seed_attachment(&device_id, path, &att.name, att.image.clone());
+                        }
+                    }
+                    content = attachments::with_attachments(&text, &attachment_paths);
+                    // Refresh the echo in place with the attachment refs
+                    // (same id, same clock — the bubble grows its thumbnails
+                    // without flickering).
+                    let refreshed = SessionMessageEntry {
+                        id: message_id.clone(),
+                        role: komet_doc::MessageRole::User,
+                        parts: vec![MessagePart::Text {
+                            id: "t0".into(),
+                            text: content.clone(),
+                        }],
+                        created_at,
+                        device_id: "local".into(),
+                        status: None,
+                        continuation_of: None,
+                    };
+                    let echo_chat_id = chat_id.clone();
+                    this.update(cx, |composer, cx| {
+                        composer.state.update(cx, |s, cx| {
+                            s.remove_echo(&echo_chat_id, &message_id);
+                            s.push_echo(&echo_chat_id, refreshed);
+                            cx.notify();
+                        });
+                    })
+                    .ok();
+                }
+
                 // Resolve the working directory: existing chats keep theirs;
                 // new chats run per the checkout plan (t3code env-mode): the
                 // space's folder as-is, an EXISTING worktree of the picked ref
@@ -4733,69 +4808,6 @@ impl Composer {
                     }
                 }
 
-                // Stage every attachment on the host device (sequential — the
-                // chunks share one channel), then thread the refs into the
-                // prompt text (`with_attachments`, the persisted transport)
-                // and the paths onto the Run request (inline image blocks).
-                let mut content = text.clone();
-                let mut attachment_paths: Vec<String> = Vec::new();
-                if !staged.is_empty() {
-                    for att in &staged {
-                        match attachments::upload_attachment(
-                            &engine,
-                            cx.background_executor(),
-                            host_device_id.as_deref(),
-                            att,
-                        )
-                        .await
-                        {
-                            Ok(path) => attachment_paths.push(path),
-                            Err(err) => {
-                                tracing::warn!(name = %att.name, error = %err, "attachment upload failed");
-                                return Err(
-                                    "Couldn't upload the attachment — the device may be offline."
-                                        .to_string(),
-                                );
-                            }
-                        }
-                    }
-                    // Seed the transcript cache from local bytes so the sent
-                    // bubble's thumbnails never round-trip (seedTranscript-
-                    // Attachment in the original send path).
-                    let seed_device = host_device_id.clone().unwrap_or_else(|| device_id.clone());
-                    for (path, att) in attachment_paths.iter().zip(&staged) {
-                        attachments::seed_attachment(&seed_device, path, &att.name, att.image.clone());
-                        if seed_device != device_id {
-                            attachments::seed_attachment(&device_id, path, &att.name, att.image.clone());
-                        }
-                    }
-                    content = attachments::with_attachments(&text, &attachment_paths);
-                    // Refresh the echo in place with the attachment refs
-                    // (same id, same clock — the bubble grows its thumbnails
-                    // without flickering).
-                    let refreshed = SessionMessageEntry {
-                        id: message_id.clone(),
-                        role: komet_doc::MessageRole::User,
-                        parts: vec![MessagePart::Text {
-                            id: "t0".into(),
-                            text: content.clone(),
-                        }],
-                        created_at,
-                        device_id: "local".into(),
-                        status: None,
-                        continuation_of: None,
-                    };
-                    let echo_chat_id = chat_id.clone();
-                    this.update(cx, |composer, cx| {
-                        composer.state.update(cx, |s, cx| {
-                            s.remove_echo(&echo_chat_id, &message_id);
-                            s.push_echo(&echo_chat_id, refreshed);
-                            cx.notify();
-                        });
-                    })
-                    .ok();
-                }
-
                 let command = if steer_cmd {
                     SessionCommandPayload::Steer {
                         prompt: content.clone(),
@@ -4830,28 +4842,74 @@ impl Composer {
                 Ok(())
             }
             .await;
+            if result.is_err() && is_new {
+                // A failed new-chat send must not strand a just-minted empty
+                // chat in the sidebar. Staging now runs before CreateChat, so
+                // usually nothing was created — but a post-mutate failure
+                // (QueueCommand) still leaves a row. Best-effort delete; a
+                // no-op if the chat was never materialized.
+                let _ = attachments::call_with_timeout(
+                    &engine,
+                    cx.background_executor(),
+                    methods::MUTATE,
+                    serde_json::json!({ "op": "deleteChat", "chatId": err_chat_id }),
+                    std::time::Duration::from_secs(5),
+                )
+                .await;
+            }
             this.update(cx, |composer, cx| {
                 composer.sending = false;
                 if let Err(message) = result {
                     // Failure: red banner, echo removed, prompt back in the
-                    // draft, staged files back in the chat's stash.
+                    // draft, staged files back in the stash. A failed NEW
+                    // chat restores to the CANVAS (key "") and navigates back
+                    // there — the minted chat is gone (deleted above), so
+                    // nothing may restore under its key.
+                    let restore_key: String = if is_new {
+                        String::new()
+                    } else {
+                        err_chat_id.clone()
+                    };
                     composer.failure = Some(message.into());
                     composer.state.update(cx, |s, cx| {
                         s.remove_echo(&err_chat_id, &err_message_id);
                         s.end_pending_send(&err_chat_id, &err_message_id);
+                        if is_new && s.selected_chat.as_deref() == Some(err_chat_id.as_str()) {
+                            // Back to the canvas; the navigation draft-swap
+                            // loads the restored draft below.
+                            s.select_chat(None, cx);
+                        }
                         cx.notify();
                     });
-                    composer.input.update(cx, |input, cx| input.set_text(restore_text, cx));
+                    if is_new && composer.current_key != restore_key {
+                        // A re-key swap to the canvas is pending (the
+                        // select_chat(None) above); it loads this draft into
+                        // the input on flush — setting the input directly
+                        // here would be clobbered by that same swap.
+                        composer.drafts.insert(restore_key.clone(), restore_text.clone());
+                    } else {
+                        // Already keyed to the restore target (either an
+                        // existing chat, or the deleted row's watch event
+                        // re-keyed to the canvas before this handler ran —
+                        // no further swap will fire). Set the input directly.
+                        composer.input.update(cx, |input, cx| input.set_text(restore_text, cx));
+                    }
                     if !staged.is_empty() {
                         // Merge by id (stashAttachments): files the user staged
-                        // while the send was in flight survive the hand-back.
-                        let slot = composer.attachments.entry(err_chat_id.clone()).or_default();
+                        // while the send was in flight survive the hand-back —
+                        // draining the minted chat's slot too when the restore
+                        // target is the canvas.
                         let mut merged = staged.clone();
-                        merged.extend(
-                            slot.drain(..)
-                                .filter(|e| !staged.iter().any(|f| f.id == e.id)),
-                        );
-                        *slot = merged;
+                        for key in [err_chat_id.clone(), restore_key.clone()] {
+                            if let Some(slot) = composer.attachments.get_mut(&key) {
+                                let fresh: Vec<_> = slot
+                                    .drain(..)
+                                    .filter(|e| !merged.iter().any(|f| f.id == e.id))
+                                    .collect();
+                                merged.extend(fresh);
+                            }
+                        }
+                        composer.attachments.insert(restore_key, merged);
                     }
                 }
                 cx.notify();
@@ -4889,13 +4947,12 @@ impl Composer {
             return false;
         }
         let now = Instant::now();
-        if let Some(armed) = self.escape_stop_armed_at {
-            if now.duration_since(armed) < Duration::from_secs(3) {
+        if let Some(armed) = self.escape_stop_armed_at
+            && now.duration_since(armed) < Duration::from_secs(3) {
                 self.escape_stop_armed_at = None;
                 self.interrupt(cx);
                 return true;
             }
-        }
         self.escape_stop_armed_at = Some(now);
         false
     }

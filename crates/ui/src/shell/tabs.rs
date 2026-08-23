@@ -23,8 +23,8 @@ impl Shell {
 
         // Try remembered navigation for the current device (pruned like open_tabs).
         let device_id = self.state.read(cx).local_device_id.clone();
-        if let Some(device_id) = device_id {
-            if let Some(nav) = self.settings.last_session_by_device.get(&device_id).cloned() {
+        if let Some(device_id) = device_id
+            && let Some(nav) = self.settings.last_session_by_device.get(&device_id).cloned() {
                 match nav {
                     RememberedNavigation::Session { id } => {
                         let (exists, space_ok) = {
@@ -71,7 +71,6 @@ impl Shell {
                     }
                 }
             }
-        }
 
         // Fallback: most recently active visible chat (recency).
         let first = {

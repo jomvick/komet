@@ -147,7 +147,7 @@ fn project_point(
 }
 
 fn hash_d(a: f32, b: f32) -> f32 {
-    let h = (a * 12.9898 + b * 78.233).sin() * 43758.5453;
+    let h = (a * 12.9898 + b * 78.233).sin() * 43_758.547;
     h - h.floor()
 }
 
@@ -1134,8 +1134,7 @@ impl IntoElement for ThinkingOrb {
                             let ink = line.white.clamp(0.0, 1.0);
                             let val = if is_dark { 1.0 - ink } else { ink };
                             let color: gpui::Hsla = gpui::rgba(
-                                ((val * 255.0).round() as u32) * 0x01010100
-                                    | ((line.a * 255.0).round() as u32).min(255),
+                                (((val * 255.0).round() as u32) * 0x01010100) | ((line.a * 255.0).round() as u32).min(255),
                             )
                             .into();
 

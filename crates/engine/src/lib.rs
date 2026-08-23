@@ -318,7 +318,11 @@ impl EngineCore {
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(|| "dev-user".into());
             let mut config = AuthConfig::new("http://localhost:27640", std::env::temp_dir());
-            config.dev_user_id = dev_user;
+            config.dev_user_id = dev_user.clone();
+            // The dev identity IS its bearer: relays and room joins need a
+            // non-None token source even fully offline (the pre-local-first
+            // behavior — without it start_host_relay idles "not signed in").
+            config.sync_token = Some(dev_user);
             Auth::new(config)
         })
         .clone()

@@ -118,11 +118,10 @@ impl FilesPanel {
     }
 
     pub fn tab_title(&self) -> SharedString {
-        if let Some(root) = &self.root_path {
-            if let Some(name) = Path::new(root).file_name().and_then(|n| n.to_str()) {
+        if let Some(root) = &self.root_path
+            && let Some(name) = Path::new(root).file_name().and_then(|n| n.to_str()) {
                 return SharedString::from(format!("Files · {name}"));
             }
-        }
         SharedString::from("Files")
     }
 
@@ -134,11 +133,7 @@ impl FilesPanel {
                 let cwd = chat.cwd.clone();
                 let device = Some(chat.device_id.clone());
                 cwd.map(|c| (c, device))
-            } else if let Some(space) = state.selected_space_row() {
-                Some((space.path.clone(), Some(space.device_id.clone())))
-            } else {
-                None
-            }
+            } else { state.selected_space_row().map(|space| (space.path.clone(), Some(space.device_id.clone()))) }
         };
 
         if let Some((root, device)) = resolved {
@@ -298,7 +293,7 @@ impl FilesPanel {
                             }
                         })
                         .collect();
-                    panel.sort_nodes(&mut panel.nodes_copy(&mut nodes));
+                    panel.sort_nodes(panel.nodes_copy(&mut nodes));
                     panel.sub_entries.insert(path_key, nodes);
                 }
                 cx.notify();
@@ -408,11 +403,10 @@ impl FilesPanel {
     fn collect_visible_rows(&self, nodes: &[FileNode], out: &mut Vec<FileNode>) {
         for node in nodes {
             out.push(node.clone());
-            if node.is_dir && self.expanded_paths.contains(&node.path) {
-                if let Some(children) = self.sub_entries.get(&node.path) {
+            if node.is_dir && self.expanded_paths.contains(&node.path)
+                && let Some(children) = self.sub_entries.get(&node.path) {
                     self.collect_visible_rows(children, out);
                 }
-            }
         }
     }
 

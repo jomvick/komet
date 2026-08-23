@@ -764,7 +764,19 @@ mod tests {
         assert_eq!(opencode.id(), HarnessId::Opencode);
         assert_eq!(opencode.display_name(), "OpenCode");
         assert_eq!(opencode.steering_mode(), SteeringMode::TurnBoundary);
-        assert!(opencode.reasoning_levels().is_empty());
+        // Komet divergence: opencode effort rides model variants, so the
+        // descriptor carries the full static ladder (unlike Comet's empty
+        // ladder until provider.list).
+        assert_eq!(
+            opencode.reasoning_levels(),
+            &[
+                ReasoningLevel::Low,
+                ReasoningLevel::Medium,
+                ReasoningLevel::High,
+                ReasoningLevel::XHigh,
+                ReasoningLevel::Max
+            ]
+        );
         let pi = registry.resolve(HarnessId::Pi).unwrap();
         assert_eq!(pi.id(), HarnessId::Pi);
         assert_eq!(pi.display_name(), "Pi");
