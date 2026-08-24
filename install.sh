@@ -36,6 +36,8 @@ case "$OS:$ARCH" in
   Darwin:arm64)  PLATFORM="macos-arm64" ;;
   *) die "unsupported platform $OS/$ARCH — grab a tarball from https://github.com/$REPO/releases" ;;
 esac
+IS_MACOS=false
+case "$OS" in Darwin) IS_MACOS=true ;; esac
 
 # --- resolve the latest version ---------------------------------------------
 API_URL="https://api.github.com/repos/$REPO/releases/latest"
@@ -47,14 +49,30 @@ if fetch "$API_URL" "$TMP/release.json"; then
 fi
 [ -n "${VERSION:-}" ] || die "could not determine the latest release from $API_URL"
 
-TARBALL="komet-$VERSION-$PLATFORM.tar.gz"
-URL="https://github.com/$REPO/releases/download/v$VERSION/$TARBALL"
-
 # --- download + unpack -------------------------------------------------------
 say "installing komet $VERSION ($PLATFORM)…"
+if $IS_MACOS; then
+  # macOS ships Komet.app inside a -app tarball (auto-updater layout) and a dmg.
+  TARBALL="komet-$VERSION-$PLATFORM-app.tar.gz"
+else
+  TARBALL="komet-$VERSION-$PLATFORM.tar.gz"
+fi
+URL="https://github.com/$REPO/releases/download/v$VERSION/$TARBALL"
 fetch "$URL" "$TMP/$TARBALL" || die "download failed: $URL"
 mkdir -p "$TMP/unpacked"
-tar -xzf "$TMP/$TARBALL" -C "$TMP/unpacked" --strip-components=1
+tar -xzf "$TMP/$TARBALL" -C "$TMP/unpacked"
+
+if $IS_MACOS; then
+  APP_SRC="$TMP/unpacked/Komet.app"
+  [ -d "$APP_SRC" ] || die "tarball did not contain Komet.app"
+  say "installing Komet.app into /Applications…"
+  rm -rf "/Applications/Komet.app"
+  cp -R "$APP_SRC" /Applications/
+  say ""
+  say "installed komet $VERSION → /Applications/Komet.app"
+  say "next steps: launch Komet from Applications or Spotlight."
+  exit 0
+fi
 
 [ -f "$TMP/unpacked/komet" ] || die "tarball did not contain a komet binary"
 
@@ -65,9 +83,10 @@ mkdir -p "$DEST"
 cp "$TMP/unpacked/komet" "$DEST/komet"
 chmod 755 "$DEST/komet"
 
-# Atomic symlink flip: same layout the self-updater uses.
-ln -sfn "$DEST" "$APP_ROOT/.current-new.$$"
-mv -f "$APP_ROOT/.current-new.$$" "$APP_ROOT/current"
+# Atomic symlink flip: same layout the self-updater uses. -T is required:
+# plain `mv` over a symlink-to-directory would move the temp link INSIDE the
+# target dir instead of replacing `current`, leaving the old version active.
+mv -fT "$APP_ROOT/.current-new.$$" "$APP_ROOT/current"
 
 mkdir -p "$BIN_DIR"
 ln -sf "$APP_ROOT/current/komet" "$BIN_DIR/komet"
