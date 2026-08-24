@@ -1,15 +1,14 @@
 name: release
 
-# Build release artifacts and publish them:
+# Build release artifacts and publish them as assets of the GitHub Release:
 #   - Linux headless tarballs (x86_64 + aarch64) via scripts/package-linux.sh
 #   - macOS dmg (Apple silicon) via scripts/package-macos.sh
-# then create a GitHub Release AND upload everything to the
-# `komet-native-releases` R2 bucket (served at komet.sh/releases/* for
-# `curl -fsSL https://komet.sh/install.sh | sh`), bumping latest.txt.
+# plus a manifest.json (version + per-artifact sha256) that the auto-updater
+# (crates/update) verifies downloads against.
 #
 # Trigger: push a tag `v<version>` matching the workspace version in
 # Cargo.toml (bump it in the same commit), or run manually via
-# workflow_dispatch (builds + uploads artifacts, no release/R2 publish).
+# workflow_dispatch (builds + uploads artifacts, no release publish).
 
 on:
   push:
@@ -37,16 +36,21 @@ jobs:
             libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
             libx11-dev libxcb1-dev libx11-xcb-dev \
             libfontconfig1-dev libfreetype-dev libasound2-dev \
-            libvulkan-dev pkg-config cmake
+            libvulkan-dev pkg-config cmake libfuse2
       - name: rust toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
-      - name: package
+      - name: package tarball
         run: scripts/package-linux.sh
+      - name: package appimage
+        if: matrix.runner == 'ubuntu-24.04'
+        run: scripts/package-appimage.sh
       - uses: actions/upload-artifact@v4
         with:
           name: linux-${{ runner.arch }}
-          path: target/package/*.tar.gz
+          path: |
+            target/package/*.tar.gz
+            target/package/*.AppImage
           if-no-files-found: error
 
   # Heads-up: the macOS cfg paths (Keychain in agent_accounts.rs) have never
@@ -113,50 +117,55 @@ jobs:
             target/package/*.tar.gz
           if-no-files-found: error
 
+  windows:
+    runs-on: windows-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: rust toolchain (rust-toolchain.toml)
+        run: rustup show active-toolchain || rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: package windows
+        shell: bash
+        run: scripts/package-windows.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ runner.arch }}
+          path: |
+            target/package/*.zip
+            target/package/*.exe
+          if-no-files-found: error
+
   publish:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [linux, macos]
+    needs: [linux, macos, windows]
     runs-on: ubuntu-latest
-    env:
-      # `secrets` is not a valid context in step `if:` expressions — surface
-      # the token through job env and gate on that instead.
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
-      CLOUDFLARE_ACCOUNT_ID: b57dde68ee5964dccc025437b5478a5b
     steps:
       - uses: actions/download-artifact@v4
         with:
-          path: dist
+          path: dist-release
           merge-multiple: true
       - name: version guard (tag == artifact version)
         run: |
           ver="${GITHUB_REF_NAME#v}"
-          ls dist/
-          ls dist/ | grep -q "komet-$ver-" \
+          ls -la dist-release/
+          ls dist-release/ | grep -qi "komet[-_]$ver" \
             || { echo "tag v$ver does not match built artifact versions — bump Cargo.toml [workspace.package] version"; exit 1; }
           echo "VERSION=$ver" >> "$GITHUB_ENV"
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: dist/*
-          generate_release_notes: true
-      - name: upload to R2 (komet.sh/releases/*)
-        if: env.CLOUDFLARE_API_TOKEN != ''
+      # manifest.json: version + per-artifact sha256 — the auto-updater
+      # (crates/update) verifies downloads against it. Built before the release
+      # so it ships as a release asset alongside the binaries.
+      - name: build manifest.json
         run: |
-          for f in dist/*; do
-            npx wrangler@4 r2 object put "komet-native-releases/$(basename "$f")" \
-              --file "$f" --remote
-          done
-          # manifest.json: version + per-artifact sha256 — the auto-updater
-          # (crates/update) verifies downloads against it. Published before
-          # latest.txt so no client ever sees a version without its checksums.
           manifest=$(jq -n --arg version "$VERSION" '{version: $version, files: {}}')
-          for f in dist/*; do
+          for f in dist-release/*; do
+            [ -f "$f" ] || continue
             sha=$(sha256sum "$f" | cut -d' ' -f1)
             manifest=$(jq --arg name "$(basename "$f")" --arg sha "$sha" \
               '.files[$name] = {sha256: $sha}' <<<"$manifest")
           done
-          printf '%s' "$manifest" > manifest.json
-          npx wrangler@4 r2 object put komet-native-releases/manifest.json \
-            --file manifest.json --remote
-          printf '%s' "$VERSION" > latest.txt
-          npx wrangler@4 r2 object put komet-native-releases/latest.txt \
-            --file latest.txt --remote
+          printf '%s\n' "$manifest" > dist-release/manifest.json
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist-release/*
+          generate_release_notes: true

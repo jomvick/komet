@@ -18,15 +18,12 @@
   --hairline: rgba(255, 255, 255, 0.08);
   --hairline-strong: rgba(255, 255, 255, 0.14);
 
-  /* Accents — same oklch sources as the app (indigo-400, red-400, amber-400,
-     emerald-400, pink-400, violet-300) */
-  --signal: #7c86ff;      /* accent — indigo-400 */
-  --signal-strong: #6d6ef5; /* accent_strong — indigo-500 */
-  --ember: #ff6467;       /* danger — red-400 */
-  --amber: #ffb900;       /* warning — amber-400 */
-  --moss: #34e39a;        /* success — emerald-400 */
-  --busy: #f472b6;        /* busy — pink-400 */
-  --violet: #c4b5fd;      /* code_text — violet-300 */
+  /* Monochrome — no brand color. Everything is paper/mist/fog on ink.
+     Only the SessionCard mock keeps a couple of muted status dots, because
+     that's product UI being depicted, not marketing chrome. */
+  --signal: var(--paper);
+  --signal-strong: #ffffff;
+  --line: rgba(255, 255, 255, 0.55); /* used for diagram strokes */
 
   --radius-panel: 10px;
   --radius-control: 6px;
@@ -45,11 +42,7 @@
   --color-dim: var(--dim);
   --color-signal: var(--signal);
   --color-signal-strong: var(--signal-strong);
-  --color-ember: var(--ember);
-  --color-amber: var(--amber);
-  --color-moss: var(--moss);
-  --color-busy: var(--busy);
-  --color-violet: var(--violet);
+  --color-line: var(--line);
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
 }
@@ -63,14 +56,21 @@ html {
 }
 
 body {
-  background: var(--ink);
+  background-color: var(--ink);
+  background-image:
+    linear-gradient(rgba(6, 6, 6, 0.72), rgba(6, 6, 6, 0.88)),
+    url("/background.png");
+  background-size: cover;
+  background-position: center top;
+  background-attachment: fixed;
+  background-repeat: no-repeat;
   color: var(--paper);
   font-family: var(--font-geist-sans), Helvetica, Arial, sans-serif;
   -webkit-font-smoothing: antialiased;
 }
 
 ::selection {
-  background: rgba(124, 134, 255, 0.35);
+  background: rgba(255, 255, 255, 0.16);
   color: var(--paper);
 }
 
@@ -118,8 +118,16 @@ body {
   animation: marquee 28s linear infinite;
 }
 
+@keyframes pulse-soft {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 1; }
+}
+.pulse-soft {
+  animation: pulse-soft 2.2s ease-in-out infinite;
+}
+
 @media (prefers-reduced-motion: reduce) {
-  .drift, .marquee, .caret-blink {
+  .drift, .marquee, .caret-blink, .pulse-soft {
     animation: none !important;
   }
 }

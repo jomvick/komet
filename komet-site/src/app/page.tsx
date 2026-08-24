@@ -1,7 +1,7 @@
 import Nav from "@/components/Nav";
 import Hero from "@/components/Hero";
-import AgentMarquee from "@/components/AgentMarquee";
 import Features from "@/components/Features";
+import Topology from "@/components/Topology";
 import Stats from "@/components/Stats";
 import Downloads from "@/components/Downloads";
 import Faq from "@/components/Faq";
@@ -13,8 +13,8 @@ export default function Home() {
       <Nav />
       <main>
         <Hero />
-        <AgentMarquee />
         <Features />
+        <Topology />
         <Stats />
         <Downloads />
         <Faq />

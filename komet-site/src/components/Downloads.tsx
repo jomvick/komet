@@ -33,7 +33,8 @@ export default function Downloads() {
           transition={{ duration: 0.6, ease: easing }}
           className="max-w-xl mb-14"
         >
-          <p className="font-mono text-[11px] uppercase tracking-wide text-signal mb-3">
+          <p className="flex items-center gap-2 font-mono text-[11px] uppercase tracking-wide text-fog mb-3">
+            <span className="h-1 w-3 bg-paper/50" />
             Installer
           </p>
           <h2 className="text-[30px] md:text-[36px] leading-tight tracking-tight font-medium text-paper">
@@ -56,7 +57,7 @@ export default function Downloads() {
                 {p.detail}
               </p>
               <div className="mt-5 flex items-center justify-between gap-3 rounded-[var(--radius-control)] bg-charcoal hairline px-3 py-2.5">
-                <code className="font-mono text-[11.5px] text-violet truncate">
+                <code className="font-mono text-[11.5px] text-paper truncate">
                   {p.command}
                 </code>
                 <CopyButton text={p.command} />
@@ -75,10 +76,10 @@ export default function Downloads() {
           Les binaires signés et notariés se mettent à jour automatiquement.
           Consulte le{" "}
           <a
-            href="https://github.com/opencode/komet/releases"
+            href="https://github.com/jomvick/komet/releases"
             target="_blank"
             rel="noreferrer"
-            className="text-signal hover:underline"
+            className="text-paper underline decoration-[var(--hairline-strong)] hover:decoration-paper"
           >
             dépôt des releases
           </a>{" "}

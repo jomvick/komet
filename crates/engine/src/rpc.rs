@@ -375,6 +375,7 @@ pub struct EngineRpc {
     workspace: WorkspaceHost,
     registry: std::sync::Arc<HarnessRegistry>,
     repos: Repos,
+    workspace_files: crate::WorkspaceFiles,
     terminals: Terminals,
     diff_sync: CheckoutDiffSync,
     uploads: Uploads,
@@ -394,6 +395,7 @@ impl EngineRpc {
         workspace: WorkspaceHost,
         registry: std::sync::Arc<HarnessRegistry>,
         repos: Repos,
+        workspace_files: crate::WorkspaceFiles,
         terminals: Terminals,
         diff_sync: CheckoutDiffSync,
         uploads: Uploads,
@@ -410,6 +412,7 @@ impl EngineRpc {
             workspace,
             registry,
             repos,
+            workspace_files,
             terminals,
             diff_sync,
             uploads,
@@ -468,79 +471,16 @@ impl EngineRpc {
     /// name an existing linked worktree for a new chat, but it is verified
     /// against the space repository before any filesystem walk begins.
     async fn file_search_root(&self, p: &FileSearchParams) -> Result<std::path::PathBuf, RpcError> {
-        let local_device = self.doc_host.device_id();
-        match (&p.chat_id, &p.space_id) {
-            (Some(_), Some(_)) | (None, None) => Err(RpcError::BadParams(
-                "SearchFiles needs exactly one of chatId or spaceId".into(),
-            )),
-            (Some(chat_id), None) => {
-                if p.path.is_some() {
-                    return Err(RpcError::BadParams(
-                        "SearchFiles path applies only to a space".into(),
-                    ));
-                }
-                let chat = self
-                    .workspace
-                    .chat(chat_id)
-                    .map_err(|e| RpcError::Failed(e.to_string()))?
-                    .ok_or_else(|| RpcError::Failed("chat not found".into()))?;
-                if chat.device_id != local_device {
-                    return Err(RpcError::Failed("chat belongs to another device".into()));
-                }
-                let cwd = chat
-                    .cwd
-                    .map(std::path::PathBuf::from)
-                    .ok_or_else(|| RpcError::Failed("chat has no workspace folder".into()))?;
-                let space_id = chat
-                    .space_id
-                    .ok_or_else(|| RpcError::Failed("chat has no workspace space".into()))?;
-                let space = self
-                    .workspace
-                    .space(&space_id)
-                    .map_err(|e| RpcError::Failed(e.to_string()))?
-                    .ok_or_else(|| RpcError::Failed("chat workspace space not found".into()))?;
-                if space.device_id != local_device {
-                    return Err(RpcError::Failed(
-                        "chat space belongs to another device".into(),
-                    ));
-                }
-                if let Some(cwd) = self
-                    .repos
-                    .workspace_checkout(std::path::Path::new(&space.path), &cwd)
-                    .await
-                {
-                    Ok(cwd)
-                } else {
-                    Err(RpcError::Failed(
-                        "chat folder is not a workspace checkout".into(),
-                    ))
-                }
-            }
-            (None, Some(space_id)) => {
-                let space = self
-                    .workspace
-                    .space(space_id)
-                    .map_err(|e| RpcError::Failed(e.to_string()))?
-                    .ok_or_else(|| RpcError::Failed("space not found".into()))?;
-                if space.device_id != local_device {
-                    return Err(RpcError::Failed("space belongs to another device".into()));
-                }
-                let space_path = std::path::PathBuf::from(&space.path);
-                let requested = p
-                    .path
-                    .as_deref()
-                    .map_or_else(|| space_path.clone(), std::path::PathBuf::from);
-                if let Some(requested) =
-                    self.repos.workspace_checkout(&space_path, &requested).await
-                {
-                    Ok(requested)
-                } else {
-                    Err(RpcError::BadParams(
-                        "SearchFiles path is not a workspace checkout".into(),
-                    ))
-                }
-            }
-        }
+        let target = komet_proto::WorkspaceTarget {
+            chat_id: p.chat_id.clone(),
+            space_id: p.space_id.clone(),
+            checkout_path: p.path.clone(),
+        };
+        self.workspace_files
+            .resolve_target(&target)
+            .await
+            .map(|workspace| workspace.root)
+            .map_err(Into::into)
     }
 
     /// Most-recent-first paths the current chat actually touched, followed by
@@ -784,6 +724,12 @@ fn forwardable(method: &str) -> bool {
             | methods::SWITCH_REF
             | methods::LIST_FOLDERS
             | methods::SEARCH_FILES
+            // Device-local workspace filesystem operations.
+            | methods::LIST_WORKSPACE_DIRECTORY
+            | methods::SEARCH_WORKSPACE_FILES
+            | methods::READ_WORKSPACE_FILE
+            | methods::WRITE_WORKSPACE_FILE
+            | methods::WATCH_WORKSPACE_FILES
             | methods::CREATE_WORKTREE
             | methods::DELETE_WORKTREE
             // Checkout diffs are produced on the device holding the checkout.
@@ -824,6 +770,7 @@ fn is_stream_method(method: &str) -> bool {
         methods::WATCH_DOC_MESSAGES
             | methods::SUBSCRIBE_TERMINAL
             | methods::WATCH_CHECKOUT_DIFFS
+            | methods::WATCH_WORKSPACE_FILES
             | methods::UPDATE_STATUS
     )
 }
@@ -1531,6 +1478,64 @@ impl RpcService for EngineRpc {
                 .await
                 .map_err(|_| RpcError::Failed("file search timed out".into()))??;
                 RpcReply::value(&matches)
+            }
+            methods::LIST_WORKSPACE_DIRECTORY => {
+                let request: komet_proto::ListWorkspaceDirectoryRequest = parse_params(params)?;
+                let page = tokio::time::timeout(
+                    crate::workspace_files::WORKSPACE_FILE_RPC_TIMEOUT,
+                    self.workspace_files.list_directory(request),
+                )
+                .await
+                .map_err(|_| RpcError::Failed("workspace directory listing timed out".into()))?
+                .map_err(RpcError::from)?;
+                RpcReply::value(&page)
+            }
+            methods::SEARCH_WORKSPACE_FILES => {
+                let request: komet_proto::SearchWorkspaceFilesRequest = parse_params(params)?;
+                let matches = tokio::time::timeout(
+                    crate::workspace_files::WORKSPACE_FILE_RPC_TIMEOUT,
+                    self.workspace_files.search(request),
+                )
+                .await
+                .map_err(|_| RpcError::Failed("workspace file search timed out".into()))?
+                .map_err(RpcError::from)?;
+                RpcReply::value(&matches)
+            }
+            methods::READ_WORKSPACE_FILE => {
+                let request: komet_proto::ReadWorkspaceFileRequest = parse_params(params)?;
+                let file = tokio::time::timeout(
+                    crate::workspace_files::WORKSPACE_FILE_RPC_TIMEOUT,
+                    self.workspace_files.read_file(request),
+                )
+                .await
+                .map_err(|_| RpcError::Failed("workspace file read timed out".into()))?
+                .map_err(RpcError::from)?;
+                RpcReply::value(&file)
+            }
+            methods::WRITE_WORKSPACE_FILE => {
+                let request: komet_proto::WriteWorkspaceFileRequest = parse_params(params)?;
+                let outcome = tokio::time::timeout(
+                    crate::workspace_files::WORKSPACE_FILE_RPC_TIMEOUT,
+                    self.workspace_files.write_file(request),
+                )
+                .await
+                .map_err(|_| RpcError::Failed("workspace file write timed out".into()))?
+                .map_err(RpcError::from)?;
+                RpcReply::value(&outcome)
+            }
+            methods::WATCH_WORKSPACE_FILES => {
+                let request: komet_proto::WatchWorkspaceFilesRequest = parse_params(params)?;
+                let subscription = self
+                    .workspace_files
+                    .watch_files(request)
+                    .await
+                    .map_err(RpcError::from)?;
+                let stream = futures::stream::unfold(subscription, |mut subscription| async move {
+                    let changes = subscription.recv().await?;
+                    let value = serde_json::to_value(changes).ok()?;
+                    Some((value, subscription))
+                });
+                Ok(RpcReply::Stream(stream.boxed()))
             }
             methods::CREATE_WORKTREE => {
                 let p: CreateWorktreeParams = parse_params(params)?;

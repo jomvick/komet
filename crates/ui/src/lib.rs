@@ -15,13 +15,14 @@
 pub mod app_menus;
 pub mod appearance;
 pub mod attachments;
+pub mod badges;
 pub mod blobatar;
 pub mod changes;
+pub mod comments;
 pub mod composer;
 pub mod context_usage;
 pub mod edge_fade;
 pub mod files;
-pub mod file_editor;
 pub mod frost;
 pub mod history;
 pub mod icons;

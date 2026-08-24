@@ -4,26 +4,75 @@ Control your coding agents (Claude Code, Codex, Cursor, Grok, Hermes, OpenCode, 
 
 Every device runs a small engine that stores sessions on that device. A new installation starts in local-only mode without an account or a network connection.
 
-## Install and run locally (Linux)
+---
 
+## 📥 Downloads & Installation
+
+All pre-built binaries and packages are available on the [GitHub Releases](https://github.com/jomvick/komet/releases) page.
+
+### 🐧 Linux
+
+**Option 1: One-line install (Recommended)**
 ```bash
-curl -fsSL https://komet.sh/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/jomvick/komet/main/install.sh | sh
+komet status
+```
+The installer configures `komet` in `~/.komet/app` and starts the user systemd service.
+
+**Option 2: Standalone AppImage**
+Download `komet-<version>-linux-x86_64.AppImage` from [Releases](https://github.com/jomvick/komet/releases):
+```bash
+chmod +x komet-*.AppImage
+./komet-*.AppImage
+```
+
+**Option 3: Tarball**
+Download and extract `komet-<version>-linux-<arch>.tar.gz` and run `./install.sh` inside the archive.
+
+---
+
+### 🍏 macOS
+
+**Option 1: Disk Image (.dmg)**
+Download `komet-<version>-macos-arm64.dmg` from [Releases](https://github.com/jomvick/komet/releases), open it and drag `Komet.app` to your `Applications` folder.
+
+**Option 2: CLI & Background Daemon**
+```bash
+komet daemon install
 komet status
 ```
 
-The installer starts the daemon immediately and keeps it running across reboots. No sign-in or sync configuration is required.
+---
 
-Day-to-day:
+### 🪟 Windows
+
+**Option 1: Portable Executable / Zip**
+Download `komet-<version>-windows-x86_64.exe` or `komet-<version>-windows-x86_64.zip` from [Releases](https://github.com/jomvick/komet/releases).
+Extract and run `komet.exe`.
+
+**Option 2: Background Service**
+To install and run Komet as a background Windows service:
+```powershell
+komet.exe daemon install
+# or
+komet.exe --service
+```
+
+---
+
+## 🚀 Day-to-Day Usage
 
 ```bash
-komet status      # local/synced mode and engine status
-komet update      # update to the latest release
+komet status      # Check engine status and local/synced mode
+komet update      # Check and update to the latest release
 komet daemon start|stop|restart|status
 ```
 
-## Multi-device sync (self-hosted)
+---
 
-Komet runs **100% locally** by default. To sync between devices, self-host `komet-sync`:
+## 🔄 Multi-Device Sync (Self-Hosted)
+
+Komet runs **100% locally** by default. To sync across devices, self-host `komet-sync`:
 
 ```bash
 komet sync-init                          # prints KOMET_SYNC_TOKEN
@@ -38,41 +87,7 @@ export KOMET_SYNC_TOKEN=xxx
 komet
 ```
 
-See `docs/self-hosted-sync.md` for details. Legacy Cloudflare/WorkOS `edge/` is deprecated.
-
-On macOS: use the desktop release, or build `komet` from source and run `komet daemon install` to install the launchd service.
-
-## Install on Windows
-
-Download the latest `.msi` installer from the [GitHub release](https://github.com/opencode/komet/releases) and run it — it installs `komet.exe` into `Program Files\Komet`, registers uninstall keys, and optionally installs the `Komet` Windows service (running as the logged-in user). A standalone `komet.exe` portable executable is also available in the release assets; no service is registered for the portable variant.
-
-To install the service from the command line:
-
-```powershell
-c:\Program Files\Komet\komet.exe --service
-```
-
-or equivalently via `sc`:
-
-```powershell
-sc create Komet binPath= "\"c:\Program Files\Komet\komet.exe\" --service"
-```
-
-Day-to-day management:
-
-```powershell
-komet daemon start
-komet daemon stop
-komet daemon restart
-komet daemon status
-```
-
-## Install and run locally (Linux)
-
-```bash
-curl -fsSL https://komet.sh/install.sh | sh
-komet status
-```
+See [`docs/self-hosted-sync.md`](docs/self-hosted-sync.md) for details.
 
 ---
 

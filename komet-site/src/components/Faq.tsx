@@ -19,7 +19,8 @@ export default function Faq() {
           transition={{ duration: 0.6, ease: easing }}
           className="mb-12"
         >
-          <p className="font-mono text-[11px] uppercase tracking-wide text-signal mb-3">
+          <p className="flex items-center gap-2 font-mono text-[11px] uppercase tracking-wide text-fog mb-3">
+            <span className="h-1 w-3 bg-paper/50" />
             Questions
           </p>
           <h2 className="text-[30px] md:text-[36px] leading-tight tracking-tight font-medium text-paper">

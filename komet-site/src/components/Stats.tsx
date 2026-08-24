@@ -2,6 +2,7 @@
 
 import { motion } from "framer-motion";
 import { stats } from "@/lib/data";
+import CountUp from "./CountUp";
 
 const easing = [0.16, 1, 0.3, 1] as const;
 
@@ -14,9 +15,9 @@ export default function Stats() {
           whileInView={{ opacity: 1, y: 0 }}
           viewport={{ once: true, margin: "-80px" }}
           transition={{ duration: 0.6, ease: easing }}
-          className="max-w-xl mb-14"
+          className="max-w-xl mb-16"
         >
-          <p className="font-mono text-[11px] uppercase tracking-wide text-signal mb-3">
+          <p className="font-mono text-[11px] uppercase tracking-wide text-fog mb-3">
             Bâti pour la vitesse
           </p>
           <h2 className="text-[30px] md:text-[36px] leading-tight tracking-tight font-medium text-paper">
@@ -24,18 +25,20 @@ export default function Stats() {
           </h2>
         </motion.div>
 
-        <div className="grid sm:grid-cols-2 lg:grid-cols-4 gap-4">
+        <motion.div
+          initial={{ opacity: 0, y: 16 }}
+          whileInView={{ opacity: 1, y: 0 }}
+          viewport={{ once: true, margin: "-60px" }}
+          transition={{ duration: 0.6, ease: easing }}
+          className="grid sm:grid-cols-2 lg:grid-cols-4 border-t border-l border-[var(--hairline)]"
+        >
           {stats.map((s, i) => (
-            <motion.div
+            <div
               key={s.label}
-              initial={{ opacity: 0, y: 20 }}
-              whileInView={{ opacity: 1, y: 0 }}
-              viewport={{ once: true, margin: "-60px" }}
-              transition={{ duration: 0.55, delay: i * 0.08, ease: easing }}
-              className="hairline rounded-[var(--radius-panel)] bg-ash/50 p-6"
+              className="border-r border-b border-[var(--hairline)] p-6"
             >
               <p className="font-mono text-[26px] text-paper tracking-tight">
-                {s.value}
+                <CountUp value={s.value} duration={0.9 + i * 0.15} />
               </p>
               <p className="mt-1 text-[13px] font-medium text-mist">
                 {s.label}
@@ -43,9 +46,9 @@ export default function Stats() {
               <p className="mt-2 text-[12px] leading-relaxed text-fog">
                 {s.note}
               </p>
-            </motion.div>
+            </div>
           ))}
-        </div>
+        </motion.div>
       </div>
     </section>
   );

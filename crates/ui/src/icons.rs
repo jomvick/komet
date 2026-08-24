@@ -61,6 +61,7 @@ icon_assets![
     // Hand-drawn git-branch glyph in the Solar Linear style (like the
     // terminal/plus/return ports) — the set has no branch icon.
     (GIT_BRANCH, "git-branch"),
+    (PULL_REQUEST, "pull-request"),
     // Compact history-ref glyphs, drawn in the same linear style.
     (CLOUD, "cloud"),
     (TAG, "tag"),
@@ -74,6 +75,7 @@ icon_assets![
     (ARROW_LEFT, "arrow-left"),
     (ARROW_RIGHT, "arrow-right"),
     (ARROW_UP, "arrow-up"),
+    (ARROW_UP_RIGHT, "arrow-up-right"),
     // arrow-up mirrored (like the sidebar flip) — the Solar Linear set here
     // has no plain arrow-down.
     (ARROW_DOWN, "arrow-down"),
@@ -84,9 +86,11 @@ icon_assets![
     // Hand-drawn expand/maximize arrows in the Solar Linear style (like the
     // terminal/plus/return ports) — the set has no expand glyph.
     (EXPAND_ARROWS, "expand-arrows"),
+    (COLLAPSE_ARROWS, "collapse-arrows"),
     // Hand-drawn fold-all chevrons, drawn as a family with EXPAND_ARROWS
     // (same stroke, caps, 90° joints) — Solar has no unfold-less either.
     (FOLD_VERTICAL, "fold-vertical"),
+    (SPLIT_COLUMNS, "split-columns"),
     (ALT_ARROW_LEFT, "alt-arrow-left"),
     (ALT_ARROW_RIGHT, "alt-arrow-right"),
     (SMARTPHONE, "smartphone"),
@@ -95,6 +99,8 @@ icon_assets![
     (RESTART, "restart"),
     (ADD_CIRCLE, "add-circle"),
     (TUNING, "tuning"),
+    (EYE, "eye"),
+    (EYE_CLOSED, "eye-closed"),
     (PAPERCLIP, "paperclip"),
     (PEN, "pen"),
     (ARCHIVE_MINIMALISTIC, "archive-minimalistic"),
