@@ -1,97 +1,113 @@
 # Komet
 
-Control your coding agents (Claude Code, Codex, Cursor, Grok, Hermes, OpenCode, Pi) locally by default, with optional multi-device sync.
+> Contrôlez vos agents de code (Claude Code, Codex, Cursor, Grok, Hermes, OpenCode, Pi) — **100% local par défaut**, synchro multi-device en option.
 
-Every device runs a small engine that stores sessions on that device. A new installation starts in local-only mode without an account or a network connection.
+Komet est un contrôleur natif **Rust + gpui** en un seul binaire. Chaque appareil fait tourner un petit moteur qui stocke les sessions localement. Aucun compte, aucun réseau requis à l'installation — la synchronisation s'active uniquement si vous l'hébergez vous-même.
 
 ---
 
-## 📥 Downloads & Installation
+## Principes
 
-All pre-built binaries and packages are available on the [GitHub Releases](https://github.com/jomvick/komet/releases) page.
+- **Local-first** — tout fonctionne hors-ligne, données sur l'appareil
+- **Un seul binaire** — interface + moteur, mode headed ou headless
+- **Agents multiples** — protocole ACP unifié (Claude, Codex, Cursor, Grok, Hermes, OpenCode, Pi)
+- **Sync optionnelle** — CRDT Loro via Cloudflare Durable Objects, auto-hébergée
 
-### 🐧 Linux
+---
 
-**Option 1: One-line install (Recommended)**
+## Installation
+
+Tous les binaires sont sur la page [**GitHub Releases**](https://github.com/jomvick/komet/releases).
+
+### Linux
+
+**Installation en une ligne (recommandé)**
 ```bash
 curl -fsSL https://raw.githubusercontent.com/jomvick/komet/main/install.sh | sh
 komet status
 ```
-The installer configures `komet` in `~/.komet/app` and starts the user systemd service.
+Installe `komet` dans `~/.komet/app` et active le service systemd utilisateur.
 
-**Option 2: Standalone AppImage**
-Download `komet-<version>-linux-x86_64.AppImage` from [Releases](https://github.com/jomvick/komet/releases):
+**AppImage autonome**
 ```bash
 chmod +x komet-*.AppImage
 ./komet-*.AppImage
 ```
-> **Astuce Linux (Fedora / Ubuntu 24.04+) :** Si l'AppImage ne s'ouvre pas au double-clic, assurez-vous que les permissions d'exécution sont activées (`chmod +x`) et que FUSE est présent (`sudo dnf install fuse` sur Fedora, `sudo apt install libfuse2` sur Ubuntu/Debian), ou exécutez avec `./komet-*.AppImage --appimage-extract-and-run`.
+> **Fedora / Ubuntu 24.04+ :** si le double-clic ne fonctionne pas, vérifiez `chmod +x` et installez FUSE (`sudo dnf install fuse` / `sudo apt install libfuse2`), ou lancez avec `--appimage-extract-and-run`.
 
-**Option 3: Tarball**
-Download and extract `komet-<version>-linux-<arch>.tar.gz` and run `./install.sh` inside the archive.
+**Archive tarball**
+Téléchargez `komet-<version>-linux-<arch>.tar.gz` puis exécutez `./install.sh` dans l'archive.
 
----
+### macOS
 
-### 🍏 macOS
+| Méthode | Fichier | Action |
+|---------|---------|--------|
+| Disk Image | `komet-<version>-macos-arm64.dmg` | Glisser `Komet.app` vers `Applications` |
+| CLI / Daemon | — | `komet daemon install && komet status` |
 
-**Option 1: Disk Image (.dmg)**
-Download `komet-<version>-macos-arm64.dmg` from [Releases](https://github.com/jomvick/komet/releases), open it and drag `Komet.app` to your `Applications` folder.
+### Windows
 
-**Option 2: CLI & Background Daemon**
-```bash
-komet daemon install
-komet status
-```
-
----
-
-### 🪟 Windows
-
-**Option 1: Portable Executable / Zip**
-Download `komet-<version>-windows-x86_64.exe` or `komet-<version>-windows-x86_64.zip` from [Releases](https://github.com/jomvick/komet/releases).
-Extract and run `komet.exe`.
-
-**Option 2: Background Service**
-To install and run Komet as a background Windows service:
-```powershell
-komet.exe daemon install
-# or
-komet.exe --service
-```
+| Méthode | Fichier | Action |
+|---------|---------|--------|
+| Portable | `komet-<version>-windows-x86_64.exe` / `.zip` | Extraire et lancer `komet.exe` |
+| Service | — | `komet.exe daemon install` ou `komet.exe --service` |
 
 ---
 
-## 🚀 Day-to-Day Usage
+## Usage quotidien
 
 ```bash
-komet status      # Check engine status and local/synced mode
-komet update      # Check and update to the latest release
+komet status                          # état moteur + mode local/synchro
+komet update                          # vérifier et installer la dernière version
 komet daemon start|stop|restart|status
+komet headless                        # moteur seul (sans UI)
 ```
 
 ---
 
-## 🔄 Multi-Device Sync (Self-Hosted)
+## Synchro multi-device (auto-hébergée)
 
-Komet runs **100% locally** by default. To sync across devices, self-host `komet-sync`:
+Désactivée par défaut. Pour synchroniser plusieurs appareils via votre propre serveur :
 
+**1. Sur votre VPS / serveur :**
 ```bash
-komet sync-init                          # prints KOMET_SYNC_TOKEN
-docker compose -f docker-compose.sync.yml up -d  # on your VPS
-# or locally: KOMET_SYNC_TOKEN=xxx komet sync-server
+komet sync-init                              # affiche KOMET_SYNC_TOKEN
+docker compose -f docker-compose.sync.yml up -d
+# ou en local : KOMET_SYNC_TOKEN=xxx komet sync-server
 ```
 
-Then on each device:
+**2. Sur chaque appareil :**
 ```bash
-export KOMET_EDGE_URL=http://YOUR_VPS:8787
+export KOMET_EDGE_URL=http://VOTRE_VPS:8787
 export KOMET_SYNC_TOKEN=xxx
 komet
 ```
 
-See [`docs/self-hosted-sync.md`](docs/self-hosted-sync.md) for details.
+> Détails complets : [`docs/self-hosted-sync.md`](docs/self-hosted-sync.md)
 
 ---
 
-Developing or curious how it works? Check out [ARCHITECTURE.md](ARCHITECTURE.md).
+## Architecture
 
-Licensed under the [MIT License](LICENSE).
+```
+gpui UI ── RPC (localhost / in-proc) ── engine A ══ DeviceRoom DO ══ engine B ── RPC ── gpui UI
+                          │         edge Worker (auth, rooms, R2)          │
+                          └── Loro CRDT sync ── SessionRoom DO ────────────┘
+```
+
+| Crate | Rôle |
+|-------|------|
+| `komet-engine` | sessions, agents, terminaux, git/worktrees |
+| `komet-ui` | interface gpui (sidebar, transcript, composer, diff) |
+| `komet-doc` | schémas Loro + couche mirror |
+| `komet-sync` | client rooms + snapshots SQLite |
+| `komet-harness` | adapteurs ACP (7 agents) |
+| `edge/` | Worker TypeScript + Durable Objects + R2 |
+
+En savoir plus : [`ARCHITECTURE.md`](ARCHITECTURE.md) · [`docs/`](docs/)
+
+---
+
+## Licence
+
+[MIT](LICENSE) — contributions bienvenues.
