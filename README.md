@@ -25,6 +25,7 @@ Download `komet-<version>-linux-x86_64.AppImage` from [Releases](https://github.
 chmod +x komet-*.AppImage
 ./komet-*.AppImage
 ```
+> **Astuce Linux (Fedora / Ubuntu 24.04+) :** Si l'AppImage ne s'ouvre pas au double-clic, assurez-vous que les permissions d'exécution sont activées (`chmod +x`) et que FUSE est présent (`sudo dnf install fuse` sur Fedora, `sudo apt install libfuse2` sur Ubuntu/Debian), ou exécutez avec `./komet-*.AppImage --appimage-extract-and-run`.
 
 **Option 3: Tarball**
 Download and extract `komet-<version>-linux-<arch>.tar.gz` and run `./install.sh` inside the archive.
