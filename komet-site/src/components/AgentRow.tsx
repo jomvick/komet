@@ -23,21 +23,22 @@ const agents = [
 export default function AgentRow() {
   return (
     <div>
-      <p className="font-mono text-[11px] uppercase tracking-wide text-fog mb-4">
+      <div className="font-mono text-[11px] tracking-[0.14em] text-muted-foreground/80 uppercase mb-4">
         Pilote les agents que tu as déjà
-      </p>
+      </div>
 
-      <div className="flex flex-wrap items-center gap-6">
+      <div className="flex flex-wrap items-center gap-x-7 gap-y-4">
         {agents.map(({ name, Icon }) => (
           <span
             key={name}
             title={name}
-            className="text-fog transition-colors hover:text-mist"
+            className="text-muted-foreground/70 transition-colors hover:text-foreground"
           >
-            <Icon size={18} />
+            <Icon size={22} />
           </span>
         ))}
       </div>
     </div>
   );
 }
+

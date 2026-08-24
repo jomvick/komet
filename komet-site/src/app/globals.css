@@ -1,54 +1,38 @@
 @import "tailwindcss";
 
+/* ─── Design tokens — Waku-aligned ─────────────────────────────────────────── */
 :root {
-  /* Surfaces — sampled straight from komet's crates/ui/src/theme.rs (dark) */
-  --ink: #060606;       /* bg — main panel */
-  --charcoal: #0d0d0d;  /* surface — shell / sidebar */
-  --ash: #161616;       /* surface_card */
-  --slate: #1c1c1c;     /* surface_dialog */
-  --graphite: #262626;  /* surface_overlay / raised */
+  --background: #1e1e1e;
+  --foreground: #ececec;
+  --muted-foreground: #9e9e9e;
+  --border: rgba(255, 255, 255, 0.1);
+  --border-strong: rgba(255, 255, 255, 0.16);
+  --primary: #ececec;
+  --primary-foreground: #1e1e1e;
+  --ring: rgba(255, 255, 255, 0.3);
 
-  /* Text */
-  --paper: #ececec;     /* text ~neutral-200 */
-  --mist: #b5b5b5;      /* text_muted ~neutral-400 */
-  --fog: #8d8d8d;       /* text_faint ~neutral-500 */
-  --dim: #989898;       /* text_dim */
-
-  /* Hairlines */
-  --hairline: rgba(255, 255, 255, 0.08);
-  --hairline-strong: rgba(255, 255, 255, 0.14);
-
-  /* Monochrome — no brand color. Everything is paper/mist/fog on ink.
-     Only the SessionCard mock keeps a couple of muted status dots, because
-     that's product UI being depicted, not marketing chrome. */
-  --signal: var(--paper);
-  --signal-strong: #ffffff;
-  --line: rgba(255, 255, 255, 0.55); /* used for diagram strokes */
-
-  --radius-panel: 10px;
-  --radius-control: 6px;
-  --radius-bubble: 16px;
+  /* kept for SessionCard (product chrome) */
+  --graphite: #2e2e2e;
+  --charcoal: #262626;
 }
 
 @theme inline {
-  --color-ink: var(--ink);
-  --color-charcoal: var(--charcoal);
-  --color-ash: var(--ash);
-  --color-slate: var(--slate);
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
   --color-graphite: var(--graphite);
-  --color-paper: var(--paper);
-  --color-mist: var(--mist);
-  --color-fog: var(--fog);
-  --color-dim: var(--dim);
-  --color-signal: var(--signal);
-  --color-signal-strong: var(--signal-strong);
-  --color-line: var(--line);
+  --color-charcoal: var(--charcoal);
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
 }
 
 * {
-  border-color: var(--hairline);
+  border-color: var(--border);
+  box-sizing: border-box;
 }
 
 html {
@@ -56,43 +40,19 @@ html {
 }
 
 body {
-  background-color: var(--ink);
-  background-image:
-    linear-gradient(rgba(6, 6, 6, 0.72), rgba(6, 6, 6, 0.88)),
-    url("/background.png");
-  background-size: cover;
-  background-position: center top;
-  background-attachment: fixed;
-  background-repeat: no-repeat;
-  color: var(--paper);
-  font-family: var(--font-geist-sans), Helvetica, Arial, sans-serif;
+  background-color: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-geist-sans), system-ui, sans-serif;
   -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
 ::selection {
   background: rgba(255, 255, 255, 0.16);
-  color: var(--paper);
+  color: var(--foreground);
 }
 
-.font-mono {
-  font-family: var(--font-geist-mono), ui-monospace, monospace;
-}
-
-/* Frost / glass — same recipe family as Theme::glass_overlay */
-.glass {
-  background: rgba(20, 20, 20, 0.55);
-  backdrop-filter: blur(20px);
-  -webkit-backdrop-filter: blur(20px);
-}
-
-.hairline {
-  border: 1px solid var(--hairline);
-}
-
-.noise {
-  background-image: url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI2MCIgaGVpZ2h0PSI2MCI+PGZpbHRlciBpZD0nbicgeD0nMCcgeT0nMCc+PGZlVHVyYnVsZW5jZSB0eXBlPSdmcmFjdGFsTm9pc2UnIGJhc2VGcmVxdWVuY3k9JzAuOScgbnVtT2N0YXZlcz0nMicgc3RpdGNoVGlsZXM9J3N0aXRjaCcvPjxmZUNvbG9yTWF0cml4IHR5cGU9J3NhdHVyYXRlJyB2YWx1ZXM9JzAnLz48L2ZpbHRlcj48cmVjdCB3aWR0aD0nMTAwJScgaGVpZ2h0PScxMDAlJyBmaWx0ZXI9J3VybCgjbiknIG9wYWNpdHk9JzAuMDUnLz48L3N2Zz4=");
-}
-
+/* SessionCard product chrome helpers */
 @keyframes blink {
   0%, 49% { opacity: 1; }
   50%, 100% { opacity: 0; }
@@ -101,19 +61,6 @@ body {
   animation: blink 1s step-end infinite;
 }
 
-@keyframes drift {
-  0% { transform: translate3d(0,0,0) scale(1); }
-  50% { transform: translate3d(2%, -3%, 0) scale(1.05); }
-  100% { transform: translate3d(0,0,0) scale(1); }
-}
-.drift {
-  animation: drift 18s ease-in-out infinite;
-}
-
-@keyframes marquee {
-  from { transform: translateX(0); }
-  to { transform: translateX(-50%); }
-}
 .marquee {
   animation: marquee 28s linear infinite;
 }

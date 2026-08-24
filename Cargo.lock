@@ -3614,7 +3614,7 @@ checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 
 [[package]]
 name = "komet"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "anyhow",
  "clap",
@@ -3633,11 +3633,12 @@ dependencies = [
  "uuid",
  "windows-service",
  "winreg 0.55.0",
+ "winres",
 ]
 
 [[package]]
 name = "komet-doc"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "chrono",
  "komet-proto",
@@ -3651,7 +3652,7 @@ dependencies = [
 
 [[package]]
 name = "komet-engine"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3688,7 +3689,7 @@ dependencies = [
 
 [[package]]
 name = "komet-harness"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3709,7 +3710,7 @@ dependencies = [
 
 [[package]]
 name = "komet-proto"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "chrono",
  "serde",
@@ -3719,7 +3720,7 @@ dependencies = [
 
 [[package]]
 name = "komet-rpc"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3738,7 +3739,7 @@ dependencies = [
 
 [[package]]
 name = "komet-sync"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "block2 0.6.2",
  "chrono",
@@ -3761,7 +3762,7 @@ dependencies = [
 
 [[package]]
 name = "komet-sync-server"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "anyhow",
  "axum",
@@ -3779,7 +3780,7 @@ dependencies = [
 
 [[package]]
 name = "komet-syntax"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "thiserror 2.0.20",
  "tree-sitter",
@@ -3813,7 +3814,7 @@ dependencies = [
 
 [[package]]
 name = "komet-ui"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -3849,7 +3850,7 @@ dependencies = [
 
 [[package]]
 name = "komet-update"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "anyhow",
  "futures",
@@ -7511,6 +7512,15 @@ dependencies = [
 
 [[package]]
 name = "toml"
+version = "0.5.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f4f7f0dd8d50a853a531c426359045b1998f04219d88799810762cd4ad314234"
+dependencies = [
+ "serde",
+]
+
+[[package]]
+name = "toml"
 version = "0.8.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc1beb996b9d83529a9e75c17a1686767d148d70663143c7854d8b4a09ced362"
@@ -9220,6 +9230,15 @@ checksum = "cb5a765337c50e9ec252c2069be9bf91c7df47afb103b642ba3a53bf8101be97"
 dependencies = [
  "cfg-if",
  "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "winres"
+version = "0.1.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b68db261ef59e9e52806f688020631e987592bd83619edccda9c47d42cde4f6c"
+dependencies = [
+ "toml 0.5.11",
 ]
 
 [[package]]

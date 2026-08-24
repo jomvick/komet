@@ -1,80 +1,57 @@
 "use client";
 
 import { useState } from "react";
-import { motion, AnimatePresence } from "framer-motion";
 import { faq } from "@/lib/data";
 
-const easing = [0.16, 1, 0.3, 1] as const;
-
 export default function Faq() {
-  const [open, setOpen] = useState<number | null>(0);
+  const [open, setOpen] = useState<number | null>(null);
 
   return (
-    <section id="faq" className="py-24 md:py-32 border-t border-[var(--hairline)]">
-      <div className="mx-auto max-w-3xl px-5">
-        <motion.div
-          initial={{ opacity: 0, y: 16 }}
-          whileInView={{ opacity: 1, y: 0 }}
-          viewport={{ once: true, margin: "-80px" }}
-          transition={{ duration: 0.6, ease: easing }}
-          className="mb-12"
-        >
-          <p className="flex items-center gap-2 font-mono text-[11px] uppercase tracking-wide text-fog mb-3">
-            <span className="h-1 w-3 bg-paper/50" />
-            Questions
-          </p>
-          <h2 className="text-[30px] md:text-[36px] leading-tight tracking-tight font-medium text-paper">
-            Ce qu&apos;on te demande le plus.
-          </h2>
-        </motion.div>
+    <section className="border-t px-5 py-16 md:px-10">
+      <div className="font-mono text-[11px] tracking-[0.14em] text-muted-foreground/80 uppercase">
+        Questions
+      </div>
 
-        <div className="space-y-2">
-          {faq.map((item, i) => {
-            const isOpen = open === i;
-            return (
-              <motion.div
-                key={item.q}
-                initial={{ opacity: 0, y: 12 }}
-                whileInView={{ opacity: 1, y: 0 }}
-                viewport={{ once: true, margin: "-40px" }}
-                transition={{ duration: 0.45, delay: i * 0.05 }}
-                className="hairline rounded-[var(--radius-panel)] bg-ash/50 overflow-hidden"
-              >
+      <div className="mt-6 flex w-full flex-col max-w-2xl">
+        {faq.map((item, i) => {
+          const isOpen = open === i;
+          return (
+            <div key={item.q} className="not-last:border-b border-border">
+              <h3 className="flex">
                 <button
+                  type="button"
                   onClick={() => setOpen(isOpen ? null : i)}
-                  className="w-full flex items-center justify-between gap-4 px-5 py-4 text-left"
+                  aria-expanded={isOpen}
+                  className="relative flex flex-1 items-start justify-between py-2.5 text-left font-medium transition-all outline-none hover:underline text-[15px]"
                 >
-                  <span className="text-[14.5px] font-medium text-paper">
-                    {item.q}
-                  </span>
-                  <motion.span
-                    animate={{ rotate: isOpen ? 45 : 0 }}
-                    transition={{ duration: 0.25 }}
-                    className="shrink-0 text-[18px] text-fog leading-none"
+                  {item.q}
+                  <svg
+                    xmlns="http://www.w3.org/2000/svg"
+                    width="16"
+                    height="16"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="2"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    className={`ml-4 shrink-0 text-muted-foreground transition-transform duration-200 ${isOpen ? "rotate-180" : ""}`}
+                    aria-hidden="true"
                   >
-                    +
-                  </motion.span>
+                    <path d="m6 9 6 6 6-6" />
+                  </svg>
                 </button>
-                <AnimatePresence initial={false}>
-                  {isOpen && (
-                    <motion.div
-                      initial={{ height: 0, opacity: 0 }}
-                      animate={{ height: "auto", opacity: 1 }}
-                      exit={{ height: 0, opacity: 0 }}
-                      transition={{ duration: 0.3, ease: easing }}
-                      className="overflow-hidden"
-                    >
-                      <p className="px-5 pb-4 text-[13.5px] leading-relaxed text-mist">
-                        {item.a}
-                      </p>
-                    </motion.div>
-                  )}
-                </AnimatePresence>
-              </motion.div>
-            );
-          })}
-        </div>
+              </h3>
+              {isOpen && (
+                <p className="pb-4 text-sm leading-relaxed text-muted-foreground">
+                  {item.a}
+                </p>
+              )}
+            </div>
+          );
+        })}
       </div>
     </section>
   );
 }
+
