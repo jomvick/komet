@@ -27,6 +27,7 @@ pulldown-cmark.workspace = true
 alacritty_terminal.workspace = true
 base64 = "0.22"
 unicode-segmentation.workspace = true
+image = "0.25"
 uuid.workspace = true
 chrono.workspace = true
 anyhow.workspace = true
