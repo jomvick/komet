@@ -1,29 +1,43 @@
 export default function Nav() {
   return (
-    <header className="relative border-b border-[var(--hairline)]">
-      <div className="mx-auto max-w-6xl px-5 py-4 flex items-center justify-between">
-        <a href="#" className="flex items-center gap-2.5 shrink-0">
-          <img src="/komet.png" alt="komet" className="h-8 w-8 object-contain" />
-          <span className="text-[14px] font-medium tracking-tight text-paper">komet</span>
+    <header className="flex h-16 items-center justify-between px-5 md:px-10">
+      {/* Logo */}
+      <a href="/" className="flex items-center gap-2.5">
+        <img
+          src="/komet.png"
+          alt=""
+          className="size-8 rounded-[6px] object-contain"
+        />
+        <span className="text-[15px] font-semibold tracking-tight">komet</span>
+      </a>
+
+      {/* Right actions */}
+      <div className="flex items-center gap-5">
+        {/* GitHub icon link — same SVG as Waku */}
+        <a
+          href="https://github.com/jomvick/komet"
+          target="_blank"
+          rel="noreferrer"
+          aria-label="GitHub"
+          className="rounded-full text-muted-foreground transition-colors outline-none hover:text-foreground"
+        >
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" className="size-6">
+            <path
+              fill="currentColor"
+              d="M12 2A10 10 0 0 0 2 12c0 4.42 2.87 8.17 6.84 9.5c.5.08.66-.23.66-.5v-1.69c-2.77.6-3.36-1.34-3.36-1.34c-.46-1.16-1.11-1.47-1.11-1.47c-.91-.62.07-.6.07-.6c1 .07 1.53 1.03 1.53 1.03c.87 1.52 2.34 1.07 2.91.83c.09-.65.35-1.09.63-1.34c-2.22-.25-4.55-1.11-4.55-4.92c0-1.11.38-2 1.03-2.71c-.1-.25-.45-1.29.1-2.64c0 0 .84-.27 2.75 1.02c.79-.22 1.65-.33 2.5-.33s1.71.11 2.5.33c1.91-1.29 2.75-1.02 2.75-1.02c.55 1.35.2 2.39.1 2.64c.65.71 1.03 1.6 1.03 2.71c0 3.82-2.34 4.66-4.57 4.91c.36.31.69.92.69 1.85V21c0 .27.16.59.67.5C19.14 20.16 22 16.42 22 12A10 10 0 0 0 12 2"
+            />
+          </svg>
         </a>
 
-        <div className="flex items-center gap-3 shrink-0">
-          <a
-            href="https://github.com/jomvick/komet"
-            target="_blank"
-            rel="noreferrer"
-            className="text-[13px] text-mist hover:text-paper transition-colors"
-          >
-            GitHub ↗
-          </a>
-          <a
-            href="#downloads"
-            className="rounded-[var(--radius-control)] bg-paper px-3.5 py-1.5 text-[13px] font-medium text-ink transition-opacity hover:opacity-85"
-          >
-            Télécharger
-          </a>
-        </div>
+        {/* Download button — same compact pill as Waku */}
+        <a
+          href="#downloads"
+          className="inline-flex items-center justify-center rounded-[min(var(--radius-md,8px),12px)] bg-primary text-primary-foreground px-2.5 h-7 text-[0.8rem] font-medium hover:opacity-80 transition-opacity"
+        >
+          Télécharger
+        </a>
       </div>
     </header>
   );
 }
+
