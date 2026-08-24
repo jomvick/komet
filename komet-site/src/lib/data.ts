@@ -70,17 +70,17 @@ export const faq = [
 export const platforms = [
   {
     os: "Linux",
-    detail: "Script d'installation, daemon persistant au démarrage.",
-    command: "curl -fsSL https://komet.sh/install.sh | sh",
+    detail: "Script d'installation automatique, AppImage autonome ou tarball.",
+    command: "curl -fsSL https://raw.githubusercontent.com/jomvick/komet/main/install.sh | sh",
   },
   {
     os: "macOS",
-    detail: "Build depuis les sources, ou service launchd via la CLI.",
+    detail: "Image disque .dmg (Apple Silicon) ou service launchd via CLI.",
     command: "komet daemon install",
   },
   {
     os: "Windows",
-    detail: "Installeur .msi signé, ou exécutable portable autonome.",
-    command: "komet.exe --service",
+    detail: "Exécutable autonome (.exe) ou archive .zip prête à l'emploi.",
+    command: "komet.exe",
   },
 ];

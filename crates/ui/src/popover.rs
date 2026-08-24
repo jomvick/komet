@@ -300,11 +300,15 @@ pub fn classify_key(key: &str, cmd: bool, ctrl: bool) -> MenuKey {
 /// [`crate::frost::MENU_BLUR`] blur from the mount helpers below, plus the
 /// same hairline + baked-in shadow. Opaque platforms keep the near-opaque
 /// tone the reference composites to on the dark panels (~#161616).
+/// Corner radius of every floating card. The frost wrapper masks its backdrop
+/// blur to the same value, so the two must agree.
+pub const CARD_RADIUS: f32 = 12.0;
+
 pub fn popover_card(theme: &Theme) -> gpui::Div {
     let card = div()
         .border_1()
         .border_color(hairline(0.10))
-        .rounded(px(12.0))
+        .rounded(px(CARD_RADIUS))
         .shadow_lg()
         .p(px(4.0))
         .overflow_hidden()

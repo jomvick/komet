@@ -28,8 +28,7 @@ use komet_rpc::methods;
 
 use crate::changes::{Changes, ChangesEvent};
 use crate::composer::{Composer, ComposerEvent, ComposerInput, ComposerInputEvent};
-use crate::file_editor::FileEditorPanel;
-use crate::files::{FilesPanel, FilesPanelEvent};
+use crate::files::{FilesCloseDisposition, FilesEvent, FilesSurface, WorkspacePathDrag};
 use crate::icons::{self, icon};
 use crate::loaders;
 use crate::motion::{self, AnimationExt as _, MotionSpec, RESIZE, SPLASH_OUT, TAB_SLIDE};
@@ -39,6 +38,7 @@ use crate::settings::accounts::AccountsPage;
 use crate::settings::appearance::AppearancePage;
 use crate::settings::archived::ArchivedPage;
 use crate::settings::devices::DevicesPage;
+use crate::settings::files::FilesSettingsPage;
 use crate::settings::harnesses::HarnessesPage;
 use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
@@ -127,8 +127,12 @@ pub fn apply_keymap(cx: &mut App, keymap: &KeymapConfig) {
         }
     }
     cx.clear_key_bindings();
+    // `clear_key_bindings` also removes the contextual editing actions that
+    // gpui-base installed at startup. Reinitialize the component layer before
+    // rebuilding Komet's bindings so Backspace, navigation, selection, undo,
+    // and the rest of the editor keymap continue to reach focused inputs.
+    gpui_base::init(cx);
     crate::composer::init(cx);
-    crate::file_editor::init(cx);
     // Fixed app-level shortcuts (⌘Q quit, ⌘W close, ⌘M minimize, ⌘H hide) —
     // these back the native menu key equivalents and must survive keymap
     // re-application.
@@ -169,6 +173,7 @@ pub enum SettingsSection {
     /// Per-provider CLI accounts (login, usage) — labeled "Accounts".
     Agents,
     Appearance,
+    Files,
     Notifications,
     Shortcuts,
     Archived,
@@ -176,11 +181,12 @@ pub enum SettingsSection {
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 8] = [
+    pub const ALL: [SettingsSection; 9] = [
         SettingsSection::Devices,
         SettingsSection::Harnesses,
         SettingsSection::Agents,
         SettingsSection::Appearance,
+        SettingsSection::Files,
         SettingsSection::Notifications,
         SettingsSection::Shortcuts,
         SettingsSection::Archived,
@@ -195,6 +201,7 @@ impl SettingsSection {
             SettingsSection::Harnesses => "Agents",
             SettingsSection::Agents => "Accounts",
             SettingsSection::Appearance => "Appearance",
+            SettingsSection::Files => "Files",
             SettingsSection::Notifications => "Notifications",
             SettingsSection::Shortcuts => "Shortcuts",
             SettingsSection::Archived => "Archived sessions",
@@ -210,18 +217,33 @@ pub enum Route {
     Settings(SettingsSection),
 }
 
-/// One right-pane surface tab (t3code RightPanelSurface, narrowed to our two
-/// kinds): a git-diff page (each tab its own [`Changes`] viewer — multiple
-/// diff panels, user request) or one embedded terminal keyed by its
-/// [`TerminalPanel`] tab key. `Picker` is the empty state ("Open a surface").
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+/// One right-pane surface tab: a workspace browser, an individual workspace
+/// file editor, a git-diff page, an embedded terminal, or a subagent
+/// transcript. `Picker` is the empty surface chooser.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RightSurface {
     #[default]
     Picker,
+    Files,
+    File(u64),
     Diff(u64),
     Terminal(u64),
-    Files(u64),
-    FileEditor(u64),
+    /// A subagent's transcript, read-only (per-subagent viz) — the handle
+    /// keys [`Shell::subagent_tabs`].
+    Subagent(u64),
+}
+
+fn push_unique_right_surface(tabs: &mut Vec<RightSurface>, surface: RightSurface) -> bool {
+    if tabs.contains(&surface) {
+        false
+    } else {
+        tabs.push(surface);
+        true
+    }
+}
+
+fn workspace_file_title(path: &str) -> SharedString {
+    path.rsplit('/').next().unwrap_or(path).to_string().into()
 }
 
 /// Per-chat panel open flags (komet parity: `sessionPanels` — the terminal and
@@ -408,10 +430,12 @@ struct SidebarResize;
 struct RightPaneResize;
 
 /// The dragged surface-tab payload (strip reorder).
+#[allow(dead_code)]
 struct RightTabDrag {
     panel_key: String,
     from: usize,
     title: SharedString,
+    workspace_path: Option<WorkspacePathDrag>,
 }
 
 /// Live drag-over state for the surface-tab strip — the terminal drawer's
@@ -794,13 +818,19 @@ pub struct Shell {
     /// Event hookups for [`Self::diffs`] (History rows opening commit tabs).
     diff_subs: std::collections::HashMap<u64, Subscription>,
     diff_seq: u64,
-    /// Files explorer surfaces by id (interactive project tree).
-    files: std::collections::HashMap<u64, Entity<FilesPanel>>,
-    files_subs: std::collections::HashMap<u64, Subscription>,
-    files_seq: u64,
-    /// File editor surfaces by id (opened file contents with dirty tracking).
-    file_editors: std::collections::HashMap<u64, Entity<FileEditorPanel>>,
-    file_editor_seq: u64,
+    /// One workspace browser per chat/panel key. Dropping the entity closes
+    /// its file watcher and every in-flight workspace request.
+    files: std::collections::HashMap<String, Entity<FilesSurface>>,
+    files_subs: std::collections::HashMap<String, Subscription>,
+    /// One independent editor/tree per opened workspace file. IDs are global
+    /// while the lookup key keeps a file tab scoped to its chat panel.
+    file_surfaces: std::collections::HashMap<u64, Entity<FilesSurface>>,
+    file_surface_paths: std::collections::HashMap<u64, String>,
+    file_surface_keys: std::collections::HashMap<(String, String), u64>,
+    file_surface_subs: std::collections::HashMap<u64, Subscription>,
+    file_surface_seq: u64,
+    pending_file_closes: std::collections::HashSet<RightSurface>,
+    window_close_pending: bool,
     /// Ordered surface tabs per panel key (drag-reorderable; stale entries —
     /// closed terminals/diffs — are skipped at read time).
     right_tabs: std::collections::HashMap<String, Vec<RightSurface>>,
@@ -816,6 +846,7 @@ pub struct Shell {
     devices_page: Option<Entity<DevicesPage>>,
     archived_page: Option<Entity<ArchivedPage>>,
     appearance_page: Option<Entity<AppearancePage>>,
+    files_settings_page: Option<Entity<FilesSettingsPage>>,
     notifications_page: Option<Entity<NotificationsPage>>,
     shortcuts_page: Option<Entity<ShortcutsPage>>,
     accounts_page: Option<Entity<AccountsPage>>,
@@ -1045,9 +1076,13 @@ impl Shell {
             diff_seq: 0,
             files: std::collections::HashMap::new(),
             files_subs: std::collections::HashMap::new(),
-            files_seq: 0,
-            file_editors: std::collections::HashMap::new(),
-            file_editor_seq: 0,
+            file_surfaces: std::collections::HashMap::new(),
+            file_surface_paths: std::collections::HashMap::new(),
+            file_surface_keys: std::collections::HashMap::new(),
+            file_surface_subs: std::collections::HashMap::new(),
+            file_surface_seq: 0,
+            pending_file_closes: std::collections::HashSet::new(),
+            window_close_pending: false,
             right_tabs: std::collections::HashMap::new(),
             right_tab_drag: None,
             right_tab_scroll: gpui::ScrollHandle::new(),
@@ -1056,6 +1091,7 @@ impl Shell {
             devices_page: None,
             archived_page: None,
             appearance_page: None,
+            files_settings_page: None,
             notifications_page: None,
             shortcuts_page: None,
             accounts_page: None,
@@ -1440,11 +1476,11 @@ impl Shell {
     /// the tree itself (matches the `files_panel` condition in
     /// `render_right_pane` by construction, not a duplicated match).
     fn files_split_active(&self, cx: &App) -> bool {
-        !matches!(self.resolved_right_active(cx), RightSurface::Files(_))
+        !matches!(self.resolved_right_active(cx), RightSurface::Files)
             && self
                 .right_surface_rows(cx)
                 .iter()
-                .any(|(s, _)| matches!(s, RightSurface::Files(_)))
+                .any(|(s, _, _, _)| matches!(s, RightSurface::Files))
     }
 
     fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
@@ -1486,9 +1522,12 @@ impl Shell {
     }
 
     /// The right pane's surface tabs in the STORED (drag-reorderable) order —
-    /// `(surface, title)`; entries whose backing tab/entity is gone are
-    /// skipped.
-    fn right_surface_rows(&self, cx: &App) -> Vec<(RightSurface, SharedString)> {
+    /// `(surface, title, dirty, tooltip_detail)`; entries whose backing tab/entity
+    /// is gone are skipped.
+    fn right_surface_rows(
+        &self,
+        cx: &App,
+    ) -> Vec<(RightSurface, SharedString, bool, Option<SharedString>)> {
         let key = self.panel_key(cx);
         let stored: &[RightSurface] = self
             .right_tabs
@@ -1503,25 +1542,39 @@ impl Shell {
         stored
             .iter()
             .filter_map(|surface| match surface {
+                RightSurface::Files => self.files.get(&key).map(|files| {
+                    let files = files.read(cx);
+                    (
+                        *surface,
+                        files.tab_title(),
+                        files.has_unsaved_changes(),
+                        None,
+                    )
+                }),
+                RightSurface::File(id) => self.file_surfaces.get(id).map(|file| {
+                    let path = self.file_surface_paths.get(id);
+                    let title = path
+                        .map(|p| workspace_file_title(p))
+                        .unwrap_or_else(|| SharedString::from("File"));
+                    (
+                        *surface,
+                        title,
+                        file.read(cx).has_unsaved_changes(),
+                        path.cloned().map(Into::into),
+                    )
+                }),
                 RightSurface::Diff(id) => self
                     .diffs
                     .get(id)
                     // Contextual title (user request): the pane's scope
                     // label, or the pinned commit's subject.
-                    .map(|changes| (*surface, changes.read(cx).tab_title())),
-                RightSurface::Files(id) => self
-                    .files
-                    .get(id)
-                    .map(|files| (*surface, files.read(cx).tab_title())),
-                RightSurface::FileEditor(id) => self
-                    .file_editors
-                    .get(id)
-                    .map(|editor| (*surface, editor.read(cx).tab_title())),
+                    .map(|changes| (*surface, changes.read(cx).tab_title(), false, None)),
                 RightSurface::Terminal(tab) => terminals
                     .iter()
                     .find(|(k, _, _)| k == tab)
-                    .map(|(_, title, _)| (*surface, title.clone())),
+                    .map(|(_, title, _)| (*surface, title.clone(), false, None)),
                 RightSurface::Picker => None,
+                RightSurface::Subagent(_) => None,
             })
             .collect()
     }
@@ -1571,13 +1624,13 @@ impl Shell {
         let rows = self.right_surface_rows(cx);
         let exists = match picked {
             RightSurface::Picker => false,
-            surface => rows.iter().any(|(s, _)| *s == surface),
+            surface => rows.iter().any(|(s, _, _, _)| *s == surface),
         };
         if exists {
             picked
         } else {
             rows.first()
-                .map(|(s, _)| *s)
+                .map(|(s, _, _, _)| *s)
                 .unwrap_or(RightSurface::Picker)
         }
     }
@@ -1586,6 +1639,16 @@ impl Shell {
         let key = self.panel_key(cx);
         self.panels.update(&key, |p| p.right_active = surface);
         match surface {
+            RightSurface::Files => {
+                if let Some(files) = self.files.get(&key).cloned() {
+                    files.update(cx, |files, cx| files.ensure_loaded(cx));
+                }
+            }
+            RightSurface::File(id) => {
+                if let Some(file) = self.file_surfaces.get(&id).cloned() {
+                    file.update(cx, |file, cx| file.ensure_loaded(cx));
+                }
+            }
             RightSurface::Terminal(tab) => {
                 let panel = self.right_terminal_panel(cx);
                 panel.update(cx, |panel, cx| panel.select_tab_by_key(tab, cx));
@@ -1595,98 +1658,381 @@ impl Shell {
                     changes.update(cx, |changes, cx| changes.ensure_content(cx));
                 }
             }
-            RightSurface::Files(id) => {
-                if let Some(files) = self.files.get(&id).cloned() {
-                    files.update(cx, |files, cx| files.ensure_root(cx));
-                }
-            }
-            RightSurface::FileEditor(id) => {
-                if let Some(editor) = self.file_editors.get(&id).cloned() {
-                    editor.update(cx, |editor, cx| editor.ensure_content(cx));
-                }
-            }
-            RightSurface::Picker => {}
+            RightSurface::Subagent(_) | RightSurface::Picker => {}
         }
         cx.notify();
     }
 
-    /// The picker's Files card / the `+` menu's Files row: opens a project
-    /// file tree explorer surface tab.
-    fn add_files_surface(&mut self, cx: &mut Context<Self>) {
-        if let Some((surface, _)) = self.right_surface_rows(cx).into_iter().find(|(s, _)| matches!(s, RightSurface::Files(_))) {
-            self.set_right_active(surface, cx);
+    fn focus_right_file_editor(
+        &mut self,
+        surface: RightSurface,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = self.panel_key(cx);
+        let files = match surface {
+            RightSurface::Files => self.files.get(&key).cloned(),
+            RightSurface::File(id) => self.file_surfaces.get(&id).cloned(),
+            _ => None,
+        };
+        if let Some(files) = files {
+            files.update(cx, |files, cx| {
+                files.focus_editor(window, cx);
+            });
+        }
+    }
+
+    /// Files is single-instance per chat: both the picker and the `+` menu
+    /// focus the existing surface instead of creating duplicate trees and
+    /// duplicate workspace subscriptions.
+    fn add_files_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active_chat.is_empty() {
             return;
         }
-        let files = cx.new(|cx| FilesPanel::new(self.state.clone(), cx));
-        self.files_seq += 1;
-        let id = self.files_seq;
-        let sub = cx.subscribe(&files, move |this: &mut Self, _, event, cx| match event {
-            FilesPanelEvent::OpenFile(path) => {
-                this.open_file_in_panel(path.clone(), cx);
+        let key = self.panel_key(cx);
+        if !self.files.contains_key(&key) {
+            let delay = self.settings.files_autosave_delay_ms;
+            let editor_font_size = self.settings.files_editor_font_size;
+            let word_wrap = self.settings.files_word_wrap;
+            let show_all_files = self.settings.files_show_all;
+            let files = cx.new(|cx| {
+                FilesSurface::new(
+                    self.state.clone(),
+                    self.active_chat.clone(),
+                    delay,
+                    editor_font_size,
+                    word_wrap,
+                    show_all_files,
+                    cx,
+                )
+            });
+            let event_key = key.clone();
+            let sub = cx.subscribe_in(
+                &files,
+                window,
+                move |this: &mut Self, _, event, window, cx| match event {
+                    FilesEvent::OpenFile(path) => this.add_file_surface(path.clone(), window, cx),
+                    FilesEvent::TitleChanged => cx.notify(),
+                    FilesEvent::FileRenamed { .. } => cx.notify(),
+                    FilesEvent::WordWrapChanged(word_wrap) => {
+                        this.set_files_word_wrap(*word_wrap, window, cx)
+                    }
+                    FilesEvent::ShowAllFilesChanged(show_all_files) => {
+                        this.set_files_show_all(*show_all_files, cx)
+                    }
+                    FilesEvent::CloseReady => {
+                        this.on_file_close_ready(RightSurface::Files, &event_key, cx)
+                    }
+                    FilesEvent::CloseCancelled => this.cancel_file_close(RightSurface::Files, cx),
+                },
+            );
+            self.files.insert(key.clone(), files);
+            self.files_subs.insert(key.clone(), sub);
+        }
+        let tabs = self.right_tabs.entry(key).or_default();
+        push_unique_right_surface(tabs, RightSurface::Files);
+        self.set_right_active(RightSurface::Files, cx);
+        self.focus_right_file_editor(RightSurface::Files, window, cx);
+    }
+
+    /// Open a workspace file as a first-class right-pane tab. Every editor is
+    /// a separate FilesSurface so its tree, search, watcher and split layout
+    /// stay stable while users move among open files.
+    fn add_file_surface(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active_chat.is_empty() {
+            return;
+        }
+        let panel_key = self.panel_key(cx);
+        let lookup = (panel_key.clone(), path.clone());
+        if let Some(id) = self.file_surface_keys.get(&lookup).copied() {
+            let surface = RightSurface::File(id);
+            self.set_right_active(surface, cx);
+            self.focus_right_file_editor(surface, window, cx);
+            return;
+        }
+
+        self.file_surface_seq += 1;
+        let id = self.file_surface_seq;
+        let file = cx.new(|cx| {
+            FilesSurface::new_editor(
+                self.state.clone(),
+                self.active_chat.clone(),
+                path.clone(),
+                self.settings.files_autosave_delay_ms,
+                self.settings.files_editor_font_size,
+                self.settings.files_word_wrap,
+                self.settings.files_show_all,
+                cx,
+            )
+        });
+        let event_panel_key = panel_key.clone();
+        let sub = cx.subscribe_in(
+            &file,
+            window,
+            move |this: &mut Self, _, event, window, cx| match event {
+                FilesEvent::OpenFile(path) => this.add_file_surface(path.clone(), window, cx),
+                FilesEvent::TitleChanged => cx.notify(),
+                FilesEvent::FileRenamed { old_path, new_path } => {
+                    this.rename_file_surface(id, &event_panel_key, old_path, new_path, cx)
+                }
+                FilesEvent::WordWrapChanged(word_wrap) => {
+                    this.set_files_word_wrap(*word_wrap, window, cx)
+                }
+                FilesEvent::ShowAllFilesChanged(show_all_files) => {
+                    this.set_files_show_all(*show_all_files, cx)
+                }
+                FilesEvent::CloseReady => {
+                    this.on_file_close_ready(RightSurface::File(id), &event_panel_key, cx)
+                }
+                FilesEvent::CloseCancelled => this.cancel_file_close(RightSurface::File(id), cx),
+            },
+        );
+        self.file_surfaces.insert(id, file);
+        self.file_surface_paths.insert(id, path);
+        self.file_surface_keys.insert(lookup, id);
+        self.file_surface_subs.insert(id, sub);
+        self.right_tabs
+            .entry(panel_key)
+            .or_default()
+            .push(RightSurface::File(id));
+        self.set_right_active(RightSurface::File(id), cx);
+    }
+
+    fn rename_file_surface(
+        &mut self,
+        id: u64,
+        panel_key: &str,
+        old_path: &str,
+        new_path: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if self.file_surface_paths.get(&id).map(String::as_str) != Some(old_path) {
+            return;
+        }
+        self.file_surface_paths.insert(id, new_path.to_string());
+        self.file_surface_keys
+            .remove(&(panel_key.to_string(), old_path.to_string()));
+        self.file_surface_keys
+            .entry((panel_key.to_string(), new_path.to_string()))
+            .or_insert(id);
+        cx.notify();
+    }
+
+    fn workspace_path_for_surface(
+        &self,
+        surface: RightSurface,
+        cx: &App,
+    ) -> Option<WorkspacePathDrag> {
+        let path = match surface {
+            RightSurface::Files => self
+                .files
+                .get(&self.panel_key(cx))
+                .and_then(|files| files.read(cx).attachment_path().map(str::to_string))?,
+            RightSurface::File(id) => self.file_surface_paths.get(&id).cloned()?,
+            RightSurface::Diff(_)
+            | RightSurface::Picker
+            | RightSurface::Terminal(_)
+            | RightSurface::Subagent(_) => {
+                return None;
+            }
+        };
+        Some(WorkspacePathDrag::new(path, false))
+    }
+
+    fn set_files_word_wrap(
+        &mut self,
+        word_wrap: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings.files_word_wrap = word_wrap;
+        if let Some(page) = self.files_settings_page.clone() {
+            page.update(cx, |page, cx| page.set_word_wrap(word_wrap, cx));
+        }
+        let surfaces = self
+            .files
+            .values()
+            .chain(self.file_surfaces.values())
+            .cloned()
+            .collect::<Vec<_>>();
+        for surface in surfaces {
+            surface.update(cx, |surface, cx| {
+                surface.set_word_wrap(word_wrap, window, cx)
+            });
+        }
+        self.schedule_save(cx);
+        cx.notify();
+    }
+
+    fn set_files_editor_font_size(&mut self, editor_font_size: f32, cx: &mut Context<Self>) {
+        self.settings.files_editor_font_size = editor_font_size;
+        let surfaces = self
+            .files
+            .values()
+            .chain(self.file_surfaces.values())
+            .cloned()
+            .collect::<Vec<_>>();
+        for surface in surfaces {
+            surface.update(cx, |surface, cx| {
+                surface.set_editor_font_size(editor_font_size, cx)
+            });
+        }
+        self.schedule_save(cx);
+        cx.notify();
+    }
+
+    fn set_files_show_all(&mut self, show_all_files: bool, cx: &mut Context<Self>) {
+        self.settings.files_show_all = show_all_files;
+        if let Some(page) = self.files_settings_page.clone() {
+            page.update(cx, |page, cx| page.set_show_all_files(show_all_files, cx));
+        }
+        let surfaces = self
+            .files
+            .values()
+            .chain(self.file_surfaces.values())
+            .cloned()
+            .collect::<Vec<_>>();
+        for surface in surfaces {
+            surface.update(cx, |surface, cx| {
+                surface.set_show_all_files(show_all_files, cx)
+            });
+        }
+        self.schedule_save(cx);
+        cx.notify();
+    }
+
+    fn on_file_close_ready(
+        &mut self,
+        surface: RightSurface,
+        panel_key: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if self.pending_file_closes.contains(&surface) {
+            self.complete_file_close(surface, panel_key, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn cancel_file_close(&mut self, surface: RightSurface, cx: &mut Context<Self>) {
+        self.pending_file_closes.remove(&surface);
+        self.window_close_pending = false;
+        cx.notify();
+    }
+
+    fn complete_file_close(
+        &mut self,
+        surface: RightSurface,
+        panel_key: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(tabs) = self.right_tabs.get_mut(panel_key) {
+            tabs.retain(|candidate| *candidate != surface);
+        }
+        match surface {
+            RightSurface::Files => {
+                self.files.remove(panel_key);
+                self.files_subs.remove(panel_key);
+            }
+            RightSurface::File(id) => {
+                self.file_surfaces.remove(&id);
+                self.file_surface_paths.remove(&id);
+                self.file_surface_subs.remove(&id);
+                self.file_surface_keys.retain(|_, value| *value != id);
+            }
+            _ => return,
+        }
+        self.pending_file_closes.remove(&surface);
+        self.panels.update(panel_key, |panel| {
+            if panel.right_active == surface {
+                panel.right_active = RightSurface::Picker;
             }
         });
-        self.files.insert(id, files);
-        self.files_subs.insert(id, sub);
-        let key = self.panel_key(cx);
-        self.right_tabs
-            .entry(key)
-            .or_default()
-            .push(RightSurface::Files(id));
-        self.set_right_active(RightSurface::Files(id), cx);
+        cx.notify();
     }
 
-    /// Open a file in the right panel with VS Code-style preview tab behavior:
-    /// - If the file is already open in a FileEditor tab, switch to it.
-    /// - If the active tab is a non-dirty FileEditor, reuse it for the new file.
-    /// - Otherwise, open a new FileEditor tab.
-    fn open_file_in_panel(&mut self, path: String, cx: &mut Context<Self>) {
+    /// A surface tab's ✕. For Files/File surfaces, initiates a graceful
+    /// close that waits for pending autosaves to flush.
+    fn close_right_surface(
+        &mut self,
+        surface: RightSurface,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let key = self.panel_key(cx);
-
-        // Check if this file is already open in any non-dirty FileEditor tab.
-        if let Some(existing_id) = self.file_editors.iter().find_map(|(id, editor)| {
-            if editor.read(cx).file_path() == path && !editor.read(cx).is_dirty() {
-                Some(*id)
-            } else {
-                None
-            }
-        }) {
-            // Switch to the existing tab.
-            self.set_right_active(RightSurface::FileEditor(existing_id), cx);
-            // Update the editor's content to the requested file.
-            if let Some(editor) = self.file_editors.get(&existing_id) {
-                editor.update(cx, |editor, cx| {
-                    editor.load_file(path, cx);
-                });
+        let files = match surface {
+            RightSurface::Files => self.files.get(&key).cloned(),
+            RightSurface::File(id) => self.file_surfaces.get(&id).cloned(),
+            _ => None,
+        };
+        if let Some(files) = files {
+            match files.update(cx, |files, cx| files.prepare_close(cx)) {
+                FilesCloseDisposition::Allow => {
+                    self.complete_file_close(surface, &key, cx);
+                }
+                FilesCloseDisposition::Pending | FilesCloseDisposition::Blocked => {
+                    self.pending_file_closes.insert(surface);
+                    self.set_right_active(surface, cx);
+                }
             }
             return;
         }
-
-        // If the active tab is a non-dirty preview FileEditor, reuse it.
-        let active = self.resolved_right_active(cx);
-        if let RightSurface::FileEditor(active_id) = active
-            && let Some(editor) = self.file_editors.get(&active_id)
-                && !editor.read(cx).is_dirty() && !editor.read(cx).is_pinned() {
-                    editor.update(cx, |editor, cx| {
-                        editor.load_file(path, cx);
-                    });
-                    return;
-                }
-
-        // Otherwise, open a new FileEditor tab.
-        let editor = cx.new(|cx| FileEditorPanel::new(self.state.clone(), path.clone(), cx));
-        self.file_editor_seq += 1;
-        let id = self.file_editor_seq;
-        self.file_editors.insert(id, editor);
-        self.right_tabs
-            .entry(key)
-            .or_default()
-            .push(RightSurface::FileEditor(id));
-        self.set_right_active(RightSurface::FileEditor(id), cx);
+        if let Some(tabs) = self.right_tabs.get_mut(&key) {
+            tabs.retain(|s| *s != surface);
+        }
+        match surface {
+            RightSurface::Files | RightSurface::File(_) => {}
+            RightSurface::Diff(id) => {
+                // Dropping the entity tears down its diff watch.
+                self.diffs.remove(&id);
+                self.diff_subs.remove(&id);
+            }
+            RightSurface::Terminal(tab) => {
+                let panel = self.right_terminal_panel(cx);
+                panel.update(cx, |panel, cx| panel.close_tab_by_key(tab, window, cx));
+            }
+            RightSurface::Subagent(_) | RightSurface::Picker => {}
+        }
+        self.panels.update(&key, |p| {
+            if p.right_active == surface {
+                p.right_active = RightSurface::Picker;
+            }
+        });
+        cx.notify();
     }
 
-    /// The picker's Git card / the `+` menu's Diff row: every click opens a
-    /// FRESH diff tab with its own scope/base selection (multiple diff
-    /// panels, user request).
+    pub fn prepare_window_close(&mut self, cx: &mut Context<Self>) -> bool {
+        let surfaces = self
+            .files
+            .values()
+            .chain(self.file_surfaces.values())
+            .cloned()
+            .collect::<Vec<_>>();
+        if surfaces
+            .iter()
+            .all(|surface| !surface.read(cx).has_unsaved_changes())
+        {
+            self.window_close_pending = false;
+            return true;
+        }
+        self.window_close_pending = true;
+        let mut all_ready = true;
+        for surface in surfaces {
+            let disposition = surface.update(cx, |surface, cx| surface.prepare_close(cx));
+            all_ready &= disposition == FilesCloseDisposition::Allow;
+        }
+        if all_ready {
+            self.window_close_pending = false;
+        }
+        all_ready
+    }
+
+    fn all_file_edits_flushed(&self, cx: &App) -> bool {
+        self.files
+            .values()
+            .chain(self.file_surfaces.values())
+            .all(|surface| !surface.read(cx).has_unsaved_changes())
+    }
     fn add_diff_surface(&mut self, cx: &mut Context<Self>) {
         let changes = cx.new(|cx| Changes::new(self.state.clone(), cx));
         self.register_diff_surface(changes, cx);
@@ -1737,45 +2083,6 @@ impl Shell {
                 .push(RightSurface::Terminal(tab));
             self.set_right_active(RightSurface::Terminal(tab), cx);
         }
-    }
-
-    /// A surface tab's ✕. The active fallback happens naturally through
-    /// [`Self::resolved_right_active`] on the next frame.
-    fn close_right_surface(
-        &mut self,
-        surface: RightSurface,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let key = self.panel_key(cx);
-        if let Some(tabs) = self.right_tabs.get_mut(&key) {
-            tabs.retain(|s| *s != surface);
-        }
-        match surface {
-            RightSurface::Diff(id) => {
-                // Dropping the entity tears down its diff watch.
-                self.diffs.remove(&id);
-                self.diff_subs.remove(&id);
-            }
-            RightSurface::Files(id) => {
-                self.files.remove(&id);
-                self.files_subs.remove(&id);
-            }
-            RightSurface::FileEditor(id) => {
-                self.file_editors.remove(&id);
-            }
-            RightSurface::Terminal(tab) => {
-                let panel = self.right_terminal_panel(cx);
-                panel.update(cx, |panel, cx| panel.close_tab_by_key(tab, window, cx));
-            }
-            RightSurface::Picker => {}
-        }
-        self.panels.update(&key, |p| {
-            if p.right_active == surface {
-                p.right_active = RightSurface::Picker;
-            }
-        });
-        cx.notify();
     }
 
     fn terminal_panel(&mut self, cx: &mut Context<Self>) -> Entity<TerminalPanel> {
@@ -2083,6 +2390,51 @@ impl Shell {
                     self.appearance_page = Some(cx.new(AppearancePage::new));
                 }
                 match &self.appearance_page {
+                    Some(page) => page.clone().into_any_element(),
+                    None => Empty.into_any_element(),
+                }
+            }
+            SettingsSection::Files => {
+                if self.files_settings_page.is_none() {
+                    let page = cx.new(|cx| {
+                        FilesSettingsPage::new(
+                            self.settings.files_autosave_delay_ms,
+                            self.settings.files_editor_font_size,
+                            self.settings.files_word_wrap,
+                            self.settings.files_show_all,
+                            cx,
+                        )
+                    });
+                    // Persist whenever the page flips a setting.
+                    let _sub = cx.subscribe(
+                        &page,
+                        |this: &mut Shell,
+                         _,
+                         event: &crate::settings::files::FilesSettingsEvent,
+                         cx| {
+                            use crate::settings::files::FilesSettingsEvent;
+                            match *event {
+                                FilesSettingsEvent::AutosaveDelayChanged(ms) => {
+                                    this.settings.files_autosave_delay_ms = ms;
+                                    this.schedule_save(cx);
+                                }
+                                FilesSettingsEvent::EditorFontSizeChanged(size) => {
+                                    this.set_files_editor_font_size(size, cx);
+                                }
+                                FilesSettingsEvent::WordWrapChanged(_) => {
+                                    // Propagated from FilesSurface events; handled via
+                                    // set_files_word_wrap when triggered from a surface.
+                                }
+                                FilesSettingsEvent::ShowAllFilesChanged(_) => {
+                                    // Propagated from FilesSurface events.
+                                }
+                            }
+                            cx.notify();
+                        },
+                    );
+                    self.files_settings_page = Some(page);
+                }
+                match &self.files_settings_page {
                     Some(page) => page.clone().into_any_element(),
                     None => Empty.into_any_element(),
                 }
@@ -3113,6 +3465,7 @@ impl Shell {
             SettingsSection::Harnesses => icons::WIDGET,
             SettingsSection::Agents => icons::KEY_MINIMALISTIC,
             SettingsSection::Appearance => icons::TUNING,
+            SettingsSection::Files => icons::FOLDER_WITH_FILES,
             SettingsSection::Notifications => icons::BELL,
             SettingsSection::Shortcuts => icons::KEYBOARD,
             SettingsSection::Archived => icons::ARCHIVE_MINIMALISTIC,
@@ -3597,8 +3950,36 @@ impl Shell {
                 (line, Some("Alpha".into()), email)
             }
         };
-        let user_menu =
-            self.render_user_menu(user_line.clone(), trigger_subline, menu_identity, theme, cx);
+        // In Development mode show a plain Settings button instead of the
+        // profile card — there is no real account to display in that scope.
+        let is_dev = matches!(workspace_scope, Some(WorkspaceScope::Development));
+        let bottom_bar: AnyElement = if is_dev {
+            let open = matches!(self.route, Route::Settings(_));
+            popover::menu_row(theme, open, "sidebar-settings-btn")
+                .id("sidebar-settings-btn")
+                .px(px(Theme::SPACE_SM))
+                .py(px(Theme::SPACE_SM))
+                .rounded(px(8.0))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.open_settings(SettingsSection::Devices, cx);
+                }))
+                .child(
+                    icon(icons::SETTINGS_MINIMALISTIC)
+                        .size(px(16.0))
+                        .text_color(if open { theme.text } else { theme.text_muted }),
+                )
+                .child(
+                    div()
+                        .text_size(px(13.0))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(if open { theme.text } else { theme.text_muted })
+                        .child(SharedString::from("Settings")),
+                )
+                .into_any_element()
+        } else {
+            self.render_user_menu(user_line.clone(), trigger_subline, menu_identity, theme, cx)
+        };
+        let user_menu = bottom_bar;
 
         // The space filter lives ABOVE the scroll region (fixed) so its
         // dropdown can float without being clipped by the list's overflow.
@@ -3788,12 +4169,11 @@ impl Shell {
     /// Fetch the manifest and stage the new Komet desktop bundle under the data dir
     /// (tokio — reqwest); the strip flips to "restart to apply" when done.
     fn begin_update_download(&mut self, cx: &mut Context<Self>) {
-        let edge_url = self.boot.edge_url.clone();
         let data_dir = self.data_dir.clone();
         self.update_flow = UpdateFlow::Downloading;
         let download = Tokio::spawn(cx, async move {
-            let manifest = komet_update::fetch_latest(&edge_url).await?;
-            komet_update::stage_mac_app(&edge_url, &manifest, &data_dir).await
+            let manifest = komet_update::fetch_latest().await?;
+            komet_update::stage_mac_app(&manifest, &data_dir).await
         });
         self.update_task = Some(cx.spawn(async move |this, cx| {
             let outcome = match download.await {
@@ -4734,6 +5114,24 @@ impl Shell {
                     .update(cx, |composer, cx| composer.add_paths(paths, cx));
                 cx.notify();
             }))
+            .on_drag_move::<WorkspacePathDrag>(cx.listener(
+                |this, e: &gpui::DragMoveEvent<WorkspacePathDrag>, _, cx| {
+                    let inside = e.bounds.contains(&e.event.position);
+                    if this.file_drag_active != inside {
+                        this.file_drag_active = inside;
+                        cx.notify();
+                    }
+                },
+            ))
+            .on_drop::<WorkspacePathDrag>(cx.listener(
+                |this, payload: &WorkspacePathDrag, window, cx| {
+                    this.file_drag_active = false;
+                    this.composer.update(cx, |composer, cx| {
+                        composer.add_workspace_path(&payload.path, payload.is_directory, window, cx)
+                    });
+                    cx.notify();
+                },
+            ))
             .child(
                 // Full-height underlay: the transcript viewport spans the
                 // whole column, scrolling UNDER the titlebar above and the
@@ -5061,6 +5459,23 @@ impl Shell {
         let content: AnyElement = if self.right_pane_open(cx) {
             let active = self.resolved_right_active(cx);
             let main: AnyElement = match active {
+                RightSurface::Files => {
+                    let key = self.panel_key(cx);
+                    if let Some(files) = self.files.get(&key).cloned() {
+                        files.update(cx, |files, cx| files.ensure_loaded(cx));
+                        files.into_any_element()
+                    } else {
+                        self.render_surface_picker(cx)
+                    }
+                }
+                RightSurface::File(id) => {
+                    if let Some(file) = self.file_surfaces.get(&id).cloned() {
+                        file.update(cx, |file, cx| file.ensure_loaded(cx));
+                        file.into_any_element()
+                    } else {
+                        self.render_surface_picker(cx)
+                    }
+                }
                 RightSurface::Diff(id) if self.diffs.contains_key(&id) => {
                     let changes = self.diffs.get(&id).cloned().expect("checked");
                     // Idempotent — also covers a persisted-open pane on boot.
@@ -5094,32 +5509,21 @@ impl Shell {
                     panel.update(cx, |panel, cx| panel.select_tab_by_key(tab, cx));
                     panel.into_any_element()
                 }
-                RightSurface::Files(id) if self.files.contains_key(&id) => {
-                    let files = self.files.get(&id).cloned().expect("checked");
-                    files.update(cx, |files, cx| files.ensure_root(cx));
-                    files.into_any_element()
-                }
-                RightSurface::FileEditor(id) if self.file_editors.contains_key(&id) => {
-                    let editor = self.file_editors.get(&id).cloned().expect("checked");
-                    editor.update(cx, |editor, cx| editor.ensure_content(cx));
-                    editor.update(cx, |editor, cx| editor.render(&theme, cx))
-                }
                 _ => self.render_surface_picker(cx),
             };
-            // Tree companion: unlike the old FileEditor-only inline split,
-            // this now wraps ANY active surface (Diff/Terminal/FileEditor/
-            // picker) whenever a Files tab exists for this chat — matching
-            // VS Code's explorer, which stays put regardless of which editor
-            // tab is focused (user request). Skipped only when the tree
-            // itself IS the active surface, so it's never shown twice.
-            let files_panel = if matches!(active, RightSurface::Files(_)) {
+            // Files browser companion: shown alongside File editor tabs
+            // and any other surface that isn't Files itself, matching
+            // VS Code's explorer-stays-put behaviour.
+            let files_panel = if active == RightSurface::Files {
                 None
             } else {
-                self.right_tabs.get(&self.panel_key(cx)).and_then(|tabs| {
-                    tabs.iter().find_map(|s| match s {
-                        RightSurface::Files(fid) => self.files.get(fid).cloned(),
-                        _ => None,
-                    })
+                let key = self.panel_key(cx);
+                self.right_tabs.get(&key).and_then(|tabs| {
+                    if tabs.contains(&RightSurface::Files) {
+                        self.files.get(&key).cloned()
+                    } else {
+                        None
+                    }
                 })
             };
             match files_panel {
@@ -5298,11 +5702,10 @@ impl Shell {
                                 ),
                             )
                             .child(
-                                row("surface-card-files", icons::DOCUMENT, "Files").on_click(
-                                    cx.listener(|this, _, _, cx| {
-                                        this.add_files_surface(cx);
-                                    }),
-                                ),
+                                row("surface-card-files", icons::FOLDER_WITH_FILES, "Files")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.add_files_surface(window, cx);
+                                    })),
                             )
                             // Git only where there IS git — the pane itself
                             // no longer gates on it (terminals work anywhere).
@@ -5482,12 +5885,13 @@ impl Shell {
                 this.right_tab_drag = None;
                 this.reorder_right_tabs(payload.from, to, cx);
             }));
-        for (ix, (surface, title)) in rows.into_iter().enumerate() {
+        for (ix, (surface, title, _dirty, _detail)) in rows.into_iter().enumerate() {
             let is_active = surface == active;
             let icon_path = match surface {
+                RightSurface::Files => icons::FOLDER_WITH_FILES,
+                RightSurface::File(_) => icons::DOCUMENT,
                 RightSurface::Diff(_) => icons::GIT_BRANCH,
-                RightSurface::Files(_) => icons::DOCUMENT,
-                RightSurface::FileEditor(_) => icons::PEN,
+                RightSurface::Subagent(_) => icons::DOCUMENT,
                 _ => icons::TERMINAL,
             };
             // t3 tab hover: the surface icon swaps IN PLACE for the close ✕
@@ -5495,6 +5899,7 @@ impl Shell {
             // hovered (user request).
             let group: SharedString = format!("right-surface-tab-{ix}").into();
             let ghost_title = title.clone();
+            let workspace_path = self.workspace_path_for_surface(surface, cx);
             let chip = div()
                 .id(("right-surface-tab", ix))
                 .group(group.clone())
@@ -5541,6 +5946,7 @@ impl Shell {
                         panel_key: self.panel_key(cx),
                         from: ix,
                         title: ghost_title,
+                        workspace_path,
                     },
                     |payload, _point, _, cx| {
                         let title = payload.title.clone();
@@ -5671,12 +6077,12 @@ impl Shell {
                         .child(
                             popover::menu_row(&theme, false, "right-plus-files")
                                 .id("right-plus-files-row")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.add_files_surface(cx);
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.add_files_surface(window, cx);
                                     this.close_right_plus(cx);
                                 }))
                                 .child(
-                                    icon(icons::DOCUMENT)
+                                    icon(icons::FOLDER_WITH_FILES)
                                         .size(px(13.0))
                                         .text_color(theme.text_muted),
                                 )
@@ -6375,6 +6781,10 @@ fn header_icon_button(
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.window_close_pending && self.all_file_edits_flushed(cx) {
+            self.window_close_pending = false;
+            window.defer(cx, |window, _| window.remove_window());
+        }
         let theme = Theme::of(cx);
         // The shell tone (komet `.frost`): the surface the sidebar sits on and
         // the main panel floats over as an inset rounded card. On macOS the
@@ -7099,8 +7509,8 @@ mod tests {
         assert_eq!(panels.get("b").right_active, RightSurface::Picker);
         panels.update("a", |p| p.right_active = RightSurface::Terminal(7));
         assert_eq!(panels.get("a").right_active, RightSurface::Terminal(7));
-        panels.update("a", |p| p.right_active = RightSurface::Files(42));
-        assert_eq!(panels.get("a").right_active, RightSurface::Files(42));
+        panels.update("a", |p| p.right_active = RightSurface::File(42));
+        assert_eq!(panels.get("a").right_active, RightSurface::File(42));
     }
 
     // ---- sidebar resort FLIP diff (§1.6) ----

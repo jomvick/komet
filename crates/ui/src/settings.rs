@@ -28,11 +28,20 @@ pub mod appearance;
 pub mod archived;
 pub mod composer;
 pub mod devices;
+pub mod files;
 pub mod harnesses;
 pub mod notifications;
 pub mod shortcuts;
 pub mod sync;
 pub mod widgets;
+
+pub const FILES_AUTOSAVE_DELAY_DEFAULT_MS: u64 = 1_000;
+pub const FILES_AUTOSAVE_DELAY_MIN_MS: u64 = 250;
+pub const FILES_AUTOSAVE_DELAY_MAX_MS: u64 = 10_000;
+
+pub const FILES_EDITOR_FONT_SIZE_DEFAULT: f32 = 13.0;
+pub const FILES_EDITOR_FONT_SIZE_MIN: f32 = 10.0;
+pub const FILES_EDITOR_FONT_SIZE_MAX: f32 = 24.0;
 
 /// Sidebar drag-resize bounds (px).
 pub const SIDEBAR_MIN: f32 = 208.0;
@@ -112,6 +121,14 @@ pub struct UiSettings {
     pub keymap: KeymapConfig,
     /// Light/dark preference. Defaults to following the OS.
     pub appearance: crate::appearance::AppearanceMode,
+    /// Idle time before an edited workspace file is saved automatically.
+    pub files_autosave_delay_ms: u64,
+    /// Wrap long lines in workspace file editors and previews.
+    pub files_word_wrap: bool,
+    /// Font size used by editable workspace-file buffers.
+    pub files_editor_font_size: f32,
+    /// Include hidden and ignored entries in workspace file trees.
+    pub files_show_all: bool,
 }
 
 impl Default for UiSettings {
@@ -135,6 +152,10 @@ impl Default for UiSettings {
             terminal_open: false,
             keymap: KeymapConfig::default(),
             appearance: crate::appearance::AppearanceMode::default(),
+            files_autosave_delay_ms: FILES_AUTOSAVE_DELAY_DEFAULT_MS,
+            files_word_wrap: false,
+            files_editor_font_size: FILES_EDITOR_FONT_SIZE_DEFAULT,
+            files_show_all: false,
         }
     }
 }
@@ -334,6 +355,15 @@ impl UiSettings {
             TERMINAL_ABS_MAX_HEIGHT,
             TERMINAL_DEFAULT_HEIGHT,
         );
+        self.files_autosave_delay_ms = self
+            .files_autosave_delay_ms
+            .clamp(FILES_AUTOSAVE_DELAY_MIN_MS, FILES_AUTOSAVE_DELAY_MAX_MS);
+        self.files_editor_font_size = clamp_or(
+            self.files_editor_font_size,
+            FILES_EDITOR_FONT_SIZE_MIN,
+            FILES_EDITOR_FONT_SIZE_MAX,
+            FILES_EDITOR_FONT_SIZE_DEFAULT,
+        );
         self
     }
 
@@ -420,6 +450,10 @@ mod tests {
                 ..KeymapConfig::default()
             },
             appearance: crate::appearance::AppearanceMode::Light,
+            files_autosave_delay_ms: 1000,
+            files_word_wrap: true,
+            files_editor_font_size: 13.0,
+            files_show_all: false,
         };
         settings.save(dir.path()).unwrap();
         assert_eq!(UiSettings::load(dir.path()), settings);

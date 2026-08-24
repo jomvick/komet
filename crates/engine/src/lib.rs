@@ -32,6 +32,7 @@ pub mod spaces;
 pub mod terminals;
 pub mod titles;
 pub mod uploads;
+pub mod workspace_files;
 pub mod workspace_host;
 
 pub use agent_accounts::{AgentAccounts, AgentAccountsConfig};
@@ -53,6 +54,7 @@ pub use spaces::SpacesSync;
 pub use terminals::Terminals;
 pub use titles::TitleGenerator;
 pub use uploads::{AttachmentChunk, Uploads};
+pub use workspace_files::{WorkspaceFiles, WorkspaceFilesError};
 pub use workspace_host::{
     DEFAULT_ORG_ID, DEFAULT_USER_ID, WORKSPACE_DOC_ID, WorkspaceHost, WorkspaceHostConfig,
 };
@@ -111,6 +113,7 @@ pub struct EngineCore {
     pub workspace: WorkspaceHost,
     pub registry: Arc<HarnessRegistry>,
     pub repos: Repos,
+    pub workspace_files: WorkspaceFiles,
     pub terminals: Terminals,
     pub diff_sync: CheckoutDiffSync,
     pub spaces_sync: SpacesSync,
@@ -271,12 +274,14 @@ impl EngineCore {
             turn_diff.note_turn_start(chat_id, cwd);
         }));
         let spaces_sync = SpacesSync::start(repos.clone(), workspace.clone(), &device_id);
+        let workspace_files = WorkspaceFiles::new(repos.clone(), workspace.clone(), device_id.clone());
         Ok(Self {
             sessions,
             doc_host,
             workspace,
             registry,
             repos,
+            workspace_files,
             terminals,
             diff_sync,
             spaces_sync,
@@ -408,6 +413,7 @@ impl EngineCore {
             self.workspace.clone(),
             self.registry.clone(),
             self.repos.clone(),
+            self.workspace_files.clone(),
             self.terminals.clone(),
             self.diff_sync.clone(),
             self.uploads.clone(),
@@ -706,15 +712,16 @@ impl Engine {
         };
         core.set_auth(auth.clone());
         if edge_enabled {
-            // Release checker: polls {edge}/releases on a 6h cadence; headless
-            // installs with KOMET_AUTO_UPDATE=1 apply + restart themselves — gated
-            // on quiescence so a restart never lands under a live run or open PTY.
+            // Release checker: polls the GitHub releases on a 6h cadence;
+            // headless installs with KOMET_AUTO_UPDATE=1 apply + restart
+            // themselves — gated on quiescence so a restart never lands under
+            // a live run or open PTY.
             let quiescent: komet_update::QuiescentCheck = {
                 let sessions = core.sessions.clone();
                 let terminals = core.terminals.clone();
                 Arc::new(move || !sessions.any_active() && !terminals.any_open())
             };
-            let updater = komet_update::Updater::spawn(config.edge_url.clone(), Some(quiescent));
+            let updater = komet_update::Updater::spawn(Some(quiescent));
             if let Some(mut token_changes) = edge.as_ref().and_then(EdgeConfig::token_changes) {
                 let updater_for_tokens = updater.clone();
                 let wake = tokio::spawn(async move {
