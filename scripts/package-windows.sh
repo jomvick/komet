@@ -35,14 +35,19 @@ cp "$BIN" "$PORTABLE_EXE"
 [[ -f "$ROOT/README.md" ]] && cp "$ROOT/README.md" "$STAGE/"
 [[ -f "$ROOT/LICENSE" ]] && cp "$ROOT/LICENSE" "$STAGE/"
 
-# Create zip using 7z, powershell, or zip
-if command -v 7z >/dev/null 2>&1; then
-  7z a "$ZIP" "$STAGE/*" >/dev/null
-elif command -v powershell >/dev/null 2>&1; then
-  powershell -NoProfile -Command "Compress-Archive -Path '$STAGE/*' -DestinationPath '$ZIP' -Force"
-elif command -v zip >/dev/null 2>&1; then
-  (cd "$OUT_DIR" && zip -r "$(basename "$ZIP")" "$(basename "$STAGE")")
-fi
+# Create zip archive inside OUT_DIR
+(
+  cd "$OUT_DIR"
+  STAGE_NAME="$(basename "$STAGE")"
+  ZIP_NAME="$(basename "$ZIP")"
+  if command -v 7z >/dev/null 2>&1 || command -v 7z.exe >/dev/null 2>&1; then
+    7z a "$ZIP_NAME" "$STAGE_NAME"
+  elif command -v zip >/dev/null 2>&1; then
+    zip -r "$ZIP_NAME" "$STAGE_NAME"
+  elif command -v powershell.exe >/dev/null 2>&1 || command -v powershell >/dev/null 2>&1; then
+    powershell -NoProfile -Command "Compress-Archive -Path '$STAGE_NAME' -DestinationPath '$ZIP_NAME' -Force"
+  fi
+)
 
 rm -rf "$STAGE"
 echo "packaged: $ZIP"
