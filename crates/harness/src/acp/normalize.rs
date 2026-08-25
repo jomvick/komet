@@ -8,8 +8,8 @@
 //! tagged `sessionUpdate`/snake_case; structs are camelCase; tool kinds and
 //! statuses are snake_case).
 
-use serde_json::Value;
 use komet_proto::{AgentEvent, SlashCommand, TodoItem, ToolCall, ToolDiff};
+use serde_json::Value;
 
 /// Byte cap applied to tool output text at the harness boundary. The doc-side
 /// fold applies its own (smaller) cap before anything persists; this one only

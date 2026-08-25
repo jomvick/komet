@@ -836,9 +836,13 @@ async fn sandbox_options_codex_translate_to_native_wire_params() {
     req.sandbox = SandboxLevel::DangerFullAccess;
     let events = run_to_end(&harness(), req, controls).await;
     assert!(
-        events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::Done { status: DoneStatus::Completed, .. })),
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            }
+        )),
         "fixture validates wire params and completes only on success: {events:?}"
     );
 }

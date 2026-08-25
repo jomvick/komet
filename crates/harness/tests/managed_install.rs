@@ -10,10 +10,10 @@
 //! Single-test binary: it mutates KOMET_ADAPTERS_DIR process-wide.
 
 use futures::StreamExt;
-use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 use komet_harness::{AcpHarness, Harness, RunControls};
 use komet_proto::{AgentEvent, RunRequest};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
 #[ignore = "network + npm + codex CLI; installs the pinned adapter for real"]

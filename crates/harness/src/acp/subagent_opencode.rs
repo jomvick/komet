@@ -26,9 +26,9 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use komet_proto::{AgentEvent, DoneStatus, TodoItem, ToolCall};
 use serde_json::Value;
 use tokio::sync::mpsc;
-use komet_proto::{AgentEvent, DoneStatus, TodoItem, ToolCall};
 
 use crate::HarnessError;
 
@@ -564,9 +564,7 @@ fn handle_bus_event(state: &mut OcState, event: &Value) -> Vec<AgentEvent> {
                 // Parts that raced ahead of this role fact replay now.
                 let held: Vec<Value> = std::mem::take(&mut child.pending_parts)
                     .into_iter()
-                    .filter(|part| {
-                        part.get("messageID").and_then(Value::as_str) == Some(message)
-                    })
+                    .filter(|part| part.get("messageID").and_then(Value::as_str) == Some(message))
                     .collect();
                 if !held.is_empty() {
                     let parent = child.parent_tool_use_id.clone();
