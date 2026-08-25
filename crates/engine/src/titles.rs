@@ -178,6 +178,7 @@ impl TitleGenerator {
                 model_options: serde_json::Map::new(),
                 cwd: cwd.to_string(),
                 sandbox: SandboxLevel::ReadOnly,
+                sandbox_options: None,
                 auto_approve: true,
                 attachments: Vec::new(),
                 resume: None,

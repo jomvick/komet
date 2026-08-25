@@ -46,6 +46,14 @@ pub enum SandboxLevel {
     DangerFullAccess,
 }
 
+/// Provider-native sandbox options riding [`RunRequest`]. Task 0 placeholder
+/// guaranteeing wire compat: old JSON without `sandboxOptions` still parses as
+/// `None`, and `None` serializes away so old readers never see it. Task 1 will
+/// expand this into the full Paseo-complete Codex/Claude/OpenCode tables.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SandboxOptions {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SteeringMode {
@@ -103,6 +111,8 @@ pub struct RunRequest {
     pub model_options: serde_json::Map<String, serde_json::Value>,
     pub cwd: String,
     pub sandbox: SandboxLevel,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_options: Option<SandboxOptions>,
     #[serde(default)]
     pub auto_approve: bool,
     /// Harness-native session id to resume, if any.
@@ -660,5 +670,16 @@ mod tests {
         assert_eq!(stats.compact_threshold, Some(96_000));
         assert_eq!(default_context_limit_for_model("gemini-2.5-pro"), 1_000_000);
         assert_eq!(format_tokens(10_500), "10k");
+    }
+
+    #[test]
+    fn run_request_old_wire_without_sandbox_options_still_parses() {
+        let old = r#"{"prompt":"p","cwd":".","sandbox":"workspace-write"}"#;
+        let req: RunRequest = serde_json::from_str(old).unwrap();
+        assert!(req.sandbox_options.is_none());
+        assert_eq!(req.sandbox, SandboxLevel::WorkspaceWrite);
+        // round-trip: None serialise away (old readers never see it)
+        let json = serde_json::to_value(&req).unwrap();
+        assert!(json.get("sandboxOptions").is_none());
     }
 }

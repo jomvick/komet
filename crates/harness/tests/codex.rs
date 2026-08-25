@@ -42,6 +42,7 @@ fn request(prompt: &str) -> RunRequest {
         model_options: serde_json::Map::new(),
         cwd: String::new(),
         sandbox: SandboxLevel::WorkspaceWrite,
+        sandbox_options: None,
         auto_approve: true,
         attachments: Vec::new(),
         worktree: None,

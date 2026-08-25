@@ -56,6 +56,7 @@ fn run_request(prompt: &str) -> RunRequest {
         model_options: Default::default(),
         cwd: "/tmp".into(),
         sandbox: SandboxLevel::WorkspaceWrite,
+        sandbox_options: None,
         auto_approve: true,
         attachments: Vec::new(),
         worktree: None,

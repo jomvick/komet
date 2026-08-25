@@ -310,6 +310,7 @@ mod tests {
             model_options: Default::default(),
             cwd: "/tmp".into(),
             sandbox: komet_proto::SandboxLevel::WorkspaceWrite,
+            sandbox_options: None,
             auto_approve: false,
             attachments: Vec::new(),
             resume: None,
