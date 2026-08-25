@@ -892,7 +892,10 @@ async fn opencode_probe_failure_surfaces_as_an_error() {
     // seems frozen"). Catalog-backed harnesses still fall back to their
     // static list (covered by the catalog harnesses' own tests).
     let harness = AcpHarness::opencode().with_executable("/nonexistent/never-an-opencode-acp");
-    let err = harness.models().await.expect_err("wire-only probe failure errors");
+    let err = harness
+        .models()
+        .await
+        .expect_err("wire-only probe failure errors");
     assert!(matches!(err, HarnessError::NotInstalled(_)), "{err:?}");
 }
 
@@ -911,7 +914,12 @@ async fn opencode_launches_with_acp_args_and_runs_the_happy_path() {
     // spec's args land on the wire. Model ids are opencode-flavored, so the
     // run carries no model set and the chat settles.
     let (controls, _steer, _token) = controls();
-    let events = run_to_end(&opencode_harness(), request_opencode("scenario:happy", None), controls).await;
+    let events = run_to_end(
+        &opencode_harness(),
+        request_opencode("scenario:happy", None),
+        controls,
+    )
+    .await;
     assert!(events.contains(&AgentEvent::TextDelta {
         text: "Hello from opencode".into()
     }));

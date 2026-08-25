@@ -522,7 +522,10 @@ async fn run_session(session: Session) {
     // approval policy translate 1:1 onto the same wire params. Granular
     // approval policies keep their granular wire shape (`{"kind":"granular",
     // "ask":[…],"autoApprove":[…]}`) instead of collapsing to "never".
-    let opts = request.sandbox_options.as_ref().and_then(|o| o.codex.as_ref());
+    let opts = request
+        .sandbox_options
+        .as_ref()
+        .and_then(|o| o.codex.as_ref());
     let (approval_policy, sandbox_mode_str, sandbox_policy): (Value, &'static str, Value) =
         match opts {
             Some(cx) => {
@@ -543,15 +546,24 @@ async fn run_session(session: Session) {
                 if !cx.writable_roots.is_empty() {
                     policy.insert(
                         "writableRoots".into(),
-                        json!(cx.writable_roots.iter().map(|p| p.display().to_string()).collect::<Vec<_>>()),
+                        json!(
+                            cx.writable_roots
+                                .iter()
+                                .map(|p| p.display().to_string())
+                                .collect::<Vec<_>>()
+                        ),
                     );
                 }
                 // NOTE: `web_search` and `features` have no app-server
                 // sandboxPolicy counterpart validated against 0.146.1 — they
                 // are intentionally NOT invented onto the wire.
                 (
-                    serde_json::to_value(cx.approval_policy.as_ref().unwrap_or(&ApprovalPolicy::Never))
-                        .expect("approval policy serializes"),
+                    serde_json::to_value(
+                        cx.approval_policy
+                            .as_ref()
+                            .unwrap_or(&ApprovalPolicy::Never),
+                    )
+                    .expect("approval policy serializes"),
                     match mode {
                         SandboxMode::ReadOnly => "read-only",
                         SandboxMode::WorkspaceWrite => "workspace-write",
@@ -1469,7 +1481,11 @@ fn user_input_questions(params: &Value) -> Vec<(String, UserInputQuestion)> {
                 id: new_message_id(),
                 header: {
                     let h = field(["header", "title", "label"]);
-                    if h.is_empty() { "Codex question".into() } else { h }
+                    if h.is_empty() {
+                        "Codex question".into()
+                    } else {
+                        h
+                    }
                 },
                 question: field(["question", "prompt", "text"]),
                 options: q

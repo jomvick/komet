@@ -118,7 +118,10 @@ mod tests {
 
     #[test]
     fn unscoped_actions_render_as_tool_keys() {
-        let p = perms(vec![], vec![("webfetch", Perm::Ask), ("todowrite", Perm::Allow)]);
+        let p = perms(
+            vec![],
+            vec![("webfetch", Perm::Ask), ("todowrite", Perm::Allow)],
+        );
         assert_eq!(
             permission_config(&p),
             r#"{"bash":{},"todowrite":"allow","webfetch":"ask"}"#
@@ -128,10 +131,7 @@ mod tests {
     #[test]
     fn keys_are_escaped() {
         let p = perms(vec![("say \"hi\"*", Perm::Deny)], vec![]);
-        assert_eq!(
-            permission_config(&p),
-            r#"{"bash":{"say \"hi\"*":"deny"}}"#
-        );
+        assert_eq!(permission_config(&p), r#"{"bash":{"say \"hi\"*":"deny"}}"#);
     }
 
     #[test]

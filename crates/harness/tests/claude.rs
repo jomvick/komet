@@ -628,7 +628,11 @@ async fn live_real_cli_single_turn() {
 async fn commands_come_from_the_initialize_control_request() {
     let h = harness();
     let commands = h.commands().await.expect("discovery succeeds");
-    assert_eq!(commands.len(), 2, "nameless entries are dropped: {commands:?}");
+    assert_eq!(
+        commands.len(),
+        2,
+        "nameless entries are dropped: {commands:?}"
+    );
     assert_eq!(commands[0].name, "review");
     assert_eq!(commands[0].description, "Review a pull request");
     assert_eq!(commands[0].input_hint.as_deref(), Some("[pr number]"));

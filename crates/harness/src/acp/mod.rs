@@ -28,9 +28,9 @@
 //!   always ends with `Done { status: Interrupted }`.
 
 mod normalize;
+pub mod opencode_perms;
 mod subagent;
 mod subagent_opencode;
-pub mod opencode_perms;
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -2218,8 +2218,7 @@ async fn run_session(session: Session) {
     // settled ids are remembered so a STALE `prompt_complete` (a late replay
     // of an already-settled prompt) can never settle a newer turn.
     let mut prompt_seq: u64 = 1;
-    let mut current_prompt_id =
-        prompt_complete_extension.then(|| format!("komet-p{prompt_seq}"));
+    let mut current_prompt_id = prompt_complete_extension.then(|| format!("komet-p{prompt_seq}"));
     let mut completed_prompts: VecDeque<String> = VecDeque::new();
     // `KOMET_ACP_PROMPT_STALL_MS` (fallback `ZERON_ACP_PROMPT_STALL_MS`) overrides the spec's bound; 0 disables.
     let prompt_stall: Option<Duration> = match std::env::var("KOMET_ACP_PROMPT_STALL_MS")

@@ -97,10 +97,10 @@ pub trait Harness: Send + Sync {
 
 pub mod acp;
 pub(crate) mod adapter_install;
+pub mod antigravity;
 pub mod claude;
 pub mod codex;
 pub mod cursor;
-pub mod antigravity;
 pub(crate) mod jsonrpc;
 pub mod mock;
 pub mod shell_env;
