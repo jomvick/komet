@@ -211,15 +211,20 @@ impl ClaudeHarness {
         }
         // Permission mode. Legacy runs (no `sandbox_options`) keep yolo:
         // auto_approve bypasses everything, parity with the codex adapter.
-        // An explicit `SandboxOptions.claude` table WINS: unless the table
-        // itself declares `allow_unsandboxed_commands` (its full-access
-        // analog), the run is restricted — `--permission-mode default` and a
-        // settings JSON carrying restricted `permissions`, never
-        // `--dangerously-skip-permissions`.
-        let claude_opts = request.sandbox_options.as_ref().and_then(|o| o.claude.as_ref());
+        // An explicit `SandboxOptions` table restricts: a `claude` entry WINS
+        // via its own `allow_unsandboxed_commands`; otherwise (entry absent or
+        // non-restricting) we fall back to the request-level sandbox level,
+        // so e.g. `sandbox = ReadOnly` with only a `codex` table stays safe.
+        let claude_opts = request
+            .sandbox_options
+            .as_ref()
+            .and_then(|o| o.claude.as_ref());
         let unrestricted = match request.sandbox_options.as_ref() {
             None => true,
-            Some(o) => o.claude.as_ref().map(|c| c.allow_unsandboxed_commands).unwrap_or(true),
+            Some(o) => match &o.claude {
+                Some(c) => c.allow_unsandboxed_commands,
+                None => request.sandbox == komet_proto::SandboxLevel::DangerFullAccess,
+            },
         };
         if request.auto_approve && unrestricted {
             cmd.args([
@@ -271,7 +276,13 @@ impl ClaudeHarness {
             if !c.filesystem.allow.is_empty() {
                 perms.insert(
                     "additionalDirectories".into(),
-                    Value::Array(c.filesystem.allow.iter().map(|p| Value::String(p.clone())).collect()),
+                    Value::Array(
+                        c.filesystem
+                            .allow
+                            .iter()
+                            .map(|p| Value::String(p.clone()))
+                            .collect(),
+                    ),
                 );
             }
             if let Some(extra) = c.settings_permissions.as_object() {
@@ -981,7 +992,10 @@ mod tests {
     }
 
     fn settings_json(args: &[String]) -> serde_json::Map<String, Value> {
-        let idx = args.iter().position(|a| a == "--settings").expect("--settings present");
+        let idx = args
+            .iter()
+            .position(|a| a == "--settings")
+            .expect("--settings present");
         let parsed: Value = serde_json::from_str(&args[idx + 1]).expect("valid settings JSON");
         parsed.as_object().cloned().expect("settings object")
     }
@@ -992,7 +1006,10 @@ mod tests {
         let cmd = h.build_command(&PathBuf::from("claude"), &base_request());
         let args = argv(&cmd);
         assert!(args.contains(&"--dangerously-skip-permissions".to_string()));
-        assert!(args.windows(2).any(|w| w == ["--permission-mode", "bypassPermissions"]));
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--permission-mode", "bypassPermissions"])
+        );
     }
 
     #[test]
@@ -1014,9 +1031,14 @@ mod tests {
         let h = ClaudeHarness::new();
         let args = argv(&h.build_command(&PathBuf::from("claude"), &req));
         assert!(!args.contains(&"--dangerously-skip-permissions".to_string()));
-        assert!(args.windows(2).any(|w| w == ["--permission-mode", "default"]));
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--permission-mode", "default"])
+        );
         let settings = settings_json(&args);
-        let perms = settings["permissions"].as_object().expect("permissions object");
+        let perms = settings["permissions"]
+            .as_object()
+            .expect("permissions object");
         assert_eq!(perms["defaultMode"], json!("default"));
         let deny = perms["deny"].as_array().expect("deny list");
         assert!(deny.contains(&json!("Bash(rm:*)")));
@@ -1052,6 +1074,23 @@ mod tests {
         let h = ClaudeHarness::new();
         let args = argv(&h.build_command(&PathBuf::from("claude"), &req));
         assert!(args.contains(&"--dangerously-skip-permissions".to_string()));
+    }
+
+    #[test]
+    fn codex_only_table_with_read_only_sandbox_restricts_claude() {
+        let mut req = base_request();
+        req.sandbox = komet_proto::SandboxLevel::ReadOnly;
+        req.sandbox_options = Some(komet_proto::SandboxOptions {
+            codex: Some(komet_proto::CodexSandbox::default()),
+            ..Default::default()
+        });
+        let h = ClaudeHarness::new();
+        let args = argv(&h.build_command(&PathBuf::from("claude"), &req));
+        assert!(!args.contains(&"--dangerously-skip-permissions".to_string()));
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--permission-mode", "default"])
+        );
     }
 
     #[test]
