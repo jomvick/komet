@@ -26,12 +26,12 @@ komet
 ```
 
 ## Variables
-- `KOMET_EDGE_URL` : URL du sync server (défaut https://edge.komet.sh pour legacy)
+- `KOMET_EDGE_URL` : URL du sync server (aucun défaut — non configuré = 100% local)
 - `KOMET_SYNC_TOKEN` : shared-secret Bearer (vide = open LAN)
 
 ## Stockage
 - `data/rooms/*.db` : SQLite par room (frames)
 - `data/blobs/` : blobs FS
 
-## Legacy
-`edge/` (Cloudflare Worker + WorkOS) est deprecated, conservé pour référence. Ne plus déployer via `wrangler`.
+## Historique
+L'ancien backend Cloudflare (Worker + Durable Objects + WorkOS + R2) a été supprimé.

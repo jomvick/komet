@@ -143,11 +143,6 @@ root).
 
 Estimate: 4–5 days.
 
-**C4. iOS** (`apps/ios/Komet/Sync/`): `ChatRoomClient.swift` cloned from
-`RegistryClient.swift`; delete `LoroProtocol.swift` once s2 dies. Shared framing test
-vectors across Rust/TS/Swift (registry precedent). Estimate: 3–4 days, can trail
-desktop by a release.
-
 ---
 
 ## Migration + whale healing
@@ -185,9 +180,6 @@ for rollback. Idempotent: epoch check makes re-entry a no-op.
    chat2 → flips registry → every device loads a 160 KB doc from a table-read DO.
 3. s2 rooms: orphaned like ws3 before them. Nightly R2 backups already exist for
    forensics; delete the route after a deprecation window.
-4. iOS in the following release; until then iOS reads `roomGen: 2` chats via the tail
-   sidecar (read-only fallback it already has for thin clients) — or gate the flip on
-   fleet capability if that's not acceptable.
 
 **M5. Edge cases.**
 - Host retired/dead, other devices hold the doc: first owner device to open the chat
@@ -227,7 +219,6 @@ explicit request; the real healing is M1.
 | 2 | B: ChatRoom DO + tests | 3–4 d |
 | 3 | C: Rust client, store migration, host duties | 4–5 d |
 | 4 | M: epoch rebuild, roomGen cutover, e2e | 2–3 d |
-| 5 | iOS client | 3–4 d (trails) |
 
 Roughly three weeks end-to-end with bake time, front-loaded so the bleeding (new
 whales) stops in the first release.

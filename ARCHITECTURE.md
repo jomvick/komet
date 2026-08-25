@@ -2,16 +2,16 @@
 
 A native controller for coding agents (Claude Code, Codex, Cursor, Grok, Hermes, OpenCode, Pi) —
 Rust engine + gpui UI, single binary. **100% local by default**: no account, no login
-screen, no network calls. Multi-device sync is built (Loro CRDT docs through Cloudflare Durable
-Objects) but **disabled by default** — see "Multi-device sync (future)" in the README.
+screen, no network calls. Multi-device sync is built (Loro CRDT docs through the self-hosted
+`komet-sync` server) but **disabled by default** — see "Multi-device sync" in the README.
 
 **Pillars:**
 - Local-first: every device runs a small engine that stores sessions on that device; the same
   Loro CRDT docs persist locally when sync is disabled.
-- Optional sync uses Loro CRDT docs (loro-mirror model) through Cloudflare Durable Objects;
-  the `edge/` worker and WorkOS auth routes exist but stay dormant until configured.
-- Durable Objects stay **TypeScript** (decision + evidence: `docs/research/durable-objects-language.md`).
-  Everything device-side is Rust.
+- Optional sync uses Loro CRDT docs (loro-mirror model) through the self-hosted `komet-sync`
+  server (`crates/sync-server`: Rust + SQLite rooms + FS blobs, bearer-token auth).
+  The legacy `edge/` Cloudflare Worker + WorkOS stack has been removed.
+- Everything device-side is Rust; no TypeScript services remain.
 - Token-usage display is excluded (poor fit for CRDTs).
 - Frontend is **gpui** (pinned Zed rev). Virtualization + markdown techniques ported from
   **mugen + pretext** (`docs/research/mugen-pretext.md`).
@@ -21,19 +21,18 @@ Objects) but **disabled by default** — see "Multi-device sync (future)" in the
 ## 1. Topology (unchanged shape, new materials)
 
 ```
-gpui UI ─ in-proc/localhost RPC ─ engine A ══ DeviceRoom DO relay ══ engine B ─ RPC ─ gpui UI
-                    │       optional edge Worker: auth, rooms, R2        │
-                    └── optional Loro sync ─ SessionRoom DO (per chat) ──┘
-                                          └─ Workspace registry room ────┘
+gpui UI ─ in-proc/localhost RPC ─ engine A ══ device-room relay ══ engine B ─ RPC ─ gpui UI
+                     │     optional komet-sync server: rooms, blobs, bearer auth    │
+                     └── optional Loro sync ─ session/registry rooms (per chat) ────┘
+                                           └─ Workspace registry room ─────────────┘
 ```
 
 - **Engine = backend** (was `@komet/backend`): runs agents, owns auth, terminals, repos/worktrees,
   diff sync, doc hosting. Pure Rust daemon, fully functional headless.
 - **UI = viewport** (was Electron): gpui app rendering engine state. Talks the same typed RPC whether the engine is in-process or a separate daemon. Organized around **spaces** — (device, folder) pairs, local or synced according to the active profile. The sidebar is the data: an attention-sorted Sessions list, filtered by a searchable spaces dropdown ("All spaces" included) that also hosts space management. The horizontal tabs are a **device-local viewport** onto that list (`ui-settings.json` `openTabs`, cross-space): closing a tab is local-only — archiving is an explicit sidebar action — and a sidebar click (re)opens a session as a tab. The new-session canvas carries a space picker (defaulting to the sidebar filter, else the last selected space); new sessions are minted onto the picked space's device via relay-forwardable RPCs.
-- **Edge (TypeScript, ported from komet `apps/edge`)**: Worker + SessionRoom DO (per chat) +
-  DeviceRoom DO (per device) + R2 attachments + WorkOS JWKS auth. Absorbs the old `apps/server`
-  responsibilities (WorkOS code exchange/refresh, orgs) so **Postgres, the Hono server, and
-  the WebRTC/signaling stack are all gone**.
+- **Sync server (`komet-sync-server`)**: self-hosted Rust service (VPS via Docker or any PC).
+  SQLite per room (frames), blobs on the filesystem, shared-secret Bearer auth
+  (`KOMET_SYNC_TOKEN`). No accounts, no third-party identity provider.
 
 ### Headed / headless
 Single binary `komet`:
@@ -56,19 +55,18 @@ The engine never re-resolves an open store because `AuthState` changed. This pre
 
 | Startup condition | `WorkspaceScope` | Online transports |
 | --- | --- | --- |
-| WorkOS enabled, no parseable saved `session.json` | `Local` | Disabled |
-| Parseable saved WorkOS session | `Synced` | Enabled when a bearer is available; organization onboarding completes before opening the store when needed |
-| WorkOS disabled without a dev bearer | `Development` | Disabled |
+| Sync server configured, no parseable saved `session.json` | `Local` | Disabled |
+| Parseable saved session | `Synced` | Enabled when a bearer is available |
+| No sync server configured and no dev bearer | `Development` | Disabled |
 | Explicit non-empty dev bearer | `Development` | Enabled |
 
 `komet login` and `komet logout` operate on `session.json` while the engine is stopped. Login selects `Synced` for the next start; logout selects `Local` for the next start. The UI may update live authentication status, but the active `WorkspaceScope` still changes only after restart.
 
-**Current default (local-only):** no WorkOS client id ships in the binary (`KOMET_WORKOS_CLIENT_ID`
-empty → `None`), so every start resolves to the "WorkOS disabled without a dev bearer" row —
-`Development` scope, no account, no login screen, zero network calls. `komet login` reports
-"dev mode — there is nothing to sign in to". To enable the synced profile later: deploy the
-`edge/` worker, set a real client id via `KOMET_WORKOS_CLIENT_ID` (and `KOMET_EDGE_URL` for a
-self-hosted edge), then the startup table above applies as written.
+**Current default (local-only):** no sync server ships preconfigured (`KOMET_EDGE_URL` unset →
+`None`), so every start resolves to the "Development" row —
+scope, no account, no login screen, zero network calls. To enable the synced profile later:
+deploy `komet-sync-server` (see `docs/self-hosted-sync.md`), then set `KOMET_EDGE_URL`
+and `KOMET_SYNC_TOKEN` on each device; the startup table above applies as written.
 
 The resolved profile selects the session snapshots, registry snapshot, run journals, and attachment cache that may contain workspace data:
 
@@ -99,8 +97,7 @@ The following product work is intentionally deferred:
 Two persistent doc kinds. When sync is enabled they share one loro-protocol room protocol over WebSocket; local-only profiles persist the same docs without joining rooms:
 
 1. **Session doc** (per chat) — the transcript + durable command queue. Schema is a Rust port of
-   `packages/session-doc` (same container names/shapes so the edge's tail materializer keeps
-   working): `meta` map, `messages` list (parts as list-of-maps with **LoroText bodies** — the
+   `packages/session-doc` (same container names/shapes so the sync tail materializer keeps working): `meta` map, `messages` list (parts as list-of-maps with **LoroText bodies** — the
    measured 1.03× oplog shape; never LWW value rewrites), `commands` list with ledger rules 1–3
    (append-only per-device entries; host-only outcomes; dedupe/TTL/supersede evaluation).
    Continuation splitting at 256KB, render-only tool parts (full inputs stay in the host's local
@@ -149,7 +146,7 @@ komet/
     engine/       komet-engine   # sessions engine (pub/sub, run journal, recovery, stall
                                  # watchdog), doc host + command executor, repos/worktrees,
                                  # checkout-diff sync, terminals (portable-pty), uploads,
-                                 # agent accounts (cred swap), auth (WorkOS via edge),
+                                 # agent accounts (cred swap), auth (bearer via sync server),
                                  # device-room host/peers, identity, single-instance lock
     rpc/          komet-rpc      # UiRpc/ControlRpc: typed req/resp/stream over WS (tokio-
                                  # tungstenite) + in-memory transport; device-room virtual
@@ -158,13 +155,12 @@ komet/
                                  # terminal view, diff pane, settings, animation kit
     syntax/       komet-syntax   # tree-sitter syntax highlighting contracts (paint-only
                                  # token runs; no UI/RPC/engine deps)
-    update/       komet-update   # self-update: versioned dirs + `current` symlink, service
-                                 # restart, macOS app-bundle staging (macOS + Linux only)
-  apps/
-    komet/                       # the binary (headed default, `headless` subcommand)
-    ios/                         # native Swift client (separate from the Rust workspace)
-  edge/                          # TypeScript Worker + DOs (auth, rooms, R2)
-  docs/                          # this file + research reports
+     update/       komet-update   # self-update: versioned dirs + `current` symlink, service
+                                  # restart, macOS app-bundle staging (macOS + Linux only)
+     sync-server/  komet-sync-server # self-hosted sync server (SQLite rooms, FS blobs, bearer auth)
+   apps/
+     komet/                       # the binary (headed default, `headless` subcommand)
+   docs/                          # this file + research reports
 ```
 
 Engine async runtime: **tokio** throughout; the UI bridges via `gpui_tokio` (`Tokio::spawn`
@@ -238,35 +234,23 @@ Direct ports of komet behaviors (spec: feature-inventory §3):
   were retired with the ACP conversion — those modules now hold static model catalogs.
 - **Repos/diffs**: git2 or `git` subprocess (subprocess — matches komet, avoids libgit2 edge
   cases); worktrees under `~/.komet/worktrees`; fs watchers (`notify`) + 2min repair; diff
-  capture (patch + numstat + untracked, 3MiB cap, sha256) → workspace registry summary + DO diff
+  capture (patch + numstat + untracked, 3MiB cap, sha256) → workspace registry summary + diff
   sidecar.
 - **Agent accounts**: credential-slot swap (macOS Keychain via `security-framework`, files
   elsewhere), plan labels, usage probes, paste-code/browser-poll OAuth flows.
-- **Auth**: WorkOS through edge routes (`/auth/exchange`, `/auth/refresh`, orgs); loopback
-  callback server headed, paste-code headless. Default is **no WorkOS key** ⇒ pure local
-  `Development` scope; setting `KOMET_WORKOS_CLIENT_ID` re-enables the synced profile.
-
-## 6. Edge plan (TypeScript, `edge/`)
-
-Port `komet/apps/edge` nearly verbatim (it is already Loro-native and smoke-tested: session room
-w/ hibernation + two-level compaction + daily alarm backups, device room byte relay + nudges +
-sidecar slots, R2 attachments, JWKS auth). Additions:
-1. Private per-user registry rooms (`/registry/{orgId}/ws` → `reg1/{orgId}/{userId}`) with authenticated row sync and ephemeral device presence.
-2. `/auth/*` routes absorbed from `apps/server` (WorkOS API key in Worker secret).
-3. Drop `/seed` migration path and legacy sync anything (fresh app).
-Hibernation hygiene: no idle timers (flush timer only while dirty), auto-response ping/pong —
-per `docs/research/durable-objects-language.md`.
+- **Auth**: bearer shared secret (`KOMET_SYNC_TOKEN`) against the self-hosted `komet-sync`
+  server; no third-party identity provider, no login screen. Default is **no sync server
+  configured** ⇒ pure local scope; setting `KOMET_EDGE_URL` + `KOMET_SYNC_TOKEN`
+  enables the synced profile.
 
 ## 7. Parity exclusions & deliberate changes
 
 - **Excluded**: token-usage display (profile heatmap, lifetime stats, per-message token columns,
   `WatchUsage`). Rate-limit meters on agent accounts are *kept* (separate concern; probed from
   CLIs, not CRDT-synced).
-- **Changed**: Postgres entity sync/server → workspace registry + edge; Electron/React/mugen → gpui with
+- **Changed**: Postgres entity sync/server → workspace registry + self-hosted sync server; Electron/React/mugen → gpui with
   ported techniques; Node harness SDKs → ACP adapter protocols; WebRTC → device-room relay.
-- **Mobile**: a native Swift client lives in `apps/ios/` (separate from the Rust workspace; same
-  local-first default — the WorkOS client id is read from Info.plist and empty by default).
-- **Kept verbatim**: session-doc schema shape + constants, command ledger rules, edge DO design,
+- **Kept verbatim**: session-doc schema shape + constants, command ledger rules, room design,
   render-parts privacy policy, UX behaviors and animation timings.
 
 ## 8. Milestones
@@ -275,16 +259,16 @@ Status legend: ✅ shipped · 🟡 shipped with named gaps (see `docs/PARITY.md`
 
 - ✅ **M0 Scaffold** — workspace builds; `proto`/`doc` crates with ledger + parts + continuation
   unit tests; gpui hello-window runs.
-- ✅ **M1 Doc + sync core** — `komet-doc` mirror over loro 1.13; room client syncs with the edge
-  running under `wrangler dev`; Rust⇄edge⇄Rust convergence test (M1 exit: two Rust peers converge
-  through a real SessionRoom DO, tail endpoint serves).
+- ✅ **M1 Doc + sync core** — `komet-doc` mirror over loro 1.13; room client syncs with the
+  self-hosted sync server; Rust⇄server⇄Rust convergence test (M1 exit: two Rust peers converge
+  through a real session room, tail endpoint serves).
 - ✅ **M2 Engine core** — Claude harness end-to-end headless: `komet headless` + dev auth runs a
   turn, journal + doc writes, recovery test.
 - ✅ **M3 UI core** — shell (sidebar/panes/header), transcript (virtualized, markdown, streaming,
   stick-to-bottom), composer (send/steer/stop, question panel); local chat fully usable headed.
 - ✅ **M4 Multi-device** — device-room host/client virtual sockets, remote device control, workspace
-  registry sync, WorkOS auth + org gate, presence. Proven live by `scripts/e2e-smoke.sh`:
-  two headless engines against a real edge — B queues a run into the chat doc, the durable
+  registry sync, bearer auth, presence. Proven live by `scripts/e2e-smoke.sh`:
+  two headless engines against a real sync server — B queues a run into the chat doc, the
   nudge wakes host A, A executes (mock harness), transcript + session status sync back to B.
 - 🟡 **M5 Full surface** — terminals, diff pane, repo/branch/folder pickers + worktrees,
   agent accounts UI, settings (devices/shortcuts/archived), Codex + Cursor + Grok + Hermes +
@@ -292,14 +276,14 @@ Status legend: ✅ shipped · 🟡 shipped with named gaps (see `docs/PARITY.md`
 - 🟡 **M6 Polish** — wire reconciliation (proto AuthState on the wire, `LocalDevice`),
   two-device e2e smoke, keyboard map, clippy/fmt sweep, Linux packaging
   (`scripts/package-linux.sh` + release profile), macOS bundling config (`dist/macos/`,
-  not executed — needs a Mac). Gaps: edge production deploy (sync dormant until then),
-  Windows packaging — the workspace already cross-compiles for `x86_64-pc-windows-gnu`
+  not executed — needs a Mac). Gaps: Windows packaging —
+  the workspace already cross-compiles for `x86_64-pc-windows-gnu`
   (UI included), but daemon, updater, credential ACLs and packaging are still unix-oriented.
 
 ## 9. Open questions (tracked, non-blocking)
 
-1. loro-protocol Rust client ⇄ TS edge interop — verify at M1; fallback is a ~300-line hand-rolled
-   client (the frame protocol is small and we control both ends).
+1. ~~loro-protocol Rust client ⇄ TS edge interop~~ — resolved by the Rust sync server
+   (the frame protocol is small and we control both ends).
 2. `lorosurgeon` fit for the mirror write path vs hand-rolled reconcile.
 3. Cursor harness (komet has it; CLI surface for Rust TBD) — parity item, scheduled after Codex.
 4. Text shaping performance for analytic row heights: gpui measures shaped text natively (Rust ⇒
