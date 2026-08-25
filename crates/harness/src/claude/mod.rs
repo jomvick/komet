@@ -209,7 +209,24 @@ impl ClaudeHarness {
         if let Some(effort) = to_effort(request.reasoning, request.model.as_deref()) {
             cmd.args(["--effort", effort]);
         }
-        if request.auto_approve {
+        // Permission mode. Legacy runs (no `sandbox_options`) keep yolo:
+        // auto_approve bypasses everything, parity with the codex adapter.
+        // An explicit `SandboxOptions` table restricts: a `claude` entry WINS
+        // via its own `allow_unsandboxed_commands`; otherwise (entry absent or
+        // non-restricting) we fall back to the request-level sandbox level,
+        // so e.g. `sandbox = ReadOnly` with only a `codex` table stays safe.
+        let claude_opts = request
+            .sandbox_options
+            .as_ref()
+            .and_then(|o| o.claude.as_ref());
+        let unrestricted = match request.sandbox_options.as_ref() {
+            None => true,
+            Some(o) => match &o.claude {
+                Some(c) => c.allow_unsandboxed_commands,
+                None => request.sandbox == komet_proto::SandboxLevel::DangerFullAccess,
+            },
+        };
+        if request.auto_approve && unrestricted {
             cmd.args([
                 "--permission-mode",
                 "bypassPermissions",
@@ -230,6 +247,50 @@ impl ClaudeHarness {
         }
         if request.reasoning == Some(ReasoningLevel::Ultracode) {
             settings.insert("ultracode".into(), Value::Bool(true));
+        }
+        // Restricted-sandbox translation: the table maps onto Claude's
+        // `settings.permissions` surface. `settings_permissions` passthrough
+        // merges LAST so raw Claude-side keys can override anything here.
+        //
+        // LIMITATIONS (no native flag exists on this CLI surface):
+        // - `fail_if_unavailable` cannot be enforced from argv; if sandboxing
+        //   is unavailable the run proceeds (documented, not silently unsafe:
+        //   permission-mode stays "default").
+        // - `network.allowed_hosts/denied_hosts` have no stable settings.json
+        //   counterpart we can rely on across CLI versions — they are NOT
+        //   invented onto the wire.
+        if let Some(c) = claude_opts {
+            let mut perms = serde_json::Map::new();
+            perms.insert("defaultMode".into(), Value::String("default".into()));
+            let mut deny: Vec<Value> = c
+                .excluded_commands
+                .iter()
+                .map(|cmd| Value::String(format!("Bash({cmd}:*)")))
+                .collect();
+            for path in &c.filesystem.deny {
+                deny.push(Value::String(format!("Edit({path})")));
+            }
+            if !deny.is_empty() {
+                perms.insert("deny".into(), Value::Array(deny));
+            }
+            if !c.filesystem.allow.is_empty() {
+                perms.insert(
+                    "additionalDirectories".into(),
+                    Value::Array(
+                        c.filesystem
+                            .allow
+                            .iter()
+                            .map(|p| Value::String(p.clone()))
+                            .collect(),
+                    ),
+                );
+            }
+            if let Some(extra) = c.settings_permissions.as_object() {
+                for (k, v) in extra {
+                    perms.insert(k.clone(), v.clone());
+                }
+            }
+            settings.insert("permissions".into(), Value::Object(perms));
         }
         if !settings.is_empty() {
             cmd.arg("--settings");
@@ -904,5 +965,152 @@ mod tests {
         assert_eq!(updated["answers"]["Pick one"], json!("B"));
         // Original input is preserved alongside the answers.
         assert!(updated["questions"].is_array());
+    }
+
+    fn base_request() -> RunRequest {
+        RunRequest {
+            prompt: "hi".into(),
+            harness: None,
+            model: None,
+            reasoning: None,
+            model_options: serde_json::Map::new(),
+            cwd: String::new(),
+            sandbox: komet_proto::SandboxLevel::DangerFullAccess,
+            sandbox_options: None,
+            auto_approve: true,
+            attachments: Vec::new(),
+            worktree: None,
+            resume: None,
+        }
+    }
+
+    fn argv(cmd: &Command) -> Vec<String> {
+        let std_cmd = cmd.as_std();
+        std::iter::once(std_cmd.get_program().to_string_lossy().to_string())
+            .chain(std_cmd.get_args().map(|a| a.to_string_lossy().to_string()))
+            .collect()
+    }
+
+    fn settings_json(args: &[String]) -> serde_json::Map<String, Value> {
+        let idx = args
+            .iter()
+            .position(|a| a == "--settings")
+            .expect("--settings present");
+        let parsed: Value = serde_json::from_str(&args[idx + 1]).expect("valid settings JSON");
+        parsed.as_object().cloned().expect("settings object")
+    }
+
+    #[test]
+    fn old_client_yolo_unchanged_without_sandbox_options() {
+        let h = ClaudeHarness::new();
+        let cmd = h.build_command(&PathBuf::from("claude"), &base_request());
+        let args = argv(&cmd);
+        assert!(args.contains(&"--dangerously-skip-permissions".to_string()));
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--permission-mode", "bypassPermissions"])
+        );
+    }
+
+    #[test]
+    fn restricted_claude_sandbox_blocks_skip_permissions_and_sets_permissions() {
+        let mut req = base_request();
+        req.sandbox_options = Some(komet_proto::SandboxOptions {
+            claude: Some(komet_proto::ClaudeSandbox {
+                filesystem: komet_proto::FilesystemSandbox {
+                    allow: vec!["/work/src".into()],
+                    deny: vec!["/etc".into()],
+                },
+                allow_unsandboxed_commands: false,
+                excluded_commands: vec!["rm".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        // Even with auto_approve, a restricted sandbox must NOT bypass.
+        let h = ClaudeHarness::new();
+        let args = argv(&h.build_command(&PathBuf::from("claude"), &req));
+        assert!(!args.contains(&"--dangerously-skip-permissions".to_string()));
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--permission-mode", "default"])
+        );
+        let settings = settings_json(&args);
+        let perms = settings["permissions"]
+            .as_object()
+            .expect("permissions object");
+        assert_eq!(perms["defaultMode"], json!("default"));
+        let deny = perms["deny"].as_array().expect("deny list");
+        assert!(deny.contains(&json!("Bash(rm:*)")));
+        assert!(deny.contains(&json!("Edit(/etc)")));
+        assert_eq!(
+            perms["additionalDirectories"].as_array().unwrap(),
+            &vec![json!("/work/src")]
+        );
+    }
+
+    #[test]
+    fn allow_unsandboxed_commands_keeps_yolo() {
+        let mut req = base_request();
+        req.sandbox_options = Some(komet_proto::SandboxOptions {
+            claude: Some(komet_proto::ClaudeSandbox {
+                allow_unsandboxed_commands: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let h = ClaudeHarness::new();
+        let args = argv(&h.build_command(&PathBuf::from("claude"), &req));
+        assert!(args.contains(&"--dangerously-skip-permissions".to_string()));
+    }
+
+    #[test]
+    fn non_claude_sandbox_table_leaves_yolo_alone() {
+        let mut req = base_request();
+        req.sandbox_options = Some(komet_proto::SandboxOptions {
+            opencode: Some(komet_proto::OpenCodePerms::default()),
+            ..Default::default()
+        });
+        let h = ClaudeHarness::new();
+        let args = argv(&h.build_command(&PathBuf::from("claude"), &req));
+        assert!(args.contains(&"--dangerously-skip-permissions".to_string()));
+    }
+
+    #[test]
+    fn codex_only_table_with_read_only_sandbox_restricts_claude() {
+        let mut req = base_request();
+        req.sandbox = komet_proto::SandboxLevel::ReadOnly;
+        req.sandbox_options = Some(komet_proto::SandboxOptions {
+            codex: Some(komet_proto::CodexSandbox::default()),
+            ..Default::default()
+        });
+        let h = ClaudeHarness::new();
+        let args = argv(&h.build_command(&PathBuf::from("claude"), &req));
+        assert!(!args.contains(&"--dangerously-skip-permissions".to_string()));
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["--permission-mode", "default"])
+        );
+    }
+
+    #[test]
+    fn settings_permissions_passthrough_merges_into_permissions() {
+        let mut req = base_request();
+        req.sandbox_options = Some(komet_proto::SandboxOptions {
+            claude: Some(komet_proto::ClaudeSandbox {
+                allow_unsandboxed_commands: false,
+                settings_permissions: json!({"allow": ["Bash(git *)"]}),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let h = ClaudeHarness::new();
+        let args = argv(&h.build_command(&PathBuf::from("claude"), &req));
+        let settings = settings_json(&args);
+        assert_eq!(
+            settings["permissions"]["allow"].as_array().unwrap(),
+            &vec![json!("Bash(git *)")]
+        );
+        assert_eq!(settings["permissions"]["defaultMode"], json!("default"));
     }
 }

@@ -304,6 +304,31 @@ impl SessionsEngine {
         // Project-less chats store cwd `~` (the creating device can't know the
         // host's home); expand it here, on the host, where the run spawns.
         request.cwd = expand_home(&request.cwd);
+        // Fail-fast gate: an explicit `sandbox_options` table that violates
+        // its own provider rules never reaches a harness spawn. The options
+        // WIN over the coarse sandbox level (and `auto_approve` grants
+        // nothing), so validation judges the table alone.
+        if let Err(validation) = komet_proto::validate_run_request(&request) {
+            tracing::warn!(chat = %chat_id, ?validation, "run rejected: sandbox validation failed");
+            let message = validation.to_string();
+            self.inner.publish(
+                chat_id,
+                &AgentEvent::Error {
+                    message: message.clone(),
+                },
+            );
+            self.inner.publish(
+                chat_id,
+                &AgentEvent::Done {
+                    status: DoneStatus::Errored,
+                    result: None,
+                    error: Some(message.clone()),
+                    session_id: None,
+                },
+            );
+            self.set_status(chat_id, SessionStatus::Idle, false);
+            return Err(EngineError::Other(message));
+        }
         // Every dispatched prompt is a turn — routed steer or fresh run alike.
         self.note_turn_start(chat_id, &request.cwd);
         let routed = lock(&self.inner.runs).get(chat_id).map(|h| {
@@ -685,6 +710,7 @@ impl SessionsEngine {
                             model_options: Default::default(),
                             cwd,
                             sandbox: komet_proto::SandboxLevel::WorkspaceWrite,
+                            sandbox_options: None,
                             auto_approve: false,
                             attachments: Vec::new(),
                             resume: None,

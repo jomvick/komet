@@ -4928,6 +4928,7 @@ impl Composer {
                             model_options: resolved.model_options.clone(),
                             cwd,
                             sandbox: SandboxLevel::WorkspaceWrite,
+                            sandbox_options: None,
                             auto_approve: false,
                             resume: None,
                             attachments: attachment_paths,
