@@ -2,7 +2,7 @@
 //! turn settle exactly once, at the end, and how close do its silent gaps
 //! come to the 30s blanket quiet-settle window? Run explicitly:
 //!
-//!   SURVEY_RUNS=3 cargo test -p zeron-harness --test real_quiet_survey -- --ignored --nocapture
+//!   SURVEY_RUNS=3 cargo test -p komet-harness --test real_quiet_survey -- --ignored --nocapture
 //!
 //! No env knob is set here — this binary runs the DEFAULTS the app ships:
 //! Claude exempt from the blanket settle, every other adapter on the 30s

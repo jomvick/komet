@@ -1,4 +1,4 @@
-//! Prompt-stall watchdog (`ZERON_ACP_PROMPT_STALL_MS`): a grok-spec agent
+//! Prompt-stall watchdog (`KOMET_ACP_PROMPT_STALL_MS`): a grok-spec agent
 //! that goes TOTALLY silent after the prompt — the wedged-shared-leader
 //! signature from the field — must surface a visible error and an errored
 //! Done instead of indefinite Working. Own test binary: the env knob is
@@ -30,7 +30,7 @@ fn fixture_path() -> PathBuf {
 async fn silent_agent_errors_via_the_prompt_stall_watchdog() {
     // SAFETY: single-test binary — nothing else reads env concurrently.
     unsafe {
-        std::env::set_var("ZERON_ACP_PROMPT_STALL_MS", "700");
+        std::env::set_var("KOMET_ACP_PROMPT_STALL_MS", "700");
     }
     let (_steer_tx, steer_rx) = mpsc::channel(8);
     let token = CancellationToken::new();
@@ -94,7 +94,7 @@ async fn silent_agent_errors_via_the_prompt_stall_watchdog() {
 #[tokio::test]
 async fn opencode_stall_hint_names_the_provider() {
     unsafe {
-        std::env::set_var("ZERON_ACP_PROMPT_STALL_MS", "700");
+        std::env::set_var("KOMET_ACP_PROMPT_STALL_MS", "700");
     }
     let (_steer_tx, steer_rx) = mpsc::channel(8);
     let token = CancellationToken::new();

@@ -1,5 +1,7 @@
 # komet — Architecture
 
+> Fork of [zeronsh/comet](https://github.com/zeronsh/comet) — MIT, Copyright Wing. See `LICENSE` and `THIRD_PARTY_NOTICES.md`.
+
 A native controller for coding agents (Claude Code, Codex, Cursor, Grok, Hermes, OpenCode, Pi) —
 Rust engine + gpui UI, single binary. **100% local by default**: no account, no login
 screen, no network calls. Multi-device sync is built (Loro CRDT docs through the self-hosted

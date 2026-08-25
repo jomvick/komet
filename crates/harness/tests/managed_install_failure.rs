@@ -1,11 +1,11 @@
-//! The zeronsh/comet#95 condition, reproduced: npm dying silently with an
+//! The kometsh/comet#95 condition, reproduced: npm dying silently with an
 //! errno-encoded exit (254 = ENOENT — npm/cli#4838) during the adapter
 //! fallback. The old `npx -y` path surfaced this as "harness protocol error:
 //! initialize: app-server exited before responding; Codex exited unexpectedly
 //! (exit code 254)" with nothing actionable. The managed install must instead
 //! fail the run with the decoded errno and a recovery hint.
 //!
-//! Single-test binary: it mutates PATH/SHELL/ZERON_* env process-wide.
+//! Single-test binary: it mutates PATH/SHELL/KOMET_* env process-wide.
 
 #![cfg(unix)]
 
@@ -28,8 +28,8 @@ async fn silent_npm_enoent_death_surfaces_decoded_error() {
 
     // SAFETY: single-test binary — nothing else reads env concurrently.
     unsafe {
-        std::env::set_var("ZERON_ADAPTERS_DIR", dir.path().join("adapters"));
-        std::env::set_var("ZERON_NO_LOGIN_SHELL", "1");
+        std::env::set_var("KOMET_ADAPTERS_DIR", dir.path().join("adapters"));
+        std::env::set_var("KOMET_NO_LOGIN_SHELL", "1");
         std::env::set_var("PATH", &bin);
         std::env::set_var("HOME", dir.path());
         std::env::remove_var("PI_ACP_EXECUTABLE");

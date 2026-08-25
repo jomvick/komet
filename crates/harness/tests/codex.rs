@@ -734,7 +734,7 @@ async fn child_thread_routing_tags_and_never_settles_parent() {
 
 /// Live smoke against the REAL codex app-server (0.146.x, installed + authed):
 /// one trivial turn, ending on turn/completed.
-/// `cargo test -p zeron-harness --test codex -- --ignored`.
+/// `cargo test -p komet-harness --test codex -- --ignored`.
 #[tokio::test]
 #[ignore = "spawns the real codex app-server; needs install + auth + network"]
 async fn live_real_app_server_single_turn() {
@@ -800,7 +800,7 @@ async fn commands_come_from_skills_list() {
     assert_eq!(h.commands().await.expect("cache hit"), commands);
 }
 
-/// Live smoke against the real CLI: `cargo test -p zeron-harness --test
+/// Live smoke against the real CLI: `cargo test -p komet-harness --test
 /// codex -- --ignored live_commands`.
 #[tokio::test]
 #[ignore]

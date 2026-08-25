@@ -108,6 +108,10 @@ Learn more: [`ARCHITECTURE.md`](ARCHITECTURE.md) · [`docs/`](docs/)
 
 ---
 
+## Credits
+
+Komet is a fork of [zeronsh/comet](https://github.com/zeronsh/comet) — same MIT license, same author (Wing). The fork diverges on local-first sync, self-hosted `komet-sync-server`, and gpui UI refinements. Upstream history is preserved via the `upstream` git remote (`git fetch upstream`).
+
 ## License
 
 [MIT](LICENSE) — contributions welcome.

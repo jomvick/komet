@@ -1,4 +1,4 @@
-//! Zeron-owned styling and highlighting adapters for `gpui-base`.
+//! Komet-owned styling and highlighting adapters for `gpui-base`.
 
 use std::{ops::Range, rc::Rc, sync::Arc};
 
@@ -12,11 +12,11 @@ use super::editor::FileEditorState;
 use crate::theme::{SyntaxPalette, Theme};
 
 #[derive(Clone)]
-struct ZeronHighlightStyleResolver {
+struct KometHighlightStyleResolver {
     palette: SyntaxPalette,
 }
 
-impl HighlightStyleResolver for ZeronHighlightStyleResolver {
+impl HighlightStyleResolver for KometHighlightStyleResolver {
     fn style(&self, name: &str) -> Option<HighlightStyle> {
         kind_for_name(name).map(|kind| HighlightStyle {
             color: Some(self.palette.color(kind)),
@@ -26,12 +26,12 @@ impl HighlightStyleResolver for ZeronHighlightStyleResolver {
 }
 
 #[derive(Clone)]
-pub(super) struct ZeronInputHighlighter {
+pub(super) struct KometInputHighlighter {
     language: SharedString,
     spans: Vec<(Range<usize>, HighlightKind)>,
 }
 
-impl ZeronInputHighlighter {
+impl KometInputHighlighter {
     fn new(source: &str, document: &HighlightedDocument) -> Self {
         Self {
             language: format!("{:?}", document.language).into(),
@@ -40,7 +40,7 @@ impl ZeronInputHighlighter {
     }
 }
 
-impl InputHighlighter for ZeronInputHighlighter {
+impl InputHighlighter for KometInputHighlighter {
     fn language(&self) -> SharedString {
         self.language.clone()
     }
@@ -127,7 +127,7 @@ pub(super) fn editor_style(theme: &Theme) -> InputEditorStyle {
         border: theme.border,
         selection: theme.accent.opacity(0.22),
         caret: theme.caret,
-        highlight_styles: Arc::new(ZeronHighlightStyleResolver {
+        highlight_styles: Arc::new(KometHighlightStyleResolver {
             palette: theme.syntax.clone(),
         }),
         editor_active_line: Some(crate::theme::wash(0.025)),
@@ -145,7 +145,7 @@ pub(super) fn install_highlighter(
     editor.update(cx, |state, cx| {
         state.set_highlighter_factory(
             Rc::new(move |_| {
-                Some(Box::new(ZeronInputHighlighter::new(&source, &document)) as Box<_>)
+                Some(Box::new(KometInputHighlighter::new(&source, &document)) as Box<_>)
             }),
             cx,
         );
@@ -297,8 +297,8 @@ mod tests {
                 },
             ],
         );
-        let highlighter = ZeronInputHighlighter::new(source, &document);
-        let resolver = ZeronHighlightStyleResolver {
+        let highlighter = KometInputHighlighter::new(source, &document);
+        let resolver = KometHighlightStyleResolver {
             palette: Theme::dark().syntax,
         };
         let runs = highlighter.styles(&(0..source.len()), &resolver);

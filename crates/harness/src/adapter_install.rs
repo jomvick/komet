@@ -59,8 +59,11 @@ impl NpmPin {
 const OK_MARKER: &str = ".komet-install-ok";
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// `$ZERON_ADAPTERS_DIR`, else `~/.komet/adapters`.
+/// `$KOMET_ADAPTERS_DIR` (fallback `$ZERON_ADAPTERS_DIR`), else `~/.komet/adapters`.
 fn adapters_root() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("KOMET_ADAPTERS_DIR").filter(|d| !d.is_empty()) {
+        return Some(PathBuf::from(dir));
+    }
     if let Some(dir) = std::env::var_os("ZERON_ADAPTERS_DIR").filter(|d| !d.is_empty()) {
         return Some(PathBuf::from(dir));
     }

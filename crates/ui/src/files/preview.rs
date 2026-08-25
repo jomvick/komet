@@ -1779,7 +1779,7 @@ impl FilesSurface {
                             .child(if confirming_reload {
                                 "Discard unsaved changes?"
                             } else {
-                                "This file changed outside Zeron."
+                                "This file changed outside Komet."
                             })
                             .child(
                                 div()

@@ -199,7 +199,7 @@ impl CodexHarness {
                     json!({
                         "clientInfo": {
                             "name": "komet-native",
-                            "title": "Zeron",
+                            "title": "Komet",
                             "version": env!("CARGO_PKG_VERSION"),
                         },
                         "capabilities": { "experimentalApi": true },
@@ -540,7 +540,7 @@ async fn run_session(session: Session) {
                 json!({
                     "clientInfo": {
                         "name": "komet-native",
-                        "title": "Zeron",
+                        "title": "Komet",
                         "version": env!("CARGO_PKG_VERSION"),
                     },
                     "capabilities": { "experimentalApi": true },

@@ -62,10 +62,11 @@ const DEFAULT_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 /// Plugin-heavy cold starts can take minutes, so model discovery and a real
 /// chat must share one generous startup budget instead of racing 10s vs 120s.
 const DEFAULT_OPENCODE_STARTUP_TIMEOUT: Duration = Duration::from_secs(300);
-const OPENCODE_STARTUP_TIMEOUT_ENV: &str = "ZERON_OPENCODE_STARTUP_TIMEOUT_SECS";
+const OPENCODE_STARTUP_TIMEOUT_ENV: &str = "KOMET_OPENCODE_STARTUP_TIMEOUT_SECS";
 
 fn opencode_startup_timeout() -> Duration {
     std::env::var(OPENCODE_STARTUP_TIMEOUT_ENV)
+        .or_else(|_| std::env::var("ZERON_OPENCODE_STARTUP_TIMEOUT_SECS"))
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|seconds| *seconds > 0)
@@ -351,7 +352,7 @@ fn hermes_spec() -> AcpAgentSpec {
         prompt_complete_extension: false,
         prompt_stall: Some(Duration::from_secs(45)),
         stall_hint: "The agent process is likely wedged \\
-             \- a stale Python/uv environment or a hung provider auth check. \\
+             - a stale Python/uv environment or a hung provider auth check. \\
              Try running `hermes acp` once in a terminal to see the raw error.",
         http_sidecar: false,
     }
@@ -409,9 +410,9 @@ fn pi_spec() -> AcpAgentSpec {
         ladder_extras: &[],
         prompt_complete_extension: false,
         prompt_stall: Some(Duration::from_secs(45)),
-        stall_hint: "The agent process is likely wedged \\
-             \u2014 a stale pi-acp adapter process or a hung provider call in \\
-             pi's own config (~/.pi). Try running `pi` once in a terminal to \\
+        stall_hint: "The agent process is likely wedged \
+             \u{2014} a stale pi-acp adapter process or a hung provider call in \
+             pi's own config (~/.pi). Try running `pi` once in a terminal to \
              check its provider setup.",
         http_sidecar: false,
     }
@@ -1337,7 +1338,7 @@ fn initialize_params(_harness: HarnessId) -> Value {
         "protocolVersion": 1,
         "clientInfo": {
             "name": "komet",
-            "title": "Zeron",
+            "title": "Komet",
             "version": env!("CARGO_PKG_VERSION"),
         },
         // Declined: agents fall back to their own fs/terminal access, which
@@ -2219,8 +2220,9 @@ async fn run_session(session: Session) {
     let mut current_prompt_id =
         prompt_complete_extension.then(|| format!("komet-p{prompt_seq}"));
     let mut completed_prompts: VecDeque<String> = VecDeque::new();
-    // `ZERON_ACP_PROMPT_STALL_MS` overrides the spec's bound; 0 disables.
-    let prompt_stall: Option<Duration> = match std::env::var("ZERON_ACP_PROMPT_STALL_MS")
+    // `KOMET_ACP_PROMPT_STALL_MS` (fallback `ZERON_ACP_PROMPT_STALL_MS`) overrides the spec's bound; 0 disables.
+    let prompt_stall: Option<Duration> = match std::env::var("KOMET_ACP_PROMPT_STALL_MS")
+        .or_else(|_| std::env::var("ZERON_ACP_PROMPT_STALL_MS"))
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
     {
@@ -2281,8 +2283,9 @@ async fn run_session(session: Session) {
     // Done ever comes, and the session strands Working until the engine's
     // quiesce watchdog parks it.
     //
-    // `ZERON_ACP_QUIET_SETTLE_MS` overrides; 0 disables.
-    let quiet_settle: Option<Duration> = match std::env::var("ZERON_ACP_QUIET_SETTLE_MS")
+    // `KOMET_ACP_QUIET_SETTLE_MS` (fallback `ZERON_ACP_QUIET_SETTLE_MS`) overrides; 0 disables.
+    let quiet_settle: Option<Duration> = match std::env::var("KOMET_ACP_QUIET_SETTLE_MS")
+        .or_else(|_| std::env::var("ZERON_ACP_QUIET_SETTLE_MS"))
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
     {
