@@ -30,5 +30,6 @@ Explicit `sandbox_options` are validated by the engine (`validate_run_request`) 
 ### Known limitations
 
 - **Claude Code:** some granular constraints cannot be expressed via command-line invocation alone (e.g. strict `fail_if_unavailable` enforcement); they rely on the CLI honoring its own settings.
+  - The `settingsPermissions` passthrough merges last over the generated permissions map, so it can override sandbox-derived entries. Escalation-shaped values (a `defaultMode` other than `"default"`/`"acceptEdits"`, or an allow entry of `"*"`, bare `"Bash"`, or `"Bash(*…)"`) are rejected at validation time; other passthrough content is forwarded unvalidated.
 - **Codex:** granular approval-policy wire shapes still need validation against live CLI behavior.
 - **OpenCode:** permissions are generated as configuration but not automatically applied to running sessions; ACP exposes no permission surface.
