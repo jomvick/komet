@@ -24,7 +24,7 @@ export default function AgentRow() {
   return (
     <div>
       <div className="font-mono text-[11px] tracking-[0.14em] text-muted-foreground/80 uppercase mb-4">
-        Pilote les agents que tu as déjà
+        Drives the agents you already use
       </div>
 
       <div className="flex flex-wrap items-center gap-x-7 gap-y-4">

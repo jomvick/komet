@@ -34,7 +34,7 @@ export default function Nav() {
           href="#downloads"
           className="inline-flex items-center justify-center rounded-[min(var(--radius-md,8px),12px)] bg-primary text-primary-foreground px-2.5 h-7 text-[0.8rem] font-medium hover:opacity-80 transition-opacity"
         >
-          Télécharger
+          Download
         </a>
       </div>
     </header>

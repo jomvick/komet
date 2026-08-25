@@ -7,7 +7,7 @@ export default function Faq() {
   const [open, setOpen] = useState<number | null>(null);
 
   return (
-    <section className="border-t px-5 py-16 md:px-10">
+    <section className="px-5 py-16 md:px-10">
       <div className="font-mono text-[11px] tracking-[0.14em] text-muted-foreground/80 uppercase">
         Questions
       </div>

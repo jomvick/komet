@@ -1,24 +1,36 @@
 "use client";
 
 import { motion } from "framer-motion";
+import { ClaudeCode, Codex, Cursor, OpenCode } from "@lobehub/icons";
+import { ShieldCheck, Laptop2, Server } from "lucide-react";
 
 const easing = [0.16, 1, 0.3, 1] as const;
 
-const nodes = [
+const agents = [
+  { label: "Claude Code", Icon: ClaudeCode, y: 12.5 },
+  { label: "Codex", Icon: Codex, y: 37.5 },
+  { label: "Cursor", Icon: Cursor, y: 62.5 },
+  { label: "OpenCode", Icon: OpenCode, y: 87.5 },
+];
+
+const destinations = [
   {
-    label: "Ton laptop",
-    detail: "moteur local, sessions sur disque",
-    active: true,
+    label: "This machine",
+    detail: "local by default",
+    Icon: Laptop2,
+    y: 16.5,
   },
   {
-    label: "Relais de sync",
-    detail: "CRDT Loro · désactivé par défaut",
-    active: false,
+    label: "Sync relay",
+    detail: "Loro CRDT, encrypted, opt-in",
+    Icon: ShieldCheck,
+    y: 50,
   },
   {
-    label: "Autre appareil",
-    detail: "VPS, desktop, ou rien du tout",
-    active: false,
+    label: "Other device",
+    detail: "VPS or second machine",
+    Icon: Server,
+    y: 83.5,
   },
 ];
 
@@ -31,67 +43,129 @@ export default function Topology() {
           whileInView={{ opacity: 1, y: 0 }}
           viewport={{ once: true, margin: "-80px" }}
           transition={{ duration: 0.6, ease: easing }}
-          className="max-w-xl mb-14"
+          className="max-w-xl mb-16"
         >
-          <p className="flex items-center gap-2 font-mono text-[11px] uppercase tracking-wide text-fog mb-3">
-            <span className="h-1 w-3 bg-paper/50" />
+          <p className="font-mono text-[11px] uppercase tracking-wide text-fog mb-3">
             Topologie
           </p>
           <h2 className="text-[30px] md:text-[36px] leading-tight tracking-tight font-medium text-paper">
-            Local tout seul, ou synchronisé quand tu l&apos;actives.
+            Runs where you work.
           </h2>
-          <p className="mt-4 text-[14px] leading-relaxed text-mist">
-            Aucun appareil n&apos;est requis en plus du tien. Le relais de
-            sync n&apos;existe que si tu le branches explicitement.
+          <p className="mt-4 text-[15px] leading-relaxed text-mist max-w-lg">
+            komet drives your agents locally. No extra device
+            is required — the sync relay only exists if you
+            explicitly plug it in.
           </p>
         </motion.div>
 
+        {/* Desktop: fan diagram */}
         <motion.div
           initial={{ opacity: 0, y: 20 }}
           whileInView={{ opacity: 1, y: 0 }}
           viewport={{ once: true, margin: "-60px" }}
           transition={{ duration: 0.6, ease: easing }}
-          className="hairline rounded-[var(--radius-panel)] bg-ash/40 px-6 py-10 md:px-10"
+          className="hidden md:block relative h-[380px]"
         >
-          <div className="flex flex-col md:flex-row items-stretch md:items-center gap-6 md:gap-0">
-            {nodes.map((n, i) => (
-              <div key={n.label} className="flex flex-1 items-center">
-                <div
-                  className={`flex-1 rounded-[var(--radius-control)] hairline px-5 py-4 ${
-                    n.active ? "bg-charcoal" : "bg-transparent"
-                  }`}
-                >
-                  <div className="flex items-center gap-2">
-                    <span
-                      className={`h-1.5 w-1.5 rounded-full ${
-                        n.active ? "bg-paper" : "bg-graphite hairline"
-                      }`}
-                    />
-                    <span className="text-[13.5px] font-medium text-paper">
-                      {n.label}
-                    </span>
-                  </div>
-                  <p className="mt-1.5 font-mono text-[11px] text-fog leading-relaxed">
-                    {n.detail}
-                  </p>
-                </div>
+          <svg
+            className="absolute inset-0 h-full w-full"
+            viewBox="0 0 100 100"
+            preserveAspectRatio="none"
+            aria-hidden="true"
+          >
+            {agents.map((a) => (
+              <path
+                key={a.label}
+                d={`M 20,${a.y} C 35,${a.y} 35,50 50,50`}
+                fill="none"
+                stroke="var(--hairline-strong)"
+                strokeWidth="0.3"
+                strokeDasharray="1.2 1.4"
+                vectorEffect="non-scaling-stroke"
+              />
+            ))}
+            {destinations.map((d) => (
+              <path
+                key={d.label}
+                d={`M 50,50 C 65,50 65,${d.y} 80,${d.y}`}
+                fill="none"
+                stroke="var(--hairline-strong)"
+                strokeWidth="0.3"
+                strokeDasharray="1.2 1.4"
+                vectorEffect="non-scaling-stroke"
+              />
+            ))}
+          </svg>
 
-                {i < nodes.length - 1 && (
-                  <div className="hidden md:block relative w-12 h-px mx-3 bg-[var(--hairline-strong)] shrink-0">
-                    <motion.span
-                      animate={{ left: ["0%", "100%"] }}
-                      transition={{
-                        duration: 2.4,
-                        repeat: Infinity,
-                        ease: "easeInOut",
-                        delay: i * 0.3,
-                      }}
-                      className="absolute -top-[3px] h-[7px] w-[7px] rounded-full bg-paper/70"
-                    />
-                  </div>
-                )}
+          {/* left column — agents */}
+          <div className="absolute left-0 top-0 h-full w-[180px] flex flex-col justify-between py-1">
+            {agents.map(({ label, Icon }) => (
+              <div
+                key={label}
+                className="flex items-center gap-3 rounded-[var(--radius-control)] hairline bg-charcoal/70 px-4 py-3"
+              >
+                <Icon size={16} className="text-mist shrink-0" />
+                <span className="text-[13px] text-paper">{label}</span>
               </div>
             ))}
+          </div>
+
+          {/* center — komet */}
+          <div className="absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2 w-[190px]">
+            <div className="rounded-[var(--radius-control)] hairline bg-graphite/60 px-5 py-4 text-center">
+              <p className="text-[13.5px] font-medium text-paper">komet</p>
+              <p className="mt-0.5 font-mono text-[10.5px] text-fog">
+                control room
+              </p>
+            </div>
+          </div>
+
+          {/* right column — destinations */}
+          <div className="absolute right-0 top-0 h-full w-[220px] flex flex-col justify-between py-1">
+            {destinations.map(({ label, detail, Icon }) => (
+              <div
+                key={label}
+                className="flex items-center gap-3 rounded-[var(--radius-control)] hairline bg-charcoal/70 px-4 py-3"
+              >
+                <Icon className="h-4 w-4 text-mist shrink-0" strokeWidth={1.6} />
+                <div>
+                  <p className="text-[13px] text-paper leading-tight">{label}</p>
+                  <p className="font-mono text-[10.5px] text-fog leading-tight">
+                    {detail}
+                  </p>
+                </div>
+              </div>
+            ))}
+          </div>
+        </motion.div>
+
+        {/* Small screens: simple stacked flow */}
+        <motion.div
+          initial={{ opacity: 0, y: 20 }}
+          whileInView={{ opacity: 1, y: 0 }}
+          viewport={{ once: true, margin: "-60px" }}
+          transition={{ duration: 0.6, ease: easing }}
+          className="md:hidden hairline rounded-[var(--radius-panel)] bg-ash/40 divide-y divide-[var(--hairline)]"
+        >
+          <div className="px-5 py-4">
+            <p className="font-mono text-[10.5px] uppercase tracking-wide text-fog mb-2">
+              Agents driven
+            </p>
+            <p className="text-[13px] text-mist">
+              Claude Code, Codex, Cursor, OpenCode…
+            </p>
+          </div>
+          <div className="px-5 py-4">
+            <p className="text-[13.5px] font-medium text-paper">komet</p>
+            <p className="font-mono text-[10.5px] text-fog">local control room</p>
+          </div>
+          <div className="px-5 py-4">
+            <p className="font-mono text-[10.5px] uppercase tracking-wide text-fog mb-2">
+              Where your sessions live
+            </p>
+            <p className="text-[13px] text-mist">
+              This machine by default, or an encrypted sync relay if you
+              turn it on.
+            </p>
           </div>
         </motion.div>
       </div>

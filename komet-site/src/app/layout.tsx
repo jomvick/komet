@@ -4,9 +4,9 @@ import { GeistMono } from "geist/font/mono";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "komet — un seul poste de contrôle pour tous tes agents de code",
+  title: "komet — one control room for all your coding agents",
   description:
-    "Komet pilote les CLI d'agents que tu utilises déjà — sessions, transcripts, activité des outils et checkpoints, dans une seule fenêtre native en graphite, entièrement sur ta machine. 100% local par défaut.",
+    "Komet drives the agent CLIs you already use — sessions, transcripts, tool activity and checkpoints, in a single graphite native window, entirely on your machine. 100% local by default.",
 };
 
 export const viewport: Viewport = {
@@ -16,7 +16,7 @@ export const viewport: Viewport = {
 export default function RootLayout({ children }: LayoutProps<"/">) {
   return (
     <html
-      lang="fr"
+      lang="en"
       className={`${GeistSans.variable} ${GeistMono.variable} min-h-dvh antialiased`}
     >
       <body className="bg-background text-foreground">
