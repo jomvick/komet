@@ -30,6 +30,7 @@
 mod normalize;
 mod subagent;
 mod subagent_opencode;
+pub mod opencode_perms;
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
