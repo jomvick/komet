@@ -56,7 +56,7 @@ export default function Hero() {
       {/* App screenshot framed like paseo.sh */}
       <div className="relative mx-auto mt-10 max-w-5xl overflow-hidden rounded-2xl border border-border">
         <img
-          src="/deep-field.jpg"
+          src="/dmg-background.png"
           alt=""
           aria-hidden="true"
           className="absolute inset-0 h-full w-full object-cover"

@@ -2,18 +2,18 @@
 
 /* ─── Design tokens — Waku-aligned ─────────────────────────────────────────── */
 :root {
-  --background: #1e1e1e;
+  --background: #09090b;
   --foreground: #ececec;
   --muted-foreground: #9e9e9e;
-  --border: rgba(255, 255, 255, 0.1);
-  --border-strong: rgba(255, 255, 255, 0.16);
+  --border: rgba(255, 255, 255, 0.08);
+  --border-strong: rgba(255, 255, 255, 0.14);
   --primary: #ececec;
-  --primary-foreground: #1e1e1e;
+  --primary-foreground: #09090b;
   --ring: rgba(255, 255, 255, 0.3);
 
-  /* kept for SessionCard (product chrome) */
-  --graphite: #2e2e2e;
-  --charcoal: #262626;
+  /* kept for SessionCard (product chrome) — tinted to dmg backdrop */
+  --graphite: #1a1820;
+  --charcoal: #13111a;
 }
 
 @theme inline {
