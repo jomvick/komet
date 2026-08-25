@@ -41,6 +41,7 @@ async fn managed_install_reaches_session_started() {
         model_options: serde_json::Map::new(),
         cwd: std::env::temp_dir().display().to_string(),
         sandbox: komet_proto::SandboxLevel::WorkspaceWrite,
+        sandbox_options: None,
         auto_approve: true,
         attachments: Vec::new(),
         worktree: None,
