@@ -25,11 +25,11 @@ Run agents on machines/data you accept exposing to them. Use OS-level isolation 
 
 ### Fail-fast validation
 
-Explicit `sandbox_options` are validated by the engine (`validate_run_request`) before any process spawns. Invalid combinations (e.g. writable roots outside the workspace without full access, empty OpenCode pattern table without fallback, unknown permissions) fail immediately with a structured error rather than producing a partially-applied configuration at runtime.
+Explicit `sandbox_options` are validated by the engine (`validate_run_request`) before any process spawns. Invalid combinations (e.g. writable roots outside the workspace without full access, an OpenCode bash pattern table lacking a `"*"` fallback, unknown permissions) fail immediately with a structured error rather than producing a partially-applied configuration at runtime.
 
 ### Known limitations
 
 - **Claude Code:** some granular constraints cannot be expressed via command-line invocation alone (e.g. strict `fail_if_unavailable` enforcement); they rely on the CLI honoring its own settings.
   - The `settingsPermissions` passthrough merges last over the generated permissions map, so it can override sandbox-derived entries. Escalation-shaped values (a `defaultMode` other than `"default"`/`"acceptEdits"`, or an allow entry of `"*"`, bare `"Bash"`, or `"Bash(*…)"`) are rejected at validation time; other passthrough content is forwarded unvalidated.
 - **Codex:** granular approval-policy wire shapes still need validation against live CLI behavior.
-- **OpenCode:** permissions are generated as configuration but not automatically applied to running sessions; ACP exposes no permission surface.
+- **OpenCode:** permission tables are currently **REJECTED by validation** (`OpenCodeOptionsNotApplied`), not applied. ACP exposes no permission config surface today, and the `OPENCODE_CONFIG` merge semantics are unverified — running with a generated overlay could clobber a user's own config or silently not apply, leaving OpenCode on ambient default permissions while the user believes they restricted them. The generator (`harness::acp::opencode_perms::opencode_config_document`) exists and is tested, but is unwired; wiring it in is deferred pending live validation.

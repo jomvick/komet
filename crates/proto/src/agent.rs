@@ -349,11 +349,17 @@ pub enum ValidationError {
     /// Claude `settings_permissions` passthrough carries an escalation-shaped
     /// value (bypass-style defaultMode or a wildcard/bash-all allow entry).
     ClaudeSettingsPermissionsEscalation { detail: String },
-    /// OpenCode bash pattern map empty with no `"*"` fallback — every
-    /// command would resolve to nothing.
-    OpenCodeEmptyPatternsWithoutFallback,
+    /// OpenCode bash pattern map with no `"*"` fallback entry — either
+    /// empty or lacking the wildcard. Under last-match-wins semantics any
+    /// unmatched command resolves to nothing (ambient default), so such a
+    /// table restricts by illusion.
+    OpenCodeMissingFallback,
     /// An unusable permission pattern (empty key can never match anything).
     OpenCodeUnknownPerm { pattern: String },
+    /// OpenCode permission tables cannot be applied yet (ACP has no
+    /// permission config surface), so a request carrying one is refused
+    /// rather than running unrestricted-by-illusion.
+    OpenCodeOptionsNotApplied { detail: String },
 }
 
 impl std::fmt::Display for ValidationError {
@@ -384,13 +390,21 @@ impl std::fmt::Display for ValidationError {
                 f,
                 "claude settingsPermissions passthrough would escalate access: {detail}"
             ),
-            Self::OpenCodeEmptyPatternsWithoutFallback => write!(
+            Self::OpenCodeMissingFallback => write!(
                 f,
-                "opencode bash permission map is empty and has no \"*\" fallback"
+                "opencode bash permission map has no \"*\" fallback entry: an unmatched \
+                 command would fall through to the ambient default instead of a chosen \
+                 permission"
             ),
             Self::OpenCodeUnknownPerm { pattern } => {
                 write!(f, "opencode has an unusable permission pattern {pattern:?}")
             }
+            Self::OpenCodeOptionsNotApplied { detail } => write!(
+                f,
+                "opencode permission tables cannot be applied yet (ACP exposes no \
+                 permission config surface), so the run is refused rather than executed \
+                 with ambient default permissions: {detail}"
+            ),
         }
     }
 }
@@ -422,18 +436,20 @@ fn settings_permissions_escalation(value: &serde_json::Value) -> Option<String> 
     None
 }
 
-fn lexically_clean(path: &std::path::Path) -> PathBuf {    use std::path::Component;
-    path.components().fold(PathBuf::new(), |mut acc, c| match c {
-        Component::CurDir => acc,
-        Component::ParentDir => {
-            acc.pop();
-            acc
-        }
-        other => {
-            acc.push(other.as_os_str());
-            acc
-        }
-    })
+fn lexically_clean(path: &std::path::Path) -> PathBuf {
+    use std::path::Component;
+    path.components()
+        .fold(PathBuf::new(), |mut acc, c| match c {
+            Component::CurDir => acc,
+            Component::ParentDir => {
+                acc.pop();
+                acc
+            }
+            other => {
+                acc.push(other.as_os_str());
+                acc
+            }
+        })
 }
 
 /// Pure containment check of `path` within `cwd` (lexical only — no fs calls,
@@ -502,16 +518,26 @@ pub fn validate_run_request(request: &RunRequest) -> Result<(), ValidationError>
     }
 
     if let Some(opencode) = &options.opencode {
-        if opencode.bash.patterns.is_empty() {
-            return Err(ValidationError::OpenCodeEmptyPatternsWithoutFallback);
+        if opencode.bash_fallback().is_none() {
+            return Err(ValidationError::OpenCodeMissingFallback);
         }
-        if let Some((pattern, _)) =
-            opencode.bash.patterns.iter().find(|(k, _)| k.is_empty())
-        {
+        if let Some((pattern, _)) = opencode.bash.patterns.iter().find(|(k, _)| k.is_empty()) {
             return Err(ValidationError::OpenCodeUnknownPerm {
                 pattern: pattern.clone(),
             });
         }
+        // The permission config generator exists and is tested
+        // (`harness::acp::opencode_perms`), but nothing can apply it yet:
+        // ACP has no permission surface and the `OPENCODE_CONFIG` merge
+        // semantics are unverified. Refuse loudly instead of running with
+        // ambient defaults while the user believes permissions were
+        // restricted.
+        let detail = format!(
+            "generated permission config document would be discarded ({} bash \
+             pattern(s))",
+            opencode.bash.patterns.len()
+        );
+        return Err(ValidationError::OpenCodeOptionsNotApplied { detail });
     }
 
     Ok(())
@@ -1599,39 +1625,37 @@ mod tests {
     }
 
     #[test]
-    fn validation_rejects_opencode_empty_patterns_without_fallback() {
-        let mut req = base_request();
-        req.sandbox_options = opencode_options(OpenCodePerms {
-            bash: BashPerms { patterns: vec![] },
-            unscoped_actions: Default::default(),
-        });
-        assert_eq!(
-            validate_run_request(&req),
-            Err(ValidationError::OpenCodeEmptyPatternsWithoutFallback)
-        );
+    fn validation_rejects_opencode_patterns_without_fallback() {
+        // Empty AND non-empty-without-"*" both lack a fallback: under
+        // last-match-wins semantics an unmatched command resolves to nothing
+        // (i.e. ambient default), so either shape is unusable.
+        for patterns in [
+            vec![],
+            vec![("npm *".to_string(), Perm::Ask)],
+            vec![
+                ("git *".to_string(), Perm::Deny),
+                ("npm *".to_string(), Perm::Allow),
+            ],
+        ] {
+            let mut req = base_request();
+            req.sandbox_options = opencode_options(OpenCodePerms {
+                bash: BashPerms { patterns },
+                unscoped_actions: Default::default(),
+            });
+            assert_eq!(
+                validate_run_request(&req),
+                Err(ValidationError::OpenCodeMissingFallback),
+                "pattern table without \"*\" must be rejected"
+            );
+        }
     }
 
     #[test]
-    fn validation_rejects_opencode_unknown_perm_pattern() {
-        // An empty pattern key can never match any command — an unusable
-        // ("unknown") permission entry.
-        let mut req = base_request();
-        req.sandbox_options = opencode_options(OpenCodePerms {
-            bash: BashPerms {
-                patterns: vec![("".into(), Perm::Allow)],
-            },
-            unscoped_actions: Default::default(),
-        });
-        assert_eq!(
-            validate_run_request(&req),
-            Err(ValidationError::OpenCodeUnknownPerm {
-                pattern: "".into(),
-            })
-        );
-    }
-
-    #[test]
-    fn validation_accepts_opencode_with_fallback() {
+    fn validation_rejects_opencode_options_until_applicable() {
+        // ACP exposes no permission surface yet, so any request carrying
+        // opencode permission tables must be REFUSED rather than silently
+        // running with ambient defaults while the user believes they
+        // restricted permissions.
         let mut req = base_request();
         req.sandbox_options = opencode_options(OpenCodePerms {
             bash: BashPerms {
@@ -1641,6 +1665,29 @@ mod tests {
                 .into_iter()
                 .collect(),
         });
-        assert_eq!(validate_run_request(&req), Ok(()));
+        assert!(matches!(
+            validate_run_request(&req),
+            Err(ValidationError::OpenCodeOptionsNotApplied { detail })
+                if detail.contains("permission")
+        ));
+    }
+
+    #[test]
+    fn validation_rejects_opencode_unknown_perm_pattern() {
+        // An empty pattern key can never match any command — an unusable
+        // ("unknown") permission entry. Structural checks (fallback, usable
+        // keys) surface before the not-yet-applicable refusal so users see
+        // WHY their table was rejected.
+        let mut req = base_request();
+        req.sandbox_options = opencode_options(OpenCodePerms {
+            bash: BashPerms {
+                patterns: vec![("".into(), Perm::Allow), ("*".into(), Perm::Ask)],
+            },
+            unscoped_actions: Default::default(),
+        });
+        assert_eq!(
+            validate_run_request(&req),
+            Err(ValidationError::OpenCodeUnknownPerm { pattern: "".into() })
+        );
     }
 }
