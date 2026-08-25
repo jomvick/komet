@@ -165,6 +165,7 @@ async fn projectless_chat_runs_from_home_and_mints_no_space() {
                     model_options: Default::default(),
                     cwd: "~".into(),
                     sandbox: SandboxLevel::WorkspaceWrite,
+                    sandbox_options: None,
                     auto_approve: true,
                     attachments: Vec::new(),
                     worktree: None,

@@ -2357,6 +2357,7 @@ impl DocHost {
                 .as_ref()
                 .map(|c| c.sandbox)
                 .unwrap_or(komet_proto::SandboxLevel::WorkspaceWrite),
+            sandbox_options: None,
             auto_approve: false,
             attachments: Vec::new(),
             resume: None,

@@ -10,10 +10,10 @@
 //! Single-test binary: it mutates KOMET_ADAPTERS_DIR process-wide.
 
 use futures::StreamExt;
-use tokio::sync::mpsc;
-use tokio_util::sync::CancellationToken;
 use komet_harness::{AcpHarness, Harness, RunControls};
 use komet_proto::{AgentEvent, RunRequest};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
 #[ignore = "network + npm + codex CLI; installs the pinned adapter for real"]
@@ -41,6 +41,7 @@ async fn managed_install_reaches_session_started() {
         model_options: serde_json::Map::new(),
         cwd: std::env::temp_dir().display().to_string(),
         sandbox: komet_proto::SandboxLevel::WorkspaceWrite,
+        sandbox_options: None,
         auto_approve: true,
         attachments: Vec::new(),
         worktree: None,

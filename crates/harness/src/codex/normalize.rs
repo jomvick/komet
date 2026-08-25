@@ -73,8 +73,16 @@ pub(crate) fn usage_event(params: &Value) -> Option<AgentEvent> {
         cached_input_tokens: count(&["cachedInputTokens", "cached_input_tokens"]),
         output_tokens: count(&["outputTokens", "output_tokens"]),
         reasoning_tokens: count(&["reasoningTokens", "reasoning_tokens"]),
-        context_limit: field(last, &["contextWindow", "context_window", "contextLimit", "context_limit"])
-            .and_then(Value::as_u64),
+        context_limit: field(
+            last,
+            &[
+                "contextWindow",
+                "context_window",
+                "contextLimit",
+                "context_limit",
+            ],
+        )
+        .and_then(Value::as_u64),
     })
 }
 
@@ -561,10 +569,16 @@ mod tests {
             Some("th-c".into())
         );
         assert_eq!(
-            notification_thread_id("turn/completed", &json!({"threadId": "th-1", "turn": {"id": "t"}})),
+            notification_thread_id(
+                "turn/completed",
+                &json!({"threadId": "th-1", "turn": {"id": "t"}})
+            ),
             Some("th-1".into())
         );
-        assert_eq!(notification_thread_id("error", &json!({"message": "x"})), None);
+        assert_eq!(
+            notification_thread_id("error", &json!({"message": "x"})),
+            None
+        );
     }
 
     #[test]

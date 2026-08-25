@@ -14,9 +14,10 @@
 //! - Notifications map to [`AgentEvent`]s: agentMessage/reasoning deltas (both
 //!   `delta`/`textDelta` spellings), item lifecycles → typed ToolCall/ToolResult,
 //!   `thread/tokenUsage/updated` → Usage, turn/completed|failed|aborted → Done.
-//! - Approvals + sandbox: yolo mode. The wire policy is always `"never"` and
-//!   the sandbox is forced to `danger-full-access` — parity with the Claude
-//!   adapter's auto-approve-everything (unattended runs). Stray
+//! - Approvals + sandbox: legacy runs (no `sandbox_options`) are yolo mode:
+//!   the wire policy is `"never"` and the sandbox is forced to
+//!   `danger-full-access` — parity with the Claude adapter. An explicit
+//!   `SandboxOptions.codex` table overrides both, translated 1:1. Stray
 //!   `item/commandExecution/requestApproval` +
 //!   `item/fileChange/requestApproval` still round-trip through
 //!   [`RunControls::request_input`] as a synthesized yes/no question.
@@ -53,8 +54,8 @@ use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
 use komet_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SlashCommand,
-    SteeringMode, UserInputAnswer, UserInputQuestion,
+    AgentEvent, ApprovalPolicy, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest,
+    SandboxMode, SlashCommand, SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
 use crate::jsonrpc::{Incoming, RpcClient};
@@ -327,7 +328,15 @@ impl Harness for CodexHarness {
         // sidesteps codex ≤0.144.x's workspace-write bug where a linked
         // worktree on a slash-named branch derives a malformed mount that
         // kills every command.
-        request.sandbox = komet_proto::SandboxLevel::DangerFullAccess;
+        //
+        // CONDITION: only for legacy clients. An explicit
+        // `SandboxOptions.codex` table WINS over this force — its provider
+        // sandbox/approval settings are translated 1:1 below, and silently
+        // escalating an explicitly read-only request to danger-full-access
+        // would defeat the whole point of the table.
+        if request.sandbox_options.is_none() {
+            request.sandbox = komet_proto::SandboxLevel::DangerFullAccess;
+        }
         let mut cmd = Command::new(&exe);
         cmd.arg("app-server");
         crate::compose_child_path(&mut cmd, &exe);
@@ -500,14 +509,75 @@ async fn run_session(session: Session) {
     let request_input = Arc::new(request_input);
 
     // ---- wire params ------------------------------------------------------
-    // Parity with the Claude adapter, which auto-approves every `can_use_tool`
-    // regardless of `auto_approve` (komet sessions run unattended; combined
-    // with the danger-full-access override above this is codex's yolo mode):
-    // never surface wire approvals. "on-request" turned
-    // every command into a yes/no question (user report: "asking me for
-    // approval at every step"). The approval-as-input plumbing below stays for
-    // stray requests and a future explicit permission-mode setting.
-    let approval_policy = "never";
+    // Legacy path (no explicit table): parity with the Claude adapter, which
+    // auto-approves every `can_use_tool` regardless of `auto_approve` (komet
+    // sessions run unattended; combined with the danger-full-access override
+    // above this is codex's yolo mode): never surface wire approvals.
+    // "on-request" turned every command into a yes/no question (user report:
+    // "asking me for approval at every step"). The approval-as-input plumbing
+    // below stays for stray requests and a future explicit permission-mode
+    // setting.
+    //
+    // Explicit `SandboxOptions.codex` path: the table's sandbox mode and
+    // approval policy translate 1:1 onto the same wire params. Granular
+    // approval policies keep their granular wire shape (`{"kind":"granular",
+    // "ask":[…],"autoApprove":[…]}`) instead of collapsing to "never".
+    let opts = request
+        .sandbox_options
+        .as_ref()
+        .and_then(|o| o.codex.as_ref());
+    let (approval_policy, sandbox_mode_str, sandbox_policy): (Value, &'static str, Value) =
+        match opts {
+            Some(cx) => {
+                let mode = cx.sandbox_mode.unwrap_or(SandboxMode::WorkspaceWrite);
+                let mut policy = serde_json::Map::new();
+                policy.insert(
+                    "type".into(),
+                    match mode {
+                        SandboxMode::ReadOnly => "readOnly",
+                        SandboxMode::WorkspaceWrite => "workspaceWrite",
+                        SandboxMode::DangerFullAccess => "dangerFullAccess",
+                    }
+                    .into(),
+                );
+                if cx.network_access {
+                    policy.insert("networkAccess".into(), true.into());
+                }
+                if !cx.writable_roots.is_empty() {
+                    policy.insert(
+                        "writableRoots".into(),
+                        json!(
+                            cx.writable_roots
+                                .iter()
+                                .map(|p| p.display().to_string())
+                                .collect::<Vec<_>>()
+                        ),
+                    );
+                }
+                // NOTE: `web_search` and `features` have no app-server
+                // sandboxPolicy counterpart validated against 0.146.1 — they
+                // are intentionally NOT invented onto the wire.
+                (
+                    serde_json::to_value(
+                        cx.approval_policy
+                            .as_ref()
+                            .unwrap_or(&ApprovalPolicy::Never),
+                    )
+                    .expect("approval policy serializes"),
+                    match mode {
+                        SandboxMode::ReadOnly => "read-only",
+                        SandboxMode::WorkspaceWrite => "workspace-write",
+                        SandboxMode::DangerFullAccess => "danger-full-access",
+                    },
+                    Value::Object(policy),
+                )
+            }
+            None => (
+                Value::String("never".into()),
+                sandbox_mode(request.sandbox),
+                sandbox_policy_value(request.sandbox),
+            ),
+        };
     let effort = to_effort(request.reasoning);
     // Service tier rides thread-start and every turn (mirrors the Codex IDE
     // client). "default" means Standard — omit it entirely.
@@ -521,8 +591,8 @@ async fn run_session(session: Session) {
     let start_params = {
         let mut p = serde_json::Map::new();
         p.insert("cwd".into(), Value::String(request.cwd.clone()));
-        p.insert("approvalPolicy".into(), approval_policy.into());
-        p.insert("sandbox".into(), sandbox_mode(request.sandbox).into());
+        p.insert("approvalPolicy".into(), approval_policy.clone());
+        p.insert("sandbox".into(), Value::String(sandbox_mode_str.into()));
         if let Some(model) = &request.model {
             p.insert("model".into(), Value::String(model.clone()));
         }
@@ -607,11 +677,8 @@ async fn run_session(session: Session) {
         let mut p = serde_json::Map::new();
         p.insert("threadId".into(), Value::String(thread_id.clone()));
         p.insert("input".into(), json!([{ "type": "text", "text": text }]));
-        p.insert("approvalPolicy".into(), approval_policy.into());
-        p.insert(
-            "sandboxPolicy".into(),
-            sandbox_policy_value(request.sandbox),
-        );
+        p.insert("approvalPolicy".into(), approval_policy.clone());
+        p.insert("sandboxPolicy".into(), sandbox_policy.clone());
         // Reasoning summaries stream (`item/reasoning/summaryTextDelta`) only
         // when asked for — without this codex "thinks" in silence for minutes:
         // nothing renders and the UI's 45s staleness gate flips Working off
@@ -1414,7 +1481,11 @@ fn user_input_questions(params: &Value) -> Vec<(String, UserInputQuestion)> {
                 id: new_message_id(),
                 header: {
                     let h = field(["header", "title", "label"]);
-                    if h.is_empty() { "Codex question".into() } else { h }
+                    if h.is_empty() {
+                        "Codex question".into()
+                    } else {
+                        h
+                    }
                 },
                 question: field(["question", "prompt", "text"]),
                 options: q
