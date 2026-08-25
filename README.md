@@ -13,6 +13,8 @@ Komet is a native **Rust + gpui** controller in a single binary. Each device run
 - **Multiple agents** — unified ACP protocol (Claude, Codex, Cursor, Grok, Hermes, OpenCode, Pi)
 - **Optional sync** — Loro CRDT via a self-hosted `komet-sync` server (SQLite + bearer token)
 
+> **Security:** komet's sandbox settings constrain the agent CLI's own permissions — they are not an OS-level boundary. See [docs/security.md](docs/security.md).
+
 ---
 
 ## Installation
