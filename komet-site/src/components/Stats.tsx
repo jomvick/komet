@@ -8,7 +8,7 @@ const easing = [0.16, 1, 0.3, 1] as const;
 
 export default function Stats() {
   return (
-    <section id="speed" className="py-24 md:py-32 border-y border-[var(--hairline)] bg-charcoal/30">
+    <section id="speed" className="py-24 md:py-32 bg-charcoal/30">
       <div className="mx-auto max-w-6xl px-5">
         <motion.div
           initial={{ opacity: 0, y: 16 }}
@@ -18,10 +18,10 @@ export default function Stats() {
           className="max-w-xl mb-16"
         >
           <p className="font-mono text-[11px] uppercase tracking-wide text-fog mb-3">
-            Bâti pour la vitesse
+            Built for speed
           </p>
           <h2 className="text-[30px] md:text-[36px] leading-tight tracking-tight font-medium text-paper">
-            Aucune couche à traverser entre toi et l&apos;agent.
+            No layers between you and the agent.
           </h2>
         </motion.div>
 
@@ -30,12 +30,12 @@ export default function Stats() {
           whileInView={{ opacity: 1, y: 0 }}
           viewport={{ once: true, margin: "-60px" }}
           transition={{ duration: 0.6, ease: easing }}
-          className="grid sm:grid-cols-2 lg:grid-cols-4 border-t border-l border-[var(--hairline)]"
+          className="grid sm:grid-cols-2 lg:grid-cols-4"
         >
           {stats.map((s, i) => (
             <div
               key={s.label}
-              className="border-r border-b border-[var(--hairline)] p-6"
+              className="p-6"
             >
               <p className="font-mono text-[26px] text-paper tracking-tight">
                 <CountUp value={s.value} duration={0.9 + i * 0.15} />

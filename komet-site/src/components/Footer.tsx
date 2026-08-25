@@ -1,6 +1,6 @@
 export default function Footer() {
   return (
-    <footer className="flex items-center gap-2 border-t px-5 py-10 text-xs text-muted-foreground md:px-10">
+    <footer className="flex items-center gap-2 px-5 py-10 text-xs text-muted-foreground md:px-10">
       <img
         src="/komet.png"
         alt=""

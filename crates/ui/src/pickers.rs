@@ -3401,9 +3401,9 @@ pub(crate) fn harness_brand_icon(harness: HarnessId) -> (&'static str, Option<gp
         // opencode's mark, monochrome like OpenAI's.
         HarnessId::Opencode => (crate::icons::OPENCODE_MARK, None),
         HarnessId::Pi => (crate::icons::PI_MARK, None),
-        // Antigravity has no dedicated bundled mark yet; use the neutral
-        // monochrome OpenAI-style treatment until one is supplied.
-        HarnessId::Antigravity => (crate::icons::OPENAI_MARK, None),
+        // Google Antigravity's mark, sourced from the LobeHub icons set
+        // (lobehub.com/icons, `@lobehub/icons-static-svg`), monochrome.
+        HarnessId::Antigravity => (crate::icons::ANTIGRAVITY_MARK, None),
     }
 }
 

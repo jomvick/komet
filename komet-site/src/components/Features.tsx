@@ -5,13 +5,16 @@ export default function Features() {
     <section>
       <div className="px-5 pt-14 md:px-10">
         <div className="font-mono text-[11px] tracking-[0.14em] text-muted-foreground/80 uppercase">
-          Pourquoi natif
+          Why native
         </div>
       </div>
 
-      <div className="mt-8 grid grid-cols-1 gap-px sm:grid-cols-2 lg:grid-cols-3">
+      <div className="mt-8 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
         {features.map((f) => (
-          <div key={f.title} className="bg-background p-6 md:p-8">
+          <div
+            key={f.title}
+            className="rounded-xl border border-border bg-charcoal/30 p-6 md:p-8 transition-colors hover:border-border-strong"
+          >
             <div className="flex items-center gap-2.5">
               <svg
                 xmlns="http://www.w3.org/2000/svg"
