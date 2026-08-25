@@ -46,13 +46,249 @@ pub enum SandboxLevel {
     DangerFullAccess,
 }
 
-/// Provider-native sandbox options riding [`RunRequest`]. Task 0 placeholder
-/// guaranteeing wire compat: old JSON without `sandboxOptions` still parses as
-/// `None`, and `None` serializes away so old readers never see it. Task 1 will
-/// expand this into the full Paseo-complete Codex/Claude/OpenCode tables.
+use std::path::PathBuf;
+
+/// Provider-native sandbox options riding [`RunRequest`] — one slot per
+/// harness family, mirroring Paseo's provider-options table. Exactly the
+/// fields each harness natively understands; strict (`deny_unknown_fields`)
+/// so a typo'd option fails at the wire instead of silently no-op'ing on
+/// the agent side.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct SandboxOptions {}
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SandboxOptions {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex: Option<CodexSandbox>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claude: Option<ClaudeSandbox>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opencode: Option<OpenCodePerms>,
+}
+
+/// Codex sandbox table (Paseo `codex` provider options). Note Paseo's
+/// semantics: `approval_policy: "never"` only removes prompts — access is
+/// governed by `sandbox_mode`, never by the approval policy.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CodexSandbox {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_mode: Option<SandboxMode>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub writable_roots: Vec<PathBuf>,
+    #[serde(default)]
+    pub network_access: bool,
+    #[serde(default)]
+    pub web_search: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval_policy: Option<ApprovalPolicy>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SandboxMode {
+    ReadOnly,
+    WorkspaceWrite,
+    DangerFullAccess,
+}
+
+/// Codex approval policy: either a blanket level (`"never"` on the wire) or a
+/// granular split of commands to always-ask vs auto-approve.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalPolicy {
+    /// `"never"` removes prompts only; [`SandboxMode`] still gates access.
+    Never,
+    Granular {
+        ask: Vec<String>,
+        auto_approve: Vec<String>,
+    },
+}
+
+// Hand-rolled because the wire mixes representations: a bare `"never"`
+// string for the blanket level, a tagged object for the granular split.
+impl Serialize for ApprovalPolicy {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Never => serializer.serialize_str("never"),
+            Self::Granular { ask, auto_approve } => {
+                use serde::ser::SerializeMap;
+                let mut map = serializer.serialize_map(Some(3))?;
+                map.serialize_entry("kind", "granular")?;
+                if !ask.is_empty() {
+                    map.serialize_entry("ask", ask)?;
+                }
+                if !auto_approve.is_empty() {
+                    map.serialize_entry("autoApprove", auto_approve)?;
+                }
+                map.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ApprovalPolicy {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        match &value {
+            serde_json::Value::String(s) if s == "never" => Ok(Self::Never),
+            serde_json::Value::Object(map)
+                if map.get("kind").and_then(|k| k.as_str()) == Some("granular") =>
+            {
+                let get_list = |key: &str| -> Vec<String> {
+                    map.get(key)
+                        .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
+                        .unwrap_or_default()
+                };
+                Ok(Self::Granular {
+                    ask: get_list("ask"),
+                    auto_approve: get_list("autoApprove"),
+                })
+            }
+            _ => Err(serde::de::Error::custom(
+                "approval policy must be \"never\" or {\"kind\":\"granular\",…}",
+            )),
+        }
+    }
+}
+
+/// Claude Code sandbox settings (Paseo `claude` provider options), mirroring
+/// Claude's `settings.permissions` surface.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClaudeSandbox {
+    #[serde(default)]
+    pub filesystem: FilesystemSandbox,
+    #[serde(default)]
+    pub network: NetworkSandbox,
+    #[serde(default)]
+    pub allow_unsandboxed_commands: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub excluded_commands: Vec<String>,
+    #[serde(default)]
+    pub fail_if_unavailable: bool,
+    /// Raw passthrough for Claude's `settings.permissions` JSON — kept opaque
+    /// so Claude-side schema evolution doesn't require a komet release.
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub settings_permissions: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FilesystemSandbox {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NetworkSandbox {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_hosts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub denied_hosts: Vec<String>,
+}
+
+/// OpenCode permission table (Paseo `opencode` provider options).
+///
+/// `bash.patterns` is an ORDERED pattern map: matching walks insertion order
+/// and the LAST matching key wins, with a trailing `"*"` entry acting as
+/// fallback (`"*": "ask"` is Paseo's canonical default). Stored as
+/// `Vec<(String, Perm)>` rather than a std map so document order survives a
+/// wire round-trip — reordering would silently change semantics.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OpenCodePerms {
+    #[serde(default)]
+    pub bash: BashPerms,
+    #[serde(default)]
+    pub unscoped_actions: UnscopedActions,
+}
+
+impl OpenCodePerms {
+    /// The trailing `"*"` bash fallback perm, if any (see [`BashPerms`]).
+    pub fn bash_fallback(&self) -> Option<Perm> {
+        self.bash.fallback()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct BashPerms {
+    pub patterns: Vec<(String, Perm)>,
+}
+
+impl BashPerms {
+    /// The trailing `"*"` fallback perm, if any pattern names it.
+    pub fn fallback(&self) -> Option<Perm> {
+        self.patterns
+            .iter()
+            .rev()
+            .find(|(key, _)| key == "*")
+            .map(|(_, perm)| *perm)
+    }
+
+    /// Resolve a command against all patterns in order; the LAST match wins.
+    /// Patterns are OpenCode-style: a trailing `*` matches any remainder
+    /// (`"npm *"`), otherwise the key must equal the command exactly.
+    pub fn resolve(&self, command: &str) -> Option<Perm> {
+        self.patterns
+            .iter()
+            .rev()
+            .find(|(key, _)| Self::matches(key, command))
+            .map(|(_, perm)| *perm)
+    }
+
+    fn matches(pattern: &str, command: &str) -> bool {
+        match pattern.strip_suffix('*') {
+            Some(prefix) => command.starts_with(prefix),
+            None => pattern == command,
+        }
+    }
+}
+
+impl Serialize for BashPerms {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_map(self.patterns.iter().map(|(k, v)| (k, v)))
+    }
+}
+
+impl<'de> Deserialize<'de> for BashPerms {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = BashPerms;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a map of bash patterns to permissions")
+            }
+            // visit_map yields entries in DOCUMENT order regardless of any
+            // map feature flags, which is exactly what we must preserve.
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut access: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut patterns = Vec::new();
+                while let Some((key, perm)) = access.next_entry()? {
+                    patterns.push((key, perm));
+                }
+                Ok(BashPerms { patterns })
+            }
+        }
+        deserializer.deserialize_map(Visitor)
+    }
+}
+
+/// Per-tool perms for tools outside the bash gate (`webfetch`, `websearch`,
+/// `todowrite`, …). Key order carries no semantics here, so a plain map is fine.
+pub type UnscopedActions = std::collections::BTreeMap<String, Perm>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Perm {
+    Allow,
+    Ask,
+    Deny,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -465,7 +701,11 @@ pub struct ContextUsageStats {
 
 impl ContextUsageStats {
     pub fn new(context_limit: u64) -> Self {
-        let context_limit = if context_limit == 0 { 200_000 } else { context_limit };
+        let context_limit = if context_limit == 0 {
+            200_000
+        } else {
+            context_limit
+        };
         Self {
             context_limit,
             compact_threshold: Some(context_limit.saturating_mul(3) / 4),
@@ -491,7 +731,14 @@ impl ContextUsageStats {
         (self.context_ratio() * 100.0).round() as u32
     }
 
-    pub fn ingest(&mut self, input: u64, cached: u64, output: u64, reasoning: u64, limit: Option<u64>) {
+    pub fn ingest(
+        &mut self,
+        input: u64,
+        cached: u64,
+        output: u64,
+        reasoning: u64,
+        limit: Option<u64>,
+    ) {
         self.input_tokens = self.input_tokens.saturating_add(input);
         self.cached_input_tokens = self.cached_input_tokens.saturating_add(cached);
         self.output_tokens = self.output_tokens.saturating_add(output);
@@ -506,9 +753,16 @@ impl ContextUsageStats {
 /// Conservative context-window defaults for providers that do not report one.
 pub fn default_context_limit_for_model(model_name: &str) -> u64 {
     let model = model_name.to_ascii_lowercase();
-    if ["gemini-1.5", "gemini-2.0", "gemini-2.5"].iter().any(|name| model.contains(name)) {
+    if ["gemini-1.5", "gemini-2.0", "gemini-2.5"]
+        .iter()
+        .any(|name| model.contains(name))
+    {
         1_000_000
-    } else if model.contains("deepseek") || ["gpt-4o", "o1", "o3"].iter().any(|name| model.contains(name)) {
+    } else if model.contains("deepseek")
+        || ["gpt-4o", "o1", "o3"]
+            .iter()
+            .any(|name| model.contains(name))
+    {
         128_000
     } else if model.contains("grok") {
         131_072
@@ -519,12 +773,19 @@ pub fn default_context_limit_for_model(model_name: &str) -> u64 {
 
 /// Formats token counts for compact UI labels.
 pub fn format_tokens(count: u64) -> String {
-    if count >= 1_000_000_000 { format!("{:.1}b", count as f64 / 1_000_000_000.0) }
-    else if count >= 10_000_000 { format!("{}m", count / 1_000_000) }
-    else if count >= 1_000_000 { format!("{:.1}m", count as f64 / 1_000_000.0) }
-    else if count >= 10_000 { format!("{}k", count / 1_000) }
-    else if count >= 1_000 { format!("{:.1}k", count as f64 / 1_000.0) }
-    else { count.to_string() }
+    if count >= 1_000_000_000 {
+        format!("{:.1}b", count as f64 / 1_000_000_000.0)
+    } else if count >= 10_000_000 {
+        format!("{}m", count / 1_000_000)
+    } else if count >= 1_000_000 {
+        format!("{:.1}m", count as f64 / 1_000_000.0)
+    } else if count >= 10_000 {
+        format!("{}k", count / 1_000)
+    } else if count >= 1_000 {
+        format!("{:.1}k", count as f64 / 1_000.0)
+    } else {
+        count.to_string()
+    }
 }
 
 #[cfg(test)]
@@ -670,6 +931,165 @@ mod tests {
         assert_eq!(stats.compact_threshold, Some(96_000));
         assert_eq!(default_context_limit_for_model("gemini-2.5-pro"), 1_000_000);
         assert_eq!(format_tokens(10_500), "10k");
+    }
+
+    #[test]
+    fn sandbox_options_rejects_unknown_field() {
+        let json = r#"{"sandboxMode":"workspace-write","unknown":1}"#;
+        assert!(serde_json::from_str::<CodexSandbox>(json).is_err());
+    }
+
+    #[test]
+    fn opencode_perms_last_key_is_fallback() {
+        let json = r#"{"bash":{"*":"ask","git status":"allow"}}"#;
+        let perms: OpenCodePerms = serde_json::from_str(json).unwrap();
+        assert_eq!(perms.bash_fallback(), Some(Perm::Ask));
+    }
+
+    #[test]
+    fn codex_sandbox_full_table_round_trips_camel_case() {
+        let json = r#"{
+            "sandboxMode": "workspace-write",
+            "writableRoots": ["/repo"],
+            "networkAccess": true,
+            "webSearch": false,
+            "features": ["shell"],
+            "approvalPolicy": "never"
+        }"#;
+        let opts: CodexSandbox = serde_json::from_str(json).unwrap();
+        assert_eq!(opts.sandbox_mode, Some(SandboxMode::WorkspaceWrite));
+        assert_eq!(opts.writable_roots, vec![PathBuf::from("/repo")]);
+        assert!(opts.network_access);
+        assert!(!opts.web_search);
+        assert_eq!(opts.approval_policy, Some(ApprovalPolicy::Never));
+        // round-trip keeps the same wire shape
+        let back: CodexSandbox =
+            serde_json::from_str(&serde_json::to_string(&opts).unwrap()).unwrap();
+        assert_eq!(back, opts);
+    }
+
+    #[test]
+    fn codex_approval_policy_granular_round_trips() {
+        let json = r#"{"kind":"granular","ask":["rm -rf"],"autoApprove":["ls"]}"#;
+        let pol: ApprovalPolicy = serde_json::from_str(json).unwrap();
+        match &pol {
+            ApprovalPolicy::Granular { ask, auto_approve } => {
+                assert_eq!(ask, &vec!["rm -rf".to_string()]);
+                assert_eq!(auto_approve, &vec!["ls".to_string()]);
+            }
+            other => panic!("expected granular, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn claude_sandbox_full_table_round_trips() {
+        let json = r#"{
+            "filesystem": {"allow": ["/repo"], "deny": ["~/.ssh"]},
+            "network": {"allowedHosts": ["crates.io"]},
+            "allowUnsandboxedCommands": false,
+            "excludedCommands": ["sudo"],
+            "failIfUnavailable": true,
+            "settingsPermissions": {"allow": ["Bash(npm run *)"]}
+        }"#;
+        let opts: ClaudeSandbox = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            opts.filesystem,
+            FilesystemSandbox {
+                allow: vec!["/repo".into()],
+                deny: vec!["~/.ssh".into()]
+            }
+        );
+        assert_eq!(opts.network.allowed_hosts, vec!["crates.io".to_string()]);
+        assert!(!opts.allow_unsandboxed_commands);
+        assert_eq!(opts.excluded_commands, vec!["sudo".to_string()]);
+        assert!(opts.fail_if_unavailable);
+        assert_eq!(
+            opts.settings_permissions.get("allow"),
+            Some(&serde_json::json!(["Bash(npm run *)"]))
+        );
+        let back: ClaudeSandbox =
+            serde_json::from_str(&serde_json::to_string(&opts).unwrap()).unwrap();
+        assert_eq!(back, opts);
+    }
+
+    /// Pattern maps must survive a wire round-trip in DOCUMENT order — the
+    /// last matching key is the fallback, so reordering changes semantics.
+    #[test]
+    fn opencode_bash_patterns_preserve_order_across_wire() {
+        let json = r#"{"bash":{"*":"deny","npm *":"allow","git status":"ask"}}"#;
+        let perms: OpenCodePerms = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            perms.bash.patterns,
+            vec![
+                ("*".to_string(), Perm::Deny),
+                ("npm *".to_string(), Perm::Allow),
+                ("git status".to_string(), Perm::Ask),
+            ]
+        );
+        // Command resolution walks all patterns, last match wins.
+        assert_eq!(perms.bash.resolve("npm install"), Some(Perm::Allow));
+        assert_eq!(perms.bash.resolve("cargo build"), Some(Perm::Deny));
+        assert_eq!(perms.bash.resolve("git status"), Some(Perm::Ask));
+        // Round-trip preserves order exactly on the wire (string path).
+        // NOTE: routing through serde_json::Value instead would sort keys —
+        // serde_json::Map is BTreeMap-ordered without the `preserve_order`
+        // feature. Wire transports carry bytes/strings, which is the path
+        // that matters here.
+        let wire = serde_json::to_string(&perms).unwrap();
+        let back: OpenCodePerms = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back, perms);
+        // A trailing "*" entry is the fallback.
+        let json = r#"{"bash":{"x":"allow","*":"deny"}}"#;
+        let perms: OpenCodePerms = serde_json::from_str(json).unwrap();
+        assert_eq!(perms.bash_fallback(), Some(Perm::Deny));
+    }
+
+    #[test]
+    fn opencode_unscoped_actions_map_tools_to_perms() {
+        let json =
+            r#"{"unscopedActions":{"webfetch":"ask","websearch":"allow","todowrite":"allow"}}"#;
+        let perms: OpenCodePerms = serde_json::from_str(json).unwrap();
+        assert_eq!(perms.unscoped_actions.get("webfetch"), Some(&Perm::Ask));
+        assert_eq!(perms.unscoped_actions.get("websearch"), Some(&Perm::Allow));
+        assert_eq!(perms.unscoped_actions.get("todowrite"), Some(&Perm::Allow));
+    }
+
+    #[test]
+    fn sandbox_options_carries_each_provider_and_defaults_empty() {
+        assert_eq!(
+            SandboxOptions::default(),
+            SandboxOptions {
+                codex: None,
+                claude: None,
+                opencode: None,
+            }
+        );
+        let req = RunRequest {
+            prompt: "p".into(),
+            model: None,
+            reasoning: None,
+            model_options: Default::default(),
+            cwd: ".".into(),
+            sandbox: SandboxLevel::ReadOnly,
+            harness: None,
+            auto_approve: false,
+            attachments: vec![],
+            worktree: None,
+            resume: None,
+            sandbox_options: Some(SandboxOptions {
+                opencode: Some(OpenCodePerms {
+                    bash: BashPerms {
+                        patterns: vec![("*".into(), Perm::Allow)],
+                    },
+                    unscoped_actions: Default::default(),
+                }),
+                ..Default::default()
+            }),
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["sandboxOptions"]["opencode"]["bash"]["*"], "allow");
+        let back: RunRequest = serde_json::from_value(json).unwrap();
+        assert_eq!(back.sandbox_options, req.sandbox_options);
     }
 
     #[test]
