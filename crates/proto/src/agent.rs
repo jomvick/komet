@@ -346,6 +346,9 @@ pub enum ValidationError {
     /// Claude contradiction: allow unsandboxed commands AND hard-fail when
     /// sandboxing is unavailable — the run could never start coherently.
     ClaudeUnsandboxedWithFailUnavailable,
+    /// Claude `settings_permissions` passthrough carries an escalation-shaped
+    /// value (bypass-style defaultMode or a wildcard/bash-all allow entry).
+    ClaudeSettingsPermissionsEscalation { detail: String },
     /// OpenCode bash pattern map empty with no `"*"` fallback — every
     /// command would resolve to nothing.
     OpenCodeEmptyPatternsWithoutFallback,
@@ -377,6 +380,10 @@ impl std::fmt::Display for ValidationError {
                 f,
                 "claude allowUnsandboxedCommands contradicts failIfUnavailable"
             ),
+            Self::ClaudeSettingsPermissionsEscalation { detail } => write!(
+                f,
+                "claude settingsPermissions passthrough would escalate access: {detail}"
+            ),
             Self::OpenCodeEmptyPatternsWithoutFallback => write!(
                 f,
                 "opencode bash permission map is empty and has no \"*\" fallback"
@@ -390,8 +397,32 @@ impl std::fmt::Display for ValidationError {
 
 impl std::error::Error for ValidationError {}
 
-fn lexically_clean(path: &std::path::Path) -> PathBuf {
-    use std::path::Component;
+/// Detect escalation-shaped content in the opaque Claude
+/// `settings.permissions` passthrough. Returns a human-readable detail when
+/// the value would grant more than the sandbox claims: a `defaultMode` other
+/// than `"default"`/`"acceptEdits"`, or an allow entry of `"*"`, bare
+/// `"Bash"`, or any `"Bash(*…)"` (unsandboxed / all-commands bash).
+fn settings_permissions_escalation(value: &serde_json::Value) -> Option<String> {
+    let obj = value.as_object()?;
+    if let Some(mode) = obj.get("defaultMode").and_then(|m| m.as_str()) {
+        if mode != "default" && mode != "acceptEdits" {
+            return Some(format!("defaultMode {mode:?}"));
+        }
+    }
+    if let Some(allow) = obj.get("allow").and_then(|a| a.as_array()) {
+        for entry in allow {
+            let Some(rule) = entry.as_str() else {
+                continue;
+            };
+            if rule == "*" || rule == "Bash" || rule.starts_with("Bash(*") {
+                return Some(format!("allow entry {rule:?}"));
+            }
+        }
+    }
+    None
+}
+
+fn lexically_clean(path: &std::path::Path) -> PathBuf {    use std::path::Component;
     path.components().fold(PathBuf::new(), |mut acc, c| match c {
         Component::CurDir => acc,
         Component::ParentDir => {
@@ -464,6 +495,9 @@ pub fn validate_run_request(request: &RunRequest) -> Result<(), ValidationError>
         }
         if claude.allow_unsandboxed_commands && claude.fail_if_unavailable {
             return Err(ValidationError::ClaudeUnsandboxedWithFailUnavailable);
+        }
+        if let Some(detail) = settings_permissions_escalation(&claude.settings_permissions) {
+            return Err(ValidationError::ClaudeSettingsPermissionsEscalation { detail });
         }
     }
 
@@ -1509,6 +1543,56 @@ mod tests {
                 deny: vec!["~/.ssh".into()],
             },
             fail_if_unavailable: true,
+            ..Default::default()
+        });
+        assert_eq!(validate_run_request(&req), Ok(()));
+    }
+
+    #[test]
+    fn validation_rejects_claude_settings_permissions_bypass_mode() {
+        let mut req = base_request();
+        req.sandbox_options = claude_options(ClaudeSandbox {
+            settings_permissions: serde_json::json!({"defaultMode": "bypassPermissions"}),
+            ..Default::default()
+        });
+        assert!(matches!(
+            validate_run_request(&req),
+            Err(ValidationError::ClaudeSettingsPermissionsEscalation { .. })
+        ));
+    }
+
+    #[test]
+    fn validation_rejects_claude_settings_permissions_wildcard_allow() {
+        for allow in [
+            serde_json::json!(["*"]),
+            serde_json::json!(["Bash"]),
+            serde_json::json!(["Bash(*)"]),
+            serde_json::json!(["Read(src/**)", "Bash(*)"]),
+        ] {
+            let mut req = base_request();
+            req.sandbox_options = claude_options(ClaudeSandbox {
+                settings_permissions: serde_json::json!({"allow": allow}),
+                ..Default::default()
+            });
+            assert!(
+                matches!(
+                    validate_run_request(&req),
+                    Err(ValidationError::ClaudeSettingsPermissionsEscalation { .. })
+                ),
+                "should reject allow={allow}"
+            );
+        }
+    }
+
+    #[test]
+    fn validation_accepts_non_escalating_claude_settings_permissions() {
+        let mut req = base_request();
+        req.sandbox_options = claude_options(ClaudeSandbox {
+            settings_permissions: serde_json::json!({
+                "defaultMode": "acceptEdits",
+                "allow": ["Read(src/**)", "Bash(git *)"],
+                "deny": ["~/.ssh"]
+            }),
             ..Default::default()
         });
         assert_eq!(validate_run_request(&req), Ok(()));
