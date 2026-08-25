@@ -12,8 +12,9 @@ use komet_harness::{
     CancellationToken, CodexHarness, Harness, HarnessError, RunControls, SteerMessage,
 };
 use komet_proto::{
-    AgentEvent, DoneStatus, HarnessId, ReasoningLevel, RunRequest, SandboxLevel, TodoItem,
-    ToolCall, UserInputAnswer, UserInputQuestion,
+    AgentEvent, ApprovalPolicy, CodexSandbox, DoneStatus, HarnessId, ReasoningLevel, RunRequest,
+    SandboxLevel, SandboxMode, SandboxOptions, TodoItem, ToolCall, UserInputAnswer,
+    UserInputQuestion,
 };
 
 fn fixture_path() -> PathBuf {
@@ -809,4 +810,35 @@ async fn live_commands_discovery() {
     let h = CodexHarness::new();
     let commands = h.commands().await.expect("live discovery");
     eprintln!("{} commands, first: {:?}", commands.len(), commands.first());
+}
+
+/// An explicit `SandboxOptions.codex` table WINS over the yolo force: the
+/// thread/turn params carry the table's sandbox + approval policy, never the
+/// unconditional danger-full-access / "never" defaults.
+#[tokio::test]
+async fn sandbox_options_codex_translate_to_native_wire_params() {
+    let (controls, _steer, _token) = controls("Yes");
+    let mut req = request("scenario:sandbox-options");
+    req.sandbox_options = Some(SandboxOptions {
+        codex: Some(CodexSandbox {
+            sandbox_mode: Some(SandboxMode::ReadOnly),
+            writable_roots: vec!["/tmp/vendor".into()],
+            network_access: true,
+            approval_policy: Some(ApprovalPolicy::Granular {
+                ask: vec!["rm -rf /".into()],
+                auto_approve: vec!["ls -la".into()],
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    });
+    // The legacy level must be IGNORED when a codex table is present.
+    req.sandbox = SandboxLevel::DangerFullAccess;
+    let events = run_to_end(&harness(), req, controls).await;
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Done { status: DoneStatus::Completed, .. })),
+        "fixture validates wire params and completes only on success: {events:?}"
+    );
 }

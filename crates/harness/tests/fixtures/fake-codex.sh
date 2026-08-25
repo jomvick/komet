@@ -55,6 +55,27 @@ tid=$(rid "$turnline")
 
 case "$turnline" in
 
+*scenario:sandbox-options*)
+  # Explicit SandboxOptions.codex table must WIN over the yolo force:
+  # thread/start carries the table's sandbox mode + approval policy,
+  # turn/start carries its sandboxPolicy — never danger-full-access/never.
+  has "$thread_line" '"sandbox":"read-only"' ||
+    { fail_turn "$tid" "thread sandbox should be read-only"; exit 0; }
+  for want in '"kind":"granular"' '"ask":["rm -rf /"]' '"autoApprove":["ls -la"]'; do
+    has "$thread_line" "$want" ||
+      { fail_turn "$tid" "thread approvalPolicy missing: $want"; exit 0; }
+  done
+  for want in '"type":"readOnly"' '"networkAccess":true' '"writableRoots"' \
+    '"/tmp/vendor"' '"kind":"granular"'; do
+    has "$turnline" "$want" ||
+      { fail_turn "$tid" "turn param missing: $want"; exit 0; }
+  done
+  emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
+  emit '{"method":"turn/started","params":{"turn":{"id":"t-1"}}}'
+  emit '{"method":"item/agentMessage/delta","params":{"itemId":"m1","delta":"sandboxed"}}'
+  emit '{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}'
+  ;;
+
 *scenario:happy*)
   # Verify the turn/start + thread/start params the harness must send.
   for want in '"method":"turn/start"' '"effort":"ultra"' '"model":"gpt-5.6-sol"' \
