@@ -11,7 +11,7 @@ Komet is a native **Rust + gpui** controller in a single binary. Each device run
 - **Local-first** — works fully offline, data stays on device
 - **Single binary** — UI + engine, headed or headless mode
 - **Multiple agents** — unified ACP protocol (Claude, Codex, Cursor, Grok, Hermes, OpenCode, Pi)
-- **Optional sync** — Loro CRDT via Cloudflare Durable Objects, self-hosted
+- **Optional sync** — Loro CRDT via a self-hosted `komet-sync` server (SQLite + bearer token)
 
 ---
 
@@ -90,9 +90,9 @@ komet
 ## Architecture
 
 ```
-gpui UI ── RPC (localhost / in-proc) ── engine A ══ DeviceRoom DO ══ engine B ── RPC ── gpui UI
-                          │         edge Worker (auth, rooms, R2)          │
-                          └── Loro CRDT sync ── SessionRoom DO ────────────┘
+gpui UI ── RPC (localhost / in-proc) ── engine A ══ komet-sync server ══ engine B ── RPC ── gpui UI
+                          │         self-hosted, bearer-token auth         │
+                          └── Loro CRDT sync (rooms + blobs) ──────────────┘
 ```
 
 | Crate | Role |
@@ -101,8 +101,8 @@ gpui UI ── RPC (localhost / in-proc) ── engine A ══ DeviceRoom DO �
 | `komet-ui` | gpui interface (sidebar, transcript, composer, diff) |
 | `komet-doc` | Loro schemas + mirror layer |
 | `komet-sync` | room client + SQLite snapshots |
+| `komet-sync-server` | self-hosted sync server (rooms, blobs, bearer auth) |
 | `komet-harness` | ACP adapters (7 agents) |
-| `edge/` | TypeScript Worker + Durable Objects + R2 |
 
 Learn more: [`ARCHITECTURE.md`](ARCHITECTURE.md) · [`docs/`](docs/)
 
