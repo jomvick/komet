@@ -62,6 +62,10 @@ pub trait Harness: Send + Sync {
     fn display_name(&self) -> &str;
     fn supports_steering(&self) -> bool;
     fn steering_mode(&self) -> SteeringMode;
+    /// Reasoning-effort ladder this harness supports, ordered weakest to
+    /// strongest. UI ids map through
+    /// [`ReasoningLevel::from_thinking_id`]/[`ReasoningLevel::as_thinking_id`]
+    /// (komet-proto).
     fn reasoning_levels(&self) -> &[ReasoningLevel];
     /// Whether the agent's own CLI is present on this device — the settings
     /// gate for enabling the harness. A filesystem probe, never a spawn.

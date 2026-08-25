@@ -38,6 +38,40 @@ pub enum ReasoningLevel {
     Ultrathink,
 }
 
+impl ReasoningLevel {
+    /// Map a UI thinkingOptionId onto the level ladder. Unknown ids return
+    /// `None` — the caller decides whether to drop or downgrade.
+    pub fn from_thinking_id(id: &str) -> Option<Self> {
+        match id {
+            "minimal" => Some(Self::Minimal),
+            "low" => Some(Self::Low),
+            "medium" => Some(Self::Medium),
+            "high" => Some(Self::High),
+            "xhigh" => Some(Self::XHigh),
+            "max" => Some(Self::Max),
+            "ultra" => Some(Self::Ultra),
+            "ultracode" => Some(Self::Ultracode),
+            "ultrathink" => Some(Self::Ultrathink),
+            _ => None,
+        }
+    }
+
+    /// The canonical thinkingOptionId for this level (serde spelling).
+    pub fn as_thinking_id(&self) -> &'static str {
+        match self {
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+            Self::Ultra => "ultra",
+            Self::Ultracode => "ultracode",
+            Self::Ultrathink => "ultrathink",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum SandboxLevel {
@@ -791,6 +825,29 @@ pub fn format_tokens(count: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// thinkingOptionId (UI) <-> ReasoningLevel round-trip table; unknown ids
+    /// must be rejected rather than silently downgraded.
+    #[test]
+    fn thinking_id_maps_to_reasoning_level_and_back() {
+        let table = [
+            ("minimal", ReasoningLevel::Minimal),
+            ("low", ReasoningLevel::Low),
+            ("medium", ReasoningLevel::Medium),
+            ("high", ReasoningLevel::High),
+            ("xhigh", ReasoningLevel::XHigh),
+            ("max", ReasoningLevel::Max),
+            ("ultra", ReasoningLevel::Ultra),
+            ("ultracode", ReasoningLevel::Ultracode),
+            ("ultrathink", ReasoningLevel::Ultrathink),
+        ];
+        for (id, level) in table {
+            assert_eq!(ReasoningLevel::from_thinking_id(id), Some(level));
+            assert_eq!(level.as_thinking_id(), id);
+        }
+        assert_eq!(ReasoningLevel::from_thinking_id("bogus"), None);
+        assert_eq!(ReasoningLevel::from_thinking_id(""), None);
+    }
 
     #[test]
     fn agent_event_round_trips() {
