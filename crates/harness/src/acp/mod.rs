@@ -349,8 +349,10 @@ fn hermes_spec() -> AcpAgentSpec {
         effort_values: default_effort_values,
         ladder_extras: &[],
         prompt_complete_extension: false,
-        prompt_stall: None,
-        stall_hint: "The agent process is likely wedged.",
+        prompt_stall: Some(Duration::from_secs(45)),
+        stall_hint: "The agent process is likely wedged \\
+             \- a stale Python/uv environment or a hung provider auth check. \\
+             Try running `hermes acp` once in a terminal to see the raw error.",
         http_sidecar: false,
     }
 }
@@ -406,8 +408,11 @@ fn pi_spec() -> AcpAgentSpec {
         effort_values: default_effort_values,
         ladder_extras: &[],
         prompt_complete_extension: false,
-        prompt_stall: None,
-        stall_hint: "The agent process is likely wedged.",
+        prompt_stall: Some(Duration::from_secs(45)),
+        stall_hint: "The agent process is likely wedged \\
+             \u2014 a stale pi-acp adapter process or a hung provider call in \\
+             pi's own config (~/.pi). Try running `pi` once in a terminal to \\
+             check its provider setup.",
         http_sidecar: false,
     }
 }
@@ -3043,15 +3048,20 @@ async fn run_session(session: Session) {
             _ = tokio::time::sleep_until(
                 prompt_stall_deadline.unwrap_or_else(tokio::time::Instant::now),
             ), if prompt_stall_deadline.is_some() && turn.is_some() && !interrupted => {
+                let mut stall_message = format!(
+                    "{agent_name} did not respond to the prompt at all \
+                     (no wire activity for {}s). {}",
+                    prompt_stall.map(|d| d.as_secs()).unwrap_or(0),
+                    stall_hint,
+                );
+                if let Some(tail) = stderr_tail.snapshot() {
+                    stall_message.push_str("; stderr: ");
+                    stall_message.push_str(&tail);
+                }
                 let _ = send(
                     &event_tx,
                     AgentEvent::Error {
-                        message: format!(
-                            "{agent_name} did not respond to the prompt at all \
-                             (no wire activity for {}s). {}",
-                            prompt_stall.map(|d| d.as_secs()).unwrap_or(0),
-                            stall_hint,
-                        ),
+                        message: stall_message,
                     },
                 )
                 .await;
