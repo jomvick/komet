@@ -133,6 +133,7 @@ impl SandboxOptions {
                         ("todowrite".into(), Perm::Deny),
                     ]
                     .into(),
+                    ..Default::default()
                 }),
             },
             SandboxLevel::WorkspaceWrite => Self {
@@ -164,6 +165,7 @@ impl SandboxOptions {
                         patterns: vec![("*".into(), Perm::Allow)],
                     },
                     unscoped_actions: [("webfetch".into(), Perm::Allow)].into(),
+                    ..Default::default()
                 }),
             },
         }
@@ -173,6 +175,15 @@ impl SandboxOptions {
 /// Codex sandbox table (Paseo `codex` provider options). Note Paseo's
 /// semantics: `approval_policy: "never"` only removes prompts — access is
 /// governed by `sandbox_mode`, never by the approval policy.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CodexSandboxWorkspaceWrite {
+    #[serde(default)]
+    pub exclude_slash_tmp: bool,
+    #[serde(default)]
+    pub exclude_tmpdir_env_var: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CodexSandbox {
@@ -188,6 +199,8 @@ pub struct CodexSandbox {
     pub features: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_policy: Option<ApprovalPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_workspace_write: Option<CodexSandboxWorkspaceWrite>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -261,6 +274,13 @@ impl<'de> Deserialize<'de> for ApprovalPolicy {
 /// Claude's `settings.permissions` surface.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ClaudeSandboxSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ClaudeSandbox {
     #[serde(default)]
     pub filesystem: FilesystemSandbox,
@@ -272,6 +292,14 @@ pub struct ClaudeSandbox {
     pub excluded_commands: Vec<String>,
     #[serde(default)]
     pub fail_if_unavailable: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disallowed_tools: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_directories: Vec<String>,
+    #[serde(default)]
+    pub settings: ClaudeSandboxSettings,
     /// Raw passthrough for Claude's `settings.permissions` JSON — kept opaque
     /// so Claude-side schema evolution doesn't require a komet release.
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
@@ -348,6 +376,16 @@ pub struct OpenCodePerms {
     pub bash: BashPerms,
     #[serde(default)]
     pub unscoped_actions: UnscopedActions,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read: Option<Perm>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edit: Option<Perm>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_directory: Option<Perm>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub webfetch: Option<Perm>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub websearch: Option<Perm>,
 }
 
 impl OpenCodePerms {
@@ -1583,6 +1621,7 @@ mod tests {
                         patterns: vec![("*".into(), Perm::Allow)],
                     },
                     unscoped_actions: Default::default(),
+                ..Default::default()
                 }),
                 ..Default::default()
             }),
@@ -1868,6 +1907,7 @@ mod tests {
             req.sandbox_options = opencode_options(OpenCodePerms {
                 bash: BashPerms { patterns },
                 unscoped_actions: Default::default(),
+                ..Default::default()
             });
             assert_eq!(
                 validate_run_request(&req),
@@ -1889,6 +1929,7 @@ mod tests {
             unscoped_actions: [("webfetch".to_string(), Perm::Allow)]
                 .into_iter()
                 .collect(),
+            ..Default::default()
         });
         assert_eq!(validate_run_request(&req), Ok(()));
     }
@@ -1905,6 +1946,7 @@ mod tests {
                 patterns: vec![("".into(), Perm::Allow), ("*".into(), Perm::Ask)],
             },
             unscoped_actions: Default::default(),
+                ..Default::default()
         });
         assert_eq!(
             validate_run_request(&req),
@@ -2027,6 +2069,7 @@ mod tests {
                 patterns: vec![("git status".into(), Perm::Allow)],
             },
             unscoped_actions: Default::default(),
+                ..Default::default()
         });
         assert_eq!(
             validate_run_request(&req),
@@ -2041,8 +2084,33 @@ mod tests {
                 patterns: vec![("*".into(), Perm::Ask), ("git status".into(), Perm::Allow)],
             },
             unscoped_actions: Default::default(),
+                ..Default::default()
         };
         assert_eq!(perms.bash_fallback(), Some(Perm::Ask));
+    }
+
+    #[test]
+    fn codex_exclude_tmp() {
+        let json = r#"{"sandboxWorkspaceWrite":{"excludeSlashTmp":true,"excludeTmpdirEnvVar":true}}"#;
+        let v: CodexSandbox = serde_json::from_str(json).unwrap();
+        assert!(v.sandbox_workspace_write.unwrap().exclude_slash_tmp);
+        assert!(serde_json::from_str::<CodexSandbox>(r#"{"unknown":1}"#).is_err());
+    }
+
+    #[test]
+    fn claude_allowed_tools() {
+        let json = r#"{"allowedTools":["Read"],"disallowedTools":["Bash"],"additionalDirectories":["/tmp"],"settings":{"sandbox":{"enabled":true}}}"#;
+        let v: ClaudeSandbox = serde_json::from_str(json).unwrap();
+        assert_eq!(v.allowed_tools, vec!["Read"]);
+        assert_eq!(v.additional_directories, vec!["/tmp"]);
+    }
+
+    #[test]
+    fn opencode_external_directory() {
+        let json = r#"{"bash":{"*":"ask"},"externalDirectory":"allow","read":"deny","edit":"ask"}"#;
+        let v: OpenCodePerms = serde_json::from_str(json).unwrap();
+        assert_eq!(v.external_directory, Some(Perm::Allow));
+        assert_eq!(v.read, Some(Perm::Deny));
     }
 
     #[test]
