@@ -948,6 +948,28 @@ async fn opencode_sets_only_the_requested_model() {
 }
 
 #[tokio::test]
+async fn opencode_overlay_injected() {
+    use komet_proto::{BashPerms, OpenCodePerms, Perm, SandboxOptions};
+    let mut req = request_opencode("scenario:overlay", None);
+    req.sandbox_options = Some(SandboxOptions {
+        opencode: Some(OpenCodePerms {
+            bash: BashPerms {
+                patterns: vec![("*".to_owned(), Perm::Ask)],
+            },
+            unscoped_actions: Default::default(),
+        }),
+        ..Default::default()
+    });
+    let (controls, _steer, _token) = controls();
+    let events = run_to_end(&opencode_harness(), req, controls).await;
+    assert!(
+        events.contains(&AgentEvent::TextDelta { text: "overlay ok".into() }),
+        "{events:?}"
+    );
+    assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
+}
+
+#[tokio::test]
 async fn opencode_steering_delivers_at_turn_boundary() {
     // No `_session/steering` extension on opencode's wire: a steer must never
     // ride `_session/steering` (the fixture would refuse it). It settles the

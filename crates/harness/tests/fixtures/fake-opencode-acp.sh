@@ -97,6 +97,17 @@ case "$promptline" in
     fi
     ;;
 
+  *scenario:overlay*)
+    # Verify OPENCODE_CONFIG points to a JSON file containing bash "*":"ask"
+    cfg="$OPENCODE_CONFIG"
+    if [ -n "$cfg" ] && [ -f "$cfg" ] && grep -q '"\*":"ask"' "$cfg" && grep -q '"permission"' "$cfg"; then
+      update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"overlay ok"}}'
+      emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+    else
+      emit "{\"id\":$pid,\"result\":{\"stopReason\":\"refusal\"}}"
+    fi
+    ;;
+
   *)
     emit "{\"id\":$pid,\"result\":{\"stopReason\":\"refusal\"}}"
     ;;
