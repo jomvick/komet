@@ -283,17 +283,33 @@ async fn other_provider_with_options_rejected() {
             "provider {provider:?} should be rejected"
         );
     }
-    // Empty options must NOT be rejected.
+    // Empty options must NOT be rejected: validation passes, so the command
+    // settles for a reason OTHER than a sandbox rejection (Cursor is not
+    // registered in this test rig, so the dispatch itself fails with
+    // "harness binary not found" — that is fine; what must never happen is
+    // the `sandbox_options rejected` validation outcome on an EMPTY table).
     let dir2 = tempfile::tempdir().unwrap();
     let core2 = assemble(dir2.path());
     let mut empty = base_request();
     empty.harness = Some(HarnessId::Cursor);
     empty.sandbox_options = Some(SandboxOptions::default());
     queue_run(&core2, "cmd-empty-ok", empty);
-    // Empty options should pass validation and spawn (assistant entry appears)
     wait_for(
-        || entries(&core2).iter().any(|e| e.role == MessageRole::Assistant),
-        "empty options should not be rejected",
+        || {
+            matches!(
+                command_status(&core2, "cmd-empty-ok"),
+                Some((SessionCommandStatus::Applied, _))
+                    | Some((SessionCommandStatus::Rejected, _))
+                    | Some((SessionCommandStatus::Expired, _))
+            )
+        },
+        "empty options command to settle",
     )
     .await;
+    let (status, resolution) = command_status(&core2, "cmd-empty-ok").unwrap();
+    let resolution = resolution.unwrap_or_default();
+    assert!(
+        !resolution.contains("sandbox_options rejected"),
+        "empty options must pass sandbox validation, got {status:?}: {resolution}"
+    );
 }

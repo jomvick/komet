@@ -720,11 +720,24 @@ impl SessionsEngine {
         let Some(resolver) = lock(&pending).remove(request_id) else {
             return Ok(false);
         };
+        let is_deny = choice == komet_proto::PermissionChoice::Deny;
         let _ = resolver.send(choice.clone());
         let _ = engine_tx.send(AgentEvent::PermissionResolved {
             request_id: request_id.to_string(),
             choice,
         });
+        if is_deny {
+            // Deny stops the agent — interrupt the run (like Esc) so it
+            // doesn't continue with the next tool.
+            drop(pending);
+            drop(engine_tx);
+            // fire-and-forget: don't block the doc_host caller
+            let sessions = self.clone();
+            let chat = chat_id.to_string();
+            tokio::spawn(async move {
+                let _ = sessions.interrupt(&chat).await;
+            });
+        }
         Ok(true)
     }
 
