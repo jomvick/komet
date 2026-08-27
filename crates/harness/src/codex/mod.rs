@@ -555,9 +555,23 @@ async fn run_session(session: Session) {
                         ),
                     );
                 }
-                // NOTE: `web_search` and `features` have no app-server
-                // sandboxPolicy counterpart validated against 0.146.1 — they
-                // are intentionally NOT invented onto the wire.
+                if let Some(ws) = &cx.sandbox_workspace_write {
+                    if ws.exclude_slash_tmp {
+                        policy.insert("excludeSlashTmp".into(), true.into());
+                    }
+                    if ws.exclude_tmpdir_env_var {
+                        policy.insert("excludeTmpdirEnvVar".into(), true.into());
+                    }
+                }
+                if cx.web_search {
+                    policy.insert("webSearch".into(), true.into());
+                }
+                if !cx.features.is_empty() {
+                    policy.insert(
+                        "features".into(),
+                        Value::Array(cx.features.iter().map(|f| Value::String(f.clone())).collect()),
+                    );
+                }
                 (
                     serde_json::to_value(
                         cx.approval_policy
