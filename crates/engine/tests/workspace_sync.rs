@@ -78,6 +78,7 @@ impl Harness for ScriptedHarness {
                     result: None,
                     error: None,
                     session_id: Some("hs-1".into()),
+                    reason: None,
                 },
             ];
             for event in script {

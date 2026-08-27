@@ -632,7 +632,7 @@ pub struct AppState {
     /// bootstrap so child views can persist small preference files.
     pub data_dir: Option<PathBuf>,
     pub workspace_state: Option<komet_proto::WorkspaceState>,
-    pub access_mode: komet_proto::AccessMode,
+    pub access_mode: komet_proto::SandboxLevel,
     engine: Option<EngineHandle>,
     boot_config: Option<EngineBootConfig>,
     watch_tasks: Vec<Task<()>>,
@@ -670,7 +670,7 @@ impl AppState {
             review_comment_flushes: HashMap::new(),
             data_dir: None,
             workspace_state: None,
-            access_mode: komet_proto::AccessMode::FullAccess,
+            access_mode: komet_proto::SandboxLevel::DangerFullAccess,
             engine: None,
             boot_config: None,
             watch_tasks: Vec::new(),

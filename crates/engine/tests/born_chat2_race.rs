@@ -70,6 +70,7 @@ impl Harness for OneLinerHarness {
                 result: None,
                 error: None,
                 session_id: Some("sess-race".into()),
+                reason: None,
             }),
         ];
         Ok(futures::stream::iter(events).boxed())

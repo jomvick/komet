@@ -21,6 +21,7 @@ pub mod chat2_host;
 pub mod diff_sync;
 pub mod doc_host;
 pub mod instance_lock;
+pub mod legacy_home;
 pub mod local_import;
 pub mod profile;
 pub mod registry;
@@ -193,6 +194,10 @@ impl EngineCore {
     ) -> Result<Self, EngineError> {
         let data_dir = profile.device_root();
         std::fs::create_dir_all(data_dir)?;
+        // One-time legacy `~/.zeron` → `~/.komet` sweep (Cursor resume stores,
+        // managed adapters, worktrees). Best-effort, before anything reads
+        // those roots; never blocks boot.
+        legacy_home::migrate(data_dir);
         let legacy_uploads_root = profile.claim_legacy_uploads_root()?;
         let device_id = load_or_create_device_id(data_dir)?;
         // This device's harness enablement (Settings → Agents) rides the

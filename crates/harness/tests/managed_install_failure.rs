@@ -39,6 +39,7 @@ async fn silent_npm_enoent_death_surfaces_decoded_error() {
     let (_steer_tx, steering) = mpsc::channel(1);
     let controls = RunControls {
         request_input: Box::new(|_| tokio::sync::oneshot::channel().1),
+        request_permission: RunControls::noop_permission(),
         steering,
         interrupt: CancellationToken::new(),
     };

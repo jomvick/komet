@@ -264,6 +264,7 @@ impl Normalizer {
                             result: None,
                             error: None,
                             session_id: None,
+                            reason: None,
                         },
                     )];
                 }
@@ -545,6 +546,7 @@ impl Normalizer {
                         result: f.result,
                         error: None,
                         session_id: f.session_id,
+                        reason: None,
                     }
                 } else {
                     // Split the CLI's internal `[ede_diagnostic]` breadcrumbs
@@ -594,6 +596,7 @@ impl Normalizer {
                         result: None,
                         error,
                         session_id: f.session_id,
+                        reason: None,
                     }
                 };
                 vec![usage, done]

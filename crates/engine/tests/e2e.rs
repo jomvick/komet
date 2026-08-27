@@ -48,6 +48,7 @@ fn done(status: DoneStatus) -> AgentEvent {
         result: None,
         error: None,
         session_id: Some("hs-1".into()),
+        reason: None,
     }
 }
 
@@ -417,11 +418,11 @@ async fn interrupt_stamps_streaming_entry_aborted() {
     // Wait for the ASSISTANT entry to stamp Aborted AND the command to settle Applied.
     wait_for(
         || {
-            let aborted = entries(&core)
-                .iter()
-                .any(|e| e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Aborted));
-            let applied = command_status(&core, "cmd-int-1")
-                == Some((SessionCommandStatus::Applied, None));
+            let aborted = entries(&core).iter().any(|e| {
+                e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Aborted)
+            });
+            let applied =
+                command_status(&core, "cmd-int-1") == Some((SessionCommandStatus::Applied, None));
             aborted && applied
         },
         "aborted stamp and command applied",
@@ -663,6 +664,7 @@ async fn recover_stale_journal_stamps_aborted_on_boot() {
         last,
         AgentEvent::Done {
             status: DoneStatus::Interrupted,
+            reason: Some(komet_proto::DoneReason::EngineRestart),
             ..
         }
     ));
@@ -1753,6 +1755,7 @@ async fn empty_reasoning_deltas_are_heartbeats_not_journal_noise() {
         result: Some("done".into()),
         error: None,
         session_id: None,
+        reason: None,
     });
     let dir = tempfile::tempdir().unwrap();
     let core = assemble(dir.path(), Arc::new(MockHarness { script }));

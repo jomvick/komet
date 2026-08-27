@@ -69,6 +69,7 @@ fn done(status: DoneStatus) -> AgentEvent {
         result: None,
         error: None,
         session_id: Some("hs-sq".into()),
+        reason: None,
     }
 }
 

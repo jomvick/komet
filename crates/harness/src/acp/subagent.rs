@@ -263,6 +263,7 @@ impl SubagentTracker {
                             result: None,
                             error: None,
                             session_id: None,
+                            reason: None,
                         },
                     )))
                     .await;
@@ -620,6 +621,7 @@ async fn tail_task(
                 result: None,
                 error: None,
                 session_id: None,
+                reason: None,
             },
         )))
         .await;

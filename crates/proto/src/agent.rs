@@ -98,6 +98,78 @@ pub struct SandboxOptions {
     pub opencode: Option<OpenCodePerms>,
 }
 
+impl SandboxOptions {
+    pub fn from_level(level: SandboxLevel) -> Self {
+        match level {
+            SandboxLevel::ReadOnly => Self {
+                codex: Some(CodexSandbox {
+                    sandbox_mode: Some(SandboxMode::ReadOnly),
+                    approval_policy: Some(ApprovalPolicy::Never),
+                    ..Default::default()
+                }),
+                claude: Some(ClaudeSandbox {
+                    filesystem: FilesystemSandbox {
+                        allow: vec![],
+                        deny: vec!["/".into()],
+                        allow_read: vec![],
+                        deny_read: vec![],
+                        allow_write: vec![],
+                        deny_write: vec!["/".into()],
+                    },
+                    allow_unsandboxed_commands: false,
+                    fail_if_unavailable: true,
+                    ..Default::default()
+                }),
+                // Opencode: ReadOnly = everything asks/denies, never ambient.
+                // Kept as `ask` fallback so the future Permission flow can
+                // surface, but no write is auto-allowed.
+                opencode: Some(OpenCodePerms {
+                    bash: BashPerms {
+                        patterns: vec![("*".into(), Perm::Deny)],
+                    },
+                    unscoped_actions: [
+                        ("webfetch".into(), Perm::Deny),
+                        ("websearch".into(), Perm::Deny),
+                        ("todowrite".into(), Perm::Deny),
+                    ]
+                    .into(),
+                }),
+            },
+            SandboxLevel::WorkspaceWrite => Self {
+                codex: Some(CodexSandbox {
+                    sandbox_mode: Some(SandboxMode::WorkspaceWrite),
+                    ..Default::default()
+                }),
+                claude: Some(ClaudeSandbox::default()),
+                opencode: Some(OpenCodePerms {
+                    bash: BashPerms {
+                        patterns: vec![("*".into(), Perm::Ask)],
+                    },
+                    ..Default::default()
+                }),
+            },
+            SandboxLevel::DangerFullAccess => Self {
+                codex: Some(CodexSandbox {
+                    sandbox_mode: Some(SandboxMode::DangerFullAccess),
+                    network_access: true,
+                    approval_policy: Some(ApprovalPolicy::Never),
+                    ..Default::default()
+                }),
+                claude: Some(ClaudeSandbox {
+                    allow_unsandboxed_commands: true,
+                    ..Default::default()
+                }),
+                opencode: Some(OpenCodePerms {
+                    bash: BashPerms {
+                        patterns: vec![("*".into(), Perm::Allow)],
+                    },
+                    unscoped_actions: [("webfetch".into(), Perm::Allow)].into(),
+                }),
+            },
+        }
+    }
+}
+
 /// Codex sandbox table (Paseo `codex` provider options). Note Paseo's
 /// semantics: `approval_policy: "never"` only removes prompts — access is
 /// governed by `sandbox_mode`, never by the approval policy.
@@ -206,13 +278,51 @@ pub struct ClaudeSandbox {
     pub settings_permissions: serde_json::Value,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct FilesystemSandbox {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deny: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_read: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny_read: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_write: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny_write: Vec<String>,
+}
+
+impl<'de> Deserialize<'de> for FilesystemSandbox {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Raw {
+            #[serde(default)]
+            allow: Vec<String>,
+            #[serde(default)]
+            deny: Vec<String>,
+            #[serde(default, rename = "allowRead")]
+            allow_read: Vec<String>,
+            #[serde(default, rename = "denyRead")]
+            deny_read: Vec<String>,
+            #[serde(default, rename = "allowWrite")]
+            allow_write: Vec<String>,
+            #[serde(default, rename = "denyWrite")]
+            deny_write: Vec<String>,
+        }
+        let raw = Raw::deserialize(deserializer)?;
+        Ok(Self {
+            allow: raw.allow,
+            deny: raw.deny,
+            allow_read: raw.allow_read,
+            deny_read: raw.deny_read,
+            allow_write: raw.allow_write,
+            deny_write: raw.deny_write,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -360,6 +470,11 @@ pub enum ValidationError {
     /// permission config surface), so a request carrying one is refused
     /// rather than running unrestricted-by-illusion.
     OpenCodeOptionsNotApplied { detail: String },
+    /// Reasoning level requested but not supported by the target harness.
+    ReasoningLevelUnsupported {
+        requested: ReasoningLevel,
+        supported: Vec<ReasoningLevel>,
+    },
 }
 
 impl std::fmt::Display for ValidationError {
@@ -404,6 +519,14 @@ impl std::fmt::Display for ValidationError {
                 "opencode permission tables cannot be applied yet (ACP exposes no \
                  permission config surface), so the run is refused rather than executed \
                  with ambient default permissions: {detail}"
+            ),
+            Self::ReasoningLevelUnsupported {
+                requested,
+                supported,
+            } => write!(
+                f,
+                "reasoning level {:?} not supported by this harness (supported: {:?})",
+                requested, supported
             ),
         }
     }
@@ -501,7 +624,13 @@ pub fn validate_run_request(request: &RunRequest) -> Result<(), ValidationError>
     }
 
     if let Some(claude) = &options.claude {
-        for allowed in &claude.filesystem.allow {
+        for allowed in claude
+            .filesystem
+            .allow
+            .iter()
+            .chain(&claude.filesystem.allow_read)
+            .chain(&claude.filesystem.allow_write)
+        {
             if !inside_cwd(allowed, &cwd) {
                 return Err(ValidationError::ClaudeFilesystemOutsideCwd {
                     path: allowed.clone(),
@@ -526,20 +655,25 @@ pub fn validate_run_request(request: &RunRequest) -> Result<(), ValidationError>
                 pattern: pattern.clone(),
             });
         }
-        // The permission config generator exists and is tested
-        // (`harness::acp::opencode_perms`), but nothing can apply it yet:
-        // ACP has no permission surface and the `OPENCODE_CONFIG` merge
-        // semantics are unverified. Refuse loudly instead of running with
-        // ambient defaults while the user believes permissions were
-        // restricted.
-        let detail = format!(
-            "generated permission config document would be discarded ({} bash \
-             pattern(s))",
-            opencode.bash.patterns.len()
-        );
-        return Err(ValidationError::OpenCodeOptionsNotApplied { detail });
     }
 
+    Ok(())
+}
+
+/// Validate reasoning level against the harness's supported ladder.
+/// `None` reasoning always passes (no explicit request).
+pub fn validate_reasoning(
+    requested: Option<ReasoningLevel>,
+    supported: &[ReasoningLevel],
+) -> Result<(), ValidationError> {
+    if let Some(level) = requested {
+        if !supported.contains(&level) {
+            return Err(ValidationError::ReasoningLevelUnsupported {
+                requested: level,
+                supported: supported.to_vec(),
+            });
+        }
+    }
     Ok(())
 }
 
@@ -814,12 +948,83 @@ pub struct UserInputAnswer {
     pub labels: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum PermissionKind {
+    Tool { name: String },
+    Command { cmdline: String },
+    FileWrite { path: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Scope {
+    Chat,
+    Repo,
+    Pattern(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum PermissionChoice {
+    Allow,
+    AllowAlways { scope: Scope },
+    Deny,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AgentPermissionAction {
+    pub id: String,
+    pub label: String,
+    pub behavior: PermissionBehavior,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PermissionBehavior {
+    Allow,
+    Deny,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PermissionDecision {
+    pub request_id: String,
+    pub choice: PermissionChoice,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_action_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_permissions: Option<SandboxOptions>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum DoneStatus {
     Completed,
     Interrupted,
     Errored,
+}
+
+/// WHY a run settled — set by the ENGINE on synthesized endings so the UI can
+/// tell a user-requested stop apart from an engine-restart recovery (neither
+/// should render as a crash). Absent ([`None`], never serialized) means the
+/// harness produced its own natural `Done`.
+///
+/// Wire-compat: additive optional field — older peers parse a Done carrying a
+/// `reason` fine only once they know the field (deny_unknown_fields is NOT set
+/// on this enum); the omitted case round-trips byte-identical to pre-field
+/// payloads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DoneReason {
+    /// The user (or an engine shutdown path acting for them) stopped the run.
+    UserRequested,
+    /// Synthesized by boot recovery (`recover_stale`): the previous engine
+    /// process died mid-run and the journal was closed on its behalf.
+    EngineRestart,
 }
 
 /// The normalized streaming event every harness emits.
@@ -890,6 +1095,22 @@ pub enum AgentEvent {
         message: String,
     },
     #[serde(rename_all = "camelCase")]
+    PermissionRequested {
+        request_id: String,
+        kind: PermissionKind,
+        summary: String,
+        choices: Vec<PermissionChoice>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        actions: Vec<AgentPermissionAction>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+    },
+    #[serde(rename_all = "camelCase")]
+    PermissionResolved {
+        request_id: String,
+        choice: PermissionChoice,
+    },
+    #[serde(rename_all = "camelCase")]
     InputRequested {
         request_id: String,
         questions: Vec<UserInputQuestion>,
@@ -909,6 +1130,9 @@ pub enum AgentEvent {
         result: Option<String>,
         error: Option<String>,
         session_id: Option<String>,
+        /// Set only on engine-synthesized endings (see [`DoneReason`]).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<DoneReason>,
     },
     /// A USER-role message injected into a running session — today only seen
     /// wrapped in [`AgentEvent::Subagent`]: the PARENT agent steering its
@@ -1272,7 +1496,8 @@ mod tests {
             opts.filesystem,
             FilesystemSandbox {
                 allow: vec!["/repo".into()],
-                deny: vec!["~/.ssh".into()]
+                deny: vec!["~/.ssh".into()],
+                ..Default::default()
             }
         );
         assert_eq!(opts.network.allowed_hosts, vec!["crates.io".to_string()]);
@@ -1534,6 +1759,7 @@ mod tests {
             filesystem: FilesystemSandbox {
                 allow: vec!["/home/other".into()],
                 deny: vec![],
+                ..Default::default()
             },
             ..Default::default()
         });
@@ -1567,6 +1793,7 @@ mod tests {
             filesystem: FilesystemSandbox {
                 allow: vec!["/repo/src".into(), "relative/dir".into()],
                 deny: vec!["~/.ssh".into()],
+                ..Default::default()
             },
             fail_if_unavailable: true,
             ..Default::default()
@@ -1651,11 +1878,9 @@ mod tests {
     }
 
     #[test]
-    fn validation_rejects_opencode_options_until_applicable() {
-        // ACP exposes no permission surface yet, so any request carrying
-        // opencode permission tables must be REFUSED rather than silently
-        // running with ambient defaults while the user believes they
-        // restricted permissions.
+    fn validation_accepts_opencode_options_once_applicable() {
+        // ACP permission surface now wired (Task 2.0), so a well-formed
+        // opencode table passes validation instead of being refused.
         let mut req = base_request();
         req.sandbox_options = opencode_options(OpenCodePerms {
             bash: BashPerms {
@@ -1665,11 +1890,7 @@ mod tests {
                 .into_iter()
                 .collect(),
         });
-        assert!(matches!(
-            validate_run_request(&req),
-            Err(ValidationError::OpenCodeOptionsNotApplied { detail })
-                if detail.contains("permission")
-        ));
+        assert_eq!(validate_run_request(&req), Ok(()));
     }
 
     #[test]
@@ -1689,5 +1910,149 @@ mod tests {
             validate_run_request(&req),
             Err(ValidationError::OpenCodeUnknownPerm { pattern: "".into() })
         );
+    }
+
+    #[test]
+    fn permission_requested_round_trips() {
+        let ev = AgentEvent::PermissionRequested {
+            request_id: "r1".into(),
+            kind: PermissionKind::Command {
+                cmdline: "rm -rf dist".into(),
+            },
+            summary: "Run `rm -rf dist`".into(),
+            choices: vec![
+                PermissionChoice::Allow,
+                PermissionChoice::AllowAlways { scope: Scope::Chat },
+                PermissionChoice::Deny,
+            ],
+            actions: vec![
+                AgentPermissionAction {
+                    id: "reject".into(),
+                    label: "Deny".into(),
+                    behavior: PermissionBehavior::Deny,
+                    pattern: None,
+                },
+                AgentPermissionAction {
+                    id: "accept".into(),
+                    label: "Allow".into(),
+                    behavior: PermissionBehavior::Allow,
+                    pattern: None,
+                },
+            ],
+            provider: Some("opencode".into()),
+        };
+        let json = serde_json::to_value(&ev).unwrap();
+        let back: AgentEvent = serde_json::from_value(json).unwrap();
+        assert_eq!(ev, back);
+    }
+
+    #[test]
+    fn old_wire_without_permission_still_parses() {
+        let json = r#"{"type":"error","message":"something failed"}"#;
+        let parsed: Result<AgentEvent, _> = serde_json::from_str(json);
+        assert!(parsed.is_ok());
+    }
+
+    #[test]
+    fn done_reason_round_trips() {
+        let ev = AgentEvent::Done {
+            status: DoneStatus::Interrupted,
+            result: None,
+            error: Some("Run interrupted by engine restart".into()),
+            session_id: None,
+            reason: Some(DoneReason::EngineRestart),
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        assert!(json.contains(r#""reason":"engineRestart""#));
+        let back: AgentEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, ev);
+    }
+
+    /// Done payloads WITHOUT a reason (every pre-field peer, journal, and
+    /// snapshot) keep parsing, with `reason` defaulting to `None` — and
+    /// `None` stays absent on serialization so the omitted case is
+    /// byte-identical to the old wire.
+    #[test]
+    fn old_wire_without_done_reason_still_parses() {
+        let json = concat!(
+            r#"{"type":"done","status":"completed","result":null,"#,
+            r#""error":null,"sessionId":"hs-1"}"#
+        );
+        let parsed: AgentEvent = serde_json::from_str(json).unwrap();
+        let expected = AgentEvent::Done {
+            status: DoneStatus::Completed,
+            result: None,
+            error: None,
+            session_id: Some("hs-1".into()),
+            reason: None,
+        };
+        assert_eq!(parsed, expected);
+        // None never serializes — the field only appears when set.
+        let json = serde_json::to_string(&expected).unwrap();
+        assert!(!json.contains("reason"));
+    }
+
+    #[test]
+    fn validation_rejects_unsupported_reasoning_level() {
+        assert_eq!(
+            validate_reasoning(Some(ReasoningLevel::High), &[]),
+            Err(ValidationError::ReasoningLevelUnsupported {
+                requested: ReasoningLevel::High,
+                supported: vec![],
+            })
+        );
+    }
+
+    #[test]
+    fn validation_accepts_reasoning_level_in_agent_ladder() {
+        assert_eq!(
+            validate_reasoning(
+                Some(ReasoningLevel::Medium),
+                &[
+                    ReasoningLevel::Low,
+                    ReasoningLevel::Medium,
+                    ReasoningLevel::High
+                ]
+            ),
+            Ok(())
+        );
+        assert_eq!(validate_reasoning(None, &[]), Ok(()));
+    }
+
+    #[test]
+    fn validation_rejects_opencode_patterns_without_wildcard_fallback() {
+        let mut req = base_request();
+        req.sandbox_options = opencode_options(OpenCodePerms {
+            bash: BashPerms {
+                patterns: vec![("git status".into(), Perm::Allow)],
+            },
+            unscoped_actions: Default::default(),
+        });
+        assert_eq!(
+            validate_run_request(&req),
+            Err(ValidationError::OpenCodeMissingFallback)
+        );
+    }
+
+    #[test]
+    fn opencode_fallback_is_keyed_not_positional() {
+        let perms = OpenCodePerms {
+            bash: BashPerms {
+                patterns: vec![("*".into(), Perm::Ask), ("git status".into(), Perm::Allow)],
+            },
+            unscoped_actions: Default::default(),
+        };
+        assert_eq!(perms.bash_fallback(), Some(Perm::Ask));
+    }
+
+    #[test]
+    fn claude_sandbox_separates_read_and_write_lists() {
+        let fs = FilesystemSandbox {
+            allow_read: vec!["/repo/.env".into()],
+            deny_write: vec!["/repo/.env".into()],
+            ..Default::default()
+        };
+        assert!(fs.allow_read.contains(&"/repo/.env".to_string()));
+        assert!(fs.deny_write.contains(&"/repo/.env".to_string()));
     }
 }

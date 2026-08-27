@@ -40,6 +40,7 @@ async fn silent_agent_errors_via_the_prompt_stall_watchdog() {
             let _ = tx.send(Vec::new());
             rx
         }),
+        request_permission: RunControls::noop_permission(),
         steering: steer_rx,
         interrupt: token.clone(),
     };
@@ -105,6 +106,7 @@ async fn opencode_stall_hint_names_the_provider() {
             let _ = tx.send(Vec::new());
             rx
         }),
+        request_permission: RunControls::noop_permission(),
         steering: steer_rx,
         interrupt: token.clone(),
     };

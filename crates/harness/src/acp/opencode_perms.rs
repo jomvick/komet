@@ -77,7 +77,6 @@ fn push_key(out: &mut String, key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
 
     fn perms(patterns: Vec<(&str, Perm)>, unscoped: Vec<(&str, Perm)>) -> OpenCodePerms {
         OpenCodePerms {
