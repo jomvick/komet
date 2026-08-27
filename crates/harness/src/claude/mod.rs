@@ -281,11 +281,45 @@ impl ClaudeHarness {
                 .chain(&c.filesystem.allow_write)
                 .cloned()
                 .collect();
-            if !extra_dirs.is_empty() {
+            let mut combined_dirs = extra_dirs;
+            combined_dirs.extend(c.additional_directories.clone());
+            combined_dirs.sort();
+            combined_dirs.dedup();
+            if !combined_dirs.is_empty() {
                 perms.insert(
                     "additionalDirectories".into(),
-                    Value::Array(extra_dirs.into_iter().map(Value::String).collect()),
+                    Value::Array(combined_dirs.into_iter().map(Value::String).collect()),
                 );
+            }
+            if !c.allowed_tools.is_empty() {
+                perms.insert(
+                    "allow".into(),
+                    Value::Array(c.allowed_tools.iter().map(|t| Value::String(t.clone())).collect()),
+                );
+            }
+            if !c.disallowed_tools.is_empty() {
+                let mut deny_arr = perms.get("deny").and_then(Value::as_array).cloned().unwrap_or_default();
+                for t in &c.disallowed_tools {
+                    deny_arr.push(Value::String(t.clone()));
+                }
+                perms.insert("deny".into(), Value::Array(deny_arr));
+            }
+            if !c.network.allowed_hosts.is_empty() || !c.network.denied_hosts.is_empty() {
+                let mut sandbox = serde_json::Map::new();
+                if !c.network.allowed_hosts.is_empty() {
+                    sandbox.insert("allowedHosts".into(), Value::Array(c.network.allowed_hosts.iter().map(|h| Value::String(h.clone())).collect()));
+                }
+                if !c.network.denied_hosts.is_empty() {
+                    sandbox.insert("deniedHosts".into(), Value::Array(c.network.denied_hosts.iter().map(|h| Value::String(h.clone())).collect()));
+                }
+                if let Some(fs_sandbox) = c.settings.sandbox.clone() {
+                    if let Some(obj) = fs_sandbox.as_object() {
+                        for (k,v) in obj { sandbox.insert(k.clone(), v.clone()); }
+                    }
+                }
+                settings.insert("sandbox".into(), Value::Object(sandbox));
+            } else if let Some(s) = c.settings.sandbox.clone() {
+                settings.insert("sandbox".into(), s);
             }
             if let Some(extra) = c.settings_permissions.as_object() {
                 for (k, v) in extra {
