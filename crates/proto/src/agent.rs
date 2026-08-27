@@ -221,6 +221,10 @@ pub enum SandboxMode {
 pub enum ApprovalPolicy {
     /// `"never"` removes prompts only; [`SandboxMode`] still gates access.
     Never,
+    /// Paseo `untrusted` — the agent proposes but does not run.
+    Untrusted,
+    /// Paseo `on-request` — prompts shown for confirmation.
+    OnRequest,
     Granular {
         ask: Vec<String>,
         auto_approve: Vec<String>,
@@ -233,6 +237,8 @@ impl Serialize for ApprovalPolicy {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {
             Self::Never => serializer.serialize_str("never"),
+            Self::Untrusted => serializer.serialize_str("untrusted"),
+            Self::OnRequest => serializer.serialize_str("on-request"),
             Self::Granular { ask, auto_approve } => {
                 use serde::ser::SerializeMap;
                 let mut map = serializer.serialize_map(Some(3))?;
@@ -254,6 +260,8 @@ impl<'de> Deserialize<'de> for ApprovalPolicy {
         let value = serde_json::Value::deserialize(deserializer)?;
         match &value {
             serde_json::Value::String(s) if s == "never" => Ok(Self::Never),
+            serde_json::Value::String(s) if s == "untrusted" => Ok(Self::Untrusted),
+            serde_json::Value::String(s) if s == "on-request" => Ok(Self::OnRequest),
             serde_json::Value::Object(map)
                 if map.get("kind").and_then(|k| k.as_str()) == Some("granular") =>
             {
@@ -508,10 +516,6 @@ pub enum ValidationError {
     OpenCodeMissingFallback,
     /// An unusable permission pattern (empty key can never match anything).
     OpenCodeUnknownPerm { pattern: String },
-    /// OpenCode permission tables cannot be applied yet (ACP has no
-    /// permission config surface), so a request carrying one is refused
-    /// rather than running unrestricted-by-illusion.
-    OpenCodeOptionsNotApplied { detail: String },
     /// Reasoning level requested but not supported by the target harness.
     ReasoningLevelUnsupported {
         requested: ReasoningLevel,
@@ -558,12 +562,6 @@ impl std::fmt::Display for ValidationError {
             Self::OpenCodeUnknownPerm { pattern } => {
                 write!(f, "opencode has an unusable permission pattern {pattern:?}")
             }
-            Self::OpenCodeOptionsNotApplied { detail } => write!(
-                f,
-                "opencode permission tables cannot be applied yet (ACP exposes no \
-                 permission config surface), so the run is refused rather than executed \
-                 with ambient default permissions: {detail}"
-            ),
             Self::ReasoningLevelUnsupported {
                 requested,
                 supported,
@@ -1540,6 +1538,22 @@ mod tests {
                 assert_eq!(auto_approve, &vec!["ls".to_string()]);
             }
             other => panic!("expected granular, got {other:?}"),
+        }
+    }
+#[test]
+    fn codex_approval_policy_blanket_levels_round_trip() {
+        for (json, want) in [
+            ("\"never\"", ApprovalPolicy::Never),
+            ("\"untrusted\"", ApprovalPolicy::Untrusted),
+            ("\"on-request\"", ApprovalPolicy::OnRequest),
+        ] {
+            let round: ApprovalPolicy = serde_json::from_str(json).unwrap();
+            assert_eq!(round, want, "parsed {json}");
+            assert_eq!(
+                serde_json::to_value(&want).unwrap(),
+                serde_json::from_str::<serde_json::Value>(json).unwrap(),
+                "re-serialized {json}"
+            );
         }
     }
 

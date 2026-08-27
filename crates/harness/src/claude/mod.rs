@@ -270,6 +270,11 @@ impl ClaudeHarness {
             for path in c.filesystem.deny.iter().chain(&c.filesystem.deny_write) {
                 deny.push(Value::String(format!("Edit({path})")));
             }
+            // Paseo `denyRead` — refuse reads (e.g. ~/.ssh, ~/.aws). Maps to
+            // Claude's `Read(path)` permission rule, distinct from Edit.
+            for path in &c.filesystem.deny_read {
+                deny.push(Value::String(format!("Read({path})")));
+            }
             if !deny.is_empty() {
                 perms.insert("deny".into(), Value::Array(deny));
             }
