@@ -90,6 +90,11 @@ mod tests {
                 .into_iter()
                 .map(|(k, p)| (k.to_owned(), p))
                 .collect(),
+            read: None,
+            edit: None,
+            external_directory: None,
+            webfetch: None,
+            websearch: None,
         }
     }
 
