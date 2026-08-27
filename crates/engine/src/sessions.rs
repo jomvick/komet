@@ -333,6 +333,48 @@ impl SessionsEngine {
             self.set_status(chat_id, SessionStatus::Idle, false);
             return Err(EngineError::Other(message));
         }
+        // A provider with EXPLICIT non-empty options is caught by
+        // validate_run_request's `request.harness` check above. When the
+        // harness is resolved IMPLICITLY (request.harness absent → the chat's
+        // stored config), enforce the same rule against the resolved
+        // harness_id so e.g. a Cursor session cannot silently run with
+        // OpenCode/Codex options it cannot apply.
+        if request
+            .sandbox_options
+            .as_ref()
+            .is_some_and(|o| !o.is_empty())
+            && matches!(
+                harness_id,
+                komet_proto::HarnessId::Cursor
+                    | komet_proto::HarnessId::Grok
+                    | komet_proto::HarnessId::Hermes
+                    | komet_proto::HarnessId::Pi
+                    | komet_proto::HarnessId::Antigravity
+            )
+        {
+            let validation = komet_proto::ValidationError::ProviderOptionsRejected {
+                provider: harness_id,
+            };
+            let message = validation.to_string();
+            self.inner.publish(
+                chat_id,
+                &komet_proto::AgentEvent::Error {
+                    message: message.clone(),
+                },
+            );
+            self.inner.publish(
+                chat_id,
+                &komet_proto::AgentEvent::Done {
+                    status: komet_proto::DoneStatus::Errored,
+                    result: None,
+                    error: Some(message.clone()),
+                    session_id: None,
+                    reason: None,
+                },
+            );
+            self.set_status(chat_id, komet_proto::SessionStatus::Idle, false);
+            return Err(EngineError::Other(message));
+        }
         // Symmetric reasoning validation: if a harness is targeted, the
         // requested level must be in its ladder (Grok/Hermes/Pi = empty).
         if let Some(level) = request.reasoning {
