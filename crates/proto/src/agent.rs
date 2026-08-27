@@ -99,6 +99,10 @@ pub struct SandboxOptions {
 }
 
 impl SandboxOptions {
+    pub fn is_empty(&self) -> bool {
+        self.codex.is_none() && self.claude.is_none() && self.opencode.is_none()
+    }
+
     pub fn from_level(level: SandboxLevel) -> Self {
         match level {
             SandboxLevel::ReadOnly => Self {
@@ -513,6 +517,8 @@ pub enum ValidationError {
         requested: ReasoningLevel,
         supported: Vec<ReasoningLevel>,
     },
+    /// Non-empty `sandbox_options` for a harness that does not support them.
+    ProviderOptionsRejected { provider: HarnessId },
 }
 
 impl std::fmt::Display for ValidationError {
@@ -565,6 +571,10 @@ impl std::fmt::Display for ValidationError {
                 f,
                 "reasoning level {:?} not supported by this harness (supported: {:?})",
                 requested, supported
+            ),
+            Self::ProviderOptionsRejected { provider } => write!(
+                f,
+                "sandbox_options rejected for provider {provider:?}: this provider does not support sandbox options"
             ),
         }
     }
@@ -639,6 +649,20 @@ pub fn validate_run_request(request: &RunRequest) -> Result<(), ValidationError>
     let Some(options) = &request.sandbox_options else {
         return Ok(());
     };
+    if !options.is_empty() {
+        if let Some(harness) = request.harness {
+            match harness {
+                HarnessId::Cursor
+                | HarnessId::Grok
+                | HarnessId::Hermes
+                | HarnessId::Pi
+                | HarnessId::Antigravity => {
+                    return Err(ValidationError::ProviderOptionsRejected { provider: harness });
+                }
+                _ => {}
+            }
+        }
+    }
     let cwd = lexically_clean(std::path::Path::new(&request.cwd));
 
     if let Some(codex) = &options.codex {
