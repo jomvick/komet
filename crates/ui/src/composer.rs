@@ -18,9 +18,9 @@ use gpui::{
     DispatchPhase, ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle,
     Focusable, GlobalElementId, InteractiveElement, KeyBinding, KeyDownEvent, LayoutId,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, PaintQuad,
-    PathPromptOptions, Pixels, Point, Role, ScrollWheelEvent, SharedString, Style, StyledImage as _,
-    Subscription, Task, TextRun, TextStyle, UTF16Selection, UnderlineStyle, Window, WrappedLine,
-    actions, div, fill, img, point, prelude::*, px, quad, relative, size,
+    PathPromptOptions, Pixels, Point, Role, ScrollWheelEvent, SharedString, Style,
+    StyledImage as _, Subscription, Task, TextRun, TextStyle, UTF16Selection, UnderlineStyle,
+    Window, WrappedLine, actions, div, fill, img, point, prelude::*, px, quad, relative, size,
 };
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -411,13 +411,13 @@ pub fn pending_input_request(
 
 pub fn pending_permission_request(
     transcript: &[SessionMessageEntry],
-    ) -> Option<(
-        String,
-        komet_proto::PermissionKind,
-        String,
-        Vec<komet_proto::PermissionChoice>,
-        Vec<komet_proto::AgentPermissionAction>,
-    )> {
+) -> Option<(
+    String,
+    komet_proto::PermissionKind,
+    String,
+    Vec<komet_proto::PermissionChoice>,
+    Vec<komet_proto::AgentPermissionAction>,
+)> {
     transcript
         .iter()
         .rev()
@@ -2746,15 +2746,16 @@ impl ComposerInput {
     fn clamp_scroll(&mut self, element_height: f32) -> bool {
         let previous = self.scroll_top;
         if self.follow_cursor
-            && let Some(cursor) = self.point_for_index(self.cursor_offset()) {
-                self.scroll_top = input_scroll_offset_for_cursor(
-                    self.scroll_top,
-                    f32::from(cursor.y),
-                    f32::from(self.line_height),
-                    self.content_height,
-                    element_height,
-                );
-            }
+            && let Some(cursor) = self.point_for_index(self.cursor_offset())
+        {
+            self.scroll_top = input_scroll_offset_for_cursor(
+                self.scroll_top,
+                f32::from(cursor.y),
+                f32::from(self.line_height),
+                self.content_height,
+                element_height,
+            );
+        }
         self.scroll_top = self
             .scroll_top
             .clamp(0.0, input_max_scroll(self.content_height, element_height));
@@ -3537,6 +3538,7 @@ pub struct Composer {
     failure: Option<SharedString>,
     wizard: Option<Wizard>,
     wizard_focus: FocusHandle,
+    permission_focus: FocusHandle,
     /// Requests already answered locally (suppresses the panel until the doc
     /// frame marks them resolved).
     answered_requests: HashSet<String>,
@@ -3657,6 +3659,7 @@ impl Composer {
             failure: None,
             wizard: None,
             wizard_focus: cx.focus_handle(),
+            permission_focus: cx.focus_handle(),
             answered_requests: HashSet::new(),
             advance_task: None,
             send_task: None,
@@ -4551,7 +4554,7 @@ impl Composer {
         let live = self.run_live(cx);
         // Question panel lifecycle (wizard state cached per request id).
         match pending {
-            Some((request_id, questions)) if live && !self.answered_requests.contains(&request_id) => {
+            Some((request_id, questions)) if !self.answered_requests.contains(&request_id) => {
                 let same = self
                     .wizard
                     .as_ref()
@@ -4568,10 +4571,9 @@ impl Composer {
             }
             _ => {
                 if let Some(wizard) = self.wizard.as_ref() {
-                    // Release when explicitly resolved or when agent is no longer live.
+                    // Release when explicitly resolved.
                     let transcript = self.state.read(cx).transcript.clone();
-                    let released = !live
-                        || input_request_resolved(&transcript, &wizard.request_id)
+                    let released = input_request_resolved(&transcript, &wizard.request_id)
                         || (!transcript.is_empty()
                             && !self.answered_requests.contains(&wizard.request_id));
                     if released {
@@ -4616,7 +4618,9 @@ impl Composer {
                 if !transcript.is_empty() {
                     // Keep at most one cycle: if no pending and not resolved, it was superseded — clear
                     for rid in stale {
-                        if !permission_request_resolved(&transcript, &rid) && pending_permission_request(&transcript).is_none() {
+                        if !permission_request_resolved(&transcript, &rid)
+                            && pending_permission_request(&transcript).is_none()
+                        {
                             // superseded permission — clear optimistic gate
                             self.answered_requests.remove(&rid);
                         }
@@ -4813,7 +4817,23 @@ impl Composer {
         let err_chat_id = chat_id.clone();
         let err_message_id = message_id.clone();
         let sandbox = self.state.read(cx).access_mode;
-        let sandbox_options = Some(komet_proto::SandboxOptions::from_level(sandbox));
+        // Only populate sandbox_options for harnesses that support SandboxOptions.
+        // Unsupported harnesses: Cursor, Grok, Hermes, Pi, Antigravity.
+        let harness_supports_sandbox = resolved.harness.as_ref().map_or(true, |h| {
+            !matches!(
+                h,
+                komet_proto::HarnessId::Cursor
+                    | komet_proto::HarnessId::Grok
+                    | komet_proto::HarnessId::Hermes
+                    | komet_proto::HarnessId::Pi
+                    | komet_proto::HarnessId::Antigravity
+            )
+        });
+        let sandbox_options = if harness_supports_sandbox {
+            Some(komet_proto::SandboxOptions::from_level(sandbox))
+        } else {
+            None
+        };
         self.send_task = Some(cx.spawn(async move |this, cx| {
             let result: Result<(), String> = async {
                 // Attachments stage FIRST — before the chat row or anything
@@ -5133,11 +5153,12 @@ impl Composer {
         }
         let now = Instant::now();
         if let Some(armed) = self.escape_stop_armed_at
-            && now.duration_since(armed) < Duration::from_secs(3) {
-                self.escape_stop_armed_at = None;
-                self.interrupt(cx);
-                return true;
-            }
+            && now.duration_since(armed) < Duration::from_secs(3)
+        {
+            self.escape_stop_armed_at = None;
+            self.interrupt(cx);
+            return true;
+        }
         self.escape_stop_armed_at = Some(now);
         false
     }
@@ -5295,6 +5316,138 @@ impl Composer {
             self.wizard_back(cx);
             cx.stop_propagation();
         }
+    }
+
+    fn on_permission_key(
+        &mut self,
+        event: &KeyDownEvent,
+        request_id: String,
+        choices: Vec<komet_proto::PermissionChoice>,
+        actions: Vec<komet_proto::AgentPermissionAction>,
+        cx: &mut Context<Self>,
+    ) {
+        let key = event.keystroke.key.as_str();
+
+        // Build resolved actions (mirroring render_permission_panel logic)
+        let mut resolved_actions: Vec<komet_proto::PermissionChoice> = Vec::new();
+        if !actions.is_empty() {
+            for a in &actions {
+                if a.behavior == komet_proto::PermissionBehavior::Allow {
+                    resolved_actions.push(komet_proto::PermissionChoice::Allow);
+                } else {
+                    resolved_actions.push(komet_proto::PermissionChoice::Deny);
+                }
+            }
+        } else {
+            resolved_actions = choices.clone();
+        }
+
+        // Digit keys select actions by index (1-9)
+        if let Ok(digit) = key.parse::<usize>() {
+            if (1..=9).contains(&digit) && digit <= resolved_actions.len() {
+                let decision = resolved_actions[digit - 1].clone();
+                let updated =
+                    if matches!(decision, komet_proto::PermissionChoice::AllowAlways { .. }) {
+                        let mut opts = komet_proto::SandboxOptions::from_level(
+                            self.state.read(cx).access_mode,
+                        );
+                        if let Some(perms) = &mut opts.opencode {
+                            // Update the existing "*" pattern to Allow (replacing, not prepending)
+                            if let Some(pos) =
+                                perms.bash.patterns.iter().position(|(p, _)| p == "*")
+                            {
+                                perms.bash.patterns[pos] = ("*".into(), komet_proto::Perm::Allow);
+                            } else {
+                                perms
+                                    .bash
+                                    .patterns
+                                    .push(("*".into(), komet_proto::Perm::Allow));
+                            }
+                        }
+                        Some(opts)
+                    } else {
+                        None
+                    };
+                self.send_permission_decision(request_id, decision, updated, cx);
+                cx.stop_propagation();
+            }
+        } else if key == "enter" {
+            // Enter approves (first allow action)
+            if let Some(decision) = resolved_actions.iter().find(|c| {
+                matches!(
+                    c,
+                    komet_proto::PermissionChoice::Allow
+                        | komet_proto::PermissionChoice::AllowAlways { .. }
+                )
+            }) {
+                let updated =
+                    if matches!(decision, komet_proto::PermissionChoice::AllowAlways { .. }) {
+                        let mut opts = komet_proto::SandboxOptions::from_level(
+                            self.state.read(cx).access_mode,
+                        );
+                        if let Some(perms) = &mut opts.opencode {
+                            // Update the existing "*" pattern to Allow (replacing, not prepending)
+                            if let Some(pos) =
+                                perms.bash.patterns.iter().position(|(p, _)| p == "*")
+                            {
+                                perms.bash.patterns[pos] = ("*".into(), komet_proto::Perm::Allow);
+                            } else {
+                                perms
+                                    .bash
+                                    .patterns
+                                    .push(("*".into(), komet_proto::Perm::Allow));
+                            }
+                        }
+                        Some(opts)
+                    } else {
+                        None
+                    };
+                self.send_permission_decision(request_id, decision.clone(), updated, cx);
+                cx.stop_propagation();
+            }
+        } else if key == "escape" {
+            // Escape denies
+            self.send_permission_decision(
+                request_id,
+                komet_proto::PermissionChoice::Deny,
+                None,
+                cx,
+            );
+            cx.stop_propagation();
+        }
+    }
+
+    fn send_permission_decision(
+        &mut self,
+        request_id: String,
+        decision: komet_proto::PermissionChoice,
+        updated_permissions: Option<komet_proto::SandboxOptions>,
+        cx: &mut Context<Self>,
+    ) {
+        self.answered_requests.insert(request_id.clone());
+        let engine = self.state.read(cx).engine.clone();
+        if let Some(engine) = engine {
+            cx.spawn_async(async move |this, cx| {
+                engine
+                    .respond_permission(request_id.clone(), decision, updated_permissions)
+                    .await
+                    .ok();
+                this.update(cx, |composer, cx| {
+                    let transcript = composer.state.read(cx).transcript.clone();
+                    let still_pending = pending_permission_request(&transcript)
+                        .is_some_and(|(pid, _, _, _, _)| pid == request_id);
+                    let resolved = permission_request_resolved(&transcript, &request_id);
+                    if still_pending && !resolved {
+                        // Retry allowed
+                    } else if resolved {
+                        // Keep hidden
+                    }
+                })
+                .ok();
+            })
+            .detach();
+        }
+        cx.notify();
     }
 
     // ---- render pieces ----
@@ -5555,11 +5708,7 @@ impl Composer {
                         resolved_actions.push(("accept".into(), "Allow".into(), true))
                     }
                     komet_proto::PermissionChoice::AllowAlways { .. } => {
-                        resolved_actions.push((
-                            "allow-always".into(),
-                            "Allow always".into(),
-                            true,
-                        ))
+                        resolved_actions.push(("allow-always".into(), "Allow always".into(), true))
                     }
                 }
             }
@@ -5568,9 +5717,7 @@ impl Composer {
         let send_decision = move |this: &mut Self,
                                   rid: String,
                                   decision: komet_proto::PermissionChoice,
-                                  updated_permissions: Option<
-            komet_proto::SandboxOptions,
-        >,
+                                  updated_permissions: Option<komet_proto::SandboxOptions>,
                                   cx: &mut Context<Self>| {
             this.answered_requests.insert(rid.clone());
             let payload = komet_doc::SessionCommandPayload::Permit {
@@ -5605,15 +5752,15 @@ impl Composer {
                             .ok();
                         } else {
                             // Safety net: if doc didn't mark resolved within 2s, retry is needed
-                            cx.background_executor()
-                                .timer(Duration::from_secs(2))
-                                .await;
+                            cx.background_executor().timer(Duration::from_secs(2)).await;
                             this.update(cx, |composer, cx| {
                                 let transcript = composer.state.read(cx).transcript.clone();
                                 let still_pending = pending_permission_request(&transcript)
                                     .is_some_and(|(pid, _, _, _, _)| pid == request_id_for_revert);
-                                let resolved =
-                                    permission_request_resolved(&transcript, &request_id_for_revert);
+                                let resolved = permission_request_resolved(
+                                    &transcript,
+                                    &request_id_for_revert,
+                                );
                                 if still_pending && !resolved {
                                     // Host hasn't resolved — allow retry, but keep hidden briefly
                                     // Check again after another second before exposing
@@ -5651,7 +5798,21 @@ impl Composer {
             cx.notify();
         };
 
+        let req_for_keys = request_id.clone();
+        let choices_for_keys = choices.clone();
+        let actions_for_keys = actions.clone();
         let mut card = div()
+            .id("permission-panel")
+            .track_focus(&self.permission_focus)
+            .on_key_down(cx.listener(move |this, event: &KeyDownEvent, _, cx| {
+                this.on_permission_key(
+                    event,
+                    req_for_keys.clone(),
+                    choices_for_keys.clone(),
+                    actions_for_keys.clone(),
+                    cx,
+                )
+            }))
             .flex()
             .flex_col()
             .gap(px(8.0))
@@ -5716,77 +5877,87 @@ impl Composer {
                     .child("This agent wants to proceed"),
             )
             .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .flex_wrap()
-                    .gap(px(8.0))
-                    .children(resolved_actions.into_iter().map(|(action_id, label, is_allow)| {
-                        let req = request_id.clone();
-                        let decision: komet_proto::PermissionChoice =
-                            if action_id == "allow-always" || label == "Allow always" {
-                                komet_proto::PermissionChoice::AllowAlways {
-                                    scope: komet_proto::Scope::Chat,
-                                }
-                            } else if is_allow {
-                                komet_proto::PermissionChoice::Allow
-                            } else {
-                                komet_proto::PermissionChoice::Deny
-                            };
-                        let element_id = format!("perm-action-{}-{action_id}", req);
-                        // Primary = first allow; deny renders danger-tinted.
-                        let (icon, bg, fg, border) = if is_allow {
-                            ("✓", theme.text, theme.bg, theme.border)
-                        } else {
-                            (
-                                "✕",
-                                gpui::transparent_black(),
-                                theme.danger,
-                                theme.danger.opacity(0.4),
-                            )
-                        };
-                        div()
-                            .id(SharedString::from(element_id))
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(6.0))
-                            .px(px(12.0))
-                            .py(px(7.0))
-                            .rounded(px(8.0))
-                            .border_1()
-                            .border_color(border)
-                            .bg(bg)
-                            .text_color(fg)
-                            .text_size(px(11.0))
-                            .cursor_pointer()
-                            .hover(|s| s.opacity(0.85))
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                // AllowAlways(Pattern/Chat) must MUTATE the
-                                // sandbox table (Paseo updatedPermissions),
-                                // not just answer once. Chat-scope always-
-                                // allow lifts the session's bash fallback to
-                                // allow for OpenCode and auto-approves Codex.
-                                let updated = match &decision {
-                                    komet_proto::PermissionChoice::AllowAlways { .. } => {
-                                        let mut opts = komet_proto::SandboxOptions::from_level(
-                                            this.state.read(cx).access_mode,
-                                        );
-                                        if let Some(perms) = &mut opts.opencode {
-                                            perms.bash.patterns.insert(
-                                                0,
-                                                ("*".into(), komet_proto::Perm::Allow),
-                                            );
-                                        }
-                                        Some(opts)
+                div().flex().flex_row().flex_wrap().gap(px(8.0)).children(
+                    resolved_actions
+                        .into_iter()
+                        .map(|(action_id, label, is_allow)| {
+                            let req = request_id.clone();
+                            let decision: komet_proto::PermissionChoice =
+                                if action_id == "allow-always" || label == "Allow always" {
+                                    komet_proto::PermissionChoice::AllowAlways {
+                                        scope: komet_proto::Scope::Chat,
                                     }
-                                    _ => None,
+                                } else if is_allow {
+                                    komet_proto::PermissionChoice::Allow
+                                } else {
+                                    komet_proto::PermissionChoice::Deny
                                 };
-                                send_decision(this, req.clone(), decision.clone(), updated, cx);
-                            }))
-                            .child(icon)
-                            .child(label)
-                    })),
+                            let element_id = format!("perm-action-{}-{action_id}", req);
+                            // Primary = first allow; deny renders danger-tinted.
+                            let (icon, bg, fg, border) = if is_allow {
+                                ("✓", theme.text, theme.bg, theme.border)
+                            } else {
+                                (
+                                    "✕",
+                                    gpui::transparent_black(),
+                                    theme.danger,
+                                    theme.danger.opacity(0.4),
+                                )
+                            };
+                            div()
+                                .id(SharedString::from(element_id))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(6.0))
+                                .px(px(12.0))
+                                .py(px(7.0))
+                                .rounded(px(8.0))
+                                .border_1()
+                                .border_color(border)
+                                .bg(bg)
+                                .text_color(fg)
+                                .text_size(px(11.0))
+                                .cursor_pointer()
+                                .hover(|s| s.opacity(0.85))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    // AllowAlways(Pattern/Chat) must MUTATE the
+                                    // sandbox table (Paseo updatedPermissions),
+                                    // not just answer once. Chat-scope always-
+                                    // allow lifts the session's bash fallback to
+                                    // allow for OpenCode and auto-approves Codex.
+                                    let updated = match &decision {
+                                        komet_proto::PermissionChoice::AllowAlways { .. } => {
+                                            let mut opts = komet_proto::SandboxOptions::from_level(
+                                                this.state.read(cx).access_mode,
+                                            );
+                                            if let Some(perms) = &mut opts.opencode {
+                                                // Update the existing "*" pattern to Allow (replacing, not prepending)
+                                                if let Some(pos) = perms
+                                                    .bash
+                                                    .patterns
+                                                    .iter()
+                                                    .position(|(p, _)| p == "*")
+                                                {
+                                                    perms.bash.patterns[pos] =
+                                                        ("*".into(), komet_proto::Perm::Allow);
+                                                } else {
+                                                    perms.bash.patterns.push((
+                                                        "*".into(),
+                                                        komet_proto::Perm::Allow,
+                                                    ));
+                                                }
+                                            }
+                                            Some(opts)
+                                        }
+                                        _ => None,
+                                    };
+                                    send_decision(this, req.clone(), decision.clone(), updated, cx);
+                                }))
+                                .child(icon)
+                                .child(label)
+                        }),
+                ),
             );
         card.into_any_element()
     }
@@ -6057,21 +6228,21 @@ impl Render for Composer {
         });
 
         let live = self.run_live(cx);
-        if live {
-            if let Some((rid, kind, summary, choices, actions)) =
-                pending_permission_request(&self.state.read(cx).transcript)
-            {
-                // Optimistic gate: hide panel immediately after click until doc syncs
-                if !self.answered_requests.contains(&rid) {
-                    let panel =
-                        self.render_permission_panel(rid, kind, summary, choices, actions, cx);
-                    return container.child(motion::fade_quick("composer-permission", div().child(panel)));
-                }
+        if let Some((rid, kind, summary, choices, actions)) =
+            pending_permission_request(&self.state.read(cx).transcript)
+        {
+            // Optimistic gate: hide panel immediately after click until doc syncs
+            if !self.answered_requests.contains(&rid) {
+                let panel = self.render_permission_panel(rid, kind, summary, choices, actions, cx);
+                return container.child(motion::fade_quick(
+                    "composer-permission",
+                    div().child(panel),
+                ));
             }
-            if wizard_active {
-                let wizard = self.render_wizard(cx);
-                return container.child(motion::fade_quick("composer-wizard", div().child(wizard)));
-            }
+        }
+        if wizard_active {
+            let wizard = self.render_wizard(cx);
+            return container.child(motion::fade_quick("composer-wizard", div().child(wizard)));
         }
 
         // New chats always use the expanded layout: the repo/branch pickers
@@ -6312,9 +6483,13 @@ impl Render for Composer {
                                             cx.notify();
                                         }))
                                         .child(match self.state.read(cx).access_mode {
-                                            komet_proto::SandboxLevel::DangerFullAccess => "Full access",
+                                            komet_proto::SandboxLevel::DangerFullAccess => {
+                                                "Full access"
+                                            }
                                             komet_proto::SandboxLevel::ReadOnly => "Read only",
-                                            komet_proto::SandboxLevel::WorkspaceWrite => "Sandboxed",
+                                            komet_proto::SandboxLevel::WorkspaceWrite => {
+                                                "Sandboxed"
+                                            }
                                         }),
                                 )
                                 .child(attach)
@@ -7150,7 +7325,10 @@ mod tests {
                 cmdline: "rm -rf dist".into(),
             },
             summary: "Run `rm -rf dist`".into(),
-            choices: vec![komet_proto::PermissionChoice::Allow, komet_proto::PermissionChoice::Deny],
+            choices: vec![
+                komet_proto::PermissionChoice::Allow,
+                komet_proto::PermissionChoice::Deny,
+            ],
             actions: vec![],
             resolved: false,
             decision: None,
@@ -7176,10 +7354,7 @@ mod tests {
         );
 
         // 2. Dead/Aborted entry with unresolved permission keeps panel.
-        let t = vec![entry(
-            Some(MessageStatus::Aborted),
-            vec![perm_part.clone()],
-        )];
+        let t = vec![entry(Some(MessageStatus::Aborted), vec![perm_part.clone()])];
         assert_eq!(
             pending_permission_request(&t).map(|(id, ..)| id),
             Some("p1".into())

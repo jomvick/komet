@@ -794,7 +794,14 @@ impl AcpHarness {
             cmd.current_dir(cwd);
         }
         if let Some(overlay) = opencode_config_overlay {
-            cmd.env("OPENCODE_CONFIG", overlay);
+            // Use OPENCODE_CONFIG_CONTENT for final-precedence runtime mechanism
+            // to prevent project opencode.json settings from weakening generated permissions
+            if let Ok(content) = std::fs::read_to_string(overlay) {
+                cmd.env("OPENCODE_CONFIG_CONTENT", content);
+            } else {
+                // Fallback to file path if content read fails
+                cmd.env("OPENCODE_CONFIG", overlay);
+            }
         }
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1267,19 +1274,21 @@ impl Harness for AcpHarness {
         // OpenCode permission overlay: write temp opencode.json and point OPENCODE_CONFIG at it.
         // The file must outlive the child, so we leak its TempPath into a owned PathBuf kept alive
         // until the child exits (the Session owns the TempDir via _opencode_overlay_dir).
-        let (_opencode_overlay_dir, opencode_overlay_path) = if self.spec.id == HarnessId::Opencode {
+        let (_opencode_overlay_dir, opencode_overlay_path) = if self.spec.id == HarnessId::Opencode
+        {
             if let Some(opts) = &request.sandbox_options
-                && let Some(perms) = &opts.opencode {
-                    let dir = tempfile::tempdir().map_err(HarnessError::Io)?;
-                    let path = dir.path().join("opencode.json");
-                    let doc = opencode_perms::opencode_config_document(perms);
-                    std::fs::write(&path, doc).map_err(HarnessError::Io)?;
-                    // Keep TempDir alive by forgetting? Instead keep dir handle alongside path.
-                    // We'll store TempDir in Session; for now return dir+path.
-                    (Some(dir), Some(path))
-                } else {
-                    (None, None)
-                }
+                && let Some(perms) = &opts.opencode
+            {
+                let dir = tempfile::tempdir().map_err(HarnessError::Io)?;
+                let path = dir.path().join("opencode.json");
+                let doc = opencode_perms::opencode_config_document(perms);
+                std::fs::write(&path, doc).map_err(HarnessError::Io)?;
+                // Keep TempDir alive by forgetting? Instead keep dir handle alongside path.
+                // We'll store TempDir in Session; for now return dir+path.
+                (Some(dir), Some(path))
+            } else {
+                (None, None)
+            }
         } else {
             (None, None)
         };
@@ -1837,10 +1846,7 @@ fn is_user_question(options: &[Value]) -> bool {
 /// `allow_once` (least sticky allow), AllowAlways wants `allow_always`, Deny
 /// wants any reject kind. `None` means the wire offered no matching option
 /// and the request must be cancelled instead.
-fn option_for_choice(
-    options: &[Value],
-    choice: &komet_proto::PermissionChoice,
-) -> Option<String> {
+fn option_for_choice(options: &[Value], choice: &komet_proto::PermissionChoice) -> Option<String> {
     fn kind(o: &Value) -> &str {
         o.get("kind").and_then(Value::as_str).unwrap_or_default()
     }
@@ -1853,7 +1859,9 @@ fn option_for_choice(
             .iter()
             .find(|o| kind(o) == "allow_always")
             .or_else(|| options.iter().find(|o| kind(o).starts_with("allow"))),
-        komet_proto::PermissionChoice::Deny => options.iter().find(|o| kind(o).starts_with("reject")),
+        komet_proto::PermissionChoice::Deny => {
+            options.iter().find(|o| kind(o).starts_with("reject"))
+        }
     };
     option
         .and_then(|o| o.get("optionId"))

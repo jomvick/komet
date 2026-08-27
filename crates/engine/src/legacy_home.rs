@@ -69,21 +69,22 @@ fn migrate_home(legacy_root: &Path, new_root: &Path, data_dir: &Path) {
             moved.push(subtree);
         }
     }
+    // Only record the marker after ALL subtrees were moved successfully or skipped
     if moved.is_empty() {
         // Nothing movable (targets pre-existed): still stamp the marker so we
         // stop rescanning on every boot.
         let _ = std::fs::write(data_dir.join(MIGRATED_MARKER), "checked\n");
-        return;
+    } else {
+        tracing::warn!(
+            subtrees = ?moved,
+            legacy = %legacy_root.display(),
+            target = %new_root.display(),
+            "migrated legacy ~/.zeron state to ~/.komet (Komet rename); sessions \
+             created by builds before the rename keep their Cursor resume and \
+             installed adapters"
+        );
+        let _ = std::fs::write(data_dir.join(MIGRATED_MARKER), "migrated\n");
     }
-    tracing::warn!(
-        subtrees = ?moved,
-        legacy = %legacy_root.display(),
-        target = %new_root.display(),
-        "migrated legacy ~/.zeron state to ~/.komet (Komet rename); sessions \
-         created by builds before the rename keep their Cursor resume and \
-         installed adapters"
-    );
-    let _ = std::fs::write(data_dir.join(MIGRATED_MARKER), "migrated\n");
 }
 
 /// Rename `from` → `to`, falling back to copy+delete when rename crosses a
@@ -98,10 +99,33 @@ fn move_dir(from: &Path, to: &Path) -> bool {
     }
     match std::fs::rename(from, to) {
         Ok(()) => true,
-        Err(_) => copy_dir_recursive(from, to)
-            .is_ok()
-            .then(|| remove_dir_all_best_effort(from))
-            .unwrap_or(false),
+        Err(_) => {
+            // Transactional copy: use a unique staging directory
+            let staging = to.with_extension(format!("staging-{}", std::process::id()));
+            match copy_dir_recursive(from, &staging) {
+                Ok(()) => {
+                    // Copy succeeded; publish by renaming staging to final target
+                    match std::fs::rename(&staging, to) {
+                        Ok(()) => {
+                            // Published successfully; now safe to remove source
+                            remove_dir_all_best_effort(from)
+                        }
+                        Err(err) => {
+                            tracing::warn!(error = %err, staging = %staging.display(), "failed to publish staging directory");
+                            // Clean up staging on failure
+                            let _ = std::fs::remove_dir_all(&staging);
+                            false
+                        }
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, from = %from.display(), "copy failed");
+                    // Clean up partial staging on failure
+                    let _ = std::fs::remove_dir_all(&staging);
+                    false
+                }
+            }
+        }
     }
 }
 
@@ -115,8 +139,20 @@ fn copy_dir_recursive(from: &Path, to: &Path) -> std::io::Result<()> {
             copy_dir_recursive(&entry.path(), &dst)?;
         } else if ty.is_file() {
             std::fs::copy(entry.path(), dst)?;
+        } else if ty.is_symlink() {
+            // Preserve symbolic links
+            let target = std::fs::read_link(entry.path())?;
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&target, &dst)?;
+            #[cfg(windows)]
+            {
+                if target.is_dir() {
+                    std::os::windows::fs::symlink_dir(&target, &dst)?;
+                } else {
+                    std::os::windows::fs::symlink_file(&target, &dst)?;
+                }
+            }
         }
-        // Symlinks inside these trees are not expected; skipping them is safe.
     }
     Ok(())
 }
@@ -176,13 +212,15 @@ mod tests {
         migrate_home(&root.join(".zeron"), &root.join(".komet"), data_dir.path());
 
         assert!(
-            root.join(".komet/cursor-state/by-agent/x/agent")
-                .exists(),
+            root.join(".komet/cursor-state/by-agent/x/agent").exists(),
             "cursor-state moved"
         );
         assert!(!root.join(".zeron/cursor-state").exists());
         let migrated_version = root.join(".komet/adapters/pkg__acp/1.2.3");
-        assert!(migrated_version.join(OK_MARKER).exists(), "marker rewritten");
+        assert!(
+            migrated_version.join(OK_MARKER).exists(),
+            "marker rewritten"
+        );
         assert!(!migrated_version.join(OK_MARKER_LEGACY).exists());
         assert!(root.join(".komet/worktrees/repo/wt").exists());
         assert!(data_dir.path().join(MIGRATED_MARKER).exists());
