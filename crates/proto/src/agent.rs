@@ -137,7 +137,11 @@ impl SandboxOptions {
                         ("todowrite".into(), Perm::Deny),
                     ]
                     .into(),
-                    ..Default::default()
+                    read: None,
+                    edit: Some(Perm::Deny),
+                    external_directory: None,
+                    webfetch: None,
+                    websearch: None,
                 }),
             },
             SandboxLevel::WorkspaceWrite => Self {
@@ -1540,7 +1544,7 @@ mod tests {
             other => panic!("expected granular, got {other:?}"),
         }
     }
-#[test]
+    #[test]
     fn codex_approval_policy_blanket_levels_round_trip() {
         for (json, want) in [
             ("\"never\"", ApprovalPolicy::Never),
@@ -1659,7 +1663,7 @@ mod tests {
                         patterns: vec![("*".into(), Perm::Allow)],
                     },
                     unscoped_actions: Default::default(),
-                ..Default::default()
+                    ..Default::default()
                 }),
                 ..Default::default()
             }),
@@ -1984,7 +1988,7 @@ mod tests {
                 patterns: vec![("".into(), Perm::Allow), ("*".into(), Perm::Ask)],
             },
             unscoped_actions: Default::default(),
-                ..Default::default()
+            ..Default::default()
         });
         assert_eq!(
             validate_run_request(&req),
@@ -2107,7 +2111,7 @@ mod tests {
                 patterns: vec![("git status".into(), Perm::Allow)],
             },
             unscoped_actions: Default::default(),
-                ..Default::default()
+            ..Default::default()
         });
         assert_eq!(
             validate_run_request(&req),
@@ -2122,14 +2126,15 @@ mod tests {
                 patterns: vec![("*".into(), Perm::Ask), ("git status".into(), Perm::Allow)],
             },
             unscoped_actions: Default::default(),
-                ..Default::default()
+            ..Default::default()
         };
         assert_eq!(perms.bash_fallback(), Some(Perm::Ask));
     }
 
     #[test]
     fn codex_exclude_tmp() {
-        let json = r#"{"sandboxWorkspaceWrite":{"excludeSlashTmp":true,"excludeTmpdirEnvVar":true}}"#;
+        let json =
+            r#"{"sandboxWorkspaceWrite":{"excludeSlashTmp":true,"excludeTmpdirEnvVar":true}}"#;
         let v: CodexSandbox = serde_json::from_str(json).unwrap();
         assert!(v.sandbox_workspace_write.unwrap().exclude_slash_tmp);
         assert!(serde_json::from_str::<CodexSandbox>(r#"{"unknown":1}"#).is_err());

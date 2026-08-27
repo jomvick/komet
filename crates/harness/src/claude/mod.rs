@@ -256,9 +256,8 @@ impl ClaudeHarness {
         // - `fail_if_unavailable` cannot be enforced from argv; if sandboxing
         //   is unavailable the run proceeds (documented, not silently unsafe:
         //   permission-mode stays "default").
-        // - `network.allowed_hosts/denied_hosts` have no stable settings.json
-        //   counterpart we can rely on across CLI versions — they are NOT
-        //   invented onto the wire.
+        // - `network.allowed_hosts/denied_hosts` are placed under the nested
+        //   network object using Claude CLI's allowedDomains and deniedDomains keys.
         if let Some(c) = claude_opts {
             let mut perms = serde_json::Map::new();
             perms.insert("defaultMode".into(), Value::String("default".into()));
@@ -299,11 +298,20 @@ impl ClaudeHarness {
             if !c.allowed_tools.is_empty() {
                 perms.insert(
                     "allow".into(),
-                    Value::Array(c.allowed_tools.iter().map(|t| Value::String(t.clone())).collect()),
+                    Value::Array(
+                        c.allowed_tools
+                            .iter()
+                            .map(|t| Value::String(t.clone()))
+                            .collect(),
+                    ),
                 );
             }
             if !c.disallowed_tools.is_empty() {
-                let mut deny_arr = perms.get("deny").and_then(Value::as_array).cloned().unwrap_or_default();
+                let mut deny_arr = perms
+                    .get("deny")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
                 for t in &c.disallowed_tools {
                     deny_arr.push(Value::String(t.clone()));
                 }
@@ -311,17 +319,44 @@ impl ClaudeHarness {
             }
             if !c.network.allowed_hosts.is_empty() || !c.network.denied_hosts.is_empty() {
                 let mut sandbox = serde_json::Map::new();
-                if !c.network.allowed_hosts.is_empty() {
-                    sandbox.insert("allowedHosts".into(), Value::Array(c.network.allowed_hosts.iter().map(|h| Value::String(h.clone())).collect()));
-                }
-                if !c.network.denied_hosts.is_empty() {
-                    sandbox.insert("deniedHosts".into(), Value::Array(c.network.denied_hosts.iter().map(|h| Value::String(h.clone())).collect()));
-                }
+                // Merge existing settings.sandbox first (without overwriting network restrictions)
                 if let Some(fs_sandbox) = c.settings.sandbox.clone() {
                     if let Some(obj) = fs_sandbox.as_object() {
-                        for (k,v) in obj { sandbox.insert(k.clone(), v.clone()); }
+                        for (k, v) in obj {
+                            // Skip network keys from settings.sandbox to prevent overwriting
+                            if k != "network" {
+                                sandbox.insert(k.clone(), v.clone());
+                            }
+                        }
                     }
                 }
+                // Place network restrictions under the nested network object
+                let mut network = serde_json::Map::new();
+                if !c.network.allowed_hosts.is_empty() {
+                    network.insert(
+                        "allowedDomains".into(),
+                        Value::Array(
+                            c.network
+                                .allowed_hosts
+                                .iter()
+                                .map(|h| Value::String(h.clone()))
+                                .collect(),
+                        ),
+                    );
+                }
+                if !c.network.denied_hosts.is_empty() {
+                    network.insert(
+                        "deniedDomains".into(),
+                        Value::Array(
+                            c.network
+                                .denied_hosts
+                                .iter()
+                                .map(|h| Value::String(h.clone()))
+                                .collect(),
+                        ),
+                    );
+                }
+                sandbox.insert("network".into(), Value::Object(network));
                 settings.insert("sandbox".into(), Value::Object(sandbox));
             } else if let Some(s) = c.settings.sandbox.clone() {
                 settings.insert("sandbox".into(), s);

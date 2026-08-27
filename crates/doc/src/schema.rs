@@ -97,6 +97,9 @@ struct DocPartJson {
     subagent_status: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     subagent_tail: Option<String>,
+    /// Dedicated request_id for permission parts (additive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request_id: Option<String>,
 }
 
 /// App parts → doc part json (mirror of `toDocParts`).
@@ -181,6 +184,7 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
                 actions,
             ))?),
             resolved: Some(*resolved),
+            request_id: Some(request_id.clone()),
             ..Default::default()
         },
     })
@@ -226,7 +230,24 @@ fn from_doc_part(p: DocPartJson) -> MessagePart {
             message: p.message.unwrap_or_default(),
         },
         "permission" => {
-            let (kind, choices, request_id, actions): (
+            // Read request_id directly from the dedicated column first
+            let request_id = if let Some(rid) = p.request_id {
+                rid
+            } else {
+                // Legacy fallback: extract from the tuple's third element
+                let tuple_rid: Option<String> = p
+                    .questions
+                    .as_ref()
+                    .and_then(|q| {
+                        serde_json::from_value::<(Value, Value, String, Value)>(q.clone()).ok()
+                    })
+                    .map(|(_, _, rid, _)| {
+                        // Strip the perm- prefix in legacy fallback
+                        rid.strip_prefix("perm-").unwrap_or(&rid).to_string()
+                    });
+                tuple_rid.unwrap_or_else(|| p.id.clone())
+            };
+            let (kind, choices, _tuple_request_id, actions): (
                 komet_proto::PermissionKind,
                 Vec<komet_proto::PermissionChoice>,
                 String,
@@ -239,7 +260,7 @@ fn from_doc_part(p: DocPartJson) -> MessagePart {
                         cmdline: String::new(),
                     },
                     vec![],
-                    p.id.clone(),
+                    request_id.clone(),
                     vec![],
                 ));
             MessagePart::Permission {
@@ -557,8 +578,8 @@ impl SessionDoc {
     }
 
     /// Mark the permission part carrying `request_id` resolved.
-    /// Permission parts use id `perm-{request_id}` and store the
-    /// triple `(kind, choices, request_id)` in `questions`.
+    /// Permission parts use id `perm-{request_id}` and have a dedicated
+    /// `request_id` column.
     /// Returns `false` when no such part exists.
     pub fn resolve_permission(&self, request_id: &str) -> Result<bool, DocError> {
         let perm_id = format!("perm-{request_id}");
@@ -587,28 +608,17 @@ impl SessionDoc {
                 if !is_permission {
                     continue;
                 }
+                // Match by the exact part id (perm-{request_id})
                 let id_matches = matches!(
                     part.get("id"),
-                    Some(loro::ValueOrContainer::Value(LoroValue::String(s))) if s.as_str() == perm_id || s.as_str() == request_id
+                    Some(loro::ValueOrContainer::Value(LoroValue::String(s))) if s.as_str() == perm_id
                 );
-                let mut request_id_matches = id_matches;
-                if !request_id_matches {
-                    if let Some(loro::ValueOrContainer::Value(LoroValue::String(s))) =
-                        part.get("questions")
-                    {
-                        // questions holds JSON tuple (kind, choices, request_id) — check if it contains request_id
-                        if s.as_str().contains(request_id) {
-                            request_id_matches = true;
-                        }
-                    } else if let Some(loro::ValueOrContainer::Value(v)) = part.get("questions") {
-                        // Fallback: stringify the value
-                        let json_str = format!("{v:?}");
-                        if json_str.contains(request_id) {
-                            request_id_matches = true;
-                        }
-                    }
-                }
-                if request_id_matches {
+                // Match by the dedicated request_id column
+                let request_id_col_matches = matches!(
+                    part.get("requestId"),
+                    Some(loro::ValueOrContainer::Value(LoroValue::String(s))) if s.as_str() == request_id
+                );
+                if id_matches || request_id_col_matches {
                     part.insert("resolved", true)?;
                     self.doc.commit();
                     return Ok(true);
@@ -697,6 +707,9 @@ fn push_part(parts: &LoroList, part: &MessagePart) -> Result<(), DocError> {
     }
     if let Some(diff_stats) = &doc_part.diff_stats {
         map.insert("diffStats", loro_value_from_json(diff_stats))?;
+    }
+    if let Some(request_id) = &doc_part.request_id {
+        map.insert("requestId", request_id.as_str())?;
     }
     Ok(())
 }
