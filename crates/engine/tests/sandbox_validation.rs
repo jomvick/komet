@@ -243,3 +243,57 @@ async fn validation_yolo_does_not_override_explicit_options() {
     )
     .await;
 }
+
+#[tokio::test]
+async fn other_provider_with_options_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path());
+    for provider in [
+        HarnessId::Cursor,
+        HarnessId::Grok,
+        HarnessId::Hermes,
+        HarnessId::Pi,
+        HarnessId::Antigravity,
+    ] {
+        let mut req = base_request();
+        req.harness = Some(provider);
+        req.sandbox_options = Some(SandboxOptions {
+            codex: Some(CodexSandbox {
+                sandbox_mode: Some(SandboxMode::WorkspaceWrite),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let cmd_id = format!("cmd-reject-{provider:?}");
+        queue_run(&core, &cmd_id, req);
+        wait_for(
+            || {
+                matches!(
+                    command_status(&core, &cmd_id),
+                    Some((SessionCommandStatus::Rejected, _))
+                )
+            },
+            "non-sandbox provider with options to be rejected",
+        )
+        .await;
+        let (status, resolution) = command_status(&core, &cmd_id).unwrap();
+        assert_eq!(status, SessionCommandStatus::Rejected);
+        assert!(
+            resolution.unwrap().contains("rejected"),
+            "provider {provider:?} should be rejected"
+        );
+    }
+    // Empty options must NOT be rejected.
+    let dir2 = tempfile::tempdir().unwrap();
+    let core2 = assemble(dir2.path());
+    let mut empty = base_request();
+    empty.harness = Some(HarnessId::Cursor);
+    empty.sandbox_options = Some(SandboxOptions::default());
+    queue_run(&core2, "cmd-empty-ok", empty);
+    // Empty options should pass validation and spawn (assistant entry appears)
+    wait_for(
+        || entries(&core2).iter().any(|e| e.role == MessageRole::Assistant),
+        "empty options should not be rejected",
+    )
+    .await;
+}
