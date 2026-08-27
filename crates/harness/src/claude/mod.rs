@@ -267,22 +267,24 @@ impl ClaudeHarness {
                 .iter()
                 .map(|cmd| Value::String(format!("Bash({cmd}:*)")))
                 .collect();
-            for path in &c.filesystem.deny {
+            for path in c.filesystem.deny.iter().chain(&c.filesystem.deny_write) {
                 deny.push(Value::String(format!("Edit({path})")));
             }
             if !deny.is_empty() {
                 perms.insert("deny".into(), Value::Array(deny));
             }
-            if !c.filesystem.allow.is_empty() {
+            let extra_dirs: Vec<_> = c
+                .filesystem
+                .allow
+                .iter()
+                .chain(&c.filesystem.allow_read)
+                .chain(&c.filesystem.allow_write)
+                .cloned()
+                .collect();
+            if !extra_dirs.is_empty() {
                 perms.insert(
                     "additionalDirectories".into(),
-                    Value::Array(
-                        c.filesystem
-                            .allow
-                            .iter()
-                            .map(|p| Value::String(p.clone()))
-                            .collect(),
-                    ),
+                    Value::Array(extra_dirs.into_iter().map(Value::String).collect()),
                 );
             }
             if let Some(extra) = c.settings_permissions.as_object() {
@@ -674,6 +676,7 @@ async fn run_session(session: Session) {
     } = session;
     let RunControls {
         request_input,
+        request_permission: _request_permission,
         mut steering,
         interrupt,
     } = controls;
@@ -782,6 +785,7 @@ async fn run_session(session: Session) {
                     result: None,
                     error: None,
                     session_id: norm.session_id.clone(),
+                    reason: None,
                 }))
                 .await;
         } else if !interrupted && !any_done {
@@ -792,6 +796,7 @@ async fn run_session(session: Session) {
                     result: None,
                     error: Some(crate::crash_message("claude", status, &stderr_tail)),
                     session_id: norm.session_id.clone(),
+                    reason: None,
                 }))
                 .await;
         }
@@ -1020,6 +1025,7 @@ mod tests {
                 filesystem: komet_proto::FilesystemSandbox {
                     allow: vec!["/work/src".into()],
                     deny: vec!["/etc".into()],
+                    ..Default::default()
                 },
                 allow_unsandboxed_commands: false,
                 excluded_commands: vec!["rm".into()],

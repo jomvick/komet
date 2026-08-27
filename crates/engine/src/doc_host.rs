@@ -340,7 +340,32 @@ impl ChatDocHandle {
                 stamped.push((entry.id.clone(), entry.created_at));
             }
         }
-        if !stamped.is_empty() {
+        // Sweep: an abandoned run can leave `MessagePart::Permission` parts
+        // unresolved forever (the run died before its decision landed). No
+        // live run owns them at boot; resolve them so the transcript is clean
+        // and no dead approval panel can ever be keyed off them again.
+        let mut resolved_perms = 0usize;
+        for entry in self.doc.read_entries()? {
+            for part in &entry.parts {
+                if let MessagePart::Permission {
+                    request_id,
+                    resolved: false,
+                    ..
+                } = part
+                    && self.doc.resolve_permission(request_id).unwrap_or(false)
+                {
+                    resolved_perms += 1;
+                }
+            }
+        }
+        if resolved_perms > 0 {
+            tracing::info!(
+                chat = %self.chat_id,
+                resolved_perms,
+                "resolved permissions abandoned by a dead run"
+            );
+        }
+        if !stamped.is_empty() || resolved_perms > 0 {
             self.publish_messages();
         }
         Ok(stamped)
@@ -1869,17 +1894,16 @@ impl DocHost {
         // Sending a message revives an archived chat: the user is acting in it
         // again, so the LWW row flips back to active on every device. Best-
         // effort — the command itself is durable regardless.
-        if is_message
-            && let Some(workspace) = self.workspace() {
-                match workspace.chat(chat_id) {
-                    Ok(Some(chat)) if chat.archived => {
-                        if let Err(err) = workspace.set_chat_archived(chat_id, false) {
-                            tracing::warn!(chat = %chat_id, error = %err, "unarchive on send failed");
-                        }
+        if is_message && let Some(workspace) = self.workspace() {
+            match workspace.chat(chat_id) {
+                Ok(Some(chat)) if chat.archived => {
+                    if let Err(err) = workspace.set_chat_archived(chat_id, false) {
+                        tracing::warn!(chat = %chat_id, error = %err, "unarchive on send failed");
                     }
-                    _ => {}
                 }
+                _ => {}
             }
+        }
         // §7 durable delivery: when another device hosts this chat, nudge its device
         // room so a cold host opens the doc and drains the queue. Fire-and-forget —
         // the command is durable in the doc either way (a host that opens the chat
@@ -2320,6 +2344,30 @@ impl DocHost {
                     SessionCommandStatus::Applied,
                     Some("answered as new turn".into()),
                 ))
+            }
+            SessionCommandPayload::Permit {
+                request_id,
+                decision,
+            } => {
+                // Route the decision to the LIVE run first (un-parks the
+                // harness awaiting the permission bridge), then stamp the
+                // doc part resolved. A dead/absent run still stamps the doc
+                // (the panel closes; nothing is un-blocked — same fallback
+                // the input path takes).
+                match sessions.respond_permission(chat_id, request_id, decision.choice.clone()) {
+                    Ok(true) => {
+                        tracing::info!(chat=%chat_id, request=%request_id, ?decision, "permit delivered to live run")
+                    }
+                    _ => {
+                        tracing::info!(chat=%chat_id, request=%request_id, ?decision, "permit with no live run (doc stamped only)")
+                    }
+                }
+                let resolved = handle.doc.resolve_permission(request_id).unwrap_or(false)
+                    || handle.doc.resolve_input(request_id).unwrap_or(false);
+                if !resolved {
+                    tracing::warn!(chat=%chat_id, request=%request_id, ?decision, "permit received but no pending permission part found");
+                }
+                Ok((SessionCommandStatus::Applied, None))
             }
         }
     }

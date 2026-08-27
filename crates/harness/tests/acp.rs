@@ -99,6 +99,7 @@ fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
             let _ = tx.send(answers);
             rx
         }),
+        request_permission: RunControls::noop_permission(),
         steering: steer_rx,
         interrupt: token.clone(),
     };
@@ -283,6 +284,7 @@ async fn question_shaped_requests_bridge_to_the_input_panel() {
             let _ = tx.send(answers);
             rx
         }),
+        request_permission: RunControls::noop_permission(),
         steering: steer_rx,
         interrupt: token.clone(),
     };

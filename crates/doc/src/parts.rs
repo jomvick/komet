@@ -191,6 +191,21 @@ pub enum MessagePart {
         id: String,
         message: String,
     },
+    #[serde(rename_all = "camelCase")]
+    Permission {
+        id: String,
+        request_id: String,
+        permission_kind: komet_proto::PermissionKind,
+        summary: String,
+        choices: Vec<komet_proto::PermissionChoice>,
+        /// Provider-native dynamic actions (Paseo `AgentPermissionAction[]`);
+        /// empty → UI falls back to the fixed Deny/Allow(/AllowAlways) set.
+        #[serde(default)]
+        actions: Vec<komet_proto::AgentPermissionAction>,
+        #[serde(default)]
+        resolved: bool,
+        decision: Option<komet_proto::PermissionChoice>,
+    },
 }
 
 impl MessagePart {
@@ -199,7 +214,8 @@ impl MessagePart {
             MessagePart::Text { id, .. }
             | MessagePart::Tool { id, .. }
             | MessagePart::Input { id, .. }
-            | MessagePart::Error { id, .. } => id,
+            | MessagePart::Error { id, .. }
+            | MessagePart::Permission { id, .. } => id,
         }
     }
 
@@ -226,6 +242,7 @@ impl MessagePart {
                 serde_json::to_vec(questions).map_or(0, |v| v.len())
             }
             MessagePart::Error { message, .. } => message.len(),
+            MessagePart::Permission { summary, .. } => summary.len(),
         }
     }
 }
@@ -422,6 +439,49 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
         // the transcript. UserMessage becomes its own doc ENTRY (the
         // engine's subagent sink writes it), never a part of the assistant
         // message.
+        AgentEvent::PermissionRequested {
+            request_id,
+            kind,
+            summary,
+            choices,
+            actions,
+            ..
+        } => {
+            let id = format!("perm-{request_id}");
+            if !out.iter().any(|p| p.id() == id) {
+                out.push(MessagePart::Permission {
+                    id: id.clone(),
+                    request_id: request_id.clone(),
+                    permission_kind: kind.clone(),
+                    summary: summary.clone(),
+                    choices: choices.clone(),
+                    actions: actions.clone(),
+                    resolved: false,
+                    decision: None,
+                });
+            }
+        }
+        AgentEvent::PermissionResolved { request_id, choice } => {
+            for p in out.iter_mut() {
+                if let MessagePart::Permission {
+                    request_id: rid,
+                    resolved,
+                    decision,
+                    ..
+                } = p
+                    && rid == request_id
+                {
+                    // Deny-wins on conflict: if already resolved to Deny, keep it
+                    if *resolved && matches!(decision, Some(komet_proto::PermissionChoice::Deny)) {
+                        continue;
+                    }
+                    if matches!(choice, komet_proto::PermissionChoice::Deny) || !*resolved {
+                        *decision = Some(choice.clone());
+                        *resolved = true;
+                    }
+                }
+            }
+        }
         AgentEvent::AssistantMessageCompleted { .. }
         | AgentEvent::Usage { .. }
         | AgentEvent::AvailableCommands { .. }

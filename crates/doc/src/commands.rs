@@ -21,6 +21,7 @@ pub enum SessionCommandKind {
     Steer,
     Interrupt,
     RespondInput,
+    Permit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,6 +55,11 @@ pub enum SessionCommandPayload {
         request_id: String,
         answers: Vec<UserInputAnswer>,
     },
+    #[serde(rename_all = "camelCase")]
+    Permit {
+        request_id: String,
+        decision: komet_proto::PermissionDecision,
+    },
 }
 
 impl SessionCommandPayload {
@@ -63,6 +69,7 @@ impl SessionCommandPayload {
             SessionCommandPayload::Steer { .. } => SessionCommandKind::Steer,
             SessionCommandPayload::Interrupt {} => SessionCommandKind::Interrupt,
             SessionCommandPayload::RespondInput { .. } => SessionCommandKind::RespondInput,
+            SessionCommandPayload::Permit { .. } => SessionCommandKind::Permit,
         }
     }
 }

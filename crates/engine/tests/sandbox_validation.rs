@@ -6,9 +6,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use komet_doc::{
-    MessageRole, SessionCommandEntry, SessionCommandPayload, SessionCommandStatus,
-};
+use komet_doc::{MessageRole, SessionCommandEntry, SessionCommandPayload, SessionCommandStatus};
 use komet_engine::{EngineCore, HarnessRegistry};
 use komet_harness::mock::MockHarness;
 use komet_proto::{
@@ -54,6 +52,7 @@ fn assemble(dir: &std::path::Path) -> EngineCore {
                 result: None,
                 error: None,
                 session_id: Some("hs-1".into()),
+                reason: None,
             },
         ],
     }));

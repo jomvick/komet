@@ -161,6 +161,28 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             message: Some(message.clone()),
             ..Default::default()
         },
+        MessagePart::Permission {
+            id,
+            request_id,
+            permission_kind,
+            summary,
+            choices,
+            actions,
+            resolved,
+            decision: _,
+        } => DocPartJson {
+            id: id.clone(),
+            kind: "permission".into(),
+            message: Some(summary.clone()),
+            questions: Some(serde_json::to_value((
+                permission_kind,
+                choices,
+                request_id,
+                actions,
+            ))?),
+            resolved: Some(*resolved),
+            ..Default::default()
+        },
     })
 }
 
@@ -203,6 +225,34 @@ fn from_doc_part(p: DocPartJson) -> MessagePart {
             id: p.id,
             message: p.message.unwrap_or_default(),
         },
+        "permission" => {
+            let (kind, choices, request_id, actions): (
+                komet_proto::PermissionKind,
+                Vec<komet_proto::PermissionChoice>,
+                String,
+                Vec<komet_proto::AgentPermissionAction>,
+            ) = p
+                .questions
+                .and_then(|q| serde_json::from_value(q).ok())
+                .unwrap_or((
+                    komet_proto::PermissionKind::Command {
+                        cmdline: String::new(),
+                    },
+                    vec![],
+                    p.id.clone(),
+                    vec![],
+                ));
+            MessagePart::Permission {
+                id: p.id,
+                request_id,
+                permission_kind: kind,
+                summary: p.message.unwrap_or_default(),
+                choices,
+                actions,
+                resolved: p.resolved.unwrap_or(false),
+                decision: None,
+            }
+        }
         _ => MessagePart::Text {
             id: p.id,
             text: p.text.unwrap_or_default(),
@@ -497,6 +547,68 @@ impl SessionDoc {
                     Some(loro::ValueOrContainer::Value(LoroValue::String(s))) if s.as_str() == request_id
                 );
                 if is_input && id_matches {
+                    part.insert("resolved", true)?;
+                    self.doc.commit();
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Mark the permission part carrying `request_id` resolved.
+    /// Permission parts use id `perm-{request_id}` and store the
+    /// triple `(kind, choices, request_id)` in `questions`.
+    /// Returns `false` when no such part exists.
+    pub fn resolve_permission(&self, request_id: &str) -> Result<bool, DocError> {
+        let perm_id = format!("perm-{request_id}");
+        let messages = self.doc.get_list("messages");
+        for i in 0..messages.len() {
+            let Some(loro::ValueOrContainer::Container(loro::Container::Map(entry))) =
+                messages.get(i)
+            else {
+                continue;
+            };
+            let Some(loro::ValueOrContainer::Container(loro::Container::List(parts))) =
+                entry.get("parts")
+            else {
+                continue;
+            };
+            for j in 0..parts.len() {
+                let Some(loro::ValueOrContainer::Container(loro::Container::Map(part))) =
+                    parts.get(j)
+                else {
+                    continue;
+                };
+                let is_permission = matches!(
+                    part.get("kind"),
+                    Some(loro::ValueOrContainer::Value(LoroValue::String(s))) if s.as_str() == "permission"
+                );
+                if !is_permission {
+                    continue;
+                }
+                let id_matches = matches!(
+                    part.get("id"),
+                    Some(loro::ValueOrContainer::Value(LoroValue::String(s))) if s.as_str() == perm_id || s.as_str() == request_id
+                );
+                let mut request_id_matches = id_matches;
+                if !request_id_matches {
+                    if let Some(loro::ValueOrContainer::Value(LoroValue::String(s))) =
+                        part.get("questions")
+                    {
+                        // questions holds JSON tuple (kind, choices, request_id) — check if it contains request_id
+                        if s.as_str().contains(request_id) {
+                            request_id_matches = true;
+                        }
+                    } else if let Some(loro::ValueOrContainer::Value(v)) = part.get("questions") {
+                        // Fallback: stringify the value
+                        let json_str = format!("{v:?}");
+                        if json_str.contains(request_id) {
+                            request_id_matches = true;
+                        }
+                    }
+                }
+                if request_id_matches {
                     part.insert("resolved", true)?;
                     self.doc.commit();
                     return Ok(true);
