@@ -302,12 +302,63 @@ async fn question_shaped_requests_bridge_to_the_input_panel() {
 }
 
 #[tokio::test]
-async fn permission_requests_auto_accept_the_preferred_allow_option() {
-    let (controls, _steer, _token) = controls();
+async fn permission_requests_block_on_the_permission_bridge() {
+    // Paseo parity: a real tool permission (allow/reject kinds) is NEVER
+    // auto-accepted — it blocks on the engine's permission bridge and the
+    // bridge's choice (here AllowAlways) is translated to the matching
+    // allow_always optionId on the wire.
+    let (steer_tx, steer_rx) = mpsc::channel(8);
+    let token = CancellationToken::new();
+    let controls = RunControls {
+        request_input: Box::new(|_questions| {
+            let (tx, rx) = oneshot::channel();
+            let _ = tx.send(Vec::new());
+            rx
+        }),
+        request_permission: Box::new(|_kind, _summary, _choices| {
+            let (tx, rx) = oneshot::channel();
+            let _ = tx.send(komet_proto::PermissionChoice::AllowAlways {
+                scope: komet_proto::Scope::Chat,
+            });
+            rx
+        }),
+        steering: steer_rx,
+        interrupt: token.clone(),
+    };
+    let _keep = (steer_tx, token);
     let events = run_to_end(&harness(), request("scenario:permission"), controls).await;
-    // The fixture answers refusal unless the harness selected "always".
+    // The fixture answers refusal unless the bridge's AllowAlways landed as
+    // optionId "always" on the wire.
     assert!(events.contains(&AgentEvent::TextDelta {
         text: "approved".into()
+    }));
+    assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
+}
+
+#[tokio::test]
+async fn permission_bridge_deny_selects_the_reject_option() {
+    let (steer_tx, steer_rx) = mpsc::channel(8);
+    let token = CancellationToken::new();
+    let controls = RunControls {
+        request_input: Box::new(|_questions| {
+            let (tx, rx) = oneshot::channel();
+            let _ = tx.send(Vec::new());
+            rx
+        }),
+        request_permission: Box::new(|_kind, _summary, _choices| {
+            let (tx, rx) = oneshot::channel();
+            let _ = tx.send(komet_proto::PermissionChoice::Deny);
+            rx
+        }),
+        steering: steer_rx,
+        interrupt: token.clone(),
+    };
+    let _keep = (steer_tx, token);
+    let events = run_to_end(&harness(), request("scenario:perm-deny"), controls).await;
+    // Deny must land as the reject option ("no"), not a cancel — the agent
+    // distinguishes an explicit rejection from an abandoned request.
+    assert!(events.contains(&AgentEvent::TextDelta {
+        text: "denied".into()
     }));
     assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
 }
@@ -957,6 +1008,11 @@ async fn opencode_overlay_injected() {
                 patterns: vec![("*".to_owned(), Perm::Ask)],
             },
             unscoped_actions: Default::default(),
+            read: None,
+            edit: None,
+            external_directory: None,
+            webfetch: None,
+            websearch: None,
         }),
         ..Default::default()
     });

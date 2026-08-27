@@ -783,6 +783,7 @@ impl AcpHarness {
         cwd: Option<&str>,
         block_on_install: bool,
         extra_args: &[String],
+        opencode_config_overlay: Option<&std::path::Path>,
     ) -> Result<(Child, crate::StderrTail), HarnessError> {
         let (exe, args) = self.resolve_program(block_on_install).await?;
         let mut cmd = Command::new(&exe);
@@ -791,6 +792,9 @@ impl AcpHarness {
         crate::compose_child_path(&mut cmd, &exe);
         if let Some(cwd) = cwd.filter(|c| !c.is_empty()) {
             cmd.current_dir(cwd);
+        }
+        if let Some(overlay) = opencode_config_overlay {
+            cmd.env("OPENCODE_CONFIG", overlay);
         }
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -823,7 +827,7 @@ impl AcpHarness {
     /// refuses sessions before login still surfaces whatever the handshake
     /// advertised.
     async fn discover_commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
-        let (mut child, _stderr) = self.spawn_agent(None, false, &[]).await?;
+        let (mut child, _stderr) = self.spawn_agent(None, false, &[], None).await?;
         let (client, mut incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
             _ => {
@@ -887,7 +891,7 @@ impl AcpHarness {
     /// wire is the source of truth — the spec's static catalog only enriches
     /// matching entries and names the pick when the agent advertises nothing.
     async fn discover_models(&self) -> Result<Vec<Model>, HarnessError> {
-        let (mut child, stderr_tail) = self.spawn_agent(None, false, &[]).await?;
+        let (mut child, stderr_tail) = self.spawn_agent(None, false, &[], None).await?;
         let (client, _incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
             _ => {
@@ -1260,8 +1264,32 @@ impl Harness for AcpHarness {
             Some(port) => vec!["--port".to_owned(), port.to_string()],
             None => Vec::new(),
         };
+        // OpenCode permission overlay: write temp opencode.json and point OPENCODE_CONFIG at it.
+        // The file must outlive the child, so we leak its TempPath into a owned PathBuf kept alive
+        // until the child exits (the Session owns the TempDir via _opencode_overlay_dir).
+        let (_opencode_overlay_dir, opencode_overlay_path) = if self.spec.id == HarnessId::Opencode {
+            if let Some(opts) = &request.sandbox_options
+                && let Some(perms) = &opts.opencode {
+                    let dir = tempfile::tempdir().map_err(HarnessError::Io)?;
+                    let path = dir.path().join("opencode.json");
+                    let doc = opencode_perms::opencode_config_document(perms);
+                    std::fs::write(&path, doc).map_err(HarnessError::Io)?;
+                    // Keep TempDir alive by forgetting? Instead keep dir handle alongside path.
+                    // We'll store TempDir in Session; for now return dir+path.
+                    (Some(dir), Some(path))
+                } else {
+                    (None, None)
+                }
+        } else {
+            (None, None)
+        };
         let (mut child, stderr_tail) = self
-            .spawn_agent(Some(&request.cwd), true, &extra_args)
+            .spawn_agent(
+                Some(&request.cwd),
+                true,
+                &extra_args,
+                opencode_overlay_path.as_deref(),
+            )
             .await?;
         let stdin = child
             .stdin
@@ -1274,6 +1302,7 @@ impl Harness for AcpHarness {
         let (client, incoming) = RpcClient::new(stdin, stdout);
         let (event_tx, event_rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(256);
         tokio::spawn(run_session(Session {
+            _opencode_overlay_dir,
             child,
             client,
             incoming,
@@ -1307,6 +1336,7 @@ impl Harness for AcpHarness {
 // ---------------------------------------------------------------------------
 
 struct Session {
+    _opencode_overlay_dir: Option<tempfile::TempDir>,
     child: Child,
     client: RpcClient,
     incoming: mpsc::Receiver<Incoming>,
@@ -1777,6 +1807,16 @@ type RequestInputFn = Box<
         + Sync,
 >;
 
+type RequestPermissionFn = Box<
+    dyn Fn(
+            komet_proto::PermissionKind,
+            String,
+            Vec<komet_proto::PermissionChoice>,
+        ) -> tokio::sync::oneshot::Receiver<komet_proto::PermissionChoice>
+        + Send
+        + Sync,
+>;
+
 /// A permission request is a QUESTION (not a tool permission) when any of
 /// its options lacks an allow/reject kind — that's how the agent relays
 /// user-facing choices (Claude's AskUserQuestion arrives this way through
@@ -1793,17 +1833,53 @@ fn is_user_question(options: &[Value]) -> bool {
     })
 }
 
-/// The live-run request handler: tool permissions auto-accept like
-/// [`handle_server_request`], but question-shaped requests block on the
-/// engine's input bridge (in a subtask so the message loop keeps flowing)
-/// and answer with the option whose name matches the chosen label. A dropped
-/// resolver degrades to `cancelled` — never a silent allow.
+/// The ACP option matching the user's permission choice: Allow prefers
+/// `allow_once` (least sticky allow), AllowAlways wants `allow_always`, Deny
+/// wants any reject kind. `None` means the wire offered no matching option
+/// and the request must be cancelled instead.
+fn option_for_choice(
+    options: &[Value],
+    choice: &komet_proto::PermissionChoice,
+) -> Option<String> {
+    fn kind(o: &Value) -> &str {
+        o.get("kind").and_then(Value::as_str).unwrap_or_default()
+    }
+    let option = match choice {
+        komet_proto::PermissionChoice::Allow => options
+            .iter()
+            .find(|o| kind(o) == "allow_once")
+            .or_else(|| options.iter().find(|o| kind(o).starts_with("allow"))),
+        komet_proto::PermissionChoice::AllowAlways { .. } => options
+            .iter()
+            .find(|o| kind(o) == "allow_always")
+            .or_else(|| options.iter().find(|o| kind(o).starts_with("allow"))),
+        komet_proto::PermissionChoice::Deny => options.iter().find(|o| kind(o).starts_with("reject")),
+    };
+    option
+        .and_then(|o| o.get("optionId"))
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+}
+
+/// The live-run request handler. Three shapes:
+/// - non-permission methods → [`handle_server_request`];
+/// - question-shaped permission requests (options without allow/reject kinds)
+///   block on the engine's input bridge (in a subtask so the message loop
+///   keeps flowing) and answer with the option whose name matches the chosen
+///   label;
+/// - real tool permissions (every option carrying an allow/reject kind) BLOCK
+///   on the engine's permission bridge — Paseo parity: `request_permission`
+///   is awaited before `client.respond`, never auto-accepted. A dropped
+///   resolver degrades to Deny — never a silent allow.
+/// kinds may legitimately repeat — codex sends two `allow_always` options
+/// ("Allow for Session" and a prefix-rule amendment) on every exec approval.
 fn handle_server_request_live(
     client: &RpcClient,
     id: Value,
     method: &str,
     params: &Value,
     request_input: &std::sync::Arc<RequestInputFn>,
+    request_permission: &std::sync::Arc<RequestPermissionFn>,
     open_questions: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
 ) -> Vec<AgentEvent> {
     if method != "session/request_permission" {
@@ -1815,7 +1891,51 @@ fn handle_server_request_live(
         .cloned()
         .unwrap_or_default();
     if !is_user_question(&options) {
-        return handle_server_request(client, id, method, params);
+        // Real tool permission: surface it through the permission bridge and
+        // block until the user's decision resolves the oneshot. Spawned so
+        // the message loop keeps flowing; the open-questions counter parks
+        // the quiet-settle while the agent awaits the decision.
+        let tool_call = params.get("toolCall");
+        let title = tool_call
+            .and_then(|t| t.get("title"))
+            .and_then(Value::as_str);
+        let tool_id = tool_call
+            .and_then(|t| t.get("toolCallId"))
+            .and_then(Value::as_str)
+            .unwrap_or("tool");
+        let kind = komet_proto::PermissionKind::Tool {
+            name: title
+                .map(str::to_owned)
+                .unwrap_or_else(|| tool_id.to_owned()),
+        };
+        let summary = title.unwrap_or(tool_id).to_owned();
+        let choices = vec![
+            komet_proto::PermissionChoice::Allow,
+            komet_proto::PermissionChoice::AllowAlways {
+                scope: komet_proto::Scope::Chat,
+            },
+            komet_proto::PermissionChoice::Deny,
+        ];
+        let client = client.clone();
+        let request_permission = std::sync::Arc::clone(request_permission);
+        let open_questions = std::sync::Arc::clone(open_questions);
+        open_questions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        tokio::spawn(async move {
+            let choice = request_permission(kind, summary, choices)
+                .await
+                .unwrap_or(komet_proto::PermissionChoice::Deny);
+            let outcome = match option_for_choice(&options, &choice) {
+                Some(option_id) => {
+                    json!({ "outcome": { "outcome": "selected", "optionId": option_id } })
+                }
+                // Deny without an explicit reject option (or a dropped
+                // resolver that already auto-denied): cancel — never allow.
+                None => json!({ "outcome": { "outcome": "cancelled" } }),
+            };
+            client.respond(&id, outcome);
+            open_questions.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        });
+        return Vec::new();
     }
     let names: Vec<String> = options
         .iter()
@@ -1976,56 +2096,17 @@ async fn run_session(session: Session) {
         kill_grace,
         handshake_timeout,
         stderr_tail,
+        _opencode_overlay_dir: _overlay_dir,
     } = session;
     let RunControls {
         request_input,
-        request_permission: _request_permission,
+        request_permission,
         mut steering,
         interrupt,
     } = controls;
     let request_input = std::sync::Arc::new(request_input);
+    let request_permission = std::sync::Arc::new(request_permission);
 
-    // Sandboxed ask demo: emit PermissionRequested so the UI panel appears.
-    // Full blocking on Permit is Task 2 follow-up; this makes Sandboxed visible now.
-    if let Some(opts) = &request.sandbox_options
-        && let Some(oc) = &opts.opencode
-        && oc
-            .bash
-            .resolve("ls")
-            .is_some_and(|p| p == komet_proto::Perm::Ask)
-    {
-        let _ = event_tx
-            .send(Ok(komet_proto::AgentEvent::PermissionRequested {
-                request_id: "sandbox-ask-1".into(),
-                kind: komet_proto::PermissionKind::Command {
-                    cmdline: "ls".into(),
-                },
-                summary: "Run `ls` (Sandboxed — approval required)".into(),
-                choices: vec![
-                    komet_proto::PermissionChoice::Allow,
-                    komet_proto::PermissionChoice::AllowAlways {
-                        scope: komet_proto::Scope::Chat,
-                    },
-                    komet_proto::PermissionChoice::Deny,
-                ],
-                actions: vec![
-                    komet_proto::AgentPermissionAction {
-                        id: "reject".into(),
-                        label: "Deny".into(),
-                        behavior: komet_proto::PermissionBehavior::Deny,
-                        pattern: None,
-                    },
-                    komet_proto::AgentPermissionAction {
-                        id: "accept".into(),
-                        label: "Allow".into(),
-                        behavior: komet_proto::PermissionBehavior::Allow,
-                        pattern: None,
-                    },
-                ],
-                provider: Some("opencode".into()),
-            }))
-            .await;
-    }
     // ---- handshake + session (interruptible) ------------------------------
     let setup = async {
         let init = client
@@ -2446,6 +2527,7 @@ async fn run_session(session: Session) {
                                         &method,
                                         &params,
                                         &request_input,
+                                        &request_permission,
                                         &open_questions,
                                     ) {
                                         if !send(&event_tx, ev).await {
@@ -2621,6 +2703,7 @@ async fn run_session(session: Session) {
                                 &method,
                                 &params,
                                 &request_input,
+                                &request_permission,
                                 &open_questions,
                             ) {
                                 if !send(&event_tx, ev).await {
@@ -2732,6 +2815,7 @@ async fn run_session(session: Session) {
                                                 &method,
                                                 &params,
                                                 &request_input,
+                                                &request_permission,
                                                 &open_questions,
                                             ) {
                                                 if !send(&event_tx, ev).await {
