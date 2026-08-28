@@ -239,7 +239,7 @@ fn from_doc_part(p: DocPartJson) -> MessagePart {
                     .questions
                     .as_ref()
                     .and_then(|q| {
-                        serde_json::from_value::<(Value, Value, String, Value)>(q.clone()).ok()
+                        serde_json::from_value::<(serde_json::Value, serde_json::Value, String, serde_json::Value)>(q.clone()).ok()
                     })
                     .map(|(_, _, rid, _)| {
                         // Strip the perm- prefix in legacy fallback
