@@ -1,5 +1,7 @@
 //! Agent-side wire types: harness identity, run requests, streaming events, tool calls.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -201,14 +203,123 @@ pub struct CodexSandbox {
     pub writable_roots: Vec<PathBuf>,
     #[serde(default)]
     pub network_access: bool,
+    /// Paseo's `webSearch` enum (`disabled|cached|indexed|live`). Bool input is
+    /// accepted for compatibility (`true` → `live`, `false` → `disabled`); the
+    /// Codex wire only carries a bool, so anything non-`disabled` maps to
+    /// `webSearch: true` (the CLI has no cached/indexed gradient).
     #[serde(default)]
-    pub web_search: bool,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub features: Vec<String>,
+    pub web_search: WebSearch,
+    /// Paseo's `features` object (`name → true|false|policy object`). An input
+    /// array of names (`["shell"]`) deserializes to all-enabled entries; the
+    /// mapper emits the object form so `network_proxy`-style policies survive.
+    #[serde(default)]
+    pub features: CodexFeatures,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_policy: Option<ApprovalPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_workspace_write: Option<CodexSandboxWorkspaceWrite>,
+}
+
+/// Paseo `webSearch`: `"disabled" | "cached" | "indexed" | "live"`, with bool
+/// compatibility (`true` → `live`, `false` → `disabled`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WebSearch {
+    #[default]
+    Disabled,
+    Cached,
+    Indexed,
+    Live,
+}
+
+impl WebSearch {
+    /// The Codex CLI wire carries a bool; anything non-`disabled` is on.
+    pub fn wire_bool(self) -> bool {
+        !matches!(self, WebSearch::Disabled)
+    }
+}
+
+impl<'de> Deserialize<'de> for WebSearch {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let v = serde_json::Value::deserialize(d)?;
+        match v {
+            serde_json::Value::Bool(true) => Ok(WebSearch::Live),
+            serde_json::Value::Bool(false) | serde_json::Value::Null => Ok(WebSearch::Disabled),
+            serde_json::Value::String(s) => match s.as_str() {
+                "disabled" => Ok(WebSearch::Disabled),
+                "cached" => Ok(WebSearch::Cached),
+                "indexed" => Ok(WebSearch::Indexed),
+                "live" => Ok(WebSearch::Live),
+                other => Err(serde::de::Error::custom(format!(
+                    "invalid webSearch: {other:?} (expected disabled|cached|indexed|live)"
+                ))),
+            },
+            other => Err(serde::de::Error::custom(format!(
+                "invalid webSearch: {other:?} (expected bool or enum string)"
+            ))),
+        }
+    }
+}
+
+/// Paseo `features`: map of feature name → `true | false | policy object`.
+/// Deserializes from an array of names (all enabled) for legacy/table inputs.
+#[derive(Debug, Clone, PartialEq, Default, Serialize)]
+pub struct CodexFeatures(pub BTreeMap<String, CodexFeature>);
+
+impl CodexFeatures {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl<'de> Deserialize<'de> for CodexFeatures {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let v = serde_json::Value::deserialize(d)?;
+        let mut out = BTreeMap::new();
+        match v {
+            serde_json::Value::Array(names) => {
+                for name in names {
+                    match name {
+                        serde_json::Value::String(s) => {
+                            out.insert(s, CodexFeature::Enabled(true));
+                        }
+                        other => {
+                            return Err(serde::de::Error::custom(format!(
+                                "features array entries must be strings, got {other:?}"
+                            )))
+                        }
+                    }
+                }
+            }
+            serde_json::Value::Object(map) => {
+                for (name, val) in map {
+                    let feature = match val {
+                        serde_json::Value::Bool(b) => CodexFeature::Enabled(b),
+                        other => CodexFeature::Policy(other),
+                    };
+                    out.insert(name, feature);
+                }
+            }
+            serde_json::Value::Null => {}
+            other => {
+                return Err(serde::de::Error::custom(format!(
+                    "features must be an array of names or an object, got {other:?}"
+                )))
+            }
+        }
+        Ok(CodexFeatures(out))
+    }
+}
+
+/// Paseo feature value: `true | false | policy object`. Untagged so the wire
+/// carries the bare bool or the bare policy object (no `{"Enabled": …}` wrap).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CodexFeature {
+    Enabled(bool),
+    /// Opaque policy object (e.g. Paseo's `network_proxy` routing policy) —
+    /// forwarded verbatim on the wire.
+    Policy(serde_json::Value),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -298,6 +409,11 @@ pub struct ClaudeSandboxSettings {
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ClaudeSandbox {
+    /// Paseo `enabled`: explicit sandbox on/off switch. `Some(false)` turns the
+    /// whole Claude sandbox translation OFF (no permission table, no settings
+    /// sandbox) — the other fields become no-ops. Absent/`true` = enabled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
     #[serde(default)]
     pub filesystem: FilesystemSandbox,
     #[serde(default)]
@@ -376,6 +492,11 @@ pub struct NetworkSandbox {
     pub allowed_hosts: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub denied_hosts: Vec<String>,
+    /// Paseo `strictAllowlist`: when true, hosts NOT in `allowed_hosts` are
+    /// denied (deny-by-default networking). Forwarded to the Claude settings
+    /// sandbox `network.strictAllowlist` key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict_allowlist: Option<bool>,
 }
 
 /// OpenCode permission table (Paseo `opencode` provider options).
@@ -1524,12 +1645,68 @@ mod tests {
         assert_eq!(opts.sandbox_mode, Some(SandboxMode::WorkspaceWrite));
         assert_eq!(opts.writable_roots, vec![PathBuf::from("/repo")]);
         assert!(opts.network_access);
-        assert!(!opts.web_search);
+        assert_eq!(opts.web_search, WebSearch::Disabled);
+        assert!(!opts.web_search.wire_bool());
+        assert_eq!(
+            opts.features.0.get("shell"),
+            Some(&CodexFeature::Enabled(true))
+        );
         assert_eq!(opts.approval_policy, Some(ApprovalPolicy::Never));
         // round-trip keeps the same wire shape
         let back: CodexSandbox =
             serde_json::from_str(&serde_json::to_string(&opts).unwrap()).unwrap();
         assert_eq!(back, opts);
+    }
+
+    #[test]
+    fn codex_web_search_enum_and_bool_compat() {
+        // Paseo enum strings.
+        let cached: CodexSandbox = serde_json::from_str(r#"{"webSearch":"cached"}"#).unwrap();
+        assert_eq!(cached.web_search, WebSearch::Cached);
+        assert!(cached.web_search.wire_bool());
+        let live: CodexSandbox = serde_json::from_str(r#"{"webSearch":"live"}"#).unwrap();
+        assert_eq!(live.web_search, WebSearch::Live);
+        // Bool compat: true → live, false → disabled.
+        let on: CodexSandbox = serde_json::from_str(r#"{"webSearch":true}"#).unwrap();
+        assert_eq!(on.web_search, WebSearch::Live);
+        let off: CodexSandbox = serde_json::from_str(r#"{"webSearch":false}"#).unwrap();
+        assert_eq!(off.web_search, WebSearch::Disabled);
+        // Unknown string is rejected (deny-by-default, not silently on).
+        assert!(serde_json::from_str::<CodexSandbox>(r#"{"webSearch":"turbo"}"#).is_err());
+    }
+
+    #[test]
+    fn codex_features_object_with_policy_round_trips() {
+        let json = r#"{"features":{"multi_agent_v2":true,"network_proxy":{"route":"allowed"}}}"#;
+        let opts: CodexSandbox = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            opts.features.0.get("multi_agent_v2"),
+            Some(&CodexFeature::Enabled(true))
+        );
+        assert_eq!(
+            opts.features.0.get("network_proxy"),
+            Some(&CodexFeature::Policy(serde_json::json!({"route":"allowed"})))
+        );
+        // Object form survives the round trip (the old Vec<String> lost it).
+        let back: CodexSandbox =
+            serde_json::from_str(&serde_json::to_string(&opts).unwrap()).unwrap();
+        assert_eq!(back, opts);
+    }
+
+    #[test]
+    fn claude_sandbox_enabled_false_disables_and_strict_allowlist_parses() {
+        let json = r#"{
+            "enabled": false,
+            "filesystem": {"allow": ["/repo"]},
+            "network": {"allowedHosts": ["crates.io"], "strictAllowlist": true}
+        }"#;
+        let opts: ClaudeSandbox = serde_json::from_str(json).unwrap();
+        assert_eq!(opts.enabled, Some(false));
+        assert_eq!(opts.network.strict_allowlist, Some(true));
+        assert_eq!(opts.network.allowed_hosts, vec!["crates.io".to_string()]);
+        // Absent enabled = on.
+        let plain: ClaudeSandbox = serde_json::from_str(r#"{"filesystem":{}}"#).unwrap();
+        assert_eq!(plain.enabled, None);
     }
 
     #[test]

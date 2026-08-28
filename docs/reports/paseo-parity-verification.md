@@ -87,7 +87,7 @@ Le **modèle** (provider‑native strict + fail‑fast + `options wins` + autres
 
 **Verdict : ATTEINT, avec les résidus documentés en section 7.**
 - Socle du modèle & workflow interactif : **atteint**.
-- Parité des champs (accès différenciés) : **atteinte sur les pertes silencieuses ; résidus de représentation documentés** (web_search/strictAllowlist/features).
+- Parité des champs (accès différenciés) : **atteinte** (web_search enum, features objet, enabled/strictAllowlist first-class — section 7) ; plus aucun perte silencieuse connue.
 
 ---
 
@@ -103,9 +103,9 @@ Changements implémentés pour lever les trous signalés plus haut :
 | Header `opencode_perms.rs` obsolète (« unwired ») | ✅ **fait** | réécrit : overlay désormais câblé, résidu merge-semantics documenté. |
 | `harness: None` contournait le rejet | ✅ **fait** | garde dans `dispatch_inner` contre le **harness résolu** pour Cursor/Grok/Hermes/Pi/Antigravity — `sessions.rs:336` . |
 | `approval_policy` `untrusted`/`on-request` | ✅ **fait** | variantes ajoutées (additif, non‑breaking) + round‑trip testé — `agent.rs`. |
-| `web_search` enum | ⚠️ documenté | le wire sandbox Codex prend un booléen ; komet mappe bool→bool. L'enum Paseo `disabled\|cached\|indexed\|live` n'est pas un→un. |
-| `claude.enabled` / `network.strictAllowlist` | ⚠️ documenté | pas des champs first‑class ; transmissibles via le passthrough `settings.sandbox` (JSON fusionné last). |
-| `codex.features` | ⚠️ documenté | restreint à `Vec<String>` (les formes objet `network_proxy`/`multi_agent_v2` ne sont pas exprimables). |
-| Merge semantics overlay OpenCode vs vraie CLI | ⚠️ ouvert | à valider sur un install opencode réel (risque clobber/shadow documenté). |
+| `web_search` enum | ✅ **fait** | `WebSearch` enum `disabled\|cached\|indexed\|live` (Paseo), bool-compatible (`true`→`live`, `false`→`disabled`), inconnu rejeté ; le wire Codex reste bool (`wire_bool()`) — `agent.rs` + tests round-trip. |
+| `claude.enabled` / `network.strictAllowlist` | ✅ **fait** | champs first-class (`ClaudeSandbox.enabled`, `NetworkSandbox.strict_allowlist`) ; `enabled: false` désactive toute la traduction sandbox Claude, `strictAllowlist` émis dans `sandbox.network` — `claude/mod.rs` + test. |
+| `codex.features` | ✅ **fait** | forme objet Paseo (`name → true\|false\|policy object`, enum `CodexFeature` untagged) ; le mapper émet l'objet — `network_proxy` et `multi_agent_v2` politiques exprimables ; input tableau de noms accepté (compat) — `agent.rs` + test. |
+| Merge semantics overlay OpenCode vs vraie CLI | ✅ **validé live** | opencode CLI 1.18.23, `opencode debug config` (2026-08-28) : `OPENCODE_CONFIG_CONTENT` gagne sur la config projet pour le fallback `"*"` (l'ancien `OPENCODE_CONFIG` fichier perdait — affaiblissement silencieux confirmé) ; merge profond — les entrées spécifiques du projet survivent. Détail `docs/security.md`. |
 
 **Régressions :** `cargo test --no-fail-fast -p komet-proto -p komet-harness -p komet-engine` → tous verts (dont les nouveaux tests `bare_tool_fields_render…`, `dedicated_bare_field_beats…`, `codex_approval_policy_blanket_levels_round_trip`).

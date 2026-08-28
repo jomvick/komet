@@ -54,8 +54,8 @@ use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
 use komet_proto::{
-    AgentEvent, ApprovalPolicy, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest,
-    SandboxMode, SlashCommand, SteeringMode, UserInputAnswer, UserInputQuestion,
+    AgentEvent, ApprovalPolicy, CodexFeature, DoneStatus, HarnessId, Model, ReasoningLevel,
+    RunRequest, SandboxMode, SlashCommand, SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
 use crate::jsonrpc::{Incoming, RpcClient};
@@ -563,13 +563,26 @@ async fn run_session(session: Session) {
                         policy.insert("excludeTmpdirEnvVar".into(), true.into());
                     }
                 }
-                if cx.web_search {
+                // Paseo's webSearch is an enum, but the Codex CLI wire only
+                // carries a bool — anything non-disabled maps to `true`.
+                if cx.web_search.wire_bool() {
                     policy.insert("webSearch".into(), true.into());
                 }
                 if !cx.features.is_empty() {
                     policy.insert(
                         "features".into(),
-                        Value::Array(cx.features.iter().map(|f| Value::String(f.clone())).collect()),
+                        Value::Object(
+                            cx.features
+                                .0
+                                .iter()
+                                .map(|(name, feature)| match feature {
+                                    CodexFeature::Enabled(b) => {
+                                        (name.clone(), Value::Bool(*b))
+                                    }
+                                    CodexFeature::Policy(v) => (name.clone(), v.clone()),
+                                })
+                                .collect(),
+                        ),
                     );
                 }
                 (

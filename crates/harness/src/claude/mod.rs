@@ -218,7 +218,11 @@ impl ClaudeHarness {
         let claude_opts = request
             .sandbox_options
             .as_ref()
-            .and_then(|o| o.claude.as_ref());
+            .and_then(|o| o.claude.as_ref())
+            // Paseo `enabled: false` turns the whole Claude sandbox OFF — the
+            // table translation below is skipped entirely (no permission
+            // table, no settings.sandbox). Restriction fields become no-ops.
+            .filter(|c| c.enabled != Some(false));
         let unrestricted = match request.sandbox_options.as_ref() {
             None => true,
             Some(o) => match &o.claude {
@@ -355,6 +359,12 @@ impl ClaudeHarness {
                                 .collect(),
                         ),
                     );
+                }
+                // Paseo `strictAllowlist`: deny-by-default networking — hosts
+                // not in allowedDomains are denied. Forwarded verbatim; Claude
+                // CLI versions that don't know the key ignore it.
+                if let Some(strict) = c.network.strict_allowlist {
+                    network.insert("strictAllowlist".into(), Value::Bool(strict));
                 }
                 sandbox.insert("network".into(), Value::Object(network));
                 settings.insert("sandbox".into(), Value::Object(sandbox));
