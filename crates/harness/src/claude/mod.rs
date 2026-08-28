@@ -376,6 +376,38 @@ impl ClaudeHarness {
                     perms.insert(k.clone(), v.clone());
                 }
             }
+            // Claude native permission rules — maps to settings.permissions
+            // entries: {action}({resource}) → effect.
+            for rule in &c.permissions {
+                let key = format!("{}({})", rule.action, rule.resource);
+                let effect_val = match rule.effect {
+                    komet_proto::Perm::Allow => Value::String("allow".into()),
+                    komet_proto::Perm::Ask => Value::String("ask".into()),
+                    komet_proto::Perm::Deny => Value::String("deny".into()),
+                };
+                perms.insert(key, effect_val);
+            }
+            // Claude credentials — maps to sandbox.credentials.files.
+            if !c.credentials.is_empty() {
+                let mut sandbox_obj = serde_json::Map::new();
+                // Merge existing sandbox settings first.
+                if let Some(fs_sandbox) = c.settings.sandbox.clone() {
+                    if let Some(obj) = fs_sandbox.as_object() {
+                        for (k, v) in obj {
+                            sandbox_obj.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+                let cred_arr: Vec<Value> = c
+                    .credentials
+                    .iter()
+                    .map(|p| Value::String(p.clone()))
+                    .collect();
+                let mut cred_obj = serde_json::Map::new();
+                cred_obj.insert("files".into(), Value::Array(cred_arr));
+                sandbox_obj.insert("credentials".into(), Value::Object(cred_obj));
+                settings.insert("sandbox".into(), Value::Object(sandbox_obj));
+            }
             settings.insert("permissions".into(), Value::Object(perms));
         }
         if !settings.is_empty() {
