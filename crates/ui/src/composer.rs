@@ -4551,7 +4551,6 @@ impl Composer {
             self.input.update(cx, |input, cx| input.set_text(draft, cx));
         }
 
-        let live = self.run_live(cx);
         // Question panel lifecycle (wizard state cached per request id).
         match pending {
             Some((request_id, questions)) if !self.answered_requests.contains(&request_id) => {
@@ -5425,11 +5424,24 @@ impl Composer {
         cx: &mut Context<Self>,
     ) {
         self.answered_requests.insert(request_id.clone());
-        let engine = self.state.read(cx).engine.clone();
-        if let Some(engine) = engine {
-            cx.spawn_async(async move |this, cx| {
+        if let Some(engine) = self.state.read(cx).engine().cloned() {
+            let payload = komet_doc::SessionCommandPayload::Permit {
+                request_id: request_id.clone(),
+                decision: komet_proto::PermissionDecision {
+                    request_id: request_id.clone(),
+                    choice: decision,
+                    selected_action_id: None,
+                    updated_permissions,
+                },
+            };
+            let params = serde_json::json!({
+                "chatId": self.state.read(cx).selected_chat.clone().unwrap_or_default(),
+                "command": serde_json::to_value(&payload).unwrap_or_default()
+            });
+            cx.spawn(async move |this, cx| {
                 engine
-                    .respond_permission(request_id.clone(), decision, updated_permissions)
+                    .client()
+                    .call(komet_rpc::methods::QUEUE_COMMAND, params)
                     .await
                     .ok();
                 this.update(cx, |composer, cx| {
@@ -5442,6 +5454,8 @@ impl Composer {
                     } else if resolved {
                         // Keep hidden
                     }
+                    let _ = still_pending;
+                    let _ = resolved;
                 })
                 .ok();
             })
@@ -6227,7 +6241,6 @@ impl Render for Composer {
             )
         });
 
-        let live = self.run_live(cx);
         if let Some((rid, kind, summary, choices, actions)) =
             pending_permission_request(&self.state.read(cx).transcript)
         {
