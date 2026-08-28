@@ -144,6 +144,7 @@ impl SandboxOptions {
                     external_directory: None,
                     webfetch: None,
                     websearch: None,
+                    ..Default::default()
                 }),
             },
             SandboxLevel::WorkspaceWrite => Self {
@@ -156,6 +157,7 @@ impl SandboxOptions {
                     bash: BashPerms {
                         patterns: vec![("*".into(), Perm::Ask)],
                     },
+                    edit: Some(Perm::Ask),
                     ..Default::default()
                 }),
             },
@@ -218,6 +220,12 @@ pub struct CodexSandbox {
     pub approval_policy: Option<ApprovalPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox_workspace_write: Option<CodexSandboxWorkspaceWrite>,
+    /// Codex filesystem entries: `filesystem."/path" = access`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub filesystem: Vec<CodexFSRule>,
+    /// Codex shell environment policy — env vars excluded from the sandbox.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell_env_policy: Option<ShellEnvPolicy>,
 }
 
 /// Paseo `webSearch`: `"disabled" | "cached" | "indexed" | "live"`, with bool
@@ -436,6 +444,13 @@ pub struct ClaudeSandbox {
     /// so Claude-side schema evolution doesn't require a komet release.
     #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub settings_permissions: serde_json::Value,
+    /// Claude sandbox credentials files — maps to `sandbox.credentials`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub credentials: Vec<String>,
+    /// Claude native permission rules — maps to `settings.permissions`
+    /// allow/deny entries (e.g. `Bash(npm run *)`, `Read(~/secrets/**)`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub permissions: Vec<PermissionRule>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
@@ -523,6 +538,25 @@ pub struct OpenCodePerms {
     pub webfetch: Option<Perm>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub websearch: Option<Perm>,
+    /// OpenCode actions: glob, grep, skill, lsp, question,
+    /// execute, task (subagents), doom_loop — each maps to a dedicated
+    /// permission rule in opencode.json.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub glob: Option<Perm>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grep: Option<Perm>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill: Option<Perm>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lsp: Option<Perm>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub question: Option<Perm>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execute: Option<Perm>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<Perm>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doom_loop: Option<Perm>,
 }
 
 impl OpenCodePerms {
@@ -828,6 +862,47 @@ pub fn validate_run_request(request: &RunRequest) -> Result<(), ValidationError>
         }
         if let Some(detail) = settings_permissions_escalation(&claude.settings_permissions) {
             return Err(ValidationError::ClaudeSettingsPermissionsEscalation { detail });
+        }
+        // Claude native permission rules: validate action/resource are non-empty.
+        for rule in &claude.permissions {
+            if rule.action.is_empty() {
+                return Err(ValidationError::OpenCodeUnknownPerm {
+                    pattern: rule.resource.clone(),
+                });
+            }
+        }
+        // Claude credentials: validate paths are inside cwd.
+        for cred in &claude.credentials {
+            if !inside_cwd(cred, &cwd) {
+                return Err(ValidationError::ClaudeFilesystemOutsideCwd {
+                    path: cred.clone(),
+                    cwd: cwd.clone(),
+                });
+            }
+        }
+    }
+
+    // Codex filesystem entries must be inside cwd unless danger-full-access.
+    if let Some(codex) = &options.codex {
+        let danger_full_access = codex.sandbox_mode == Some(SandboxMode::DangerFullAccess);
+        if !danger_full_access {
+            for entry in &codex.filesystem {
+                if !inside_cwd(&entry.path, &cwd) {
+                    return Err(ValidationError::WritableRootOutsideCwd {
+                        root: PathBuf::from(&entry.path),
+                        cwd: cwd.clone(),
+                    });
+                }
+            }
+        }
+        if let Some(policy) = &codex.shell_env_policy {
+            for name in &policy.exclude {
+                if name.is_empty() {
+                    return Err(ValidationError::OpenCodeUnknownPerm {
+                        pattern: name.clone(),
+                    });
+                }
+            }
         }
     }
 
@@ -1149,11 +1224,55 @@ pub enum Scope {
     Pattern(String),
 }
 
+/// Choice returned by the harness for a permission request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum PermissionChoice {
     Allow,
     AllowAlways { scope: Scope },
+    Deny,
+}
+impl Default for PermissionChoice {
+    fn default() -> Self {
+        PermissionChoice::Allow
+    }
+}
+
+/// A single permission rule: {action, resource, effect}.
+/// Mirrors Claude's `Bash(npm run *)`, `Read(~/secrets/**)`,
+/// Codex's filesystem entries, and OpenCode's per-action rules.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PermissionRule {
+    pub action: String,
+    pub resource: String,
+    pub effect: Perm,
+}
+
+/// Shell environment policy (Codex `shell_environment_policy`).
+/// Controls which env vars are excluded from the sandbox.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShellEnvPolicy {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exclude: Vec<String>,
+}
+
+/// A filesystem access entry (Codex `filesystem."path" = access`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CodexFSRule {
+    pub path: String,
+    pub access: FSAccess,
+}
+
+/// Filesystem access level for Codex filesystem entries.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FSAccess {
+    #[default]
+    Read,
+    Write,
     Deny,
 }
 

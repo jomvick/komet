@@ -38,6 +38,14 @@ pub fn permission_config(perms: &OpenCodePerms) -> String {
         ("external_directory", perms.external_directory),
         ("webfetch", perms.webfetch),
         ("websearch", perms.websearch),
+        ("glob", perms.glob),
+        ("grep", perms.grep),
+        ("skill", perms.skill),
+        ("lsp", perms.lsp),
+        ("question", perms.question),
+        ("execute", perms.execute),
+        ("task", perms.task),
+        ("doom_loop", perms.doom_loop),
     ];
     for (tool, perm) in &perms.unscoped_actions {
         if dedicated.iter().any(|(n, p)| *n == tool && p.is_some()) {
@@ -117,6 +125,14 @@ mod tests {
             external_directory: None,
             webfetch: None,
             websearch: None,
+            glob: None,
+            grep: None,
+            skill: None,
+            lsp: None,
+            question: None,
+            execute: None,
+            task: None,
+            doom_loop: None,
         }
     }
 
@@ -180,6 +196,7 @@ mod tests {
             external_directory: Some(Perm::Deny),
             webfetch: Some(Perm::Deny),
             websearch: Some(Perm::Ask),
+            ..Default::default()
         };
         assert_eq!(
             permission_config(&p),
@@ -201,6 +218,7 @@ mod tests {
             external_directory: None,
             webfetch: Some(Perm::Deny),
             websearch: None,
+            ..Default::default()
         };
         assert_eq!(
             permission_config(&p),

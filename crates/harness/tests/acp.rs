@@ -1013,6 +1013,7 @@ async fn opencode_overlay_injected() {
             external_directory: None,
             webfetch: None,
             websearch: None,
+            ..Default::default()
         }),
         ..Default::default()
     });

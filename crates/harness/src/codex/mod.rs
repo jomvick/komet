@@ -563,6 +563,32 @@ async fn run_session(session: Session) {
                         policy.insert("excludeTmpdirEnvVar".into(), true.into());
                     }
                 }
+                // Codex filesystem entries — maps to sandbox.filesystem.
+                if !cx.filesystem.is_empty() {
+                    let mut fs_map = serde_json::Map::new();
+                    for entry in &cx.filesystem {
+                        let access_val = match entry.access {
+                            komet_proto::FSAccess::Read => "read",
+                            komet_proto::FSAccess::Write => "write",
+                            komet_proto::FSAccess::Deny => "deny",
+                        };
+                        fs_map.insert(entry.path.clone(), Value::String(access_val.to_string()));
+                    }
+                    policy.insert("filesystem".into(), Value::Object(fs_map));
+                }
+                // Codex shell environment policy — excludes env vars from sandbox.
+                if let Some(pol) = &cx.shell_env_policy {
+                    if !pol.exclude.is_empty() {
+                        let exclude_arr: Vec<Value> = pol
+                            .exclude
+                            .iter()
+                            .map(|v| Value::String(v.clone()))
+                            .collect();
+                        let mut sep_obj = serde_json::Map::new();
+                        sep_obj.insert("exclude".into(), Value::Array(exclude_arr));
+                        policy.insert("shellEnvironmentPolicy".into(), Value::Object(sep_obj));
+                    }
+                }
                 // Paseo's webSearch is an enum, but the Codex CLI wire only
                 // carries a bool — anything non-disabled maps to `true`.
                 if cx.web_search.wire_bool() {
