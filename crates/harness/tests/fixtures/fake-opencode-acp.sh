@@ -98,9 +98,14 @@ case "$promptline" in
     ;;
 
   *scenario:overlay*)
-    # Verify OPENCODE_CONFIG points to a JSON file containing bash "*":"ask"
-    cfg="$OPENCODE_CONFIG"
-    if [ -n "$cfg" ] && [ -f "$cfg" ] && grep -q '"\*":"ask"' "$cfg" && grep -q '"permission"' "$cfg"; then
+    # Verify the permission overlay reached us: OPENCODE_CONFIG_CONTENT carries
+    # the generated opencode.json CONTENT (final-precedence runtime mechanism);
+    # fall back to the OPENCODE_CONFIG file path for older wiring.
+    cfg="$OPENCODE_CONFIG_CONTENT"
+    if [ -z "$cfg" ] && [ -n "$OPENCODE_CONFIG" ] && [ -f "$OPENCODE_CONFIG" ]; then
+      cfg="$(cat "$OPENCODE_CONFIG")"
+    fi
+    if [ -n "$cfg" ] && printf '%s' "$cfg" | grep -q '"\*":"ask"' && printf '%s' "$cfg" | grep -q '"permission"'; then
       update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"overlay ok"}}'
       emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
     else
