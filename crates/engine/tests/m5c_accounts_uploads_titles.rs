@@ -532,6 +532,7 @@ async fn titling_e2e_names_chat_and_renames_worktree_branch() {
                 result: None,
                 error: None,
                 session_id: None,
+                reason: None,
             },
         ],
     );

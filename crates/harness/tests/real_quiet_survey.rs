@@ -39,6 +39,7 @@ fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
             let _ = tx.send(answers);
             rx
         }),
+        request_permission: RunControls::noop_permission(),
         steering: steer_rx,
         interrupt: token.clone(),
     };
@@ -114,6 +115,7 @@ async fn probe_once(harness: AcpHarness) -> ProbeOutcome {
                         result: None,
                         error: Some(e.to_string()),
                         session_id: None,
+                        reason: None,
                     },
                 ));
                 break;

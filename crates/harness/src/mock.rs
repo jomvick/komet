@@ -149,6 +149,7 @@ impl Harness for MockHarness {
                     result: None,
                     error: None,
                     session_id: None,
+                    reason: None,
                 });
             });
             let stream = futures::stream::unfold(rx, |mut rx| async move {
@@ -295,6 +296,7 @@ impl Harness for MockHarness {
                     result: None,
                     error: None,
                     session_id: None,
+reason: None,
                 };
                 vec![
                     AgentEvent::TextDelta {

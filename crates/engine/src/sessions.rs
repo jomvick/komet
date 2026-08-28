@@ -30,8 +30,8 @@ use komet_doc::{
 };
 use komet_harness::{CancellationToken, Harness, RunControls, SteerMessage};
 use komet_proto::{
-    AgentEvent, DoneStatus, HarnessId, RunRequest, Session, SessionStatus, UserInputAnswer,
-    UserInputQuestion,
+    AgentEvent, DoneReason, DoneStatus, HarnessId, RunRequest, Session, SessionStatus,
+    UserInputAnswer, UserInputQuestion,
 };
 
 use crate::doc_host::{ChatDocHandle, DocHost};
@@ -56,6 +56,8 @@ pub enum SteerOutcome {
 }
 
 type PendingInputs = Arc<Mutex<HashMap<String, oneshot::Sender<Vec<UserInputAnswer>>>>>;
+type PendingPermissionChoices =
+    Arc<Mutex<HashMap<String, oneshot::Sender<komet_proto::PermissionChoice>>>>;
 
 /// A harness-native session id plus the cwd it was created under. Harness
 /// session stores are cwd-scoped (claude keys conversations by project
@@ -78,6 +80,7 @@ struct RunHandle {
     cancel: watch::Sender<bool>,
     engine_tx: mpsc::UnboundedSender<AgentEvent>,
     pending_inputs: PendingInputs,
+    pending_permissions: PendingPermissionChoices,
     /// Steers accepted into the mailbox but not yet confirmed by a `Steered`
     /// event — the at-least-once ledger. A run can die with accepted steers
     /// still in its mailbox (idle reaper vs. a routed send; a mid-turn error
@@ -324,10 +327,95 @@ impl SessionsEngine {
                     result: None,
                     error: Some(message.clone()),
                     session_id: None,
+                    reason: None,
                 },
             );
             self.set_status(chat_id, SessionStatus::Idle, false);
             return Err(EngineError::Other(message));
+        }
+        // A provider with EXPLICIT non-empty options is caught by
+        // validate_run_request's `request.harness` check above. When the
+        // harness is resolved IMPLICITLY (request.harness absent → the chat's
+        // stored config), enforce the same rule against the resolved
+        // harness_id so e.g. a Cursor session cannot silently run with
+        // OpenCode/Codex options it cannot apply.
+        if request
+            .sandbox_options
+            .as_ref()
+            .is_some_and(|o| !o.is_empty())
+            && matches!(
+                harness_id,
+                komet_proto::HarnessId::Cursor
+                    | komet_proto::HarnessId::Grok
+                    | komet_proto::HarnessId::Hermes
+                    | komet_proto::HarnessId::Pi
+                    | komet_proto::HarnessId::Antigravity
+            )
+        {
+            let validation = komet_proto::ValidationError::ProviderOptionsRejected {
+                provider: harness_id,
+            };
+            let message = validation.to_string();
+            self.inner.publish(
+                chat_id,
+                &komet_proto::AgentEvent::Error {
+                    message: message.clone(),
+                },
+            );
+            self.inner.publish(
+                chat_id,
+                &komet_proto::AgentEvent::Done {
+                    status: komet_proto::DoneStatus::Errored,
+                    result: None,
+                    error: Some(message.clone()),
+                    session_id: None,
+                    reason: None,
+                },
+            );
+            self.set_status(chat_id, komet_proto::SessionStatus::Idle, false);
+            return Err(EngineError::Other(message));
+        }
+        // Symmetric reasoning validation: if a harness is targeted, the
+        // requested level must be in its ladder (Grok/Hermes/Pi = empty).
+        if let Some(level) = request.reasoning {
+            let supported: &[komet_proto::ReasoningLevel] = match request.harness {
+                Some(komet_proto::HarnessId::Grok)
+                | Some(komet_proto::HarnessId::Hermes)
+                | Some(komet_proto::HarnessId::Pi) => &[],
+                _ => &[
+                    komet_proto::ReasoningLevel::Minimal,
+                    komet_proto::ReasoningLevel::Low,
+                    komet_proto::ReasoningLevel::Medium,
+                    komet_proto::ReasoningLevel::High,
+                    komet_proto::ReasoningLevel::XHigh,
+                    komet_proto::ReasoningLevel::Max,
+                    komet_proto::ReasoningLevel::Ultra,
+                    komet_proto::ReasoningLevel::Ultracode,
+                    komet_proto::ReasoningLevel::Ultrathink,
+                ],
+            };
+            if let Err(validation) = komet_proto::validate_reasoning(Some(level), supported) {
+                tracing::warn!(chat = %chat_id, ?validation, "run rejected: reasoning validation failed");
+                let message = validation.to_string();
+                self.inner.publish(
+                    chat_id,
+                    &AgentEvent::Error {
+                        message: message.clone(),
+                    },
+                );
+                self.inner.publish(
+                    chat_id,
+                    &AgentEvent::Done {
+                        status: DoneStatus::Errored,
+                        result: None,
+                        error: Some(message.clone()),
+                        session_id: None,
+                        reason: None,
+                    },
+                );
+                self.set_status(chat_id, SessionStatus::Idle, false);
+                return Err(EngineError::Other(message));
+            }
         }
         // Every dispatched prompt is a turn — routed steer or fresh run alike.
         self.note_turn_start(chat_id, &request.cwd);
@@ -412,6 +500,7 @@ impl SessionsEngine {
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let (engine_tx, engine_rx) = mpsc::unbounded_channel::<AgentEvent>();
         let pending_inputs: PendingInputs = Arc::new(Mutex::new(HashMap::new()));
+        let pending_permissions: PendingPermissionChoices = Arc::new(Mutex::new(HashMap::new()));
 
         // Input bridge: the harness asks questions; we mint the request id, park the
         // resolver for `respond_input`, and surface the event through the run pipeline.
@@ -429,9 +518,36 @@ impl SessionsEngine {
                 rx
             })
         };
+        // Permission bridge: the harness asks "may I run X"; we mint the
+        // request id, park the resolver for `respond_permission`, and surface
+        // `PermissionRequested` through the run pipeline (mirror of the input
+        // bridge above).
+        let request_permission = {
+            let pending = pending_permissions.clone();
+            let engine_tx = engine_tx.clone();
+            Box::new(
+                move |kind: komet_proto::PermissionKind,
+                      summary: String,
+                      choices: Vec<komet_proto::PermissionChoice>| {
+                    let (tx, rx) = oneshot::channel();
+                    let request_id = new_id();
+                    lock(&pending).insert(request_id.clone(), tx);
+                    let _ = engine_tx.send(AgentEvent::PermissionRequested {
+                        request_id,
+                        kind,
+                        summary,
+                        choices,
+                        actions: Vec::new(),
+                        provider: None,
+                    });
+                    rx
+                },
+            )
+        };
         let interrupt_token = CancellationToken::new();
         let controls = RunControls {
             request_input,
+            request_permission,
             steering: steer_rx,
             interrupt: interrupt_token.clone(),
         };
@@ -446,6 +562,7 @@ impl SessionsEngine {
                 cancel: cancel_tx,
                 engine_tx,
                 pending_inputs,
+                pending_permissions,
                 routed_steers: Arc::new(Mutex::new(std::collections::VecDeque::new())),
             },
         );
@@ -559,9 +676,11 @@ impl SessionsEngine {
                 h.interrupt_token.clone(),
                 h.cancel.clone(),
                 h.pending_inputs.clone(),
+                h.pending_permissions.clone(),
+                h.engine_tx.clone(),
             )
         });
-        let Some((run_id, token, cancel, pending)) = target else {
+        let Some((run_id, token, cancel, pending, pending_perms, engine_tx)) = target else {
             return Ok(false);
         };
         // Engine-side grace deadline FIRST: the run task must observe
@@ -575,6 +694,19 @@ impl SessionsEngine {
         let parked: Vec<_> = lock(&pending).drain().map(|(_, tx)| tx).collect();
         for tx in parked {
             let _ = tx.send(Vec::new());
+        }
+        // Unpark any blocked permissions (mirrors the question drain above) AND
+        // publish each denial into the doc pipeline: without the synthetic
+        // `PermissionResolved`, the transcript's `MessagePart::Permission`
+        // stays `resolved: false` forever and its approval panel resurrects on
+        // every later render of this dead run.
+        let parked_perms: Vec<_> = lock(&pending_perms).drain().collect();
+        for (request_id, tx) in parked_perms {
+            let _ = tx.send(komet_proto::PermissionChoice::Deny);
+            let _ = engine_tx.send(AgentEvent::PermissionResolved {
+                request_id,
+                choice: komet_proto::PermissionChoice::Deny,
+            });
         }
         // Harness-level interrupt (protocol + child teardown).
         token.cancel();
@@ -609,6 +741,45 @@ impl SessionsEngine {
         let _ = engine_tx.send(AgentEvent::InputResolved {
             request_id: request_id.to_string(),
         });
+        Ok(true)
+    }
+
+    /// Resolve a pending permission request (Paseo `respondToPermission`).
+    /// Returns `false` when no such request is pending (unknown id, run
+    /// already settled, or the decision raced a dead run).
+    pub fn respond_permission(
+        &self,
+        chat_id: &str,
+        request_id: &str,
+        choice: komet_proto::PermissionChoice,
+    ) -> Result<bool, EngineError> {
+        let target = lock(&self.inner.runs)
+            .get(chat_id)
+            .map(|h| (h.pending_permissions.clone(), h.engine_tx.clone()));
+        let Some((pending, engine_tx)) = target else {
+            return Ok(false);
+        };
+        let Some(resolver) = lock(&pending).remove(request_id) else {
+            return Ok(false);
+        };
+        let is_deny = choice == komet_proto::PermissionChoice::Deny;
+        let _ = resolver.send(choice.clone());
+        let _ = engine_tx.send(AgentEvent::PermissionResolved {
+            request_id: request_id.to_string(),
+            choice,
+        });
+        if is_deny {
+            // Deny stops the agent — interrupt the run (like Esc) so it
+            // doesn't continue with the next tool.
+            drop(pending);
+            drop(engine_tx);
+            // fire-and-forget: don't block the doc_host caller
+            let sessions = self.clone();
+            let chat = chat_id.to_string();
+            tokio::spawn(async move {
+                let _ = sessions.interrupt(&chat).await;
+            });
+        }
         Ok(true)
     }
 
@@ -678,6 +849,7 @@ impl SessionsEngine {
                 result: None,
                 error: Some(note.into()),
                 session_id: None,
+                reason: Some(DoneReason::EngineRestart),
             };
             self.inner.publish(&chat_id, &done);
             let stamped = handle.mark_abandoned_streams(note)?.len();
@@ -687,6 +859,20 @@ impl SessionsEngine {
 
             if !will_resume {
                 continue;
+            }
+            // Multi-device guard: only the chat's HOST device re-dispatches a
+            // crashed run. A non-host device booting with a stale journal (its
+            // own crashed run from an earlier era, since the chat migrated) has
+            // stamped the doc + closed the journal above — but must NEVER spawn
+            // a competing run: the host owns the run plane (§7 device routing).
+            if let Some(host) = self.inner.doc_host() {
+                if !host.is_host(&chat_id) {
+                    tracing::info!(
+                        chat = %chat_id,
+                        "auto-resume skipped: chat hosted by another device"
+                    );
+                    continue;
+                }
             }
             let attempt = self.inner.journal.note_resume_attempt(&chat_id);
             let (user_id, prompt_text) = prompt.expect("gated by will_resume");
@@ -785,9 +971,9 @@ impl Inner {
                 context_limit,
             } => {
                 let mut usage_stats = lock(&self.usage_stats);
-                let entry = usage_stats
-                    .entry(chat_id.to_string())
-                    .or_insert_with(|| komet_proto::ContextUsageStats::new(context_limit.unwrap_or(200_000)));
+                let entry = usage_stats.entry(chat_id.to_string()).or_insert_with(|| {
+                    komet_proto::ContextUsageStats::new(context_limit.unwrap_or(200_000))
+                });
                 entry.ingest(
                     *input_tokens,
                     *cached_input_tokens,
@@ -1171,6 +1357,7 @@ async fn drive_run(
                     result: None,
                     error: Some(message),
                     session_id: None,
+                    reason: None,
                 },
             );
             inner.remove_run(&chat_id, &run_id);
@@ -1282,6 +1469,8 @@ async fn drive_run(
                 result: None,
                 error: None,
                 session_id: None,
+                // Engine synthesized it because the user stopped the run.
+                reason: Some(DoneReason::UserRequested),
             },
             _ = live_heartbeat.tick() => {
                 inner.touch_session(&chat_id);
@@ -1318,12 +1507,14 @@ async fn drive_run(
                     result: None,
                     error: Some(err.to_string()),
                     session_id: None,
+                    reason: None,
                 },
                 None if interrupted => AgentEvent::Done {
                     status: DoneStatus::Interrupted,
                     result: None,
                     error: None,
                     session_id: None,
+                    reason: Some(DoneReason::UserRequested),
                 },
                 // Stream end while PARKED idle: a per-turn adapter closing
                 // after its final Done — a clean end, not a crash (the turn
@@ -1335,6 +1526,7 @@ async fn drive_run(
                     result: None,
                     error: Some("harness stream ended without Done".into()),
                     session_id: None,
+                    reason: None,
                 },
             },
             _ = tokio::time::sleep_until(flush_at), if dirty => {
@@ -1433,6 +1625,21 @@ async fn drive_run(
                 continue;
             }
         }
+        if let AgentEvent::PermissionRequested { request_id, .. } = &event {
+            let pending = lock(&inner.runs)
+                .get(&chat_id)
+                .map(|h| h.pending_permissions.clone());
+            let known = pending.is_some_and(|p| lock(&p).contains_key(request_id));
+            if !known {
+                tracing::warn!(
+                    chat = %chat_id,
+                    request = %request_id,
+                    "dropping harness-emitted PermissionRequested (unknown id; \
+                     the engine permission bridge owns this lifecycle)"
+                );
+                continue;
+            }
+        }
         // PARKED: a steer boundary, a terminal Done, or SELF-CONTINUED OUTPUT
         // re-opens the session; everything else stays gated. The ACP child
         // keeps forwarding `session/update` frames after a turn completes,
@@ -1507,6 +1714,18 @@ async fn drive_run(
                     // A stale answer settling after its turn already closed:
                     // nothing is running — stay parked.
                     AgentEvent::InputResolved { .. } => continue,
+                    // A permission request with NO turn behind it: deny it right here.
+                    AgentEvent::PermissionRequested { request_id, .. } => {
+                        let resolver = lock(&inner.runs)
+                            .get(&chat_id)
+                            .and_then(|h| lock(&h.pending_permissions).remove(request_id));
+                        if let Some(tx) = resolver {
+                            let _ = tx.send(komet_proto::PermissionChoice::Deny);
+                        }
+                        tracing::debug!(chat = %chat_id, "parked session: post-turn permission request auto-denied");
+                        continue;
+                    }
+                    AgentEvent::PermissionResolved { .. } => continue,
                     _ => continue,
                 }
             }

@@ -12,28 +12,50 @@
 //! wins, see [`komet_proto::BashPerms::resolve`]). Building the JSON text in
 //! document order keeps the round-trip faithful.
 //!
-//! STATUS: this module is the pure translation seam only. ACP exposes no
-//! permission config surface today (nothing in `session/new`'s
-//! `configOptions`, no dedicated method), and pointing `OPENCODE_CONFIG` at
-//! a generated file is unverified against merge semantics — wiring that up
-//! without live validation risks clobbering a user's own config. Callers
-//! (engine/UI) should write this section into an `opencode.json` overlay
-//! once that path is validated; the generator here is stable and tested.
+//! STATUS: wired. `AcpHarness::run` writes this section as a temp
+//! `opencode.json` overlay and points `OPENCODE_CONFIG` at it at spawn time
+//! (`crates/harness/src/acp/mod.rs`), so the user's own config file is not
+//! rewritten. Residual unknown (documented in `docs/security.md`): the
+//! overlay's merge semantics against a pre-existing `OPENCODE_CONFIG` chain
+//! are not yet validated against a live opencode CLI.
 
 use komet_proto::{BashPerms, OpenCodePerms, Perm};
 
 /// The full `"permission"` value for an `opencode.json` overlay, key order
-/// preserved exactly as declared.
+/// preserved exactly as declared. `bash` renders as its ordered pattern map
+/// and always appears; the bare per-tool fields (`read`/`edit`/
+/// `external_directory`/`webfetch`/`websearch`) render as their bare perm
+/// when set. A bare field that also appears in `unscoped_actions` wins — the
+/// map is order-less, so emitting a duplicate key would make the document
+/// ambiguous.
 pub fn permission_config(perms: &OpenCodePerms) -> String {
-    let mut out = String::from("{");
-    out.push_str("\"bash\":{");
+    let mut out = String::from("{\"bash\":{");
     out.push_str(&bash_patterns_json(&perms.bash));
     out.push('}');
+    let dedicated = [
+        ("read", perms.read),
+        ("edit", perms.edit),
+        ("external_directory", perms.external_directory),
+        ("webfetch", perms.webfetch),
+        ("websearch", perms.websearch),
+    ];
     for (tool, perm) in &perms.unscoped_actions {
+        if dedicated.iter().any(|(n, p)| *n == tool && p.is_some()) {
+            // The dedicated field renders this key below; skip the duplicate.
+            continue;
+        }
         out.push(',');
         push_key(&mut out, tool);
         out.push(':');
         out.push_str(perm_str(*perm));
+    }
+    for (tool, perm) in dedicated {
+        if let Some(p) = perm {
+            out.push(',');
+            push_key(&mut out, tool);
+            out.push(':');
+            out.push_str(perm_str(p));
+        }
     }
     out.push('}');
     out
@@ -77,7 +99,6 @@ fn push_key(out: &mut String, key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
 
     fn perms(patterns: Vec<(&str, Perm)>, unscoped: Vec<(&str, Perm)>) -> OpenCodePerms {
         OpenCodePerms {
@@ -91,6 +112,11 @@ mod tests {
                 .into_iter()
                 .map(|(k, p)| (k.to_owned(), p))
                 .collect(),
+            read: None,
+            edit: None,
+            external_directory: None,
+            webfetch: None,
+            websearch: None,
         }
     }
 
@@ -140,6 +166,45 @@ mod tests {
         assert_eq!(
             opencode_config_document(&p),
             r#"{"permission":{"bash":{"*":"ask"}}}"#
+        );
+    }
+#[test]
+    fn bare_tool_fields_render_at_their_top_level_keys() {
+        let p = OpenCodePerms {
+            bash: BashPerms {
+                patterns: vec![("*".to_owned(), Perm::Deny)],
+            },
+            unscoped_actions: Default::default(),
+            read: Some(Perm::Allow),
+            edit: Some(Perm::Allow),
+            external_directory: Some(Perm::Deny),
+            webfetch: Some(Perm::Deny),
+            websearch: Some(Perm::Ask),
+        };
+        assert_eq!(
+            permission_config(&p),
+            r#"{"bash":{"*":"deny"},"read":"allow","edit":"allow","external_directory":"deny","webfetch":"deny","websearch":"ask"}"#
+        );
+    }
+
+    #[test]
+    fn dedicated_bare_field_beats_unscoped_action_on_same_key() {
+        // webfetch with a dedicated value AND an unscoped entry: the dedicated
+        // field wins; the unscoped duplicate is not emitted.
+        let p = OpenCodePerms {
+            bash: BashPerms {
+                patterns: vec![("*".to_owned(), Perm::Ask)],
+            },
+            unscoped_actions: [("webfetch".to_owned(), Perm::Allow)].into(),
+            read: None,
+            edit: None,
+            external_directory: None,
+            webfetch: Some(Perm::Deny),
+            websearch: None,
+        };
+        assert_eq!(
+            permission_config(&p),
+            r#"{"bash":{"*":"ask"},"webfetch":"deny"}"#
         );
     }
 }

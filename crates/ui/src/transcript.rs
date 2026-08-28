@@ -830,7 +830,7 @@ pub fn rows_for_entry(
                         });
                     }
                     // Tools are grouped by the outer arm; nothing reaches here.
-                    MessagePart::Tool { .. } => {}
+                    MessagePart::Tool { .. } | MessagePart::Permission { .. } => {}
                 }
             }
         }

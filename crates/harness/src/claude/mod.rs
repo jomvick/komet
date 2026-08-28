@@ -218,7 +218,11 @@ impl ClaudeHarness {
         let claude_opts = request
             .sandbox_options
             .as_ref()
-            .and_then(|o| o.claude.as_ref());
+            .and_then(|o| o.claude.as_ref())
+            // Paseo `enabled: false` turns the whole Claude sandbox OFF — the
+            // table translation below is skipped entirely (no permission
+            // table, no settings.sandbox). Restriction fields become no-ops.
+            .filter(|c| c.enabled != Some(false));
         let unrestricted = match request.sandbox_options.as_ref() {
             None => true,
             Some(o) => match &o.claude {
@@ -256,9 +260,8 @@ impl ClaudeHarness {
         // - `fail_if_unavailable` cannot be enforced from argv; if sandboxing
         //   is unavailable the run proceeds (documented, not silently unsafe:
         //   permission-mode stays "default").
-        // - `network.allowed_hosts/denied_hosts` have no stable settings.json
-        //   counterpart we can rely on across CLI versions — they are NOT
-        //   invented onto the wire.
+        // - `network.allowed_hosts/denied_hosts` are placed under the nested
+        //   network object using Claude CLI's allowedDomains and deniedDomains keys.
         if let Some(c) = claude_opts {
             let mut perms = serde_json::Map::new();
             perms.insert("defaultMode".into(), Value::String("default".into()));
@@ -267,23 +270,106 @@ impl ClaudeHarness {
                 .iter()
                 .map(|cmd| Value::String(format!("Bash({cmd}:*)")))
                 .collect();
-            for path in &c.filesystem.deny {
+            for path in c.filesystem.deny.iter().chain(&c.filesystem.deny_write) {
                 deny.push(Value::String(format!("Edit({path})")));
+            }
+            // Paseo `denyRead` — refuse reads (e.g. ~/.ssh, ~/.aws). Maps to
+            // Claude's `Read(path)` permission rule, distinct from Edit.
+            for path in &c.filesystem.deny_read {
+                deny.push(Value::String(format!("Read({path})")));
             }
             if !deny.is_empty() {
                 perms.insert("deny".into(), Value::Array(deny));
             }
-            if !c.filesystem.allow.is_empty() {
+            let extra_dirs: Vec<_> = c
+                .filesystem
+                .allow
+                .iter()
+                .chain(&c.filesystem.allow_read)
+                .chain(&c.filesystem.allow_write)
+                .cloned()
+                .collect();
+            let mut combined_dirs = extra_dirs;
+            combined_dirs.extend(c.additional_directories.clone());
+            combined_dirs.sort();
+            combined_dirs.dedup();
+            if !combined_dirs.is_empty() {
                 perms.insert(
                     "additionalDirectories".into(),
+                    Value::Array(combined_dirs.into_iter().map(Value::String).collect()),
+                );
+            }
+            if !c.allowed_tools.is_empty() {
+                perms.insert(
+                    "allow".into(),
                     Value::Array(
-                        c.filesystem
-                            .allow
+                        c.allowed_tools
                             .iter()
-                            .map(|p| Value::String(p.clone()))
+                            .map(|t| Value::String(t.clone()))
                             .collect(),
                     ),
                 );
+            }
+            if !c.disallowed_tools.is_empty() {
+                let mut deny_arr = perms
+                    .get("deny")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                for t in &c.disallowed_tools {
+                    deny_arr.push(Value::String(t.clone()));
+                }
+                perms.insert("deny".into(), Value::Array(deny_arr));
+            }
+            if !c.network.allowed_hosts.is_empty() || !c.network.denied_hosts.is_empty() {
+                let mut sandbox = serde_json::Map::new();
+                // Merge existing settings.sandbox first (without overwriting network restrictions)
+                if let Some(fs_sandbox) = c.settings.sandbox.clone() {
+                    if let Some(obj) = fs_sandbox.as_object() {
+                        for (k, v) in obj {
+                            // Skip network keys from settings.sandbox to prevent overwriting
+                            if k != "network" {
+                                sandbox.insert(k.clone(), v.clone());
+                            }
+                        }
+                    }
+                }
+                // Place network restrictions under the nested network object
+                let mut network = serde_json::Map::new();
+                if !c.network.allowed_hosts.is_empty() {
+                    network.insert(
+                        "allowedDomains".into(),
+                        Value::Array(
+                            c.network
+                                .allowed_hosts
+                                .iter()
+                                .map(|h| Value::String(h.clone()))
+                                .collect(),
+                        ),
+                    );
+                }
+                if !c.network.denied_hosts.is_empty() {
+                    network.insert(
+                        "deniedDomains".into(),
+                        Value::Array(
+                            c.network
+                                .denied_hosts
+                                .iter()
+                                .map(|h| Value::String(h.clone()))
+                                .collect(),
+                        ),
+                    );
+                }
+                // Paseo `strictAllowlist`: deny-by-default networking — hosts
+                // not in allowedDomains are denied. Forwarded verbatim; Claude
+                // CLI versions that don't know the key ignore it.
+                if let Some(strict) = c.network.strict_allowlist {
+                    network.insert("strictAllowlist".into(), Value::Bool(strict));
+                }
+                sandbox.insert("network".into(), Value::Object(network));
+                settings.insert("sandbox".into(), Value::Object(sandbox));
+            } else if let Some(s) = c.settings.sandbox.clone() {
+                settings.insert("sandbox".into(), s);
             }
             if let Some(extra) = c.settings_permissions.as_object() {
                 for (k, v) in extra {
@@ -674,6 +760,7 @@ async fn run_session(session: Session) {
     } = session;
     let RunControls {
         request_input,
+        request_permission: _request_permission,
         mut steering,
         interrupt,
     } = controls;
@@ -782,6 +869,7 @@ async fn run_session(session: Session) {
                     result: None,
                     error: None,
                     session_id: norm.session_id.clone(),
+                    reason: None,
                 }))
                 .await;
         } else if !interrupted && !any_done {
@@ -792,6 +880,7 @@ async fn run_session(session: Session) {
                     result: None,
                     error: Some(crate::crash_message("claude", status, &stderr_tail)),
                     session_id: norm.session_id.clone(),
+                    reason: None,
                 }))
                 .await;
         }
@@ -1020,6 +1109,7 @@ mod tests {
                 filesystem: komet_proto::FilesystemSandbox {
                     allow: vec!["/work/src".into()],
                     deny: vec!["/etc".into()],
+                    ..Default::default()
                 },
                 allow_unsandboxed_commands: false,
                 excluded_commands: vec!["rm".into()],
