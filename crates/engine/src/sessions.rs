@@ -860,6 +860,20 @@ impl SessionsEngine {
             if !will_resume {
                 continue;
             }
+            // Multi-device guard: only the chat's HOST device re-dispatches a
+            // crashed run. A non-host device booting with a stale journal (its
+            // own crashed run from an earlier era, since the chat migrated) has
+            // stamped the doc + closed the journal above — but must NEVER spawn
+            // a competing run: the host owns the run plane (§7 device routing).
+            if let Some(host) = self.inner.doc_host() {
+                if !host.is_host(&chat_id) {
+                    tracing::info!(
+                        chat = %chat_id,
+                        "auto-resume skipped: chat hosted by another device"
+                    );
+                    continue;
+                }
+            }
             let attempt = self.inner.journal.note_resume_attempt(&chat_id);
             let (user_id, prompt_text) = prompt.expect("gated by will_resume");
             let sessions = self.clone();

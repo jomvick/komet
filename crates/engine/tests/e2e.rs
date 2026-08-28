@@ -675,6 +675,138 @@ async fn recover_stale_journal_stamps_aborted_on_boot() {
 }
 
 #[tokio::test]
+async fn recover_stale_does_not_resume_run_hosted_by_another_device() {
+    use komet_proto::{Chat, Space};
+    use komet_doc::WorkspaceDoc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let device_id = "dev-booting"; // THIS device's id (crashed here earlier)
+    let host_device = "dev-current-host"; // the chat migrated to this device
+    std::fs::create_dir_all(dir.path()).unwrap();
+    std::fs::write(dir.path().join("device-id"), device_id).unwrap();
+
+    // Crash state: fresh (< 12h) streaming entry + a user prompt, so
+    // `will_resume` would be TRUE — only the host guard prevents the dispatch.
+    let now = chrono::Utc::now().timestamp_millis();
+    {
+        let journal = RunJournal::open(dir.path().join("orgs/dev-org/dev-user/journals")).unwrap();
+        journal
+            .append(
+                CHAT,
+                &AgentEvent::TextDelta {
+                    text: "doomed".into(),
+                },
+            )
+            .unwrap();
+
+        let doc = SessionDoc::init(CHAT).unwrap();
+        doc.push_message(&SessionMessageEntry {
+            id: "m-user".into(),
+            role: MessageRole::User,
+            parts: vec![MessagePart::Text {
+                id: "t0".into(),
+                text: "hi".into(),
+            }],
+            created_at: now,
+            device_id: device_id.into(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+        })
+        .unwrap();
+        let mut writer = SegmentWriter::begin(&doc, "m-assist", device_id, now + 1).unwrap();
+        writer
+            .sync(&[MessagePart::Text {
+                id: "t0".into(),
+                text: "doomed".into(),
+            }])
+            .unwrap();
+        // No finish — still streaming.
+
+        // Workspace registry: the chat row is OWNED by the other device, so
+        // this device is NOT the host and must not re-dispatch the run.
+        let ws = WorkspaceDoc::new();
+        ws.upsert_space(&Space {
+            id: "space-1".into(),
+            device_id: host_device.into(),
+            path: "/tmp/other".into(),
+            name: None,
+            git_detected: false,
+            git_checked_at: None,
+            checkout_id: None,
+            created_at: chrono::Utc::now(),
+        })
+        .unwrap();
+        ws.upsert_chat(&Chat {
+            id: CHAT.into(),
+            device_id: host_device.into(),
+            title: Some("hosted elsewhere".into()),
+            archived: false,
+            cwd: Some("/tmp/other".into()),
+            branch: None,
+            checkout_id: None,
+            config: None,
+            last_message_preview: None,
+            last_message_at: Some(chrono::Utc::now()),
+            created_at: chrono::Utc::now(),
+            harness_session_id: None,
+            room_gen: None,
+            harness_session_cwd: None,
+            space_id: Some("space-1".into()),
+            last_seen_at: Some(chrono::Utc::now()),
+        })
+        .unwrap();
+        let store = DocsStore::open(dir.path().join("orgs/dev-org/dev-user")).unwrap();
+        store
+            .save_snapshot(CHAT, &doc.export_snapshot().unwrap())
+            .unwrap();
+        store
+            .save_snapshot("workspace2", &ws.export_snapshot().unwrap())
+            .unwrap();
+    }
+
+    // Boot: recover_stale stamps + closes the journal but must NOT resume.
+    let core = assemble(
+        dir.path(),
+        Arc::new(MockHarness {
+            script: mock_script(),
+        }),
+    );
+    assert_eq!(core.device_id, device_id);
+
+    // Doc stamping still happens (the streaming entry is THIS device's orphan).
+    let all = entries(&core);
+    let assistant = all.iter().find(|e| e.id == "m-assist").unwrap();
+    assert_eq!(assistant.status, Some(MessageStatus::Aborted));
+
+    // Journal closed (no longer stale)…
+    let journal = RunJournal::open(dir.path().join("orgs/dev-org/dev-user/journals")).unwrap();
+    assert!(journal.stale_sessions().unwrap().is_empty());
+
+    // …but NO auto-resume: the host guard skips before the revival ledger is
+    // even touched, and no run is dispatched (no new assistant entry, no
+    // Running session, no second Done later on).
+    assert!(
+        !dir
+            .path()
+            .join("orgs/dev-org/dev-user/journals")
+            .join(format!("{CHAT}.resume"))
+            .exists(),
+        "revival ledger must not be touched for a non-host device"
+    );
+    assert_ne!(
+        core.sessions.session_status(CHAT).map(|s| s.status),
+        Some(SessionStatus::Working)
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let all = entries(&core);
+    assert_eq!(
+        all.iter().filter(|e| e.role == MessageRole::Assistant).count(),
+        1,
+        "no resumed run may append a second assistant entry"
+    );
+}
+
+#[tokio::test]
 async fn rpc_surface_over_in_memory_transport() {
     let dir = tempfile::tempdir().unwrap();
     let core = assemble(
