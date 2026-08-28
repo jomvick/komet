@@ -48,12 +48,38 @@ pub struct RunControls {
     pub request_input: Box<
         dyn Fn(Vec<UserInputQuestion>) -> oneshot::Receiver<Vec<UserInputAnswer>> + Send + Sync,
     >,
+    /// Permission bridge (Paseo `respondToPermission`): the run asks "may I
+    /// run this tool/command", the host surfaces `PermissionRequested`, parks
+    /// the resolver, and the user's decision comes back as the choice. A
+    /// dropped receiver (run died) degrades to Deny on the harness side.
+    pub request_permission: Box<
+        dyn Fn(komet_proto::PermissionKind, String, Vec<komet_proto::PermissionChoice>)
+            -> oneshot::Receiver<komet_proto::PermissionChoice>
+            + Send
+            + Sync,
+    >,
     /// Steer prompts consumed at step/turn boundaries.
     pub steering: mpsc::Receiver<SteerMessage>,
     /// Cancel to interrupt the live run: the harness sends its protocol-level
     /// interrupt, then escalates to SIGTERM/SIGKILL on the child after a grace
     /// period. The run's stream ends with `Done { status: Interrupted }`.
     pub interrupt: CancellationToken,
+}
+
+impl RunControls {
+    pub fn noop_permission(
+    ) -> Box<
+        dyn Fn(komet_proto::PermissionKind, String, Vec<komet_proto::PermissionChoice>)
+            -> oneshot::Receiver<komet_proto::PermissionChoice>
+            + Send
+            + Sync,
+    > {
+        Box::new(|_kind, _summary, _choices| {
+            let (tx, rx) = oneshot::channel();
+            let _ = tx.send(komet_proto::PermissionChoice::Deny);
+            rx
+        })
+    }
 }
 
 #[async_trait]

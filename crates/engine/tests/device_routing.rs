@@ -170,6 +170,7 @@ impl Harness for InstantHarness {
                 result: None,
                 error: None,
                 session_id: Some("hs-1".into()),
+                reason: None,
             }),
         ])
         .boxed())

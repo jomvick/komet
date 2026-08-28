@@ -247,6 +247,11 @@ async fn collect_text(
             let _ = tx.send(Vec::new());
             rx
         }),
+        request_permission: Box::new(|_kind, _summary, _choices| {
+            let (tx, rx) = tokio::sync::oneshot::channel::<komet_proto::PermissionChoice>();
+            let _ = tx.send(komet_proto::PermissionChoice::Deny);
+            rx
+        }),
         steering: steer_rx,
         interrupt: CancellationToken::new(),
     };

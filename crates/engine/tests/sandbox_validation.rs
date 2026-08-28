@@ -6,9 +6,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use komet_doc::{
-    MessageRole, SessionCommandEntry, SessionCommandPayload, SessionCommandStatus,
-};
+use komet_doc::{MessageRole, SessionCommandEntry, SessionCommandPayload, SessionCommandStatus};
 use komet_engine::{EngineCore, HarnessRegistry};
 use komet_harness::mock::MockHarness;
 use komet_proto::{
@@ -54,6 +52,7 @@ fn assemble(dir: &std::path::Path) -> EngineCore {
                 result: None,
                 error: None,
                 session_id: Some("hs-1".into()),
+                reason: None,
             },
         ],
     }));
@@ -243,4 +242,74 @@ async fn validation_yolo_does_not_override_explicit_options() {
         "valid yolo run to complete",
     )
     .await;
+}
+
+#[tokio::test]
+async fn other_provider_with_options_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path());
+    for provider in [
+        HarnessId::Cursor,
+        HarnessId::Grok,
+        HarnessId::Hermes,
+        HarnessId::Pi,
+        HarnessId::Antigravity,
+    ] {
+        let mut req = base_request();
+        req.harness = Some(provider);
+        req.sandbox_options = Some(SandboxOptions {
+            codex: Some(CodexSandbox {
+                sandbox_mode: Some(SandboxMode::WorkspaceWrite),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let cmd_id = format!("cmd-reject-{provider:?}");
+        queue_run(&core, &cmd_id, req);
+        wait_for(
+            || {
+                matches!(
+                    command_status(&core, &cmd_id),
+                    Some((SessionCommandStatus::Rejected, _))
+                )
+            },
+            "non-sandbox provider with options to be rejected",
+        )
+        .await;
+        let (status, resolution) = command_status(&core, &cmd_id).unwrap();
+        assert_eq!(status, SessionCommandStatus::Rejected);
+        assert!(
+            resolution.unwrap().contains("rejected"),
+            "provider {provider:?} should be rejected"
+        );
+    }
+    // Empty options must NOT be rejected: validation passes, so the command
+    // settles for a reason OTHER than a sandbox rejection (Cursor is not
+    // registered in this test rig, so the dispatch itself fails with
+    // "harness binary not found" — that is fine; what must never happen is
+    // the `sandbox_options rejected` validation outcome on an EMPTY table).
+    let dir2 = tempfile::tempdir().unwrap();
+    let core2 = assemble(dir2.path());
+    let mut empty = base_request();
+    empty.harness = Some(HarnessId::Cursor);
+    empty.sandbox_options = Some(SandboxOptions::default());
+    queue_run(&core2, "cmd-empty-ok", empty);
+    wait_for(
+        || {
+            matches!(
+                command_status(&core2, "cmd-empty-ok"),
+                Some((SessionCommandStatus::Applied, _))
+                    | Some((SessionCommandStatus::Rejected, _))
+                    | Some((SessionCommandStatus::Expired, _))
+            )
+        },
+        "empty options command to settle",
+    )
+    .await;
+    let (status, resolution) = command_status(&core2, "cmd-empty-ok").unwrap();
+    let resolution = resolution.unwrap_or_default();
+    assert!(
+        !resolution.contains("sandbox_options rejected"),
+        "empty options must pass sandbox validation, got {status:?}: {resolution}"
+    );
 }

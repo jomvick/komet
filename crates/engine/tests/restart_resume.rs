@@ -108,6 +108,7 @@ impl Harness for RecordingHarness {
                 result: None,
                 error: Some("Recording exited unexpectedly (exit code 1): boom".into()),
                 session_id: None,
+                reason: None,
             })]
         } else {
             vec![
@@ -127,6 +128,7 @@ impl Harness for RecordingHarness {
                     result: None,
                     error: None,
                     session_id: Some(self.session_id.clone()),
+                    reason: None,
                 }),
             ]
         };
@@ -474,6 +476,7 @@ impl Harness for PersistentHarness {
                         result: None,
                         error: None,
                         session_id: Some("hs-persist".into()),
+                        reason: None,
                     },
                 ]
             };

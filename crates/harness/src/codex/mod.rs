@@ -54,8 +54,8 @@ use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
 use komet_proto::{
-    AgentEvent, ApprovalPolicy, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest,
-    SandboxMode, SlashCommand, SteeringMode, UserInputAnswer, UserInputQuestion,
+    AgentEvent, ApprovalPolicy, CodexFeature, DoneStatus, HarnessId, Model, ReasoningLevel,
+    RunRequest, SandboxMode, SlashCommand, SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
 use crate::jsonrpc::{Incoming, RpcClient};
@@ -503,6 +503,7 @@ async fn run_session(session: Session) {
     } = session;
     let RunControls {
         request_input,
+        request_permission: _request_permission,
         mut steering,
         interrupt,
     } = controls;
@@ -554,9 +555,36 @@ async fn run_session(session: Session) {
                         ),
                     );
                 }
-                // NOTE: `web_search` and `features` have no app-server
-                // sandboxPolicy counterpart validated against 0.146.1 — they
-                // are intentionally NOT invented onto the wire.
+                if let Some(ws) = &cx.sandbox_workspace_write {
+                    if ws.exclude_slash_tmp {
+                        policy.insert("excludeSlashTmp".into(), true.into());
+                    }
+                    if ws.exclude_tmpdir_env_var {
+                        policy.insert("excludeTmpdirEnvVar".into(), true.into());
+                    }
+                }
+                // Paseo's webSearch is an enum, but the Codex CLI wire only
+                // carries a bool — anything non-disabled maps to `true`.
+                if cx.web_search.wire_bool() {
+                    policy.insert("webSearch".into(), true.into());
+                }
+                if !cx.features.is_empty() {
+                    policy.insert(
+                        "features".into(),
+                        Value::Object(
+                            cx.features
+                                .0
+                                .iter()
+                                .map(|(name, feature)| match feature {
+                                    CodexFeature::Enabled(b) => {
+                                        (name.clone(), Value::Bool(*b))
+                                    }
+                                    CodexFeature::Policy(v) => (name.clone(), v.clone()),
+                                })
+                                .collect(),
+                        ),
+                    );
+                }
                 (
                     serde_json::to_value(
                         cx.approval_policy
@@ -644,34 +672,36 @@ async fn run_session(session: Session) {
         Ok::<String, HarnessError>(thread_id)
     };
     let thread_id = tokio::select! {
-        res = setup => match res {
-            Ok(thread_id) => thread_id,
-            Err(e) => {
+            res = setup => match res {
+                Ok(thread_id) => thread_id,
+                Err(e) => {
+                    let _ = event_tx
+                        .send(Ok(AgentEvent::Done {
+                            status: DoneStatus::Errored,
+                            result: None,
+                            error: Some(e.to_string()),
+                            session_id: None,
+    reason: None,
+                        }))
+                        .await;
+                    shutdown_child(&mut child, kill_grace).await;
+                    return;
+                }
+            },
+            _ = interrupt.cancelled() => {
                 let _ = event_tx
                     .send(Ok(AgentEvent::Done {
-                        status: DoneStatus::Errored,
+                        status: DoneStatus::Interrupted,
                         result: None,
-                        error: Some(e.to_string()),
+                        error: None,
                         session_id: None,
+    reason: None,
                     }))
                     .await;
                 shutdown_child(&mut child, kill_grace).await;
                 return;
             }
-        },
-        _ = interrupt.cancelled() => {
-            let _ = event_tx
-                .send(Ok(AgentEvent::Done {
-                    status: DoneStatus::Interrupted,
-                    result: None,
-                    error: None,
-                    session_id: None,
-                }))
-                .await;
-            shutdown_child(&mut child, kill_grace).await;
-            return;
-        }
-    };
+        };
 
     let turn_params = |text: &str| -> Value {
         let mut p = serde_json::Map::new();
@@ -729,6 +759,7 @@ async fn run_session(session: Session) {
                     result: None,
                     error: Some(e.to_string()),
                     session_id: Some(thread_id.clone()),
+                    reason: None,
                 }))
                 .await;
             shutdown_child(&mut child, kill_grace).await;
@@ -755,324 +786,486 @@ async fn run_session(session: Session) {
 
     'main: loop {
         tokio::select! {
-            inc = incoming.recv() => match inc {
-                Some(Incoming::Notification { method, params }) => {
-                // Foreign-thread traffic FIRST: a child thread's turn/thread
-                // bookkeeping must never reach the parent turn router below
-                // (a child's turn/completed would settle the PARENT turn).
-                if let Some(nthread) = notification_thread_id(&method, &params)
-                    && !nthread.is_empty()
-                    && nthread != thread_id
-                {
-                    // Registration path: a child thread/started with an
-                    // explicit spawn source. The spawn-call mapping from a
-                    // subAgentActivity item wins (that id IS the parent
-                    // chip); this only seeds a fallback.
-                    if method == "thread/started"
-                        && params
-                            .pointer("/thread/source/subAgent/thread_spawn")
-                            .is_some()
-                    {
-                        children
-                            .entry(nthread.clone())
-                            .or_insert_with(|| nthread.clone());
-                    }
-                    match route_child_notification(&method) {
-                        ChildRoute::Parent => {
-                            // Unknown/parent-owned: fall through so a codex
-                            // update degrades to "the parent sees it",
-                            // never silent loss.
+                    inc = incoming.recv() => match inc {
+                        Some(Incoming::Notification { method, params }) => {
+                        // Foreign-thread traffic FIRST: a child thread's turn/thread
+                        // bookkeeping must never reach the parent turn router below
+                        // (a child's turn/completed would settle the PARENT turn).
+                        if let Some(nthread) = notification_thread_id(&method, &params)
+                            && !nthread.is_empty()
+                            && nthread != thread_id
+                        {
+                            // Registration path: a child thread/started with an
+                            // explicit spawn source. The spawn-call mapping from a
+                            // subAgentActivity item wins (that id IS the parent
+                            // chip); this only seeds a fallback.
+                            if method == "thread/started"
+                                && params
+                                    .pointer("/thread/source/subAgent/thread_spawn")
+                                    .is_some()
+                            {
+                                children
+                                    .entry(nthread.clone())
+                                    .or_insert_with(|| nthread.clone());
+                            }
+                            match route_child_notification(&method) {
+                                ChildRoute::Parent => {
+                                    // Unknown/parent-owned: fall through so a codex
+                                    // update degrades to "the parent sees it",
+                                    // never silent loss.
+                                }
+                                ChildRoute::Consumed => continue,
+                                ChildRoute::Subagent => {
+                                    // Attributed child traffic — but only for a
+                                    // REGISTERED child; pre-registration lifecycle
+                                    // (captured ordering: a child's status change
+                                    // can precede its registration) is dropped, not
+                                    // passed to the parent path.
+                                    if let Some(parent_call) = children.get(&nthread).cloned() {
+                                        let events: Vec<AgentEvent> = match method.as_str() {
+                                            // The child settling its turn IS the
+                                            // subagent finishing its assignment —
+                                            // the chip's terminal state.
+                                            "turn/completed" => vec![AgentEvent::Done {
+                                                status: if turn_error_message(&params).is_some()
+                                                    || params
+                                                        .pointer("/turn/status")
+                                                        .and_then(Value::as_str)
+                                                        == Some("failed")
+                                                {
+                                                    DoneStatus::Errored
+                                                } else {
+                                                    DoneStatus::Completed
+                                                },
+                                                result: None,
+                                                error: None,
+                                                session_id: Some(nthread.clone()),
+        reason: None,
+                                            }],
+                                            "turn/failed" => vec![AgentEvent::Done {
+                                                status: DoneStatus::Errored,
+                                                result: None,
+                                                error: turn_error_message(&params),
+                                                session_id: Some(nthread.clone()),
+        reason: None,
+                                            }],
+                                            "turn/aborted" => vec![AgentEvent::Done {
+                                                status: DoneStatus::Interrupted,
+                                                result: None,
+                                                error: None,
+                                                session_id: Some(nthread.clone()),
+        reason: None,
+                                            }],
+                                            "item/agentMessage/delta" => delta_text(&params)
+                                                .map(|text| AgentEvent::TextDelta { text })
+                                                .into_iter()
+                                                .collect(),
+                                            "item/reasoning/textDelta"
+                                            | "item/reasoning/summaryTextDelta" => delta_text(&params)
+                                                .map(|text| AgentEvent::ReasoningDelta { text })
+                                                .into_iter()
+                                                .collect(),
+                                            "item/started" | "item/completed" => {
+                                                let phase = if method == "item/started" {
+                                                    Phase::Started
+                                                } else {
+                                                    Phase::Completed
+                                                };
+                                                let item =
+                                                    params.get("item").cloned().unwrap_or(Value::Null);
+                                                // Same paragraphing as the parent:
+                                                // a child's completed message ends
+                                                // a paragraph in its transcript.
+                                                if phase == Phase::Completed
+                                                    && matches!(
+                                                        item_type(&item),
+                                                        "agentMessage" | "agent_message"
+                                                    )
+                                                {
+                                                    vec![AgentEvent::TextDelta {
+                                                        text: "\n\n".into(),
+                                                    }]
+                                                } else if matches!(
+                                                    item_type(&item),
+                                                    "userMessage" | "user_message"
+                                                ) {
+                                                    // A CHILD thread's user message
+                                                    // is the parent steering it (the
+                                                    // collab send_message path) —
+                                                    // its own entry in the subagent
+                                                    // doc. Completed only: both
+                                                    // lifecycle events carry the
+                                                    // full item.
+                                                    if phase == Phase::Completed {
+                                                        user_message_text(&item)
+                                                            .map(|text| AgentEvent::UserMessage { text })
+                                                            .into_iter()
+                                                            .collect()
+                                                    } else {
+                                                        Vec::new()
+                                                    }
+                                                } else {
+                                                    map_item(phase, &item)
+                                                }
+                                            }
+                                            "error" => vec![AgentEvent::Error {
+                                                message: params
+                                                    .pointer("/error/message")
+                                                    .and_then(Value::as_str)
+                                                    .or_else(|| {
+                                                        params.get("message").and_then(Value::as_str)
+                                                    })
+                                                    .unwrap_or("Codex subagent error")
+                                                    .to_owned(),
+                                            }],
+                                            "thread/closed" => vec![AgentEvent::Done {
+                                                status: DoneStatus::Completed,
+                                                result: None,
+                                                error: None,
+                                                session_id: Some(nthread.clone()),
+        reason: None,
+                                            }],
+                                            _ => Vec::new(),
+                                        };
+                                        for ev in events {
+                                            let wrapped = AgentEvent::Subagent {
+                                                parent_tool_use_id: parent_call.clone(),
+                                                event: Box::new(ev),
+                                            };
+                                            if !send(&event_tx, wrapped).await {
+                                                break 'main;
+                                            }
+                                        }
+                                    }
+                                    continue;
+                                }
+                            }
                         }
-                        ChildRoute::Consumed => continue,
-                        ChildRoute::Subagent => {
-                            // Attributed child traffic — but only for a
-                            // REGISTERED child; pre-registration lifecycle
-                            // (captured ordering: a child's status change
-                            // can precede its registration) is dropped, not
-                            // passed to the parent path.
-                            if let Some(parent_call) = children.get(&nthread).cloned() {
-                                let events: Vec<AgentEvent> = match method.as_str() {
-                                    // The child settling its turn IS the
-                                    // subagent finishing its assignment —
-                                    // the chip's terminal state.
-                                    "turn/completed" => vec![AgentEvent::Done {
-                                        status: if turn_error_message(&params).is_some()
-                                            || params
-                                                .pointer("/turn/status")
-                                                .and_then(Value::as_str)
-                                                == Some("failed")
+                        match method.as_str() {
+                            "turn/started" => router.note_started(turn_id(&params)),
+
+                            "item/agentMessage/delta" => {
+                                streamed_text.insert(item_id(&params));
+                                if let Some(text) = delta_text(&params)
+                                    && !send(&event_tx, AgentEvent::TextDelta { text }).await
+                                {
+                                    break 'main;
+                                }
+                            }
+
+                            "item/reasoning/textDelta" | "item/reasoning/summaryTextDelta" => {
+                                if let Some(text) = delta_text(&params)
+                                    && !send(&event_tx, AgentEvent::ReasoningDelta { text }).await
+                                {
+                                    break 'main;
+                                }
+                            }
+
+                            "item/started" | "item/completed" => {
+                                let phase = if method == "item/started" {
+                                    Phase::Started
+                                } else {
+                                    Phase::Completed
+                                };
+                                let item = params.get("item").cloned().unwrap_or(Value::Null);
+                                // A subAgentActivity item on the parent thread names a
+                                // child: register it (its call id = the parent chip
+                                // its traffic is attributed to). NEVER the root
+                                // thread itself — the wire emits subAgentActivity
+                                // about the root during collab runs, and registering
+                                // it would intercept every subsequent root
+                                // notification including turn/completed (the thread
+                                // would hang Working after the fleet finished).
+                                if matches!(
+                                    item_type(&item),
+                                    "subAgentActivity" | "sub_agent_activity"
+                                ) {
+                                    let child = item
+                                        .get("agentThreadId")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("");
+                                    let path = item
+                                        .get("agentPath")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("");
+                                    let call = item.get("id").and_then(Value::as_str).unwrap_or("");
+                                    if !child.is_empty()
+                                        && child != thread_id
+                                        && path != "/root"
+                                        && path != "/"
+                                        && !call.is_empty()
+                                    {
+                                        children.insert(child.to_owned(), call.to_owned());
+                                    } else if child == thread_id || path == "/root" || path == "/" {
+                                        // The root's own activity marker: no chip, no
+                                        // registration — it is not a subagent.
+                                        continue;
+                                    }
+                                }
+                                if matches!(item_type(&item), "agentMessage" | "agent_message") {
+                                    if phase == Phase::Completed {
+                                        // Fallback for non-streamed messages only.
+                                        let id = item.get("id").and_then(Value::as_str).unwrap_or("");
+                                        let text = item.get("text").and_then(Value::as_str).unwrap_or("");
+                                        if !streamed_text.contains(id)
+                                            && !text.is_empty()
+                                            && !send(&event_tx, AgentEvent::TextDelta { text: text.into() }).await
                                         {
-                                            DoneStatus::Errored
+                                            break 'main;
+                                        }
+                                        // Codex emits several assistant messages per
+                                        // turn (commentary, final answer); their
+                                        // deltas carry no separator, so consecutive
+                                        // messages rendered concatenated
+                                        // ("…waiting.Beta's 90-second…" — live
+                                        // finding). Close each message as a
+                                        // paragraph.
+                                        if !send(
+                                            &event_tx,
+                                            AgentEvent::TextDelta {
+                                                text: "\n\n".into(),
+                                            },
+                                        )
+                                        .await
+                                        {
+                                            break 'main;
+                                        }
+                                        // Deltas are token chunks, not steering
+                                        // boundaries: the completed item is the
+                                        // provider-authoritative end of the text part.
+                                        let (prev, _next) = rotate(&mut assistant_message_id);
+                                        if !send(
+                                            &event_tx,
+                                            AgentEvent::AssistantMessageCompleted {
+                                                assistant_message_id: prev,
+                                            },
+                                        )
+                                        .await
+                                        {
+                                            break 'main;
+                                        }
+                                    }
+                                } else {
+                                    for ev in map_item(phase, &item) {
+                                        if !send(&event_tx, ev).await {
+                                            break 'main;
+                                        }
+                                    }
+                                }
+                            }
+
+                            "thread/tokenUsage/updated" => {
+                                if let Some(usage) = usage_event(&params) {
+                                    pending_usage = Some(usage);
+                                }
+                            }
+
+                            "turn/completed" => {
+                                let id = turn_id(&params);
+                                router.note_completed(&id);
+                                // Item ids never span turns; without this the set grew
+                                // one entry per message for a persistent session's life.
+                                streamed_text.clear();
+                                if let Some(usage) = pending_usage.take()
+                                    && !send(&event_tx, usage).await
+                                {
+                                    break 'main;
+                                }
+                                let error = turn_error_message(&params).or_else(|| {
+                                    (params
+                                        .pointer("/turn/status")
+                                        .and_then(Value::as_str)
+                                        == Some("failed"))
+                                    .then(|| "Codex turn failed".to_owned())
+                                });
+                                let status = if interrupted {
+                                    DoneStatus::Interrupted
+                                } else if error.is_some() {
+                                    DoneStatus::Errored
+                                } else {
+                                    DoneStatus::Completed
+                                };
+                                done_current = true;
+                                if !send(
+                                    &event_tx,
+                                    AgentEvent::Done {
+                                        status,
+                                        result: None,
+                                        error,
+                                        session_id: Some(thread_id.clone()),
+        reason: None,
+                                    },
+                                )
+                                .await
+                                {
+                                    break 'main;
+                                }
+                                if interrupted {
+                                    done_after_interrupt = true;
+                                    break 'main;
+                                }
+                                // Persistent session: a steer that lost the race with
+                                // this turn's end becomes the next turn now; otherwise
+                                // stay alive for the mailbox — the caller owns teardown.
+                                if let Some(text) = queued_steers.pop_front() {
+                                    if !steer_as_new_turn(
+                                        &client,
+                                        turn_params(&text),
+                                        &mut router,
+                                        &event_tx,
+                                        &mut assistant_message_id,
+                                        &mut done_current,
+                                    )
+                                    .await
+                                    {
+                                        break 'main;
+                                    }
+                                } else if !steering_open {
+                                    break 'main;
+                                }
+                            }
+
+                            "turn/failed" => {
+                                router.note_completed(&turn_id(&params));
+                                if let Some(usage) = pending_usage.take()
+                                    && !send(&event_tx, usage).await
+                                {
+                                    break 'main;
+                                }
+                                done_current = true;
+                                if interrupted {
+                                    done_after_interrupt = true;
+                                }
+                                let _ = send(
+                                    &event_tx,
+                                    AgentEvent::Done {
+                                        status: if interrupted {
+                                            DoneStatus::Interrupted
                                         } else {
-                                            DoneStatus::Completed
+                                            DoneStatus::Errored
                                         },
                                         result: None,
-                                        error: None,
-                                        session_id: Some(nthread.clone()),
-                                    }],
-                                    "turn/failed" => vec![AgentEvent::Done {
-                                        status: DoneStatus::Errored,
-                                        result: None,
-                                        error: turn_error_message(&params),
-                                        session_id: Some(nthread.clone()),
-                                    }],
-                                    "turn/aborted" => vec![AgentEvent::Done {
+                                        error: Some(
+                                            turn_error_message(&params)
+                                                .unwrap_or_else(|| "Codex turn failed".into()),
+                                        ),
+                                        session_id: Some(thread_id.clone()),
+        reason: None,
+                                    },
+                                )
+                                .await;
+                                break 'main;
+                            }
+
+                            "turn/aborted" => {
+                                router.note_completed(&turn_id(&params));
+                                done_current = true;
+                                if interrupted {
+                                    done_after_interrupt = true;
+                                }
+                                let _ = send(
+                                    &event_tx,
+                                    AgentEvent::Done {
                                         status: DoneStatus::Interrupted,
                                         result: None,
                                         error: None,
-                                        session_id: Some(nthread.clone()),
-                                    }],
-                                    "item/agentMessage/delta" => delta_text(&params)
-                                        .map(|text| AgentEvent::TextDelta { text })
-                                        .into_iter()
-                                        .collect(),
-                                    "item/reasoning/textDelta"
-                                    | "item/reasoning/summaryTextDelta" => delta_text(&params)
-                                        .map(|text| AgentEvent::ReasoningDelta { text })
-                                        .into_iter()
-                                        .collect(),
-                                    "item/started" | "item/completed" => {
-                                        let phase = if method == "item/started" {
-                                            Phase::Started
-                                        } else {
-                                            Phase::Completed
-                                        };
-                                        let item =
-                                            params.get("item").cloned().unwrap_or(Value::Null);
-                                        // Same paragraphing as the parent:
-                                        // a child's completed message ends
-                                        // a paragraph in its transcript.
-                                        if phase == Phase::Completed
-                                            && matches!(
-                                                item_type(&item),
-                                                "agentMessage" | "agent_message"
-                                            )
+                                        session_id: Some(thread_id.clone()),
+        reason: None,
+                                    },
+                                )
+                                .await;
+                                break 'main;
+                            }
+
+                            "error" => {
+                                // 0.146.x nests it (`params.error.message`); older
+                                // builds were flat (`params.message`) — accept both.
+                                let message = params
+                                    .pointer("/error/message")
+                                    .and_then(Value::as_str)
+                                    .or_else(|| params.get("message").and_then(Value::as_str))
+                                    .unwrap_or("Codex error")
+                                    .to_owned();
+                                if !send(&event_tx, AgentEvent::Error { message }).await {
+                                    break 'main;
+                                }
+                            }
+
+                            // thread/status, mcpServer startup, account noise, … —
+                            // unknown notification methods are tolerated by design.
+                            _ => {}
+                        }
+                        }
+
+                        Some(Incoming::Request { id, method, params }) => {
+                            handle_server_request(
+                                &client,
+                                id,
+                                &method,
+                                &params,
+                                request.auto_approve,
+                                &request_input,
+                            );
+                        }
+
+                        // stdout EOF or reader gone: the app server exited.
+                        Some(Incoming::Eof) | None => break 'main,
+                    },
+
+                    steer = steering.recv(), if steering_open && !interrupted => match steer {
+                        Some(msg) => {
+                            let text = msg.prompt;
+                            if let Some(expected) = router.active.clone() {
+                                let steer_params = json!({
+                                    "threadId": thread_id,
+                                    "expectedTurnId": expected,
+                                    "input": [{ "type": "text", "text": text }],
+                                });
+                                match client.request("turn/steer", steer_params).await {
+                                    Ok(_) => {
+                                        let (prev, next) = rotate(&mut assistant_message_id);
+                                        if !send(
+                                            &event_tx,
+                                            AgentEvent::Steered {
+                                                assistant_message_id: Some(prev),
+                                                next_assistant_message_id: Some(next),
+                                            },
+                                        )
+                                        .await
                                         {
-                                            vec![AgentEvent::TextDelta {
-                                                text: "\n\n".into(),
-                                            }]
-                                        } else if matches!(
-                                            item_type(&item),
-                                            "userMessage" | "user_message"
-                                        ) {
-                                            // A CHILD thread's user message
-                                            // is the parent steering it (the
-                                            // collab send_message path) —
-                                            // its own entry in the subagent
-                                            // doc. Completed only: both
-                                            // lifecycle events carry the
-                                            // full item.
-                                            if phase == Phase::Completed {
-                                                user_message_text(&item)
-                                                    .map(|text| AgentEvent::UserMessage { text })
-                                                    .into_iter()
-                                                    .collect()
-                                            } else {
-                                                Vec::new()
-                                            }
-                                        } else {
-                                            map_item(phase, &item)
+                                            break 'main;
                                         }
                                     }
-                                    "error" => vec![AgentEvent::Error {
-                                        message: params
-                                            .pointer("/error/message")
-                                            .and_then(Value::as_str)
-                                            .or_else(|| {
-                                                params.get("message").and_then(Value::as_str)
-                                            })
-                                            .unwrap_or("Codex subagent error")
-                                            .to_owned(),
-                                    }],
-                                    "thread/closed" => vec![AgentEvent::Done {
-                                        status: DoneStatus::Completed,
-                                        result: None,
-                                        error: None,
-                                        session_id: Some(nthread.clone()),
-                                    }],
-                                    _ => Vec::new(),
-                                };
-                                for ev in events {
-                                    let wrapped = AgentEvent::Subagent {
-                                        parent_tool_use_id: parent_call.clone(),
-                                        event: Box::new(ev),
-                                    };
-                                    if !send(&event_tx, wrapped).await {
-                                        break 'main;
+                                    // A failed `turn/steer` does NOT mean the text is
+                                    // bad: most commonly the active turn finished
+                                    // between the UI send and this request. Queue it
+                                    // for redelivery as the next `turn/start` when the
+                                    // expected turn's end arrives (also the safe
+                                    // fallback for older Codex without steering).
+                                    Err(e) => {
+                                        tracing::debug!(
+                                            target: "komet_harness::codex",
+                                            "turn/steer rejected (queued as next turn): {e}"
+                                        );
+                                        if router.active.as_deref() == Some(expected.as_str())
+                                            && !router.is_completed(&expected)
+                                        {
+                                            queued_steers.push_back(text);
+                                        } else if !steer_as_new_turn(
+                                            &client,
+                                            turn_params(&text),
+                                            &mut router,
+                                            &event_tx,
+                                            &mut assistant_message_id,
+                                            &mut done_current,
+                                        )
+                                        .await
+                                        {
+                                            break 'main;
+                                        }
                                     }
                                 }
-                            }
-                            continue;
-                        }
-                    }
-                }
-                match method.as_str() {
-                    "turn/started" => router.note_started(turn_id(&params)),
-
-                    "item/agentMessage/delta" => {
-                        streamed_text.insert(item_id(&params));
-                        if let Some(text) = delta_text(&params)
-                            && !send(&event_tx, AgentEvent::TextDelta { text }).await
-                        {
-                            break 'main;
-                        }
-                    }
-
-                    "item/reasoning/textDelta" | "item/reasoning/summaryTextDelta" => {
-                        if let Some(text) = delta_text(&params)
-                            && !send(&event_tx, AgentEvent::ReasoningDelta { text }).await
-                        {
-                            break 'main;
-                        }
-                    }
-
-                    "item/started" | "item/completed" => {
-                        let phase = if method == "item/started" {
-                            Phase::Started
-                        } else {
-                            Phase::Completed
-                        };
-                        let item = params.get("item").cloned().unwrap_or(Value::Null);
-                        // A subAgentActivity item on the parent thread names a
-                        // child: register it (its call id = the parent chip
-                        // its traffic is attributed to). NEVER the root
-                        // thread itself — the wire emits subAgentActivity
-                        // about the root during collab runs, and registering
-                        // it would intercept every subsequent root
-                        // notification including turn/completed (the thread
-                        // would hang Working after the fleet finished).
-                        if matches!(
-                            item_type(&item),
-                            "subAgentActivity" | "sub_agent_activity"
-                        ) {
-                            let child = item
-                                .get("agentThreadId")
-                                .and_then(Value::as_str)
-                                .unwrap_or("");
-                            let path = item
-                                .get("agentPath")
-                                .and_then(Value::as_str)
-                                .unwrap_or("");
-                            let call = item.get("id").and_then(Value::as_str).unwrap_or("");
-                            if !child.is_empty()
-                                && child != thread_id
-                                && path != "/root"
-                                && path != "/"
-                                && !call.is_empty()
-                            {
-                                children.insert(child.to_owned(), call.to_owned());
-                            } else if child == thread_id || path == "/root" || path == "/" {
-                                // The root's own activity marker: no chip, no
-                                // registration — it is not a subagent.
-                                continue;
-                            }
-                        }
-                        if matches!(item_type(&item), "agentMessage" | "agent_message") {
-                            if phase == Phase::Completed {
-                                // Fallback for non-streamed messages only.
-                                let id = item.get("id").and_then(Value::as_str).unwrap_or("");
-                                let text = item.get("text").and_then(Value::as_str).unwrap_or("");
-                                if !streamed_text.contains(id)
-                                    && !text.is_empty()
-                                    && !send(&event_tx, AgentEvent::TextDelta { text: text.into() }).await
-                                {
-                                    break 'main;
-                                }
-                                // Codex emits several assistant messages per
-                                // turn (commentary, final answer); their
-                                // deltas carry no separator, so consecutive
-                                // messages rendered concatenated
-                                // ("…waiting.Beta's 90-second…" — live
-                                // finding). Close each message as a
-                                // paragraph.
-                                if !send(
-                                    &event_tx,
-                                    AgentEvent::TextDelta {
-                                        text: "\n\n".into(),
-                                    },
-                                )
-                                .await
-                                {
-                                    break 'main;
-                                }
-                                // Deltas are token chunks, not steering
-                                // boundaries: the completed item is the
-                                // provider-authoritative end of the text part.
-                                let (prev, _next) = rotate(&mut assistant_message_id);
-                                if !send(
-                                    &event_tx,
-                                    AgentEvent::AssistantMessageCompleted {
-                                        assistant_message_id: prev,
-                                    },
-                                )
-                                .await
-                                {
-                                    break 'main;
-                                }
-                            }
-                        } else {
-                            for ev in map_item(phase, &item) {
-                                if !send(&event_tx, ev).await {
-                                    break 'main;
-                                }
-                            }
-                        }
-                    }
-
-                    "thread/tokenUsage/updated" => {
-                        if let Some(usage) = usage_event(&params) {
-                            pending_usage = Some(usage);
-                        }
-                    }
-
-                    "turn/completed" => {
-                        let id = turn_id(&params);
-                        router.note_completed(&id);
-                        // Item ids never span turns; without this the set grew
-                        // one entry per message for a persistent session's life.
-                        streamed_text.clear();
-                        if let Some(usage) = pending_usage.take()
-                            && !send(&event_tx, usage).await
-                        {
-                            break 'main;
-                        }
-                        let error = turn_error_message(&params).or_else(|| {
-                            (params
-                                .pointer("/turn/status")
-                                .and_then(Value::as_str)
-                                == Some("failed"))
-                            .then(|| "Codex turn failed".to_owned())
-                        });
-                        let status = if interrupted {
-                            DoneStatus::Interrupted
-                        } else if error.is_some() {
-                            DoneStatus::Errored
-                        } else {
-                            DoneStatus::Completed
-                        };
-                        done_current = true;
-                        if !send(
-                            &event_tx,
-                            AgentEvent::Done {
-                                status,
-                                result: None,
-                                error,
-                                session_id: Some(thread_id.clone()),
-                            },
-                        )
-                        .await
-                        {
-                            break 'main;
-                        }
-                        if interrupted {
-                            done_after_interrupt = true;
-                            break 'main;
-                        }
-                        // Persistent session: a steer that lost the race with
-                        // this turn's end becomes the next turn now; otherwise
-                        // stay alive for the mailbox — the caller owns teardown.
-                        if let Some(text) = queued_steers.pop_front() {
-                            if !steer_as_new_turn(
+                            } else if !steer_as_new_turn(
                                 &client,
                                 turn_params(&text),
                                 &mut router,
@@ -1084,209 +1277,54 @@ async fn run_session(session: Session) {
                             {
                                 break 'main;
                             }
-                        } else if !steering_open {
-                            break 'main;
                         }
-                    }
-
-                    "turn/failed" => {
-                        router.note_completed(&turn_id(&params));
-                        if let Some(usage) = pending_usage.take()
-                            && !send(&event_tx, usage).await
-                        {
-                            break 'main;
-                        }
-                        done_current = true;
-                        if interrupted {
-                            done_after_interrupt = true;
-                        }
-                        let _ = send(
-                            &event_tx,
-                            AgentEvent::Done {
-                                status: if interrupted {
-                                    DoneStatus::Interrupted
-                                } else {
-                                    DoneStatus::Errored
-                                },
-                                result: None,
-                                error: Some(
-                                    turn_error_message(&params)
-                                        .unwrap_or_else(|| "Codex turn failed".into()),
-                                ),
-                                session_id: Some(thread_id.clone()),
-                            },
-                        )
-                        .await;
-                        break 'main;
-                    }
-
-                    "turn/aborted" => {
-                        router.note_completed(&turn_id(&params));
-                        done_current = true;
-                        if interrupted {
-                            done_after_interrupt = true;
-                        }
-                        let _ = send(
-                            &event_tx,
-                            AgentEvent::Done {
-                                status: DoneStatus::Interrupted,
-                                result: None,
-                                error: None,
-                                session_id: Some(thread_id.clone()),
-                            },
-                        )
-                        .await;
-                        break 'main;
-                    }
-
-                    "error" => {
-                        // 0.146.x nests it (`params.error.message`); older
-                        // builds were flat (`params.message`) — accept both.
-                        let message = params
-                            .pointer("/error/message")
-                            .and_then(Value::as_str)
-                            .or_else(|| params.get("message").and_then(Value::as_str))
-                            .unwrap_or("Codex error")
-                            .to_owned();
-                        if !send(&event_tx, AgentEvent::Error { message }).await {
-                            break 'main;
-                        }
-                    }
-
-                    // thread/status, mcpServer startup, account noise, … —
-                    // unknown notification methods are tolerated by design.
-                    _ => {}
-                }
-                }
-
-                Some(Incoming::Request { id, method, params }) => {
-                    handle_server_request(
-                        &client,
-                        id,
-                        &method,
-                        &params,
-                        request.auto_approve,
-                        &request_input,
-                    );
-                }
-
-                // stdout EOF or reader gone: the app server exited.
-                Some(Incoming::Eof) | None => break 'main,
-            },
-
-            steer = steering.recv(), if steering_open && !interrupted => match steer {
-                Some(msg) => {
-                    let text = msg.prompt;
-                    if let Some(expected) = router.active.clone() {
-                        let steer_params = json!({
-                            "threadId": thread_id,
-                            "expectedTurnId": expected,
-                            "input": [{ "type": "text", "text": text }],
-                        });
-                        match client.request("turn/steer", steer_params).await {
-                            Ok(_) => {
-                                let (prev, next) = rotate(&mut assistant_message_id);
-                                if !send(
-                                    &event_tx,
-                                    AgentEvent::Steered {
-                                        assistant_message_id: Some(prev),
-                                        next_assistant_message_id: Some(next),
-                                    },
-                                )
-                                .await
-                                {
-                                    break 'main;
-                                }
-                            }
-                            // A failed `turn/steer` does NOT mean the text is
-                            // bad: most commonly the active turn finished
-                            // between the UI send and this request. Queue it
-                            // for redelivery as the next `turn/start` when the
-                            // expected turn's end arrives (also the safe
-                            // fallback for older Codex without steering).
-                            Err(e) => {
-                                tracing::debug!(
-                                    target: "komet_harness::codex",
-                                    "turn/steer rejected (queued as next turn): {e}"
-                                );
-                                if router.active.as_deref() == Some(expected.as_str())
-                                    && !router.is_completed(&expected)
-                                {
-                                    queued_steers.push_back(text);
-                                } else if !steer_as_new_turn(
-                                    &client,
-                                    turn_params(&text),
-                                    &mut router,
-                                    &event_tx,
-                                    &mut assistant_message_id,
-                                    &mut done_current,
-                                )
-                                .await
-                                {
-                                    break 'main;
-                                }
+                        None => {
+                            // Mailbox closed (the caller's graceful idle-reap): finish
+                            // once nothing is in flight — mirrors codex.ts's steer loop
+                            // `finish()` on a null take.
+                            steering_open = false;
+                            if router.active.is_none() && queued_steers.is_empty() {
+                                break 'main;
                             }
                         }
-                    } else if !steer_as_new_turn(
-                        &client,
-                        turn_params(&text),
-                        &mut router,
-                        &event_tx,
-                        &mut assistant_message_id,
-                        &mut done_current,
-                    )
-                    .await
-                    {
-                        break 'main;
-                    }
-                }
-                None => {
-                    // Mailbox closed (the caller's graceful idle-reap): finish
-                    // once nothing is in flight — mirrors codex.ts's steer loop
-                    // `finish()` on a null take.
-                    steering_open = false;
-                    if router.active.is_none() && queued_steers.is_empty() {
-                        break 'main;
-                    }
-                }
-            },
+                    },
 
-            _ = interrupt.cancelled(), if !interrupt_sent => {
-                interrupt_sent = true;
-                interrupted = true;
-                if let Some(turn) = router.active.clone() {
-                    let client = client.clone();
-                    let thread = thread_id.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = client
-                            .request("turn/interrupt", json!({ "threadId": thread, "turnId": turn }))
-                            .await
-                        {
-                            tracing::debug!(
-                                target: "komet_harness::codex",
-                                "turn/interrupt failed (escalation will reap): {e}"
-                            );
+                    _ = interrupt.cancelled(), if !interrupt_sent => {
+                        interrupt_sent = true;
+                        interrupted = true;
+                        if let Some(turn) = router.active.clone() {
+                            let client = client.clone();
+                            let thread = thread_id.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = client
+                                    .request("turn/interrupt", json!({ "threadId": thread, "turnId": turn }))
+                                    .await
+                                {
+                                    tracing::debug!(
+                                        target: "komet_harness::codex",
+                                        "turn/interrupt failed (escalation will reap): {e}"
+                                    );
+                                }
+                            });
+                            // Escalate if the app server doesn't wind down (turn/aborted)
+                            // within the grace periods: SIGTERM, then SIGKILL.
+                            if let Some(pid) = child.id() {
+                                escalation = Some(tokio::spawn(async move {
+                                    tokio::time::sleep(interrupt_grace).await;
+                                    send_signal(pid, Signal::Term);
+                                    tokio::time::sleep(kill_grace).await;
+                                    send_signal(pid, Signal::Kill);
+                                }));
+                            }
+                        } else {
+                            // Idle between turns: nothing to interrupt — the terminal
+                            // bookkeeping below still guarantees Done { Interrupted }.
+                            break 'main;
                         }
-                    });
-                    // Escalate if the app server doesn't wind down (turn/aborted)
-                    // within the grace periods: SIGTERM, then SIGKILL.
-                    if let Some(pid) = child.id() {
-                        escalation = Some(tokio::spawn(async move {
-                            tokio::time::sleep(interrupt_grace).await;
-                            send_signal(pid, Signal::Term);
-                            tokio::time::sleep(kill_grace).await;
-                            send_signal(pid, Signal::Kill);
-                        }));
-                    }
-                } else {
-                    // Idle between turns: nothing to interrupt — the terminal
-                    // bookkeeping below still guarantees Done { Interrupted }.
-                    break 'main;
-                }
-            },
+                    },
 
-            _ = event_tx.closed() => break 'main,
-        }
+                    _ = event_tx.closed() => break 'main,
+                }
     }
 
     // Terminal bookkeeping: never end the stream without a Done unless the
@@ -1299,6 +1337,7 @@ async fn run_session(session: Session) {
                     result: None,
                     error: None,
                     session_id: Some(thread_id.clone()),
+                    reason: None,
                 }))
                 .await;
         } else if !interrupted && !done_current {
@@ -1316,6 +1355,7 @@ async fn run_session(session: Session) {
                         &stderr_tail,
                     )),
                     session_id: Some(thread_id.clone()),
+                    reason: None,
                 }))
                 .await;
         }

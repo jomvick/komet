@@ -632,7 +632,7 @@ pub struct AppState {
     /// bootstrap so child views can persist small preference files.
     pub data_dir: Option<PathBuf>,
     pub workspace_state: Option<komet_proto::WorkspaceState>,
-    pub access_mode: komet_proto::AccessMode,
+    pub access_mode: komet_proto::SandboxLevel,
     engine: Option<EngineHandle>,
     boot_config: Option<EngineBootConfig>,
     watch_tasks: Vec<Task<()>>,
@@ -670,7 +670,7 @@ impl AppState {
             review_comment_flushes: HashMap::new(),
             data_dir: None,
             workspace_state: None,
-            access_mode: komet_proto::AccessMode::FullAccess,
+            access_mode: komet_proto::SandboxLevel::WorkspaceWrite,
             engine: None,
             boot_config: None,
             watch_tasks: Vec::new(),
@@ -852,9 +852,10 @@ impl AppState {
     /// Derives or returns the current context usage metrics for the selected chat.
     pub fn current_context_usage(&self) -> komet_proto::ContextUsageStats {
         if let Some(chat_id) = &self.selected_chat
-            && let Some(stats) = self.context_usage.get(chat_id) {
-                return stats.clone();
-            }
+            && let Some(stats) = self.context_usage.get(chat_id)
+        {
+            return stats.clone();
+        }
         let model_name = self
             .selected_chat_row()
             .and_then(|c| c.config.as_ref())
@@ -2713,11 +2714,7 @@ mod tests {
             GatePhase::Ready
         );
         assert_eq!(
-            gate_phase(
-                &ConnectionStatus::Ready,
-                Some(WorkspaceScope::Synced),
-                None
-            ),
+            gate_phase(&ConnectionStatus::Ready, Some(WorkspaceScope::Synced), None),
             GatePhase::Ready
         );
         assert_eq!(

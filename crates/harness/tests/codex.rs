@@ -70,6 +70,7 @@ fn controls(
             let _ = tx.send(answers);
             rx
         }),
+        request_permission: RunControls::noop_permission(),
         steering: steer_rx,
         interrupt: token.clone(),
     };
@@ -274,6 +275,7 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
             result: None,
             error: None,
             session_id: Some("th-1".into()),
+            reason: None,
         })
     );
 }
@@ -317,6 +319,7 @@ async fn steering_uses_turn_steer_with_expected_turn_id() {
             result: None,
             error: None,
             session_id: Some("th-1".into()),
+            reason: None,
         })
     );
 }
@@ -390,6 +393,7 @@ async fn approvals_round_trip_as_input_requests() {
             let _ = tx.send(answers);
             rx
         }),
+        request_permission: RunControls::noop_permission(),
         steering: steer_rx,
         interrupt: token.clone(),
     };
@@ -420,6 +424,7 @@ async fn approvals_round_trip_as_input_requests() {
             result: None,
             error: None,
             session_id: Some("th-1".into()),
+            reason: None,
         })
     );
 }
@@ -473,6 +478,7 @@ async fn interrupt_sends_turn_interrupt_and_maps_aborted() {
             result: None,
             error: None,
             session_id: Some("th-1".into()),
+            reason: None,
         })
     );
 }
@@ -509,6 +515,7 @@ async fn unresponsive_child_is_reaped_with_interrupted_done() {
             result: None,
             error: None,
             session_id: Some("th-1".into()),
+            reason: None,
         })
     );
 }
@@ -524,6 +531,7 @@ async fn turn_failed_maps_to_errored_done() {
             result: None,
             error: Some("boom".into()),
             session_id: Some("th-1".into()),
+            reason: None,
         })
     );
 }
@@ -549,6 +557,7 @@ async fn resume_falls_back_to_fresh_thread() {
             result: None,
             error: None,
             session_id: Some("th-fresh".into()),
+            reason: None,
         })
     );
 }
