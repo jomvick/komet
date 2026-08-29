@@ -563,8 +563,8 @@ async fn run_session(session: Session) {
                         policy.insert("excludeTmpdirEnvVar".into(), true.into());
                     }
                 }
-                // Codex filesystem entries — maps to sandbox.filesystem.
-                if !cx.filesystem.is_empty() {
+                // Codex filesystem: explicit entries + auto read-only protected subpaths per root (B3).
+                {
                     let mut fs_map = serde_json::Map::new();
                     for entry in &cx.filesystem {
                         let access_val = match entry.access {
@@ -574,16 +574,30 @@ async fn run_session(session: Session) {
                         };
                         fs_map.insert(entry.path.clone(), Value::String(access_val.to_string()));
                     }
-                    policy.insert("filesystem".into(), Value::Object(fs_map));
+                    // B3: auto-inject .git/.codex/.agents as read-only under each writable root (and cwd fallback)
+                    let roots: Vec<String> = if cx.writable_roots.is_empty() {
+                        vec![]
+                    } else {
+                        cx.writable_roots.iter().map(|p| p.display().to_string()).collect()
+                    };
+                    for root in &roots {
+                        for rule in komet_proto::default_read_only_subpaths_for_root(root) {
+                            fs_map.entry(rule.path).or_insert(Value::String("read".into()));
+                        }
+                    }
+                    if !fs_map.is_empty() {
+                        policy.insert("filesystem".into(), Value::Object(fs_map));
+                    }
                 }
-                // Codex shell environment policy — excludes env vars from sandbox.
-                if let Some(pol) = &cx.shell_env_policy {
-                    if !pol.exclude.is_empty() {
-                        let exclude_arr: Vec<Value> = pol
-                            .exclude
-                            .iter()
-                            .map(|v| Value::String(v.clone()))
-                            .collect();
+                // Codex shell environment policy — excludes env vars from sandbox (B2 defaults).
+                {
+                    let effective_exclude: Vec<String> = match &cx.shell_env_policy {
+                        Some(pol) if !pol.exclude.is_empty() => pol.exclude.clone(),
+                        _ if mode != SandboxMode::DangerFullAccess => komet_proto::DEFAULT_CODEX_SHELL_EXCLUDE.iter().map(|s| s.to_string()).collect(),
+                        _ => vec![],
+                    };
+                    if !effective_exclude.is_empty() {
+                        let exclude_arr: Vec<Value> = effective_exclude.into_iter().map(Value::String).collect();
                         let mut sep_obj = serde_json::Map::new();
                         sep_obj.insert("exclude".into(), Value::Array(exclude_arr));
                         policy.insert("shellEnvironmentPolicy".into(), Value::Object(sep_obj));

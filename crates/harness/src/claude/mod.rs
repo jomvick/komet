@@ -1224,6 +1224,28 @@ mod tests {
     }
 
     #[test]
+    fn strict_allowlist_wire() {
+        let mut req = base_request();
+        req.sandbox_options = Some(komet_proto::SandboxOptions {
+            claude: Some(komet_proto::ClaudeSandbox {
+                network: komet_proto::NetworkSandbox {
+                    allowed_hosts: vec!["crates.io".into()],
+                    strict_allowlist: Some(true),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let h = ClaudeHarness::new();
+        let args = argv(&h.build_command(&PathBuf::from("claude"), &req));
+        let settings = settings_json(&args);
+        let network = settings["sandbox"]["network"].as_object().expect("network object");
+        assert_eq!(network["strictAllowlist"], json!(true));
+        assert_eq!(network["allowedDomains"], json!(["crates.io"]));
+    }
+
+    #[test]
     fn settings_permissions_passthrough_merges_into_permissions() {
         let mut req = base_request();
         req.sandbox_options = Some(komet_proto::SandboxOptions {

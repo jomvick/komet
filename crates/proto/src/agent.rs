@@ -111,6 +111,7 @@ impl SandboxOptions {
                 codex: Some(CodexSandbox {
                     sandbox_mode: Some(SandboxMode::ReadOnly),
                     approval_policy: Some(ApprovalPolicy::Never),
+                    shell_env_policy: Some(ShellEnvPolicy::with_defaults()),
                     ..Default::default()
                 }),
                 claude: Some(ClaudeSandbox {
@@ -154,6 +155,7 @@ impl SandboxOptions {
             SandboxLevel::WorkspaceWrite => Self {
                 codex: Some(CodexSandbox {
                     sandbox_mode: Some(SandboxMode::WorkspaceWrite),
+                    shell_env_policy: Some(ShellEnvPolicy::with_defaults()),
                     ..Default::default()
                 }),
                 claude: Some(ClaudeSandbox {
@@ -588,6 +590,10 @@ pub struct OpenCodePerms {
     /// restricted levels; empty = no extra deny rules.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sensitive_read_deny: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opencode_sandbox_runtime: Option<bool>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read_only_paths: Vec<String>,
 }
 
 /// Default sensitive paths OpenCode should refuse to `read` in restricted
@@ -1298,6 +1304,8 @@ pub struct PermissionRule {
     pub effect: Perm,
 }
 
+pub const DEFAULT_CODEX_SHELL_EXCLUDE: &[&str] = &["*_KEY", "*_TOKEN", "*_SECRET", "*_PASSWORD", "AWS_*"];
+
 /// Shell environment policy (Codex `shell_environment_policy`).
 /// Controls which env vars are excluded from the sandbox.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -1306,6 +1314,9 @@ pub struct ShellEnvPolicy {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exclude: Vec<String>,
 }
+impl ShellEnvPolicy { pub fn with_defaults() -> Self { Self { exclude: DEFAULT_CODEX_SHELL_EXCLUDE.iter().map(|s| s.to_string()).collect() } } }
+/// Returns  entries
+pub fn default_read_only_subpaths_for_root(root: &str) -> Vec<CodexFSRule> { const PROTECTED: &[&str] = &[".git", ".codex", ".agents"]; let base = root.trim_end_matches("/"); PROTECTED.iter().map(|n| CodexFSRule { path: format!("{base}/{n}"), access: FSAccess::Read }).collect() }
 
 /// A filesystem access entry (Codex `filesystem."path" = access`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
