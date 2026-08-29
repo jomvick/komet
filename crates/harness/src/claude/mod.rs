@@ -405,16 +405,20 @@ impl ClaudeHarness {
                     perms.insert(k.clone(), v.clone());
                 }
             }
-            // Claude native permission rules — maps to settings.permissions
-            // entries: {action}({resource}) → effect.
+            // Claude native permission rules → settings.permissions {allow,ask,deny}:[].
             for rule in &c.permissions {
-                let key = format!("{}({})", rule.action, rule.resource);
-                let effect_val = match rule.effect {
-                    komet_proto::Perm::Allow => Value::String("allow".into()),
-                    komet_proto::Perm::Ask => Value::String("ask".into()),
-                    komet_proto::Perm::Deny => Value::String("deny".into()),
+                let entry = format!("{}({})", rule.action, rule.resource);
+                let list_key = match rule.effect {
+                    komet_proto::Perm::Allow => "allow",
+                    komet_proto::Perm::Ask => "ask",
+                    komet_proto::Perm::Deny => "deny",
                 };
-                perms.insert(key, effect_val);
+                perms
+                    .entry(list_key.to_string())
+                    .or_insert_with(|| Value::Array(Vec::new()))
+                    .as_array_mut()
+                    .unwrap()
+                    .push(Value::String(entry));
             }
             settings.insert("permissions".into(), Value::Object(perms));
         }

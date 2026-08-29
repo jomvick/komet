@@ -311,6 +311,8 @@ async fn permission_timeout_auto_denies_and_resolves() {
         "permission part in doc",
     )
     .await;
+    let request_id = permission_request_id(&core);
+    assert!(request_id.is_some(), "permission part was created");
 
     // The engine must NOT output the agent's next command: the unanswered
     // request auto-denies → the run interrupts → it settles idle. (The
@@ -330,9 +332,6 @@ async fn permission_timeout_auto_denies_and_resolves() {
             ))),
         "the agent must not continue after a timeout auto-deny"
     );
-    // The auto-denied request is delivered (true) and the doc part resolved.
-    let request_id = permission_request_id(&core);
-    assert!(request_id.is_some(), "permission part was created");
     let delivered = core
         .sessions
         .respond_permission(CHAT, request_id.as_ref().unwrap(), PermissionChoice::Allow);
