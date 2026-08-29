@@ -262,6 +262,8 @@ impl ClaudeHarness {
         //   permission-mode stays "default").
         // - `network.allowed_hosts/denied_hosts` are placed under the nested
         //   network object using Claude CLI's allowedDomains and deniedDomains keys.
+        //   The two bools below (allowUnsandboxedCommands, failIfUnavailable) ride
+        //   the generated settings.sandbox (A2: fail closed when sandbox is active).
         if let Some(c) = claude_opts {
             let mut perms = serde_json::Map::new();
             perms.insert("defaultMode".into(), Value::String("default".into()));
@@ -321,20 +323,25 @@ impl ClaudeHarness {
                 }
                 perms.insert("deny".into(), Value::Array(deny_arr));
             }
-            if !c.network.allowed_hosts.is_empty() || !c.network.denied_hosts.is_empty() {
-                let mut sandbox = serde_json::Map::new();
-                // Merge existing settings.sandbox first (without overwriting network restrictions)
-                if let Some(fs_sandbox) = c.settings.sandbox.clone() {
-                    if let Some(obj) = fs_sandbox.as_object() {
-                        for (k, v) in obj {
-                            // Skip network keys from settings.sandbox to prevent overwriting
-                            if k != "network" {
-                                sandbox.insert(k.clone(), v.clone());
-                            }
+            // ── settings.sandbox (unified) ────────────────────────────────
+            // Build the Claude sandbox object once and merge: existing
+            // `settings.sandbox`, network restrictions, credentials, and the
+            // A2 fail-closed bools.
+            let mut sandbox = serde_json::Map::new();
+            if let Some(fs_sandbox) = c.settings.sandbox.clone() {
+                if let Some(obj) = fs_sandbox.as_object() {
+                    for (k, v) in obj {
+                        // Skip network keys from settings.sandbox — overwritten
+                        // by the generated restrictions below.
+                        if k != "network" {
+                            sandbox.insert(k.clone(), v.clone());
                         }
                     }
                 }
-                // Place network restrictions under the nested network object
+            }
+            let has_network =
+                !c.network.allowed_hosts.is_empty() || !c.network.denied_hosts.is_empty();
+            if has_network || c.network.strict_allowlist.is_some() {
                 let mut network = serde_json::Map::new();
                 if !c.network.allowed_hosts.is_empty() {
                     network.insert(
@@ -367,9 +374,31 @@ impl ClaudeHarness {
                     network.insert("strictAllowlist".into(), Value::Bool(strict));
                 }
                 sandbox.insert("network".into(), Value::Object(network));
+            }
+            // Claude credentials — maps to sandbox.credentials.files.
+            if !c.credentials.is_empty() {
+                let cred_arr: Vec<Value> = c
+                    .credentials
+                    .iter()
+                    .map(|p| Value::String(p.clone()))
+                    .collect();
+                let mut cred_obj = serde_json::Map::new();
+                cred_obj.insert("files".into(), Value::Array(cred_arr));
+                sandbox.insert("credentials".into(), Value::Object(cred_obj));
+            }
+            // A2 — fail closed: while the sandbox is active, commands that can't
+            // be sandboxed must FAIL rather than fall back to the regular
+            // permission flow. Allow the escape hatch only when the caller asks.
+            sandbox.insert(
+                "allowUnsandboxedCommands".into(),
+                Value::Bool(c.allow_unsandboxed_commands),
+            );
+            sandbox.insert(
+                "failIfUnavailable".into(),
+                Value::Bool(c.fail_if_unavailable),
+            );
+            if !sandbox.is_empty() {
                 settings.insert("sandbox".into(), Value::Object(sandbox));
-            } else if let Some(s) = c.settings.sandbox.clone() {
-                settings.insert("sandbox".into(), s);
             }
             if let Some(extra) = c.settings_permissions.as_object() {
                 for (k, v) in extra {
@@ -386,27 +415,6 @@ impl ClaudeHarness {
                     komet_proto::Perm::Deny => Value::String("deny".into()),
                 };
                 perms.insert(key, effect_val);
-            }
-            // Claude credentials — maps to sandbox.credentials.files.
-            if !c.credentials.is_empty() {
-                let mut sandbox_obj = serde_json::Map::new();
-                // Merge existing sandbox settings first.
-                if let Some(fs_sandbox) = c.settings.sandbox.clone() {
-                    if let Some(obj) = fs_sandbox.as_object() {
-                        for (k, v) in obj {
-                            sandbox_obj.insert(k.clone(), v.clone());
-                        }
-                    }
-                }
-                let cred_arr: Vec<Value> = c
-                    .credentials
-                    .iter()
-                    .map(|p| Value::String(p.clone()))
-                    .collect();
-                let mut cred_obj = serde_json::Map::new();
-                cred_obj.insert("files".into(), Value::Array(cred_arr));
-                sandbox_obj.insert("credentials".into(), Value::Object(cred_obj));
-                settings.insert("sandbox".into(), Value::Object(sandbox_obj));
             }
             settings.insert("permissions".into(), Value::Object(perms));
         }

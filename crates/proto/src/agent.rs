@@ -144,6 +144,10 @@ impl SandboxOptions {
                     external_directory: None,
                     webfetch: None,
                     websearch: None,
+                    sensitive_read_deny: OPCODE_SENSITIVE_READ_DENY
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
                     ..Default::default()
                 }),
             },
@@ -152,12 +156,31 @@ impl SandboxOptions {
                     sandbox_mode: Some(SandboxMode::WorkspaceWrite),
                     ..Default::default()
                 }),
-                claude: Some(ClaudeSandbox::default()),
+                claude: Some(ClaudeSandbox {
+                    // A6 — defense in depth: komet-level mirror of Claude's
+                    // protected paths. Even with the OS sandbox active, these
+                    // config surfaces are explicitly denied so a prompt
+                    // injection can't rewrite the permission policy itself.
+                    filesystem: FilesystemSandbox {
+                        deny_write: vec![
+                            ".claude/settings.json".into(),
+                            ".claude/settings.local.json".into(),
+                            ".claude/hooks/**".into(),
+                            ".mcp.json".into(),
+                        ],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
                 opencode: Some(OpenCodePerms {
                     bash: BashPerms {
                         patterns: vec![("*".into(), Perm::Ask)],
                     },
                     edit: Some(Perm::Ask),
+                    sensitive_read_deny: OPCODE_SENSITIVE_READ_DENY
+                        .iter()
+                        .map(|s| s.to_string())
+                        .collect(),
                     ..Default::default()
                 }),
             },
@@ -557,7 +580,33 @@ pub struct OpenCodePerms {
     pub task: Option<Perm>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doom_loop: Option<Perm>,
+    /// Sensitive paths to deny `read` on, by default (C3). Matching
+    /// OpenCode's default `.env` deny and the upstream plugin's defaults;
+    /// e.g. `~/.ssh`, `~/.aws/credentials`, `~/.config/gcloud`, `~/.npmrc`,
+    /// `.env`. Emitted as granular `read` deny patterns so an ambient
+    /// `"*": "allow"` read never exposes them. Populated by `from_level` for
+    /// restricted levels; empty = no extra deny rules.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sensitive_read_deny: Vec<String>,
 }
+
+/// Default sensitive paths OpenCode should refuse to `read` in restricted
+/// sandbox levels (C3) — matches OpenCode's intrinsic `.env` deny plus the
+/// upstream `opencode-sandbox-plugin` defaults. `~` is expanded by OpenCode
+/// at match time.
+pub const OPCODE_SENSITIVE_READ_DENY: &[&str] = &[
+    ".env",
+    ".env.*",
+    "~/.ssh/**",
+    "~/.aws/credentials",
+    "~/.aws/config",
+    "~/.config/gcloud/**",
+    "~/.npmrc",
+    "~/.netrc",
+    "~/.git-credentials",
+    "~/.docker/config.json",
+    "~/.kube/config",
+];
 
 impl OpenCodePerms {
     /// The trailing `"*"` bash fallback perm, if any (see [`BashPerms`]).

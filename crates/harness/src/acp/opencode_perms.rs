@@ -47,6 +47,23 @@ pub fn permission_config(perms: &OpenCodePerms) -> String {
         ("task", perms.task),
         ("doom_loop", perms.doom_loop),
     ];
+    // C3 — sensitive read deny: when no explicit `read` perm was set, emit a
+    // granular `read` pattern map that denies the sensitive paths while
+    // keeping ambient reads allowed. An explicit user `read` wins (their
+    // choice, no silent override in either direction).
+    if perms.read.is_none() && !perms.sensitive_read_deny.is_empty() {
+        out.push_str(",\"read\":{");
+        let mut first = true;
+        for pattern in &perms.sensitive_read_deny {
+            if !first {
+                out.push(',');
+            }
+            first = false;
+            push_key(&mut out, pattern);
+            out.push_str(":\"deny\"");
+        }
+        out.push_str(",\"*\":\"allow\"}");
+    }
     for (tool, perm) in &perms.unscoped_actions {
         if dedicated.iter().any(|(n, p)| *n == tool && p.is_some()) {
             // The dedicated field renders this key below; skip the duplicate.
@@ -133,6 +150,7 @@ mod tests {
             execute: None,
             task: None,
             doom_loop: None,
+            sensitive_read_deny: vec![],
         }
     }
 
@@ -223,6 +241,43 @@ mod tests {
         assert_eq!(
             permission_config(&p),
             r#"{"bash":{"*":"ask"},"webfetch":"deny"}"#
+        );
+    }
+
+    #[test]
+    fn sensitive_read_deny_emits_granular_map_when_read_unset() {
+        // C3: restricted levels populate sensitive_read_deny; with no explicit
+        // `read`, the overlay denies the sensitive paths and keeps ambient
+        // reads allowed via the trailing "*":"allow".
+        let p = OpenCodePerms {
+            bash: BashPerms {
+                patterns: vec![("*".to_owned(), Perm::Ask)],
+            },
+            unscoped_actions: Default::default(),
+            sensitive_read_deny: vec![".env".to_owned(), "~/.ssh/**".to_owned()],
+            ..Default::default()
+        };
+        assert_eq!(
+            permission_config(&p),
+            r#"{"bash":{"*":"ask"},"read":{".env":"deny","~/.ssh/**":"deny","*":"allow"}}"#
+        );
+    }
+
+    #[test]
+    fn explicit_read_beats_sensitive_deny_defaults() {
+        // An explicit user `read` wins — no silent override in either direction.
+        let p = OpenCodePerms {
+            bash: BashPerms {
+                patterns: vec![("*".to_owned(), Perm::Ask)],
+            },
+            unscoped_actions: Default::default(),
+            read: Some(Perm::Allow),
+            sensitive_read_deny: vec![".env".to_owned()],
+            ..Default::default()
+        };
+        assert_eq!(
+            permission_config(&p),
+            r#"{"bash":{"*":"ask"},"read":"allow"}"#
         );
     }
 }
