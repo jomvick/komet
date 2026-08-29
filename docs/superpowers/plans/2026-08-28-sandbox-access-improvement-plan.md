@@ -139,11 +139,9 @@
 **Rationale:** Codex's permission profiles (`:read-only`, `:workspace`, `:danger-full-access`) with inheritance and `extends` are the cleanest model. Komet should adopt this profile pattern and add the missing `Restricted` read access.
 
 #### B1. Add `CodexSandbox` `read_only_access` mapping to `ReadOnlyAccess::Restricted`
-- **What:** Map komet's `CodexSandbox` to Codex's `ReadOnlyAccess::Restricted { include_platform_defaults, readable_roots }` when in read-only mode
-- **Why:** Currently komet maps `ReadOnly` to `SandboxMode::ReadOnly` + `ApprovalPolicy::Never` but doesn't express the granular `ReadOnlyAccess::Restricted` form that limits reads to current directory + minimal platform roots
-- **Action:** Add `read_only_access` field to `CodexSandbox` proto struct, mapper emits `ReadOnlyAccess::Restricted` when appropriate
-- **Files:** `crates/proto/src/agent.rs`, `crates/harness/src/codex/mod.rs`, `crates/harness/src/codex/normalize.rs`
-- **Test:** Verify `read_only_access.restricted` produces the restricted profile in the wire request
+- **Status: BLOCKED by the wire (verified live 2026-08-28, codex-cli 0.147.0 app-server).**
+- **Live evidence:** `turn/start` sandboxPolicy accepted `{"type":"readOnly","readOnlyAccess":"restricted"}` without error while `{"type":"bogus"}` was rejected (`unknown variant, expected one of dangerFullAccess|readOnly|externalSandbox|workspaceWrite`) → unknown fields are silently ignored, so `readOnlyAccess` is NOT a parsed field. Likewise `thread/start`'s `sandbox` variants are **unit** (`{"read-only": {…}}` → `expected unit`); no read-access data exists there either. A type-mismatch probe confirmed the camelCase fields komet already sends (`writableRoots`, `networkAccess`, `excludeSlashTmp`, `excludeTmpdirEnvVar`) ARE parsed and honored (bad types rejected), while snake_case spellings are ignored.
+- **Decision:** do NOT add a `read_only_access` field — it would be a silent no-op (the class of bug this plan exists to prevent). Re-evaluate when a Codex release exposes the restricted-read surface on the wire. The *intent* (limit reads in read-only mode) is currently only achievable via the OS-level layer (Track D).
 
 #### B2. Implement env var masking (`shell_environment_policy`)
 - **What:** Add `CodexSandbox.env_exclude` field (`Vec<String>`) mapping to Codex's `[shell_environment_policy] exclude` — masks `*_KEY`, `*_TOKEN`, `*_SECRET`, `*_PASSWORD`, `AWS_*`
