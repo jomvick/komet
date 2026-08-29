@@ -1283,8 +1283,19 @@ impl Harness for AcpHarness {
                 let path = dir.path().join("opencode.json");
                 let doc = opencode_perms::opencode_config_document(perms);
                 std::fs::write(&path, doc).map_err(HarnessError::Io)?;
-                // Keep TempDir alive by forgetting? Instead keep dir handle alongside path.
-                // We'll store TempDir in Session; for now return dir+path.
+                // C1: opt-in sandbox-runtime — write sandbox.json alongside overlay
+                if let Some(cfg) = opencode_perms::sandbox_runtime_config(perms, &request.cwd) {
+                    let sandbox_path = dir.path().join("sandbox.json");
+                    std::fs::write(&sandbox_path, cfg).map_err(HarnessError::Io)?;
+                    // Best-effort: also materialise into <cwd>/.opencode/sandbox.json so the
+                    // plugin (which reads from cwd, not OPENCODE_CONFIG_CONTENT) sees it.
+                    // Overlay dir is temp; cwd copy is additive and never overwrites user file
+                    // without explicit opt-in — we only write if the file doesn't exist.
+                    let cwd_sandbox = std::path::Path::new(&request.cwd).join(".opencode/sandbox.json");
+                    if cwd_sandbox.parent().is_some_and(|p| p.exists()) && !cwd_sandbox.exists() {
+                        let _ = std::fs::write(&cwd_sandbox, std::fs::read(&sandbox_path).unwrap_or_default());
+                    }
+                }
                 (Some(dir), Some(path))
             } else {
                 (None, None)
