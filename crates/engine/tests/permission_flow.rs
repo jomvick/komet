@@ -40,6 +40,7 @@ fn run_request(prompt: &str) -> RunRequest {
         attachments: Vec::new(),
         worktree: None,
         resume: None,
+        permission_timeout_ms: None,
     }
 }
 
@@ -291,4 +292,80 @@ async fn deny_stops_agent() {
         "the agent must not continue after a denial"
     );
     core.sessions.shutdown().await;
+
+#[tokio::test(flavor = "multi_thread")]
+async fn permission_timeout_auto_denies_and_resolves() {
+    // D4 — the hang guard: a runtime permission request left unanswered past
+    // the timeout is auto-DENIED (Deny interrupts the run) and the doc's
+    // `Permission` part is resolved, so a dead approval panel never renders.
+    let (core, _dir) = assemble();
+    core.sessions
+        .set_permission_timeout(Some(Duration::from_millis(150)));
+    core.sessions
+        .dispatch(CHAT, HarnessId::Mock, run_request(MAIN_PROMPT), None)
+        .await
+        .expect("dispatch");
+
+    wait_for(
+        || permission_request_id(&core).is_some(),
+        "permission part in doc",
+    )
+    .await;
+    let request_id = permission_request_id(&core);
+    assert!(request_id.is_some(), "permission part was created");
+
+    // The engine must NOT output the agent's next command: the unanswered
+    // request auto-denies → the run interrupts → it settles idle. (The
+    // PermitHarness would otherwise sit in `tokio::select!` for 3s.)
+    wait_for(
+        || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Idle),
+        "hung permission run to settle after timeout auto-deny",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        !entries(&core)
+            .iter()
+            .any(|e| e.parts.iter().any(|p| matches!(
+                p,
+                MessagePart::Text { text, .. } if text == "RAN AFTER DENY"
+            ))),
+        "the agent must not continue after a timeout auto-deny"
+    );
+    let delivered = core
+        .sessions
+        .respond_permission(CHAT, request_id.as_ref().unwrap(), PermissionChoice::Allow);
+    assert_eq!(
+        delivered.expect("respond_permission call"),
+        false,
+        "an auto-denied request must not be re-resolvable (already settled)"
+    );
+    core.sessions.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn permission_timeout_disabled_never_interrupts() {
+    // With the guard disabled (`None`), an unanswered request must hang forever
+    // — the proven blocking semantics stay intact for attended sessions.
+    let (core, _dir) = assemble();
+    core.sessions.set_permission_timeout(None);
+    core.sessions
+        .dispatch(CHAT, HarnessId::Mock, run_request(MAIN_PROMPT), None)
+        .await
+        .expect("dispatch");
+
+    wait_for(
+        || permission_request_id(&core).is_some(),
+        "permission part in doc",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Still waiting on the harness (no auto-deny), the session is Working.
+    assert_ne!(
+        core.sessions.session_status(CHAT).map(|s| s.status),
+        Some(SessionStatus::Idle),
+        "a disabled guard must not interrupt an unanswered permission"
+    );
+    core.sessions.shutdown().await;
+}
 }

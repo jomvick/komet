@@ -186,6 +186,7 @@ impl TitleGenerator {
                 // chat's existing cwd — it never materializes its own
                 // worktree.
                 worktree: None,
+                permission_timeout_ms: None,
             };
             match collect_text(harness.as_ref(), request).await {
                 Ok(raw) => {

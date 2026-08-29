@@ -127,6 +127,10 @@ struct Inner {
     /// dispatch or accepted steer) — the diff sync snapshots the checkout tree
     /// for the Changes pane's "Latest turn" scope. Absent in bare tests.
     turn_listener: OnceLock<TurnListener>,
+    /// D4 — permission-bridge hang guard: a runtime permission request left
+    /// unanswered this long is auto-DENIED (Deny also interrupts the run) and
+    /// its doc part resolved. `None` disables the guard entirely.
+    permission_timeout: Mutex<Option<std::time::Duration>>,
 }
 
 /// Turn-start hook: called with `(chat_id, cwd)`.
@@ -163,8 +167,15 @@ impl SessionsEngine {
                 usage_stats: Mutex::new(HashMap::new()),
                 titles: OnceLock::new(),
                 turn_listener: OnceLock::new(),
+                permission_timeout: Mutex::new(Some(std::time::Duration::from_secs(10 * 60))),
             }),
         }
+    }
+
+    /// D4 — tune (or disable with `None`) the permission-bridge hang guard.
+    /// Already-pending requests keep the timeout they were created with.
+    pub fn set_permission_timeout(&self, timeout: Option<std::time::Duration>) {
+        *lock(&self.inner.permission_timeout) = timeout;
     }
 
     /// Retrieve context & token usage metrics for a chat session.
@@ -525,6 +536,12 @@ impl SessionsEngine {
         let request_permission = {
             let pending = pending_permissions.clone();
             let engine_tx = engine_tx.clone();
+            let sessions = self.clone();
+            let chat = chat_id.to_string();
+            let permission_timeout: Option<std::time::Duration> = request
+                .permission_timeout_ms
+                .map(std::time::Duration::from_millis)
+                .or(*lock(&self.inner.permission_timeout));
             Box::new(
                 move |kind: komet_proto::PermissionKind,
                       summary: String,
@@ -533,13 +550,47 @@ impl SessionsEngine {
                     let request_id = new_id();
                     lock(&pending).insert(request_id.clone(), tx);
                     let _ = engine_tx.send(AgentEvent::PermissionRequested {
-                        request_id,
+                        request_id: request_id.clone(),
                         kind,
                         summary,
                         choices,
                         actions: Vec::new(),
                         provider: None,
                     });
+                    // D4 — hang guard: an unanswered request auto-denies after
+                    // the configured window. `respond_permission` is a no-op
+                    // (Ok(false)) if the user already answered — the race is
+                    // safe either way, and Deny carries the deny→interrupt
+                    // semantics so a hung run can't outlive its prompt.
+                    if let Some(timeout) = permission_timeout {
+                        let watchdog_sessions = sessions.clone();
+                        let watchdog_chat = chat.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(timeout).await;
+                            match watchdog_sessions.respond_permission(
+                                &watchdog_chat,
+                                &request_id,
+                                komet_proto::PermissionChoice::Deny,
+                            ) {
+                                Ok(true) => {
+                                    // The doc part must resolve too, or a dead
+                                    // approval panel would keep rendering.
+                                    if let Ok(handle) =
+                                        watchdog_sessions.doc_handle(&watchdog_chat)
+                                    {
+                                        let _ =
+                                            handle.doc().resolve_permission(&request_id.clone());
+                                    }
+                                    tracing::info!(
+                                        chat = %watchdog_chat,
+                                        request = %request_id,
+                                        "permission auto-denied: bridge timeout"
+                                    );
+                                }
+                                _ => {}
+                            }
+                        });
+                    }
                     rx
                 },
             )
@@ -905,6 +956,7 @@ impl SessionsEngine {
                             // never mint a fresh worktree on top of a session
                             // that already has one (or doesn't need one).
                             worktree: None,
+                            permission_timeout_ms: None,
                         })
                     });
                 let Some(mut request) = request else {
@@ -1922,17 +1974,53 @@ async fn drive_run(
                     let _ = tx.send(Vec::new());
                 }
             }
+            // Mirror of the input drain above, for the same reason: a
+            // permission still pending at turn end can never be legitimately
+            // answered. Draining the resolver here (not just the doc-part
+            // force-resolve below) closes the underlying oneshot too, so a
+            // `respond_permission` racing this Done can't find a live
+            // resolver for a run that's already gone.
+            let pending_perms = lock(&inner.runs)
+                .get(&chat_id)
+                .filter(|h| h.run_id == run_id)
+                .map(|h| h.pending_permissions.clone());
+            if let Some(pending_perms) = pending_perms {
+                for (request_id, tx) in lock(&pending_perms).drain() {
+                    let _ = tx.send(komet_proto::PermissionChoice::Deny);
+                    inner.publish(
+                        &chat_id,
+                        &AgentEvent::PermissionResolved {
+                            request_id,
+                            choice: komet_proto::PermissionChoice::Deny,
+                        },
+                    );
+                }
+            }
             let message_status = match status {
                 DoneStatus::Interrupted => MessageStatus::Aborted,
                 DoneStatus::Completed | DoneStatus::Errored => MessageStatus::Complete,
             };
             // No dangling chips: a run that ends for ANY reason (completed,
-            // errored, interrupted) terminally resolves its input parts — an
-            // unresolved question must not outlive the run that asked it
+            // errored, interrupted) terminally resolves its input AND
+            // permission parts — neither must outlive the run that asked it
             // (its resolver died with the run; an answer could never land).
+            // Permission force-resolves to Deny (mirrors the synthetic
+            // `PermissionResolved` just published above, and the deny-wins-
+            // on-conflict rule in `fold_event_into_parts`): an agent that's
+            // gone can't act on a belated Allow, so Deny is the only decision
+            // that can't misrepresent what happened.
             for part in folded.iter_mut() {
-                if let MessagePart::Input { resolved, .. } = part {
-                    *resolved = true;
+                match part {
+                    MessagePart::Input { resolved, .. } => *resolved = true,
+                    MessagePart::Permission {
+                        resolved, decision, ..
+                    } => {
+                        *resolved = true;
+                        if decision.is_none() {
+                            *decision = Some(komet_proto::PermissionChoice::Deny);
+                        }
+                    }
+                    _ => {}
                 }
             }
             // A Done landing on a PARKED session with nothing streamed (the
