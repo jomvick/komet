@@ -108,16 +108,20 @@ pub fn sandbox_runtime_config(perms: &OpenCodePerms, cwd: &str) -> Option<String
         return None;
     }
     let mut deny_read: Vec<String> = perms.sensitive_read_deny.clone();
-    deny_read.extend(perms.read_only_paths.clone());
     if deny_read.is_empty() {
         deny_read = komet_proto::OPCODE_SENSITIVE_READ_DENY.iter().map(|s| s.to_string()).collect();
     }
+    let deny_write: Vec<String> = perms.read_only_paths.clone();
     let allow_write = vec![cwd.to_string(), "/tmp".to_string()];
+    let mut fs = serde_json::json!({
+        "denyRead": deny_read,
+        "allowWrite": allow_write
+    });
+    if !deny_write.is_empty() {
+        fs["denyWrite"] = serde_json::json!(deny_write);
+    }
     let cfg = serde_json::json!({
-        "filesystem": {
-            "denyRead": deny_read,
-            "allowWrite": allow_write
-        }
+        "filesystem": fs
     });
     Some(serde_json::to_string_pretty(&cfg).unwrap())
 }
