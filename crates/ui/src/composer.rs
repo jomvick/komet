@@ -31,6 +31,7 @@ use komet_proto::{
 use komet_rpc::{RpcError, methods};
 
 use crate::attachments::{self, StagedAttachment};
+use crate::icons::{self, icon};
 use crate::motion;
 use crate::pickers::Pickers;
 use crate::state::{AppState, Indicator};
@@ -5697,10 +5698,6 @@ impl Composer {
             komet_proto::PermissionKind::FileWrite { path } => Some(path.clone()),
             _ => None,
         };
-        let tool_name = match &kind {
-            komet_proto::PermissionKind::Tool { name } => Some(name.clone()),
-            _ => None,
-        };
 
         // Provider-native actions win (Paseo: `request.actions` when
         // non-empty); otherwise derive from the fixed choice set.
@@ -5837,25 +5834,30 @@ impl Composer {
             .border_color(theme.border)
             .bg(theme.input_glass_bg());
 
-        // Header: tool name tag + title
+        // Header: a contextual icon + the one human summary. Previously a
+        // separate "kind name" badge sat next to the summary text — but ACP
+        // only ever gives us ONE descriptive string (`toolCall.title`), so
+        // that badge and the summary were the same text nearly every time
+        // (the "git push" / "git push" duplicate this replaces). An icon
+        // carries the category without ever competing with the summary for
+        // the same words.
+        let kind_icon = match &kind {
+            komet_proto::PermissionKind::Command { .. } => icons::TERMINAL,
+            komet_proto::PermissionKind::FileWrite { .. } => icons::PEN,
+            komet_proto::PermissionKind::Tool { .. } => icons::WIDGET,
+        };
         card = card.child(
             div()
                 .flex()
                 .flex_row()
                 .items_center()
                 .gap(px(8.0))
-                .when_some(tool_name, |el, name| {
-                    el.child(
-                        div()
-                            .px(px(6.0))
-                            .py(px(2.0))
-                            .rounded(px(5.0))
-                            .bg(theme.text.opacity(0.08))
-                            .text_size(px(10.0))
-                            .text_color(theme.text_muted)
-                            .child(SharedString::from(name)),
-                    )
-                })
+                .child(
+                    icon(kind_icon)
+                        .size(px(14.0))
+                        .text_color(theme.text_muted)
+                        .flex_shrink_0(),
+                )
                 .child(
                     div()
                         .text_size(px(12.0))
@@ -5864,7 +5866,10 @@ impl Composer {
                 ),
         );
 
-        // Detail line (command / path), Paseo ToolCallDetailsContent analog
+        // Detail line (command / path), Paseo ToolCallDetailsContent analog.
+        // Monospace: this is code/a path, not prose — and it now visually
+        // matches the terminal icon above it instead of looking like a
+        // second, oddly-wrapped sentence.
         if let Some(detail) = &detail_line {
             card = card.child(
                 div()
@@ -5874,6 +5879,7 @@ impl Composer {
                     .bg(theme.bg.opacity(0.5))
                     .border_1()
                     .border_color(theme.border.opacity(0.6))
+                    .font_family(theme.font_mono.clone())
                     .text_size(px(11.0))
                     .line_height(px(16.0))
                     .text_color(theme.text_muted)
@@ -5883,13 +5889,30 @@ impl Composer {
             );
         }
 
-        // Question label + action row (desktop: horizontal wrap)
+        // Question label + action row (desktop: horizontal wrap). The warning
+        // glyph gives the line weight without borrowing `theme.danger` — that
+        // stays reserved for the Deny action itself, so "needs your
+        // attention" and "this specific choice is destructive" never look
+        // like the same signal.
         card = card
             .child(
                 div()
-                    .text_size(px(11.0))
-                    .text_color(theme.text_muted)
-                    .child("This agent wants to proceed"),
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(
+                        icon(icons::DANGER_TRIANGLE)
+                            .size(px(12.0))
+                            .text_color(theme.warning)
+                            .flex_shrink_0(),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(theme.text_muted)
+                            .child("This agent wants to proceed"),
+                    ),
             )
             .child(
                 div().flex().flex_row().flex_wrap().gap(px(8.0)).children(

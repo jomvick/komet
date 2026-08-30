@@ -292,6 +292,7 @@ async fn deny_stops_agent() {
         "the agent must not continue after a denial"
     );
     core.sessions.shutdown().await;
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn permission_timeout_auto_denies_and_resolves() {
@@ -367,5 +368,4 @@ async fn permission_timeout_disabled_never_interrupts() {
         "a disabled guard must not interrupt an unanswered permission"
     );
     core.sessions.shutdown().await;
-}
 }

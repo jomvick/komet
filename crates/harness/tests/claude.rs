@@ -46,6 +46,7 @@ fn request(prompt: &str) -> RunRequest {
         sandbox_options: None,
         auto_approve: true,
         attachments: Vec::new(),
+        permission_timeout_ms: None,
         worktree: None,
         resume: None,
     }

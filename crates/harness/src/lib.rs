@@ -42,22 +42,29 @@ pub struct SteerMessage {
     pub message_id: Option<String>,
 }
 
+pub type RequestInputFn = Box<
+    dyn Fn(Vec<UserInputQuestion>) -> oneshot::Receiver<Vec<UserInputAnswer>> + Send + Sync,
+>;
+
+pub type RequestPermissionFn = Box<
+    dyn Fn(
+            komet_proto::PermissionKind,
+            String,
+            Vec<komet_proto::PermissionChoice>,
+        ) -> oneshot::Receiver<komet_proto::PermissionChoice>
+        + Send
+        + Sync,
+>;
+
 /// Host-side controls handed to a run: input-request bridge + steering mailbox.
 pub struct RunControls {
     /// The run sends questions and awaits answers (blocks the agent, mirrors komet).
-    pub request_input: Box<
-        dyn Fn(Vec<UserInputQuestion>) -> oneshot::Receiver<Vec<UserInputAnswer>> + Send + Sync,
-    >,
+    pub request_input: RequestInputFn,
     /// Permission bridge (Paseo `respondToPermission`): the run asks "may I
     /// run this tool/command", the host surfaces `PermissionRequested`, parks
     /// the resolver, and the user's decision comes back as the choice. A
     /// dropped receiver (run died) degrades to Deny on the harness side.
-    pub request_permission: Box<
-        dyn Fn(komet_proto::PermissionKind, String, Vec<komet_proto::PermissionChoice>)
-            -> oneshot::Receiver<komet_proto::PermissionChoice>
-            + Send
-            + Sync,
-    >,
+    pub request_permission: RequestPermissionFn,
     /// Steer prompts consumed at step/turn boundaries.
     pub steering: mpsc::Receiver<SteerMessage>,
     /// Cancel to interrupt the live run: the harness sends its protocol-level

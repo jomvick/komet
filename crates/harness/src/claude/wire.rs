@@ -264,6 +264,16 @@ pub(crate) fn allow_response(updated_input: Value) -> Value {
     json!({ "behavior": "allow", "updatedInput": updated_input })
 }
 
+/// `can_use_tool` deny payload.
+pub(crate) fn deny_response(message: Option<&str>) -> Value {
+    let mut obj = serde_json::Map::new();
+    obj.insert("behavior".into(), "deny".into());
+    if let Some(msg) = message {
+        obj.insert("message".into(), msg.into());
+    }
+    Value::Object(obj)
+}
+
 /// Client→CLI interrupt control request.
 pub(crate) fn interrupt_request_line(request_id: &str) -> String {
     json!({

@@ -309,6 +309,7 @@ async fn target_device_id_routes_over_the_relay() {
             sandbox_options: None,
             auto_approve: true,
             attachments: Vec::new(),
+            permission_timeout_ms: None,
             worktree: None,
             resume: None,
         },

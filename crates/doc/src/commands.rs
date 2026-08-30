@@ -320,6 +320,7 @@ mod tests {
             sandbox_options: None,
             auto_approve: false,
             attachments: Vec::new(),
+            permission_timeout_ms: None,
             resume: None,
             worktree: None,
         }

@@ -33,6 +33,7 @@
 
 pub mod catalog;
 mod normalize;
+pub mod permissions;
 mod wire;
 
 use std::path::PathBuf;
@@ -255,172 +256,14 @@ impl ClaudeHarness {
         // Restricted-sandbox translation: the table maps onto Claude's
         // `settings.permissions` surface. `settings_permissions` passthrough
         // merges LAST so raw Claude-side keys can override anything here.
-        //
-        // LIMITATIONS (no native flag exists on this CLI surface):
-        // - `fail_if_unavailable` cannot be enforced from argv; if sandboxing
-        //   is unavailable the run proceeds (documented, not silently unsafe:
-        //   permission-mode stays "default").
-        // - `network.allowed_hosts/denied_hosts` are placed under the nested
-        //   network object using Claude CLI's allowedDomains and deniedDomains keys.
-        //   The two bools below (allowUnsandboxedCommands, failIfUnavailable) ride
-        //   the generated settings.sandbox (A2: fail closed when sandbox is active).
         if let Some(c) = claude_opts {
-            let mut perms = serde_json::Map::new();
-            perms.insert("defaultMode".into(), Value::String("default".into()));
-            let mut deny: Vec<Value> = c
-                .excluded_commands
-                .iter()
-                .map(|cmd| Value::String(format!("Bash({cmd}:*)")))
-                .collect();
-            for path in c.filesystem.deny.iter().chain(&c.filesystem.deny_write) {
-                deny.push(Value::String(format!("Edit({path})")));
-            }
-            // Paseo `denyRead` — refuse reads (e.g. ~/.ssh, ~/.aws). Maps to
-            // Claude's `Read(path)` permission rule, distinct from Edit.
-            for path in &c.filesystem.deny_read {
-                deny.push(Value::String(format!("Read({path})")));
-            }
-            if !deny.is_empty() {
-                perms.insert("deny".into(), Value::Array(deny));
-            }
-            let extra_dirs: Vec<_> = c
-                .filesystem
-                .allow
-                .iter()
-                .chain(&c.filesystem.allow_read)
-                .chain(&c.filesystem.allow_write)
-                .cloned()
-                .collect();
-            let mut combined_dirs = extra_dirs;
-            combined_dirs.extend(c.additional_directories.clone());
-            combined_dirs.sort();
-            combined_dirs.dedup();
-            if !combined_dirs.is_empty() {
-                perms.insert(
-                    "additionalDirectories".into(),
-                    Value::Array(combined_dirs.into_iter().map(Value::String).collect()),
-                );
-            }
-            if !c.allowed_tools.is_empty() {
-                perms.insert(
-                    "allow".into(),
-                    Value::Array(
-                        c.allowed_tools
-                            .iter()
-                            .map(|t| Value::String(t.clone()))
-                            .collect(),
-                    ),
-                );
-            }
-            if !c.disallowed_tools.is_empty() {
-                let mut deny_arr = perms
-                    .get("deny")
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default();
-                for t in &c.disallowed_tools {
-                    deny_arr.push(Value::String(t.clone()));
-                }
-                perms.insert("deny".into(), Value::Array(deny_arr));
-            }
-            // ── settings.sandbox (unified) ────────────────────────────────
-            // Build the Claude sandbox object once and merge: existing
-            // `settings.sandbox`, network restrictions, credentials, and the
-            // A2 fail-closed bools.
-            let mut sandbox = serde_json::Map::new();
-            if let Some(fs_sandbox) = c.settings.sandbox.clone() {
-                if let Some(obj) = fs_sandbox.as_object() {
-                    for (k, v) in obj {
-                        // Skip network keys from settings.sandbox — overwritten
-                        // by the generated restrictions below.
-                        if k != "network" {
-                            sandbox.insert(k.clone(), v.clone());
-                        }
-                    }
-                }
-            }
-            let has_network =
-                !c.network.allowed_hosts.is_empty() || !c.network.denied_hosts.is_empty();
-            if has_network || c.network.strict_allowlist.is_some() {
-                let mut network = serde_json::Map::new();
-                if !c.network.allowed_hosts.is_empty() {
-                    network.insert(
-                        "allowedDomains".into(),
-                        Value::Array(
-                            c.network
-                                .allowed_hosts
-                                .iter()
-                                .map(|h| Value::String(h.clone()))
-                                .collect(),
-                        ),
-                    );
-                }
-                if !c.network.denied_hosts.is_empty() {
-                    network.insert(
-                        "deniedDomains".into(),
-                        Value::Array(
-                            c.network
-                                .denied_hosts
-                                .iter()
-                                .map(|h| Value::String(h.clone()))
-                                .collect(),
-                        ),
-                    );
-                }
-                // Paseo `strictAllowlist`: deny-by-default networking — hosts
-                // not in allowedDomains are denied. Forwarded verbatim; Claude
-                // CLI versions that don't know the key ignore it.
-                if let Some(strict) = c.network.strict_allowlist {
-                    network.insert("strictAllowlist".into(), Value::Bool(strict));
-                }
-                sandbox.insert("network".into(), Value::Object(network));
-            }
-            // Claude credentials — maps to sandbox.credentials.files.
-            if !c.credentials.is_empty() {
-                let cred_arr: Vec<Value> = c
-                    .credentials
-                    .iter()
-                    .map(|p| Value::String(p.clone()))
-                    .collect();
-                let mut cred_obj = serde_json::Map::new();
-                cred_obj.insert("files".into(), Value::Array(cred_arr));
-                sandbox.insert("credentials".into(), Value::Object(cred_obj));
-            }
-            // A2 — fail closed: while the sandbox is active, commands that can't
-            // be sandboxed must FAIL rather than fall back to the regular
-            // permission flow. Allow the escape hatch only when the caller asks.
-            sandbox.insert(
-                "allowUnsandboxedCommands".into(),
-                Value::Bool(c.allow_unsandboxed_commands),
-            );
-            sandbox.insert(
-                "failIfUnavailable".into(),
-                Value::Bool(c.fail_if_unavailable),
-            );
+            let (perms, sandbox) = permissions::build_claude_settings_maps(c);
             if !sandbox.is_empty() {
                 settings.insert("sandbox".into(), Value::Object(sandbox));
             }
-            if let Some(extra) = c.settings_permissions.as_object() {
-                for (k, v) in extra {
-                    perms.insert(k.clone(), v.clone());
-                }
+            if !perms.is_empty() {
+                settings.insert("permissions".into(), Value::Object(perms));
             }
-            // Claude native permission rules → settings.permissions {allow,ask,deny}:[].
-            for rule in &c.permissions {
-                let entry = format!("{}({})", rule.action, rule.resource);
-                let list_key = match rule.effect {
-                    komet_proto::Perm::Allow => "allow",
-                    komet_proto::Perm::Ask => "ask",
-                    komet_proto::Perm::Deny => "deny",
-                };
-                perms
-                    .entry(list_key.to_string())
-                    .or_insert_with(|| Value::Array(Vec::new()))
-                    .as_array_mut()
-                    .unwrap()
-                    .push(Value::String(entry));
-            }
-            settings.insert("permissions".into(), Value::Object(perms));
         }
         if !settings.is_empty() {
             cmd.arg("--settings");
@@ -651,6 +494,14 @@ impl Harness for ClaudeHarness {
         );
         let _ = stdin_tx.send(StdinMsg::Line(first));
 
+        let auto_approve = request.auto_approve;
+        let unrestricted = match request.sandbox_options.as_ref() {
+            None => true,
+            Some(o) => match &o.claude {
+                Some(c) => c.allow_unsandboxed_commands,
+                None => request.sandbox == komet_proto::SandboxLevel::DangerFullAccess,
+            },
+        };
         let (event_tx, event_rx) = mpsc::channel::<Result<AgentEvent, HarnessError>>(256);
         tokio::spawn(run_session(Session {
             child,
@@ -659,6 +510,8 @@ impl Harness for ClaudeHarness {
             event_tx,
             controls,
             reasoning: request.reasoning,
+            auto_approve,
+            unrestricted,
             interrupt_grace: self.interrupt_grace,
             kill_grace: self.kill_grace,
             stderr_tail,
@@ -782,6 +635,8 @@ struct Session {
     event_tx: mpsc::Sender<Result<AgentEvent, HarnessError>>,
     controls: RunControls,
     reasoning: Option<ReasoningLevel>,
+    auto_approve: bool,
+    unrestricted: bool,
     interrupt_grace: Duration,
     kill_grace: Duration,
     /// Rolling stderr tail for the crash message on an unexpected exit.
@@ -798,17 +653,20 @@ async fn run_session(session: Session) {
         event_tx,
         controls,
         reasoning,
+        auto_approve,
+        unrestricted,
         interrupt_grace,
         kill_grace,
         stderr_tail,
     } = session;
     let RunControls {
         request_input,
-        request_permission: _request_permission,
+        request_permission,
         mut steering,
         interrupt,
     } = controls;
     let request_input = Arc::new(request_input);
+    let request_permission = Arc::new(request_permission);
 
     let mut norm = Normalizer::new();
     let mut steering_open = true;
@@ -834,7 +692,14 @@ async fn run_session(session: Session) {
                         }
                     };
                     if let Frame::ControlRequest(req) = frame {
-                        handle_control_request(req, &request_input, &stdin_tx);
+                        handle_control_request(
+                            req,
+                            &request_input,
+                            &request_permission,
+                            auto_approve,
+                            unrestricted,
+                            &stdin_tx,
+                        );
                         continue;
                     }
                     for ev in norm.normalize(frame, interrupted) {
@@ -942,16 +807,16 @@ type RequestInputFn = Box<
         + Sync,
 >;
 
-/// Serve one `can_use_tool` control request. Every tool is auto-approved
-/// (unattended parity — the CLI still blocks until SOME response arrives, so
-/// every request must be answered); `AskUserQuestion` is intercepted —
-/// surface the questions through the engine's input bridge (which owns the
-/// `InputRequested`/`InputResolved` lifecycle), wait for the user's answers
-/// (in a subtask so the frame loop keeps flowing), and hand them back keyed
-/// by question text, as the tool expects.
+/// Serve one `can_use_tool` control request. Unattended/auto_approve runs
+/// auto-allow immediately; `AskUserQuestion` is intercepted and routed
+/// to the engine's input bridge; other tool requests route to the permission
+/// bridge when not auto-approved.
 fn handle_control_request(
     req: ControlRequestFrame,
     request_input: &Arc<RequestInputFn>,
+    request_permission: &Arc<crate::RequestPermissionFn>,
+    auto_approve: bool,
+    unrestricted: bool,
     stdin_tx: &mpsc::UnboundedSender<StdinMsg>,
 ) {
     if req.request.subtype != "can_use_tool" {
@@ -961,29 +826,45 @@ fn handle_control_request(
         );
         return;
     }
-    if req.request.tool_name != "AskUserQuestion" {
+    if req.request.tool_name == "AskUserQuestion" {
+        let request_input = Arc::clone(request_input);
+        let stdin_tx = stdin_tx.clone();
+        tokio::spawn(async move {
+            let request_id = req.request_id;
+            let input = req.request.input;
+            let questions = parse_questions(&input);
+            let answers = (request_input)(questions.clone()).await.unwrap_or_default();
+            let updated = updated_input_with_answers(&input, &questions, &answers);
+            let line = control_response_line(&request_id, allow_response(updated));
+            let _ = stdin_tx.send(StdinMsg::Line(line));
+        });
+        return;
+    }
+
+    if auto_approve && unrestricted {
         let line = control_response_line(&req.request_id, allow_response(req.request.input));
         let _ = stdin_tx.send(StdinMsg::Line(line));
         return;
     }
-    let request_input = Arc::clone(request_input);
+
+    let request_permission = Arc::clone(request_permission);
     let stdin_tx = stdin_tx.clone();
     tokio::spawn(async move {
         let request_id = req.request_id;
         let input = req.request.input;
-        let questions = parse_questions(&input);
-        // The engine's input bridge is the SOLE emitter of
-        // `InputRequested`/`InputResolved`: it mints the request id, parks the
-        // resolver for `respond_input`, and surfaces both events. Emitting our
-        // own copy here (keyed by Claude's control-request id) folded a SECOND
-        // input part into the doc whose id no resolver knew — the QuestionPanel
-        // answered that unanswerable twin and the run never resumed.
-        //
-        // A dropped sender (caller went away) degrades to empty answers so the
-        // agent is unblocked rather than wedged.
-        let answers = (request_input)(questions.clone()).await.unwrap_or_default();
-        let updated = updated_input_with_answers(&input, &questions, &answers);
-        let line = control_response_line(&request_id, allow_response(updated));
+        let (kind, summary, choices) =
+            permissions::parse_tool_permission(&req.request.tool_name, &input);
+        let decision = (request_permission)(kind, summary, choices)
+            .await
+            .unwrap_or(komet_proto::PermissionChoice::Deny);
+        let resp = match decision {
+            komet_proto::PermissionChoice::Allow
+            | komet_proto::PermissionChoice::AllowAlways { .. } => allow_response(input),
+            komet_proto::PermissionChoice::Deny => {
+                wire::deny_response(Some("Permission denied by user"))
+            }
+        };
+        let line = control_response_line(&request_id, resp);
         let _ = stdin_tx.send(StdinMsg::Line(line));
     });
 }
@@ -1112,6 +993,7 @@ mod tests {
             sandbox_options: None,
             auto_approve: true,
             attachments: Vec::new(),
+            permission_timeout_ms: None,
             worktree: None,
             resume: None,
         }

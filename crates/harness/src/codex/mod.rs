@@ -38,6 +38,7 @@
 
 pub(crate) mod catalog;
 mod normalize;
+pub(crate) mod permissions;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -54,13 +55,13 @@ use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
 use komet_proto::{
-    AgentEvent, ApprovalPolicy, CodexFeature, DoneStatus, HarnessId, Model, ReasoningLevel,
-    RunRequest, SandboxMode, SlashCommand, SteeringMode, UserInputAnswer, UserInputQuestion,
+    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SlashCommand,
+    SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
 use crate::jsonrpc::{Incoming, RpcClient};
 use crate::{Harness, HarnessError, RunControls};
-use catalog::{REASONING_LEVELS, sandbox_mode, sandbox_policy_value, static_models, to_effort};
+use catalog::{REASONING_LEVELS, static_models, to_effort};
 use normalize::{
     ChildRoute, Phase, delta_text, item_id, item_type, map_item, notification_thread_id,
     route_child_notification, turn_error_message, turn_id, usage_event, user_message_text,
@@ -503,11 +504,12 @@ async fn run_session(session: Session) {
     } = session;
     let RunControls {
         request_input,
-        request_permission: _request_permission,
+        request_permission,
         mut steering,
         interrupt,
     } = controls;
     let request_input = Arc::new(request_input);
+    let request_permission = Arc::new(request_permission);
 
     // ---- wire params ------------------------------------------------------
     // Legacy path (no explicit table): parity with the Claude adapter, which
@@ -529,121 +531,11 @@ async fn run_session(session: Session) {
         .and_then(|o| o.codex.as_ref());
     let (approval_policy, sandbox_mode_str, sandbox_policy): (Value, &'static str, Value) =
         match opts {
-            Some(cx) => {
-                let mode = cx.sandbox_mode.unwrap_or(SandboxMode::WorkspaceWrite);
-                let mut policy = serde_json::Map::new();
-                policy.insert(
-                    "type".into(),
-                    match mode {
-                        SandboxMode::ReadOnly => "readOnly",
-                        SandboxMode::WorkspaceWrite => "workspaceWrite",
-                        SandboxMode::DangerFullAccess => "dangerFullAccess",
-                    }
-                    .into(),
-                );
-                if cx.network_access {
-                    policy.insert("networkAccess".into(), true.into());
-                }
-                if !cx.writable_roots.is_empty() {
-                    policy.insert(
-                        "writableRoots".into(),
-                        json!(
-                            cx.writable_roots
-                                .iter()
-                                .map(|p| p.display().to_string())
-                                .collect::<Vec<_>>()
-                        ),
-                    );
-                }
-                if let Some(ws) = &cx.sandbox_workspace_write {
-                    if ws.exclude_slash_tmp {
-                        policy.insert("excludeSlashTmp".into(), true.into());
-                    }
-                    if ws.exclude_tmpdir_env_var {
-                        policy.insert("excludeTmpdirEnvVar".into(), true.into());
-                    }
-                }
-                // Codex filesystem: explicit entries + auto read-only protected subpaths per root (B3).
-                {
-                    let mut fs_map = serde_json::Map::new();
-                    for entry in &cx.filesystem {
-                        let access_val = match entry.access {
-                            komet_proto::FSAccess::Read => "read",
-                            komet_proto::FSAccess::Write => "write",
-                            komet_proto::FSAccess::Deny => "deny",
-                        };
-                        fs_map.insert(entry.path.clone(), Value::String(access_val.to_string()));
-                    }
-                    // B3: auto-inject .git/.codex/.agents as read-only under each writable root (and cwd fallback)
-                    let roots: Vec<String> = if cx.writable_roots.is_empty() {
-                        vec![]
-                    } else {
-                        cx.writable_roots.iter().map(|p| p.display().to_string()).collect()
-                    };
-                    for root in &roots {
-                        for rule in komet_proto::default_read_only_subpaths_for_root(root) {
-                            fs_map.entry(rule.path).or_insert(Value::String("read".into()));
-                        }
-                    }
-                    if !fs_map.is_empty() {
-                        policy.insert("filesystem".into(), Value::Object(fs_map));
-                    }
-                }
-                // Codex shell environment policy — excludes env vars from sandbox (B2 defaults).
-                {
-                    let effective_exclude: Vec<String> = match &cx.shell_env_policy {
-                        Some(pol) if !pol.exclude.is_empty() => pol.exclude.clone(),
-                        _ if mode != SandboxMode::DangerFullAccess => komet_proto::DEFAULT_CODEX_SHELL_EXCLUDE.iter().map(|s| s.to_string()).collect(),
-                        _ => vec![],
-                    };
-                    if !effective_exclude.is_empty() {
-                        let exclude_arr: Vec<Value> = effective_exclude.into_iter().map(Value::String).collect();
-                        let mut sep_obj = serde_json::Map::new();
-                        sep_obj.insert("exclude".into(), Value::Array(exclude_arr));
-                        policy.insert("shellEnvironmentPolicy".into(), Value::Object(sep_obj));
-                    }
-                }
-                // Paseo's webSearch is an enum, but the Codex CLI wire only
-                // carries a bool — anything non-disabled maps to `true`.
-                if cx.web_search.wire_bool() {
-                    policy.insert("webSearch".into(), true.into());
-                }
-                if !cx.features.is_empty() {
-                    policy.insert(
-                        "features".into(),
-                        Value::Object(
-                            cx.features
-                                .0
-                                .iter()
-                                .map(|(name, feature)| match feature {
-                                    CodexFeature::Enabled(b) => {
-                                        (name.clone(), Value::Bool(*b))
-                                    }
-                                    CodexFeature::Policy(v) => (name.clone(), v.clone()),
-                                })
-                                .collect(),
-                        ),
-                    );
-                }
-                (
-                    serde_json::to_value(
-                        cx.approval_policy
-                            .as_ref()
-                            .unwrap_or(&ApprovalPolicy::Never),
-                    )
-                    .expect("approval policy serializes"),
-                    match mode {
-                        SandboxMode::ReadOnly => "read-only",
-                        SandboxMode::WorkspaceWrite => "workspace-write",
-                        SandboxMode::DangerFullAccess => "danger-full-access",
-                    },
-                    Value::Object(policy),
-                )
-            }
+            Some(cx) => permissions::build_codex_policies(cx, &request.cwd),
             None => (
-                Value::String("never".into()),
-                sandbox_mode(request.sandbox),
-                sandbox_policy_value(request.sandbox),
+                json!("never"),
+                "danger-full-access",
+                json!({ "type": "dangerFullAccess" }),
             ),
         };
     let effort = to_effort(request.reasoning);
@@ -1245,6 +1137,7 @@ async fn run_session(session: Session) {
                                 &params,
                                 request.auto_approve,
                                 &request_input,
+                                &request_permission,
                             );
                         }
 
@@ -1467,6 +1360,7 @@ fn handle_server_request(
     params: &Value,
     auto_approve: bool,
     request_input: &Arc<RequestInputFn>,
+    request_permission: &Arc<crate::RequestPermissionFn>,
 ) {
     // A tool's user-input request (EXPERIMENTAL, codex 0.146.x) is a CONTENT
     // question, never auto-approvable — route it to the input bridge and
@@ -1512,23 +1406,18 @@ fn handle_server_request(
         return;
     }
 
-    let question = approval_question(method, params);
+    let (kind, summary, choices) = permissions::parse_approval_request(method, params);
     let client = client.clone();
-    let request_input = Arc::clone(request_input);
+    let request_permission = Arc::clone(request_permission);
     tokio::spawn(async move {
-        // The engine's input bridge owns the `InputRequested`/`InputResolved`
-        // lifecycle (it mints the request id the resolver is parked under);
-        // emitting our own copy here doubled the doc's input part with an id
-        // `respond_input` could never match.
-        //
-        // A dropped sender (caller went away) degrades to a decline so the
-        // agent is unblocked — never silently allowed.
-        let answers = (request_input)(vec![question.clone()])
+        let decision = (request_permission)(kind, summary, choices)
             .await
-            .unwrap_or_default();
-        let accept = answers.iter().any(|a| {
-            a.question_id == question.id && a.labels.iter().any(|l| l.eq_ignore_ascii_case("yes"))
-        });
+            .unwrap_or(komet_proto::PermissionChoice::Deny);
+        let accept = matches!(
+            decision,
+            komet_proto::PermissionChoice::Allow
+                | komet_proto::PermissionChoice::AllowAlways { .. }
+        );
         client.respond(
             &id,
             json!({ "decision": if accept { "accept" } else { "decline" } }),
@@ -1594,53 +1483,6 @@ fn user_input_questions(params: &Value) -> Vec<(String, UserInputQuestion)> {
         .collect()
 }
 
-/// Synthesize the yes/no question an approval request surfaces to the user.
-fn approval_question(method: &str, params: &Value) -> UserInputQuestion {
-    let (header, question) = if method.contains("commandExecution") {
-        let command = match params.get("command") {
-            Some(Value::String(s)) => s.clone(),
-            Some(Value::Array(parts)) => parts
-                .iter()
-                .filter_map(Value::as_str)
-                .collect::<Vec<_>>()
-                .join(" "),
-            _ => String::new(),
-        };
-        (
-            "Approve command".to_owned(),
-            if command.is_empty() {
-                "Codex wants to run a command. Allow it?".to_owned()
-            } else {
-                format!("Codex wants to run `{command}`. Allow it?")
-            },
-        )
-    } else {
-        let paths: Vec<&str> = params
-            .get("changes")
-            .and_then(Value::as_array)
-            .map(|a| a.as_slice())
-            .unwrap_or_default()
-            .iter()
-            .filter_map(|c| c.get("path").and_then(Value::as_str))
-            .collect();
-        (
-            "Approve file change".to_owned(),
-            if paths.is_empty() {
-                "Codex wants to modify files. Allow it?".to_owned()
-            } else {
-                format!("Codex wants to modify {}. Allow it?", paths.join(", "))
-            },
-        )
-    };
-    UserInputQuestion {
-        id: new_message_id(),
-        header,
-        question,
-        options: vec!["Yes".into(), "No".into()],
-        multi_select: false,
-    }
-}
-
 use crate::{Signal, send_signal, shutdown_child};
 
 #[cfg(test)]
@@ -1649,29 +1491,44 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn approval_questions_are_yes_no() {
-        let q = approval_question(
+    fn parses_approval_requests_correctly() {
+        let (kind, summary, choices) = permissions::parse_approval_request(
             "item/commandExecution/requestApproval",
             &json!({"itemId": "c1", "command": "rm -rf /tmp/x"}),
         );
-        assert_eq!(q.header, "Approve command");
-        assert!(q.question.contains("rm -rf /tmp/x"));
-        assert_eq!(q.options, vec!["Yes".to_string(), "No".to_string()]);
-        assert!(!q.multi_select);
+        assert_eq!(
+            kind,
+            komet_proto::PermissionKind::Command {
+                cmdline: "rm -rf /tmp/x".into()
+            }
+        );
+        assert_eq!(summary, "Run `rm -rf /tmp/x`");
+        assert_eq!(choices.len(), 3);
 
-        let q = approval_question(
+        let (kind, summary, _) = permissions::parse_approval_request(
             "item/fileChange/requestApproval",
             &json!({"changes": [{"path": "/a.rs"}, {"path": "/b.rs"}]}),
         );
-        assert_eq!(q.header, "Approve file change");
-        assert!(q.question.contains("/a.rs, /b.rs"));
+        assert_eq!(
+            kind,
+            komet_proto::PermissionKind::FileWrite {
+                path: "/a.rs".into()
+            }
+        );
+        assert_eq!(summary, "Write `/a.rs, /b.rs`");
 
         // Command as argv array joins with spaces.
-        let q = approval_question(
+        let (kind, summary, _) = permissions::parse_approval_request(
             "item/commandExecution/requestApproval",
             &json!({"command": ["git", "push", "--force"]}),
         );
-        assert!(q.question.contains("git push --force"));
+        assert_eq!(
+            kind,
+            komet_proto::PermissionKind::Command {
+                cmdline: "git push --force".into()
+            }
+        );
+        assert_eq!(summary, "Run `git push --force`");
     }
 
     #[test]
