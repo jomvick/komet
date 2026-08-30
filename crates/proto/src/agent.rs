@@ -1069,6 +1069,8 @@ pub struct RunRequest {
     /// host ignores it and runs in `cwd` (the repo's main checkout).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<WorktreeSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_timeout_ms: Option<u64>,
 }
 
 /// Isolated-worktree directive riding [`RunRequest`]. The worktree is created
@@ -2013,6 +2015,7 @@ mod tests {
             attachments: vec![],
             worktree: None,
             resume: None,
+            permission_timeout_ms: None,
             sandbox_options: Some(SandboxOptions {
                 opencode: Some(OpenCodePerms {
                     bash: BashPerms {
@@ -2059,6 +2062,7 @@ mod tests {
             attachments: vec![],
             worktree: None,
             resume: None,
+            permission_timeout_ms: None,
         }
     }
 
