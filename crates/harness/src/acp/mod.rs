@@ -1880,6 +1880,85 @@ fn option_for_choice(options: &[Value], choice: &komet_proto::PermissionChoice) 
         .map(str::to_owned)
 }
 
+fn parse_acp_permission(tool_call: Option<&Value>) -> (komet_proto::PermissionKind, String) {
+    let Some(tool_call) = tool_call else {
+        return (
+            komet_proto::PermissionKind::Tool {
+                name: "tool".into(),
+            },
+            "tool".into(),
+        );
+    };
+    let title = tool_call.get("title").and_then(Value::as_str);
+    let tool_id = tool_call
+        .get("toolCallId")
+        .and_then(Value::as_str)
+        .unwrap_or("tool");
+    let summary = title.unwrap_or(tool_id).to_owned();
+
+    let input = tool_call
+        .get("rawInput")
+        .or_else(|| tool_call.get("input"))
+        .or_else(|| tool_call.get("arguments"));
+
+    if let Some(inp) = input {
+        if let Some(cmd) = inp
+            .get("command")
+            .or_else(|| inp.get("cmd"))
+            .and_then(Value::as_str)
+        {
+            return (
+                komet_proto::PermissionKind::Command {
+                    cmdline: cmd.to_owned(),
+                },
+                summary,
+            );
+        }
+        if let Some(path) = inp
+            .get("path")
+            .or_else(|| inp.get("filePath"))
+            .or_else(|| inp.get("file"))
+            .and_then(Value::as_str)
+        {
+            return (
+                komet_proto::PermissionKind::FileWrite {
+                    path: path.to_owned(),
+                },
+                summary,
+            );
+        }
+    }
+
+    let lower_id = tool_id.to_ascii_lowercase();
+    if lower_id == "bash"
+        || lower_id == "command"
+        || lower_id == "terminal"
+        || lower_id == "execute"
+    {
+        return (
+            komet_proto::PermissionKind::Command {
+                cmdline: title.unwrap_or(tool_id).to_owned(),
+            },
+            summary,
+        );
+    }
+    if lower_id == "edit" || lower_id == "write" || lower_id == "write_file" {
+        return (
+            komet_proto::PermissionKind::FileWrite {
+                path: title.unwrap_or(tool_id).to_owned(),
+            },
+            summary,
+        );
+    }
+
+    (
+        komet_proto::PermissionKind::Tool {
+            name: tool_id.to_owned(),
+        },
+        summary,
+    )
+}
+
 /// The live-run request handler. Three shapes:
 /// - non-permission methods → [`handle_server_request`];
 /// - question-shaped permission requests (options without allow/reject kinds)
@@ -1915,19 +1994,7 @@ fn handle_server_request_live(
         // the message loop keeps flowing; the open-questions counter parks
         // the quiet-settle while the agent awaits the decision.
         let tool_call = params.get("toolCall");
-        let title = tool_call
-            .and_then(|t| t.get("title"))
-            .and_then(Value::as_str);
-        let tool_id = tool_call
-            .and_then(|t| t.get("toolCallId"))
-            .and_then(Value::as_str)
-            .unwrap_or("tool");
-        let kind = komet_proto::PermissionKind::Tool {
-            name: title
-                .map(str::to_owned)
-                .unwrap_or_else(|| tool_id.to_owned()),
-        };
-        let summary = title.unwrap_or(tool_id).to_owned();
+        let (kind, summary) = parse_acp_permission(tool_call);
         let choices = vec![
             komet_proto::PermissionChoice::Allow,
             komet_proto::PermissionChoice::AllowAlways {

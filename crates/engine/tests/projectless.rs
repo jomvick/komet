@@ -169,6 +169,7 @@ async fn projectless_chat_runs_from_home_and_mints_no_space() {
                     sandbox_options: None,
                     auto_approve: true,
                     attachments: Vec::new(),
+                    permission_timeout_ms: None,
                     worktree: None,
                     resume: None,
                 },

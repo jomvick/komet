@@ -37,6 +37,7 @@ fn run_request(prompt: &str) -> RunRequest {
         sandbox_options: None,
         auto_approve: true,
         attachments: Vec::new(),
+        permission_timeout_ms: None,
         worktree: None,
         resume: None,
     }
@@ -1799,6 +1800,7 @@ async fn real_claude_sees_uploaded_image_inline() {
         sandbox_options: None,
         auto_approve: false,
         attachments: vec![path],
+        permission_timeout_ms: None,
         worktree: None,
         resume: None,
     };

@@ -17,6 +17,7 @@ fn run_request_attachments_survive_command_round_trip() {
         sandbox_options: None,
         auto_approve: true,
         attachments: vec!["/tmp/a.png".into()],
+        permission_timeout_ms: None,
         resume: None,
         worktree: None,
     };

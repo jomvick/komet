@@ -29,6 +29,7 @@ fn base_request() -> RunRequest {
         sandbox_options: None,
         auto_approve: false,
         attachments: vec![],
+        permission_timeout_ms: None,
         worktree: None,
         resume: None,
     }

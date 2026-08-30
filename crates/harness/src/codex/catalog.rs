@@ -38,6 +38,7 @@ pub(crate) fn to_effort(reasoning: Option<ReasoningLevel>) -> Option<&'static st
 }
 
 /// `thread/start`'s `sandbox` param (kebab-case wire words).
+#[allow(dead_code)]
 pub(crate) fn sandbox_mode(sandbox: SandboxLevel) -> &'static str {
     match sandbox {
         SandboxLevel::ReadOnly => "read-only",
@@ -47,6 +48,7 @@ pub(crate) fn sandbox_mode(sandbox: SandboxLevel) -> &'static str {
 }
 
 /// `turn/start`'s `sandboxPolicy.type` (camelCase variant of the same policy).
+#[allow(dead_code)]
 pub(crate) fn sandbox_policy_type(sandbox: SandboxLevel) -> &'static str {
     match sandbox {
         SandboxLevel::ReadOnly => "readOnly",
@@ -59,6 +61,7 @@ pub(crate) fn sandbox_policy_type(sandbox: SandboxLevel) -> &'static str {
 /// access: komet agents fetch deps and hit APIs unattended, and with the
 /// approval policy pinned to "never" a network-less sandbox would fail those
 /// commands with no escalation path.
+#[allow(dead_code)]
 pub(crate) fn sandbox_policy_value(sandbox: SandboxLevel) -> serde_json::Value {
     let mut policy = serde_json::Map::new();
     policy.insert("type".into(), sandbox_policy_type(sandbox).into());

@@ -163,6 +163,7 @@ async fn transcript_survives_open_racing_create_chat() {
                         sandbox_options: None,
                         auto_approve: true,
                         attachments: Vec::new(),
+                        permission_timeout_ms: None,
                         resume: None,
                         worktree: None,
                     },

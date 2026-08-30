@@ -55,6 +55,7 @@ async fn silent_agent_errors_via_the_prompt_stall_watchdog() {
         sandbox_options: None,
         auto_approve: true,
         attachments: Vec::new(),
+        permission_timeout_ms: None,
         worktree: None,
         resume: None,
     };
@@ -121,6 +122,7 @@ async fn opencode_stall_hint_names_the_provider() {
         sandbox_options: None,
         auto_approve: true,
         attachments: Vec::new(),
+        permission_timeout_ms: None,
         worktree: None,
         resume: None,
     };

@@ -54,6 +54,7 @@ async fn silent_npm_enoent_death_surfaces_decoded_error() {
         sandbox_options: None,
         auto_approve: true,
         attachments: Vec::new(),
+        permission_timeout_ms: None,
         worktree: None,
         resume: None,
     };

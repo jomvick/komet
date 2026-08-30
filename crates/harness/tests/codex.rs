@@ -12,9 +12,9 @@ use komet_harness::{
     CancellationToken, CodexHarness, Harness, HarnessError, RunControls, SteerMessage,
 };
 use komet_proto::{
-    AgentEvent, ApprovalPolicy, CodexSandbox, DoneStatus, HarnessId, ReasoningLevel, RunRequest,
-    SandboxLevel, SandboxMode, SandboxOptions, TodoItem, ToolCall, UserInputAnswer,
-    UserInputQuestion,
+    AgentEvent, ApprovalPolicy, CodexSandbox, DoneStatus, HarnessId, PermissionChoice,
+    PermissionKind, ReasoningLevel, RunRequest, SandboxLevel, SandboxMode, SandboxOptions, TodoItem,
+    ToolCall, UserInputAnswer,
 };
 
 fn fixture_path() -> PathBuf {
@@ -46,12 +46,13 @@ fn request(prompt: &str) -> RunRequest {
         sandbox_options: None,
         auto_approve: true,
         attachments: Vec::new(),
+        permission_timeout_ms: None,
         worktree: None,
         resume: None,
     }
 }
 
-/// Controls whose `request_input` answers every question with `answer_label`.
+/// Controls whose `request_input` and `request_permission` answer according to `answer_label`.
 fn controls(
     answer_label: &'static str,
 ) -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
@@ -70,7 +71,16 @@ fn controls(
             let _ = tx.send(answers);
             rx
         }),
-        request_permission: RunControls::noop_permission(),
+        request_permission: Box::new(move |_kind, _summary, _choices| {
+            let (tx, rx) = oneshot::channel();
+            let choice = if answer_label == "Yes" {
+                PermissionChoice::Allow
+            } else {
+                PermissionChoice::Deny
+            };
+            let _ = tx.send(choice);
+            rx
+        }),
         steering: steer_rx,
         interrupt: token.clone(),
     };
@@ -368,32 +378,23 @@ async fn rejected_steer_falls_back_to_a_follow_up_turn() {
 }
 
 #[tokio::test]
-async fn approvals_round_trip_as_input_requests() {
-    // Approvals must reach the ENGINE's input bridge (`request_input`) — and
-    // the harness must NOT emit its own `InputRequested`/`InputResolved`
-    // twins: the bridge owns that lifecycle (it mints the request id the
-    // resolver is parked under; a harness-emitted copy folded an unanswerable
-    // duplicate chip into the doc).
-    let asked: Arc<Mutex<Vec<UserInputQuestion>>> = Arc::new(Mutex::new(Vec::new()));
+async fn approvals_round_trip_as_permission_requests() {
+    // Approvals must reach the ENGINE's permission bridge (`request_permission`) — and
+    // the harness must NOT emit its own `PermissionRequested`/`PermissionResolved`
+    // twins: the bridge owns that lifecycle.
+    let permissions: Arc<Mutex<Vec<(PermissionKind, String)>>> = Arc::new(Mutex::new(Vec::new()));
     let (steer_tx, steer_rx) = mpsc::channel(8);
     let _steer = steer_tx;
     let token = CancellationToken::new();
-    let seen = asked.clone();
+    let seen = permissions.clone();
     let controls = RunControls {
-        request_input: Box::new(move |questions| {
-            seen.lock().unwrap().extend(questions.iter().cloned());
+        request_input: Box::new(|_| oneshot::channel().1),
+        request_permission: Box::new(move |kind, summary, _choices| {
+            seen.lock().unwrap().push((kind, summary));
             let (tx, rx) = oneshot::channel();
-            let answers: Vec<UserInputAnswer> = questions
-                .iter()
-                .map(|q| UserInputAnswer {
-                    question_id: q.id.clone(),
-                    labels: vec!["Yes".into()],
-                })
-                .collect();
-            let _ = tx.send(answers);
+            let _ = tx.send(PermissionChoice::Allow);
             rx
         }),
-        request_permission: RunControls::noop_permission(),
         steering: steer_rx,
         interrupt: token.clone(),
     };
@@ -401,19 +402,26 @@ async fn approvals_round_trip_as_input_requests() {
     req.auto_approve = false;
     let events = run_to_end(&harness(), req, controls).await;
 
-    let asked = asked.lock().unwrap();
-    assert_eq!(asked.len(), 2, "{events:?}");
-    assert_eq!(asked[0].header, "Approve command");
-    assert!(asked[0].question.contains("rm -rf /tmp/x"));
-    assert_eq!(asked[0].options, vec!["Yes".to_string(), "No".to_string()]);
-    assert_eq!(asked[1].header, "Approve file change");
-    assert!(asked[1].question.contains("/tmp/a.rs"));
+    let permissions = permissions.lock().unwrap();
+    assert_eq!(permissions.len(), 2, "{events:?}");
+    assert_eq!(
+        permissions[0].0,
+        PermissionKind::Command {
+            cmdline: "rm -rf /tmp/x".into()
+        }
+    );
+    assert_eq!(
+        permissions[1].0,
+        PermissionKind::FileWrite {
+            path: "/tmp/a.rs".into()
+        }
+    );
     assert!(
         !events.iter().any(|e| matches!(
             e,
-            AgentEvent::InputRequested { .. } | AgentEvent::InputResolved { .. }
+            AgentEvent::PermissionRequested { .. } | AgentEvent::PermissionResolved { .. }
         )),
-        "harness must not emit input lifecycle events itself: {events:?}"
+        "harness must not emit permission lifecycle events itself: {events:?}"
     );
 
     // The fake only completes the turn after seeing BOTH accept decisions.
