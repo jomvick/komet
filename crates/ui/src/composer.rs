@@ -5031,6 +5031,7 @@ impl Composer {
                             resume: None,
                             attachments: attachment_paths,
                             worktree: None,
+                            permission_timeout_ms: None,
                         },
                         message_id: message_id.clone(),
                     }
