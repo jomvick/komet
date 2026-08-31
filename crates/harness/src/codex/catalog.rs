@@ -7,7 +7,9 @@
 //! short-lived `codex app-server` + `model/list` pagination can later be
 //! spliced in (same call t3code's Codex provider makes).
 
-use komet_proto::{Model, ModelOption, ModelOptionChoice, ReasoningLevel, SandboxLevel};
+use komet_proto::{
+    Model, ModelOption, ModelOptionChoice, ReasoningLevel, SandboxLevel, SlashCommand,
+};
 
 /// The unified reasoning ladder Codex accepts (`minimal` is offered but clamped
 /// on the wire — see [`to_effort`]).
@@ -173,6 +175,52 @@ pub(crate) fn static_models() -> Vec<Model> {
             "Ultra-fast lightweight coding",
             XHIGH_LADDER,
         ),
+    ]
+}
+
+/// Built-in slash commands native to Codex CLI / TUI.
+pub(crate) fn static_commands() -> Vec<SlashCommand> {
+    vec![
+        SlashCommand {
+            name: "compact".into(),
+            description: "Compact the session context window".into(),
+            input_hint: None,
+        },
+        SlashCommand {
+            name: "diff".into(),
+            description: "View current workspace git diff".into(),
+            input_hint: None,
+        },
+        SlashCommand {
+            name: "clear".into(),
+            description: "Clear context and start a new thread".into(),
+            input_hint: None,
+        },
+        SlashCommand {
+            name: "undo".into(),
+            description: "Undo the last tool/file modifications".into(),
+            input_hint: None,
+        },
+        SlashCommand {
+            name: "review".into(),
+            description: "Review current changes or a git commit".into(),
+            input_hint: Some("[commit|branch]".into()),
+        },
+        SlashCommand {
+            name: "model".into(),
+            description: "Switch active model or reasoning effort".into(),
+            input_hint: Some("[model_id]".into()),
+        },
+        SlashCommand {
+            name: "plan".into(),
+            description: "Create or iterate on an implementation plan".into(),
+            input_hint: Some("[prompt]".into()),
+        },
+        SlashCommand {
+            name: "export".into(),
+            description: "Export current conversation transcript".into(),
+            input_hint: Some("[format]".into()),
+        },
     ]
 }
 

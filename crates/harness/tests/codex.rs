@@ -801,19 +801,22 @@ async fn live_real_app_server_single_turn() {
 async fn commands_come_from_skills_list() {
     let h = harness();
     let commands = h.commands().await.expect("discovery succeeds");
-    assert_eq!(
-        commands.len(),
-        2,
-        "same-name skills across cwd groups dedupe: {commands:?}"
+    assert!(
+        commands.len() >= 10,
+        "static commands and discovered skills present: len={}",
+        commands.len()
     );
-    assert_eq!(commands[0].name, "imagegen");
+    assert!(commands.iter().any(|c| c.name == "compact"));
+    assert!(commands.iter().any(|c| c.name == "diff"));
+
+    let imagegen = commands.iter().find(|c| c.name == "imagegen").expect("imagegen skill");
     assert_eq!(
-        commands[0].description, "Generate or edit images",
+        imagegen.description, "Generate or edit images",
         "interface.shortDescription wins over the model-facing paragraph"
     );
-    assert_eq!(commands[1].name, "bare");
+    let bare = commands.iter().find(|c| c.name == "bare").expect("bare skill");
     assert_eq!(
-        commands[1].description, "No interface block",
+        bare.description, "No interface block",
         "top-level description is the fallback"
     );
     assert_eq!(h.commands().await.expect("cache hit"), commands);

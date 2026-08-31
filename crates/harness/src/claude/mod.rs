@@ -280,10 +280,8 @@ impl ClaudeHarness {
     }
 
     /// Short-lived discovery probe: spawn the CLI in stream-json mode, send
-    /// the `initialize` control request, and read the commands out of its
-    /// control_response. No user message is ever written, so no turn (and no
-    /// API call) happens; the child is torn down as soon as the response
-    /// lands.
+    /// the `initialize` and `get_context_usage` control requests, and combine
+    /// static built-in commands with dynamically discovered skills.
     async fn discover_commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
         let exe = self.resolve_executable()?;
         let mut cmd = Command::new(&exe);
@@ -313,13 +311,113 @@ impl ClaudeHarness {
             shutdown_child(&mut child, self.kill_grace).await;
             return Err(HarnessError::Protocol("claude child has no stdio".into()));
         };
-        const PROBE_ID: &str = "komet-command-probe";
+        const INIT_PROBE_ID: &str = "komet-command-probe";
+        const CONTEXT_PROBE_ID: &str = "komet-context-probe";
         let discovery = async {
-            let request = serde_json::json!({
+            let init_req = serde_json::json!({
                 "type": "control_request",
-                "request_id": PROBE_ID,
+                "request_id": INIT_PROBE_ID,
                 "request": { "subtype": "initialize" },
             });
+            let context_req = wire::context_usage_request_line(CONTEXT_PROBE_ID);
+            stdin
+                .write_all(format!("{init_req}\n{context_req}\n").as_bytes())
+                .await
+                .map_err(HarnessError::Io)?;
+            stdin.flush().await.map_err(HarnessError::Io)?;
+
+            let mut init_commands: Vec<SlashCommand> = Vec::new();
+            let mut skill_commands: Vec<SlashCommand> = Vec::new();
+            let mut got_init = false;
+            let mut got_context = false;
+
+            let mut lines = BufReader::new(stdout).lines();
+            while let Some(line) = lines.next_line().await.map_err(HarnessError::Io)? {
+                let Ok(frame) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                if frame.get("type").and_then(Value::as_str) != Some("control_response") {
+                    continue;
+                }
+                let response = frame.get("response").cloned().unwrap_or(Value::Null);
+                let req_id = response.get("request_id").and_then(Value::as_str);
+                if req_id == Some(INIT_PROBE_ID) {
+                    got_init = true;
+                    if response.get("subtype").and_then(Value::as_str) != Some("error") {
+                        init_commands = parse_initialize_commands(&response);
+                    }
+                } else if req_id == Some(CONTEXT_PROBE_ID) {
+                    got_context = true;
+                    if response.get("subtype").and_then(Value::as_str) != Some("error") {
+                        skill_commands = wire::parse_skills_frontmatter(&response);
+                    }
+                }
+                if got_init && got_context {
+                    break;
+                }
+            }
+
+            let mut commands = catalog::static_commands();
+            let mut seen: std::collections::HashSet<String> =
+                commands.iter().map(|c| c.name.clone()).collect();
+
+            for skill in skill_commands {
+                if seen.insert(skill.name.clone()) {
+                    commands.push(skill);
+                }
+            }
+
+            for init_cmd in init_commands {
+                if seen.insert(init_cmd.name.clone()) {
+                    commands.push(init_cmd);
+                }
+            }
+
+            Ok(commands)
+        };
+        let result = tokio::time::timeout(Duration::from_secs(10), discovery).await;
+        shutdown_child(&mut child, self.kill_grace).await;
+        match result {
+            Ok(inner) => inner,
+            Err(_) => {
+                // If live discovery timed out, fallback to static catalog
+                Ok(catalog::static_commands())
+            }
+        }
+    }
+
+    /// Query structured context usage (tokens, categories, loaded files, MCP tools, skills)
+    /// from the CLI via `get_context_usage` control request.
+    pub async fn get_context_usage(&self) -> Result<komet_proto::ContextUsage, HarnessError> {
+        let exe = self.resolve_executable()?;
+        let mut cmd = Command::new(&exe);
+        crate::compose_child_path(&mut cmd, &exe);
+        cmd.args([
+            "--print",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+        ]);
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let mut child = cmd.spawn().map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                HarnessError::NotInstalled(exe.display().to_string())
+            } else {
+                HarnessError::Io(e)
+            }
+        })?;
+        let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+            shutdown_child(&mut child, self.kill_grace).await;
+            return Err(HarnessError::Protocol("claude child has no stdio".into()));
+        };
+        const REQ_ID: &str = "komet-context-usage";
+        let probe = async {
+            let request = wire::context_usage_request_line(REQ_ID);
             stdin
                 .write_all(format!("{request}\n").as_bytes())
                 .await
@@ -334,27 +432,27 @@ impl ClaudeHarness {
                     continue;
                 }
                 let response = frame.get("response").cloned().unwrap_or(Value::Null);
-                if response.get("request_id").and_then(Value::as_str) != Some(PROBE_ID) {
+                if response.get("request_id").and_then(Value::as_str) != Some(REQ_ID) {
                     continue;
                 }
                 if response.get("subtype").and_then(Value::as_str) == Some("error") {
                     let msg = response
                         .get("error")
                         .and_then(Value::as_str)
-                        .unwrap_or("initialize control request failed");
+                        .unwrap_or("get_context_usage control request failed");
                     return Err(HarnessError::Protocol(msg.into()));
                 }
-                return Ok(parse_initialize_commands(&response));
+                return Ok(wire::parse_context_usage_response(&response));
             }
             Err(HarnessError::Protocol(
-                "claude exited before answering the initialize control request".into(),
+                "claude exited before answering get_context_usage".into(),
             ))
         };
-        let result = tokio::time::timeout(Duration::from_secs(10), discovery).await;
+        let result = tokio::time::timeout(Duration::from_secs(10), probe).await;
         shutdown_child(&mut child, self.kill_grace).await;
         match result {
             Ok(inner) => inner,
-            Err(_) => Err(HarnessError::Protocol("command discovery timed out".into())),
+            Err(_) => Err(HarnessError::Protocol("get_context_usage timed out".into())),
         }
     }
 }
@@ -438,9 +536,18 @@ impl Harness for ClaudeHarness {
     /// stdout line, well before any API traffic). Cached on success.
     async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
         self.commands
-            .get_or_try_init(|| self.discover_commands())
+            .get_or_try_init(|| async {
+                match self.discover_commands().await {
+                    Ok(commands) => Ok(commands),
+                    Err(_) => Ok(catalog::static_commands()),
+                }
+            })
             .await
             .cloned()
+    }
+
+    async fn context_usage(&self) -> Result<komet_proto::ContextUsage, HarnessError> {
+        self.get_context_usage().await
     }
 
     async fn run(

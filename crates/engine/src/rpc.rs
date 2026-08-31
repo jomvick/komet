@@ -969,18 +969,11 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&models)
             }
             methods::LIST_COMMANDS => {
-                // Same shape as ListModels: forces a lazy resolve, then the
-                // harness's own (cached) discovery. Non-ACP harnesses return
-                // an empty list from the trait default.
                 let p: ListModelsParams = parse_params(params)?;
-                let harness = self
-                    .registry
-                    .resolve(p.harness)
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
-                let commands = harness
-                    .commands()
-                    .await
-                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let commands = match self.registry.resolve(p.harness) {
+                    Ok(harness) => harness.commands().await.unwrap_or_default(),
+                    Err(_) => Vec::new(),
+                };
                 RpcReply::value(&commands)
             }
             methods::QUEUE_COMMAND => {
@@ -1002,9 +995,23 @@ impl RpcService for EngineRpc {
                 )))
             }
             methods::GET_CONTEXT_USAGE => {
-                let p: ChatParams = parse_params(params)?;
-                let usage = self.sessions.usage_for(&p.chat_id);
-                RpcReply::value(&usage)
+                if let Ok(p) = serde_json::from_value::<ChatParams>(params.clone()) {
+                    if let Some(usage) = self.sessions.usage_for(&p.chat_id) {
+                        return RpcReply::value(&usage);
+                    }
+                }
+                if let Ok(p) = serde_json::from_value::<ListModelsParams>(params) {
+                    let harness = self
+                        .registry
+                        .resolve(p.harness)
+                        .map_err(|e| RpcError::Failed(e.to_string()))?;
+                    let usage = harness
+                        .context_usage()
+                        .await
+                        .map_err(|e| RpcError::Failed(e.to_string()))?;
+                    return RpcReply::value(&usage);
+                }
+                RpcReply::value(&komet_proto::ContextUsage::default())
             }
             methods::PROBE_SYNC => {
                 self.workspace.probe();

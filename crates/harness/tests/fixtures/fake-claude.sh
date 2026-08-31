@@ -101,13 +101,22 @@ case "$first" in
   exec sleep 30
   ;;
 
-*'"subtype":"initialize"'*)
-  # Command discovery: the initialize control request arrives as the FIRST
-  # stdin line (no user message ever follows). Shape mirrors 2.1.228's
-  # control_response: commands under response.response.
-  rid=$(printf '%s\n' "$first" | sed 's/.*"request_id":"\([^"]*\)".*/\1/')
-  emit "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"$rid\",\"response\":{\"commands\":[{\"name\":\"review\",\"description\":\"Review a pull request\",\"argumentHint\":\"[pr number]\"},{\"name\":\"compact\",\"description\":\"Compact the conversation\",\"argumentHint\":\"\"},{\"name\":\"\",\"description\":\"nameless: dropped\"}],\"output_style\":\"default\"}}}"
-  # Stay alive until the driver tears us down, like the real CLI would.
+*'"subtype":"initialize"'*|*'"subtype":"get_context_usage"'*)
+  # Command discovery and context usage probes.
+  line="$first"
+  while [ -n "$line" ]; do
+    case "$line" in
+    *'"subtype":"initialize"'*)
+      rid=$(printf '%s\n' "$line" | sed 's/.*"request_id":"\([^"]*\)".*/\1/')
+      emit "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"$rid\",\"response\":{\"commands\":[{\"name\":\"review\",\"description\":\"Review a pull request\",\"argumentHint\":\"[pr number]\"},{\"name\":\"compact\",\"description\":\"Compact the conversation\",\"argumentHint\":\"\"},{\"name\":\"\",\"description\":\"nameless: dropped\"}],\"output_style\":\"default\"}}}"
+      ;;
+    *'"subtype":"get_context_usage"'*)
+      rid=$(printf '%s\n' "$line" | sed 's/.*"request_id":"\([^"]*\)".*/\1/')
+      emit "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"$rid\",\"response\":{\"totalTokens\":1234,\"maxTokens\":200000,\"categories\":[{\"name\":\"Skills\",\"tokens\":500,\"color\":\"warning\"}],\"memoryFiles\":[{\"path\":\"/tmp/CLAUDE.md\",\"type\":\"Project\",\"tokens\":100}],\"mcpTools\":[{\"name\":\"search\",\"serverName\":\"codegraph\",\"tokens\":50,\"isLoaded\":true}],\"skills\":{\"skillFrontmatter\":[{\"name\":\"custom-skill\",\"source\":\"userSettings\",\"tokens\":50},{\"name\":\"dataviz\",\"source\":\"built-in\",\"tokens\":382}]}}}}"
+      ;;
+    esac
+    read -r -t 1 line || break
+  done
   exec sleep 30
   ;;
 

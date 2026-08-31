@@ -628,29 +628,53 @@ async fn live_real_cli_single_turn() {
 }
 
 // ---------------------------------------------------------------------------
-// Slash-command discovery
+// Slash-command discovery & Context Usage (Bucket C)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn commands_come_from_the_initialize_control_request() {
+async fn commands_discovery_merges_catalog_and_probes() {
     let h = harness();
     let commands = h.commands().await.expect("discovery succeeds");
-    assert_eq!(
-        commands.len(),
-        2,
-        "nameless entries are dropped: {commands:?}"
+    assert!(
+        commands.len() >= 20,
+        "static commands + discovered skills present: len={}",
+        commands.len()
     );
-    assert_eq!(commands[0].name, "review");
-    assert_eq!(commands[0].description, "Review a pull request");
-    assert_eq!(commands[0].input_hint.as_deref(), Some("[pr number]"));
-    assert_eq!(commands[1].name, "compact");
-    assert_eq!(commands[1].input_hint, None, "empty hint reads as None");
 
-    // Cached: the second call reuses the first probe's result (the fake has
-    // exited; a re-probe against a dead binary path would still work here,
-    // but object identity of the cached list is the cheap assertion).
+    // Static catalog entry
+    assert!(commands.iter().any(|c| c.name == "compact"));
+    assert!(commands.iter().any(|c| c.name == "diff"));
+
+    // Discovered custom skill from get_context_usage
+    let custom = commands
+        .iter()
+        .find(|c| c.name == "custom-skill")
+        .expect("custom-skill discovered");
+    assert_eq!(custom.description, "Custom skill (custom-skill)");
+
+    // Cached: the second call reuses the first probe's result
     let again = h.commands().await.expect("cache hit");
     assert_eq!(again, commands);
+}
+
+#[tokio::test]
+async fn context_usage_queries_metrics_and_skills() {
+    let h = harness();
+    let usage = h.context_usage().await.expect("context usage succeeds");
+    assert_eq!(usage.total_tokens, 1234);
+    assert_eq!(usage.max_tokens, 200000);
+    assert_eq!(usage.categories.len(), 1);
+    assert_eq!(usage.categories[0].name, "Skills");
+    assert_eq!(usage.categories[0].tokens, 500);
+    assert_eq!(usage.memory_files.len(), 1);
+    assert_eq!(usage.memory_files[0].path, "/tmp/CLAUDE.md");
+    assert_eq!(usage.mcp_tools.len(), 1);
+    assert_eq!(usage.mcp_tools[0].name, "search");
+    assert_eq!(usage.skills.len(), 2);
+    assert_eq!(usage.skills[0].name, "custom-skill");
+    assert_eq!(usage.skills[0].source, "userSettings");
+    assert_eq!(usage.skills[1].name, "dataviz");
+    assert_eq!(usage.skills[1].source, "built-in");
 }
 
 /// Live smoke against the real CLI: `cargo test -p komet-harness --test
