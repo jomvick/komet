@@ -662,6 +662,8 @@ reason: None,
                 ReasoningLevel::Low,
                 ReasoningLevel::Medium,
                 ReasoningLevel::High,
+                ReasoningLevel::Max,
+                ReasoningLevel::Ultra,
             ],
             installed: true,
             enabled: None,
@@ -802,7 +804,9 @@ mod tests {
             &[
                 ReasoningLevel::Low,
                 ReasoningLevel::Medium,
-                ReasoningLevel::High
+                ReasoningLevel::High,
+                ReasoningLevel::Max,
+                ReasoningLevel::Ultra,
             ]
         );
     }

@@ -19,7 +19,7 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 
 use komet_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SteeringMode, ToolCall,
+    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SlashCommand, SteeringMode,
 };
 
 use crate::{Harness, HarnessError, RunControls};
@@ -75,15 +75,6 @@ impl Default for AntigravityHarness {
     }
 }
 
-fn effort(level: Option<ReasoningLevel>) -> Option<&'static str> {
-    match level {
-        Some(ReasoningLevel::Minimal | ReasoningLevel::Low) => Some("low"),
-        Some(ReasoningLevel::Medium) => Some("medium"),
-        Some(_) => Some("high"),
-        None => None,
-    }
-}
-
 fn usage_event(usage: &Value) -> AgentEvent {
     let count = |key| usage.get(key).and_then(Value::as_u64).unwrap_or_default();
     AgentEvent::Usage {
@@ -113,11 +104,7 @@ impl Harness for AntigravityHarness {
         true
     }
     fn reasoning_levels(&self) -> &[ReasoningLevel] {
-        &[
-            ReasoningLevel::Low,
-            ReasoningLevel::Medium,
-            ReasoningLevel::High,
-        ]
+        catalog::FULL_LADDER
     }
     fn installed(&self) -> bool {
         self.resolve_executable().is_ok()
@@ -125,13 +112,37 @@ impl Harness for AntigravityHarness {
 
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         self.resolve_executable()?;
-        Ok(vec![Model {
-            id: catalog::default_model().into(),
-            label: "Antigravity default".into(),
-            description: Some("Uses the model selected in Antigravity CLI".into()),
-            reasoning_levels: self.reasoning_levels().to_vec(),
-            options: Vec::new(),
-        }])
+        Ok(catalog::static_models())
+    }
+
+    async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
+        Ok(vec![
+            SlashCommand {
+                name: "goal".into(),
+                description: "Run a long-running autonomous task with extra thoroughness".into(),
+                input_hint: Some("<goal instruction>".into()),
+            },
+            SlashCommand {
+                name: "schedule".into(),
+                description: "Schedule a one-shot timer or recurring cron job".into(),
+                input_hint: Some("<schedule instruction>".into()),
+            },
+            SlashCommand {
+                name: "browser".into(),
+                description: "Web browsing, search, and web application testing".into(),
+                input_hint: Some("<url or search task>".into()),
+            },
+            SlashCommand {
+                name: "grill-me".into(),
+                description: "Interactive architectural interview to clarify design decisions".into(),
+                input_hint: None,
+            },
+            SlashCommand {
+                name: "learn".into(),
+                description: "Persist lessons, behavioral rules, or setup for future tasks".into(),
+                input_hint: Some("<learning note>".into()),
+            },
+        ])
     }
 
     async fn run(
@@ -164,7 +175,7 @@ impl Harness for AntigravityHarness {
         {
             command.args(["--model", model]);
         }
-        if let Some(effort) = effort(request.reasoning) {
+        if let Some(effort) = catalog::to_effort(request.reasoning) {
             command.args(["--effort", effort]);
         }
         if request.auto_approve {
@@ -184,73 +195,94 @@ impl Harness for AntigravityHarness {
             let mut finished = false;
             loop {
                 tokio::select! {
-                                    _ = controls.interrupt.cancelled() => {
-                                        let _ = child.start_kill();
-                                        let _ = tx.send(Ok(AgentEvent::Done { status: DoneStatus::Interrupted, result: None, error: None, session_id: session_id.clone(), reason: Some(komet_proto::DoneReason::UserRequested) })).await;
-                                        break;
+                    _ = controls.interrupt.cancelled() => {
+                        let _ = child.start_kill();
+                        let _ = tx.send(Ok(AgentEvent::Done {
+                            status: DoneStatus::Interrupted,
+                            result: None,
+                            error: None,
+                            session_id: session_id.clone(),
+                            reason: Some(komet_proto::DoneReason::UserRequested),
+                        })).await;
+                        break;
+                    }
+                    line = lines.next_line() => match line {
+                        Ok(Some(line)) => {
+                            let Ok(frame) = serde_json::from_str::<Value>(&line) else { continue; };
+                            match frame.get("event").and_then(Value::as_str) {
+                                Some("init") => {
+                                    session_id = frame.get("conversation_id").and_then(Value::as_str).map(str::to_owned);
+                                    let init = frame.get("init").unwrap_or(&Value::Null);
+                                    if tx.send(Ok(AgentEvent::SessionStarted {
+                                        harness: HarnessId::Antigravity,
+                                        model: init.get("model").and_then(Value::as_str).unwrap_or(catalog::default_model()).to_owned(),
+                                        tools: init.get("tools").and_then(Value::as_array).map(|tools| tools.iter().filter_map(Value::as_str).map(str::to_owned).collect()).unwrap_or_default(),
+                                        cwd: init.get("cwd").and_then(Value::as_str).unwrap_or("").to_owned(),
+                                        session_id: session_id.clone().unwrap_or_default(),
+                                        assistant_message_id: uuid::Uuid::new_v4().to_string(),
+                                    })).await.is_err() { break; }
+                                }
+                                Some("step_update") => {
+                                    let step = frame.get("step_update").unwrap_or(&Value::Null);
+                                    if let Some(text) = step.get("text_delta").and_then(Value::as_str) {
+                                        saw_text = true;
+                                        if tx.send(Ok(AgentEvent::TextDelta { text: text.to_owned() })).await.is_err() { break; }
                                     }
-                                    line = lines.next_line() => match line {
-                                        Ok(Some(line)) => {
-                                            let Ok(frame) = serde_json::from_str::<Value>(&line) else { continue; };
-                                            match frame.get("event").and_then(Value::as_str) {
-                                                Some("init") => {
-                                                    session_id = frame.get("conversation_id").and_then(Value::as_str).map(str::to_owned);
-                                                    let init = frame.get("init").unwrap_or(&Value::Null);
-                                                    if tx.send(Ok(AgentEvent::SessionStarted {
-                                                        harness: HarnessId::Antigravity,
-                                                        model: init.get("model").and_then(Value::as_str).unwrap_or(catalog::default_model()).to_owned(),
-                                                        tools: init.get("tools").and_then(Value::as_array).map(|tools| tools.iter().filter_map(Value::as_str).map(str::to_owned).collect()).unwrap_or_default(),
-                                                        cwd: init.get("cwd").and_then(Value::as_str).unwrap_or("").to_owned(),
-                                                        session_id: session_id.clone().unwrap_or_default(),
-                                                        assistant_message_id: uuid::Uuid::new_v4().to_string(),
-                                                    })).await.is_err() { break; }
+                                    if step.get("step_type").and_then(Value::as_str) == Some("tool") {
+                                        let id = format!("agy-step-{}", step.get("step_index").and_then(Value::as_u64).unwrap_or_default());
+                                        let info = step.get("tool_info").unwrap_or(&Value::Null);
+                                        let tool_name = info.get("name").or_else(|| step.get("tool_name")).and_then(Value::as_str).unwrap_or("tool");
+                                        let params = info.get("parameters");
+
+                                        // Bridge interactive questions if present
+                                        if tool_name == "ask_question" {
+                                            if let Some(params) = params {
+                                                if let Some(questions) = normalize::extract_questions(params) {
+                                                    let rx = (controls.request_input)(questions);
+                                                    tokio::spawn(async move {
+                                                        let _ = rx.await;
+                                                    });
                                                 }
-                                                Some("step_update") => {
-                                                    let step = frame.get("step_update").unwrap_or(&Value::Null);
-                                                    if let Some(text) = step.get("text_delta").and_then(Value::as_str) {
-                                                        saw_text = true;
-                                                        if tx.send(Ok(AgentEvent::TextDelta { text: text.to_owned() })).await.is_err() { break; }
-                                                    }
-                                                    if step.get("step_type").and_then(Value::as_str) == Some("tool") {
-                                                        let id = format!("agy-step-{}", step.get("step_index").and_then(Value::as_u64).unwrap_or_default());
-                                                        let info = step.get("tool_info").unwrap_or(&Value::Null);
-                                                        let call = ToolCall::Unknown { name: info.get("name").or_else(|| step.get("tool_name")).and_then(Value::as_str).unwrap_or("tool").to_owned(), input: info.get("parameters").cloned() };
-                                                        if tx.send(Ok(AgentEvent::ToolCall { id: id.clone(), call })).await.is_err() { break; }
-                                                        if step.get("state").and_then(Value::as_str) == Some("DONE") {
-                                                            let is_error = info.get("error").is_some();
-                                                            if tx.send(Ok(AgentEvent::ToolResult { id, is_error, output: info.get("output").and_then(Value::as_str).map(str::to_owned), diff: None })).await.is_err() { break; }
-                                                        }
-                                                    }
-                                                    if let Some(usage) = step.get("usage")
-                                                        && tx.send(Ok(usage_event(usage))).await.is_err() { break; }
-                                                }
-                                                Some("result") => {
-                                                    let result = frame.get("result").unwrap_or(&Value::Null);
-                                                    session_id = result.get("conversation_id").and_then(Value::as_str).map(str::to_owned).or(session_id);
-                                                    if !saw_text
-                                                        && let Some(text) = result.get("response").and_then(Value::as_str).filter(|text| !text.is_empty())
-                                                            && tx.send(Ok(AgentEvent::TextDelta { text: text.to_owned() })).await.is_err() { break; }
-                                                    if let Some(usage) = result.get("usage")
-                                                        && tx.send(Ok(usage_event(usage))).await.is_err() { break; }
-                                                    let success = result.get("status").and_then(Value::as_str) == Some("SUCCESS");
-                                                    let event = AgentEvent::Done {
-                                                        status: if success { DoneStatus::Completed } else { DoneStatus::Errored },
-                                                        result: result.get("response").and_then(Value::as_str).map(str::to_owned),
-                                                        error: result.get("error").and_then(Value::as_str).map(str::to_owned),
-                                                        session_id: session_id.clone(),
-                reason: None,
-                                                    };
-                                                    let _ = tx.send(Ok(event)).await;
-                                                    finished = true;
-                                                    break;
-                                                }
-                                                _ => {}
                                             }
                                         }
-                                        Ok(None) => break,
-                                        Err(error) => { let _ = tx.send(Err(HarnessError::Io(error))).await; break; }
+
+                                        let call = normalize::normalize_tool_call(tool_name, params);
+                                        if tx.send(Ok(AgentEvent::ToolCall { id: id.clone(), call })).await.is_err() { break; }
+                                        if step.get("state").and_then(Value::as_str) == Some("DONE") {
+                                            let is_error = info.get("error").is_some();
+                                            if tx.send(Ok(AgentEvent::ToolResult { id, is_error, output: info.get("output").and_then(Value::as_str).map(str::to_owned), diff: None })).await.is_err() { break; }
+                                        }
                                     }
+                                    if let Some(usage) = step.get("usage")
+                                        && tx.send(Ok(usage_event(usage))).await.is_err() { break; }
                                 }
+                                Some("result") => {
+                                    let result = frame.get("result").unwrap_or(&Value::Null);
+                                    session_id = result.get("conversation_id").and_then(Value::as_str).map(str::to_owned).or(session_id);
+                                    if !saw_text
+                                        && let Some(text) = result.get("response").and_then(Value::as_str).filter(|text| !text.is_empty())
+                                            && tx.send(Ok(AgentEvent::TextDelta { text: text.to_owned() })).await.is_err() { break; }
+                                    if let Some(usage) = result.get("usage")
+                                        && tx.send(Ok(usage_event(usage))).await.is_err() { break; }
+                                    let success = result.get("status").and_then(Value::as_str) == Some("SUCCESS");
+                                    let event = AgentEvent::Done {
+                                        status: if success { DoneStatus::Completed } else { DoneStatus::Errored },
+                                        result: result.get("response").and_then(Value::as_str).map(str::to_owned),
+                                        error: result.get("error").and_then(Value::as_str).map(str::to_owned),
+                                        session_id: session_id.clone(),
+                                        reason: None,
+                                    };
+                                    let _ = tx.send(Ok(event)).await;
+                                    finished = true;
+                                    break;
+                                }
+                                _ => {}
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(error) => { let _ = tx.send(Err(HarnessError::Io(error))).await; break; }
+                    }
+                }
             }
             if !finished && !tx.is_closed() {
                 let status = child.wait().await.ok();
