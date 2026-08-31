@@ -47,7 +47,9 @@ const PULSE_TICK: Duration = Duration::from_millis(16);
 /// How long a view stays on the tick list after its last spinner paint. One
 /// lease outlives a few missed frames; an unmounted spinner stops renewing and
 /// the view drops off, letting the clock park.
-const PULSE_LEASE: Duration = Duration::from_millis(300);
+/// 100ms (was 300ms): the clock parks sooner after a spinner unmounts,
+/// avoiding ~12 extra forced frames per spinner disappearance.
+const PULSE_LEASE: Duration = Duration::from_millis(100);
 
 struct PulseClock {
     epoch: Instant,
