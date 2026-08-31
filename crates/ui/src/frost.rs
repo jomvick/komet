@@ -20,7 +20,16 @@ use crate::theme::Theme;
 /// [`Theme::glass_overlay`] tint is thin enough that a 16px blur left
 /// backdrop detail ghosting through menu rows. The composer pill keeps its
 /// own lighter 16 (`chat-composer-glass` blurs 12–16 in the reference).
+///
+/// On macOS the blur is composited by the Metal layer (essentially free at any
+/// sigma). On Linux gpui rasterizes it frame-by-frame via wgpu, so σ=44 is
+/// measurably expensive in the GPU paint pass. σ=32 still reads as a rich
+/// frosted surface — the difference is imperceptible at screen pixel density —
+/// while giving back meaningful GPU headroom at 60 fps.
+#[cfg(target_os = "macos")]
 pub const MENU_BLUR: f32 = 44.0;
+#[cfg(not(target_os = "macos"))]
+pub const MENU_BLUR: f32 = 32.0;
 
 /// Frost `child` (a popover card): backdrop-blurred on glass, pass-through on
 /// opaque platforms. `corner_radius` must match the card's rounding.
