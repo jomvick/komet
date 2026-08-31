@@ -209,8 +209,15 @@ impl CodexHarness {
                 )
                 .await?;
             client.notify("initialized", None);
-            let skills = client.request("skills/list", json!({})).await?;
-            Ok::<Vec<SlashCommand>, HarnessError>(parse_skill_commands(&skills))
+            let skills = client.request("skills/list", json!({})).await.unwrap_or(Value::Null);
+            let mut commands = catalog::static_commands();
+            let discovered = parse_skill_commands(&skills);
+            for cmd in discovered {
+                if !commands.iter().any(|c| c.name == cmd.name) {
+                    commands.push(cmd);
+                }
+            }
+            Ok::<Vec<SlashCommand>, HarnessError>(commands)
         };
         let result = tokio::time::timeout(Duration::from_secs(10), discovery).await;
         shutdown_child(&mut child, self.kill_grace).await;
@@ -311,9 +318,19 @@ impl Harness for CodexHarness {
     /// [`Self::discover_commands`]); cached on success.
     async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
         self.commands
-            .get_or_try_init(|| self.discover_commands())
+            .get_or_try_init(|| async {
+                match self.discover_commands().await {
+                    Ok(commands) => Ok(commands),
+                    Err(_) => Ok(catalog::static_commands()),
+                }
+            })
             .await
             .cloned()
+    }
+
+    async fn context_usage(&self) -> Result<komet_proto::ContextUsage, HarnessError> {
+        self.resolve_executable()?;
+        Ok(komet_proto::ContextUsage::default())
     }
 
     async fn run(

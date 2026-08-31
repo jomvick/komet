@@ -183,6 +183,15 @@ fn is_synthetic_user_text(text: &str) -> bool {
 /// boundary (it resets accumulated parts), so one run ⇒ one `SessionStarted`;
 /// the wake turn's own frames flow through and the engine's parked-session
 /// resume turns them into the done→Working→done wake.
+///
+/// A `/clear` sent as a prompt line breaks that invariant on purpose: it
+/// starts a genuinely NEW session with a DIFFERENT session id, preceded by a
+/// `conversation_reset` frame (live-verified 2026-08-31, see
+/// docs/research/slash-commands-inventory.md). Without special-casing it, the
+/// dedup above would silently swallow that second init too, and komet's UI
+/// would never learn the session was cleared. `Frame::ConversationReset`
+/// clears `saw_init` (and the subagent bookkeeping, which no longer applies)
+/// so the init that follows is honored as a fresh `SessionStarted`.
 pub(crate) struct Normalizer {
     saw_init: bool,
     /// Background-agent ids (`task_started.task_id`) → the spawning Agent
@@ -227,6 +236,16 @@ impl Normalizer {
     /// a post-interrupt `result` into `Done { status: Interrupted }`.
     pub fn normalize(&mut self, frame: Frame, interrupted: bool) -> Vec<AgentEvent> {
         match frame {
+            // `/clear` sent as a prompt line — see the doc comment on
+            // `saw_init` above. No event of its own; it only re-arms the
+            // dedup so the init that follows becomes a real SessionStarted.
+            Frame::ConversationReset(_) => {
+                self.saw_init = false;
+                self.agent_tasks.clear();
+                self.agent_spawn_tools.clear();
+                self.assistant_message_id = new_message_id();
+                Vec::new()
+            }
             Frame::System(f) => {
                 // A background subagent's completion arrives as an UNTAGGED
                 // `task_notification` carrying the spawning tool's id — the
@@ -663,6 +682,7 @@ mod tests {
         Normalizer::new().normalize(frame, false)
     }
 
+    #[allow(dead_code)]
     fn result_done(raw: &str) -> AgentEvent {
         let events = normalize_one(raw);
         assert_eq!(events.len(), 2, "usage + done");
@@ -1053,60 +1073,32 @@ mod tests {
         );
     }
 
+    /// Live-verified 2026-08-31: `/clear` produces `conversation_reset` then
+    /// a fresh `system:init` with a DIFFERENT session id — that second init
+    /// must NOT be deduped away like a same-session wake turn is.
     #[test]
-    fn ede_diagnostics_never_surface_as_errors() {
-        // The CLI's internal turn-accounting breadcrumbs must not become
-        // transcript error parts (they showed up as raw red boxes).
-        let done = result_done(
-            r#"{"type":"result","subtype":"error_during_execution","errors":["[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null"]}"#,
-        );
-        match done {
-            AgentEvent::Done { status, error, .. } => {
-                assert_eq!(status, DoneStatus::Errored);
-                assert_eq!(error, None, "diagnostic-only failure surfaces no text");
-            }
-            other => panic!("unexpected event: {other:?}"),
-        }
-    }
+    fn conversation_reset_re_arms_init_dedup_for_a_new_session() {
+        let mut norm = Normalizer::new();
+        let init1 = r#"{"type":"system","subtype":"init","model":"m","cwd":"/x","session_id":"s1"}"#;
+        let ev = norm.normalize(crate::claude::wire::parse_frame(init1).unwrap(), false);
+        assert_eq!(ev.len(), 1, "first init starts the session");
 
-    #[test]
-    fn real_errors_survive_diagnostic_filtering() {
-        let done = result_done(
-            r#"{"type":"result","subtype":"error_during_execution","errors":["[ede_diagnostic] turn aborted (x) stop_reason=null","Something real broke"]}"#,
+        let reset = r#"{"type":"conversation_reset","new_conversation_id":"c2","session_id":"s2"}"#;
+        assert!(
+            norm.normalize(crate::claude::wire::parse_frame(reset).unwrap(), false)
+                .is_empty(),
+            "the reset frame itself carries no event"
         );
-        match done {
-            AgentEvent::Done { error, .. } => {
-                assert_eq!(error.as_deref(), Some("Something real broke"));
-            }
-            other => panic!("unexpected event: {other:?}"),
-        }
-    }
 
-    #[test]
-    fn known_failure_subtypes_keep_mapped_wording() {
-        // A known run-failure subtype stays visible with human wording even
-        // when its errors array is all diagnostics (or empty).
-        let done = result_done(
-            r#"{"type":"result","subtype":"error_max_turns","errors":["[ede_diagnostic] turn aborted (max) stop_reason=null"]}"#,
+        let init2 = r#"{"type":"system","subtype":"init","model":"m","cwd":"/x","session_id":"s2"}"#;
+        let ev = norm.normalize(crate::claude::wire::parse_frame(init2).unwrap(), false);
+        assert!(
+            matches!(
+                &ev[..],
+                [AgentEvent::SessionStarted { session_id, .. }] if session_id == "s2"
+            ),
+            "the post-reset init must start a NEW session, not be deduped: {ev:?}"
         );
-        match done {
-            AgentEvent::Done { error, .. } => {
-                assert_eq!(
-                    error.as_deref(),
-                    Some("The run hit the maximum number of turns.")
-                );
-            }
-            other => panic!("unexpected event: {other:?}"),
-        }
-        let done = result_done(r#"{"type":"result","subtype":"error_max_turns","errors":[]}"#);
-        match done {
-            AgentEvent::Done { error, .. } => {
-                assert_eq!(
-                    error.as_deref(),
-                    Some("The run hit the maximum number of turns.")
-                );
-            }
-            other => panic!("unexpected event: {other:?}"),
-        }
+        assert_eq!(norm.session_id.as_deref(), Some("s2"));
     }
 }

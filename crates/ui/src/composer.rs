@@ -3493,6 +3493,7 @@ fn mention_error_message(err: &RpcError) -> SharedString {
 }
 
 /// A failed command discovery, translated for the popup.
+#[allow(dead_code)]
 fn slash_error_message(err: &RpcError) -> SharedString {
     match err {
         RpcError::UnknownMethod(_) => {
@@ -3528,8 +3529,10 @@ pub struct Composer {
     /// In-flight file-picker prompt (paperclip).
     picker_task: Option<Task<()>>,
     mention_task: Option<Task<()>>,
+    mention_scroll: gpui::ScrollHandle,
     mention: FileMentionState,
     slash_task: Option<Task<()>>,
+    slash_scroll: gpui::ScrollHandle,
     slash: SlashState,
     /// Advertised commands per harness (one `ListCommands` per harness per
     /// composer lifetime; the engine caches discovery on its side too).
@@ -3598,7 +3601,10 @@ impl Composer {
         // The footer toolbar (checkout kind + ref picker) is rendered INLINE
         // by the composer from picker state — a pickers-side notify (refs
         // loaded, popover toggled, pick made) must repaint the composer too.
-        let pickers_observe = cx.observe(&pickers, |_, _, cx| cx.notify());
+        let pickers_observe = cx.observe(&pickers, |this: &mut Self, _, cx| {
+            this.prefetch_slash_commands(cx);
+            cx.notify();
+        });
         let observe = cx.observe(&state, |this: &mut Self, _, cx| this.on_state_changed(cx));
         let input_events = cx.subscribe(&input, |this: &mut Self, _, event, cx| match event {
             ComposerInputEvent::Submitted => this.on_submit(cx),
@@ -3651,8 +3657,10 @@ impl Composer {
             preview_focus_pending: false,
             picker_task: None,
             mention_task: None,
+            mention_scroll: gpui::ScrollHandle::new(),
             mention: FileMentionState::default(),
             slash_task: None,
+            slash_scroll: gpui::ScrollHandle::new(),
             slash: SlashState::default(),
             slash_cache: HashMap::new(),
             current_key,
@@ -3680,6 +3688,7 @@ impl Composer {
             _pickers_observe: pickers_observe,
             _input_events: input_events,
         };
+        composer.prefetch_slash_commands(cx);
         // Dev knob: pre-stage attachments (drop/paste can't be synthesized on
         // a rig) — `KOMET_ATTACH=/path/a.png[,/path/b.png]`, and
         // `KOMET_ATTACH_PREVIEW=1` boots with the first one's lightbox open.
@@ -4086,6 +4095,9 @@ impl Composer {
     fn move_mention(&mut self, delta: isize, cx: &mut Context<Self>) {
         self.mention.active =
             crate::popover::menu_step(self.mention.active, self.mention.results.len(), delta);
+        if let Some(active) = self.mention.active {
+            self.mention_scroll.scroll_to_item(active);
+        }
         self.sync_mention_controls(cx);
         cx.notify();
     }
@@ -4163,11 +4175,20 @@ impl Composer {
                     }),
             );
         } else {
+            let mut list = div()
+                .id("file-mention-scroll")
+                .size_full()
+                .max_h(px(270.0))
+                .flex()
+                .flex_col()
+                .gap(px(1.0))
+                .overflow_y_scroll()
+                .track_scroll(&self.mention_scroll);
             for (ix, result) in self.mention.results.iter().enumerate() {
                 let selected = self.mention.active == Some(ix);
                 let path = result.path.clone();
                 let tooltip_path: SharedString = path.clone().into();
-                card = card.child(
+                list = list.child(
                     crate::popover::menu_row(theme, selected, format!("file-mention-result-{ix}"))
                         .id(("file-mention-result", ix))
                         .tooltip(move |_, cx| {
@@ -4209,6 +4230,7 @@ impl Composer {
                         ),
                 );
             }
+            card = card.child(list);
         }
         let anchor = self
             .input
@@ -4234,6 +4256,62 @@ impl Composer {
     }
 
     // ---- slash commands ---------------------------------------------------
+
+    /// Eagerly prefetch slash commands for the active harness so that typing `/`
+    /// opens immediately without delay.
+    fn prefetch_slash_commands(&mut self, cx: &mut Context<Self>) {
+        let harness = self.pickers.read(cx).resolved(cx).harness;
+        let Some(harness) = harness else {
+            return;
+        };
+        if self.slash_cache.contains_key(&harness) || self.slash_task.is_some() {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let target = {
+            let state = self.state.read(cx);
+            state
+                .selected_chat_row()
+                .map(|chat| chat.device_id.clone())
+                .or_else(|| state.selected_space_row().map(|s| s.device_id.clone()))
+        };
+        let request = self.slash.request;
+        self.slash_task = Some(cx.spawn(async move |this, cx| {
+            let mut params = serde_json::json!({ "harness": harness });
+            if let (Some(target), Some(object)) = (&target, params.as_object_mut()) {
+                object.insert("targetDeviceId".into(), target.clone().into());
+            }
+            let result = engine.client().call(methods::LIST_COMMANDS, params).await;
+            this.update(cx, |composer, cx| {
+                composer.slash_task = None;
+                if composer.slash.request != request {
+                    return;
+                }
+                composer.slash.loading = false;
+                match result {
+                    Ok(value) => match serde_json::from_value::<Vec<SlashCommand>>(value) {
+                        Ok(commands) => {
+                            composer.slash_cache.insert(harness, commands);
+                        }
+                        Err(err) => {
+                            tracing::warn!(%err, "slash command decode failed");
+                            composer.slash_cache.entry(harness).or_default();
+                        }
+                    },
+                    Err(err) => {
+                        tracing::debug!(%err, "slash command discovery failed");
+                        composer.slash_cache.entry(harness).or_default();
+                    }
+                }
+                if composer.slash.token.is_some() {
+                    composer.refilter_slash(cx);
+                }
+            })
+            .ok();
+        }));
+    }
 
     /// Track the `/` token on every edit: open/refresh the popup, fetch the
     /// harness's command list on first open, filter locally per keystroke.
@@ -4275,50 +4353,11 @@ impl Composer {
             self.refilter_slash(cx);
             return;
         }
-        // First open for this harness: one ListCommands, targeted like file
-        // search (the chat/space host device owns the agent binary).
+        // First open for this harness: trigger prefetch.
         self.slash.request = self.slash.request.wrapping_add(1);
         self.slash.loading = true;
         self.refilter_slash(cx);
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
-            self.slash.loading = false;
-            return;
-        };
-        let target = {
-            let state = self.state.read(cx);
-            state
-                .selected_chat_row()
-                .map(|chat| chat.device_id.clone())
-                .or_else(|| state.selected_space_row().map(|s| s.device_id.clone()))
-        };
-        let request = self.slash.request;
-        self.slash_task = Some(cx.spawn(async move |this, cx| {
-            let mut params = serde_json::json!({ "harness": harness });
-            if let (Some(target), Some(object)) = (&target, params.as_object_mut()) {
-                object.insert("targetDeviceId".into(), target.clone().into());
-            }
-            let result = engine.client().call(methods::LIST_COMMANDS, params).await;
-            this.update(cx, |composer, cx| {
-                if composer.slash.request != request {
-                    return;
-                }
-                composer.slash.loading = false;
-                match result {
-                    Ok(value) => match serde_json::from_value::<Vec<SlashCommand>>(value) {
-                        Ok(commands) => {
-                            composer.slash_cache.insert(harness, commands);
-                        }
-                        Err(err) => tracing::warn!(%err, "slash command decode failed"),
-                    },
-                    Err(err) => {
-                        tracing::debug!(%err, "slash command discovery failed");
-                        composer.slash.error = Some(slash_error_message(&err));
-                    }
-                }
-                composer.refilter_slash(cx);
-            })
-            .ok();
-        }));
+        self.prefetch_slash_commands(cx);
         cx.notify();
     }
 
@@ -4346,6 +4385,9 @@ impl Composer {
     fn move_slash(&mut self, delta: isize, cx: &mut Context<Self>) {
         self.slash.active =
             crate::popover::menu_step(self.slash.active, self.slash.filtered.len(), delta);
+        if let Some(active) = self.slash.active {
+            self.slash_scroll.scroll_to_item(active);
+        }
         self.sync_mention_controls(cx);
         cx.notify();
     }
@@ -4413,7 +4455,7 @@ impl Composer {
             .map(Vec::as_slice)
             .unwrap_or_default();
         let mut card = crate::popover::popover_card(theme)
-            .w(px(380.0))
+            .w(px(400.0))
             .max_h(px(280.0))
             .overflow_hidden()
             .on_mouse_down_out(cx.listener(|this, _, _, cx| this.dismiss_slash(cx)));
@@ -4448,6 +4490,15 @@ impl Composer {
                     }),
             );
         } else {
+            let mut list = div()
+                .id("slash-popup-scroll")
+                .size_full()
+                .max_h(px(270.0))
+                .flex()
+                .flex_col()
+                .gap(px(1.0))
+                .overflow_y_scroll()
+                .track_scroll(&self.slash_scroll);
             for (row_ix, &cmd_ix) in self.slash.filtered.iter().enumerate() {
                 let Some(command) = commands.get(cmd_ix) else {
                     continue;
@@ -4463,7 +4514,7 @@ impl Composer {
                     }
                 }
                 let description: SharedString = description.into();
-                card = card.child(
+                list = list.child(
                     crate::popover::menu_row(theme, selected, format!("slash-result-{row_ix}"))
                         .id(("slash-result", row_ix))
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -4502,6 +4553,7 @@ impl Composer {
                         ),
                 );
             }
+            card = card.child(list);
         }
         let anchor = self
             .input

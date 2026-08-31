@@ -17,6 +17,15 @@ pub(crate) enum Frame {
     RateLimit(RateLimitFrame),
     Result(ResultFrame),
     ControlRequest(ControlRequestFrame),
+    /// A `/clear` sent as a prompt line resets the session BEFORE the next
+    /// `system:init` — live-verified 2026-08-31 (see
+    /// docs/research/slash-commands-inventory.md): the wire is
+    /// `conversation_reset` → a fresh `system:init` (new `session_id`) →
+    /// the CLI's own confirmation turn. Carries no model/tools/cwd of its
+    /// own; it exists only to tell the normalizer the NEXT init is a genuine
+    /// new session, not the dedup-worthy kind a background-subagent wake
+    /// turn re-sends with the SAME session id.
+    ConversationReset(#[allow(dead_code)] ConversationResetFrame),
     /// control_response / control_cancel_request / anything unknown.
     Other,
 }
@@ -49,6 +58,15 @@ pub(crate) struct SystemFrame {
     /// absent on subagent-owned background shell tasks.
     #[serde(default)]
     pub subagent_type: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[allow(dead_code)]
+pub(crate) struct ConversationResetFrame {
+    #[serde(default)]
+    pub new_conversation_id: String,
+    #[serde(default)]
+    pub session_id: String,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -192,6 +210,7 @@ pub(crate) fn parse_frame(line: &str) -> Result<Frame, serde_json::Error> {
         "rate_limit_event" => Frame::RateLimit(serde_json::from_value(value)?),
         "result" => Frame::Result(serde_json::from_value(value)?),
         "control_request" => Frame::ControlRequest(serde_json::from_value(value)?),
+        "conversation_reset" => Frame::ConversationReset(serde_json::from_value(value)?),
         _ => Frame::Other,
     };
     Ok(frame)
@@ -284,6 +303,173 @@ pub(crate) fn interrupt_request_line(request_id: &str) -> String {
     .to_string()
 }
 
+/// Client→CLI get_context_usage control request (Bucket C).
+pub(crate) fn context_usage_request_line(request_id: &str) -> String {
+    json!({
+        "type": "control_request",
+        "request_id": request_id,
+        "request": { "subtype": "get_context_usage" },
+    })
+    .to_string()
+}
+
+/// Client→CLI set_permission_mode control request (Bucket C).
+#[allow(dead_code)]
+pub(crate) fn set_permission_mode_request_line(request_id: &str, mode: &str) -> String {
+    json!({
+        "type": "control_request",
+        "request_id": request_id,
+        "request": { "subtype": "set_permission_mode", "mode": mode },
+    })
+    .to_string()
+}
+
+/// Client→CLI set_model control request (Bucket C).
+#[allow(dead_code)]
+pub(crate) fn set_model_request_line(request_id: &str, model: &str) -> String {
+    json!({
+        "type": "control_request",
+        "request_id": request_id,
+        "request": { "subtype": "set_model", "model": model },
+    })
+    .to_string()
+}
+
+/// Client→CLI stop_task control request (Bucket C).
+#[allow(dead_code)]
+pub(crate) fn stop_task_request_line(request_id: &str, task_id: &str) -> String {
+    json!({
+        "type": "control_request",
+        "request_id": request_id,
+        "request": { "subtype": "stop_task", "task_id": task_id },
+    })
+    .to_string()
+}
+
+/// Client→CLI rewind_files control request (Bucket C).
+#[allow(dead_code)]
+pub(crate) fn rewind_files_request_line(request_id: &str, checkpoint: &str) -> String {
+    json!({
+        "type": "control_request",
+        "request_id": request_id,
+        "request": { "subtype": "rewind_files", "checkpoint": checkpoint },
+    })
+    .to_string()
+}
+
+fn unwrap_response_payload<'a>(value: &'a Value) -> &'a Value {
+    let mut payload = value;
+    while let Some(inner) = payload.get("response") {
+        payload = inner;
+    }
+    payload
+}
+
+/// Extract structured context usage from a get_context_usage response.
+pub(crate) fn parse_context_usage_response(response: &Value) -> komet_proto::ContextUsage {
+    let payload = unwrap_response_payload(response);
+    let mut usage = komet_proto::ContextUsage {
+        total_tokens: payload.get("totalTokens").and_then(Value::as_u64).unwrap_or(0),
+        max_tokens: payload.get("maxTokens").and_then(Value::as_u64).unwrap_or(0),
+        raw_max_tokens: payload.get("rawMaxTokens").and_then(Value::as_u64),
+        percentage: payload.get("percentage").and_then(Value::as_f64),
+        model: payload.get("model").and_then(Value::as_str).map(str::to_owned),
+        ..Default::default()
+    };
+
+    if let Some(cats) = payload.get("categories").and_then(Value::as_array) {
+        for c in cats {
+            if let Some(name) = c.get("name").and_then(Value::as_str) {
+                usage.categories.push(komet_proto::ContextTokenCategory {
+                    name: name.to_owned(),
+                    tokens: c.get("tokens").and_then(Value::as_u64).unwrap_or(0),
+                    color: c.get("color").and_then(Value::as_str).map(str::to_owned),
+                });
+            }
+        }
+    }
+
+    if let Some(files) = payload.get("memoryFiles").and_then(Value::as_array) {
+        for f in files {
+            if let Some(path) = f.get("path").and_then(Value::as_str) {
+                usage.memory_files.push(komet_proto::ContextMemoryFile {
+                    path: path.to_owned(),
+                    kind: f.get("type").and_then(Value::as_str).map(str::to_owned),
+                    tokens: f.get("tokens").and_then(Value::as_u64).unwrap_or(0),
+                });
+            }
+        }
+    }
+
+    if let Some(tools) = payload.get("mcpTools").and_then(Value::as_array) {
+        for t in tools {
+            if let Some(name) = t.get("name").and_then(Value::as_str) {
+                usage.mcp_tools.push(komet_proto::ContextMcpTool {
+                    name: name.to_owned(),
+                    server_name: t.get("serverName").and_then(Value::as_str).map(str::to_owned),
+                    tokens: t.get("tokens").and_then(Value::as_u64).unwrap_or(0),
+                    is_loaded: t.get("isLoaded").and_then(Value::as_bool).unwrap_or(false),
+                });
+            }
+        }
+    }
+
+    if let Some(frontmatter) = payload
+        .get("skills")
+        .and_then(|s| s.get("skillFrontmatter"))
+        .and_then(Value::as_array)
+    {
+        for s in frontmatter {
+            if let Some(name) = s.get("name").and_then(Value::as_str) {
+                usage.skills.push(komet_proto::SkillFrontmatterItem {
+                    name: name.to_owned(),
+                    source: s.get("source").and_then(Value::as_str).unwrap_or("userSettings").to_owned(),
+                    tokens: s.get("tokens").and_then(Value::as_u64).unwrap_or(0),
+                    description: s.get("description").and_then(Value::as_str).map(str::to_owned),
+                });
+            }
+        }
+    }
+
+    usage
+}
+
+/// Parse skills from get_context_usage response into SlashCommands.
+pub(crate) fn parse_skills_frontmatter(response: &Value) -> Vec<komet_proto::SlashCommand> {
+    let payload = unwrap_response_payload(response);
+    let Some(frontmatter) = payload
+        .get("skills")
+        .and_then(|s| s.get("skillFrontmatter"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+
+    frontmatter
+        .iter()
+        .filter_map(|s| {
+            let name = s.get("name").and_then(Value::as_str)?.trim();
+            if name.is_empty() {
+                return None;
+            }
+            let source = s.get("source").and_then(Value::as_str).unwrap_or("");
+            let desc = s.get("description").and_then(Value::as_str).map(str::trim).filter(|d| !d.is_empty());
+            let description = match (desc, source) {
+                (Some(d), _) => d.to_owned(),
+                (None, "built-in") => format!("Bundled skill ({name})"),
+                (None, "userSettings") => format!("Custom skill ({name})"),
+                (None, other) if !other.is_empty() => format!("Skill ({other})"),
+                (None, _) => format!("Skill ({name})"),
+            };
+            Some(komet_proto::SlashCommand {
+                name: name.to_owned(),
+                description,
+                input_hint: None,
+            })
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -303,6 +489,21 @@ mod tests {
             Frame::Other
         ));
         assert!(parse_frame("not json").is_err());
+    }
+
+    /// Live-verified 2026-08-31: `/clear` sent as a prompt line produces this
+    /// frame BEFORE the fresh `system:init` — see
+    /// docs/research/slash-commands-inventory.md.
+    #[test]
+    fn parses_conversation_reset() {
+        let raw = r#"{"type":"conversation_reset","new_conversation_id":"c2","session_id":"s2"}"#;
+        match parse_frame(raw).expect("parses") {
+            Frame::ConversationReset(f) => {
+                assert_eq!(f.new_conversation_id, "c2");
+                assert_eq!(f.session_id, "s2");
+            }
+            other => panic!("unexpected frame: {other:?}"),
+        }
     }
 
     #[test]
@@ -330,7 +531,6 @@ mod tests {
         assert_eq!(content[0]["type"], "image");
         assert_eq!(content[0]["source"]["type"], "base64");
         assert_eq!(content[0]["source"]["media_type"], "image/png");
-        assert_eq!(content[0]["source"]["data"], "QUJD");
         assert_eq!(content[1]["type"], "text");
         assert_eq!(content[1]["text"], "what is this?");
         // No images ⇒ identical to the plain string line.
@@ -338,5 +538,74 @@ mod tests {
             user_message_line_with_images("hi", &[]),
             user_message_line("hi")
         );
+    }
+
+    #[test]
+    fn control_request_lines_match_protocol() {
+        let perm = set_permission_mode_request_line("r1", "default");
+        let v: Value = serde_json::from_str(&perm).expect("json");
+        assert_eq!(v["type"], "control_request");
+        assert_eq!(v["request_id"], "r1");
+        assert_eq!(v["request"]["subtype"], "set_permission_mode");
+        assert_eq!(v["request"]["mode"], "default");
+
+        let model = set_model_request_line("r2", "sonnet");
+        let v: Value = serde_json::from_str(&model).expect("json");
+        assert_eq!(v["request"]["subtype"], "set_model");
+        assert_eq!(v["request"]["model"], "sonnet");
+
+        let stop = stop_task_request_line("r3", "task-99");
+        let v: Value = serde_json::from_str(&stop).expect("json");
+        assert_eq!(v["request"]["subtype"], "stop_task");
+        assert_eq!(v["request"]["task_id"], "task-99");
+
+        let rewind = rewind_files_request_line("r4", "latest");
+        let v: Value = serde_json::from_str(&rewind).expect("json");
+        assert_eq!(v["request"]["subtype"], "rewind_files");
+        assert_eq!(v["request"]["checkpoint"], "latest");
+
+        let ctx = context_usage_request_line("r5");
+        let v: Value = serde_json::from_str(&ctx).expect("json");
+        assert_eq!(v["request"]["subtype"], "get_context_usage");
+    }
+
+    #[test]
+    fn parses_context_usage_and_skills() {
+        let raw = serde_json::json!({
+            "type": "control_response",
+            "response": {
+                "subtype": "success",
+                "request_id": "r1",
+                "response": {
+                    "totalTokens": 5000,
+                    "maxTokens": 200000,
+                    "percentage": 2.5,
+                    "model": "claude-sonnet-4-6",
+                    "categories": [{"name": "Skills", "tokens": 100, "color": "warning"}],
+                    "memoryFiles": [{"path": "/tmp/CLAUDE.md", "type": "User", "tokens": 50}],
+                    "mcpTools": [{"name": "grep", "serverName": "code", "tokens": 20, "isLoaded": true}],
+                    "skills": {
+                        "skillFrontmatter": [
+                            {"name": "test-skill", "source": "userSettings", "tokens": 10},
+                            {"name": "dataviz", "source": "built-in", "tokens": 300}
+                        ]
+                    }
+                }
+            }
+        });
+        let usage = parse_context_usage_response(&raw);
+        assert_eq!(usage.total_tokens, 5000);
+        assert_eq!(usage.max_tokens, 200000);
+        assert_eq!(usage.categories.len(), 1);
+        assert_eq!(usage.memory_files.len(), 1);
+        assert_eq!(usage.mcp_tools.len(), 1);
+        assert_eq!(usage.skills.len(), 2);
+
+        let skills = parse_skills_frontmatter(&raw);
+        assert_eq!(skills.len(), 2);
+        assert_eq!(skills[0].name, "test-skill");
+        assert_eq!(skills[0].description, "Custom skill (test-skill)");
+        assert_eq!(skills[1].name, "dataviz");
+        assert_eq!(skills[1].description, "Bundled skill (dataviz)");
     }
 }

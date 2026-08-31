@@ -18,7 +18,7 @@ use tokio::sync::{mpsc, oneshot};
 pub use tokio_util::sync::CancellationToken;
 
 use komet_proto::{
-    AgentEvent, HarnessId, Model, ReasoningLevel, RunRequest, SlashCommand, SteeringMode,
+    AgentEvent, ContextUsage, HarnessId, Model, ReasoningLevel, RunRequest, SlashCommand, SteeringMode,
     UserInputAnswer, UserInputQuestion,
 };
 
@@ -119,6 +119,10 @@ pub trait Harness: Send + Sync {
     /// for harnesses without them. May spawn a short-lived discovery process.
     async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
         Ok(Vec::new())
+    }
+    /// Structured context and token usage from the harness (Bucket C control request).
+    async fn context_usage(&self) -> Result<ContextUsage, HarnessError> {
+        Ok(ContextUsage::default())
     }
     /// Run one (persistent) session; the stream ends with `AgentEvent::Done`.
     async fn run(

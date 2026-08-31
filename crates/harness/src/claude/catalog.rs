@@ -9,7 +9,165 @@
 //! curated list directly; `ClaudeHarness::models` is the single seam where
 //! dynamic discovery can later be spliced in.
 
-use komet_proto::{Model, ModelOption, ModelOptionChoice, ReasoningLevel};
+use komet_proto::{Model, ModelOption, ModelOptionChoice, ReasoningLevel, SlashCommand};
+
+/// Curated list of Claude Code built-in slash commands (Bucket A) and bundled skills.
+pub(crate) fn static_commands() -> Vec<SlashCommand> {
+    vec![
+        // Context / Session Management
+        SlashCommand {
+            name: "compact".into(),
+            description: "Compact conversation history to free context space".into(),
+            input_hint: Some("[instructions]".into()),
+        },
+        SlashCommand {
+            name: "context".into(),
+            description: "Show token usage and context breakdown".into(),
+            input_hint: Some("[all]".into()),
+        },
+        SlashCommand {
+            name: "cost".into(),
+            description: "Show token and cost usage statistics".into(),
+            input_hint: None,
+        },
+        SlashCommand {
+            name: "clear".into(),
+            description: "Reset conversation history and start fresh".into(),
+            input_hint: Some("[name]".into()),
+        },
+        SlashCommand {
+            name: "rewind".into(),
+            description: "Rewind files to a previous checkpoint".into(),
+            input_hint: Some("[checkpoint]".into()),
+        },
+        SlashCommand {
+            name: "diff".into(),
+            description: "Show uncommitted changes in the repository".into(),
+            input_hint: None,
+        },
+        SlashCommand {
+            name: "branch".into(),
+            description: "Create or switch to a git branch".into(),
+            input_hint: Some("<branch name>".into()),
+        },
+        SlashCommand {
+            name: "rename".into(),
+            description: "Rename the current session".into(),
+            input_hint: Some("<new name>".into()),
+        },
+        SlashCommand {
+            name: "export".into(),
+            description: "Export conversation history to a file".into(),
+            input_hint: Some("<filename>".into()),
+        },
+        SlashCommand {
+            name: "plan".into(),
+            description: "Switch to planning mode with a goal description".into(),
+            input_hint: Some("<description>".into()),
+        },
+        SlashCommand {
+            name: "goal".into(),
+            description: "Set a high-level goal condition or clear it".into(),
+            input_hint: Some("<condition|clear>".into()),
+        },
+        SlashCommand {
+            name: "btw".into(),
+            description: "Ask a quick side-question without polluting primary context".into(),
+            input_hint: Some("<question>".into()),
+        },
+        SlashCommand {
+            name: "add-dir".into(),
+            description: "Add a directory to the context workspace".into(),
+            input_hint: Some("<path>".into()),
+        },
+        SlashCommand {
+            name: "cd".into(),
+            description: "Change working directory".into(),
+            input_hint: Some("<path>".into()),
+        },
+        SlashCommand {
+            name: "subtask".into(),
+            description: "Run a subagent task in the current session".into(),
+            input_hint: Some("<task description>".into()),
+        },
+        SlashCommand {
+            name: "config".into(),
+            description: "View or modify a configuration setting".into(),
+            input_hint: Some("<key=value>".into()),
+        },
+        SlashCommand {
+            name: "memory".into(),
+            description: "View or edit CLAUDE.md memory file".into(),
+            input_hint: None,
+        },
+        SlashCommand {
+            name: "sandbox".into(),
+            description: "View or adjust execution sandbox policy".into(),
+            input_hint: None,
+        },
+        SlashCommand {
+            name: "init".into(),
+            description: "Initialize CLAUDE.md memory file for current project".into(),
+            input_hint: None,
+        },
+        // Bundled skills
+        SlashCommand {
+            name: "review".into(),
+            description: "Review changes or a pull request".into(),
+            input_hint: Some("[pr number]".into()),
+        },
+        SlashCommand {
+            name: "security-review".into(),
+            description: "Run a comprehensive security review".into(),
+            input_hint: None,
+        },
+        SlashCommand {
+            name: "simplify".into(),
+            description: "Simplify code for clarity and maintainability".into(),
+            input_hint: None,
+        },
+        SlashCommand {
+            name: "loop".into(),
+            description: "Run an autonomous loop until completion".into(),
+            input_hint: Some("<prompt>".into()),
+        },
+        SlashCommand {
+            name: "claude-api".into(),
+            description: "Search Claude API reference and examples".into(),
+            input_hint: Some("<query>".into()),
+        },
+        SlashCommand {
+            name: "dataviz".into(),
+            description: "Generate charts and data visualizations".into(),
+            input_hint: Some("<data/request>".into()),
+        },
+        SlashCommand {
+            name: "run".into(),
+            description: "Run a script or command".into(),
+            input_hint: Some("<command>".into()),
+        },
+        SlashCommand {
+            name: "batch".into(),
+            description: "Execute a batch of refactoring tasks".into(),
+            input_hint: Some("<tasks>".into()),
+        },
+        SlashCommand {
+            name: "doctor".into(),
+            description: "Diagnose common project configuration issues".into(),
+            input_hint: None,
+        },
+        SlashCommand {
+            name: "debug".into(),
+            description: "Diagnose and debug errors or failing tests".into(),
+            input_hint: Some("<issue>".into()),
+        },
+        SlashCommand {
+            name: "verify".into(),
+            description: "Verify test results and build integrity".into(),
+            input_hint: None,
+        },
+    ]
+}
 
 /// The ultrathink directive rides every user message as a prompt prefix — that
 /// is how the mode actually works in Claude Code (a prompt convention, not an

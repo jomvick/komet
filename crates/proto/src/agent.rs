@@ -1236,6 +1236,78 @@ pub struct SlashCommand {
     pub input_hint: Option<String>,
 }
 
+/// A category entry in context breakdown (e.g. "Skills", "Free space", "System prompt").
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextTokenCategory {
+    pub name: String,
+    #[serde(default)]
+    pub tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+}
+
+/// A memory file loaded into context (e.g. project/user CLAUDE.md).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextMemoryFile {
+    pub path: String,
+    #[serde(rename = "type", default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub tokens: u64,
+}
+
+/// An MCP tool registered with the harness.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextMcpTool {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_name: Option<String>,
+    #[serde(default)]
+    pub tokens: u64,
+    #[serde(default)]
+    pub is_loaded: bool,
+}
+
+/// A skill entry advertised in skillFrontmatter.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SkillFrontmatterItem {
+    pub name: String,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// Structured context / token usage reported by a harness control request (Bucket C `get_context_usage`).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContextUsage {
+    #[serde(default)]
+    pub total_tokens: u64,
+    #[serde(default)]
+    pub max_tokens: u64,
+    #[serde(default)]
+    pub raw_max_tokens: Option<u64>,
+    #[serde(default)]
+    pub percentage: Option<f64>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub categories: Vec<ContextTokenCategory>,
+    #[serde(default)]
+    pub memory_files: Vec<ContextMemoryFile>,
+    #[serde(default)]
+    pub mcp_tools: Vec<ContextMcpTool>,
+    #[serde(default)]
+    pub skills: Vec<SkillFrontmatterItem>,
+}
+
 /// A file modification carried inline on a tool result (ACP
 /// `ToolCallContent::Diff`). `old_text: None` means a new file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

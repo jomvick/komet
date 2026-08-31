@@ -882,7 +882,13 @@ impl AcpHarness {
                     }
                 }
             }
-            Ok::<Vec<SlashCommand>, HarnessError>(commands)
+            let mut all_commands = static_commands(self.spec.id);
+            for cmd in commands {
+                if !all_commands.iter().any(|c| c.name == cmd.name) {
+                    all_commands.push(cmd);
+                }
+            }
+            Ok::<Vec<SlashCommand>, HarnessError>(all_commands)
         };
         let result = tokio::time::timeout(Duration::from_secs(10), discovery).await;
         shutdown_child(&mut child, self.kill_grace).await;
@@ -1192,6 +1198,60 @@ fn trait_from_config_option(option: &Value) -> Option<ModelOption> {
     }
 }
 
+/// Built-in slash commands native to ACP agents (OpenCode built-ins).
+pub(crate) fn static_commands(id: HarnessId) -> Vec<SlashCommand> {
+    match id {
+        HarnessId::Opencode => vec![
+            SlashCommand {
+                name: "compact".into(),
+                description: "Compact the conversation context".into(),
+                input_hint: None,
+            },
+            SlashCommand {
+                name: "clear".into(),
+                description: "Clear session history and reset context".into(),
+                input_hint: None,
+            },
+            SlashCommand {
+                name: "diff".into(),
+                description: "Show uncommitted git changes".into(),
+                input_hint: None,
+            },
+            SlashCommand {
+                name: "undo".into(),
+                description: "Undo last file modification".into(),
+                input_hint: None,
+            },
+            SlashCommand {
+                name: "redo".into(),
+                description: "Redo undone file modification".into(),
+                input_hint: None,
+            },
+            SlashCommand {
+                name: "model".into(),
+                description: "Switch active LLM model".into(),
+                input_hint: Some("[model_name]".into()),
+            },
+            SlashCommand {
+                name: "mode".into(),
+                description: "Switch execution mode (plan, build, review)".into(),
+                input_hint: Some("[mode]".into()),
+            },
+            SlashCommand {
+                name: "init".into(),
+                description: "Initialize project configuration".into(),
+                input_hint: None,
+            },
+            SlashCommand {
+                name: "review".into(),
+                description: "Review staged or unstaged code diffs".into(),
+                input_hint: None,
+            },
+        ],
+        _ => Vec::new(),
+    }
+}
+
 #[async_trait]
 impl Harness for AcpHarness {
     fn id(&self) -> HarnessId {
@@ -1252,9 +1312,19 @@ impl Harness for AcpHarness {
 
     async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
         self.commands
-            .get_or_try_init(|| self.discover_commands())
+            .get_or_try_init(|| async {
+                match self.discover_commands().await {
+                    Ok(commands) if !commands.is_empty() => Ok(commands),
+                    _ => Ok(static_commands(self.spec.id)),
+                }
+            })
             .await
             .cloned()
+    }
+
+    async fn context_usage(&self) -> Result<komet_proto::ContextUsage, HarnessError> {
+        self.resolve_launch()?;
+        Ok(komet_proto::ContextUsage::default())
     }
 
     async fn run(

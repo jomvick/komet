@@ -626,6 +626,21 @@ async fn commands_discovery_scans_the_initialize_response() {
 }
 
 #[tokio::test]
+async fn opencode_commands_discovery_includes_static_builtins() {
+    let harness = opencode_harness();
+    let commands = harness.commands().await.expect("discovery");
+    assert!(
+        commands.len() >= 8,
+        "opencode builtins present: len={}",
+        commands.len()
+    );
+    assert!(commands.iter().any(|c| c.name == "compact"));
+    assert!(commands.iter().any(|c| c.name == "diff"));
+    assert!(commands.iter().any(|c| c.name == "review"));
+    assert!(commands.iter().any(|c| c.name == "undo"));
+}
+
+#[tokio::test]
 async fn missing_binary_surfaces_not_installed_with_install_hint() {
     let harness = AcpHarness::grok().with_executable("/nonexistent/definitely-not-grok");
     let err = harness
