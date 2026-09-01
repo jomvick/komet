@@ -9,6 +9,11 @@
 //!   lives in `~/.claude.json`.
 //! - **Codex** — `$CODEX_HOME/auth.json` (default `~/.codex`): a ChatGPT OAuth
 //!   token set (identity inside the `id_token` JWT) or a raw API key.
+//! - **Antigravity** — Google OAuth via `agy` (default `~/.gemini/antigravity-cli/`
+//!   or OS keychain; `ANTIGRAVITY_HOME` relocates). Discovery on this host shows
+//!   `You are not logged into Antigravity` with no token file on disk — the Go
+//!   binary resolves the token source at runtime (ADC/keychain). Komet mirrors the
+//!   file-based pattern and probes known locations.
 //!
 //! Claude-swap mechanics:
 //!
@@ -80,6 +85,8 @@ pub struct AgentAccountsConfig {
     pub claude_config_file: PathBuf,
     /// Codex home (`$CODEX_HOME` or `~/.codex`) — holds `auth.json`.
     pub codex_home: PathBuf,
+    /// Antigravity home (`$ANTIGRAVITY_HOME` or `~/.gemini/antigravity-cli`) — holds `auth.json`.
+    pub antigravity_home: PathBuf,
 }
 
 impl AgentAccountsConfig {
@@ -101,6 +108,8 @@ impl AgentAccountsConfig {
             claude_config_dir: claude_dir.unwrap_or_else(|| home_dir().join(".claude")),
             claude_config_file,
             codex_home: env_dir("CODEX_HOME").unwrap_or_else(|| home_dir().join(".codex")),
+            antigravity_home: env_dir("ANTIGRAVITY_HOME")
+                .unwrap_or_else(|| home_dir().join(".gemini/antigravity-cli")),
         }
     }
 
@@ -110,6 +119,10 @@ impl AgentAccountsConfig {
 
     fn codex_auth_file(&self) -> PathBuf {
         self.codex_home.join("auth.json")
+    }
+
+    fn antigravity_auth_file(&self) -> PathBuf {
+        self.antigravity_home.join("auth.json")
     }
 
     fn root_dir(&self) -> PathBuf {
@@ -276,11 +289,19 @@ impl AgentAccounts {
             active_keys.insert(HarnessId::Codex, detected.account_key.clone());
             self.snapshot_detected(HarnessId::Codex, &detected)?;
         }
+        if let Some(detected) = self.detect_antigravity() {
+            active_keys.insert(HarnessId::Antigravity, detected.account_key.clone());
+            self.snapshot_detected(HarnessId::Antigravity, &detected)?;
+        }
 
         // Stable presentation order: provider, then slot creation order (never
         // active-first — switching must not reshuffle the cards).
         let mut accounts: Vec<AgentAccount> = Vec::new();
-        for harness in [HarnessId::ClaudeCode, HarnessId::Codex] {
+        for harness in [
+            HarnessId::ClaudeCode,
+            HarnessId::Codex,
+            HarnessId::Antigravity,
+        ] {
             let active_key = active_keys.get(&harness).cloned();
             let slots = self.read_slots(harness);
             for slot in &slots {
@@ -346,6 +367,7 @@ impl AgentAccounts {
         match harness {
             HarnessId::ClaudeCode => self.activate_claude(&slot).await?,
             HarnessId::Codex => self.activate_codex(&slot)?,
+            HarnessId::Antigravity => self.activate_antigravity(&slot)?,
             other => {
                 return Err(EngineError::Other(format!(
                     "agent accounts are not supported for {other:?}"
@@ -412,6 +434,13 @@ impl AgentAccounts {
         write_file_atomic(&self.inner.config.codex_auth_file(), json.as_bytes(), true)
     }
 
+    fn activate_antigravity(&self, slot: &Slot) -> Result<(), EngineError> {
+        std::fs::create_dir_all(&self.inner.config.antigravity_home)?;
+        let json = serde_json::to_string_pretty(&slot.credentials)
+            .map_err(|e| EngineError::Other(format!("serialize antigravity auth: {e}")))?;
+        write_file_atomic(&self.inner.config.antigravity_auth_file(), json.as_bytes(), true)
+    }
+
     // ── forget ──────────────────────────────────────────────────────────────
 
     pub async fn forget(
@@ -455,6 +484,7 @@ impl AgentAccounts {
         match harness {
             HarnessId::ClaudeCode => Ok(self.start_claude_login()),
             HarnessId::Codex => self.start_codex_login().await,
+            HarnessId::Antigravity => self.start_antigravity_login().await,
             other => Err(EngineError::Other(format!(
                 "agent logins are not supported for {other:?}"
             ))),
@@ -611,6 +641,129 @@ impl AgentAccounts {
 
         let deadline = Instant::now() + Duration::from_secs(5);
         let url = loop {
+            if let Some(url) = scan_openai_url(&lock(&output)) {
+                break url;
+            }
+            if lock(&exit).is_some() || Instant::now() > deadline {
+                break String::new();
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        Ok(AgentLoginStart {
+            login_id,
+            url,
+            mode: AgentLoginMode::Browser,
+        })
+    }
+
+    async fn start_antigravity_login(&self) -> Result<AgentLoginStart, EngineError> {
+        // Mirror Codex: throwaway ANTIGRAVITY_HOME so live session untouched
+        let stale: Vec<String> = lock(&self.inner.flows)
+            .iter()
+            .filter(|(_, f)| matches!(f, LoginFlow::Codex { .. }))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in stale {
+            self.cancel_login(&id);
+        }
+        let login_id = new_id();
+        let home = self
+            .inner
+            .config
+            .root_dir()
+            .join(format!(".login-{login_id}"));
+        std::fs::create_dir_all(&home)?;
+        let mut child = match tokio::process::Command::new("agy")
+            .arg("login")
+            .env("ANTIGRAVITY_HOME", &home)
+            .env("GEMINI_HOME", &home)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(err) => {
+                let _ = std::fs::remove_dir_all(&home);
+                return Err(EngineError::Other(
+                    if err.kind() == std::io::ErrorKind::NotFound {
+                        "The `agy` CLI was not found on this device — install it first.".into()
+                    } else {
+                        format!("Could not start antigravity login: {err}")
+                    },
+                ));
+            }
+        };
+        let output = Arc::new(Mutex::new(String::new()));
+        for pipe in [
+            child
+                .stdout
+                .take()
+                .map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Send + Unpin>),
+            child
+                .stderr
+                .take()
+                .map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Send + Unpin>),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let sink = output.clone();
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut pipe = pipe;
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = pipe.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    lock(&sink).push_str(&String::from_utf8_lossy(&buf[..n]));
+                }
+            });
+        }
+        let child = Arc::new(Mutex::new(Some(child)));
+        let exit: Arc<Mutex<Option<Option<i32>>>> = Arc::new(Mutex::new(None));
+        {
+            let child = child.clone();
+            let exit = exit.clone();
+            tokio::spawn(async move {
+                loop {
+                    {
+                        let mut slot = lock(&child);
+                        match slot.as_mut().map(|c| c.try_wait()) {
+                            None => break,
+                            Some(Ok(Some(status))) => {
+                                *lock(&exit) = Some(status.code());
+                                *slot = None;
+                                break;
+                            }
+                            Some(Ok(None)) => {}
+                            Some(Err(_)) => {
+                                *lock(&exit) = Some(None);
+                                *slot = None;
+                                break;
+                            }
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            });
+        }
+        lock(&self.inner.flows).insert(
+            login_id.clone(),
+            LoginFlow::Codex {
+                child,
+                home,
+                started_at: Instant::now(),
+                output: output.clone(),
+                exit: exit.clone(),
+            },
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let url = loop {
+            if let Some(url) = scan_google_url(&lock(&output)) {
+                break url;
+            }
             if let Some(url) = scan_openai_url(&lock(&output)) {
                 break url;
             }
@@ -805,13 +958,32 @@ impl AgentAccounts {
                 home, exit, output, ..
             }) => (home.clone(), exit.clone(), output.clone()),
         };
-        if let Some(detected) = read_json(&home.join("auth.json")).and_then(parse_codex_auth) {
-            self.snapshot_detected(HarnessId::Codex, &detected)?;
+        // Try antigravity first (shares same throwaway structure as codex)
+        if let Some(detected) = read_json(&home.join("auth.json"))
+            .and_then(|v| parse_antigravity_auth(v.clone()).or_else(|| parse_codex_auth(v)))
+        {
+            let harness = if parse_antigravity_auth(read_json(&home.join("auth.json")).unwrap_or_default()).is_some() {
+                HarnessId::Antigravity
+            } else {
+                HarnessId::Codex
+            };
+            self.snapshot_detected(harness, &detected)?;
             self.cancel_login(login_id);
             return Ok(AgentLoginPoll {
                 status: AgentLoginStatus::Done,
                 message: None,
             });
+        }
+        // Also probe antigravity-specific filenames
+        for name in ["oauth_token.json", "credentials.json"] {
+            if let Some(detected) = read_json(&home.join(name)).and_then(parse_antigravity_auth) {
+                self.snapshot_detected(HarnessId::Antigravity, &detected)?;
+                self.cancel_login(login_id);
+                return Ok(AgentLoginPoll {
+                    status: AgentLoginStatus::Done,
+                    message: None,
+                });
+            }
         }
         let exited = *lock(&exit);
         if let Some(code) = exited {
@@ -911,6 +1083,18 @@ impl AgentAccounts {
 
     fn detect_codex(&self) -> Option<Detected> {
         read_json(&self.inner.config.codex_auth_file()).and_then(parse_codex_auth)
+    }
+
+    fn detect_antigravity(&self) -> Option<Detected> {
+        // Probe known filenames inside antigravity_home
+        for name in ["auth.json", "oauth_token.json", "credentials.json"] {
+            let path = self.inner.config.antigravity_home.join(name);
+            if let Some(auth) = read_json(&path).and_then(parse_antigravity_auth) {
+                return Some(auth);
+            }
+        }
+        // Fallback: legacy gemini path already covered via ANTIGRAVITY_HOME default
+        None
     }
 
     /// Persist a detected login into its slot (refreshing stored tokens).
@@ -1553,6 +1737,81 @@ fn scan_openai_url(output: &str) -> Option<String> {
     let rest = &output[start..];
     let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
     Some(rest[..end].to_string())
+}
+
+fn scan_google_url(output: &str) -> Option<String> {
+    for prefix in ["https://accounts.google.com/", "https://auth.google.com/"] {
+        if let Some(start) = output.find(prefix) {
+            let rest = &output[start..];
+            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            return Some(rest[..end].to_string());
+        }
+    }
+    None
+}
+
+fn parse_antigravity_auth(auth: serde_json::Value) -> Option<Detected> {
+    // Try JWT id_token first (Google OAuth)
+    if let Some(id_token) = auth
+        .get("tokens")
+        .and_then(|t| t.get("id_token"))
+        .and_then(|v| v.as_str())
+        .or_else(|| auth.get("id_token").and_then(|v| v.as_str()))
+    {
+        let claims = jwt_claims(id_token).unwrap_or_else(|| serde_json::json!({}));
+        if let Some(email) = str_field(&claims, "email") {
+            return Some(Detected {
+                account_key: str_field(&claims, "sub").unwrap_or_else(|| email.clone()),
+                profile: SlotProfile {
+                    email: email.clone(),
+                    display_name: str_field(&claims, "name"),
+                    organization: None,
+                    plan: None,
+                    auth_kind: AgentAuthKind::Oauth,
+                },
+                credentials: Some(auth),
+                claude_config: None,
+            });
+        }
+    }
+    // Plain shape: {email, access_token} or {access_token, refresh_token}
+    if let Some(email) = str_field(&auth, "email")
+        .or_else(|| str_field(&auth, "emailAddress"))
+    {
+        return Some(Detected {
+            account_key: email.clone(),
+            profile: SlotProfile {
+                email,
+                display_name: str_field(&auth, "name")
+                    .or_else(|| str_field(&auth, "displayName")),
+                organization: None,
+                plan: None,
+                auth_kind: AgentAuthKind::Oauth,
+            },
+            credentials: Some(auth),
+            claude_config: None,
+        });
+    }
+    // Generic access_token present -> derive key from hash
+    if let Some(token) = str_field(&auth, "access_token")
+        .or_else(|| str_field(&auth, "accessToken"))
+    {
+        let digest = Sha256::digest(token.as_bytes());
+        let key = crate::repos::hex(&digest)[..12].to_string();
+        return Some(Detected {
+            account_key: format!("antigravity:{key}"),
+            profile: SlotProfile {
+                email: format!("Antigravity ·…{key}"),
+                display_name: None,
+                organization: None,
+                plan: None,
+                auth_kind: AgentAuthKind::Oauth,
+            },
+            credentials: Some(auth),
+            claude_config: None,
+        });
+    }
+    None
 }
 
 /// Minimal percent-encoding for OAuth query params (matches `encodeURIComponent`

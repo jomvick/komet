@@ -112,9 +112,10 @@ pub fn format_reset(resets_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Opt
 
 /// The provider cards, in display order: (harness, name, CLI command — named
 /// in the empty-state copy, komet settings.agents.tsx `PROVIDERS`).
-pub const PROVIDERS: [(HarnessId, &str, &str); 2] = [
+pub const PROVIDERS: [(HarnessId, &str, &str); 3] = [
     (HarnessId::ClaudeCode, "Claude Code", "claude"),
     (HarnessId::Codex, "Codex", "codex"),
+    (HarnessId::Antigravity, "Antigravity", "agy"),
 ];
 
 /// Accounts of one provider, active first (stable otherwise). Pure.
@@ -164,6 +165,7 @@ impl LoginFlow {
         };
         match harness {
             HarnessId::Codex => "Add Codex account",
+            HarnessId::Antigravity => "Add Antigravity account",
             _ => "Add Claude account",
         }
     }
