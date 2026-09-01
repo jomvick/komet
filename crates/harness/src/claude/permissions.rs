@@ -174,6 +174,38 @@ pub fn build_claude_settings_maps(
     (perms, sandbox)
 }
 
+/// A one-line label for a (possibly multi-part) shell command: the first
+/// `;`/`&&`/`||`/newline-separated segment, capped at [`SUMMARY_MAX_CHARS`],
+/// plus a "(+N more)" suffix when the chain has further segments. The full
+/// command still rides [`PermissionKind::Command::cmdline`] verbatim for the
+/// detail block — this is ONLY the header line, which used to just be the
+/// entire raw command (`format!("Run `{cmd}`")`) and, for a long chain like
+/// `git status; echo "---"; git diff --stat; …`, rendered as the identical
+/// text twice: once as the "summary" header, once again in the monospace
+/// detail box right below it (user report, screenshot 2026-09-01).
+const SUMMARY_MAX_CHARS: usize = 56;
+
+fn summarize_command(cmd: &str) -> String {
+    let segments: Vec<&str> = cmd
+        .split(['\n', ';'])
+        .flat_map(|s| s.split("&&"))
+        .flat_map(|s| s.split("||"))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let first = segments.first().copied().unwrap_or(cmd).trim();
+    let mut short: String = if first.chars().count() > SUMMARY_MAX_CHARS {
+        first.chars().take(SUMMARY_MAX_CHARS).collect::<String>() + "…"
+    } else {
+        first.to_string()
+    };
+    let remaining = segments.len().saturating_sub(1);
+    if remaining > 0 {
+        short.push_str(&format!(" (+{remaining} more)"));
+    }
+    short
+}
+
 /// Extract [`PermissionKind`], summary, and default choices from a tool call payload.
 pub fn parse_tool_permission(
     tool_name: &str,
@@ -197,7 +229,7 @@ pub fn parse_tool_permission(
             let summary = if cmd.is_empty() {
                 "Run command".into()
             } else {
-                format!("Run `{cmd}`")
+                format!("Run `{}`", summarize_command(cmd))
             };
             (
                 PermissionKind::Command {
@@ -257,6 +289,29 @@ mod tests {
         );
         assert_eq!(summary, "Run `git push origin main`");
         assert_eq!(choices.len(), 3);
+    }
+
+    #[test]
+    fn long_multi_command_chains_summarize_instead_of_duplicating() {
+        // Regression for the permission popup showing the exact same full
+        // command twice (header + detail box) when the CLI's `command` is a
+        // long `;`-joined chain (screenshot 2026-09-01).
+        let input = json!({
+            "command": "git status; echo \"---\"; git diff --stat; echo \"---\"; git diff --cached --stat; echo \"---\"; git log --oneline -3; echo \"---\"; git branch --show-current; echo \"---\"; git remote -v | head -5"
+        });
+        let (_, summary, _) = parse_tool_permission("Bash", &input);
+        assert_eq!(summary, "Run `git status` (+9 more)");
+        assert!(summary.chars().count() < 40, "header must stay short: {summary}");
+    }
+
+    #[test]
+    fn a_single_long_command_still_truncates() {
+        let long = "a".repeat(100);
+        let input = json!({ "command": long });
+        let (_, summary, _) = parse_tool_permission("Bash", &input);
+        assert!(summary.starts_with("Run `"));
+        assert!(summary.chars().count() <= 5 + SUMMARY_MAX_CHARS + 1 + 1, "{summary}");
+        assert!(summary.ends_with('…'));
     }
 
     #[test]
