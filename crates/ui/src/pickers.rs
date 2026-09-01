@@ -2297,6 +2297,8 @@ impl Pickers {
             // Context usage ring (interactive — opens the usage popover).
             let closing = self.open.closing_since();
             let context_stats = self.state.read(cx).current_context_usage();
+            let chat_harness = chat.config.as_ref().map(|c| c.harness);
+            let chat_model = chat.config.as_ref().and_then(|c| c.model.as_deref());
             let is_context_open = self.open_kind() == Some(PickerKind::ContextUsage);
             let context_chip = div()
                 .id("context-usage-ring")
@@ -2317,6 +2319,7 @@ impl Pickers {
                 )
                 .child(crate::context_usage::render_context_ring(
                     &context_stats,
+                    chat_harness,
                     &theme,
                 ));
             let mut overlay: Option<(PickerKind, AnyElement)> = if self.mounted_kind()
@@ -2324,10 +2327,15 @@ impl Pickers {
             {
                 let stats = self.state.read(cx).current_context_usage();
                 let popover_theme = Theme::of(cx).clone();
-                let content = crate::context_usage::render_context_popover(&stats, &popover_theme);
+                let content = crate::context_usage::render_context_popover(
+                    &stats,
+                    chat_harness,
+                    chat_model,
+                    &popover_theme,
+                );
                 Some((
                     PickerKind::ContextUsage,
-                    self.popover_frame_flush(290.0, content, cx),
+                    self.popover_frame_flush(320.0, content, cx),
                 ))
             } else {
                 None
@@ -2366,6 +2374,9 @@ impl Pickers {
         // Refs feed the draft labels — eager + idempotent.
         self.ensure_refs(false, cx);
         let closing = self.open.closing_since();
+        let resolved = self.resolved(cx);
+        let draft_harness = resolved.harness;
+        let draft_model = resolved.model.as_deref();
         let mut overlay: Option<(PickerKind, AnyElement)> = match self.mounted_kind() {
             Some(PickerKind::Branch) => {
                 let content = self.render_branch_popover(cx);
@@ -2378,10 +2389,15 @@ impl Pickers {
             Some(PickerKind::ContextUsage) => {
                 let stats = self.state.read(cx).current_context_usage();
                 let popover_theme = Theme::of(cx).clone();
-                let content = crate::context_usage::render_context_popover(&stats, &popover_theme);
+                let content = crate::context_usage::render_context_popover(
+                    &stats,
+                    draft_harness,
+                    draft_model,
+                    &popover_theme,
+                );
                 Some((
                     PickerKind::ContextUsage,
-                    self.popover_frame_flush(290.0, content, cx),
+                    self.popover_frame_flush(320.0, content, cx),
                 ))
             }
             // Space/Device popovers mount on the canvas selectors
@@ -2432,6 +2448,7 @@ impl Pickers {
             )
             .child(crate::context_usage::render_context_ring(
                 &context_stats,
+                draft_harness,
                 &theme,
             ));
         // Checkout on the left edge, ref on the right — the row's
