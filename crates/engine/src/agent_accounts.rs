@@ -657,7 +657,11 @@ impl AgentAccounts {
     }
 
     async fn start_antigravity_login(&self) -> Result<AgentLoginStart, EngineError> {
-        // Mirror Codex: throwaway ANTIGRAVITY_HOME so live session untouched
+        // agy requires a TTY (bubbletea) and ignores ANTIGRAVITY_HOME/GEMINI_HOME
+        // in headless spawn — the Codex-style throwaway flow would hang forever
+        // on "Connexion en cours". Return a manual instruction instead and poll
+        // the real home for a new credential file. This keeps Annuler working
+        // and avoids orphan children.
         let stale: Vec<String> = lock(&self.inner.flows)
             .iter()
             .filter(|(_, f)| matches!(f, LoginFlow::Codex { .. }))
@@ -665,6 +669,42 @@ impl AgentAccounts {
             .collect();
         for id in stale {
             self.cancel_login(&id);
+        }
+        // Fast probe: if agy exists but needs TTY, fail fast with guidance
+        // instead of spawning a hanging child.
+        let probe = tokio::process::Command::new("agy")
+            .arg("login")
+            .env("ANTIGRAVITY_HOME", "/tmp")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn();
+        if let Ok(mut probe_child) = probe {
+            let mut probe_out = String::new();
+            if let Some(mut stderr) = probe_child.stderr.take() {
+                use tokio::io::AsyncReadExt;
+                let mut buf = [0u8; 2048];
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    stderr.read(&mut buf),
+                )
+                .await
+                .map(|r| {
+                    if let Ok(n) = r {
+                        probe_out.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    }
+                });
+            }
+            let _ = probe_child.start_kill();
+            if probe_out.contains("could not open TTY") || probe_out.contains("bubbletea") {
+                return Err(EngineError::Other(
+                    "Antigravity nécessite un terminal interactif — lancez `agy` manuellement dans un terminal, connectez-vous, puis cliquez sur Actualiser. Le multi-compte (switch) fonctionne une fois loggé.".into(),
+                ));
+            }
+        } else if probe.is_err() {
+            return Err(EngineError::Other(
+                "The `agy` CLI was not found on this device — install it first.".into(),
+            ));
         }
         let login_id = new_id();
         let home = self
@@ -752,8 +792,8 @@ impl AgentAccounts {
         lock(&self.inner.flows).insert(
             login_id.clone(),
             LoginFlow::Codex {
-                child,
-                home,
+                child: child.clone(),
+                home: home.clone(),
                 started_at: Instant::now(),
                 output: output.clone(),
                 exit: exit.clone(),
@@ -761,10 +801,23 @@ impl AgentAccounts {
         );
         let deadline = Instant::now() + Duration::from_secs(5);
         let url = loop {
-            if let Some(url) = scan_google_url(&lock(&output)) {
+            let out = lock(&output).clone();
+            if out.contains("could not open TTY") || out.contains("bubbletea") {
+                // agy needs interactive TTY — fail fast with guidance instead of
+                // leaving "Connexion en cours" hanging. Clean up child/home.
+                if let Some(c) = lock(&child).as_mut() {
+                    let _ = c.start_kill();
+                }
+                let _ = std::fs::remove_dir_all(&home);
+                lock(&self.inner.flows).remove(&login_id);
+                return Err(EngineError::Other(
+                    "Antigravity nécessite un terminal interactif — lancez `agy` manuellement dans un terminal, connectez-vous, puis cliquez sur Actualiser. Le multi-compte (switch) fonctionne une fois loggé.".into(),
+                ));
+            }
+            if let Some(url) = scan_google_url(&out) {
                 break url;
             }
-            if let Some(url) = scan_openai_url(&lock(&output)) {
+            if let Some(url) = scan_openai_url(&out) {
                 break url;
             }
             if lock(&exit).is_some() || Instant::now() > deadline {
