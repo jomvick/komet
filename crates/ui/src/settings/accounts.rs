@@ -959,21 +959,29 @@ impl AccountsPage {
                 ))
                 .into_any_element(),
             LoginFlow::PasteCode {
+                harness,
                 start,
                 submitting,
                 error,
                 ..
             } => {
                 let submitting = *submitting;
+                let copy = match harness {
+                    HarnessId::Antigravity => {
+                        "A terminal-based Google sign-in has started. Approve access in \
+                         the browser, then paste the authorization code Google shows \
+                         you below. Your current login is untouched until you switch."
+                    }
+                    _ => {
+                        "A browser window opened. Sign in to the account you want to add, \
+                         approve access, then paste the code Anthropic shows you below. Your \
+                         current login is untouched until you switch."
+                    }
+                };
                 div()
                     .flex()
                     .flex_col()
-                    .child(div().mt(px(8.0)).child(popover::dialog_body(
-                        &theme,
-                        "A browser window opened. Sign in to the account you want to add, \
-                         approve access, then paste the code Anthropic shows you below. Your \
-                         current login is untouched until you switch.",
-                    )))
+                    .child(div().mt(px(8.0)).child(popover::dialog_body(&theme, copy)))
                     .child(url_link(
                         "login-open-url",
                         "Reopen the authorization page",

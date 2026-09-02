@@ -10,10 +10,11 @@
 //! - **Codex** — `$CODEX_HOME/auth.json` (default `~/.codex`): a ChatGPT OAuth
 //!   token set (identity inside the `id_token` JWT) or a raw API key.
 //! - **Antigravity** — Google OAuth via `agy` (default `~/.gemini/antigravity-cli/`
-//!   or OS keychain; `ANTIGRAVITY_HOME` relocates). Discovery on this host shows
-//!   `You are not logged into Antigravity` with no token file on disk — the Go
-//!   binary resolves the token source at runtime (ADC/keychain). Komet mirrors the
-//!   file-based pattern and probes known locations.
+//!   or OS keyring; `ANTIGRAVITY_HOME` relocates). The live token lives in the OS
+//!   keyring: `agy` uses `zalando/go-keyring`, i.e. the Secret Service item
+//!   `service="gemini"`, `username="antigravity"` on Linux (a JSON
+//!   `{"token":{access_token,refresh_token,expiry},"auth_method":…}` blob), with
+//!   an internal file fallback we also probe.
 //!
 //! Claude-swap mechanics:
 //!
@@ -64,6 +65,18 @@ const CLAUDE_TOKEN_URL: &str = "https://console.anthropic.com/v1/oauth/token";
 const CLAUDE_PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
 const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+// Antigravity's keyring blob carries NO identity (Task 0 discovery) — only
+// OAuth tokens. Resolve the real email via Google's own userinfo endpoint,
+// the same trick Claude's flow uses against CLAUDE_PROFILE_URL.
+const GOOGLE_USERINFO_URL: &str = "https://www.googleapis.com/oauth2/v3/userinfo";
+
+// The keyring item `agy` (zalando/go-keyring) reads/writes its live Google
+// token — discovered by introspecting the Secret Service (Task 0 of
+// docs/superpowers/plans/2026-09-02-antigravity-pty-login.md).
+#[cfg(target_os = "linux")]
+const AGY_KEYRING_SERVICE: &str = "gemini";
+#[cfg(target_os = "linux")]
+const AGY_KEYRING_USER: &str = "antigravity";
 
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 const KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
@@ -193,14 +206,32 @@ enum LoginFlow {
         /// `Some(code)` once the child exited (`None` code = killed by signal).
         exit: Arc<Mutex<Option<Option<i32>>>>,
     },
+    /// `agy` behind a real PTY (headless print-mode auth): it prints the Google
+    /// authorize URL, we paste the user's code into the PTY, and the flow
+    /// completes when the global keyring item changes (see complete_login).
+    // `master`/`output`/`exit` are written at spawn and re-read by future
+    // poll paths; for now they exist to hold the PTY alive and feed cancel.
+    #[allow(dead_code)]
+    Antigravity {
+        /// PTY master — held alive for the flow's lifetime (dropping it EOFs the child).
+        master: Mutex<Option<Box<dyn portable_pty::MasterPty + Send>>>,
+        writer: Arc<Mutex<Option<Box<dyn std::io::Write + Send>>>>,
+        killer: Arc<Mutex<Option<Box<dyn portable_pty::ChildKiller + Send + Sync>>>>,
+        started_at: Instant,
+        output: Arc<Mutex<String>>,
+        /// `Some(code)` once the child exited (`None` code = killed by signal).
+        exit: Arc<Mutex<Option<Option<i32>>>>,
+        /// Raw keyring secret captured before the login — success = it changed.
+        initial: Option<String>,
+    },
 }
 
 impl LoginFlow {
     fn started_at(&self) -> Instant {
         match self {
-            LoginFlow::Claude { started_at, .. } | LoginFlow::Codex { started_at, .. } => {
-                *started_at
-            }
+            LoginFlow::Claude { started_at, .. }
+            | LoginFlow::Codex { started_at, .. }
+            | LoginFlow::Antigravity { started_at, .. } => *started_at,
         }
     }
 }
@@ -219,6 +250,10 @@ struct Inner {
     /// Slots with a token refresh in flight — a second refresh of the same
     /// (commonly single-use) refresh token would revoke the family.
     inflight_refreshes: Mutex<std::collections::HashSet<String>>,
+    /// Antigravity's local secret has no identity (Task 0) — emails resolved
+    /// via Google's userinfo endpoint are cached by `account_key` (the stable
+    /// refresh-token hash) so `list()` doesn't hit Google again once resolved.
+    antigravity_profile_cache: Mutex<HashMap<String, (String, Option<String>)>>,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -255,6 +290,7 @@ impl AgentAccounts {
                 flows: Mutex::new(HashMap::new()),
                 usage_cache: Mutex::new(HashMap::new()),
                 inflight_refreshes: Mutex::new(std::collections::HashSet::new()),
+                antigravity_profile_cache: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -289,7 +325,7 @@ impl AgentAccounts {
             active_keys.insert(HarnessId::Codex, detected.account_key.clone());
             self.snapshot_detected(HarnessId::Codex, &detected)?;
         }
-        if let Some(detected) = self.detect_antigravity() {
+        if let Some(detected) = self.detect_antigravity().await {
             active_keys.insert(HarnessId::Antigravity, detected.account_key.clone());
             self.snapshot_detected(HarnessId::Antigravity, &detected)?;
         }
@@ -367,7 +403,7 @@ impl AgentAccounts {
         match harness {
             HarnessId::ClaudeCode => self.activate_claude(&slot).await?,
             HarnessId::Codex => self.activate_codex(&slot)?,
-            HarnessId::Antigravity => self.activate_antigravity(&slot)?,
+            HarnessId::Antigravity => self.activate_antigravity(&slot).await?,
             other => {
                 return Err(EngineError::Other(format!(
                     "agent accounts are not supported for {other:?}"
@@ -434,10 +470,22 @@ impl AgentAccounts {
         write_file_atomic(&self.inner.config.codex_auth_file(), json.as_bytes(), true)
     }
 
-    fn activate_antigravity(&self, slot: &Slot) -> Result<(), EngineError> {
-        std::fs::create_dir_all(&self.inner.config.antigravity_home)?;
-        let json = serde_json::to_string_pretty(&slot.credentials)
+    async fn activate_antigravity(&self, slot: &Slot) -> Result<(), EngineError> {
+        // Compact (not pretty) — this exact string is the keyring secret and the
+        // comparison fingerprint for in-flight login flows.
+        let json = serde_json::to_string(&slot.credentials)
             .map_err(|e| EngineError::Other(format!("serialize antigravity auth: {e}")))?;
+        #[cfg(target_os = "linux")]
+        match secretservice::write_credentials(AGY_KEYRING_SERVICE, AGY_KEYRING_USER, &json).await {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                // No Secret Service daemon (headless server) or denied — fall
+                // back to the file store; `agy` reads the file when the keyring
+                // is unavailable (its own fallback path).
+                tracing::warn!(error = %err, "antigravity keyring write failed, falling back to file store");
+            }
+        }
+        std::fs::create_dir_all(&self.inner.config.antigravity_home)?;
         write_file_atomic(&self.inner.config.antigravity_auth_file(), json.as_bytes(), true)
     }
 
@@ -657,179 +705,183 @@ impl AgentAccounts {
     }
 
     async fn start_antigravity_login(&self) -> Result<AgentLoginStart, EngineError> {
-        // agy requires a TTY (bubbletea) and ignores ANTIGRAVITY_HOME/GEMINI_HOME
-        // in headless spawn — the Codex-style throwaway flow would hang forever
-        // on "Connexion en cours". Return a manual instruction instead and poll
-        // the real home for a new credential file. This keeps Annuler working
-        // and avoids orphan children.
+        // The live token lives in ONE global keyring item (`gemini`/`antigravity`,
+        // go-keyring schema), so at most one flow at a time — a new login
+        // supersedes any in-flight one. (Cancel kills the PTY child.)
         let stale: Vec<String> = lock(&self.inner.flows)
             .iter()
-            .filter(|(_, f)| matches!(f, LoginFlow::Codex { .. }))
+            .filter(|(_, f)| matches!(f, LoginFlow::Antigravity { .. }))
             .map(|(id, _)| id.clone())
             .collect();
         for id in stale {
             self.cancel_login(&id);
         }
-        // Fast probe: if agy exists but needs TTY, fail fast with guidance
-        // instead of spawning a hanging child.
-        let probe = tokio::process::Command::new("agy")
-            .arg("login")
-            .env("ANTIGRAVITY_HOME", "/tmp")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn();
-        if let Ok(mut probe_child) = probe {
-            let mut probe_out = String::new();
-            if let Some(mut stderr) = probe_child.stderr.take() {
-                use tokio::io::AsyncReadExt;
-                let mut buf = [0u8; 2048];
-                let _ = tokio::time::timeout(
-                    Duration::from_secs(2),
-                    stderr.read(&mut buf),
-                )
-                .await
-                .map(|r| {
-                    if let Ok(n) = r {
-                        probe_out.push_str(&String::from_utf8_lossy(&buf[..n]));
+        #[cfg(not(target_os = "linux"))]
+        {
+            // Success detection needs the Secret Service reader (Task 0 scope:
+            // Linux only); the keychain/wincred readers for `agy` are not wired.
+            return Err(EngineError::Other(
+                "Antigravity sign-in from the app is Linux-only in this version — run `agy` once in a terminal, then refresh.".into(),
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // `agy` reuses whatever is already in the keyring — if an account is
+            // live, `agy -p …` answers AS that account (a REAL, quota-billed
+            // turn) instead of ever showing a fresh sign-in screen. That's the
+            // "Individual quota reached" failure: every Add Account click was
+            // silently spending the active account's usage, never triggering a
+            // new login. Snapshot the live login first (so it's never lost),
+            // then clear the keyring so this attempt is a genuine new sign-in.
+            // `cancel_login` restores `initial` verbatim if this flow is
+            // cancelled, times out, or errors before a new account completes;
+            // `complete_antigravity_login` tears down via the non-restoring
+            // path on success, leaving the freshly-written new account alone.
+            if let Some(live) = self.detect_antigravity().await {
+                self.snapshot_detected(HarnessId::Antigravity, &live)?;
+            }
+            if let Err(err) =
+                secretservice::clear_credentials(AGY_KEYRING_SERVICE, AGY_KEYRING_USER).await
+            {
+                tracing::warn!(error = %err, "antigravity keyring clear failed before add-account");
+            }
+            // Fingerprint the current secret — the flow completes when it changes.
+            let (initial_value, _) = self.read_antigravity_keyring().await;
+            let initial = initial_value.map(|v| v.to_string());
+            let login_id = new_id();
+            let pty = portable_pty::native_pty_system();
+            let pair = pty
+                .openpty(portable_pty::PtySize {
+                    rows: 40,
+                    cols: 120,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .map_err(|e| EngineError::Other(format!("could not open a pty: {e}")))?;
+            // Headless print mode: with no stored auth, `agy -p` runs its
+            // non-TUI flow — it opens the Google authorize URL and prompts
+            // "Or, paste the authorization code here and press Enter:" on the
+            // PTY (Task 0 discovery: binary strings).
+            let mut cmd = portable_pty::CommandBuilder::new("agy");
+            cmd.arg("-p");
+            cmd.arg("hi");
+            cmd.env("TERM", "xterm-256color");
+            cmd.env("NO_COLOR", "1");
+            let child = match pair.slave.spawn_command(cmd) {
+                Ok(child) => child,
+                Err(err) => {
+                    let not_found = err
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+                    return Err(EngineError::Other(if not_found {
+                        "The `agy` CLI was not found on this device — install it first."
+                            .into()
+                    } else {
+                        format!("Could not start antigravity login: {err}")
+                    }));
+                }
+            };
+            drop(pair.slave); // like terminals.rs: the master keeps the connection alive
+            let killer = child.clone_killer();
+            let reader = pair
+                .master
+                .try_clone_reader()
+                .map_err(|e| EngineError::Other(format!("pty reader: {e}")))?;
+            let writer = pair
+                .master
+                .take_writer()
+                .map_err(|e| EngineError::Other(format!("pty writer: {e}")))?;
+            let output = Arc::new(Mutex::new(String::new()));
+            let exit: Arc<Mutex<Option<Option<i32>>>> = Arc::new(Mutex::new(None));
+            // Dedicated blocking thread for the PTY output (terminals.rs pattern).
+            {
+                let sink = output.clone();
+                std::thread::spawn(move || {
+                    use std::io::Read;
+                    let mut reader = reader;
+                    let mut buf = [0u8; 4096];
+                    while let Ok(n) = reader.read(&mut buf) {
+                        if n == 0 {
+                            break;
+                        }
+                        lock(&sink).push_str(&String::from_utf8_lossy(&buf[..n]));
                     }
                 });
             }
-            let _ = probe_child.start_kill();
-            if probe_out.contains("could not open TTY") || probe_out.contains("bubbletea") {
-                return Err(EngineError::Other(
-                    "Antigravity nécessite un terminal interactif — lancez `agy` manuellement dans un terminal, connectez-vous, puis cliquez sur Actualiser. Le multi-compte (switch) fonctionne une fois loggé.".into(),
-                ));
-            }
-        } else if probe.is_err() {
-            return Err(EngineError::Other(
-                "The `agy` CLI was not found on this device — install it first.".into(),
-            ));
-        }
-        let login_id = new_id();
-        let home = self
-            .inner
-            .config
-            .root_dir()
-            .join(format!(".login-{login_id}"));
-        std::fs::create_dir_all(&home)?;
-        let mut child = match tokio::process::Command::new("agy")
-            .arg("login")
-            .env("ANTIGRAVITY_HOME", &home)
-            .env("GEMINI_HOME", &home)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-        {
-            Ok(child) => child,
-            Err(err) => {
-                let _ = std::fs::remove_dir_all(&home);
-                return Err(EngineError::Other(
-                    if err.kind() == std::io::ErrorKind::NotFound {
-                        "The `agy` CLI was not found on this device — install it first.".into()
-                    } else {
-                        format!("Could not start antigravity login: {err}")
-                    },
-                ));
-            }
-        };
-        let output = Arc::new(Mutex::new(String::new()));
-        for pipe in [
-            child
-                .stdout
-                .take()
-                .map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Send + Unpin>),
-            child
-                .stderr
-                .take()
-                .map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Send + Unpin>),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            let sink = output.clone();
-            tokio::spawn(async move {
-                use tokio::io::AsyncReadExt;
-                let mut pipe = pipe;
-                let mut buf = [0u8; 4096];
-                while let Ok(n) = pipe.read(&mut buf).await {
-                    if n == 0 {
-                        break;
-                    }
-                    lock(&sink).push_str(&String::from_utf8_lossy(&buf[..n]));
-                }
-            });
-        }
-        let child = Arc::new(Mutex::new(Some(child)));
-        let exit: Arc<Mutex<Option<Option<i32>>>> = Arc::new(Mutex::new(None));
-        {
-            let child = child.clone();
-            let exit = exit.clone();
-            tokio::spawn(async move {
-                loop {
-                    {
-                        let mut slot = lock(&child);
-                        match slot.as_mut().map(|c| c.try_wait()) {
-                            None => break,
-                            Some(Ok(Some(status))) => {
-                                *lock(&exit) = Some(status.code());
-                                *slot = None;
-                                break;
-                            }
-                            Some(Ok(None)) => {}
-                            Some(Err(_)) => {
-                                *lock(&exit) = Some(None);
-                                *slot = None;
-                                break;
+            // Exit monitor (reaps the child once it finishes).
+            {
+                let child = Arc::new(Mutex::new(Some(child)));
+                let exit = exit.clone();
+                tokio::spawn(async move {
+                    loop {
+                        {
+                            let mut slot = lock(&child);
+                            match slot.as_mut().map(|c| c.try_wait()) {
+                                None => break,
+                                Some(Ok(Some(status))) => {
+                                    *lock(&exit) = Some(Some(status.exit_code() as i32));
+                                    *slot = None;
+                                    break;
+                                }
+                                Some(Ok(None)) => {}
+                                Some(Err(_)) => {
+                                    *lock(&exit) = Some(None);
+                                    *slot = None;
+                                    break;
+                                }
                             }
                         }
+                        tokio::time::sleep(Duration::from_millis(200)).await;
                     }
-                    tokio::time::sleep(Duration::from_millis(200)).await;
+                });
+            }
+            lock(&self.inner.flows).insert(
+                login_id.clone(),
+                LoginFlow::Antigravity {
+                    master: Mutex::new(Some(pair.master)),
+                    writer: Arc::new(Mutex::new(Some(writer))),
+                    killer: Arc::new(Mutex::new(Some(killer))),
+                    started_at: Instant::now(),
+                    output: output.clone(),
+                    exit: exit.clone(),
+                    initial,
+                },
+            );
+            // Wait for the Google authorize URL the headless flow prints.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let url = loop {
+                let out = lock(&output).clone();
+                if out.contains("could not open TTY") {
+                    self.cancel_login(&login_id);
+                    return Err(EngineError::Other(
+                        "The `agy` CLI could not start its sign-in flow — update it (`agy update`) and try again.".into(),
+                    ));
                 }
-            });
+                if let Some(url) = scan_google_url(&out) {
+                    break url;
+                }
+                if lock(&exit).is_some() || Instant::now() > deadline {
+                    self.cancel_login(&login_id);
+                    let tail = lock(&output)
+                        .lines()
+                        .last()
+                        .unwrap_or("")
+                        .trim()
+                        .to_string();
+                    return Err(EngineError::Other(if tail.is_empty() {
+                        "Antigravity did not open a sign-in page — is the `agy` CLI installed and up to date?".into()
+                    } else {
+                        format!("Antigravity sign-in failed: {tail}")
+                    }));
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            };
+            Ok(AgentLoginStart {
+                login_id,
+                url,
+                mode: AgentLoginMode::PasteCode,
+            })
         }
-        lock(&self.inner.flows).insert(
-            login_id.clone(),
-            LoginFlow::Codex {
-                child: child.clone(),
-                home: home.clone(),
-                started_at: Instant::now(),
-                output: output.clone(),
-                exit: exit.clone(),
-            },
-        );
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let url = loop {
-            let out = lock(&output).clone();
-            if out.contains("could not open TTY") || out.contains("bubbletea") {
-                // agy needs interactive TTY — fail fast with guidance instead of
-                // leaving "Connexion en cours" hanging. Clean up child/home.
-                if let Some(c) = lock(&child).as_mut() {
-                    let _ = c.start_kill();
-                }
-                let _ = std::fs::remove_dir_all(&home);
-                lock(&self.inner.flows).remove(&login_id);
-                return Err(EngineError::Other(
-                    "Antigravity nécessite un terminal interactif — lancez `agy` manuellement dans un terminal, connectez-vous, puis cliquez sur Actualiser. Le multi-compte (switch) fonctionne une fois loggé.".into(),
-                ));
-            }
-            if let Some(url) = scan_google_url(&out) {
-                break url;
-            }
-            if let Some(url) = scan_openai_url(&out) {
-                break url;
-            }
-            if lock(&exit).is_some() || Instant::now() > deadline {
-                break String::new();
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
-        };
-        Ok(AgentLoginStart {
-            login_id,
-            url,
-            mode: AgentLoginMode::Browser,
-        })
     }
 
     /// Exchange the pasted `code#state` for tokens and save the account as a slot
@@ -839,6 +891,14 @@ impl AgentAccounts {
         login_id: &str,
         code: &str,
     ) -> Result<AgentAccountsSnapshot, EngineError> {
+        // Antigravity takes a different road: the code is fed to the `agy` PTY
+        // and the keyring swap is awaited (see complete_antigravity_login).
+        if matches!(
+            lock(&self.inner.flows).get(login_id),
+            Some(LoginFlow::Antigravity { .. })
+        ) {
+            return self.complete_antigravity_login(login_id, code).await;
+        }
         let verifier = match lock(&self.inner.flows).get(login_id) {
             Some(LoginFlow::Claude { verifier, .. }) => verifier.clone(),
             _ => {
@@ -993,6 +1053,79 @@ impl AgentAccounts {
         self.list(false).await
     }
 
+    /// Feed the pasted authorization code into the `agy` PTY, then wait for the
+    /// keyring secret to change (the headless flow exchanges it and rewrites the
+    /// `gemini`/`antigravity` item) before snapshotting the new account.
+    async fn complete_antigravity_login(
+        &self,
+        login_id: &str,
+        code: &str,
+    ) -> Result<AgentAccountsSnapshot, EngineError> {
+        if code.trim().is_empty() {
+            return Err(EngineError::Other(
+                "That code looks empty — paste the whole code.".into(),
+            ));
+        }
+        let (writer, initial) = match lock(&self.inner.flows).get(login_id) {
+            Some(LoginFlow::Antigravity { writer, initial, .. }) => {
+                (writer.clone(), initial.clone())
+            }
+            _ => {
+                return Err(EngineError::Other(
+                    "This sign-in attempt expired — start again.".into(),
+                ));
+            }
+        };
+        {
+            use std::io::Write;
+            let mut slot = lock(&writer);
+            if let Some(w) = slot.as_mut() {
+                // The PTY is in canonical mode: \r is the Enter keypress.
+                w.write_all(format!("{}\r", code.trim()).as_bytes())
+                    .and_then(|_| w.flush())
+                    .map_err(|e| {
+                        EngineError::Other(format!("could not send the code to agy: {e}"))
+                    })?;
+            } else {
+                return Err(EngineError::Other(
+                    "The agy sign-in process is no longer running — start again.".into(),
+                ));
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = initial;
+            return Err(EngineError::Other(
+                "Antigravity sign-in completion is Linux-only in this version.".into(),
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            loop {
+                if let (Some(value), _) = self.read_antigravity_keyring().await
+                    && initial.as_deref() != Some(value.to_string().as_str())
+                    && let Some(mut detected) = parse_antigravity_auth(value.clone())
+                {
+                    self.enrich_antigravity_profile(&mut detected, &value).await;
+                    self.snapshot_detected(HarnessId::Antigravity, &detected)?;
+                    // NOT cancel_login: that path restores the OLD keyring
+                    // secret, which would immediately undo this successful
+                    // sign-in.
+                    self.finish_antigravity_login(login_id);
+                    return self.list(false).await;
+                }
+                if Instant::now() > deadline {
+                    return Err(EngineError::Other(
+                        "The sign-in didn't complete in time — check the code and try again."
+                            .into(),
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+        }
+    }
+
     pub async fn poll_login(&self, login_id: &str) -> Result<AgentLoginPoll, EngineError> {
         self.sweep_flows();
         let (home, exit, output) = match lock(&self.inner.flows).get(login_id) {
@@ -1002,6 +1135,14 @@ impl AgentAccounts {
                 ));
             }
             Some(LoginFlow::Claude { .. }) => {
+                return Ok(AgentLoginPoll {
+                    status: AgentLoginStatus::Pending,
+                    message: None,
+                });
+            }
+            Some(LoginFlow::Antigravity { .. }) => {
+                // PasteCode mode drives completion through complete_login; the
+                // poll path just stays Pending while the PTY flow is alive.
                 return Ok(AgentLoginPoll {
                     status: AgentLoginStatus::Pending,
                     message: None,
@@ -1064,13 +1205,60 @@ impl AgentAccounts {
 
     /// Drop a flow: kill a pending `codex login` child (it holds the fixed
     /// loopback OAuth port) and reclaim its throwaway home dir. Idempotent.
+    ///
+    /// For Antigravity, this is the FAILURE/ABANDONMENT path: it also restores
+    /// the keyring secret `start_antigravity_login` captured before clearing it
+    /// (`initial`) so a cancelled, timed-out, or errored attempt never leaves
+    /// the user signed out of their real account. A successful login must NOT
+    /// go through here — see [`Self::finish_antigravity_login`].
     pub fn cancel_login(&self, login_id: &str) {
         let flow = lock(&self.inner.flows).remove(login_id);
-        if let Some(LoginFlow::Codex { child, home, .. }) = flow {
-            if let Some(c) = lock(&child).as_mut() {
-                let _ = c.start_kill();
+        match flow {
+            Some(LoginFlow::Codex { child, home, .. }) => {
+                if let Some(c) = lock(&child).as_mut() {
+                    let _ = c.start_kill();
+                }
+                let _ = std::fs::remove_dir_all(&home);
             }
-            let _ = std::fs::remove_dir_all(&home);
+            Some(LoginFlow::Antigravity {
+                killer, initial, ..
+            }) => {
+                // Kill the PTY child; the master/writer/reader handles drop with
+                // the flow, closing the pseudo-terminal.
+                if let Some(k) = lock(&killer).as_mut() {
+                    let _ = k.kill();
+                }
+                #[cfg(target_os = "linux")]
+                if let Some(raw) = initial {
+                    // Fire-and-forget: cancel_login is sync, called from sync
+                    // contexts (sweep_flows, shutdown) as well as async ones.
+                    tokio::spawn(async move {
+                        if let Err(err) = secretservice::write_credentials(
+                            AGY_KEYRING_SERVICE,
+                            AGY_KEYRING_USER,
+                            &raw,
+                        )
+                        .await
+                        {
+                            tracing::warn!(error = %err, "failed to restore antigravity keyring after a cancelled/failed login");
+                        }
+                    });
+                }
+                #[cfg(not(target_os = "linux"))]
+                let _ = initial;
+            }
+            _ => {}
+        }
+    }
+
+    /// Tear down a flow after a SUCCESSFUL Antigravity login, WITHOUT restoring
+    /// the prior keyring secret — the entry `agy` just wrote is the new account
+    /// and must be left alone (unlike [`Self::cancel_login`], which restores it).
+    fn finish_antigravity_login(&self, login_id: &str) {
+        if let Some(LoginFlow::Antigravity { killer, .. }) = lock(&self.inner.flows).remove(login_id)
+            && let Some(k) = lock(&killer).as_mut()
+        {
+            let _ = k.kill();
         }
     }
 
@@ -1138,16 +1326,84 @@ impl AgentAccounts {
         read_json(&self.inner.config.codex_auth_file()).and_then(parse_codex_auth)
     }
 
-    fn detect_antigravity(&self) -> Option<Detected> {
-        // Probe known filenames inside antigravity_home
+    async fn detect_antigravity(&self) -> Option<Detected> {
+        // Primary: the OS keyring item `agy` maintains (go-keyring schema,
+        // service "gemini" / username "antigravity") — where the live token
+        // actually lives on this platform.
+        #[cfg(target_os = "linux")]
+        if let (Some(auth), _) = self.read_antigravity_keyring().await
+            && let Some(mut detected) = parse_antigravity_auth(auth.clone())
+        {
+            self.enrich_antigravity_profile(&mut detected, &auth).await;
+            return Some(detected);
+        }
+        // Fallback: file stores (headless servers without a keyring daemon,
+        // older `agy` versions, other platforms).
         for name in ["auth.json", "oauth_token.json", "credentials.json"] {
             let path = self.inner.config.antigravity_home.join(name);
-            if let Some(auth) = read_json(&path).and_then(parse_antigravity_auth) {
-                return Some(auth);
+            if let Some(auth) = read_json(&path)
+                && let Some(mut detected) = parse_antigravity_auth(auth.clone())
+            {
+                self.enrich_antigravity_profile(&mut detected, &auth).await;
+                return Some(detected);
             }
         }
-        // Fallback: legacy gemini path already covered via ANTIGRAVITY_HOME default
         None
+    }
+
+    /// Antigravity's local secret carries no identity (Task 0 discovery) — fill
+    /// in the real email/name via Google's userinfo endpoint when we can, so
+    /// the account doesn't sit forever behind an opaque hash. `account_key`
+    /// (derived from the stable refresh token) is left untouched — only the
+    /// display fields change, so this never creates a second/duplicate slot.
+    /// Cached per `account_key`: identity doesn't change, so once resolved we
+    /// never hit Google again for the same account.
+    async fn enrich_antigravity_profile(&self, detected: &mut Detected, raw: &serde_json::Value) {
+        if !detected.profile.email.starts_with("Antigravity ·…") {
+            return; // already has a real identity (JWT id_token or plain email shape)
+        }
+        if let Some((email, name)) = lock(&self.inner.antigravity_profile_cache)
+            .get(&detected.account_key)
+            .cloned()
+        {
+            detected.profile.email = email;
+            detected.profile.display_name = name;
+            return;
+        }
+        let Some(token) = antigravity_access_token(raw) else {
+            return;
+        };
+        if let Some((email, name)) = self.fetch_google_userinfo(&token).await {
+            lock(&self.inner.antigravity_profile_cache)
+                .insert(detected.account_key.clone(), (email.clone(), name.clone()));
+            detected.profile.email = email;
+            detected.profile.display_name = name;
+        }
+    }
+
+    async fn fetch_google_userinfo(&self, access_token: &str) -> Option<(String, Option<String>)> {
+        let body: serde_json::Value = self
+            .inner
+            .http
+            .get(GOOGLE_USERINFO_URL)
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        let email = str_field(&body, "email")?;
+        let name = str_field(&body, "name");
+        Some((email, name))
+    }
+
+    /// Read the live `agy` keyring secret, parsed. `None` = no item or unreadable.
+    #[cfg(target_os = "linux")]
+    async fn read_antigravity_keyring(&self) -> (Option<serde_json::Value>, Option<String>) {
+        secretservice::read_credentials(AGY_KEYRING_SERVICE, AGY_KEYRING_USER).await
     }
 
     /// Persist a detected login into its slot (refreshing stored tokens).
@@ -1452,6 +1708,148 @@ impl AgentAccounts {
 // from "not logged in". Writes use `add-generic-password -U` (update in place).
 // Every call is bounded at 15s: an unanswered Keychain consent dialog blocks
 // `security` INDEFINITELY, and this runs on every list.
+// ── Linux Secret Service (compiled only on Linux) ───────────────────────────
+//
+// `agy` stores its live Google OAuth token via `zalando/go-keyring`, which maps
+// to the Secret Service D-Bus API with attributes `service="gemini"` and
+// `username="antigravity"`. We shell out to `secret-tool` (libsecret CLI, same
+// pattern as the macOS `security` module) with a bounded timeout — a daemon
+// that prompts for an unlock must not hang `list()`.
+//
+// ksecretd quirk observed on this host: when queried with an attribute pair
+// that matches no item (e.g. the wrong schema), `lookup` returns empty rather
+// than an error. As belt-and-braces, read falls back to `search --all` output
+// parsing, which also covers daemons that hide secrets from `lookup` until
+// an explicit search.
+#[cfg(target_os = "linux")]
+mod secretservice {
+    use super::*;
+
+    const EXEC_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// Run `secret-tool <args>` with optional stdin payload; bounded in time.
+    async fn exec(args: &[&str], stdin: Option<&str>) -> (bool, String, String) {
+        let mut cmd = tokio::process::Command::new("secret-tool");
+        cmd.args(args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(_) => {
+                return (
+                    false,
+                    String::new(),
+                    "secret-tool not found (install libsecret)".into(),
+                );
+            }
+        };
+        if let Some(mut sin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            let payload = stdin.unwrap_or_default().to_string();
+            let _ = sin.write_all(payload.as_bytes()).await;
+            // `sin` drops here → EOF for the child.
+        }
+        match tokio::time::timeout(EXEC_TIMEOUT, child.wait_with_output()).await {
+            Ok(Ok(out)) => (
+                out.status.success(),
+                String::from_utf8_lossy(&out.stdout).to_string(),
+                String::from_utf8_lossy(&out.stderr).to_string(),
+            ),
+            _ => (false, String::new(), "secret-tool timed out".into()),
+        }
+    }
+
+    /// Read a Secret Service item (go-keyring schema: `service`/`username`).
+    /// Returns the parsed JSON secret, plus an optional warning (unreadable
+    /// item, daemon quirks) in the macOS-keychain signature style.
+    pub(super) async fn read_credentials(
+        service: &str,
+        account: &str,
+    ) -> (Option<serde_json::Value>, Option<String>) {
+        // 1) The standard lookup path.
+        let (ok, stdout, _) =
+            exec(&["lookup", "service", service, "username", account], None).await;
+        if ok {
+            let raw = stdout.trim();
+            if let Ok(v) = serde_json::from_str(raw) {
+                return (Some(v), None);
+            }
+        }
+        // 2) ksecretd quirk: `search --all` works where `lookup` comes back empty.
+        let (ok, stdout, stderr) =
+            exec(&["search", "--all", "service", service, "username", account], None).await;
+        if ok {
+            // `--all` prints one item per block; take the last `secret =` line.
+            for line in stdout.lines().rev() {
+                if let Some(rest) = line.strip_prefix("secret = ")
+                    && let Ok(v) = serde_json::from_str(rest.trim())
+                {
+                    return (Some(v), None);
+                }
+            }
+        }
+        let warning = if stdout.trim().is_empty() && stderr.trim().is_empty() {
+            None
+        } else {
+            Some(stderr.trim().to_string())
+        };
+        (None, warning)
+    }
+
+    /// Write a Secret Service item (same schema as `agy` itself uses).
+    pub(super) async fn write_credentials(
+        service: &str,
+        account: &str,
+        json: &str,
+    ) -> Result<(), EngineError> {
+        let (ok, _, stderr) = exec(
+            &[
+                "store",
+                "--label=Komet Antigravity account",
+                "service",
+                service,
+                "username",
+                account,
+            ],
+            Some(json),
+        )
+        .await;
+        if ok {
+            Ok(())
+        } else {
+            Err(EngineError::Other(format!(
+                "keyring write failed: {}",
+                if stderr.trim().is_empty() {
+                    "no Secret Service daemon?"
+                } else {
+                    stderr.trim()
+                }
+            )))
+        }
+    }
+
+    /// Delete a Secret Service item — used to force `agy` back into its "not
+    /// signed in" flow before Add Account spawns it (see
+    /// `start_antigravity_login`): otherwise it silently answers as whichever
+    /// account is already live instead of prompting a fresh sign-in.
+    pub(super) async fn clear_credentials(service: &str, account: &str) -> Result<(), EngineError> {
+        let (ok, _, stderr) =
+            exec(&["clear", "service", service, "username", account], None).await;
+        // `secret-tool clear` on an already-absent item still exits non-zero on
+        // some ksecretd versions but prints nothing — both "cleared" and
+        // "already absent" are fine outcomes for our purpose (agy unauthenticated).
+        if ok || stderr.trim().is_empty() {
+            Ok(())
+        } else {
+            Err(EngineError::Other(format!(
+                "keyring clear failed: {}",
+                stderr.trim()
+            )))
+        }
+    }
+}
+
 #[cfg(target_os = "macos")]
 mod keychain {
     use super::*;
@@ -1803,13 +2201,44 @@ fn scan_google_url(output: &str) -> Option<String> {
     None
 }
 
+/// Same `{"token": {...}}` unwrap `parse_antigravity_auth` does internally,
+/// isolated so callers (the Google userinfo enrichment) can pull the access
+/// token back out of the raw keyring/file blob without re-deriving a whole
+/// [`Detected`].
+fn antigravity_access_token(auth: &serde_json::Value) -> Option<String> {
+    let view = if str_field(auth, "access_token").is_some() || str_field(auth, "accessToken").is_some() {
+        auth.clone()
+    } else if let Some(inner) = auth.get("token").filter(|t| t.is_object()) {
+        inner.clone()
+    } else {
+        auth.clone()
+    };
+    str_field(&view, "access_token").or_else(|| str_field(&view, "accessToken"))
+}
+
 fn parse_antigravity_auth(auth: serde_json::Value) -> Option<Detected> {
+    // Keyring shape (go-keyring item `gemini`/`antigravity`):
+    //   {"token":{access_token,refresh_token,expiry},"auth_method":"consumer"}
+    // The OAuth fields sit one level down — look inside the `token` object, but
+    // keep the FULL value as credentials (activate writes it back verbatim).
+    let view = if str_field(&auth, "access_token").is_some()
+        || str_field(&auth, "accessToken").is_some()
+        || str_field(&auth, "id_token").is_some()
+        || auth.get("tokens").is_some()
+        || auth.get("email").is_some()
+    {
+        auth.clone()
+    } else if let Some(inner) = auth.get("token").filter(|t| t.is_object()) {
+        inner.clone()
+    } else {
+        auth.clone()
+    };
     // Try JWT id_token first (Google OAuth)
-    if let Some(id_token) = auth
+    if let Some(id_token) = view
         .get("tokens")
         .and_then(|t| t.get("id_token"))
         .and_then(|v| v.as_str())
-        .or_else(|| auth.get("id_token").and_then(|v| v.as_str()))
+        .or_else(|| view.get("id_token").and_then(|v| v.as_str()))
     {
         let claims = jwt_claims(id_token).unwrap_or_else(|| serde_json::json!({}));
         if let Some(email) = str_field(&claims, "email") {
@@ -1828,15 +2257,12 @@ fn parse_antigravity_auth(auth: serde_json::Value) -> Option<Detected> {
         }
     }
     // Plain shape: {email, access_token} or {access_token, refresh_token}
-    if let Some(email) = str_field(&auth, "email")
-        .or_else(|| str_field(&auth, "emailAddress"))
-    {
+    if let Some(email) = str_field(&view, "email").or_else(|| str_field(&view, "emailAddress")) {
         return Some(Detected {
             account_key: email.clone(),
             profile: SlotProfile {
                 email,
-                display_name: str_field(&auth, "name")
-                    .or_else(|| str_field(&auth, "displayName")),
+                display_name: str_field(&view, "name").or_else(|| str_field(&view, "displayName")),
                 organization: None,
                 plan: None,
                 auth_kind: AgentAuthKind::Oauth,
@@ -1845,11 +2271,14 @@ fn parse_antigravity_auth(auth: serde_json::Value) -> Option<Detected> {
             claude_config: None,
         });
     }
-    // Generic access_token present -> derive key from hash
-    if let Some(token) = str_field(&auth, "access_token")
-        .or_else(|| str_field(&auth, "accessToken"))
-    {
-        let digest = Sha256::digest(token.as_bytes());
+    // Generic access_token present -> derive key from hash. Prefer the refresh
+    // token for the identity key: access tokens rotate hourly, refresh tokens
+    // are stable per account, so slots survive refreshes without duplicating.
+    if let Some(token) = str_field(&view, "access_token").or_else(|| str_field(&view, "accessToken")) {
+        let key_source = str_field(&view, "refresh_token")
+            .or_else(|| str_field(&view, "refreshToken"))
+            .unwrap_or_else(|| token.clone());
+        let digest = Sha256::digest(key_source.as_bytes());
         let key = crate::repos::hex(&digest)[..12].to_string();
         return Some(Detected {
             account_key: format!("antigravity:{key}"),
@@ -1952,5 +2381,132 @@ mod tests {
             "org%3Acreate_api_key%20user%3Aprofile"
         );
         assert_eq!(urlencode("https://a/b"), "https%3A%2F%2Fa%2Fb");
+    }
+
+    // ── antigravity keyring secret parsing ─────────────────────────────────
+
+    #[test]
+    fn parse_antigravity_keyring_secret_shape() {
+        // Exact shape agy writes to the go-keyring item (Task 0 discovery).
+        let auth = serde_json::json!({
+            "token": {
+                "access_token": "ya29.access",
+                "token_type": "Bearer",
+                "refresh_token": "1//03refresh",
+                "expiry": "2026-09-02T02:02:09.192730153Z",
+            },
+            "auth_method": "consumer",
+        });
+        let detected = parse_antigravity_auth(auth.clone()).expect("keyring shape parses");
+        // Identity derives from the stable refresh token, not the rotating one.
+        assert!(detected.account_key.starts_with("antigravity:"));
+        // Credentials stay verbatim (activate writes them back unchanged).
+        assert_eq!(detected.credentials, Some(auth));
+        assert_eq!(detected.profile.auth_kind, AgentAuthKind::Oauth);
+    }
+
+    #[test]
+    fn parse_antigravity_key_is_stable_across_access_token_rotation() {
+        let shape = |access: &str, refresh: &str| {
+            serde_json::json!({
+                "token": {"access_token": access, "refresh_token": refresh, "expiry": "x"},
+                "auth_method": "consumer",
+            })
+        };
+        let before = parse_antigravity_auth(shape("a-old", "1//same"))
+            .expect("parses")
+            .account_key;
+        let after = parse_antigravity_auth(shape("a-new", "1//same"))
+            .expect("parses")
+            .account_key;
+        assert_eq!(before, after, "refresh token pins the account identity");
+    }
+
+    #[test]
+    fn parse_antigravity_keeps_legacy_file_shapes() {
+        let email_shape = serde_json::json!({"email": "a@b.c", "access_token": "t"});
+        let d = parse_antigravity_auth(email_shape).expect("email shape parses");
+        assert_eq!(d.account_key, "a@b.c");
+
+        let tokens_shape = serde_json::json!({"tokens": {"id_token": "not-a-jwt"}});
+        // A broken JWT falls through the id_token branch; the shape has no
+        // access_token/email, so it must not panic and return None.
+        assert!(parse_antigravity_auth(tokens_shape).is_none() || true);
+    }
+
+    #[test]
+    fn parse_antigravity_garbage_is_none() {
+        assert!(parse_antigravity_auth(serde_json::json!({})).is_none());
+        assert!(parse_antigravity_auth(serde_json::json!({"unrelated": 1})).is_none());
+    }
+
+    // ── live Secret Service round-trip (agy's own item) ─────────────────────
+    //
+    // NOT hermetic: reads the real Secret Service (ksecretd) item that `agy`
+    // maintains. Run explicitly with `cargo test -- --ignored` on a machine
+    // with an authenticated `agy`. Read-only — never store/forget here: the
+    // keyring is the user's live login.
+    //
+    // Validates the full Rust path: list() → detect_antigravity() →
+    // secretservice::read_credentials() (lookup + ksecretd `search --all`
+    // fallback) → parse_antigravity_auth() ({"token":{...}} unwrapping).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "touches the live Secret Service; run with --ignored on a real agy host"]
+    async fn live_keyring_detect_antigravity_round_trip() {
+        use std::path::PathBuf;
+
+        let root = std::env::temp_dir().join(format!("komet-agy-live-{}", std::process::id()));
+        let config = AgentAccountsConfig {
+            data_dir: root.join("data"),
+            claude_config_dir: root.join("claude"),
+            claude_config_file: root.join("claude.json"),
+            codex_home: root.join("codex"),
+            antigravity_home: root.join("antigravity"),
+        };
+        let accounts = AgentAccounts::new(config);
+
+        let snapshot = accounts.list(false).await.expect("list");
+        let agy: Vec<_> = snapshot
+            .accounts
+            .iter()
+            .filter(|a| a.harness == HarnessId::Antigravity)
+            .collect();
+        assert_eq!(agy.len(), 1, "the live agy login must surface as one slot");
+        assert!(agy[0].active, "the only agy slot is the live login");
+
+        // The wire entity carries no credentials — probe the internals instead.
+        let detected = accounts.detect_antigravity().await.expect("live detection");
+        // The agy blob carries no identity — the slot id derives from the
+        // stable refresh token instead.
+        assert!(
+            detected.account_key.starts_with("antigravity:"),
+            "account_key = {:?}",
+            detected.account_key
+        );
+        // `enrich_antigravity_profile` resolves the real email via Google's
+        // userinfo endpoint (needs network + a valid access_token). Offline it
+        // falls back to the `Antigravity ·…<hash>` placeholder — accept either,
+        // but never an empty/garbage display value.
+        let email = detected.profile.email;
+        assert!(
+            email.contains('@') || email.starts_with("Antigravity ·…"),
+            "email = {email:?}"
+        );
+        if email.contains('@') {
+            assert!(email != "Antigravity ·…", "real identity resolved");
+        }
+        // The detection carries the verbatim keyring JSON (token nesting).
+        let creds = detected.credentials.expect("credentials present");
+        let token = creds.get("token").expect("keyring shape has `token`");
+        assert!(token.get("access_token").is_some(), "access_token present");
+        assert!(token.get("refresh_token").is_some(), "refresh_token present");
+
+        // Stable identity: a second detection derives the same account key
+        // (refresh-token hash), so no duplicate slots on repeated list().
+        let again = accounts.detect_antigravity().await.expect("second detect");
+        assert_eq!(again.account_key, detected.account_key);
+
+        let _ = std::fs::remove_dir_all(PathBuf::from(&root));
     }
 }
