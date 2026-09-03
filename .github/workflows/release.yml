@@ -1,8 +1,12 @@
 name: release
 
 # Build release artifacts and publish them as assets of the GitHub Release:
-#   - Linux headless tarballs (x86_64 + aarch64) via scripts/package-linux.sh
+#   - Linux tarballs (x86_64 + aarch64) via scripts/package-linux.sh
+#   - Linux AppImage via scripts/package-appimage.sh
+#   - Linux .deb via scripts/package-deb.sh
+#   - Linux .rpm via scripts/package-rpm.sh
 #   - macOS dmg (Apple silicon) via scripts/package-macos.sh
+#   - Windows zip + exe via scripts/package-windows.sh
 # plus a manifest.json (version + per-artifact sha256) that the auto-updater
 # (crates/update) verifies downloads against.
 #
@@ -36,21 +40,30 @@ jobs:
             libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
             libx11-dev libxcb1-dev libx11-xcb-dev \
             libfontconfig1-dev libfreetype-dev libasound2-dev \
-            libvulkan-dev pkg-config cmake libfuse2
+            libvulkan-dev pkg-config cmake libfuse2 \
+            python3-pil rpm
       - name: rust toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+      - name: generate icons from master logo
+        run: python3 scripts/gen-icons.py
       - name: package tarball
         run: scripts/package-linux.sh
       - name: package appimage
-        if: matrix.runner == 'ubuntu-24.04'
+        if: matrix.runner == 'ubuntu-22.04'
         run: scripts/package-appimage.sh
+      - name: package deb
+        run: scripts/package-deb.sh
+      - name: package rpm
+        run: scripts/package-rpm.sh
       - uses: actions/upload-artifact@v4
         with:
           name: linux-${{ runner.arch }}
           path: |
             target/package/*.tar.gz
             target/package/*.AppImage
+            target/package/*.deb
+            target/package/*.rpm
           if-no-files-found: error
 
   # Heads-up: the macOS cfg paths (Keychain in agent_accounts.rs) have never
@@ -78,6 +91,11 @@ jobs:
       - name: rust toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+      - name: generate icons from master logo
+        run: |
+          python3 -m pip install --quiet --user pillow 2>/dev/null \
+            || python3 -m pip install --quiet --user --break-system-packages pillow
+          python3 scripts/gen-icons.py
       - name: import Developer ID certificate
         if: env.MACOS_CERT_P12 != ''
         run: |

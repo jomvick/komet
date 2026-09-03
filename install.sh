@@ -83,9 +83,11 @@ mkdir -p "$DEST"
 cp "$TMP/unpacked/komet" "$DEST/komet"
 chmod 755 "$DEST/komet"
 
-# Atomic symlink flip: same layout the self-updater uses. -T is required:
-# plain `mv` over a symlink-to-directory would move the temp link INSIDE the
-# target dir instead of replacing `current`, leaving the old version active.
+# Atomic symlink flip: same layout the self-updater uses. we create the temp
+# symlink → $DEST first, then rename it over `current` (the `-T` prevents
+# plain `mv` from moving it INSIDE the target dir if `current` is itself a
+# symlink-to-directory), so never a window with no `current` present.
+ln -s "$DEST" "$APP_ROOT/.current-new.$$"
 mv -fT "$APP_ROOT/.current-new.$$" "$APP_ROOT/current"
 
 mkdir -p "$BIN_DIR"
@@ -99,6 +101,10 @@ ln -sf "$APP_ROOT/current/komet" "$BIN_DIR/komet"
 [ -f "$TMP/unpacked/komet.png" ] && {
   mkdir -p "$HOME/.local/share/icons/hicolor/1024x1024/apps"
   cp "$TMP/unpacked/komet.png" "$HOME/.local/share/icons/hicolor/1024x1024/apps/komet.png"
+}
+[ -d "$TMP/unpacked/icons/hicolor" ] && {
+  mkdir -p "$HOME/.local/share/icons"
+  cp -r "$TMP/unpacked/icons/hicolor" "$HOME/.local/share/icons/"
 }
 
 case ":$PATH:" in
