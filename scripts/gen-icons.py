@@ -6,6 +6,8 @@ Outputs:
 - dist/macos/icon-1024.png: 1024x1024 RGBA squircle following Apple HIG margins & subtle drop shadow
 - dist/windows/komet.ico: multi-resolution ICO (16, 24, 32, 48, 64, 128, 256) with alpha channel
 - dist/icons/hicolor/<size>x<size>/apps/komet.png: standard FreeDesktop icon hierarchy
+- dist/komet_logo.svg: SVG wrapper (data-URI PNG) of the official squircle logo
+- komet-site/public/komet-logo.svg: same SVG wrapper for the marketing site
 
 Usage:
   python3 scripts/gen-icons.py
@@ -78,6 +80,24 @@ def generate_macos_icon(squircle: Image.Image) -> Image.Image:
     return canvas
 
 
+def generate_logo_svg(squircle: Image.Image) -> str:
+    """Embed a 512px render of the squircle into an SVG wrapper (data URI)."""
+    import base64
+    import io
+    png = squircle.resize((512, 512), Image.LANCZOS)
+    buf = io.BytesIO()
+    png.save(buf, format="PNG")
+    b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+    return (
+        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1254 1254" '
+        'width="1254" height="1254">\n'
+        '  <title>komet</title>\n'
+        '  <desc>Official komet logo — derived from dist/logo.png</desc>\n'
+        f'  <image href="data:image/png;base64,{b64}" width="1254" height="1254"/>\n'
+        '</svg>\n'
+    )
+
+
 def main():
     assert os.path.isfile(SRC_LOGO), f"Master logo not found at {SRC_LOGO}"
     print(f"Loading master: {SRC_LOGO}")
@@ -108,6 +128,14 @@ def main():
         resized = squircle.resize((size, size), Image.LANCZOS)
         resized.save(out_path, "PNG")
     print(f"Generated XDG hicolor icons: {HICOLOR_SIZES}")
+
+    # 5. Logo SVGs (data-URI wrappers deriving from the master logo.png)
+    svg_text = generate_logo_svg(squircle)
+    for svg_rel in ["dist/komet_logo.svg", "komet-site/public/komet-logo.svg"]:
+        svg_path = os.path.join(ROOT, svg_rel)
+        with open(svg_path, "w", encoding="utf-8") as fh:
+            fh.write(svg_text)
+        print(f"Generated SVG logo: {os.path.relpath(svg_path, ROOT)}")
 
 
 if __name__ == "__main__":
