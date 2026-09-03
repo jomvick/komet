@@ -30,8 +30,10 @@ fi
 rm -rf "$STAGE" "$TARBALL"
 mkdir -p "$STAGE"
 install -m 755 "$BIN" "$STAGE/komet"
+strip --strip-unneeded "$STAGE/komet" 2>/dev/null || true
 install -m 644 "$ROOT/dist/komet.desktop" "$STAGE/komet.desktop"
 install -m 644 "$ROOT/dist/komet.png" "$STAGE/komet.png"
+cp -r "$ROOT/dist/icons" "$STAGE/icons"
 
 cat >"$STAGE/install.sh" <<'INSTALL'
 #!/usr/bin/env bash
@@ -40,9 +42,16 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 install -Dm755 "$HERE/komet" "$HOME/.local/bin/komet"
 install -Dm644 "$HERE/komet.desktop" "$HOME/.local/share/applications/komet.desktop"
-install -Dm644 "$HERE/komet.png" "$HOME/.local/share/icons/hicolor/1024x1024/apps/komet.png"
+mkdir -p "$HOME/.local/share/icons"
+if [[ -d "$HERE/icons/hicolor" ]]; then
+  cp -r "$HERE/icons/hicolor" "$HOME/.local/share/icons/"
+else
+  install -Dm644 "$HERE/komet.png" "$HOME/.local/share/icons/hicolor/1024x1024/apps/komet.png"
+fi
 command -v update-desktop-database >/dev/null 2>&1 \
   && update-desktop-database "$HOME/.local/share/applications" || true
+command -v gtk-update-icon-cache >/dev/null 2>&1 \
+  && gtk-update-icon-cache -f -t "$HOME/.local/share/icons/hicolor" || true
 echo "Installed. Make sure ~/.local/bin is on your PATH."
 INSTALL
 chmod 755 "$STAGE/install.sh"

@@ -18,12 +18,12 @@ else
 fi
 
 rm -rf "$APPDIR" "$APPIMAGE"
-mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/applications" "$APPDIR/usr/share/icons/hicolor/1024x1024/apps"
+mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/applications" "$APPDIR/usr/share/icons"
 
 install -m 755 "$BIN" "$APPDIR/usr/bin/komet"
 install -m 644 "$ROOT/dist/komet.desktop" "$APPDIR/usr/share/applications/komet.desktop"
 install -m 644 "$ROOT/dist/komet.desktop" "$APPDIR/komet.desktop"
-install -m 644 "$ROOT/dist/komet.png" "$APPDIR/usr/share/icons/hicolor/1024x1024/apps/komet.png"
+cp -r "$ROOT/dist/icons/hicolor" "$APPDIR/usr/share/icons/"
 install -m 644 "$ROOT/dist/komet.png" "$APPDIR/komet.png"
 # top-level icon required by AppImage spec
 cp "$APPDIR/komet.png" "$APPDIR/.DirIcon"
