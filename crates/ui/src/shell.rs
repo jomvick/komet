@@ -858,11 +858,19 @@ pub struct Shell {
     rename_dialog: Option<RenameChatDialog>,
     /// Chat id awaiting delete confirmation.
     delete_confirm: Option<String>,
+    /// Delete-confirm card keyboard focus: tracked on the card so Escape can
+    /// dismiss it without the mouse; `delete_focus_pending` arms the initial
+    /// focus on open (rename's dialog piggybacks on its focused input).
+    delete_focus: gpui::FocusHandle,
+    delete_focus_pending: bool,
     /// Space-row context menu (dropdown rows): (space id, window position).
     space_menu: popover::Popup<(String, Point<Pixels>)>,
     rename_space_dialog: Option<RenameSpaceDialog>,
     /// Space id awaiting delete confirmation (hard delete + session cascade).
     delete_space_confirm: Option<String>,
+    /// Same keyboard treatment as the chat delete card (see `delete_focus`).
+    space_delete_focus: gpui::FocusHandle,
+    space_delete_focus_pending: bool,
     /// The add-space palette (⌘K-style; device tabs + folder search), `Some`
     /// while open.
     add_space: Option<AddSpaceFlow>,
@@ -1101,9 +1109,16 @@ impl Shell {
             chat_menu: popover::Popup::default(),
             rename_dialog: None,
             delete_confirm: None,
+            // Tracked on the delete-confirm card (like the add-space palette)
+            // so Escape reaches it without the mouse — the rename dialog
+            // gets its keys from its focused input instead.
+            delete_focus: cx.focus_handle(),
+            delete_focus_pending: false,
             space_menu: popover::Popup::default(),
             rename_space_dialog: None,
             delete_space_confirm: None,
+            space_delete_focus: cx.focus_handle(),
+            space_delete_focus_pending: false,
             add_space: None,
             spaces_menu: popover::Popup::default(),
             chat_status_hover: None,
@@ -1202,6 +1217,7 @@ impl Shell {
                 "rename" => self.open_rename_chat(first, cx),
                 "delete" => {
                     self.delete_confirm = Some(first);
+                    self.delete_focus_pending = true;
                 }
                 _ => {}
             }
@@ -2556,16 +2572,22 @@ impl Shell {
     }
 
     fn submit_rename_chat(&mut self, cx: &mut Context<Self>) {
-        let Some(dialog) = self.rename_dialog.take() else {
+        let Some(dialog) = self.rename_dialog.as_ref() else {
             return;
         };
         let title = dialog.input.read(cx).text().trim().to_string();
-        if !title.is_empty() {
-            self.mutate(
-                serde_json::json!({ "op": "renameChat", "chatId": dialog.chat_id, "title": title }),
-                cx,
-            );
+        if title.is_empty() {
+            // Empty titles aren't valid — keep the dialog open so a cleared
+            // field doesn't silently close with no rename and no feedback.
+            cx.notify();
+            return;
         }
+        let chat_id = dialog.chat_id.clone();
+        self.rename_dialog = None;
+        self.mutate(
+            serde_json::json!({ "op": "renameChat", "chatId": chat_id, "title": title }),
+            cx,
+        );
         cx.notify();
     }
 
@@ -4805,6 +4827,7 @@ impl Shell {
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.close_chat_menu(cx);
                             this.delete_confirm = Some(delete_id.clone());
+                            this.delete_focus_pending = true;
                             cx.notify();
                         }))
                         .child(
@@ -4874,6 +4897,9 @@ impl Shell {
         }
 
         if let Some(chat_id) = self.delete_confirm.clone() {
+            if std::mem::take(&mut self.delete_focus_pending) {
+                window.focus(&self.delete_focus, cx);
+            }
             let title = transcript::single_line(
                 &self
                     .state
@@ -4885,6 +4911,13 @@ impl Shell {
                     .unwrap_or_else(|| "New session".into()),
             );
             let card = popover::dialog_card(&theme)
+                .track_focus(&self.delete_focus)
+                .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _, cx| {
+                    if ev.keystroke.key == "escape" {
+                        this.delete_confirm = None;
+                        cx.notify();
+                    }
+                }))
                 .child(popover::dialog_title(&theme, "Delete session?"))
                 .child(div().mt(px(6.0)).child(popover::dialog_body(
                     &theme,

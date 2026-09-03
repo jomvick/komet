@@ -443,12 +443,18 @@ impl Pickers {
                 // second highlight next to the selection (user report;
                 // `toggle` arms the mute right before its clear).
                 if !std::mem::take(&mut this.search_reset_muted) {
-                    if this.open_kind() == Some(PickerKind::Branch) {
-                        this.active = 0;
-                    }
-                    if this.open_kind() == Some(PickerKind::HarnessModel) {
-                        this.active = 0;
-                        this.model_scroll.set_offset(gpui::Point::default());
+                    match this.open_kind() {
+                        Some(PickerKind::Branch) => this.active = 0,
+                        Some(PickerKind::HarnessModel) => {
+                            this.active = 0;
+                            this.model_scroll.set_offset(gpui::Point::default());
+                        }
+                        // Space/Device share the keyboard-nav highlight and
+                        // Enter picks `rows[nth(active)]` — a stale index
+                        // after filtering left Enter dead, so reset it with
+                        // the row set like the other filterable pickers.
+                        Some(PickerKind::Space) | Some(PickerKind::Device) => this.active = 0,
+                        _ => {}
                     }
                 }
                 cx.notify();
