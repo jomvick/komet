@@ -3578,6 +3578,9 @@ pub struct Composer {
     /// SNAP instead of morphing (see [`ROUTE_SNAP_MS`]).
     route_snap_until: Option<Instant>,
     escape_stop_armed_at: Option<Instant>,
+    /// Clears a stale arming hint once its 3-second stop window lapses
+    /// (while the run stays live the hint must not linger forever).
+    escape_hint_task: Option<Task<()>>,
     _observe: Subscription,
     _pickers_observe: Subscription,
     _input_events: Subscription,
@@ -3684,6 +3687,7 @@ impl Composer {
             morph_clock: Instant::now(),
             route_snap_until: None,
             escape_stop_armed_at: None,
+            escape_hint_task: None,
             _observe: observe,
             _pickers_observe: pickers_observe,
             _input_events: input_events,
@@ -5210,15 +5214,34 @@ impl Composer {
         {
             self.escape_stop_armed_at = None;
             self.interrupt(cx);
+            cx.notify();
             return true;
         }
         self.escape_stop_armed_at = Some(now);
+        cx.notify();
+        // The arming window lapses on its own; clear the hint state so
+        // "Press Esc again" can't outlive it.
+        let expires_in = Duration::from_secs(3);
+        self.escape_hint_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(expires_in).await;
+            this.update(cx, |composer, cx| {
+                composer.escape_stop_armed_at = None;
+                composer.escape_hint_task = None;
+                cx.notify();
+            })
+            .ok();
+        }));
         false
     }
 
-    #[allow(dead_code)]
-    fn is_escape_stop_armed(&self) -> bool {
-        self.escape_stop_armed_at.is_some()
+    fn is_escape_stop_armed(&self, cx: &App) -> bool {
+        // Only while a run is live and the 3s stop window is still open —
+        // otherwise a stale arming would show "Press Esc again" with nothing
+        // to stop.
+        self.run_live(cx)
+            && self
+                .escape_stop_armed_at
+                .is_some_and(|armed| armed.elapsed() < Duration::from_secs(3))
     }
 
     fn mention_escape(&mut self, _: &MentionEscape, _: &mut Window, cx: &mut Context<Self>) {
@@ -6314,6 +6337,21 @@ impl Render for Composer {
                     .line_height(px(15.0))
                     .text_color(theme.text_muted.opacity(0.8))
                     .child("This agent can't be steered mid-turn — your message will be queued and sent when the current turn finishes."),
+            )
+        });
+        // First Escape while a run is live only arms a 3s stop window; say so
+        // explicitly so the second press (which actually stops) isn't a
+        // surprise — without this the first press read as a dead key.
+        let container = container.when(self.is_escape_stop_armed(cx), |el| {
+            el.child(
+                div()
+                    .id("composer-escape-hint")
+                    .mt(px(6.0))
+                    .px(px(12.0))
+                    .text_size(px(11.0))
+                    .line_height(px(15.0))
+                    .text_color(theme.text_muted.opacity(0.8))
+                    .child("Press Esc again to stop the current run."),
             )
         });
 

@@ -1939,16 +1939,22 @@ impl Shell {
     }
 
     pub(super) fn submit_rename_space(&mut self, cx: &mut Context<Self>) {
-        let Some(dialog) = self.rename_space_dialog.take() else {
+        let Some(dialog) = self.rename_space_dialog.as_ref() else {
             return;
         };
         let name = dialog.input.read(cx).text().trim().to_string();
-        if !name.is_empty() {
-            self.mutate(
-                serde_json::json!({ "op": "renameSpace", "spaceId": dialog.space_id, "name": name }),
-                cx,
-            );
+        if name.is_empty() {
+            // Empty names aren't valid — keep the dialog open so a cleared
+            // field doesn't silently close with no rename and no feedback.
+            cx.notify();
+            return;
         }
+        let space_id = dialog.space_id.clone();
+        self.rename_space_dialog = None;
+        self.mutate(
+            serde_json::json!({ "op": "renameSpace", "spaceId": space_id, "name": name }),
+            cx,
+        );
         cx.notify();
     }
 
@@ -2000,6 +2006,7 @@ impl Shell {
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.close_space_menu(cx);
                             this.delete_space_confirm = Some(delete_id.clone());
+                            this.space_delete_focus_pending = true;
                             cx.notify();
                         }))
                         .child(
@@ -2064,6 +2071,9 @@ impl Shell {
         }
 
         if let Some(space_id) = self.delete_space_confirm.clone() {
+            if std::mem::take(&mut self.space_delete_focus_pending) {
+                window.focus(&self.space_delete_focus, cx);
+            }
             let (name, device, count) = {
                 let state = self.state.read(cx);
                 let space = state.space_row(&space_id);
@@ -2088,6 +2098,13 @@ impl Shell {
                 )
             };
             let card = popover::dialog_card(&theme)
+                .track_focus(&self.space_delete_focus)
+                .on_key_down(cx.listener(|this, ev: &gpui::KeyDownEvent, _, cx| {
+                    if ev.keystroke.key == "escape" {
+                        this.delete_space_confirm = None;
+                        cx.notify();
+                    }
+                }))
                 .child(popover::dialog_title(&theme, "Remove project?"))
                 .child(div().mt(px(6.0)).child(popover::dialog_body(&theme, copy)))
                 .child(
