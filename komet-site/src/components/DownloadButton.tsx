@@ -8,8 +8,11 @@ type Entry = { label: string; asset: string };
 /** Preferred user-facing asset per platform, in display order. */
 const PREFERRED: Entry[] = [
   { label: "macOS (Apple Silicon)", asset: "macos-arm64.dmg" },
-  { label: "Linux (x86_64)", asset: "linux-x86_64.tar.gz" },
-  { label: "Linux (arm64)", asset: "linux-aarch64.tar.gz" },
+  { label: "Linux — tarball (x86_64)", asset: "linux-x86_64.tar.gz" },
+  { label: "Linux — tarball (arm64)", asset: "linux-aarch64.tar.gz" },
+  { label: "Linux — Debian/Ubuntu (.deb)", asset: "_amd64.deb" },
+  { label: "Linux — Fedora/RHEL (.rpm)", asset: "x86_64.rpm" },
+  { label: "Linux — AppImage", asset: "linux-x86_64.AppImage" },
   { label: "Windows (x86_64)", asset: "windows-x86_64.exe" },
 ];
 
