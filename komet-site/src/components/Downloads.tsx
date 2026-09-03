@@ -28,7 +28,7 @@ export default function Downloads() {
       </div>
 
       <p className="mt-5 text-[13px] text-muted-foreground">
-        All binaries (tarballs, AppImage, .dmg, .exe) are on{" "}
+        All binaries (.tar.gz, .AppImage, .deb, .rpm, .dmg, .exe) are on{" "}
         <a
           href="https://github.com/jomvick/komet/releases/latest"
           target="_blank"

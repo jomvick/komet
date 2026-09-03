@@ -76,7 +76,7 @@ export const faq = [
 export const platforms = [
   {
     os: "Linux",
-    detail: "Automatic install script, standalone AppImage or tarball.",
+    detail: "Automatic install script, tarball, AppImage, .deb or .rpm package.",
     command: "curl -fsSL https://raw.githubusercontent.com/jomvick/komet/main/install.sh | sh",
   },
   {
