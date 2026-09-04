@@ -457,6 +457,11 @@ impl AccountsPage {
         cx: &mut Context<Self>,
     ) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
+            // Surface a dead engine handle instead of silently no-oping; the
+            // headed log default is `warn`, so this stays visible there too.
+            tracing::warn!(method, account = %account.id, "account_action dropped: no engine handle");
+            self.error = Some("Engine is not running — reopen the Accounts page.".into());
+            cx.notify();
             return;
         };
         self.busy_account = Some(account.id.clone());
@@ -467,8 +472,14 @@ impl AccountsPage {
             "accountId": account.id,
             "harness": account.harness,
         }));
+        tracing::debug!(method, account = %account.id, "account_action dispatching");
         self.action_task = Some(cx.spawn(async move |this, cx| {
             let result = engine.client().call(method, params).await;
+            if let Err(err) = &result {
+                // A failed switch/forget must be diagnosable under the headed
+                // default filter (`warn`), not only with RUST_LOG=debug.
+                tracing::warn!(method, error = %err, "account_action failed");
+            }
             this.update(cx, |page, cx| {
                 page.busy_account = None;
                 match result {
@@ -756,10 +767,16 @@ impl AccountsPage {
     /// One account row (komet settings.agents.tsx `AccountRow`): initial
     /// avatar, email + usage meters left; badges over the Switch/Forget
     /// actions right-anchored.
+    ///
+    /// The Switch/Forget element ids embed the account id, not the row index:
+    /// gpui keys interactive element state by the id path, and row indices
+    /// restart at zero per provider section — two buttons sharing
+    /// `("account-switch", 0)` share one `pending_mouse_down` cell, and the
+    /// first-painted one's capture-phase mouse-up clears it before the
+    /// other's handler runs, silently eating every click on later sections.
     fn render_account_row(
         &self,
         account: &AgentAccount,
-        ix: usize,
         first: bool,
         theme: &Theme,
         now: DateTime<Utc>,
@@ -781,6 +798,9 @@ impl AccountsPage {
             .into();
         let switch_account = account.clone();
         let forget_account = account.clone();
+        // Globally-unique interactive ids — see render_account_row doc.
+        let forget_id: SharedString = format!("account-forget-{}", account.id).into();
+        let switch_id: SharedString = format!("account-switch-{}", account.id).into();
 
         let badges = div()
             .flex()
@@ -805,7 +825,7 @@ impl AccountsPage {
                 .gap(px(4.0))
                 .child(
                     div()
-                        .id(("account-forget", ix))
+                        .id(forget_id)
                         .rounded(px(6.0))
                         .px(px(6.0))
                         .py(px(4.0))
@@ -828,7 +848,7 @@ impl AccountsPage {
                             theme,
                             if is_busy { "Switching…" } else { "Switch" },
                         )
-                        .id(("account-switch", ix))
+                        .id(switch_id)
                         .px(px(8.0))
                         .py(px(4.0))
                         .rounded(px(6.0))
@@ -1327,7 +1347,7 @@ impl Render for AccountsPage {
                             .iter()
                             .enumerate()
                             .map(|(ix, account)| {
-                                self.render_account_row(account, ix, ix == 0, &theme, now, cx)
+                                self.render_account_row(account, ix == 0, &theme, now, cx)
                             })
                             .collect();
                         let add_id: SharedString = format!("add-account-{name}").into();
