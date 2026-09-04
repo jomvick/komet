@@ -152,7 +152,7 @@ pub async fn fetch_latest() -> anyhow::Result<Manifest> {
         Ok(resp) if resp.status().is_success() => resp
             .json::<Manifest>()
             .await
-            .with_context(|| format!("parsing manifest.json"))?
+            .with_context(|| "parsing manifest.json".to_string())?
             .files,
         Ok(resp) => {
             tracing::debug!(status = %resp.status(), "manifest.json unavailable; downloads will skip verification");

@@ -336,9 +336,8 @@ async fn permission_timeout_auto_denies_and_resolves() {
     let delivered = core
         .sessions
         .respond_permission(CHAT, request_id.as_ref().unwrap(), PermissionChoice::Allow);
-    assert_eq!(
-        delivered.expect("respond_permission call"),
-        false,
+    assert!(
+        !delivered.expect("respond_permission call"),
         "an auto-denied request must not be re-resolvable (already settled)"
     );
     core.sessions.shutdown().await;

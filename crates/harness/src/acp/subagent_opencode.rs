@@ -638,7 +638,9 @@ fn part_snapshot_events(child: &mut ChildState, part: &Value) -> Vec<AgentEvent>
             // these, so we do too: one UserMessage per part (posted
             // atomically — there is no user delta channel), which the engine
             // writes as its own user entry.
-            if kind == "text" && child.assistant_messages.get(message_id).is_none() {
+            if kind == "text"
+                && !child.assistant_messages.contains_key(message_id)
+            {
                 // Role unknown: hold the part instead of guessing (dedup by
                 // part id — snapshots re-deliver).
                 if !child

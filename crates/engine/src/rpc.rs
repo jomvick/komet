@@ -995,11 +995,10 @@ impl RpcService for EngineRpc {
                 )))
             }
             methods::GET_CONTEXT_USAGE => {
-                if let Ok(p) = serde_json::from_value::<ChatParams>(params.clone()) {
-                    if let Some(usage) = self.sessions.usage_for(&p.chat_id) {
+                if let Ok(p) = serde_json::from_value::<ChatParams>(params.clone())
+                    && let Some(usage) = self.sessions.usage_for(&p.chat_id) {
                         return RpcReply::value(&usage);
                     }
-                }
                 if let Ok(p) = serde_json::from_value::<ListModelsParams>(params) {
                     let harness = self
                         .registry

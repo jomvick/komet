@@ -17,7 +17,7 @@ async fn main() {
     // Wait for backfill to land content (or time out empty).
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
-        if doc.get_list("messages").len() > 0 || std::time::Instant::now() > deadline {
+        if !doc.get_list("messages").is_empty() || std::time::Instant::now() > deadline {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -61,5 +61,5 @@ async fn main() {
         bad_kind,
         parsed
     );
-    client.shutdown().await;
+    let _ = client.shutdown().await;
 }

@@ -257,7 +257,6 @@ impl HarnessRegistry {
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner)
                         .clone();
-                    let id = id;
                     tokio::spawn(async move {
                         if let Ok(fresh) = harness.models().await
                             && !fresh.is_empty()

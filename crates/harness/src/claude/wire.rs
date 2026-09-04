@@ -357,7 +357,7 @@ pub(crate) fn rewind_files_request_line(request_id: &str, checkpoint: &str) -> S
     .to_string()
 }
 
-fn unwrap_response_payload<'a>(value: &'a Value) -> &'a Value {
+fn unwrap_response_payload(value: &Value) -> &Value {
     let mut payload = value;
     while let Some(inner) = payload.get("response") {
         payload = inner;

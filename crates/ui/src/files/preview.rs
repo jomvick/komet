@@ -2243,8 +2243,7 @@ impl FilesSurface {
             .preview
             .active_comment
             .as_deref()
-            .and_then(|id| comments.iter().find(|comment| comment.id == id))
-            .map(|comment| comment.clone());
+            .and_then(|id| comments.iter().find(|comment| comment.id == id)).cloned();
         if let Some(comment) = active_comment
             && let Some(top) = editor_comment_overlay_top(
                 &layout,
@@ -2582,8 +2581,7 @@ fn editor_comment_overlay_horizontal(layout: &EditorOverlayLayout) -> (f32, f32)
     let anchored_left =
         (layout.gutter_width - EDITOR_COMMENT_CARD_MARGIN).max(EDITOR_COMMENT_CARD_MARGIN);
     let anchored_width = (layout.viewport_width - anchored_left - EDITOR_COMMENT_CARD_MARGIN)
-        .min(EDITOR_COMMENT_CARD_WIDTH)
-        .max(0.0);
+        .clamp(0.0, EDITOR_COMMENT_CARD_WIDTH);
     if anchored_width >= EDITOR_COMMENT_CARD_MIN_ANCHORED_WIDTH {
         (anchored_left, anchored_width)
     } else {

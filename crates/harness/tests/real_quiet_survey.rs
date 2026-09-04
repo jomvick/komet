@@ -199,11 +199,12 @@ fn is_auth_or_missing(o: &ProbeOutcome) -> bool {
 #[tokio::test]
 #[ignore = "runs every installed+authenticated agent CLI; costs a few small prompts each"]
 async fn real_all_harnesses_quiet_survey() {
+    type AgentCtor = fn() -> AcpHarness;
     let runs: usize = std::env::var("SURVEY_RUNS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(3);
-    let agents: Vec<(&str, fn() -> AcpHarness)> = vec![
+    let agents: Vec<(&str, AgentCtor)> = vec![
         ("grok", AcpHarness::grok),
         ("hermes", AcpHarness::hermes),
         ("pi", AcpHarness::pi),

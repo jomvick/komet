@@ -1745,8 +1745,8 @@ fn config_option_sets(
 /// task-chip + sidecar-bus tracker. Both observe the raw updates ahead of
 /// [`map_update`]; their tagged events flow from their own tasks.
 enum SubagentObserver {
-    Grok(SubagentTracker),
-    Opencode(OpencodeTracker),
+    Grok(Box<SubagentTracker>),
+    Opencode(Box<OpencodeTracker>),
 }
 
 impl SubagentObserver {
@@ -2039,8 +2039,10 @@ fn parse_acp_permission(tool_call: Option<&Value>) -> (komet_proto::PermissionKi
 ///   on the engine's permission bridge — Paseo parity: `request_permission`
 ///   is awaited before `client.respond`, never auto-accepted. A dropped
 ///   resolver degrades to Deny — never a silent allow.
-/// kinds may legitimately repeat — codex sends two `allow_always` options
-/// ("Allow for Session" and a prefix-rule amendment) on every exec approval.
+///
+/// The acp request kinds may legitimately repeat — codex sends two
+/// `allow_always` options ("Allow for Session" and a prefix-rule amendment)
+/// on every exec approval.
 fn handle_server_request_live(
     client: &RpcClient,
     id: Value,
@@ -2480,17 +2482,17 @@ async fn run_session(session: Session) {
     // event bus; everything else gets the grok tracker (inert for agents
     // that never emit the `subagent_*` extension updates).
     let mut subagents = if harness == HarnessId::Opencode {
-        SubagentObserver::Opencode(OpencodeTracker::new(
+        SubagentObserver::Opencode(Box::new(OpencodeTracker::new(
             session_id.clone(),
             event_tx.clone(),
             sidecar_port.map(|p| format!("http://127.0.0.1:{p}")),
-        ))
+        )))
     } else {
-        SubagentObserver::Grok(SubagentTracker::new(
+        SubagentObserver::Grok(Box::new(SubagentTracker::new(
             session_id.clone(),
             event_tx.clone(),
             sessions_root,
-        ))
+        )))
     };
 
     // ---- main loop --------------------------------------------------------

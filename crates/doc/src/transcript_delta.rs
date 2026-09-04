@@ -284,8 +284,8 @@ mod tests {
         let a = entry("a", "hello");
         let b0 = entry("b", "wor");
         let b1 = entry("b", "world");
-        apply(&[], &[a.clone()]);
-        apply(&[a.clone()], &[a.clone(), b0.clone()]);
+        apply(&[], std::slice::from_ref(&a));
+        apply(std::slice::from_ref(&a), &[a.clone(), b0.clone()]);
         apply(&[a.clone(), b0], &[a, b1]);
     }
 
@@ -328,7 +328,7 @@ mod tests {
         // Same id but a rewritten (non-prefix) text must re-send the entry.
         let b0 = entry("b", "draft text");
         let b1 = entry("b", "final");
-        let frame = diff_transcript(&[b0.clone()], &[b1.clone()]);
+        let frame = diff_transcript(std::slice::from_ref(&b0), std::slice::from_ref(&b1));
         match &frame {
             TranscriptFrame::Delta { upsert, append, .. } => {
                 assert_eq!(upsert.len(), 1);

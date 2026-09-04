@@ -3017,8 +3017,7 @@ impl Transcript {
             .map(|(_, ix)| *ix);
         let row_key = row_id.clone();
         let entity = cx.weak_entity();
-        let handler: Rc<dyn Fn(usize, SharedString, &mut Window, &mut gpui::App)> =
-            Rc::new(move |ix, code, _window, cx| {
+        let handler: render::CopyHandler = Rc::new(move |ix, code, _window, cx| {
                 cx.write_to_clipboard(ClipboardItem::new_string(code.to_string()));
                 let row_key = row_key.clone();
                 entity

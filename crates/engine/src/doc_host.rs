@@ -2509,18 +2509,6 @@ fn encode_part_segment(part_id: &str) -> String {
     out
 }
 
-#[cfg(test)]
-mod part_segment_tests {
-    use super::encode_part_segment;
-
-    #[test]
-    fn hash_and_colon_are_escaped_unreserved_pass_through() {
-        assert_eq!(encode_part_segment("m1#c1"), "m1%23c1");
-        assert_eq!(encode_part_segment("tool:call_9"), "tool%3Acall_9");
-        assert_eq!(encode_part_segment("plain-id_0.diff~"), "plain-id_0.diff~");
-    }
-}
-
 /// Per-chat background task: reacts to doc changes (local commits and remote imports)
 /// by re-publishing the transcript watch, draining commands, and debouncing snapshots.
 /// Holds only a weak handle so a dropped host tears the task down.
@@ -2560,5 +2548,17 @@ async fn chat_task(host: DocHost, weak: Weak<ChatDocHandle>, mut changed_rx: wat
                 host.evict_over_budget();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod part_segment_tests {
+    use super::encode_part_segment;
+
+    #[test]
+    fn hash_and_colon_are_escaped_unreserved_pass_through() {
+        assert_eq!(encode_part_segment("m1#c1"), "m1%23c1");
+        assert_eq!(encode_part_segment("tool:call_9"), "tool%3Acall_9");
+        assert_eq!(encode_part_segment("plain-id_0.diff~"), "plain-id_0.diff~");
     }
 }

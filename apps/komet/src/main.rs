@@ -114,9 +114,7 @@ fn main() -> anyhow::Result<()> {
     // the engine logs the exact failure line. One file per launch, previous
     // launch kept as `.old`.
     let log_file = if long_running {
-        let mode = if cli.service {
-            "headless"
-        } else if cli.command.is_some() {
+        let mode = if cli.service || cli.command.is_some() {
             "headless"
         } else {
             "headed"
@@ -156,13 +154,13 @@ fn main() -> anyhow::Result<()> {
             println!("KOMET_SYNC_TOKEN={token}");
             println!("KOMET_EDGE_URL=http://YOUR_VPS_IP:8787");
             println!("\nSur chaque device: export KOMET_SYNC_TOKEN={token} KOMET_EDGE_URL=http://YOUR_VPS_IP:8787");
-            return Ok(());
+            Ok(())
         }
         Some(Command::SyncServer { port }) => {
             let runtime = tokio::runtime::Runtime::new()?;
             let token = std::env::var("KOMET_SYNC_TOKEN").ok();
             let data_dir = std::env::var_os("KOMET_DATA_DIR").map(std::path::PathBuf::from).unwrap_or_else(dirs_data_dir);
-            return runtime.block_on(komet_sync_server::serve(data_dir, token, port));
+            runtime.block_on(komet_sync_server::serve(data_dir, token, port))
         }
         Some(Command::Headless) => {
             let runtime = tokio::runtime::Runtime::new()?;

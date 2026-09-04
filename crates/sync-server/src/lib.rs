@@ -25,12 +25,12 @@ pub struct Room {
     pub db_path: PathBuf,
 }
 
-fn room_db_path(data_dir: &PathBuf, room: &str) -> PathBuf {
+fn room_db_path(data_dir: &std::path::Path, room: &str) -> PathBuf {
     let safe: String = room.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
     data_dir.join("rooms").join(format!("{safe}.db"))
 }
 
-fn open_room_db(path: &PathBuf) -> rusqlite::Connection {
+fn open_room_db(path: &std::path::Path) -> rusqlite::Connection {
     std::fs::create_dir_all(path.parent().unwrap()).ok();
     let conn = rusqlite::Connection::open(path).unwrap();
     conn.execute("CREATE TABLE IF NOT EXISTS frames (id INTEGER PRIMARY KEY AUTOINCREMENT, data BLOB NOT NULL)", []).ok();

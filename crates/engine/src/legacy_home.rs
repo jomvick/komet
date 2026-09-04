@@ -229,7 +229,7 @@ mod tests {
         std::fs::create_dir_all(root.join(".komet/cursor-state")).unwrap();
         migrate_home(&root.join(".komet"), &root.join(".komet"), data_dir.path());
         assert!(
-            !root.join(".komet/cursor-state/by-agent/x/agent").exists() == false,
+            root.join(".komet/cursor-state/by-agent/x/agent").exists(),
             "existing migrated tree untouched"
         );
         assert!(root.join(".komet/cursor-state").exists());
