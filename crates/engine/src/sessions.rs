@@ -567,27 +567,24 @@ impl SessionsEngine {
                         let watchdog_chat = chat.clone();
                         tokio::spawn(async move {
                             tokio::time::sleep(timeout).await;
-                            match watchdog_sessions.respond_permission(
+                            if let Ok(true) = watchdog_sessions.respond_permission(
                                 &watchdog_chat,
                                 &request_id,
                                 komet_proto::PermissionChoice::Deny,
                             ) {
-                                Ok(true) => {
-                                    // The doc part must resolve too, or a dead
-                                    // approval panel would keep rendering.
-                                    if let Ok(handle) =
-                                        watchdog_sessions.doc_handle(&watchdog_chat)
-                                    {
-                                        let _ =
-                                            handle.doc().resolve_permission(&request_id.clone());
-                                    }
-                                    tracing::info!(
-                                        chat = %watchdog_chat,
-                                        request = %request_id,
-                                        "permission auto-denied: bridge timeout"
-                                    );
+                                // The doc part must resolve too, or a dead
+                                // approval panel would keep rendering.
+                                if let Ok(handle) =
+                                    watchdog_sessions.doc_handle(&watchdog_chat)
+                                {
+                                    let _ =
+                                        handle.doc().resolve_permission(&request_id.clone());
                                 }
-                                _ => {}
+                                tracing::info!(
+                                    chat = %watchdog_chat,
+                                    request = %request_id,
+                                    "permission auto-denied: bridge timeout"
+                                );
                             }
                         });
                     }
@@ -916,15 +913,14 @@ impl SessionsEngine {
             // own crashed run from an earlier era, since the chat migrated) has
             // stamped the doc + closed the journal above — but must NEVER spawn
             // a competing run: the host owns the run plane (§7 device routing).
-            if let Some(host) = self.inner.doc_host() {
-                if !host.is_host(&chat_id) {
+            if let Some(host) = self.inner.doc_host()
+                && !host.is_host(&chat_id) {
                     tracing::info!(
                         chat = %chat_id,
                         "auto-resume skipped: chat hosted by another device"
                     );
                     continue;
                 }
-            }
             let attempt = self.inner.journal.note_resume_attempt(&chat_id);
             let (user_id, prompt_text) = prompt.expect("gated by will_resume");
             let sessions = self.clone();

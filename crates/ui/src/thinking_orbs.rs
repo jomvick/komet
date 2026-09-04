@@ -123,6 +123,9 @@ pub struct OrbFrame {
 // Math & 3D Projection Helpers
 // ---------------------------------------------------------------------------
 
+/// Project a sphere point to screen space (`cx`/`cy` are the sphere's center
+/// on screen). All call sites project in unit scale.
+#[allow(clippy::too_many_arguments)]
 fn project_point(
     x: f32,
     y: f32,
@@ -446,16 +449,12 @@ fn solve_cycle(time: f32, count: usize, slot_dur: f32, rest: f32) -> (Vec<f32>, 
         let ep = 1.0 - (1.0 - cl).powi(3);
 
         if slot < count {
-            for i in 0..slot {
-                amount[i] = 1.0;
-            }
+            amount[..slot].fill(1.0);
             amount[slot] = ep;
             active = slot as i32;
         } else {
             let u = 2 * count - 1 - slot;
-            for i in 0..u {
-                amount[i] = 1.0;
-            }
+            amount[..u].fill(1.0);
             amount[u] = 1.0 - ep;
             active = u as i32;
         }

@@ -79,8 +79,8 @@ pub fn build_claude_settings_maps(
 
     // ── settings.sandbox (unified) ────────────────────────────────
     let mut sandbox = serde_json::Map::new();
-    if let Some(fs_sandbox) = c.settings.sandbox.clone() {
-        if let Some(obj) = fs_sandbox.as_object() {
+    if let Some(fs_sandbox) = c.settings.sandbox.clone()
+        && let Some(obj) = fs_sandbox.as_object() {
             for (k, v) in obj {
                 // Skip network keys from settings.sandbox — overwritten
                 // by the generated restrictions below.
@@ -89,7 +89,6 @@ pub fn build_claude_settings_maps(
                 }
             }
         }
-    }
 
     let has_network =
         !c.network.allowed_hosts.is_empty() || !c.network.denied_hosts.is_empty();
@@ -185,25 +184,26 @@ pub fn build_claude_settings_maps(
 /// detail box right below it (user report, screenshot 2026-09-01).
 const SUMMARY_MAX_CHARS: usize = 56;
 
-fn summarize_command(cmd: &str) -> String {
-    let segments: Vec<&str> = cmd
-        .split(['\n', ';'])
+/// The `;`/`&&`/`||`/newline-separated segments of `cmd`, trimmed and
+/// non-empty, in order.
+fn command_segments(cmd: &str) -> impl Iterator<Item = &str> {
+    cmd.split(['\n', ';'])
         .flat_map(|s| s.split("&&"))
         .flat_map(|s| s.split("||"))
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .collect();
-    let first = segments.first().copied().unwrap_or(cmd).trim();
-    let mut short: String = if first.chars().count() > SUMMARY_MAX_CHARS {
+}
+
+/// The backticked label for a command's first segment, capped at
+/// [`SUMMARY_MAX_CHARS`]. No "(+N more)" suffix here — callers place it
+/// OUTSIDE the backticks: `Run `git status` (+10 more)`.
+fn summarize_command(cmd: &str) -> String {
+    let first = command_segments(cmd).next().unwrap_or(cmd);
+    if first.chars().count() > SUMMARY_MAX_CHARS {
         first.chars().take(SUMMARY_MAX_CHARS).collect::<String>() + "…"
     } else {
         first.to_string()
-    };
-    let remaining = segments.len().saturating_sub(1);
-    if remaining > 0 {
-        short.push_str(&format!(" (+{remaining} more)"));
     }
-    short
 }
 
 /// Extract [`PermissionKind`], summary, and default choices from a tool call payload.
@@ -229,7 +229,13 @@ pub fn parse_tool_permission(
             let summary = if cmd.is_empty() {
                 "Run command".into()
             } else {
-                format!("Run `{}`", summarize_command(cmd))
+                let label = summarize_command(cmd);
+                let remaining = command_segments(cmd).count().saturating_sub(1);
+                if remaining > 0 {
+                    format!("Run `{label}` (+{remaining} more)")
+                } else {
+                    format!("Run `{label}`")
+                }
             };
             (
                 PermissionKind::Command {
@@ -300,7 +306,8 @@ mod tests {
             "command": "git status; echo \"---\"; git diff --stat; echo \"---\"; git diff --cached --stat; echo \"---\"; git log --oneline -3; echo \"---\"; git branch --show-current; echo \"---\"; git remote -v | head -5"
         });
         let (_, summary, _) = parse_tool_permission("Bash", &input);
-        assert_eq!(summary, "Run `git status` (+9 more)");
+        // 10 `;` separators → 11 segments → 10 further segments after the first.
+        assert_eq!(summary, "Run `git status` (+10 more)");
         assert!(summary.chars().count() < 40, "header must stay short: {summary}");
     }
 
@@ -311,7 +318,9 @@ mod tests {
         let (_, summary, _) = parse_tool_permission("Bash", &input);
         assert!(summary.starts_with("Run `"));
         assert!(summary.chars().count() <= 5 + SUMMARY_MAX_CHARS + 1 + 1, "{summary}");
-        assert!(summary.ends_with('…'));
+        // The label is backtick-wrapped: `Run `……`` — the truncation ellipsis
+        // sits right before the closing backtick.
+        assert!(summary.ends_with("…`"));
     }
 
     #[test]

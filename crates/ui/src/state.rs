@@ -871,10 +871,10 @@ impl AppState {
                     komet_doc::MessagePart::Text { text, .. } => {
                         total_chars += text.len();
                     }
-                    komet_doc::MessagePart::Tool { output, .. } => {
-                        if let Some(out) = output {
-                            total_chars += out.len();
-                        }
+                    komet_doc::MessagePart::Tool {
+                        output: Some(out), ..
+                    } => {
+                        total_chars += out.len();
                     }
                     _ => {}
                 }

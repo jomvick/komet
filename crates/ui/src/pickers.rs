@@ -1991,6 +1991,11 @@ impl Pickers {
 
     // ---- render ----
 
+    /// One row trigger chip (model / traits / branch / checkout …): `kind`
+    /// selects the popover it opens, `label`+`chip_icon` the face, `set`
+    /// whether an active selection exists (brightens the chip), `suffix` the
+    /// secondary run-length badge on the right edge.
+    #[allow(clippy::too_many_arguments)] // one chip builder for all picker rows
     fn trigger_chip(
         &self,
         kind: PickerKind,
@@ -2278,9 +2283,7 @@ impl Pickers {
             // Sessions never move: read-only checkout-kind + ref labels,
             // LEFT-aligned, only when the session's project has git. The
             // target (project @ device) lives in the titlebar now.
-            let Some(space) = space.as_ref().filter(|s| s.git_detected) else {
-                return None;
-            };
+            let space = space.as_ref().filter(|s| s.git_detected)?;
             let is_worktree = chat.cwd.as_deref().is_some_and(|cwd| cwd != space.path);
             let (icon_path, label) = if is_worktree {
                 (crate::icons::FOLDER_WITH_FILES, "Worktree")

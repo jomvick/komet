@@ -410,15 +410,19 @@ pub fn pending_input_request(
         })
 }
 
-pub fn pending_permission_request(
-    transcript: &[SessionMessageEntry],
-) -> Option<(
+/// A pending interactive permission request: `(request id, kind, tool title,
+/// offered choices, actions)` — destructured positionally at the call sites.
+pub type PendingPermissionRequest = (
     String,
     komet_proto::PermissionKind,
     String,
     Vec<komet_proto::PermissionChoice>,
     Vec<komet_proto::AgentPermissionAction>,
-)> {
+);
+
+pub fn pending_permission_request(
+    transcript: &[SessionMessageEntry],
+) -> Option<PendingPermissionRequest> {
     transcript
         .iter()
         .rev()
@@ -3393,9 +3397,8 @@ fn mention_token(text: &str, cursor: usize) -> Option<MentionToken> {
         .rev()
         .find_map(|(at, ch)| ch.is_whitespace().then_some(at + ch.len_utf8()))
         .unwrap_or(0);
-    let Some(relative_at) = text[token_start..cursor].rfind('@') else {
-        return None;
-    };
+    let relative_at = text[token_start..cursor].rfind('@')?;
+
     let at = token_start + relative_at;
     let valid_boundary = at == 0
         || text[..at]
@@ -4875,7 +4878,7 @@ impl Composer {
         let sandbox = self.state.read(cx).access_mode;
         // Only populate sandbox_options for harnesses that support SandboxOptions.
         // Unsupported harnesses: Cursor, Grok, Hermes, Pi, Antigravity.
-        let harness_supports_sandbox = resolved.harness.as_ref().map_or(true, |h| {
+        let harness_supports_sandbox = resolved.harness.as_ref().is_none_or(|h| {
             !matches!(
                 h,
                 komet_proto::HarnessId::Cursor
@@ -5816,8 +5819,8 @@ impl Composer {
                     updated_permissions,
                 },
             };
-            if let Some(engine) = this.state.read(cx).engine().cloned() {
-                if let Some(chat_id) = this.state.read(cx).selected_chat.clone() {
+            if let Some(engine) = this.state.read(cx).engine().cloned()
+                && let Some(chat_id) = this.state.read(cx).selected_chat.clone() {
                     let params = serde_json::json!({
                         "chatId": chat_id,
                         "command": serde_json::to_value(&payload).unwrap_or_default()
@@ -5858,14 +5861,14 @@ impl Composer {
                                             .await;
                                         this.update(cx, |composer, cx| {
                                             let t = composer.state.read(cx).transcript.clone();
-                                            if permission_request_resolved(&t, &rid2) {
-                                                composer.answered_requests.remove(&rid2);
-                                            } else if pending_permission_request(&t)
-                                                .is_some_and(|(p, _, _, _, _)| p == rid2)
+                                            // Both retry paths unhide the same way:
+                                            // the request is still actionable.
+                                            if permission_request_resolved(&t, &rid2)
+                                                || pending_permission_request(&t)
+                                                    .is_some_and(|(p, _, _, _, _)| p == rid2)
+                                                    && composer.run_live(cx)
                                             {
-                                                if composer.run_live(cx) {
-                                                    composer.answered_requests.remove(&rid2);
-                                                }
+                                                composer.answered_requests.remove(&rid2);
                                             }
                                             cx.notify();
                                         })
@@ -5881,7 +5884,6 @@ impl Composer {
                     })
                     .detach();
                 }
-            }
             cx.notify();
         };
 

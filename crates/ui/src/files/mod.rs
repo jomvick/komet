@@ -365,6 +365,21 @@ impl Render for FilesSurface {
     }
 }
 
+/// Common construction parameters for a [`FilesSurface`]: the enclosing app
+/// `state` + `chat_id`, the `presentation` (browser vs. a single editor
+/// anchored at `editor_path`), and the editor appearance settings mirrored
+/// from the app settings.
+struct FilesSurfaceParams {
+    state: Entity<AppState>,
+    chat_id: String,
+    presentation: FilesPresentation,
+    editor_path: Option<String>,
+    autosave_delay_ms: u64,
+    editor_font_size: f32,
+    word_wrap: bool,
+    show_all_files: bool,
+}
+
 impl FilesSurface {
     pub fn new(
         state: Entity<AppState>,
@@ -375,19 +390,23 @@ impl FilesSurface {
         show_all_files: bool,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::new_with_presentation(
-            state,
-            chat_id,
-            FilesPresentation::Browser,
-            None,
-            autosave_delay_ms,
-            editor_font_size,
-            word_wrap,
-            show_all_files,
+        Self::build(
+            FilesSurfaceParams {
+                state,
+                chat_id,
+                presentation: FilesPresentation::Browser,
+                editor_path: None,
+                autosave_delay_ms,
+                editor_font_size,
+                word_wrap,
+                show_all_files,
+            },
             cx,
         )
     }
 
+    /// Open a specific workspace file as a standalone editor surface.
+    #[allow(clippy::too_many_arguments)] // flat ctor mirrors the call sites
     pub fn new_editor(
         state: Entity<AppState>,
         chat_id: String,
@@ -398,28 +417,32 @@ impl FilesSurface {
         show_all_files: bool,
         cx: &mut Context<Self>,
     ) -> Self {
-        Self::new_with_presentation(
-            state,
-            chat_id,
-            FilesPresentation::Editor,
-            Some(path),
-            autosave_delay_ms,
-            editor_font_size,
-            word_wrap,
-            show_all_files,
+        Self::build(
+            FilesSurfaceParams {
+                state,
+                chat_id,
+                presentation: FilesPresentation::Editor,
+                editor_path: Some(path),
+                autosave_delay_ms,
+                editor_font_size,
+                word_wrap,
+                show_all_files,
+            },
             cx,
         )
     }
 
-    fn new_with_presentation(
-        state: Entity<AppState>,
-        chat_id: String,
-        presentation: FilesPresentation,
-        editor_path: Option<String>,
-        autosave_delay_ms: u64,
-        editor_font_size: f32,
-        word_wrap: bool,
-        show_all_files: bool,
+    fn build(
+        FilesSurfaceParams {
+            state,
+            chat_id,
+            presentation,
+            editor_path,
+            autosave_delay_ms,
+            editor_font_size,
+            word_wrap,
+            show_all_files,
+        }: FilesSurfaceParams,
         cx: &mut Context<Self>,
     ) -> Self {
         let search = cx.new(|cx| {

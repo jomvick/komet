@@ -235,16 +235,14 @@ impl Harness for AntigravityHarness {
                                         let params = info.get("parameters");
 
                                         // Bridge interactive questions if present
-                                        if tool_name == "ask_question" {
-                                            if let Some(params) = params {
-                                                if let Some(questions) = normalize::extract_questions(params) {
+                                        if tool_name == "ask_question"
+                                            && let Some(params) = params
+                                                && let Some(questions) = normalize::extract_questions(params) {
                                                     let rx = (controls.request_input)(questions);
                                                     tokio::spawn(async move {
                                                         let _ = rx.await;
                                                     });
                                                 }
-                                            }
-                                        }
 
                                         let call = normalize::normalize_tool_call(tool_name, params);
                                         if tx.send(Ok(AgentEvent::ToolCall { id: id.clone(), call })).await.is_err() { break; }

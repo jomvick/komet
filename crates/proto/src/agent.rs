@@ -801,11 +801,10 @@ impl std::error::Error for ValidationError {}
 /// `"Bash"`, or any `"Bash(*…)"` (unsandboxed / all-commands bash).
 fn settings_permissions_escalation(value: &serde_json::Value) -> Option<String> {
     let obj = value.as_object()?;
-    if let Some(mode) = obj.get("defaultMode").and_then(|m| m.as_str()) {
-        if mode != "default" && mode != "acceptEdits" {
+    if let Some(mode) = obj.get("defaultMode").and_then(|m| m.as_str())
+        && mode != "default" && mode != "acceptEdits" {
             return Some(format!("defaultMode {mode:?}"));
         }
-    }
     if let Some(allow) = obj.get("allow").and_then(|a| a.as_array()) {
         for entry in allow {
             let Some(rule) = entry.as_str() else {
@@ -861,8 +860,8 @@ pub fn validate_run_request(request: &RunRequest) -> Result<(), ValidationError>
     let Some(options) = &request.sandbox_options else {
         return Ok(());
     };
-    if !options.is_empty() {
-        if let Some(harness) = request.harness {
+    if !options.is_empty()
+        && let Some(harness) = request.harness {
             match harness {
                 HarnessId::Cursor
                 | HarnessId::Grok
@@ -874,7 +873,6 @@ pub fn validate_run_request(request: &RunRequest) -> Result<(), ValidationError>
                 _ => {}
             }
         }
-    }
     let cwd = lexically_clean(std::path::Path::new(&request.cwd));
 
     if let Some(codex) = &options.codex {
@@ -981,14 +979,13 @@ pub fn validate_reasoning(
     requested: Option<ReasoningLevel>,
     supported: &[ReasoningLevel],
 ) -> Result<(), ValidationError> {
-    if let Some(level) = requested {
-        if !supported.contains(&level) {
+    if let Some(level) = requested
+        && !supported.contains(&level) {
             return Err(ValidationError::ReasoningLevelUnsupported {
                 requested: level,
                 supported: supported.to_vec(),
             });
         }
-    }
     Ok(())
 }
 
@@ -1356,15 +1353,12 @@ pub enum Scope {
 /// Choice returned by the harness for a permission request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
+#[derive(Default)]
 pub enum PermissionChoice {
+    #[default]
     Allow,
     AllowAlways { scope: Scope },
     Deny,
-}
-impl Default for PermissionChoice {
-    fn default() -> Self {
-        PermissionChoice::Allow
-    }
 }
 
 /// A single permission rule: {action, resource, effect}.
