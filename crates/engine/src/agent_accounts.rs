@@ -1411,11 +1411,30 @@ impl AgentAccounts {
         let Some(credentials) = &d.credentials else {
             return Ok(());
         };
+        // A degraded identity must never erase a richer one. Antigravity's
+        // keyring secret carries no email; when Google userinfo can't be
+        // reached (expired access token, offline) the freshly detected profile
+        // is the opaque `Antigravity ·…hash` placeholder. If we already know
+        // the real identity for this account_key (resolved on an earlier list),
+        // keep it — only the display fields are at stake, never the tokens.
+        let profile = match self
+            .read_slots(harness)
+            .into_iter()
+            .find(|s| s.account_key == d.account_key)
+        {
+            Some(existing)
+                if is_opaque_antigravity_email(&d.profile.email)
+                    && !is_opaque_antigravity_email(&existing.profile.email) =>
+            {
+                existing.profile
+            }
+            _ => d.profile.clone(),
+        };
         self.write_slot(&Slot {
             id: slot_id_for(harness, &d.account_key),
             harness,
             account_key: d.account_key.clone(),
-            profile: d.profile.clone(),
+            profile,
             credentials: credentials.clone(),
             claude_config: d.claude_config.clone(),
             saved_at: now_ms(),
@@ -2216,6 +2235,13 @@ fn antigravity_access_token(auth: &serde_json::Value) -> Option<String> {
     str_field(&view, "access_token").or_else(|| str_field(&view, "accessToken"))
 }
 
+/// `parse_antigravity_auth` derives this placeholder when the keyring secret
+/// carries no identity and Google userinfo couldn't be reached — a real
+/// resolution (`enrich_antigravity_profile`) replaces it with an actual email.
+fn is_opaque_antigravity_email(email: &str) -> bool {
+    email.starts_with("Antigravity ·…")
+}
+
 fn parse_antigravity_auth(auth: serde_json::Value) -> Option<Detected> {
     // Keyring shape (go-keyring item `gemini`/`antigravity`):
     //   {"token":{access_token,refresh_token,expiry},"auth_method":"consumer"}
@@ -2438,6 +2464,74 @@ mod tests {
     fn parse_antigravity_garbage_is_none() {
         assert!(parse_antigravity_auth(serde_json::json!({})).is_none());
         assert!(parse_antigravity_auth(serde_json::json!({"unrelated": 1})).is_none());
+    }
+
+    #[test]
+    fn snapshot_detected_keeps_resolved_identity_over_opaque_placeholder() {
+        let root = std::env::temp_dir()
+            .join(format!("komet-agy-snapshot-{}", std::process::id()));
+        let config = AgentAccountsConfig {
+            data_dir: root.join("data"),
+            claude_config_dir: root.join("claude"),
+            claude_config_file: root.join("claude.json"),
+            codex_home: root.join("codex"),
+            antigravity_home: root.join("antigravity"),
+        };
+        let accounts = AgentAccounts::new(config);
+
+        let keyring_shape = |access: &str| {
+            serde_json::json!({
+                "token": {"access_token": access, "refresh_token": "1//stable", "expiry": "x"},
+                "auth_method": "consumer",
+            })
+        };
+        let detected = |email: &str, access: &str| Detected {
+            account_key: "antigravity:stablehash".into(),
+            profile: SlotProfile {
+                email: email.into(),
+                display_name: None,
+                organization: None,
+                plan: None,
+                auth_kind: AgentAuthKind::Oauth,
+            },
+            credentials: Some(keyring_shape(access)),
+            claude_config: None,
+        };
+
+        // 1) First detection with a resolved identity (Google userinfo worked).
+        let _ = accounts.snapshot_detected(
+            HarnessId::Antigravity,
+            &detected("real@gmail.com", "ya29.v1"),
+        );
+        // 2) A later list() re-detects the live login while userinfo is
+        // unreachable — the degraded placeholder must NOT erase the email.
+        let _ = accounts.snapshot_detected(
+            HarnessId::Antigravity,
+            &detected("Antigravity ·…stablehash", "ya29.v2"),
+        );
+        let slots = accounts.read_slots(HarnessId::Antigravity);
+        assert_eq!(slots.len(), 1, "same account_key, no duplicate slot");
+        assert_eq!(
+            slots[0].profile.email, "real@gmail.com",
+            "degraded re-detection must keep the resolved identity"
+        );
+        // Tokens still refresh verbatim even when the profile is preserved.
+        assert_eq!(
+            slots[0].credentials.get("token")
+                .and_then(|t| t.get("access_token"))
+                .and_then(|v| v.as_str()),
+            Some("ya29.v2"),
+        );
+
+        // 3) A genuinely richer detection still upgrades the profile.
+        let _ = accounts.snapshot_detected(
+            HarnessId::Antigravity,
+            &detected("renamed@gmail.com", "ya29.v3"),
+        );
+        let slots = accounts.read_slots(HarnessId::Antigravity);
+        assert_eq!(slots[0].profile.email, "renamed@gmail.com");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     // ── live Secret Service round-trip (agy's own item) ─────────────────────
