@@ -36,10 +36,28 @@ impl McpSecretStore {
         store
     }
 
-    /// Ephemeral in-memory store for tests (no file I/O on drop unless set_secret called with temp path).
+    /// Ephemeral in-memory store for tests — uses a unique temp path (pid + nanos) to avoid collisions
+    /// across parallel test processes/instances. No file I/O until `set_secret`.
     pub fn ephemeral() -> Self {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let pid = std::process::id();
+        // Use thread id hash for extra uniqueness within same process
+        let tid = format!("{:?}", std::thread::current().id());
+        let tid_hash = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            tid.hash(&mut h);
+            h.finish()
+        };
+        let path = std::env::temp_dir().join(format!(
+            "komet-mcp-secrets-ephemeral-{}-{}-{}.json",
+            pid, tid_hash, nanos
+        ));
         Self {
-            path: PathBuf::from("/tmp/komet-mcp-secrets-ephemeral.json"),
+            path,
             secrets: HashMap::new(),
         }
     }
@@ -107,14 +125,41 @@ impl McpSecretStore {
         self.secrets.get(id).cloned().unwrap_or_default()
     }
 
-    /// Alias for header resolution — same underlying store.
+    /// Alias for header resolution — currently same underlying merged map.
+    /// Caller should filter by `config.headers` keys (see `get_resolved_headers_for`).
+    /// Kept for backward compat; partitioned storage will be introduced in Task 5.
     pub fn get_resolved_headers(&self, id: &str) -> HashMap<String, String> {
         self.resolve(id)
     }
 
-    /// Resolve env secrets for a server id.
+    /// Alias for env resolution — currently same underlying merged map.
+    /// Caller should filter by `config.env` keys (see `get_resolved_env_for`).
     pub fn get_resolved_env(&self, id: &str) -> HashMap<String, String> {
         self.resolve(id)
+    }
+
+    /// Filtered header resolution: returns only keys present in `config_headers`.
+    pub fn get_resolved_headers_for(
+        &self,
+        id: &str,
+        config_headers: &HashMap<String, String>,
+    ) -> HashMap<String, String> {
+        let all = self.resolve(id);
+        all.into_iter()
+            .filter(|(k, _)| config_headers.contains_key(k))
+            .collect()
+    }
+
+    /// Filtered env resolution: returns only keys present in `config_env`.
+    pub fn get_resolved_env_for(
+        &self,
+        id: &str,
+        config_env: &HashMap<String, String>,
+    ) -> HashMap<String, String> {
+        let all = self.resolve(id);
+        all.into_iter()
+            .filter(|(k, _)| config_env.contains_key(k))
+            .collect()
     }
 
     /// Remove a secret.

@@ -72,8 +72,6 @@ similar = "2"
 
 # async / net
 tokio = { version = "1", features = ["full"] }
-axum = "0.8"
-rmcp = { version = "3", features = ["server", "transport-streamable-http-server"] }
 tokio-util = "0.7"
 libc = "0.2"
 gethostname = "1"

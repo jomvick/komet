@@ -35,8 +35,6 @@ dirs.workspace = true
 reqwest.workspace = true
 ignore.workspace = true
 nucleo-matcher.workspace = true
-rmcp.workspace = true
-axum.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
