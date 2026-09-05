@@ -305,12 +305,27 @@ impl Harness for CodexHarness {
         true
     }
 
-    /// The curated static catalog (see [`catalog`]); requires an installed CLI
-    /// so an absent binary surfaces as [`HarnessError::NotInstalled`] here.
+    /// Live `~/.codex/models_cache.json` first (what the CLI itself offers),
+    /// curated snapshot as fallback — so the picker never proposes stale ids
+    /// the app server rejects. Requires an installed CLI so an absent binary
+    /// surfaces as [`HarnessError::NotInstalled`] here.
     /// This is the seam for live discovery: a short-lived `codex app-server`
     /// paging `model/list` (experimentalApi) exactly as codex.ts does.
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         self.resolve_executable()?;
+        if let Some(home) = std::env::var_os("CODEX_HOME")
+            .map(PathBuf::from)
+            .filter(|p| !p.as_os_str().is_empty())
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".codex")))
+        {
+            let cache = home.join("models_cache.json");
+            if let Ok(text) = std::fs::read_to_string(&cache)
+                && let Ok(value) = serde_json::from_str::<serde_json::Value>(&text)
+                && let Some(models) = catalog::parse_models_cache(&value)
+            {
+                return Ok(models);
+            }
+        }
         Ok(static_models())
     }
 

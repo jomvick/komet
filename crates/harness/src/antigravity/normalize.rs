@@ -18,22 +18,24 @@ pub fn normalize_tool_call(name: &str, params: Option<&Value>) -> ToolCall {
     let p = params.unwrap_or(&Value::Null);
 
     match name {
-        "run_command" | "bash" | "exec" => {
+        "run_command" | "bash" | "exec" | "command_status" | "send_command_input" | "notebook_execution" => {
             let command = p
                 .get("CommandLine")
                 .or_else(|| p.get("command"))
                 .or_else(|| p.get("cmd"))
+                .or_else(|| p.get("Input"))
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
             ToolCall::Exec { command }
         }
-        "view_file" | "read_file" => {
+        "view_file" | "read_file" | "read_resource" => {
             let path = p
                 .get("AbsolutePath")
                 .or_else(|| p.get("path"))
                 .or_else(|| p.get("file_path"))
                 .or_else(|| p.get("TargetFile"))
+                .or_else(|| p.get("Uri"))
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
@@ -53,10 +55,11 @@ pub fn normalize_tool_call(name: &str, params: Option<&Value>) -> ToolCall {
                 .map(str::to_string);
             ToolCall::WriteFile { path, content }
         }
-        "replace_file_content" | "edit_file" => {
+        "replace_file_content" | "edit_file" | "multi_replace_file_content" | "sed_file" | "notebook_edit" => {
             let path = p
                 .get("TargetFile")
                 .or_else(|| p.get("path"))
+                .or_else(|| p.get("file_path"))
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
@@ -99,6 +102,15 @@ pub fn normalize_tool_call(name: &str, params: Option<&Value>) -> ToolCall {
                 .to_string();
             ToolCall::Glob { pattern }
         }
+        "list_dir" => {
+            let path = p
+                .get("DirectoryPath")
+                .or_else(|| p.get("path"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            ToolCall::Glob { pattern: path }
+        }
         "search_web" => {
             let query = p
                 .get("query")
@@ -108,7 +120,7 @@ pub fn normalize_tool_call(name: &str, params: Option<&Value>) -> ToolCall {
                 .to_string();
             ToolCall::WebSearch { query }
         }
-        "read_url_content" => {
+        "read_url_content" | "open_browser_url" | "read_browser_page" => {
             let url = p
                 .get("Url")
                 .or_else(|| p.get("url"))
@@ -234,6 +246,34 @@ mod tests {
         match call {
             ToolCall::Unknown { name, .. } => assert_eq!(name, "Agent: Codebase Researcher"),
             _ => panic!("expected Unknown with subagent name"),
+        }
+    }
+
+    #[test]
+    fn test_normalize_list_dir() {
+        let json = serde_json::json!({ "DirectoryPath": "/home/user/project" });
+        let call = normalize_tool_call("list_dir", Some(&json));
+        match call {
+            ToolCall::Glob { pattern } => assert_eq!(pattern, "/home/user/project"),
+            _ => panic!("expected Glob tool call for list_dir"),
+        }
+    }
+
+    #[test]
+    fn test_normalize_edit_file() {
+        let json = serde_json::json!({
+            "TargetFile": "/app/main.rs",
+            "TargetContent": "old",
+            "ReplacementContent": "new"
+        });
+        let call = normalize_tool_call("multi_replace_file_content", Some(&json));
+        match call {
+            ToolCall::EditFile { path, old_string, new_string } => {
+                assert_eq!(path, "/app/main.rs");
+                assert_eq!(old_string.as_deref(), Some("old"));
+                assert_eq!(new_string.as_deref(), Some("new"));
+            }
+            _ => panic!("expected EditFile tool call"),
         }
     }
 
