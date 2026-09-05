@@ -205,7 +205,8 @@ fn secret_store_resolve_and_set_secret() {
     assert_eq!(store2.resolve("gh").get("GH_TOKEN").unwrap(), "secret123");
     // Debug must not leak
     let debug = format!("{store2:?}");
-    assert!(!debug.contains("secret123") || debug.contains("McpSecretStore"));
+    assert!(!debug.contains("secret123"));
+    assert!(debug.contains("McpSecretStore"));
 }
 
 #[test]
@@ -220,4 +221,35 @@ fn secret_store_file_has_600_perms_on_unix() {
         let perms = std::fs::metadata(&path).unwrap().permissions();
         assert_eq!(perms.mode() & 0o777, 0o600);
     }
+}
+
+#[test]
+fn secret_store_partitioned_headers_and_env() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mcp-secrets.json");
+    let mut store = McpSecretStore::new(&path);
+    store.set_secret("gh", "Authorization", "Bearer x").unwrap();
+    store.set_secret("gh", "GH_TOKEN", "tok123").unwrap();
+    // Unfiltered resolve returns both
+    assert_eq!(store.resolve("gh").len(), 2);
+    // Filtered views distinguish headers vs env via config key sets
+    let cfg_headers = HashMap::from([("Authorization".into(), "dummy".into())]);
+    let cfg_env = HashMap::from([("GH_TOKEN".into(), "dummy".into())]);
+    let headers = store.get_resolved_headers_for("gh", &cfg_headers);
+    let env = store.get_resolved_env_for("gh", &cfg_env);
+    assert_eq!(headers.get("Authorization").unwrap(), "Bearer x");
+    assert!(headers.get("GH_TOKEN").is_none());
+    assert_eq!(env.get("GH_TOKEN").unwrap(), "tok123");
+    assert!(env.get("Authorization").is_none());
+    // Aliases still return merged (documented)
+    assert_eq!(store.get_resolved_headers("gh").len(), 2);
+    assert_eq!(store.get_resolved_env("gh").len(), 2);
+}
+
+#[test]
+fn ephemeral_uses_unique_path() {
+    let a = McpSecretStore::ephemeral();
+    let b = McpSecretStore::ephemeral();
+    assert_ne!(a.path(), b.path());
+    assert!(a.path().to_string_lossy().contains("komet-mcp-secrets-ephemeral"));
 }
