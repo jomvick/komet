@@ -138,7 +138,7 @@ Expected: FAIL, module `mcp` does not exist.
 
 ```rust
 pub mod catalog;
-pub mod policy;
+// NOTE: `pub mod policy;` arrives with Task 3 — do NOT declare it here.
 ```
 
 `catalog.rs` (essentials — full schemas inline, no schemars dependency):
@@ -204,9 +204,11 @@ impl McpCatalog {
     }
 
     pub fn list(&self) -> Vec<ToolDef> {
-        let mut v: Vec<_> = self.tools.values().cloned().collect();
-        v.sort_by_key(|t| t.name);
-        v
+        // Definition order (matches the acceptance test) — NOT sorted.
+        ["list_sessions", "get_session_status", "list_spaces"]
+            .iter()
+            .filter_map(|n| self.tools.get(n).cloned())
+            .collect()
     }
 
     pub async fn execute(&self, name: &str, input: serde_json::Value) -> Result<serde_json::Value, CatalogError> {
