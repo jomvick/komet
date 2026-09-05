@@ -1068,6 +1068,18 @@ pub struct RunRequest {
     pub worktree: Option<WorktreeSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_timeout_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<McpInjection>,
+}
+
+/// Per-run internal MCP endpoint riding the request (host-local).
+/// Additive + serde-defaulted: an old host ignores it and runs without MCP.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpInjection {
+    pub server_name: String,
+    pub url: String,
+    pub auth_token: String,
 }
 
 /// Isolated-worktree directive riding [`RunRequest`]. The worktree is created
@@ -1834,6 +1846,26 @@ mod tests {
     }
 
     #[test]
+    fn mcp_injection_round_trips_and_stays_additive() {
+        let old = r#"{"prompt":"p","model":null,"reasoning":null,"cwd":".","sandbox":"workspace-write","resume":null}"#;
+        let req: RunRequest = serde_json::from_str(old).unwrap();
+        assert!(req.mcp.is_none());
+        let json = serde_json::to_value(&req).unwrap();
+        assert!(json.get("mcp").is_none());
+        let req = RunRequest {
+            mcp: Some(McpInjection {
+                server_name: "komet".into(),
+                url: "http://127.0.0.1:9/mcp/agents?callerAgentId=r1".into(),
+                auth_token: "t".into(),
+            }),
+            ..req
+        };
+        let round: RunRequest =
+            serde_json::from_value(serde_json::to_value(&req).unwrap()).unwrap();
+        assert_eq!(round.mcp, req.mcp);
+    }
+
+    #[test]
     fn harness_id_uses_kebab_case() {
         assert_eq!(
             serde_json::to_string(&HarnessId::ClaudeCode).unwrap(),
@@ -2082,6 +2114,7 @@ mod tests {
             worktree: None,
             resume: None,
             permission_timeout_ms: None,
+            mcp: None,
             sandbox_options: Some(SandboxOptions {
                 opencode: Some(OpenCodePerms {
                     bash: BashPerms {
@@ -2129,6 +2162,7 @@ mod tests {
             worktree: None,
             resume: None,
             permission_timeout_ms: None,
+            mcp: None,
         }
     }
 
