@@ -116,7 +116,7 @@ Expected: one hit (used via `komet_doc::sanitize_tool_call` in `crates/engine/sr
 #[tokio::test]
 async fn catalog_lists_three_readonly_tools_and_executes() {
     let catalog = McpCatalog::komet_default(Arc::new(FakeHost));
-    let names: Vec<_> = catalog.list().iter().map(|t| t.name.clone()).collect();
+    let names: Vec<_> = catalog.list().iter().map(|t| t.name).collect();
     assert_eq!(names, vec!["list_sessions", "get_session_status", "list_spaces"]);
     assert!(catalog.list().iter().all(|t| t.readonly));
     let v = catalog.execute("list_spaces", serde_json::json!({})).await.unwrap();

@@ -149,7 +149,7 @@ mod tests {
     #[tokio::test]
     async fn catalog_lists_three_readonly_tools_and_executes() {
         let catalog = McpCatalog::komet_default(Arc::new(FakeHost));
-        let names: Vec<_> = catalog.list().iter().map(|t| t.name.clone()).collect();
+        let names: Vec<_> = catalog.list().iter().map(|t| t.name).collect();
         assert_eq!(
             names,
             vec!["list_sessions", "get_session_status", "list_spaces"]
