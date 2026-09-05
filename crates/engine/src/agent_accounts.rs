@@ -1407,6 +1407,11 @@ impl AgentAccounts {
     }
 
     /// Read the live `agy` keyring secret, parsed. `None` = no item or unreadable.
+    #[cfg(not(target_os = "linux"))]
+    async fn read_antigravity_keyring(&self) -> (Option<serde_json::Value>, Option<String>) {
+        (None, None)
+    }
+
     #[cfg(target_os = "linux")]
     async fn read_antigravity_keyring(&self) -> (Option<serde_json::Value>, Option<String>) {
         secretservice::read_credentials(AGY_KEYRING_SERVICE, AGY_KEYRING_USER).await
