@@ -323,6 +323,7 @@ mod tests {
             permission_timeout_ms: None,
             resume: None,
             worktree: None,
+            mcp: None,
         }
     }
 }
