@@ -128,52 +128,86 @@ fn model(id: &str, label: &str, description: &str, ladder: &[ReasoningLevel]) ->
     }
 }
 
-/// The curated catalog: a snapshot of codex-cli 0.144's `model/list`, newest
-/// family first — efforts as the server reports them (gpt-5.6 goes up to
-/// `ultra`). Mirrors codex.ts's `CODEX_MODELS` fallback.
+/// Map a live `models_cache.json` effort list to the closest ladder.
+fn ladder_for_efforts(efforts: &[String]) -> &'static [ReasoningLevel] {
+    if efforts.iter().any(|e| e == "ultra") {
+        ULTRA_LADDER
+    } else if efforts.iter().any(|e| e == "max") {
+        MAX_LADDER
+    } else {
+        XHIGH_LADDER
+    }
+}
+
+/// Parse a `~/.codex/models_cache.json` document into models. `None` when the
+/// cache has no usable entries (caller falls back to [`static_models`]).
+pub(crate) fn parse_models_cache(value: &serde_json::Value) -> Option<Vec<Model>> {
+    let models = value.get("models")?.as_array()?;
+    let mut out = Vec::new();
+    for m in models {
+        let id = m.get("slug")?.as_str()?;
+        if m.get("visibility")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|v| v == "hidden")
+        {
+            continue;
+        }
+        let label = m
+            .get("display_name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(id);
+        let description = m
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let efforts: Vec<String> = m
+            .get("supported_reasoning_levels")
+            .and_then(serde_json::Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|l| l.get("effort")?.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.push(model(id, label, description, ladder_for_efforts(&efforts)));
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+/// The curated catalog: a snapshot of the live `models_cache.json` (codex-cli
+/// 0.147) — keep in sync; stale ids are rejected by the app server. Mirrors
+/// codex.ts's `CODEX_MODELS` fallback.
 pub(crate) fn static_models() -> Vec<Model> {
     vec![
         model(
-            "gpt-5.6-sol",
-            "GPT-5.6-Sol",
-            "Frontier reasoning flagship",
-            ULTRA_LADDER,
-        ),
-        model(
             "gpt-5.6-terra",
             "GPT-5.6-Terra",
-            "Deep multi-step agentic work",
+            "Balanced agentic coding model for everyday work.",
             ULTRA_LADDER,
         ),
         model(
             "gpt-5.6-luna",
             "GPT-5.6-Luna",
-            "Fast frontier model",
+            "Fast and affordable agentic coding model.",
             MAX_LADDER,
         ),
         model(
             "gpt-5.5",
             "GPT-5.5",
-            "Previous generation flagship",
-            XHIGH_LADDER,
-        ),
-        model(
-            "gpt-5.4",
-            "GPT-5.4",
-            "Reliable general coding",
+            "Frontier model for complex coding, research, and real-world work.",
             XHIGH_LADDER,
         ),
         model(
             "gpt-5.4-mini",
             "GPT-5.4-Mini",
-            "Small, fast and capable",
+            "Small, fast, and cost-efficient model for simpler coding tasks.",
             XHIGH_LADDER,
         ),
         model(
-            "gpt-5.3-codex-spark",
-            "GPT-5.3-Codex-Spark",
-            "Ultra-fast lightweight coding",
-            XHIGH_LADDER,
+            "codex-auto-review",
+            "Codex Auto Review",
+            "Automatic approval review model for Codex.",
+            MAX_LADDER,
         ),
     ]
 }
@@ -241,13 +275,40 @@ mod tests {
     #[test]
     fn catalog_is_newest_first_with_service_tiers() {
         let models = static_models();
-        assert_eq!(models.len(), 7);
-        assert_eq!(models[0].id, "gpt-5.6-sol");
+        assert_eq!(models.len(), 5);
+        assert_eq!(models[0].id, "gpt-5.6-terra");
         assert!(models[0].reasoning_levels.contains(&ReasoningLevel::Ultra));
-        assert!(!models[3].reasoning_levels.contains(&ReasoningLevel::Max));
+        assert!(!models[2].reasoning_levels.contains(&ReasoningLevel::Max));
         for m in &models {
             let tier = m.options.iter().find(|o| o.id == "serviceTier");
             assert!(tier.is_some(), "{} missing serviceTier", m.id);
         }
+    }
+
+    #[test]
+    fn parse_models_cache_reads_live_cache() {
+        let value = serde_json::json!({
+            "models": [
+                {
+                    "slug": "gpt-5.6-terra",
+                    "display_name": "GPT-5.6-Terra",
+                    "description": "Balanced agentic coding model.",
+                    "visibility": "list",
+                    "supported_reasoning_levels": [
+                        {"effort": "low"}, {"effort": "ultra"}
+                    ]
+                },
+                {
+                    "slug": "hidden-model",
+                    "display_name": "Hidden",
+                    "visibility": "hidden",
+                    "supported_reasoning_levels": [{"effort": "low"}]
+                }
+            ]
+        });
+        let parsed = parse_models_cache(&value).expect("parses");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].id, "gpt-5.6-terra");
+        assert!(parsed[0].reasoning_levels.contains(&ReasoningLevel::Ultra));
     }
 }

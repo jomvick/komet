@@ -97,16 +97,23 @@ pub fn force_usage_for(trigger: LoadTrigger) -> bool {
 }
 
 /// Compact absolute reset moment (komet settings.agents.tsx `formatReset`):
-/// a local clock time ("3:45 PM") when it lands within ~22h, else a short
-/// weekday ("Mon"); the caller prefixes "resets ". Pure given `now`.
+/// a local clock time ("3:45 PM") when it lands within ~22h,
+/// a short weekday + time ("Sun 11:50 AM") within 7 days,
+/// else month + day + time; the caller prefixes "resets ". Pure given `now`.
 pub fn format_reset(resets_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Option<String> {
     use chrono::Local;
     let at = resets_at?;
     let local = at.with_timezone(&Local);
-    Some(if at.signed_duration_since(now).num_hours() < 22 {
+    let diff = at.signed_duration_since(now);
+    if diff.num_seconds() <= 0 {
+        return Some("resets soon".into());
+    }
+    Some(if diff.num_hours() < 22 {
         format!("resets {}", local.format("%-I:%M %p"))
+    } else if diff.num_days() < 7 {
+        format!("resets {} {}", local.format("%a"), local.format("%-I:%M %p"))
     } else {
-        format!("resets {}", local.format("%a"))
+        format!("resets {} {}", local.format("%b %-d"), local.format("%-I:%M %p"))
     })
 }
 
@@ -692,8 +699,8 @@ impl AccountsPage {
     // ---- render pieces ----
 
     /// One usage window (komet settings.agents.tsx `UsageMeter`): label ·
-    /// 5px rounded-full bar (indigo → amber ≥80% → red ≥95%) · "NN% used" ·
-    /// quiet reset time.
+    /// 5px rounded-full bar (indigo → amber ≥80% → red ≥95%) · "NN% used (MM% left)" ·
+    /// reset time with prominence when exhausted.
     fn render_usage_meter(
         &self,
         window: &komet_proto::AgentUsageWindow,
@@ -701,12 +708,16 @@ impl AccountsPage {
         now: DateTime<Utc>,
     ) -> AnyElement {
         let fraction = window.used_fraction.clamp(0.0, 1.0);
+        let remaining_fraction = (1.0 - fraction).clamp(0.0, 1.0);
         let level = usage_level(fraction);
         let fill = usage_color(level, theme).opacity(match level {
             UsageLevel::Normal => 0.8,
             _ => 0.85,
         });
         let reset = format_reset(window.resets_at, now);
+        let used_pct = (fraction * 100.0).round() as u32;
+        let left_pct = (remaining_fraction * 100.0).round() as u32;
+
         div()
             .flex()
             .flex_row()
@@ -716,16 +727,17 @@ impl AccountsPage {
             .text_color(theme.text_muted.opacity(0.7))
             .child(
                 div()
-                    .w(px(48.0))
+                    .w(px(72.0))
                     .flex_none()
                     .truncate()
+                    .font_weight(gpui::FontWeight::MEDIUM)
                     .child(SharedString::from(window.label.clone())),
             )
             .child(
                 div()
                     .flex_1()
                     .min_w(px(56.0))
-                    .max_w(px(230.0))
+                    .max_w(px(220.0))
                     .h(px(5.0))
                     .rounded_full()
                     .overflow_hidden()
@@ -744,20 +756,24 @@ impl AccountsPage {
             )
             .child(
                 div()
-                    .w(px(64.0))
                     .flex_none()
                     .text_right()
-                    .child(SharedString::from(format!(
-                        "{}% used",
-                        (fraction * 100.0).round() as u32
-                    ))),
+                    .child(SharedString::from(if used_pct >= 100 {
+                        "100% used (0% left)".to_string()
+                    } else {
+                        format!("{}% used ({}% left)", used_pct, left_pct)
+                    })),
             )
             .when_some(reset, |el, reset| {
                 el.child(
                     div()
                         .flex_none()
                         .truncate()
-                        .text_color(theme.text_muted.opacity(0.45))
+                        .text_color(if level == UsageLevel::Critical {
+                            theme.danger_muted.opacity(0.9)
+                        } else {
+                            theme.text_muted.opacity(0.45)
+                        })
                         .child(SharedString::from(reset)),
                 )
             })
@@ -1540,13 +1556,14 @@ mod tests {
                 soon.with_timezone(&Local).format("%-I:%M %p")
             ))
         );
-        // Beyond: a short weekday ("resets Mon").
+        // Beyond: a short weekday + time ("resets Mon 3:45 PM").
         let later = now + TimeDelta::days(3);
         assert_eq!(
             format_reset(Some(later), now),
             Some(format!(
-                "resets {}",
-                later.with_timezone(&Local).format("%a")
+                "resets {} {}",
+                later.with_timezone(&Local).format("%a"),
+                later.with_timezone(&Local).format("%-I:%M %p")
             ))
         );
     }

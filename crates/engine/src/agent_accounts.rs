@@ -69,6 +69,12 @@ const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 // OAuth tokens. Resolve the real email via Google's own userinfo endpoint,
 // the same trick Claude's flow uses against CLAUDE_PROFILE_URL.
 const GOOGLE_USERINFO_URL: &str = "https://www.googleapis.com/oauth2/v3/userinfo";
+const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+const ANTIGRAVITY_CLIENT_ID: &str = concat!(
+    "1071006060591-",
+    "tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com",
+);
+const ANTIGRAVITY_CLIENT_SECRET: &str = concat!("GOCSPX-", "K58FWR486LdLJ1mLB8sXC4z6qDAf");
 
 // The keyring item `agy` (zalando/go-keyring) reads/writes its live Google
 // token — discovered by introspecting the Secret Service (Task 0 of
@@ -1567,7 +1573,8 @@ impl AgentAccounts {
         }
         let usage = match harness {
             HarnessId::ClaudeCode => self.claude_usage(slot, is_active).await,
-            HarnessId::Codex => self.codex_usage(slot).await,
+            HarnessId::Codex => self.codex_usage(slot, is_active).await,
+            HarnessId::Antigravity => self.antigravity_usage(slot, is_active).await,
             _ => None,
         };
         lock(&self.inner.usage_cache).insert(key, (usage.clone(), Instant::now()));
@@ -1617,19 +1624,235 @@ impl AgentAccounts {
         (!windows.is_empty()).then_some(windows)
     }
 
-    async fn codex_usage(&self, slot: &Slot) -> Option<Vec<AgentUsageWindow>> {
-        let tokens = slot.credentials.get("tokens")?;
-        // api-key mode has no ChatGPT rate windows.
-        let access_token = str_field(tokens, "access_token")?;
+    async fn codex_usage(&self, slot: &Slot, is_active: bool) -> Option<Vec<AgentUsageWindow>> {
+        // Candidates: slot token first, then — for the active account — the
+        // live ~/.codex/auth.json (the CLI refreshes it on every launch, the
+        // slot copy goes stale). First candidate that yields rate windows
+        // wins, so the Accounts page quota bar (used/left + reset) renders
+        // instead of "Usage unavailable".
+        let mut candidates: Vec<(String, String)> = Vec::new();
+        if let Some(tokens) = slot.credentials.get("tokens")
+            && let Some(access) = str_field(tokens, "access_token")
+        {
+            candidates.push((
+                access,
+                str_field(tokens, "account_id").unwrap_or_default(),
+            ));
+        }
+        if is_active {
+            let live = std::fs::read_to_string(self.inner.config.codex_home.join("auth.json"))
+                .ok()
+                .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok());
+            if let Some(tokens) = live.as_ref().and_then(|v| v.get("tokens"))
+                && let Some(access) = str_field(tokens, "access_token")
+                && !candidates.iter().any(|(t, _)| t == &access)
+            {
+                candidates.push((
+                    access,
+                    str_field(tokens, "account_id").unwrap_or_default(),
+                ));
+            }
+        }
+        for (access_token, account_id) in candidates {
+            let body: serde_json::Value = self
+                .inner
+                .http
+                .get(CODEX_USAGE_URL)
+                .bearer_auth(&access_token)
+                .header("chatgpt-account-id", &account_id)
+                .send()
+                .await
+                .ok()?
+                .error_for_status()
+                .ok()?
+                .json()
+                .await
+                .ok()?;
+            let rl = body.get("rate_limit")?;
+            let mut windows = Vec::new();
+            for key in ["primary_window", "secondary_window"] {
+                if let Some(w) = rl.get(key)
+                    && let Some(used) = w.get("used_percent").and_then(|v| v.as_f64())
+                {
+                    let span = w
+                        .get("limit_window_seconds")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    windows.push(AgentUsageWindow {
+                        label: if span > 86_400 { "Week" } else { "Session" }.to_string(),
+                        used_fraction: (used / 100.0) as f32,
+                        resets_at: parse_when(w.get("reset_at")),
+                    });
+                }
+            }
+            if !windows.is_empty() {
+                return Some(windows);
+            }
+        }
+        None
+    }
+
+    async fn antigravity_usage(&self, slot: &Slot, is_active: bool) -> Option<Vec<AgentUsageWindow>> {
+        // 1. If this slot is the active one, check local language_server Connect-RPC first
+        if is_active {
+            if let Some((port, token)) = discover_language_server(&self.inner.config.antigravity_home) {
+                let url = format!("http://127.0.0.1:{port}/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary");
+                if let Ok(resp) = self
+                    .inner
+                    .http
+                    .post(&url)
+                    .header("Content-Type", "application/json")
+                    .header("x-codeium-csrf-token", &token)
+                    .body("{}")
+                    .send()
+                    .await
+                    && let Ok(resp) = resp.error_for_status()
+                    && let Ok(body) = resp.json::<serde_json::Value>().await
+                {
+                    let windows = parse_antigravity_quota_response(&body);
+                    if !windows.is_empty() {
+                        return Some(windows);
+                    }
+                }
+            }
+        }
+
+        // 2. Cloud Code PA endpoint with OAuth token. For the active slot the
+        // saved file copy is often stale (rotated on every agy launch) while
+        // the keyring holds the live token — try the live keyring first so
+        // the Accounts page quota bar (consumed/remaining + reset) renders
+        // instead of "Usage unavailable".
+        const ENDPOINT: &str = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary";
+
+        async fn query_pa(
+            http: &reqwest::Client,
+            endpoint: &str,
+            token: &str,
+        ) -> Option<Vec<AgentUsageWindow>> {
+            let resp = http
+                .post(endpoint)
+                .bearer_auth(token)
+                .header("Content-Type", "application/json")
+                .header("User-Agent", "Antigravity/1.0")
+                .header("x-goog-api-client", "gl-go/1.22 gdcl/0.0.0")
+                .json(&serde_json::json!({
+                    "project": "aicode-consumers"
+                }))
+                .send()
+                .await
+                .ok()?;
+            let resp = resp.error_for_status().ok()?;
+            let body = resp.json::<serde_json::Value>().await.ok()?;
+            let windows = parse_antigravity_quota_response(&body);
+            (!windows.is_empty()).then_some(windows)
+        }
+
+        if is_active
+            && let (Some(raw), _) = self.read_antigravity_keyring().await
+            && let Some(live) = antigravity_access_token(&raw)
+            && let Some(windows) = query_pa(&self.inner.http, ENDPOINT, &live).await
+        {
+            return Some(windows);
+        }
+
+        let raw = slot.credentials.as_object().map(|_| &slot.credentials)?;
+        let mut access_token = antigravity_access_token(raw)?;
+
+        // Check if token is expired (by expiry field)
+        let token_view = if let Some(inner) = raw.get("token").filter(|t| t.is_object()) {
+            inner
+        } else if let Some(inner) = raw.get("tokens").filter(|t| t.is_object()) {
+            inner
+        } else {
+            raw
+        };
+        let is_expired = str_field(token_view, "expiry")
+            .and_then(|exp| chrono::DateTime::parse_from_rfc3339(&exp).ok())
+            .map(|exp| exp.with_timezone(&chrono::Utc) < chrono::Utc::now() + chrono::Duration::seconds(30))
+            .unwrap_or(false);
+
+        if is_expired {
+            if let Some(refreshed) = self.refresh_antigravity_slot(slot).await {
+                access_token = refreshed;
+            }
+        }
+
+        let send_pa = |token: &str| {
+            self.inner
+                .http
+                .post(ENDPOINT)
+                .bearer_auth(token)
+                .header("Content-Type", "application/json")
+                .header("User-Agent", "Antigravity/1.0")
+                .header("x-goog-api-client", "gl-go/1.22 gdcl/0.0.0")
+                .json(&serde_json::json!({
+                    "project": "aicode-consumers"
+                }))
+                .send()
+        };
+
+        match send_pa(&access_token).await {
+            Ok(resp) if resp.status() == reqwest::StatusCode::UNAUTHORIZED => {
+                // Try refreshing token and retry once
+                if let Some(new_token) = self.refresh_antigravity_slot(slot).await {
+                    if let Ok(retry_resp) = send_pa(&new_token).await
+                        && let Ok(retry_resp) = retry_resp.error_for_status()
+                        && let Ok(body) = retry_resp.json::<serde_json::Value>().await
+                    {
+                        let windows = parse_antigravity_quota_response(&body);
+                        if !windows.is_empty() {
+                            return Some(windows);
+                        }
+                    }
+                }
+            }
+            Ok(resp) if resp.status().is_success() => {
+                if let Ok(body) = resp.json::<serde_json::Value>().await {
+                    let windows = parse_antigravity_quota_response(&body);
+                    if !windows.is_empty() {
+                        return Some(windows);
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        None
+    }
+
+    /// Refresh a saved Antigravity slot's expired access token so its usage stays queryable.
+    async fn refresh_antigravity_slot(&self, slot: &Slot) -> Option<String> {
+        if !lock(&self.inner.inflight_refreshes).insert(slot.id.clone()) {
+            return None;
+        }
+        let result = self.refresh_antigravity_slot_once(slot).await;
+        lock(&self.inner.inflight_refreshes).remove(&slot.id);
+        result
+    }
+
+    async fn refresh_antigravity_slot_once(&self, slot: &Slot) -> Option<String> {
+        let raw = slot.credentials.as_object().map(|_| &slot.credentials)?;
+        let view = if str_field(raw, "refresh_token").is_some() || str_field(raw, "refreshToken").is_some() {
+            raw.clone()
+        } else if let Some(inner) = raw.get("token").filter(|t| t.is_object()) {
+            inner.clone()
+        } else if let Some(inner) = raw.get("tokens").filter(|t| t.is_object()) {
+            inner.clone()
+        } else {
+            raw.clone()
+        };
+        let refresh_token = str_field(&view, "refresh_token")
+            .or_else(|| str_field(&view, "refreshToken"))?;
         let body: serde_json::Value = self
             .inner
             .http
-            .get(CODEX_USAGE_URL)
-            .bearer_auth(&access_token)
-            .header(
-                "chatgpt-account-id",
-                str_field(tokens, "account_id").unwrap_or_default(),
-            )
+            .post(GOOGLE_TOKEN_URL)
+            .json(&serde_json::json!({
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "client_id": ANTIGRAVITY_CLIENT_ID,
+                "client_secret": ANTIGRAVITY_CLIENT_SECRET,
+            }))
             .send()
             .await
             .ok()?
@@ -1638,24 +1861,39 @@ impl AgentAccounts {
             .json()
             .await
             .ok()?;
-        let rl = body.get("rate_limit")?;
-        let mut windows = Vec::new();
-        for key in ["primary_window", "secondary_window"] {
-            if let Some(w) = rl.get(key)
-                && let Some(used) = w.get("used_percent").and_then(|v| v.as_f64())
-            {
-                let span = w
-                    .get("limit_window_seconds")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0);
-                windows.push(AgentUsageWindow {
-                    label: if span > 86_400 { "Week" } else { "Session" }.to_string(),
-                    used_fraction: (used / 100.0) as f32,
-                    resets_at: parse_when(w.get("reset_at")),
-                });
+        let access_token = str_field(&body, "access_token")?;
+        let expires_in = body
+            .get("expires_in")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(3600);
+        let mut updated_slot = slot.clone();
+        if let Some(map) = updated_slot.credentials.as_object_mut() {
+            let expiry = (chrono::Utc::now() + chrono::Duration::seconds(expires_in)).to_rfc3339();
+            if let Some(inner) = map.get_mut("token").and_then(|t| t.as_object_mut()) {
+                inner.insert("access_token".into(), serde_json::json!(access_token));
+                inner.insert("expiry".into(), serde_json::json!(expiry));
+                if let Some(new_rt) = str_field(&body, "refresh_token") {
+                    inner.insert("refresh_token".into(), serde_json::json!(new_rt));
+                }
+            } else if let Some(inner) = map.get_mut("tokens").and_then(|t| t.as_object_mut()) {
+                inner.insert("access_token".into(), serde_json::json!(access_token));
+                inner.insert("expiry".into(), serde_json::json!(expiry));
+                if let Some(new_rt) = str_field(&body, "refresh_token") {
+                    inner.insert("refresh_token".into(), serde_json::json!(new_rt));
+                }
+            } else {
+                map.insert("access_token".into(), serde_json::json!(access_token));
+                map.insert("expiry".into(), serde_json::json!(expiry));
+                if let Some(new_rt) = str_field(&body, "refresh_token") {
+                    map.insert("refresh_token".into(), serde_json::json!(new_rt));
+                }
             }
         }
-        (!windows.is_empty()).then_some(windows)
+        updated_slot.saved_at = now_ms();
+        if let Err(err) = self.write_slot(&updated_slot) {
+            tracing::warn!(slot = %slot.id, error = %err, "refreshed antigravity slot write failed");
+        }
+        Some(access_token)
     }
 
     /// Refresh a saved Claude slot's expired access token so its usage stays
@@ -2220,6 +2458,118 @@ fn scan_google_url(output: &str) -> Option<String> {
     None
 }
 
+/// Parse Connect-RPC or REST quota summary responses into [`AgentUsageWindow`]s.
+fn parse_antigravity_quota_response(body: &serde_json::Value) -> Vec<AgentUsageWindow> {
+    let mut windows = Vec::new();
+    let resp = body
+        .get("response")
+        .or_else(|| body.get("userQuotaSummary"))
+        .unwrap_or(body);
+    if let Some(groups) = resp.get("groups").and_then(|g| g.as_array()) {
+        for group in groups {
+            let group_name = str_field(group, "displayName").unwrap_or_default();
+            let short_label = if group_name.contains("Gemini") {
+                "Gemini"
+            } else if group_name.contains("Claude") || group_name.contains("GPT") {
+                "Claude/GPT"
+            } else if !group_name.is_empty() {
+                &group_name
+            } else {
+                "Quota"
+            };
+            if let Some(buckets) = group.get("buckets").and_then(|b| b.as_array()) {
+                for bucket in buckets {
+                    if let Some(remaining) = bucket.get("remainingFraction").and_then(|v| v.as_f64()) {
+                        let used = (1.0 - remaining).clamp(0.0, 1.0) as f32;
+                        let resets_at = parse_when(bucket.get("resetTime"));
+                        windows.push(AgentUsageWindow {
+                            label: short_label.to_string(),
+                            used_fraction: used,
+                            resets_at,
+                        });
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    if windows.is_empty() {
+        for bucket in resp.get("buckets").and_then(|b| b.as_array()).into_iter().flatten() {
+            if let Some(remaining) = bucket.get("remainingFraction").and_then(|v| v.as_f64()) {
+                let name = str_field(bucket, "displayName")
+                    .or_else(|| str_field(bucket, "modelId"))
+                    .unwrap_or_else(|| "Quota".to_string());
+                let used = (1.0 - remaining).clamp(0.0, 1.0) as f32;
+                let resets_at = parse_when(bucket.get("resetTime"));
+                windows.push(AgentUsageWindow {
+                    label: name,
+                    used_fraction: used,
+                    resets_at,
+                });
+            }
+        }
+    }
+    windows
+}
+
+/// Discover running Antigravity `language_server` HTTP port and CSRF token.
+fn discover_language_server(antigravity_home: &Path) -> Option<(u16, String)> {
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(entries) = std::fs::read_dir("/proc") {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                let Ok(cmdline_bytes) = std::fs::read(path.join("cmdline")) else {
+                    continue;
+                };
+                let cmdline = String::from_utf8_lossy(&cmdline_bytes);
+                if cmdline.contains("language_server") {
+                    let args: Vec<&str> = cmdline.split('\0').collect();
+                    let mut csrf_token = None;
+                    for (i, &arg) in args.iter().enumerate() {
+                        if arg == "--csrf_token" && i + 1 < args.len() {
+                            csrf_token = Some(args[i + 1].to_string());
+                            break;
+                        }
+                    }
+                    if let Some(token) = csrf_token {
+                        let log_candidates = [
+                            home_dir().join(".config/Antigravity/logs/language_server.log"),
+                            antigravity_home.join("logs/language_server.log"),
+                            home_dir().join(".gemini/antigravity/logs/language_server.log"),
+                        ];
+                        for log_path in &log_candidates {
+                            if let Ok(log_content) = std::fs::read_to_string(log_path) {
+                                let mut last_port = None;
+                                for line in log_content.lines() {
+                                    if let Some(pos) = line.find("for HTTP") {
+                                        let before = &line[..pos];
+                                        if let Some(at_pos) = before.rfind(" at ") {
+                                            let port_str = before[at_pos + 4..].trim();
+                                            if let Ok(port) = port_str.parse::<u16>() {
+                                                last_port = Some(port);
+                                            }
+                                        }
+                                    }
+                                }
+                                if let Some(port) = last_port {
+                                    return Some((port, token));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = antigravity_home;
+    None
+}
+
 /// Same `{"token": {...}}` unwrap `parse_antigravity_auth` does internally,
 /// isolated so callers (the Google userinfo enrichment) can pull the access
 /// token back out of the raw keyring/file blob without re-deriving a whole
@@ -2602,5 +2952,52 @@ mod tests {
         assert_eq!(again.account_key, detected.account_key);
 
         let _ = std::fs::remove_dir_all(PathBuf::from(&root));
+    }
+
+    #[test]
+    fn parse_antigravity_quota_response_extracts_groups_and_buckets() {
+        let json = serde_json::json!({
+            "response": {
+                "groups": [
+                    {
+                        "displayName": "Gemini Models",
+                        "description": "Models within this group: Gemini Flash, Gemini Pro",
+                        "buckets": [
+                            {
+                                "bucketId": "gemini-weekly",
+                                "displayName": "Weekly Limit Remaining",
+                                "window": "weekly",
+                                "remainingFraction": 1.0,
+                                "resetTime": "2026-09-11T01:56:05Z"
+                            }
+                        ]
+                    },
+                    {
+                        "displayName": "Claude and GPT models",
+                        "description": "Models within this group: Claude Opus, Claude Sonnet, GPT-OSS",
+                        "buckets": [
+                            {
+                                "bucketId": "3p-weekly",
+                                "displayName": "Weekly Limit Remaining",
+                                "description": "You have used some of your weekly limit.",
+                                "window": "weekly",
+                                "remainingFraction": 0.16,
+                                "resetTime": "2026-09-06T18:16:20Z"
+                            }
+                        ]
+                    }
+                ]
+            }
+        });
+
+        let windows = parse_antigravity_quota_response(&json);
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].label, "Gemini");
+        assert!((windows[0].used_fraction - 0.0).abs() < 0.01);
+        assert!(windows[0].resets_at.is_some());
+
+        assert_eq!(windows[1].label, "Claude/GPT");
+        assert!((windows[1].used_fraction - 0.84).abs() < 0.01);
+        assert!(windows[1].resets_at.is_some());
     }
 }

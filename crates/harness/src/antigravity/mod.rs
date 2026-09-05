@@ -26,11 +26,15 @@ use crate::{Harness, HarnessError, RunControls};
 
 pub struct AntigravityHarness {
     executable: Option<PathBuf>,
+    models: tokio::sync::OnceCell<Vec<Model>>,
 }
 
 impl AntigravityHarness {
     pub fn new() -> Self {
-        Self { executable: None }
+        Self {
+            executable: None,
+            models: tokio::sync::OnceCell::new(),
+        }
     }
 
     pub fn with_executable(mut self, path: impl Into<PathBuf>) -> Self {
@@ -60,7 +64,12 @@ impl AntigravityHarness {
         }
         if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
             paths.push(home.join(".local/bin").join(executable));
+            paths.push(home.join(".gemini/antigravity/bin").join(executable));
+            paths.push(home.join(".config/Antigravity/bin").join(executable));
+            paths.push(home.join(".local/share/antigravity/bin").join(executable));
         }
+        paths.push(PathBuf::from("/usr/local/bin").join(executable));
+        paths.push(PathBuf::from("/usr/bin").join(executable));
         paths.into_iter().find(|path| path.is_file()).ok_or_else(|| {
             HarnessError::NotInstalled(
                 "agy (install with `curl -fsSL https://antigravity.google/cli/install.sh | bash`, then authenticate with `agy`; set ANTIGRAVITY_CLI_EXECUTABLE to override)".into(),
@@ -111,8 +120,26 @@ impl Harness for AntigravityHarness {
     }
 
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
-        self.resolve_executable()?;
-        Ok(catalog::static_models())
+        let executable = self.resolve_executable()?;
+        self.models
+            .get_or_try_init(|| async {
+                let mut cmd = Command::new(&executable);
+                crate::compose_child_path(&mut cmd, &executable);
+                cmd.arg("models");
+                cmd.stdout(Stdio::piped()).stderr(Stdio::null());
+                if let Ok(Ok(output)) = tokio::time::timeout(std::time::Duration::from_secs(15), cmd.output()).await
+                    && output.status.success()
+                    && let Ok(text) = String::from_utf8(output.stdout)
+                {
+                    let parsed = catalog::parse_models(&text);
+                    if !parsed.is_empty() {
+                        return Ok(parsed);
+                    }
+                }
+                Ok(catalog::static_models())
+            })
+            .await
+            .cloned()
     }
 
     async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
@@ -160,10 +187,13 @@ impl Harness for AntigravityHarness {
             .args(["--output-format", "stream-json"])
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .kill_on_drop(true);
         if !request.cwd.is_empty() {
             command.current_dir(&request.cwd);
+            // Antigravity CLI uses --add-dir to track active workspace directories.
+            // Without this flag, agy warns that no workspace is active.
+            command.arg("--add-dir").arg(&request.cwd);
         }
         if let Some(conversation) = request.resume.as_deref().filter(|id| !id.is_empty()) {
             command.args(["--conversation", conversation]);
@@ -178,25 +208,49 @@ impl Harness for AntigravityHarness {
         if let Some(effort) = catalog::to_effort(request.reasoning) {
             command.args(["--effort", effort]);
         }
-        if request.auto_approve {
-            command.arg("--dangerously-skip-permissions");
+        if request.sandbox == komet_proto::SandboxLevel::ReadOnly {
+            command.arg("--sandbox");
         }
+        // agy in non-interactive print mode (-p) cannot prompt for permissions over stdio;
+        // any tool requiring review is auto-denied by agy causing premature cancellation.
+        // Therefore --dangerously-skip-permissions is required to enable tool usage in normal runs.
+        command.arg("--dangerously-skip-permissions");
+
         let mut child = command.spawn().map_err(HarnessError::Io)?;
         let stdout = child
             .stdout
             .take()
             .ok_or_else(|| HarnessError::Protocol("agy stdout unavailable".into()))?;
+        let stderr = child.stderr.take();
         let (tx, rx) = mpsc::channel(128);
+
+        let stderr_lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let stderr_lines_clone = std::sync::Arc::clone(&stderr_lines);
+        if let Some(stderr) = stderr {
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let mut lock = stderr_lines_clone.lock().unwrap();
+                    if lock.len() >= 20 {
+                        lock.remove(0);
+                    }
+                    lock.push(line);
+                }
+            });
+        }
 
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             let mut saw_text = false;
             let mut session_id: Option<String> = None;
             let mut finished = false;
+            let mut seen_tools = std::collections::HashSet::new();
+            let mut last_diagnostic: Option<String> = None;
             loop {
                 tokio::select! {
                     _ = controls.interrupt.cancelled() => {
                         let _ = child.start_kill();
+                        let _ = child.wait().await;
                         let _ = tx.send(Ok(AgentEvent::Done {
                             status: DoneStatus::Interrupted,
                             result: None,
@@ -204,11 +258,18 @@ impl Harness for AntigravityHarness {
                             session_id: session_id.clone(),
                             reason: Some(komet_proto::DoneReason::UserRequested),
                         })).await;
+                        finished = true;
                         break;
                     }
                     line = lines.next_line() => match line {
                         Ok(Some(line)) => {
-                            let Ok(frame) = serde_json::from_str::<Value>(&line) else { continue; };
+                            let Ok(frame) = serde_json::from_str::<Value>(&line) else {
+                                let trimmed = line.trim();
+                                if !trimmed.is_empty() {
+                                    last_diagnostic = Some(trimmed.to_string());
+                                }
+                                continue;
+                            };
                             match frame.get("event").and_then(Value::as_str) {
                                 Some("init") => {
                                     session_id = frame.get("conversation_id").and_then(Value::as_str).map(str::to_owned);
@@ -224,19 +285,34 @@ impl Harness for AntigravityHarness {
                                 }
                                 Some("step_update") => {
                                     let step = frame.get("step_update").unwrap_or(&Value::Null);
-                                    if let Some(text) = step.get("text_delta").and_then(Value::as_str) {
+                                    let text = step.get("text_delta")
+                                        .or_else(|| step.get("delta"))
+                                        .or_else(|| step.get("text"))
+                                        .and_then(Value::as_str)
+                                        .filter(|t| !t.is_empty());
+                                    if let Some(text) = text {
                                         saw_text = true;
                                         if tx.send(Ok(AgentEvent::TextDelta { text: text.to_owned() })).await.is_err() { break; }
                                     }
-                                    if step.get("step_type").and_then(Value::as_str) == Some("tool") {
-                                        let id = format!("agy-step-{}", step.get("step_index").and_then(Value::as_u64).unwrap_or_default());
+                                    let is_tool = step.get("step_type").and_then(Value::as_str) == Some("tool")
+                                        || step.get("tool_name").is_some()
+                                        || step.get("tool_info").is_some();
+                                    if is_tool {
+                                        let step_idx = step.get("step_index").and_then(Value::as_u64).unwrap_or_default();
+                                        let id = format!("agy-step-{step_idx}");
                                         let info = step.get("tool_info").unwrap_or(&Value::Null);
                                         let tool_name = info.get("name").or_else(|| step.get("tool_name")).and_then(Value::as_str).unwrap_or("tool");
-                                        let params = info.get("parameters");
+                                        let params = info.get("parameters")
+                                            .or_else(|| step.get("parameters"))
+                                            .or_else(|| info.get("params"))
+                                            .or_else(|| step.get("params"));
+                                        let state = step.get("state").and_then(Value::as_str).unwrap_or("");
 
-                                        // Bridge interactive questions if present
-                                        if tool_name == "ask_question"
-                                            && let Some(params) = params
+                                        // Emit ToolCall only once per tool id
+                                        if seen_tools.insert(id.clone()) {
+                                            // Bridge interactive questions if present
+                                            if tool_name == "ask_question"
+                                                && let Some(params) = params
                                                 && let Some(questions) = normalize::extract_questions(params) {
                                                     let rx = (controls.request_input)(questions);
                                                     tokio::spawn(async move {
@@ -244,11 +320,50 @@ impl Harness for AntigravityHarness {
                                                     });
                                                 }
 
-                                        let call = normalize::normalize_tool_call(tool_name, params);
-                                        if tx.send(Ok(AgentEvent::ToolCall { id: id.clone(), call })).await.is_err() { break; }
-                                        if step.get("state").and_then(Value::as_str) == Some("DONE") {
-                                            let is_error = info.get("error").is_some();
-                                            if tx.send(Ok(AgentEvent::ToolResult { id, is_error, output: info.get("output").and_then(Value::as_str).map(str::to_owned), diff: None })).await.is_err() { break; }
+                                            let call = normalize::normalize_tool_call(tool_name, params);
+                                            if tx.send(Ok(AgentEvent::ToolCall { id: id.clone(), call })).await.is_err() { break; }
+                                        }
+
+                                        // Settle tool on DONE or ERROR
+                                        if state == "DONE" || state == "ERROR" {
+                                            let is_error = state == "ERROR" || info.get("error").is_some() || step.get("error").is_some();
+                                            let output = info.get("output")
+                                                .or_else(|| step.get("output"))
+                                                .or_else(|| info.get("result"))
+                                                .or_else(|| step.get("result"))
+                                                .and_then(Value::as_str)
+                                                .map(str::to_owned)
+                                                .or_else(|| {
+                                                    info.get("error").or_else(|| step.get("error")).map(|err| {
+                                                        if let Some(msg) = err.get("message").and_then(Value::as_str) {
+                                                            msg.to_owned()
+                                                        } else if let Some(s) = err.as_str() {
+                                                            s.to_owned()
+                                                        } else {
+                                                            err.to_string()
+                                                        }
+                                                    })
+                                                });
+                                            let diff: Option<komet_proto::ToolDiff> = info.get("diff")
+                                                .or_else(|| step.get("diff"))
+                                                .and_then(|d| {
+                                                    if let Some(s) = d.as_str() {
+                                                        let path = info.get("path")
+                                                            .or_else(|| info.get("TargetFile"))
+                                                            .or_else(|| step.get("path"))
+                                                            .and_then(Value::as_str)
+                                                            .unwrap_or_default()
+                                                            .to_string();
+                                                        Some(komet_proto::ToolDiff {
+                                                            path,
+                                                            old_text: None,
+                                                            new_text: s.to_string(),
+                                                        })
+                                                    } else {
+                                                        serde_json::from_value(d.clone()).ok()
+                                                    }
+                                                });
+                                            if tx.send(Ok(AgentEvent::ToolResult { id, is_error, output, diff })).await.is_err() { break; }
                                         }
                                     }
                                     if let Some(usage) = step.get("usage")
@@ -257,16 +372,35 @@ impl Harness for AntigravityHarness {
                                 Some("result") => {
                                     let result = frame.get("result").unwrap_or(&Value::Null);
                                     session_id = result.get("conversation_id").and_then(Value::as_str).map(str::to_owned).or(session_id);
+                                    let response_text = result.get("response").and_then(Value::as_str);
                                     if !saw_text
-                                        && let Some(text) = result.get("response").and_then(Value::as_str).filter(|text| !text.is_empty())
-                                            && tx.send(Ok(AgentEvent::TextDelta { text: text.to_owned() })).await.is_err() { break; }
+                                        && let Some(text) = response_text.filter(|text| !text.is_empty())
+                                        && tx.send(Ok(AgentEvent::TextDelta { text: text.to_owned() })).await.is_err() { break; }
                                     if let Some(usage) = result.get("usage")
                                         && tx.send(Ok(usage_event(usage))).await.is_err() { break; }
-                                    let success = result.get("status").and_then(Value::as_str) == Some("SUCCESS");
+
+                                    let status_str = result.get("status").and_then(Value::as_str).unwrap_or("");
+                                    let success = status_str == "SUCCESS";
+
+                                    let mut error = result.get("error").and_then(Value::as_str).map(str::to_owned);
+                                    if !success && error.is_none() {
+                                        let err_tail = {
+                                            let l = stderr_lines.lock().unwrap();
+                                            if !l.is_empty() {
+                                                Some(l.join("\n"))
+                                            } else {
+                                                None
+                                            }
+                                        };
+                                        error = err_tail.or_else(|| last_diagnostic.clone()).or_else(|| {
+                                            Some(format!("Antigravity ended with status: {status_str}"))
+                                        });
+                                    }
+
                                     let event = AgentEvent::Done {
                                         status: if success { DoneStatus::Completed } else { DoneStatus::Errored },
-                                        result: result.get("response").and_then(Value::as_str).map(str::to_owned),
-                                        error: result.get("error").and_then(Value::as_str).map(str::to_owned),
+                                        result: response_text.map(str::to_owned),
+                                        error,
                                         session_id: session_id.clone(),
                                         reason: None,
                                     };
@@ -284,13 +418,26 @@ impl Harness for AntigravityHarness {
             }
             if !finished && !tx.is_closed() {
                 let status = child.wait().await.ok();
+                let err_tail = {
+                    let l = stderr_lines.lock().unwrap();
+                    if !l.is_empty() {
+                        Some(l.join("\n"))
+                    } else {
+                        None
+                    }
+                };
+                let detail = err_tail
+                    .or(last_diagnostic)
+                    .map(|d| format!(": {d}"))
+                    .unwrap_or_default();
                 let _ = tx
                     .send(Ok(AgentEvent::Done {
                         status: DoneStatus::Errored,
                         result: None,
                         error: Some(format!(
-                            "Antigravity CLI ended before returning a result ({})",
-                            crate::describe_exit(status)
+                            "Antigravity CLI ended before returning a result ({}){}",
+                            crate::describe_exit(status),
+                            detail
                         )),
                         session_id,
                         reason: None,

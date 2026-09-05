@@ -247,7 +247,9 @@ impl HarnessRegistry {
         // REFRESH_AFTER so the file stays warm without a probe per open.
         if let Some(cached) = self.models_cache_entries().get(&id).cloned() {
             let age = now - cached.discovered_at_ms;
-            if age < ttl_ms {
+            let has_obsolete = id == HarnessId::Antigravity
+                && cached.models.iter().any(|m| m.id == "gemini-3.7-flash" || m.id == "gemini-2.5-flash");
+            if age < ttl_ms && !has_obsolete {
                 if age >= refresh_after_ms
                     && let Ok(harness) = self.resolve(id)
                 {
@@ -661,8 +663,6 @@ reason: None,
                 ReasoningLevel::Low,
                 ReasoningLevel::Medium,
                 ReasoningLevel::High,
-                ReasoningLevel::Max,
-                ReasoningLevel::Ultra,
             ],
             installed: true,
             enabled: None,
@@ -804,8 +804,6 @@ mod tests {
                 ReasoningLevel::Low,
                 ReasoningLevel::Medium,
                 ReasoningLevel::High,
-                ReasoningLevel::Max,
-                ReasoningLevel::Ultra,
             ]
         );
     }
