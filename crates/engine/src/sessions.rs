@@ -953,6 +953,7 @@ impl SessionsEngine {
                             // that already has one (or doesn't need one).
                             worktree: None,
                             permission_timeout_ms: None,
+                            mcp: None,
                         })
                     });
                 let Some(mut request) = request else {

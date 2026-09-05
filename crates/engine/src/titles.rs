@@ -187,6 +187,7 @@ impl TitleGenerator {
                 // worktree.
                 worktree: None,
                 permission_timeout_ms: None,
+                mcp: None,
             };
             match collect_text(harness.as_ref(), request).await {
                 Ok(raw) => {

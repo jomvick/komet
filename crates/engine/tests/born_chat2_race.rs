@@ -166,6 +166,7 @@ async fn transcript_survives_open_racing_create_chat() {
                         permission_timeout_ms: None,
                         resume: None,
                         worktree: None,
+                        mcp: None,
                     },
                     message_id: "msg-race-1".into(),
                 },

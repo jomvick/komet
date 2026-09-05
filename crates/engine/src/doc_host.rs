@@ -2417,6 +2417,7 @@ impl DocHost {
             // even if we wanted to.
             worktree: None,
             permission_timeout_ms: None,
+            mcp: None,
         })
     }
 
