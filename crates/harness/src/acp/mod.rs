@@ -850,7 +850,7 @@ impl AcpHarness {
             if commands.is_empty() {
                 let cwd = std::env::var("HOME").unwrap_or_else(|_| "/".into());
                 let session = client
-                    .request("session/new", json!({ "cwd": cwd, "mcpServers": [] }))
+                    .request("session/new", json!({ "cwd": cwd, "mcpServers": [], "env": [] }))
                     .await;
                 if session.is_ok() {
                     // The update usually arrives within milliseconds of the
@@ -918,7 +918,7 @@ impl AcpHarness {
                 .await?;
             let cwd = std::env::var("HOME").unwrap_or_else(|_| "/".into());
             let session = client
-                .request("session/new", json!({ "cwd": cwd, "mcpServers": [] }))
+                .request("session/new", json!({ "cwd": cwd, "mcpServers": [], "env": [] }))
                 .await?;
             let mut models = models_from_session(&session, &(self.spec.models)());
             // Prompt-convention modes (Claude Ultrathink) extend any real
@@ -1467,6 +1467,20 @@ fn initialize_params(_harness: HarnessId) -> Value {
         // the diff pane, and commands belong to the agent's own sandbox.
         "clientCapabilities": capabilities,
     })
+}
+
+fn mcp_servers(injection: Option<&komet_proto::McpInjection>) -> Vec<Value> {
+    injection
+        .map(|injection| {
+            vec![json!({
+                "type": "http",
+                "url": injection.url,
+                "headers": {
+                    "Authorization": format!("Bearer {}", injection.auth_token),
+                },
+            })]
+        })
+        .unwrap_or_default()
 }
 
 /// `initialize._meta.steering.supported` — the `_session/steering` extension
@@ -2273,7 +2287,11 @@ async fn run_session(session: Session) {
         let steer_ext = steering_supported(&init);
         let init_commands = scan_available_commands(&init);
 
-        let session_params = json!({ "cwd": request.cwd, "mcpServers": [] });
+        let session_params = json!({
+            "cwd": request.cwd,
+            "mcpServers": mcp_servers(request.mcp.as_ref()),
+            "env": [],
+        });
         let (session_id, session_response) = if let Some(resume) = &request.resume {
             let mut load = session_params.clone();
             load["sessionId"] = Value::String(resume.clone());
@@ -3418,6 +3436,23 @@ async fn run_session(session: Session) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_servers_are_scoped_to_the_run_request() {
+        let injection = komet_proto::McpInjection {
+            server_name: "komet".into(),
+            url: "http://127.0.0.1:9/mcp/agents?callerAgentId=run".into(),
+            auth_token: "secret-token".into(),
+        };
+        assert_eq!(mcp_servers(None), Vec::<Value>::new());
+        let servers = mcp_servers(Some(&injection));
+        assert_eq!(servers[0]["type"], "http");
+        assert_eq!(servers[0]["url"], injection.url);
+        assert_eq!(
+            servers[0]["headers"]["Authorization"],
+            "Bearer secret-token"
+        );
+    }
 
     #[test]
     fn opencode_model_probe_and_chat_share_one_startup_budget() {
