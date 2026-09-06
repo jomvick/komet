@@ -1070,6 +1070,11 @@ pub struct RunRequest {
     pub permission_timeout_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp: Option<McpInjection>,
+    /// External MCP servers resolved for this run (secrets included ONLY for harness launch).
+    /// Additive + serde-defaulted: an old host ignores it and runs without externals.
+    /// Kept separate from `mcp` (internal Komet MCP).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mcp_external: Vec<crate::mcp::ResolvedMcpServer>,
 }
 
 /// Per-run internal MCP endpoint riding the request (host-local).
@@ -2115,6 +2120,7 @@ mod tests {
             resume: None,
             permission_timeout_ms: None,
             mcp: None,
+            mcp_external: Vec::new(),
             sandbox_options: Some(SandboxOptions {
                 opencode: Some(OpenCodePerms {
                     bash: BashPerms {
@@ -2163,6 +2169,7 @@ mod tests {
             resume: None,
             permission_timeout_ms: None,
             mcp: None,
+            mcp_external: Vec::new(),
         }
     }
 

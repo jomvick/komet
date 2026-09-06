@@ -13,7 +13,7 @@ pub mod workspace;
 
 pub use agent::*;
 pub use entities::*;
-pub use mcp::{McpTransport, PublicMcpServerConfig};
+pub use mcp::{McpServerConfig, McpTransport, PublicMcpServerConfig, ResolvedMcpServer};
 pub use workspace::*;
 
 /// Parse "0.2.12" (tolerating a `-suffix`/`+build` tail on the last part)

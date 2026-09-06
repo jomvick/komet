@@ -187,7 +187,7 @@ impl TitleGenerator {
                 // worktree.
                 worktree: None,
                 permission_timeout_ms: None,
-                mcp: None,
+                mcp: None, mcp_external: Vec::new(),
             };
             match collect_text(harness.as_ref(), request).await {
                 Ok(raw) => {

@@ -548,7 +548,36 @@ impl SessionsEngine {
         // Secrets stay only in the returned Vec<ResolvedMcpServer> (passed as harness_mcp_servers
         // to the provider launch); they are NEVER stored in RunRequest.mcp (internal Komet MCP)
         // nor in journal/transcript — only PublicMcpServerConfig is UI-visible.
-        let _harness_mcp_servers = self.harness_mcp_servers_for_run(chat_id);
+        // Wire externals via RunRequest.mcp_external (kept separate from internal mcp).
+        let resolved = self.prepare_mcp_for_run(chat_id);
+        let proto_externals: Vec<komet_proto::ResolvedMcpServer> = resolved
+            .into_iter()
+            .map(|r| {
+                let cfg = r.config;
+                let proto_cfg = komet_proto::McpServerConfig {
+                    id: cfg.id,
+                    name: cfg.name,
+                    enabled: cfg.enabled,
+                    transport: match cfg.transport {
+                        crate::mcp::McpTransport::Http => komet_proto::McpTransport::Http,
+                        crate::mcp::McpTransport::Sse => komet_proto::McpTransport::Sse,
+                        crate::mcp::McpTransport::Stdio => komet_proto::McpTransport::Stdio,
+                    },
+                    command: cfg.command,
+                    args: cfg.args,
+                    url: cfg.url,
+                    headers: cfg.headers,
+                    env: cfg.env,
+                    always_load: cfg.always_load,
+                };
+                komet_proto::ResolvedMcpServer {
+                    config: proto_cfg,
+                    resolved_headers: r.resolved_headers,
+                    resolved_env: r.resolved_env,
+                }
+            })
+            .collect();
+        request.mcp_external = proto_externals;
         let handle = self.doc_handle(chat_id)?;
         let user_id = message_id.unwrap_or_else(new_id);
         handle.write_user_message(&user_id, &request.prompt, now_ms())?;
@@ -1014,7 +1043,7 @@ impl SessionsEngine {
                             // that already has one (or doesn't need one).
                             worktree: None,
                             permission_timeout_ms: None,
-                            mcp: None,
+                            mcp: None, mcp_external: Vec::new(),
                         })
                     });
                 let Some(mut request) = request else {
