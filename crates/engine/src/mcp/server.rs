@@ -2,7 +2,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::future::BoxFuture;
-use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Semaphore, watch};
@@ -10,7 +9,8 @@ use tokio::task::AbortHandle;
 use tokio_util::sync::CancellationToken;
 
 use super::catalog::McpCatalog;
-use super::policy::{Decision, McpPolicy};
+use super::policy::{secure_summary, Decision, McpPolicy};
+pub use crate::mcp::status::McpStatus;
 
 const MCP_PATH: &str = "/mcp/agents";
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
@@ -37,28 +37,6 @@ pub type AskFn = Arc<dyn Fn(PermissionAsk) -> BoxFuture<'static, AskDecision> + 
 pub enum EndpointError {
     #[error("failed to bind MCP endpoint: {0}")]
     Bind(#[from] std::io::Error),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum McpStatus {
-    Starting,
-    Ready,
-    Error(String),
-    Stopped,
-}
-
-impl Serialize for McpStatus {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(match self {
-            Self::Starting => "starting",
-            Self::Ready => "ready",
-            Self::Error(_) => "error",
-            Self::Stopped => "stopped",
-        })
-    }
 }
 
 struct EndpointState {
@@ -198,54 +176,6 @@ impl McpEndpoint {
             state,
         })
     }
-}
-
-/// Secure summary: `Serveur: {s} Tool: {t} Arguments: {summary_sécurisé}`
-/// Truncates to 200 chars, masks token/password/secret/bearer values.
-fn secure_summary(server: &str, tool: &str, args: &serde_json::Value) -> String {
-    let mut s = format!("Serveur: {server} Tool: {tool} Arguments: ");
-    let args_str = if args.is_null() || args.as_object().map(|o| o.is_empty()).unwrap_or(false) {
-        "{}".to_string()
-    } else {
-        // mask sensitive keys
-        let mut masked = serde_json::Map::new();
-        if let Some(obj) = args.as_object() {
-            for (k, v) in obj {
-                let lower = k.to_lowercase();
-                if lower.contains("token")
-                    || lower.contains("password")
-                    || lower.contains("secret")
-                    || lower.contains("authorization")
-                    || lower.contains("bearer")
-                {
-                    masked.insert(k.clone(), serde_json::Value::String("***".into()));
-                } else {
-                    let mut val_str = v.to_string();
-                    if val_str.len() > 200 {
-                        val_str.truncate(200);
-                        val_str.push('…');
-                    }
-                    // truncate json string representation, but keep as value
-                    masked.insert(k.clone(), v.clone());
-                }
-            }
-        }
-        let mut out = serde_json::to_string(&serde_json::Value::Object(masked))
-            .unwrap_or_else(|_| "{}".into());
-        if out.len() > 500 {
-            out.truncate(500);
-            out.push('…');
-        }
-        out
-    };
-    s.push_str(&args_str);
-    if s.len() > 800 {
-        s.truncate(800);
-        s.push('…');
-    }
-    // Ensure no token leak via raw bearer presence
-    s = s.replace("Bearer", "***");
-    s
 }
 
 async fn handle_conn(

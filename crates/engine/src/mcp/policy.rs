@@ -7,6 +7,82 @@ pub enum Decision {
     Deny,
 }
 
+/// Secure summary for permission prompts: `Serveur: {s} Tool: {t} Arguments: {…}`
+/// Masks sensitive keys (token/password/secret/authorization/bearer, case-insensitive),
+/// truncates per-value to 200 chars, whole args to 500, final string to 800,
+/// and redacts any raw `Bearer` (case-insensitive) to `***`.
+/// Public so `doc_host` and `server` share the same implementation.
+pub fn secure_summary(server: &str, tool: &str, args: &serde_json::Value) -> String {
+    let mut s = format!("Serveur: {server} Tool: {tool} Arguments: ");
+    let args_str = if args.is_null() || args.as_object().map(|o| o.is_empty()).unwrap_or(false) {
+        "{}".to_string()
+    } else {
+        let mut masked = serde_json::Map::new();
+        if let Some(obj) = args.as_object() {
+            for (k, v) in obj {
+                let lower = k.to_lowercase();
+                if lower.contains("token")
+                    || lower.contains("password")
+                    || lower.contains("secret")
+                    || lower.contains("authorization")
+                    || lower.contains("bearer")
+                {
+                    masked.insert(k.clone(), serde_json::Value::String("***".into()));
+                } else if let Some(s) = v.as_str() {
+                    // String value – truncate inner string to 200 chars
+                    let mut val_str = s.to_string();
+                    if val_str.len() > 200 {
+                        val_str.truncate(200);
+                        val_str.push('…');
+                    }
+                    masked.insert(k.clone(), serde_json::Value::String(val_str));
+                } else {
+                    let mut val_str = v.to_string();
+                    if val_str.len() > 200 {
+                        val_str.truncate(200);
+                        val_str.push('…');
+                        masked.insert(k.clone(), serde_json::Value::String(val_str));
+                    } else {
+                        masked.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+        }
+        let mut out = serde_json::to_string(&serde_json::Value::Object(masked))
+            .unwrap_or_else(|_| "{}".into());
+        if out.len() > 500 {
+            out.truncate(500);
+            out.push('…');
+        }
+        out
+    };
+    s.push_str(&args_str);
+    if s.len() > 800 {
+        s.truncate(800);
+        s.push('…');
+    }
+    // Case-insensitive Bearer redaction (e.g. "Bearer", "bearer", "BEARER")
+    s = replace_case_insensitive(&s, "bearer", "***");
+    s
+}
+
+fn replace_case_insensitive(haystack: &str, needle: &str, replacement: &str) -> String {
+    let lower_hay = haystack.to_lowercase();
+    let lower_needle = needle.to_lowercase();
+    let mut result = String::with_capacity(haystack.len());
+    let mut last = 0usize;
+    let mut search_start = 0usize;
+    while let Some(pos) = lower_hay[search_start..].find(&lower_needle) {
+        let abs_pos = search_start + pos;
+        result.push_str(&haystack[last..abs_pos]);
+        result.push_str(replacement);
+        last = abs_pos + needle.len();
+        search_start = abs_pos + needle.len();
+    }
+    result.push_str(&haystack[last..]);
+    result
+}
+
 pub struct McpPolicy {
     rules: HashMap<(String, String), Decision>,
     session_memo: HashMap<(String, String), Decision>,
