@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
 use crate::mcp::config::{McpServerConfig, PublicMcpServerConfig};
 use crate::mcp::secrets::McpSecretStore;
 
@@ -49,6 +51,12 @@ impl std::fmt::Debug for McpRegistry {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+struct VersionedWrapper {
+    version: u32,
+    servers: Vec<McpServerConfig>,
+}
+
 impl McpRegistry {
     fn file_path_for(data_dir: &Path) -> PathBuf {
         // If data_dir looks like a file path ending with .json, use it directly
@@ -68,10 +76,15 @@ impl McpRegistry {
         if file_path.exists() {
             let data = std::fs::read_to_string(&file_path)?;
             if !data.trim().is_empty() {
-                // Support both Vec<McpServerConfig> and HashMap<String,McpServerConfig> formats
-                // Prefer Vec for stable ordering; fallback to map.
-                let parsed_vec: Result<Vec<McpServerConfig>, _> = serde_json::from_str(&data);
-                if let Ok(vec) = parsed_vec {
+                // Prefer versioned wrapper {"version":1,"servers":[...]} for new files;
+                // fallback to bare Vec and HashMap for migration.
+                if let Ok(wrapped) = serde_json::from_str::<VersionedWrapper>(&data) {
+                    for cfg in wrapped.servers {
+                        if !cfg.id.trim().is_empty() {
+                            servers.insert(cfg.id.clone(), cfg);
+                        }
+                    }
+                } else if let Ok(vec) = serde_json::from_str::<Vec<McpServerConfig>>(&data) {
                     for cfg in vec {
                         // Don't validate on load; allow persisted invalid to be filtered at resolve.
                         // But skip empty ids to avoid map corruption.
@@ -83,11 +96,10 @@ impl McpRegistry {
                     // Try HashMap format
                     let parsed_map: HashMap<String, McpServerConfig> = serde_json::from_str(&data)?;
                     for (k, cfg) in parsed_map {
-                        if !cfg.id.trim().is_empty() {
-                            servers.insert(k, cfg);
-                        } else {
-                            servers.insert(cfg.id.clone(), cfg);
+                        if cfg.id.trim().is_empty() {
+                            continue;
                         }
+                        servers.insert(k, cfg);
                     }
                 }
             }
@@ -112,13 +124,48 @@ impl McpRegistry {
                 std::fs::create_dir_all(parent)?;
             }
         }
-        // Persist as sorted Vec for determinism
+        // Persist as versioned wrapper for determinism and migration support
         let mut vec: Vec<&McpServerConfig> = self.servers.values().collect();
         vec.sort_by(|a, b| a.id.cmp(&b.id));
-        let data = serde_json::to_string_pretty(&vec)?;
-        std::fs::write(&self.file_path, data)?;
-        // No chmod 600 needed for registry (contains secret placeholders but not primary secret store);
-        // still avoid logging values.
+        #[derive(Serialize)]
+        struct PersistWrapper<'a> {
+            version: u32,
+            servers: Vec<&'a McpServerConfig>,
+        }
+        let wrapper = PersistWrapper {
+            version: 1,
+            servers: vec,
+        };
+        let data = serde_json::to_string_pretty(&wrapper)?;
+        // Atomic write: temp file + rename
+        let tmp_path = {
+            let p = self.file_path.clone();
+            // append .tmp to avoid colliding with with_extension logic
+            let s = p.to_string_lossy().to_string() + ".tmp";
+            PathBuf::from(s)
+        };
+        std::fs::write(&tmp_path, &data)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = std::fs::metadata(&tmp_path) {
+                let mut perms = meta.permissions();
+                perms.set_mode(0o600);
+                let _ = std::fs::set_permissions(&tmp_path, perms);
+            }
+        }
+        std::fs::rename(&tmp_path, &self.file_path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = std::fs::metadata(&self.file_path) {
+                let mut perms = meta.permissions();
+                if perms.mode() & 0o777 != 0o600 {
+                    perms.set_mode(0o600);
+                    let _ = std::fs::set_permissions(&self.file_path, perms);
+                }
+            }
+        }
         tracing::debug!(
             server_count = self.servers.len(),
             path = %self.file_path.display(),
@@ -165,8 +212,6 @@ impl McpRegistry {
         match entry {
             Some(cfg) => {
                 cfg.enabled = enabled;
-                // Clone to avoid borrow across persist
-                let _ = cfg;
                 self.persist()?;
                 tracing::debug!(server_id = %id, enabled = enabled, "mcp server set_enabled");
                 Ok(())
