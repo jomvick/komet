@@ -67,6 +67,7 @@ impl Default for McpServerConfig {
 
 /// Public view without secret values — safe to send over RPC / logs / UI.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
 pub struct PublicMcpServerConfig {
     pub id: String,
     pub name: String,

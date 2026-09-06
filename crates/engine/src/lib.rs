@@ -445,7 +445,8 @@ impl EngineCore {
             self.agent_accounts.clone(),
             self.workspace_scope,
         )
-        .with_auth(self.auth());
+        .with_auth(self.auth())
+        .with_mcp(self.mcp_registry.clone(), self.mcp_secrets.clone());
         if let Some(links) = self.links() {
             rpc = rpc.with_links(links);
         }

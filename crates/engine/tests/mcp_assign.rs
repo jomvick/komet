@@ -45,12 +45,12 @@ async fn test_engine_with_mcp() -> (EngineCore, TempDir, String) {
         always_load: false,
     };
     // Use McpRegistry::load to persist
-    let mut reg = McpRegistry::load(dir.path()).unwrap();
+    let reg = McpRegistry::load(dir.path()).unwrap();
     reg.save(&cfg).unwrap();
 
     // Secret store with actual secret containing word "secret"
     let secrets_path = dir.path().join("mcp-secrets.json");
-    let mut store = McpSecretStore::new(&secrets_path);
+    let store = McpSecretStore::new(&secrets_path);
     store
         .set_secret("gh", "Authorization", "Bearer super-secret-token-xyz")
         .unwrap();
@@ -194,7 +194,7 @@ async fn run_does_not_store_secrets_in_journal() {
 async fn disabled_or_missing_mcp_filtered() {
     let dir = tempfile::tempdir().unwrap();
     // Create registry with disabled gh
-    let mut reg = McpRegistry::load(dir.path()).unwrap();
+    let reg = McpRegistry::load(dir.path()).unwrap();
     reg.save(&McpServerConfig {
         id: "gh".into(),
         name: "GitHub".into(),
@@ -208,7 +208,7 @@ async fn disabled_or_missing_mcp_filtered() {
         always_load: false,
     })
     .unwrap();
-    let mut store = McpSecretStore::new(dir.path().join("mcp-secrets.json"));
+    let store = McpSecretStore::new(dir.path().join("mcp-secrets.json"));
     store.set_secret("gh", "GH_TOKEN", "secret123").unwrap();
 
     let core = EngineCore::assemble(dir.path(), registry_with_mock(), HarnessId::Mock, None).unwrap();

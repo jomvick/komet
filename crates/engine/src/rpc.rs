@@ -52,7 +52,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde::Deserialize;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tokio::sync::watch;
 
@@ -64,6 +64,7 @@ use crate::agent_accounts::AgentAccounts;
 use crate::auth::Auth;
 use crate::diff_sync::CheckoutDiffSync;
 use crate::doc_host::DocHost;
+use crate::mcp::{McpRegistry, McpSecretStore, McpServerConfig, McpStatus};
 use crate::registry::HarnessRegistry;
 use crate::repos::{Repos, home_dir};
 use crate::sessions::SessionsEngine;
@@ -91,6 +92,84 @@ struct ListModelsParams {
 struct SetHarnessEnabledParams {
     harness: HarnessId,
     enabled: bool,
+}
+
+// ---------------------------------------------------------------------------
+// MCP external servers (Task 7). Params accept secret values (headers/env) —
+// they are write-only: replies always use the secret-free public view.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct McpIdParams {
+    id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SaveMcpServerParams {
+    id: String,
+    name: String,
+    #[serde(default = "crate::mcp::default_enabled")]
+    enabled: bool,
+    transport: crate::mcp::McpTransport,
+    #[serde(default)]
+    command: Option<String>,
+    #[serde(default)]
+    args: Vec<String>,
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    headers: HashMap<String, Option<String>>,
+    #[serde(default)]
+    env: HashMap<String, Option<String>>,
+    #[serde(default)]
+    always_load: bool,
+}
+
+impl SaveMcpServerParams {
+    /// Merge into an existing config: empty/null secret values are skipped so
+    /// re-saving a form that only shows masked placeholders never wipes the
+    /// stored secret.
+    fn into_config(self, existing: Option<&McpServerConfig>) -> McpServerConfig {
+        // Provided (non-empty) value replaces; empty/null keeps the stored one.
+        let keep = |v: &Option<String>, old: Option<&String>| -> Option<String> {
+            match v {
+                Some(s) if !s.is_empty() => Some(s.clone()),
+                _ => old.cloned(),
+            }
+        };
+        let mut headers = HashMap::new();
+        for (k, v) in &self.headers {
+            if let Some(val) = keep(v, existing.and_then(|e| e.headers.get(k))) {
+                headers.insert(k.clone(), val);
+            }
+        }
+        let mut env = HashMap::new();
+        for (k, v) in &self.env {
+            if let Some(val) = keep(v, existing.and_then(|e| e.env.get(k))) {
+                env.insert(k.clone(), val);
+            }
+        }
+        McpServerConfig {
+            id: self.id,
+            name: self.name,
+            enabled: self.enabled,
+            transport: self.transport,
+            command: self.command,
+            args: self.args,
+            url: self.url,
+            headers,
+            env,
+            always_load: self.always_load,
+        }
+    }
+}
+
+/// `{config: {...}}` override for `TestMcpServer`/`ListMcpTools`: probe unsaved
+/// form values (secrets included). Dropped after the probe — never persisted.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TestMcpOverride {
+    config: McpServerConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -385,6 +464,10 @@ pub struct EngineRpc {
     updater: Option<komet_update::Updater>,
     local_import: Option<crate::local_import::LocalImporter>,
     engine_info: EngineInfo,
+    /// External MCP server registry (shared with `SessionsEngine`).
+    mcp_registry: Option<std::sync::Arc<McpRegistry>>,
+    /// MCP secret store (shared with `SessionsEngine`); write-only via RPC.
+    mcp_secrets: Option<std::sync::Arc<McpSecretStore>>,
 }
 
 impl EngineRpc {
@@ -422,6 +505,8 @@ impl EngineRpc {
             updater: None,
             local_import: None,
             engine_info,
+            mcp_registry: None,
+            mcp_secrets: None,
         }
     }
 
@@ -429,6 +514,33 @@ impl EngineRpc {
     pub fn with_auth(mut self, auth: Auth) -> Self {
         self.auth = Some(auth);
         self
+    }
+
+    /// Attach the external-MCP registry + secret store. Optional so tests and
+    /// minimal assemblies can build the RPC surface without an MCP stack.
+    pub fn with_mcp(
+        mut self,
+        registry: std::sync::Arc<McpRegistry>,
+        secrets: std::sync::Arc<McpSecretStore>,
+    ) -> Self {
+        self.mcp_registry = Some(registry);
+        self.mcp_secrets = Some(secrets);
+        self
+    }
+
+    /// The attached MCP registry, or an in-memory empty one (dev-mode embeds
+    /// that never wired an MCP stack still answer ListMcpServers honestly).
+    fn mcp_registry(&self) -> Result<std::sync::Arc<McpRegistry>, RpcError> {
+        self.mcp_registry
+            .clone()
+            .ok_or_else(|| RpcError::Failed("MCP registry not attached".into()))
+    }
+
+    /// The attached MCP secret store (write-only surface — never serialize it).
+    fn mcp_secrets(&self) -> Result<std::sync::Arc<McpSecretStore>, RpcError> {
+        self.mcp_secrets
+            .clone()
+            .ok_or_else(|| RpcError::Failed("MCP secret store not attached".into()))
     }
 
     /// Attach the peer link cache — enables `targetDeviceId` relay forwarding.
@@ -700,6 +812,159 @@ impl EngineRpc {
     }
 }
 
+impl EngineRpc {
+    /// Dispatch the external-MCP surface (Task 7). Replies carry the secret-free
+    /// `PublicMcpServerConfig` only: secret values flow in via `SaveMcpServer`
+    /// (merged into the local store) and never flow back out — not in list/get
+    /// replies, not in test results, not in status streams.
+    async fn handle_mcp(
+        &self,
+        registry: std::sync::Arc<McpRegistry>,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<RpcReply, RpcError> {
+        match method {
+            methods::LIST_MCP_SERVERS => {
+                let servers = registry.list_public();
+                RpcReply::value(&serde_json::json!({ "servers": servers }))
+            }
+            methods::GET_MCP_SERVER => {
+                let p: McpIdParams = parse_params(params)?;
+                let server = registry
+                    .list_public()
+                    .into_iter()
+                    .find(|s| s.id == p.id)
+                    .ok_or_else(|| RpcError::Failed(format!("mcp server not found: {}", p.id)))?;
+                RpcReply::value(&server)
+            }
+            methods::SAVE_MCP_SERVER => {
+                let p: SaveMcpServerParams = parse_params(params)?;
+                let existing = registry.get(&p.id);
+                let config = p.into_config(existing.as_ref());
+                config
+                    .validate()
+                    .map_err(|e| RpcError::BadParams(format!("mcp server config: {e}")))?;
+                // Secret values are write-only: upsert into the local store.
+                // Empty/absent values keep the previously stored secret, so a
+                // form round-trip showing masked placeholders cannot wipe it.
+                let store = self.mcp_secrets()?;
+                for (key, value) in &config.headers {
+                    store
+                        .set_secret(&config.id, key, value)
+                        .map_err(|e| RpcError::Failed(format!("mcp secret store: {e}")))?;
+                }
+                for (key, value) in &config.env {
+                    store
+                        .set_secret(&config.id, key, value)
+                        .map_err(|e| RpcError::Failed(format!("mcp secret store: {e}")))?;
+                }
+                registry
+                    .save(&config)
+                    .map_err(|e| RpcError::Failed(format!("mcp registry: {e}")))?;
+                RpcReply::value(&config.public_view())
+            }
+            methods::DELETE_MCP_SERVER => {
+                let p: McpIdParams = parse_params(params)?;
+                // Best-effort secret purge; the delete proceeds even if the
+                // store disagrees (orphaned secrets are inert).
+                if let Ok(store) = self.mcp_secrets() {
+                    let keys: Vec<String> = store.resolve(&p.id).keys().cloned().collect();
+                    for key in keys {
+                        let _ = store.remove_secret(&p.id, &key);
+                    }
+                }
+                registry
+                    .delete(&p.id)
+                    .map_err(|e| RpcError::Failed(format!("mcp registry: {e}")))?;
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::SET_MCP_SERVER_ENABLED => {
+                let enabled = params
+                    .get("enabled")
+                    .and_then(serde_json::Value::as_bool)
+                    .ok_or_else(|| RpcError::BadParams("enabled (bool) required".into()))?;
+                let p: McpIdParams = parse_params(params)?;
+                registry
+                    .set_enabled(&p.id, enabled)
+                    .map_err(|e| RpcError::Failed(format!("mcp registry: {e}")))?;
+                let server = registry
+                    .list_public()
+                    .into_iter()
+                    .find(|s| s.id == p.id)
+                    .ok_or_else(|| RpcError::Failed(format!("mcp server not found: {}", p.id)))?;
+                RpcReply::value(&server)
+            }
+            // One-shot ephemeral probe: connect (5s) + tools/list (10s), never
+            // launches the provider. Accepts `{id}` to test a stored server or
+            // `{config:{...}}` to probe unsaved form values (secrets included —
+            // the config is dropped after the probe, nothing is persisted).
+            methods::TEST_MCP_SERVER | methods::LIST_MCP_TOOLS => {
+                let config = if params.get("config").is_some_and(|v| !v.is_null()) {
+                    parse_params::<TestMcpOverride>(params)?.config
+                } else {
+                    let p: McpIdParams = parse_params(params)?;
+                    registry.get(&p.id).ok_or_else(|| {
+                        RpcError::Failed(format!("mcp server not found: {}", p.id))
+                    })?
+                };
+                let started = std::time::Instant::now();
+                let discovery = crate::mcp::discovery::McpDiscovery::new();
+                let result = discovery.list_tools(&config).await;
+                let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                match result {
+                    Ok(tools) => RpcReply::value(&serde_json::json!({
+                        "id": config.id,
+                        "status": McpStatus::Ready,
+                        "latencyMs": latency_ms,
+                        "toolsCount": tools.len(),
+                        "tools": tools,
+                    })),
+                    Err(e) => RpcReply::value(&serde_json::json!({
+                        "id": config.id,
+                        "status": McpStatus::Error(e.to_string()),
+                        "latencyMs": latency_ms,
+                        "error": e.to_string(),
+                        "toolsCount": 0,
+                    })),
+                }
+            }
+            // Live status for one server: an ephemeral probe whose McpStatus
+            // watch is bridged into the reply stream
+            // (starting → ready|error → stopped when the probe ends).
+            methods::WATCH_MCP_STATUS => {
+                let id = params
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let (tx, rx) = tokio::sync::watch::channel(McpStatus::Starting);
+                tokio::spawn(async move {
+                    let Some(config) = registry.get(&id) else {
+                        let _ = tx.send(McpStatus::Error(format!("mcp server not found: {id}")));
+                        return;
+                    };
+                    let discovery =
+                        crate::mcp::discovery::McpDiscovery::with_status(McpStatus::Starting);
+                    let mut status_rx = discovery.subscribe();
+                    let probe = tokio::spawn(async move {
+                        let _ = discovery.list_tools(&config).await;
+                    });
+                    loop {
+                        let _ = tx.send(status_rx.borrow_and_update().clone());
+                        if status_rx.changed().await.is_err() {
+                            break;
+                        }
+                    }
+                    let _ = probe.await;
+                    let _ = tx.send(McpStatus::Stopped);
+                });
+                Ok(RpcReply::Stream(watch_stream(rx)))
+            }
+            other => Err(RpcError::UnknownMethod(other.to_string())),
+        }
+    }
+}
+
 /// ControlRpc methods that honor `targetDeviceId` (feature-inventory §2.1). Extend this
 /// list (plus [`is_stream_method`] for streams) to make more of the surface
 /// device-addressable — the handlers themselves need no changes.
@@ -760,6 +1025,16 @@ fn forwardable(method: &str) -> bool {
             | methods::UPDATE_STATUS
             | methods::APPLY_UPDATE
             | methods::GET_CONTEXT_USAGE
+            // External MCP registries are device-local: each device manages its
+            // own servers/secrets, and status/test run against local processes.
+            | methods::LIST_MCP_SERVERS
+            | methods::GET_MCP_SERVER
+            | methods::SAVE_MCP_SERVER
+            | methods::DELETE_MCP_SERVER
+            | methods::SET_MCP_SERVER_ENABLED
+            | methods::TEST_MCP_SERVER
+            | methods::LIST_MCP_TOOLS
+            | methods::WATCH_MCP_STATUS
     )
 }
 
@@ -772,6 +1047,7 @@ fn is_stream_method(method: &str) -> bool {
             | methods::WATCH_CHECKOUT_DIFFS
             | methods::WATCH_WORKSPACE_FILES
             | methods::UPDATE_STATUS
+            | methods::WATCH_MCP_STATUS
     )
 }
 
@@ -942,6 +1218,31 @@ impl RpcService for EngineRpc {
             return AuthRpc::new(self.auth()?.clone())
                 .handle(method, params)
                 .await;
+        }
+        // MCP external servers: every call needs the registry, and mutating
+        // calls also need the (write-only) secret store.
+        const MCP_MUTATING: &[&str] = &[
+            methods::SAVE_MCP_SERVER,
+            methods::DELETE_MCP_SERVER,
+            methods::SET_MCP_SERVER_ENABLED,
+        ];
+        let is_mcp_method = matches!(
+            method,
+            methods::LIST_MCP_SERVERS
+                | methods::GET_MCP_SERVER
+                | methods::SAVE_MCP_SERVER
+                | methods::DELETE_MCP_SERVER
+                | methods::SET_MCP_SERVER_ENABLED
+                | methods::TEST_MCP_SERVER
+                | methods::LIST_MCP_TOOLS
+                | methods::WATCH_MCP_STATUS
+        );
+        if is_mcp_method {
+            if MCP_MUTATING.contains(&method) {
+                self.mcp_secrets()?; // fail fast when the store is not wired
+            }
+            let registry = self.mcp_registry()?;
+            return self.handle_mcp(registry, method, params).await;
         }
         match method {
             methods::ENGINE_INFO => RpcReply::value(&self.engine_info),

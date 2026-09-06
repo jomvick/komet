@@ -7,7 +7,7 @@ use super::secrets::McpSecretStore;
 #[test]
 fn registry_persists_and_masks_secrets() {
     let dir = tempfile::tempdir().unwrap();
-    let mut reg = McpRegistry::load(dir.path()).unwrap();
+    let reg = McpRegistry::load(dir.path()).unwrap();
     reg.save(&McpServerConfig {
         id: "gh".into(),
         name: "GitHub".into(),
@@ -39,7 +39,7 @@ fn registry_persists_and_masks_secrets() {
 #[test]
 fn registry_resolve_filters_enabled_and_resolves_secrets() {
     let dir = tempfile::tempdir().unwrap();
-    let mut reg = McpRegistry::load(dir.path()).unwrap();
+    let reg = McpRegistry::load(dir.path()).unwrap();
     // enabled server
     reg.save(&McpServerConfig {
         id: "gh".into(),
@@ -70,7 +70,7 @@ fn registry_resolve_filters_enabled_and_resolves_secrets() {
     .unwrap();
     // store secrets
     let secrets_path = dir.path().join("mcp-secrets.json");
-    let mut store = McpSecretStore::new(&secrets_path);
+    let store = McpSecretStore::new(&secrets_path);
     store.set_secret("gh", "Authorization", "Bearer resolved-secret").unwrap();
     store.set_secret("gh", "GH_TOKEN", "resolved-token").unwrap();
 
@@ -87,7 +87,7 @@ fn registry_resolve_filters_enabled_and_resolves_secrets() {
 #[test]
 fn registry_save_validates_and_persists() {
     let dir = tempfile::tempdir().unwrap();
-    let mut reg = McpRegistry::load(dir.path()).unwrap();
+    let reg = McpRegistry::load(dir.path()).unwrap();
     // invalid config: stdio without command
     let err = reg
         .save(&McpServerConfig {
@@ -126,7 +126,7 @@ fn registry_save_validates_and_persists() {
 #[test]
 fn registry_add_update_delete_set_enabled() {
     let dir = tempfile::tempdir().unwrap();
-    let mut reg = McpRegistry::load(dir.path()).unwrap();
+    let reg = McpRegistry::load(dir.path()).unwrap();
     // add via save
     reg.save(&McpServerConfig {
         id: "a".into(),
@@ -175,7 +175,7 @@ fn registry_add_update_delete_set_enabled() {
 #[test]
 fn registry_list_public_masks_and_logs() {
     let dir = tempfile::tempdir().unwrap();
-    let mut reg = McpRegistry::load(dir.path()).unwrap();
+    let reg = McpRegistry::load(dir.path()).unwrap();
     reg.save(&McpServerConfig {
         id: "s".into(),
         name: "SecretServer".into(),

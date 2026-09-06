@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
@@ -35,7 +36,11 @@ impl std::fmt::Debug for ResolvedMcpServer {
 pub struct McpRegistry {
     data_dir: PathBuf,
     file_path: PathBuf,
-    servers: HashMap<String, McpServerConfig>,
+    /// Interior mutability: the registry is shared as `Arc` between the
+    /// sessions engine (resolve at run time) and the RPC surface
+    /// (save/delete/enable from the UI). Locking is per-operation; the
+    /// file write happens inside the lock so persists stay serialized.
+    servers: Mutex<HashMap<String, McpServerConfig>>,
 }
 
 impl std::fmt::Debug for McpRegistry {
@@ -45,7 +50,7 @@ impl std::fmt::Debug for McpRegistry {
             .field("file_path", &self.file_path)
             .field(
                 "servers",
-                &format_args!("{{{} servers masked}}", self.servers.len()),
+                &format_args!("{{{} servers masked}}", self.lock_servers().len()),
             )
             .finish()
     }
@@ -79,6 +84,14 @@ impl ResolvedMcpServer {
 }
 
 impl McpRegistry {
+    /// Lock the server map, recovering from poisoning (a panicked peer must
+    /// not wedge the registry; individual entries remain valid).
+    fn lock_servers(&self) -> std::sync::MutexGuard<'_, HashMap<String, McpServerConfig>> {
+        self.servers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Create an empty registry rooted at `data_dir` (no file I/O).
     pub fn empty(data_dir: impl AsRef<Path>) -> Self {
         let data_dir = data_dir.as_ref().to_path_buf();
@@ -86,7 +99,7 @@ impl McpRegistry {
         Self {
             data_dir,
             file_path,
-            servers: HashMap::new(),
+            servers: Mutex::new(HashMap::new()),
         }
     }
 
@@ -146,18 +159,18 @@ impl McpRegistry {
         Ok(Self {
             data_dir,
             file_path,
-            servers,
+            servers: Mutex::new(servers),
         })
     }
 
-    fn persist(&self) -> anyhow::Result<()> {
+    fn persist(&self, servers: &HashMap<String, McpServerConfig>) -> anyhow::Result<()> {
         if let Some(parent) = self.file_path.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent)?;
             }
         }
         // Persist as versioned wrapper for determinism and migration support
-        let mut vec: Vec<&McpServerConfig> = self.servers.values().collect();
+        let mut vec: Vec<&McpServerConfig> = servers.values().collect();
         vec.sort_by(|a, b| a.id.cmp(&b.id));
         #[derive(Serialize)]
         struct PersistWrapper<'a> {
@@ -199,7 +212,7 @@ impl McpRegistry {
             }
         }
         tracing::debug!(
-            server_count = self.servers.len(),
+            server_count = servers.len(),
             path = %self.file_path.display(),
             "mcp registry persisted (values masked)"
         );
@@ -207,30 +220,42 @@ impl McpRegistry {
     }
 
     /// Validate and upsert a server config. Persists to disk.
-    pub fn save(&mut self, config: &McpServerConfig) -> anyhow::Result<()> {
+    /// The file write happens under the lock so concurrent persists serialize.
+    pub fn save(&self, config: &McpServerConfig) -> anyhow::Result<()> {
         config.validate()?;
         let id = config.id.clone();
-        self.servers.insert(id.clone(), config.clone());
-        self.persist()?;
+        let mut servers = self.lock_servers();
+        servers.insert(id.clone(), config.clone());
+        self.persist(&servers)?;
+        drop(servers);
         tracing::debug!(server_id = %id, "mcp server saved (values masked)");
         Ok(())
     }
 
     /// Alias for save — add new server.
-    pub fn add(&mut self, config: McpServerConfig) -> anyhow::Result<()> {
+    pub fn add(&self, config: McpServerConfig) -> anyhow::Result<()> {
         self.save(&config)
     }
 
     /// Alias for save — update existing server.
-    pub fn update(&mut self, config: McpServerConfig) -> anyhow::Result<()> {
+    pub fn update(&self, config: McpServerConfig) -> anyhow::Result<()> {
         self.save(&config)
     }
 
+    /// One stored config (secret values included — engine-internal use only;
+    /// the RPC surface answers with `public_view`).
+    pub fn get(&self, id: &str) -> Option<McpServerConfig> {
+        self.lock_servers().get(id).cloned()
+    }
+
     /// Delete a server by id. No-op if missing. Persists.
-    pub fn delete(&mut self, id: &str) -> anyhow::Result<()> {
-        let removed = self.servers.remove(id).is_some();
+    pub fn delete(&self, id: &str) -> anyhow::Result<()> {
+        let removed = {
+            let mut servers = self.lock_servers();
+            servers.remove(id).is_some()
+        };
         if removed {
-            self.persist()?;
+            self.persist(&self.lock_servers())?;
             tracing::debug!(server_id = %id, "mcp server deleted");
         } else {
             tracing::debug!(server_id = %id, "mcp server delete: not found");
@@ -239,12 +264,13 @@ impl McpRegistry {
     }
 
     /// Set enabled flag for a server. Persists.
-    pub fn set_enabled(&mut self, id: &str, enabled: bool) -> anyhow::Result<()> {
-        let entry = self.servers.get_mut(id);
-        match entry {
+    pub fn set_enabled(&self, id: &str, enabled: bool) -> anyhow::Result<()> {
+        let mut servers = self.lock_servers();
+        match servers.get_mut(id) {
             Some(cfg) => {
                 cfg.enabled = enabled;
-                self.persist()?;
+                self.persist(&servers)?;
+                drop(servers);
                 tracing::debug!(server_id = %id, enabled = enabled, "mcp server set_enabled");
                 Ok(())
             }
@@ -254,8 +280,9 @@ impl McpRegistry {
 
     /// Public view — no secret values. Sorted by id.
     pub fn list_public(&self) -> Vec<PublicMcpServerConfig> {
+        let servers = self.lock_servers();
         let mut out: Vec<PublicMcpServerConfig> =
-            self.servers.values().map(|c| c.public_view()).collect();
+            servers.values().map(|c| c.public_view()).collect();
         out.sort_by(|a, b| a.id.cmp(&b.id));
         tracing::debug!(count = out.len(), "mcp list_public (values masked)");
         out
@@ -263,14 +290,11 @@ impl McpRegistry {
 
     /// Resolve servers by ids: filter enabled + valid, resolve secrets via store.
     /// Logs are masked (only server_id, no header/env dumps).
-    pub fn resolve(
-        &self,
-        ids: &[String],
-        store: &McpSecretStore,
-    ) -> Vec<ResolvedMcpServer> {
+    pub fn resolve(&self, ids: &[String], store: &McpSecretStore) -> Vec<ResolvedMcpServer> {
         let mut out = Vec::new();
+        let servers = self.lock_servers();
         for id in ids {
-            let Some(cfg) = self.servers.get(id) else {
+            let Some(cfg) = servers.get(id) else {
                 tracing::debug!(server_id = %id, "mcp resolve: not found (masked)");
                 continue;
             };
@@ -307,10 +331,10 @@ impl McpRegistry {
 
     /// Number of servers.
     pub fn len(&self) -> usize {
-        self.servers.len()
+        self.lock_servers().len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.servers.is_empty()
+        self.lock_servers().is_empty()
     }
 }
