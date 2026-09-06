@@ -34,6 +34,8 @@
 pub mod catalog;
 mod normalize;
 pub mod permissions;
+#[cfg(test)]
+mod tests_mcp;
 mod wire;
 
 use std::path::PathBuf;
@@ -169,7 +171,7 @@ impl ClaudeHarness {
         })
     }
 
-    fn build_command(&self, exe: &PathBuf, request: &RunRequest) -> Command {
+    pub(crate) fn build_command(&self, exe: &PathBuf, request: &RunRequest) -> Command {
         let mut cmd = Command::new(exe);
         crate::compose_child_path(&mut cmd, exe);
         cmd.args([
@@ -268,6 +270,166 @@ impl ClaudeHarness {
         if !settings.is_empty() {
             cmd.arg("--settings");
             cmd.arg(Value::Object(settings).to_string());
+        }
+        // MCP injection: merge internal `mcp` + external `mcp_external` into
+        // `mcpServers` JSON for `--mcp-config`. Deduplicate by `id`, suppress
+        // duplicate if `url` identical, and respect `always_load` (do not
+        // overwrite an existing `id` without it). Secrets (headers/env) ride
+        // only at launch via `mcp_external`; logs mask values.
+        {
+            let mut servers = serde_json::Map::new();
+            if let Some(mcp) = &request.mcp {
+                servers.insert(
+                    mcp.server_name.clone(),
+                    serde_json::json!({
+                        "type": "http",
+                        "url": mcp.url,
+                        "headers": {
+                            "Authorization": format!("Bearer {}", mcp.auth_token)
+                        }
+                    }),
+                );
+            }
+            for ext in &request.mcp_external {
+                let id = ext.config.id.clone();
+                if servers.contains_key(&id) {
+                    let existing_url = servers
+                        .get(&id)
+                        .and_then(|v| v.get("url"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    let new_url = ext.config.url.clone();
+                    if existing_url == new_url {
+                        tracing::debug!(server_id=%id, "claude mcp dedup by id/url (masked)");
+                        continue;
+                    }
+                    if !ext.config.always_load {
+                        tracing::debug!(server_id=%id, "claude mcp skip overwrite without always_load (masked)");
+                        continue;
+                    }
+                }
+                if let Some(new_url) = ext.config.url.as_deref() {
+                    let dup = servers
+                        .values()
+                        .any(|v| v.get("url").and_then(Value::as_str) == Some(new_url));
+                    if dup {
+                        tracing::debug!(server_id=%id, "claude mcp dedup by url (masked)");
+                        continue;
+                    }
+                }
+                let entry = match ext.config.transport {
+                    komet_proto::McpTransport::Stdio => {
+                        let mut obj = serde_json::Map::new();
+                        if let Some(cmd_str) = ext.config.command.clone() {
+                            obj.insert("command".into(), Value::String(cmd_str));
+                        }
+                        obj.insert(
+                            "args".into(),
+                            Value::Array(
+                                ext.config
+                                    .args
+                                    .iter()
+                                    .cloned()
+                                    .map(Value::String)
+                                    .collect(),
+                            ),
+                        );
+                        let env_src = if !ext.resolved_env.is_empty() {
+                            &ext.resolved_env
+                        } else {
+                            &ext.config.env
+                        };
+                        if !env_src.is_empty() {
+                            obj.insert(
+                                "env".into(),
+                                Value::Object(
+                                    env_src
+                                        .iter()
+                                        .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+                                        .collect(),
+                                ),
+                            );
+                        }
+                        Value::Object(obj)
+                    }
+                    komet_proto::McpTransport::Http => {
+                        let mut obj = serde_json::Map::new();
+                        obj.insert("type".into(), Value::String("http".into()));
+                        if let Some(url) = ext.config.url.clone() {
+                            obj.insert("url".into(), Value::String(url));
+                        }
+                        let headers = if !ext.resolved_headers.is_empty() {
+                            &ext.resolved_headers
+                        } else {
+                            &ext.config.headers
+                        };
+                        if !headers.is_empty() {
+                            obj.insert(
+                                "headers".into(),
+                                Value::Object(
+                                    headers
+                                        .iter()
+                                        .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+                                        .collect(),
+                                ),
+                            );
+                        }
+                        if !ext.resolved_env.is_empty() {
+                            obj.insert(
+                                "env".into(),
+                                Value::Object(
+                                    ext.resolved_env
+                                        .iter()
+                                        .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+                                        .collect(),
+                                ),
+                            );
+                        }
+                        Value::Object(obj)
+                    }
+                    komet_proto::McpTransport::Sse => {
+                        let mut obj = serde_json::Map::new();
+                        obj.insert("type".into(), Value::String("sse".into()));
+                        if let Some(url) = ext.config.url.clone() {
+                            obj.insert("url".into(), Value::String(url));
+                        }
+                        let headers = if !ext.resolved_headers.is_empty() {
+                            &ext.resolved_headers
+                        } else {
+                            &ext.config.headers
+                        };
+                        if !headers.is_empty() {
+                            obj.insert(
+                                "headers".into(),
+                                Value::Object(
+                                    headers
+                                        .iter()
+                                        .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+                                        .collect(),
+                                ),
+                            );
+                        }
+                        if !ext.resolved_env.is_empty() {
+                            obj.insert(
+                                "env".into(),
+                                Value::Object(
+                                    ext.resolved_env
+                                        .iter()
+                                        .map(|(k, v)| (k.clone(), Value::String(v.clone())))
+                                        .collect(),
+                                ),
+                            );
+                        }
+                        Value::Object(obj)
+                    }
+                };
+                servers.insert(id, entry);
+            }
+            if !servers.is_empty() {
+                let config = serde_json::json!({"mcpServers": servers}).to_string();
+                cmd.args(["--mcp-config", &config]);
+                tracing::debug!(server_count=servers.len(), "claude mcpServers injected (values masked)");
+            }
         }
         if !request.cwd.is_empty() {
             cmd.current_dir(&request.cwd);
