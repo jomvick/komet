@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 
-use komet_proto::{HarnessId, McpInjection, McpServerConfig, McpTransport, ResolvedMcpServer, RunRequest};
+use komet_proto::{
+    HarnessId, McpInjection, McpServerConfig, McpTransport, ResolvedMcpServer, RunRequest,
+};
 use serde_json::Value;
 
 use crate::capabilities::supports_dynamic_mcp;
@@ -94,9 +96,31 @@ fn claude_mcp_config_merges_without_duplicate() {
 #[test]
 fn capability_matrix_reports_codex_status() {
     assert_eq!(supports_dynamic_mcp(HarnessId::ClaudeCode), (true, ""));
+    assert_eq!(supports_dynamic_mcp(HarnessId::Opencode), (true, ""));
+    assert_eq!(supports_dynamic_mcp(HarnessId::Grok), (true, ""));
+    assert_eq!(supports_dynamic_mcp(HarnessId::Hermes), (true, ""));
+    assert_eq!(supports_dynamic_mcp(HarnessId::Pi), (true, ""));
+    assert_eq!(supports_dynamic_mcp(HarnessId::Mock), (true, ""));
     assert_eq!(
         supports_dynamic_mcp(HarnessId::Codex),
-        (false, "Ce provider ne supporte pas l'injection MCP dynamique")
+        (
+            false,
+            "Ce provider ne supporte pas l'injection MCP dynamique"
+        )
+    );
+    assert_eq!(
+        supports_dynamic_mcp(HarnessId::Cursor),
+        (
+            false,
+            "Ce provider ne supporte pas l'injection MCP dynamique"
+        )
+    );
+    assert_eq!(
+        supports_dynamic_mcp(HarnessId::Antigravity),
+        (
+            false,
+            "Ce provider ne supporte pas l'injection MCP dynamique"
+        )
     );
 }
 

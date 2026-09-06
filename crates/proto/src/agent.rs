@@ -319,7 +319,7 @@ impl<'de> Deserialize<'de> for CodexFeatures {
                         other => {
                             return Err(serde::de::Error::custom(format!(
                                 "features array entries must be strings, got {other:?}"
-                            )))
+                            )));
                         }
                     }
                 }
@@ -337,7 +337,7 @@ impl<'de> Deserialize<'de> for CodexFeatures {
             other => {
                 return Err(serde::de::Error::custom(format!(
                     "features must be an array of names or an object, got {other:?}"
-                )))
+                )));
             }
         }
         Ok(CodexFeatures(out))
@@ -802,9 +802,11 @@ impl std::error::Error for ValidationError {}
 fn settings_permissions_escalation(value: &serde_json::Value) -> Option<String> {
     let obj = value.as_object()?;
     if let Some(mode) = obj.get("defaultMode").and_then(|m| m.as_str())
-        && mode != "default" && mode != "acceptEdits" {
-            return Some(format!("defaultMode {mode:?}"));
-        }
+        && mode != "default"
+        && mode != "acceptEdits"
+    {
+        return Some(format!("defaultMode {mode:?}"));
+    }
     if let Some(allow) = obj.get("allow").and_then(|a| a.as_array()) {
         for entry in allow {
             let Some(rule) = entry.as_str() else {
@@ -861,18 +863,19 @@ pub fn validate_run_request(request: &RunRequest) -> Result<(), ValidationError>
         return Ok(());
     };
     if !options.is_empty()
-        && let Some(harness) = request.harness {
-            match harness {
-                HarnessId::Cursor
-                | HarnessId::Grok
-                | HarnessId::Hermes
-                | HarnessId::Pi
-                | HarnessId::Antigravity => {
-                    return Err(ValidationError::ProviderOptionsRejected { provider: harness });
-                }
-                _ => {}
+        && let Some(harness) = request.harness
+    {
+        match harness {
+            HarnessId::Cursor
+            | HarnessId::Grok
+            | HarnessId::Hermes
+            | HarnessId::Pi
+            | HarnessId::Antigravity => {
+                return Err(ValidationError::ProviderOptionsRejected { provider: harness });
             }
+            _ => {}
         }
+    }
     let cwd = lexically_clean(std::path::Path::new(&request.cwd));
 
     if let Some(codex) = &options.codex {
@@ -980,12 +983,13 @@ pub fn validate_reasoning(
     supported: &[ReasoningLevel],
 ) -> Result<(), ValidationError> {
     if let Some(level) = requested
-        && !supported.contains(&level) {
-            return Err(ValidationError::ReasoningLevelUnsupported {
-                requested: level,
-                supported: supported.to_vec(),
-            });
-        }
+        && !supported.contains(&level)
+    {
+        return Err(ValidationError::ReasoningLevelUnsupported {
+            requested: level,
+            supported: supported.to_vec(),
+        });
+    }
     Ok(())
 }
 
@@ -1079,12 +1083,22 @@ pub struct RunRequest {
 
 /// Per-run internal MCP endpoint riding the request (host-local).
 /// Additive + serde-defaulted: an old host ignores it and runs without MCP.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct McpInjection {
     pub server_name: String,
     pub url: String,
     pub auth_token: String,
+}
+
+impl std::fmt::Debug for McpInjection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("McpInjection")
+            .field("server_name", &self.server_name)
+            .field("url", &self.url)
+            .field("auth_token", &format_args!("[redacted]"))
+            .finish()
+    }
 }
 
 /// Isolated-worktree directive riding [`RunRequest`]. The worktree is created
@@ -1374,7 +1388,9 @@ pub enum Scope {
 pub enum PermissionChoice {
     #[default]
     Allow,
-    AllowAlways { scope: Scope },
+    AllowAlways {
+        scope: Scope,
+    },
     Deny,
 }
 
@@ -1389,7 +1405,8 @@ pub struct PermissionRule {
     pub effect: Perm,
 }
 
-pub const DEFAULT_CODEX_SHELL_EXCLUDE: &[&str] = &["*_KEY", "*_TOKEN", "*_SECRET", "*_PASSWORD", "AWS_*"];
+pub const DEFAULT_CODEX_SHELL_EXCLUDE: &[&str] =
+    &["*_KEY", "*_TOKEN", "*_SECRET", "*_PASSWORD", "AWS_*"];
 
 /// Shell environment policy (Codex `shell_environment_policy`).
 /// Controls which env vars are excluded from the sandbox.
@@ -1399,9 +1416,28 @@ pub struct ShellEnvPolicy {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub exclude: Vec<String>,
 }
-impl ShellEnvPolicy { pub fn with_defaults() -> Self { Self { exclude: DEFAULT_CODEX_SHELL_EXCLUDE.iter().map(|s| s.to_string()).collect() } } }
+impl ShellEnvPolicy {
+    pub fn with_defaults() -> Self {
+        Self {
+            exclude: DEFAULT_CODEX_SHELL_EXCLUDE
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        }
+    }
+}
 /// Returns  entries
-pub fn default_read_only_subpaths_for_root(root: &str) -> Vec<CodexFSRule> { const PROTECTED: &[&str] = &[".git", ".codex", ".agents"]; let base = root.trim_end_matches("/"); PROTECTED.iter().map(|n| CodexFSRule { path: format!("{base}/{n}"), access: FSAccess::Read }).collect() }
+pub fn default_read_only_subpaths_for_root(root: &str) -> Vec<CodexFSRule> {
+    const PROTECTED: &[&str] = &[".git", ".codex", ".agents"];
+    let base = root.trim_end_matches("/");
+    PROTECTED
+        .iter()
+        .map(|n| CodexFSRule {
+            path: format!("{base}/{n}"),
+            access: FSAccess::Read,
+        })
+        .collect()
+}
 
 /// A filesystem access entry (Codex `filesystem."path" = access`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1871,6 +1907,18 @@ mod tests {
     }
 
     #[test]
+    fn mcp_injection_debug_redacts_token() {
+        let inj = McpInjection {
+            server_name: "komet".into(),
+            url: "http://127.0.0.1:9/mcp".into(),
+            auth_token: "super-secret-token".into(),
+        };
+        let debug = format!("{inj:?}");
+        assert!(!debug.contains("super-secret-token"));
+        assert!(debug.contains("[redacted]"));
+    }
+
+    #[test]
     fn harness_id_uses_kebab_case() {
         assert_eq!(
             serde_json::to_string(&HarnessId::ClaudeCode).unwrap(),
@@ -1969,7 +2017,9 @@ mod tests {
         );
         assert_eq!(
             opts.features.0.get("network_proxy"),
-            Some(&CodexFeature::Policy(serde_json::json!({"route":"allowed"})))
+            Some(&CodexFeature::Policy(
+                serde_json::json!({"route":"allowed"})
+            ))
         );
         // Object form survives the round trip (the old Vec<String> lost it).
         let back: CodexSandbox =

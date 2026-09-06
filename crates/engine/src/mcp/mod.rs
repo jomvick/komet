@@ -1,6 +1,7 @@
 pub mod catalog;
 pub mod config;
 pub mod discovery;
+pub mod host;
 pub mod policy;
 pub mod registry;
 pub mod secrets;

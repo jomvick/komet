@@ -170,8 +170,20 @@ impl McpRegistry {
             }
         }
         // Persist as versioned wrapper for determinism and migration support
-        let mut vec: Vec<&McpServerConfig> = servers.values().collect();
-        vec.sort_by(|a, b| a.id.cmp(&b.id));
+        // The registry stores only secret key names. Values belong exclusively
+        // to McpSecretStore; keeping them out of this file is the security
+        // boundary even when a caller accidentally passes a fully populated
+        // config to `save`.
+        let mut sanitized: Vec<McpServerConfig> = servers
+            .values()
+            .map(|config| {
+                let mut config = config.clone();
+                config.headers.values_mut().for_each(|value| value.clear());
+                config.env.values_mut().for_each(|value| value.clear());
+                config
+            })
+            .collect();
+        sanitized.sort_by(|a, b| a.id.cmp(&b.id));
         #[derive(Serialize)]
         struct PersistWrapper<'a> {
             version: u32,
@@ -179,7 +191,7 @@ impl McpRegistry {
         }
         let wrapper = PersistWrapper {
             version: 1,
-            servers: vec,
+            servers: sanitized.iter().collect(),
         };
         let data = serde_json::to_string_pretty(&wrapper)?;
         // Atomic write: temp file + rename
@@ -293,24 +305,26 @@ impl McpRegistry {
     pub fn resolve(&self, ids: &[String], store: &McpSecretStore) -> Vec<ResolvedMcpServer> {
         let mut out = Vec::new();
         let servers = self.lock_servers();
-        for id in ids {
-            let Some(cfg) = servers.get(id) else {
-                tracing::debug!(server_id = %id, "mcp resolve: not found (masked)");
+        let requested: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
+        for cfg in servers.values() {
+            // `always_load` is the explicit global assignment. Otherwise a
+            // server must be selected on the chat's MCP configuration.
+            if !cfg.always_load && !requested.contains(cfg.id.as_str()) {
                 continue;
-            };
+            }
             if !cfg.enabled {
-                tracing::debug!(server_id = %id, "mcp resolve: filtered disabled");
+                tracing::debug!(server_id = %cfg.id, "mcp resolve: filtered disabled");
                 continue;
             }
             if let Err(e) = cfg.validate() {
-                tracing::debug!(server_id = %id, error = %e, "mcp resolve: filtered invalid (masked)");
+                tracing::debug!(server_id = %cfg.id, error = %e, "mcp resolve: filtered invalid (masked)");
                 continue;
             }
             // Resolve via store, filtered by config's declared keys
-            let resolved_headers = store.get_resolved_headers_for(id, &cfg.headers);
-            let resolved_env = store.get_resolved_env_for(id, &cfg.env);
+            let resolved_headers = store.get_resolved_headers_for(&cfg.id, &cfg.headers);
+            let resolved_env = store.get_resolved_env_for(&cfg.id, &cfg.env);
             tracing::debug!(
-                server_id = %id,
+                server_id = %cfg.id,
                 headers = resolved_headers.len(),
                 env = resolved_env.len(),
                 "mcp resolve: ok (values masked)"

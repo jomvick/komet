@@ -9,7 +9,7 @@ use tokio::task::AbortHandle;
 use tokio_util::sync::CancellationToken;
 
 use super::catalog::McpCatalog;
-use super::policy::{secure_summary, Decision, McpPolicy};
+use super::policy::{Decision, McpPolicy, secure_summary};
 pub use crate::mcp::status::McpStatus;
 
 const MCP_PATH: &str = "/mcp/agents";
@@ -541,5 +541,18 @@ mod tests {
         assert_eq!(ep.status(), McpStatus::Stopped);
         rx.changed().await.unwrap();
         assert_eq!(*rx.borrow(), McpStatus::Stopped);
+    }
+
+    #[tokio::test]
+    async fn run_endpoint_lifecycle_ready_then_stopped_with_rotation() {
+        let first = start_test_endpoint().await;
+        assert_eq!(first.status(), McpStatus::Ready);
+        assert!(first.url().starts_with("http://127.0.0.1:"));
+        let token1 = first.token_for_test_only().to_string();
+        first.shutdown();
+        assert_eq!(first.status(), McpStatus::Stopped);
+        let second = start_test_endpoint().await;
+        assert_ne!(second.token_for_test_only(), token1);
+        second.shutdown();
     }
 }

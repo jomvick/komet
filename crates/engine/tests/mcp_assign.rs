@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use komet_engine::{EngineCore, HarnessRegistry};
 use komet_engine::mcp::{McpRegistry, McpSecretStore, McpServerConfig, McpTransport};
+use komet_engine::{EngineCore, HarnessRegistry};
 use komet_proto::{ChatConfig, HarnessId, RunRequest, SandboxLevel};
 use tempfile::TempDir;
 
@@ -21,7 +21,8 @@ fn run_request(prompt: &str) -> RunRequest {
         permission_timeout_ms: None,
         worktree: None,
         resume: None,
-        mcp: None, mcp_external: Vec::new(),
+        mcp: None,
+        mcp_external: Vec::new(),
     }
 }
 
@@ -72,7 +73,13 @@ async fn test_engine_with_mcp() -> (EngineCore, TempDir, String) {
         mcp_server_ids: vec!["gh".into()],
     };
     core.workspace
-        .create_chat(&chat_id, None, Some(&core.device_id), Some(chat_config), Some("/tmp".into()))
+        .create_chat(
+            &chat_id,
+            None,
+            Some(&core.device_id),
+            Some(chat_config),
+            Some("/tmp".into()),
+        )
         .unwrap();
 
     (core, dir, chat_id)
@@ -109,8 +116,17 @@ async fn run_does_not_store_secrets_in_journal() {
     let (core, dir, chat_id) = test_engine_with_mcp().await;
 
     // Verify chat config holds mcp_server_ids
-    let chat = core.workspace.read_chats().unwrap().into_iter().find(|c| c.id == chat_id).unwrap();
-    assert_eq!(chat.config.as_ref().unwrap().mcp_server_ids, vec!["gh".to_string()]);
+    let chat = core
+        .workspace
+        .read_chats()
+        .unwrap()
+        .into_iter()
+        .find(|c| c.id == chat_id)
+        .unwrap();
+    assert_eq!(
+        chat.config.as_ref().unwrap().mcp_server_ids,
+        vec!["gh".to_string()]
+    );
 
     // Build run request (simulated dispatch without actually running harness) — ensure internal mcp field is None
     let req = run_request("hello");
@@ -120,7 +136,10 @@ async fn run_does_not_store_secrets_in_journal() {
     let resolved = core.sessions.prepare_mcp_for_run(&chat_id);
     assert_eq!(resolved.len(), 1);
     // Convert to harness config (in-memory only, contains secrets, never persisted)
-    let harness_cfgs: Vec<_> = resolved.into_iter().map(|r| r.into_harness_config()).collect();
+    let harness_cfgs: Vec<_> = resolved
+        .into_iter()
+        .map(|r| r.into_harness_config())
+        .collect();
     assert_eq!(harness_cfgs[0].id, "gh");
     // That harness config DOES contain secret in-memory (for launch), but we must not persist it
     // Verify that its Debug is masked (so logs don't leak)
@@ -159,7 +178,9 @@ async fn run_does_not_store_secrets_in_journal() {
                     if path.is_dir() {
                         stack.push(path);
                     } else if path.extension().is_some_and(|e| e == "jsonl")
-                        && path.file_name().is_some_and(|n| n.to_string_lossy().contains(chat_id))
+                        && path
+                            .file_name()
+                            .is_some_and(|n| n.to_string_lossy().contains(chat_id))
                     {
                         return Some(path);
                     }
@@ -170,7 +191,11 @@ async fn run_does_not_store_secrets_in_journal() {
     }
     if let Some(path) = find_journal(dir.path(), &chat_id) {
         let journal = std::fs::read_to_string(&path).unwrap();
-        assert!(!journal.contains("super-secret-token-xyz"), "journal must not contain secret: {}", path.display());
+        assert!(
+            !journal.contains("super-secret-token-xyz"),
+            "journal must not contain secret: {}",
+            path.display()
+        );
         assert!(!journal.contains("ghp_secret_value_123"));
     }
 
@@ -211,7 +236,8 @@ async fn disabled_or_missing_mcp_filtered() {
     let store = McpSecretStore::new(dir.path().join("mcp-secrets.json"));
     store.set_secret("gh", "GH_TOKEN", "secret123").unwrap();
 
-    let core = EngineCore::assemble(dir.path(), registry_with_mock(), HarnessId::Mock, None).unwrap();
+    let core =
+        EngineCore::assemble(dir.path(), registry_with_mock(), HarnessId::Mock, None).unwrap();
     let chat_id = format!("chat-{}", uuid::Uuid::new_v4());
     let cfg = ChatConfig {
         harness: HarnessId::Mock,
@@ -222,9 +248,61 @@ async fn disabled_or_missing_mcp_filtered() {
         mcp_server_ids: vec!["gh".into(), "missing".into()],
     };
     core.workspace
-        .create_chat(&chat_id, None, Some(&core.device_id), Some(cfg), Some("/tmp".into()))
+        .create_chat(
+            &chat_id,
+            None,
+            Some(&core.device_id),
+            Some(cfg),
+            Some("/tmp".into()),
+        )
         .unwrap();
     let resolved = core.sessions.prepare_mcp_for_run(&chat_id);
-    assert!(resolved.is_empty(), "disabled and missing should be filtered");
+    assert!(
+        resolved.is_empty(),
+        "disabled and missing should be filtered"
+    );
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn prepare_mcp_for_run_includes_always_load_without_assignment() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = McpRegistry::load(dir.path()).unwrap();
+    reg.save(&McpServerConfig {
+        id: "global".into(),
+        name: "Global".into(),
+        enabled: true,
+        transport: McpTransport::Stdio,
+        command: Some("npx".into()),
+        args: vec![],
+        url: None,
+        headers: Default::default(),
+        env: Default::default(),
+        always_load: true,
+    })
+    .unwrap();
+    let core =
+        EngineCore::assemble(dir.path(), registry_with_mock(), HarnessId::Mock, None).unwrap();
+    let chat_id = format!("chat-{}", uuid::Uuid::new_v4());
+    let cfg = ChatConfig {
+        harness: HarnessId::Mock,
+        model: None,
+        reasoning: None,
+        model_options: Default::default(),
+        sandbox: SandboxLevel::WorkspaceWrite,
+        mcp_server_ids: Vec::new(),
+    };
+    core.workspace
+        .create_chat(
+            &chat_id,
+            None,
+            Some(&core.device_id),
+            Some(cfg),
+            Some("/tmp".into()),
+        )
+        .unwrap();
+    let resolved = core.sessions.prepare_mcp_for_run(&chat_id);
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(resolved[0].config.id, "global");
     core.shutdown().await;
 }
