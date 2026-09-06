@@ -35,6 +35,7 @@ use komet_proto::{
 };
 
 use crate::doc_host::{ChatDocHandle, DocHost};
+use crate::mcp::{McpRegistry, McpSecretStore, ResolvedMcpServer};
 use crate::registry::HarnessRegistry;
 use crate::run_journal::RunJournal;
 use crate::{EngineError, new_id, now_ms};
@@ -101,6 +102,8 @@ struct Inner {
     device_id: String,
     journal: Arc<RunJournal>,
     registry: Arc<HarnessRegistry>,
+    mcp_registry: Arc<McpRegistry>,
+    mcp_secrets: Arc<McpSecretStore>,
     /// Set-once (first wins), cleared on runtime retirement: sessions and
     /// doc-host reference each other through Arcs, so this back-edge must be
     /// severable for a replaced engine graph to drop.
@@ -150,6 +153,8 @@ impl SessionsEngine {
         device_id: String,
         journal: Arc<RunJournal>,
         registry: Arc<HarnessRegistry>,
+        mcp_registry: Arc<McpRegistry>,
+        mcp_secrets: Arc<McpSecretStore>,
     ) -> Self {
         let (sessions_tx, _) = watch::channel(Vec::new());
         Self {
@@ -157,6 +162,8 @@ impl SessionsEngine {
                 device_id,
                 journal,
                 registry,
+                mcp_registry,
+                mcp_secrets,
                 doc_host: Mutex::new(None),
                 runs: Mutex::new(HashMap::new()),
                 hubs: Mutex::new(HashMap::new()),
@@ -170,6 +177,21 @@ impl SessionsEngine {
                 permission_timeout: Mutex::new(Some(std::time::Duration::from_secs(10 * 60))),
             }),
         }
+    }
+
+    /// Test-only constructor with ephemeral MCP stores.
+    pub fn new_for_tests(
+        device_id: String,
+        journal: Arc<RunJournal>,
+        registry: Arc<HarnessRegistry>,
+    ) -> Self {
+        Self::new(
+            device_id,
+            journal,
+            registry,
+            Arc::new(McpRegistry::empty(std::env::temp_dir())),
+            Arc::new(McpSecretStore::ephemeral()),
+        )
     }
 
     /// D4 — tune (or disable with `None`) the permission-bridge hang guard.
@@ -248,6 +270,40 @@ impl SessionsEngine {
     /// The last request dispatched for a chat (steer→new-turn fallback).
     pub fn last_request(&self, chat_id: &str) -> Option<RunRequest> {
         lock(&self.inner.last_requests).get(chat_id).cloned()
+    }
+
+    /// IDs assigned to the chat for MCP servers (`ChatConfig.mcp_server_ids`).
+    fn mcp_ids_for_chat(&self, chat_id: &str) -> Vec<String> {
+        if let Some(host) = self.inner.doc_host() {
+            if let Some(ws) = host.workspace() {
+                if let Some(cfg) = ws.chat_config(chat_id) {
+                    return cfg.mcp_server_ids;
+                }
+            }
+        }
+        Vec::new()
+    }
+
+    /// Resolve MCP servers assigned to a chat (`ChatConfig.mcp_server_ids` → `ResolvedMcpServer`).
+    /// Filters disabled / invalid entries and injects secrets from `McpSecretStore`.
+    /// Never persists secrets; resolved values are in-memory only for the harness launch.
+    /// Public/UI view should use `PublicMcpServerConfig`.
+    pub fn prepare_mcp_for_run(&self, chat_id: &str) -> Vec<ResolvedMcpServer> {
+        let ids = self.mcp_ids_for_chat(chat_id);
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        self.inner.mcp_registry.resolve(&ids, &self.inner.mcp_secrets)
+    }
+
+    /// Build the `harness_mcp_servers` vector for the next harness launch.
+    /// Kept separate from `RunRequest.mcp` (internal Komet MCP) — Task 4/5 wires this into
+    /// `acp`/`claude`/`codex` via `into_harness_config`.
+    pub fn harness_mcp_servers_for_run(&self, chat_id: &str) -> Vec<crate::mcp::McpServerConfig> {
+        self.prepare_mcp_for_run(chat_id)
+            .into_iter()
+            .map(|r| r.into_harness_config())
+            .collect()
     }
 
     /// Subscribe to a chat's live event stream: returns the journal replay after
@@ -488,6 +544,11 @@ impl SessionsEngine {
         }
 
         let harness = self.inner.registry.resolve(harness_id)?;
+        // MCP: resolve external servers assigned to the chat via ChatConfig.mcp_server_ids.
+        // Secrets stay only in the returned Vec<ResolvedMcpServer> (passed as harness_mcp_servers
+        // to the provider launch); they are NEVER stored in RunRequest.mcp (internal Komet MCP)
+        // nor in journal/transcript — only PublicMcpServerConfig is UI-visible.
+        let _harness_mcp_servers = self.harness_mcp_servers_for_run(chat_id);
         let handle = self.doc_handle(chat_id)?;
         let user_id = message_id.unwrap_or_else(new_id);
         handle.write_user_message(&user_id, &request.prompt, now_ms())?;

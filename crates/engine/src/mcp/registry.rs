@@ -57,7 +57,39 @@ struct VersionedWrapper {
     servers: Vec<McpServerConfig>,
 }
 
+impl ResolvedMcpServer {
+    /// Convert into a harness-launchable server config with resolved secrets in-memory.
+    /// Secrets are present only in the returned `McpServerConfig` copy, never persisted.
+    pub fn into_harness_config(self) -> McpServerConfig {
+        let mut cfg = self.config.clone();
+        // Resolved values replace placeholders for provider launch.
+        if !self.resolved_headers.is_empty() {
+            cfg.headers = self.resolved_headers;
+        }
+        if !self.resolved_env.is_empty() {
+            cfg.env = self.resolved_env;
+        }
+        cfg
+    }
+
+    /// Public view for UI / logging — no secret values.
+    pub fn public_view(&self) -> PublicMcpServerConfig {
+        self.config.public_view()
+    }
+}
+
 impl McpRegistry {
+    /// Create an empty registry rooted at `data_dir` (no file I/O).
+    pub fn empty(data_dir: impl AsRef<Path>) -> Self {
+        let data_dir = data_dir.as_ref().to_path_buf();
+        let file_path = Self::file_path_for(&data_dir);
+        Self {
+            data_dir,
+            file_path,
+            servers: HashMap::new(),
+        }
+    }
+
     fn file_path_for(data_dir: &Path) -> PathBuf {
         // If data_dir looks like a file path ending with .json, use it directly
         // to remain flexible; otherwise join mcp-servers.json.

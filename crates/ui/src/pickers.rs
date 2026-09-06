@@ -126,6 +126,7 @@ impl ResolvedRunConfig {
             reasoning: self.reasoning,
             model_options: self.model_options.clone(),
             sandbox: SandboxLevel::WorkspaceWrite,
+            mcp_server_ids: Vec::new(),
         })
     }
 }
