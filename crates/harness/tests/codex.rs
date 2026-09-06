@@ -49,7 +49,7 @@ fn request(prompt: &str) -> RunRequest {
         permission_timeout_ms: None,
         worktree: None,
         resume: None,
-        mcp: None,
+        mcp: None, mcp_external: Vec::new(),
     }
 }
 

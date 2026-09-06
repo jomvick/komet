@@ -20,7 +20,7 @@ fn run_request_attachments_survive_command_round_trip() {
         permission_timeout_ms: None,
         resume: None,
         worktree: None,
-        mcp: None,
+        mcp: None, mcp_external: Vec::new(),
     };
     doc.queue_command(&SessionCommandEntry {
         id: "c1".into(),

@@ -5092,7 +5092,7 @@ impl Composer {
                             attachments: attachment_paths,
                             worktree: None,
                             permission_timeout_ms: None,
-                            mcp: None,
+                            mcp: None, mcp_external: Vec::new(),
                         },
                         message_id: message_id.clone(),
                     }

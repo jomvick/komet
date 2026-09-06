@@ -850,7 +850,10 @@ impl AcpHarness {
             if commands.is_empty() {
                 let cwd = std::env::var("HOME").unwrap_or_else(|_| "/".into());
                 let session = client
-                    .request("session/new", json!({ "cwd": cwd, "mcpServers": [], "env": [] }))
+                    .request(
+                        "session/new",
+                        build_acp_session_params(&cwd, None, vec![]),
+                    )
                     .await;
                 if session.is_ok() {
                     // The update usually arrives within milliseconds of the
@@ -918,7 +921,7 @@ impl AcpHarness {
                 .await?;
             let cwd = std::env::var("HOME").unwrap_or_else(|_| "/".into());
             let session = client
-                .request("session/new", json!({ "cwd": cwd, "mcpServers": [], "env": [] }))
+                .request("session/new", build_acp_session_params(&cwd, None, vec![]))
                 .await?;
             let mut models = models_from_session(&session, &(self.spec.models)());
             // Prompt-convention modes (Claude Ultrathink) extend any real
@@ -1481,6 +1484,57 @@ fn mcp_servers(injection: Option<&komet_proto::McpInjection>) -> Vec<Value> {
             })]
         })
         .unwrap_or_default()
+}
+
+/// Build `session/new` params merging internal `komet` MCP + external resolved servers.
+/// Transport handling: Http→type http, Sse→type sse, Stdio→name/command/args/env.
+/// Always includes `env: []` for opencode 1.18.25+.
+pub fn build_acp_session_params(
+    cwd: &str,
+    internal: Option<komet_proto::McpInjection>,
+    externals: Vec<komet_proto::ResolvedMcpServer>,
+) -> Value {
+    let mut servers = Vec::new();
+    if let Some(inj) = internal {
+        servers.push(json!({
+            "type": "http",
+            "url": inj.url,
+            "headers": {
+                "Authorization": format!("Bearer {}", inj.auth_token)
+            }
+        }));
+    }
+    for ext in externals {
+        match ext.config.transport {
+            komet_proto::McpTransport::Http => {
+                servers.push(json!({
+                    "type": "http",
+                    "url": ext.config.url,
+                    "headers": ext.resolved_headers
+                }));
+            }
+            komet_proto::McpTransport::Sse => {
+                servers.push(json!({
+                    "type": "sse",
+                    "url": ext.config.url,
+                    "headers": ext.resolved_headers
+                }));
+            }
+            komet_proto::McpTransport::Stdio => {
+                servers.push(json!({
+                    "name": ext.config.id,
+                    "command": ext.config.command,
+                    "args": ext.config.args,
+                    "env": ext.resolved_env
+                }));
+            }
+        }
+    }
+    json!({
+        "cwd": cwd,
+        "mcpServers": servers,
+        "env": []
+    })
 }
 
 /// `initialize._meta.steering.supported` — the `_session/steering` extension
@@ -2287,11 +2341,11 @@ async fn run_session(session: Session) {
         let steer_ext = steering_supported(&init);
         let init_commands = scan_available_commands(&init);
 
-        let session_params = json!({
-            "cwd": request.cwd,
-            "mcpServers": mcp_servers(request.mcp.as_ref()),
-            "env": [],
-        });
+        let session_params = build_acp_session_params(
+            &request.cwd,
+            request.mcp.clone(),
+            request.mcp_external.clone(),
+        );
         let (session_id, session_response) = if let Some(resume) = &request.resume {
             let mut load = session_params.clone();
             load["sessionId"] = Value::String(resume.clone());
