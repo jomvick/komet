@@ -2602,6 +2602,7 @@ mod tests {
             reasoning: Some(komet_proto::ReasoningLevel::XHigh),
             model_options: serde_json::Map::new(),
             sandbox: komet_proto::SandboxLevel::WorkspaceWrite,
+            mcp_server_ids: Vec::new(),
         };
         state.apply_chat_config("a", config.clone());
         assert_eq!(
@@ -2626,6 +2627,7 @@ mod tests {
                 reasoning: None,
                 model_options: serde_json::Map::new(),
                 sandbox: komet_proto::SandboxLevel::WorkspaceWrite,
+                mcp_server_ids: Vec::new(),
             },
         );
     }
