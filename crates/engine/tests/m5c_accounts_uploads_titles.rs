@@ -33,6 +33,7 @@ fn test_accounts(root: &Path) -> (AgentAccounts, AgentAccountsConfig) {
         claude_config_file: root.join("claude.json"),
         codex_home: root.join("codex"),
         antigravity_home: root.join("antigravity"),
+        cursor_auth_file: root.join("cursor-sdk-auth.json"),
     };
     (AgentAccounts::new(config.clone()), config)
 }
