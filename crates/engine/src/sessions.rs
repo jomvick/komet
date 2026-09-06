@@ -312,7 +312,8 @@ impl SessionsEngine {
     }
 
     /// Per-run localhost Komet MCP. Bind failure is visible then the run
-    /// continues without internal tools — externals are unaffected.
+    /// continues without internal tools — the agent's own MCP config is
+    /// unaffected.
     async fn start_internal_mcp(&self, chat_id: &str, run_id: &str) -> Option<RunningEndpoint> {
         let Some(workspace) = self.inner.workspace() else {
             tracing::warn!(chat = %chat_id, "internal MCP skipped: workspace not wired");
@@ -578,70 +579,9 @@ impl SessionsEngine {
         }
 
         let harness = self.inner.registry.resolve(harness_id)?;
-        // MCP: resolve external servers assigned to the chat via ChatConfig.mcp_server_ids.
-        // Secrets stay only in the returned Vec<ResolvedMcpServer> (passed as harness_mcp_servers
-        // to the provider launch); they are NEVER stored in RunRequest.mcp (internal Komet MCP)
-        // nor in journal/transcript — only PublicMcpServerConfig is UI-visible.
-        // Wire externals via RunRequest.mcp_external (kept separate from internal mcp).
-        let resolved = self.prepare_mcp_for_run(chat_id);
-        let proto_externals: Vec<komet_proto::ResolvedMcpServer> = resolved
-            .into_iter()
-            .map(|r| {
-                let cfg = r.config;
-                let proto_cfg = komet_proto::McpServerConfig {
-                    id: cfg.id,
-                    name: cfg.name,
-                    enabled: cfg.enabled,
-                    transport: match cfg.transport {
-                        crate::mcp::McpTransport::Http => komet_proto::McpTransport::Http,
-                        crate::mcp::McpTransport::Sse => komet_proto::McpTransport::Sse,
-                        crate::mcp::McpTransport::Stdio => komet_proto::McpTransport::Stdio,
-                    },
-                    command: cfg.command,
-                    args: cfg.args,
-                    url: cfg.url,
-                    headers: cfg.headers,
-                    env: cfg.env,
-                    always_load: cfg.always_load,
-                };
-                komet_proto::ResolvedMcpServer {
-                    config: proto_cfg,
-                    resolved_headers: r.resolved_headers,
-                    resolved_env: r.resolved_env,
-                }
-            })
-            .collect();
-        if !proto_externals.is_empty() {
-            let (supported, reason) = komet_harness::capabilities::supports_dynamic_mcp(harness_id);
-            if !supported {
-                tracing::warn!(
-                    chat = %chat_id,
-                    harness = ?harness_id,
-                    servers = proto_externals.len(),
-                    "run rejected: provider cannot inject MCP"
-                );
-                let message = reason.to_string();
-                self.inner.publish(
-                    chat_id,
-                    &AgentEvent::Error {
-                        message: message.clone(),
-                    },
-                );
-                self.inner.publish(
-                    chat_id,
-                    &AgentEvent::Done {
-                        status: DoneStatus::Errored,
-                        result: None,
-                        error: Some(message.clone()),
-                        session_id: None,
-                        reason: None,
-                    },
-                );
-                self.set_status(chat_id, SessionStatus::Idle, false);
-                return Err(EngineError::Other(message));
-            }
-        }
-        request.mcp_external = proto_externals;
+        // External MCP stays with the agent (Claude Desktop, Codex config,
+        // Cursor mcp.json, …). Komet only injects the per-run internal server
+        // via `request.mcp` after `run_id` is minted.
         let handle = self.doc_handle(chat_id)?;
         let user_id = message_id.unwrap_or_else(new_id);
         handle.write_user_message(&user_id, &request.prompt, now_ms())?;
