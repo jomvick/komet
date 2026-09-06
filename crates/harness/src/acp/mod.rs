@@ -1494,16 +1494,7 @@ pub fn build_acp_session_params(
     internal: Option<komet_proto::McpInjection>,
     externals: Vec<komet_proto::ResolvedMcpServer>,
 ) -> Value {
-    let mut servers = Vec::new();
-    if let Some(inj) = internal {
-        servers.push(json!({
-            "type": "http",
-            "url": inj.url,
-            "headers": {
-                "Authorization": format!("Bearer {}", inj.auth_token)
-            }
-        }));
-    }
+    let mut servers = mcp_servers(internal.as_ref());
     for ext in externals {
         match ext.config.transport {
             komet_proto::McpTransport::Http => {
