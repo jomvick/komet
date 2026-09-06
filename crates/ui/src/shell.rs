@@ -40,10 +40,11 @@ use crate::settings::archived::ArchivedPage;
 use crate::settings::devices::DevicesPage;
 use crate::settings::files::FilesSettingsPage;
 use crate::settings::harnesses::HarnessesPage;
+use crate::settings::mcp::McpServersPage;
 use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
 use crate::settings::{
-    KeymapConfig, RememberedNavigation, RIGHT_PANE_DEFAULT, RIGHT_PANE_MAX, RIGHT_PANE_MIN,
+    KeymapConfig, RIGHT_PANE_DEFAULT, RIGHT_PANE_MAX, RIGHT_PANE_MIN, RememberedNavigation,
     SAVE_DEBOUNCE_MS, SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, TERMINAL_DEFAULT_HEIGHT,
     UiSettings, platform_combo,
 };
@@ -170,6 +171,8 @@ pub enum SettingsSection {
     Devices,
     /// Which harnesses the composer offers (enable/disable toggles).
     Harnesses,
+    /// External MCP servers the agents see (registry CRUD + test).
+    McpServers,
     /// Per-provider CLI accounts (login, usage) — labeled "Accounts".
     Agents,
     Appearance,
@@ -181,9 +184,10 @@ pub enum SettingsSection {
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 9] = [
+    pub const ALL: [SettingsSection; 10] = [
         SettingsSection::Devices,
         SettingsSection::Harnesses,
+        SettingsSection::McpServers,
         SettingsSection::Agents,
         SettingsSection::Appearance,
         SettingsSection::Files,
@@ -199,6 +203,7 @@ impl SettingsSection {
         match self {
             SettingsSection::Devices => "Devices",
             SettingsSection::Harnesses => "Agents",
+            SettingsSection::McpServers => "MCP Servers",
             SettingsSection::Agents => "Accounts",
             SettingsSection::Appearance => "Appearance",
             SettingsSection::Files => "Files",
@@ -855,6 +860,7 @@ pub struct Shell {
     shortcuts_page: Option<Entity<ShortcutsPage>>,
     accounts_page: Option<Entity<AccountsPage>>,
     harnesses_page: Option<Entity<HarnessesPage>>,
+    mcp_servers_page: Option<Entity<McpServersPage>>,
     shortcuts_sub: Option<Subscription>,
     notifications_sub: Option<Subscription>,
     /// Session-row context menu: (chat id, window position).
@@ -1040,6 +1046,7 @@ impl Shell {
             }
             Some("settings/agents") => Route::Settings(SettingsSection::Agents),
             Some("settings/harnesses") => Route::Settings(SettingsSection::Harnesses),
+            Some("settings/mcp") => Route::Settings(SettingsSection::McpServers),
             Some("settings/appearance") => Route::Settings(SettingsSection::Appearance),
             Some("settings/notifications") => Route::Settings(SettingsSection::Notifications),
             Some("settings/shortcuts") => Route::Settings(SettingsSection::Shortcuts),
@@ -1108,6 +1115,7 @@ impl Shell {
             shortcuts_page: None,
             accounts_page: None,
             harnesses_page: None,
+            mcp_servers_page: None,
             shortcuts_sub: None,
             notifications_sub: None,
             chat_menu: popover::Popup::default(),
@@ -2256,9 +2264,7 @@ impl Shell {
             }
         };
         if self.settings.last_session_by_device.get(&device_id) != Some(&nav) {
-            self.settings
-                .last_session_by_device
-                .insert(device_id, nav);
+            self.settings.last_session_by_device.insert(device_id, nav);
             self.schedule_save(cx);
         }
     }
@@ -2323,6 +2329,11 @@ impl Shell {
         // CLIs are installed, so installing one shows up on the next open.
         if section == SettingsSection::Harnesses {
             self.harnesses_page = None;
+        }
+        // Re-probe the MCP list each visit so servers added elsewhere (or by
+        // another device) show up on the next open.
+        if section == SettingsSection::McpServers {
+            self.mcp_servers_page = None;
         }
         self.route = Route::Settings(section);
         self.nav.push(NavEntry::Settings(section));
@@ -2391,6 +2402,16 @@ impl Shell {
                     self.harnesses_page = Some(cx.new(|cx| HarnessesPage::new(state, cx)));
                 }
                 match &self.harnesses_page {
+                    Some(page) => page.clone().into_any_element(),
+                    None => Empty.into_any_element(),
+                }
+            }
+            SettingsSection::McpServers => {
+                if self.mcp_servers_page.is_none() {
+                    let state = self.state.clone();
+                    self.mcp_servers_page = Some(cx.new(|cx| McpServersPage::new(state, cx)));
+                }
+                match &self.mcp_servers_page {
                     Some(page) => page.clone().into_any_element(),
                     None => Empty.into_any_element(),
                 }
@@ -3489,6 +3510,7 @@ impl Shell {
         let section_icon = |item: SettingsSection| match item {
             SettingsSection::Devices => icons::MONITOR,
             SettingsSection::Harnesses => icons::WIDGET,
+            SettingsSection::McpServers => icons::CLOUD,
             SettingsSection::Agents => icons::KEY_MINIMALISTIC,
             SettingsSection::Appearance => icons::TUNING,
             SettingsSection::Files => icons::FOLDER_WITH_FILES,
@@ -5951,7 +5973,11 @@ impl Shell {
                 .gap(px(5.0))
                 .cursor_pointer()
                 .border_b_2()
-                .border_color(if is_active { theme.accent } else { gpui::transparent_black() })
+                .border_color(if is_active {
+                    theme.accent
+                } else {
+                    gpui::transparent_black()
+                })
                 // The old session-tab strip's solved carve-out: NOT
                 // `.occlude()` — a BlockMouse hitbox ends the hit test,
                 // so the scroll container behind the tabs never saw
@@ -5991,14 +6017,22 @@ impl Shell {
                         cx.new(|_| SurfaceTabGhost { title })
                     },
                 )
-                .child(icon(icon_path).size(px(13.0)).text_color(if is_active { theme.text } else { theme.text_muted.opacity(0.7) }))
+                .child(icon(icon_path).size(px(13.0)).text_color(if is_active {
+                    theme.text
+                } else {
+                    theme.text_muted.opacity(0.7)
+                }))
                 .child(
                     div()
                         .min_w_0()
                         .flex_1()
                         .truncate()
                         .text_size(px(12.0))
-                        .text_color(if is_active { theme.text } else { theme.text_muted })
+                        .text_color(if is_active {
+                            theme.text
+                        } else {
+                            theme.text_muted
+                        })
                         .child(title),
                 )
                 .child(
@@ -6017,7 +6051,11 @@ impl Shell {
                             cx.stop_propagation();
                             this.close_right_surface(surface, window, cx);
                         }))
-                        .child(icon(icons::CLOSE).size(px(10.0)).text_color(theme.text_muted)),
+                        .child(
+                            icon(icons::CLOSE)
+                                .size(px(10.0))
+                                .text_color(theme.text_muted),
+                        ),
                 );
             // Sliding transform while a sibling drags over (the terminal
             // drawer's exact recipe): animate 150ms between committed

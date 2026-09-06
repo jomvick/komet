@@ -19,6 +19,7 @@ use gpui::{
     Subscription, Task, Window, div, prelude::*, px,
 };
 
+use komet_engine::mcp::PublicMcpServerConfig;
 use komet_engine::registry::HarnessDescriptor;
 use komet_proto::{
     ChatConfig, FolderListing, HarnessId, Model, ReasoningLevel, RepoRef, SandboxLevel, Space,
@@ -76,6 +77,8 @@ pub struct DraftConfig {
     pub branch: Option<String>,
     /// Where the new session runs (the t3code env-mode).
     pub checkout: CheckoutKind,
+    /// External MCP servers opted into for this new chat (ids only).
+    pub mcp_server_ids: Vec<String>,
 }
 
 /// Where a new session runs (t3code's env-mode: `local | worktree`). "Current
@@ -115,6 +118,8 @@ pub struct ResolvedRunConfig {
     pub model: Option<String>,
     pub reasoning: Option<ReasoningLevel>,
     pub model_options: serde_json::Map<String, serde_json::Value>,
+    /// External MCP servers enabled for this session (ids only — never values).
+    pub mcp_server_ids: Vec<String>,
 }
 
 impl ResolvedRunConfig {
@@ -126,7 +131,7 @@ impl ResolvedRunConfig {
             reasoning: self.reasoning,
             model_options: self.model_options.clone(),
             sandbox: SandboxLevel::WorkspaceWrite,
-            mcp_server_ids: Vec::new(),
+            mcp_server_ids: self.mcp_server_ids.clone(),
         })
     }
 }
@@ -220,6 +225,37 @@ pub fn traits_summary(
     } else {
         Some(parts.join(" · "))
     }
+}
+
+/// Keep session MCP picks that still exist and are opt-in (`always_load`
+/// servers are a global assignment — resolve injects them without a chat id).
+pub fn sanitize_session_mcp_ids(
+    selected: &[String],
+    servers: &[PublicMcpServerConfig],
+) -> Vec<String> {
+    selected
+        .iter()
+        .filter(|id| {
+            servers
+                .iter()
+                .any(|server| server.id == **id && server.enabled && !server.always_load)
+        })
+        .cloned()
+        .collect()
+}
+
+/// Composer chip label: bare "MCP" until at least one server is assigned.
+pub fn session_mcp_chip_label(selected: usize, always_load: usize) -> String {
+    match selected + always_load {
+        0 => "MCP".to_string(),
+        n => format!("MCP · {n}"),
+    }
+}
+
+/// Red-banner copy when the selected agent cannot receive `mcpServers`.
+pub fn mcp_unsupported_warning(harness: Option<HarnessId>) -> Option<&'static str> {
+    let (ok, reason) = komet_harness::capabilities::supports_dynamic_mcp(harness?);
+    (!ok).then_some(reason)
 }
 
 /// Whether any trait departs from its default — the trigger brightens only
@@ -376,6 +412,8 @@ pub enum PickerKind {
     /// New-session canvas only: the device project-less sessions run on (a
     /// project pick implies its own host and overrides this).
     Device,
+    /// Session MCP assignment (ids only — never secret values).
+    Mcp,
 }
 
 pub struct Pickers {
@@ -423,6 +461,9 @@ pub struct Pickers {
     /// In-flight mid-session `SwitchRef` (the ref being switched to).
     switching: Option<String>,
     switch_task: Option<Task<()>>,
+    /// Public MCP registry (ids/names only — ListMcpServers never returns values).
+    mcp_servers: Loadable<Vec<PublicMcpServerConfig>>,
+    mcp_task: Option<Task<()>>,
     /// Last mid-session switch failure (shown in the ref popover).
     switch_error: Option<String>,
     mutate_task: Option<Task<()>>,
@@ -481,6 +522,7 @@ impl Pickers {
                 this.config.model = None;
                 this.config.reasoning = None;
                 this.config.model_options.clear();
+                this.config.mcp_server_ids.clear();
                 this.switch_error = None;
             }
             // A space switch invalidates the branch draft + cache — the folder
@@ -517,6 +559,7 @@ impl Pickers {
             Some("checkout") => Some(PickerKind::Checkout),
             Some("project") => Some(PickerKind::Space),
             Some("device") => Some(PickerKind::Device),
+            Some("mcp") => Some(PickerKind::Mcp),
             _ => None,
         };
         let mut open = popover::Popup::default();
@@ -574,6 +617,8 @@ impl Pickers {
             switch_task: None,
             switch_error: None,
             mutate_task: None,
+            mcp_servers: Loadable::Idle,
+            mcp_task: None,
             _search_events: search_events,
             _state_observe: state_observe,
             _catalog_observe: catalog_observe,
@@ -732,7 +777,96 @@ impl Pickers {
                 .or_else(|| self.effective_model_id(cx).map(str::to_string)),
             reasoning: self.effective_reasoning(cx),
             model_options: self.explicit_options(cx),
+            mcp_server_ids: self.effective_mcp_server_ids(cx),
         }
+    }
+
+    /// Explicit session picks: the chat's persisted ids, else the new-chat draft.
+    fn effective_mcp_server_ids(&self, cx: &App) -> Vec<String> {
+        let raw = if let Some(config) = self
+            .state
+            .read(cx)
+            .selected_chat_row()
+            .and_then(|c| c.config.as_ref())
+        {
+            config.mcp_server_ids.clone()
+        } else {
+            self.config.mcp_server_ids.clone()
+        };
+        match self.mcp_servers.ready() {
+            Some(servers) => sanitize_session_mcp_ids(&raw, servers),
+            None => raw,
+        }
+    }
+
+    fn mcp_picker_rows(&self) -> Vec<PublicMcpServerConfig> {
+        self.mcp_servers
+            .ready()
+            .map(|list| list.iter().filter(|s| s.enabled).cloned().collect())
+            .unwrap_or_default()
+    }
+
+    fn toggle_mcp_server(&mut self, id: String, always_load: bool, cx: &mut Context<Self>) {
+        if always_load {
+            return;
+        }
+        if self.state.read(cx).selected_chat.is_some() {
+            self.update_chat_config(cx, move |config| {
+                if config.mcp_server_ids.iter().any(|existing| existing == &id) {
+                    config.mcp_server_ids.retain(|existing| existing != &id);
+                } else {
+                    config.mcp_server_ids.push(id);
+                }
+            });
+        } else if self
+            .config
+            .mcp_server_ids
+            .iter()
+            .any(|existing| existing == &id)
+        {
+            self.config
+                .mcp_server_ids
+                .retain(|existing| existing != &id);
+        } else {
+            self.config.mcp_server_ids.push(id);
+        }
+        cx.notify();
+    }
+
+    fn ensure_mcp_servers(&mut self, force: bool, cx: &mut Context<Self>) {
+        let reload = match self.mcp_servers {
+            Loadable::Idle => true,
+            Loadable::Loading => false,
+            Loadable::Ready(_) | Loadable::Error(_) => force,
+        };
+        if !reload {
+            return;
+        }
+        let Some(engine) = self.engine(cx) else {
+            return;
+        };
+        if !matches!(self.mcp_servers, Loadable::Ready(_)) {
+            self.mcp_servers = Loadable::Loading;
+        }
+        self.mcp_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(methods::LIST_MCP_SERVERS, serde_json::json!({}))
+                .await;
+            this.update(cx, |pickers, cx| {
+                pickers.mcp_servers = match result {
+                    Ok(value) => match value.get("servers").cloned().and_then(|servers| {
+                        serde_json::from_value::<Vec<PublicMcpServerConfig>>(servers).ok()
+                    }) {
+                        Some(list) => Loadable::Ready(list),
+                        None => Loadable::Error("ListMcpServers reply missing `servers`".into()),
+                    },
+                    Err(err) => Loadable::Error(err.to_string()),
+                };
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     // ---- open/close ----
@@ -815,6 +949,7 @@ impl Pickers {
             PickerKind::ContextUsage => 0,
             PickerKind::Space => self.selected_space_index(cx),
             PickerKind::Device => self.selected_device_index(cx),
+            PickerKind::Mcp => 0,
         };
         if kind == PickerKind::HarnessModel {
             self.model_scroll.set_offset(gpui::Point::default());
@@ -867,6 +1002,7 @@ impl Pickers {
                 self.ensure_harnesses(true, cx);
                 self.prefetch_models(cx);
             }
+            PickerKind::Mcp => self.ensure_mcp_servers(true, cx),
             // Projects, devices, and context usage are already synced state — nothing to load.
             PickerKind::Space | PickerKind::Device | PickerKind::ContextUsage => {}
         }
@@ -1282,6 +1418,7 @@ impl Pickers {
             .and_then(|c| c.config.as_ref())
         {
             config.sandbox = existing.sandbox;
+            config.mcp_server_ids = existing.mcp_server_ids.clone();
         }
         change(&mut config);
         // Reasoning must stay concrete for whatever model the row now names —
@@ -1676,9 +1813,10 @@ impl Pickers {
             self.defaults.no_project = state.no_project;
         }
         if let Some(dir) = &self.data_dir
-            && let Err(err) = self.defaults.save(dir) {
-                tracing::warn!(error = %err, "composer-defaults save failed");
-            }
+            && let Err(err) = self.defaults.save(dir)
+        {
+            tracing::warn!(error = %err, "composer-defaults save failed");
+        }
     }
 
     /// Devices in picker order: this device first, then by name.
@@ -1957,6 +2095,7 @@ impl Pickers {
                     Some(PickerKind::ContextUsage) => 0,
                     Some(PickerKind::Space) => self.filtered_space_rows(cx).len(),
                     Some(PickerKind::Device) => self.filtered_device_rows(cx).len(),
+                    Some(PickerKind::Mcp) => self.mcp_picker_rows().len(),
                     None => 0,
                 };
                 let current = (self.active != NO_ACTIVE_ROW).then_some(self.active);
@@ -1982,6 +2121,10 @@ impl Pickers {
                         CheckoutKind::NewWorktree
                     };
                     self.pick_checkout(kind, cx);
+                } else if self.open_kind() == Some(PickerKind::Mcp) {
+                    if let Some(server) = self.mcp_picker_rows().into_iter().nth(self.active) {
+                        self.toggle_mcp_server(server.id, server.always_load, cx);
+                    }
                 } else {
                     self.on_search_submit(cx);
                 }
@@ -2015,6 +2158,7 @@ impl Pickers {
             PickerKind::ContextUsage => "picker-context-usage",
             PickerKind::Space => "picker-space",
             PickerKind::Device => "picker-device",
+            PickerKind::Mcp => "picker-mcp",
         };
         let open = self.open_kind() == Some(kind);
         // Ghost pill (komet composer/styles.tsx `pill`): `h-8 rounded-lg px-2.5
@@ -2332,24 +2476,23 @@ impl Pickers {
                     chat_harness,
                     &theme,
                 ));
-            let mut overlay: Option<(PickerKind, AnyElement)> = if self.mounted_kind()
-                == Some(PickerKind::ContextUsage)
-            {
-                let stats = self.state.read(cx).current_context_usage();
-                let popover_theme = Theme::of(cx).clone();
-                let content = crate::context_usage::render_context_popover(
-                    &stats,
-                    chat_harness,
-                    chat_model,
-                    &popover_theme,
-                );
-                Some((
-                    PickerKind::ContextUsage,
-                    self.popover_frame_flush(320.0, content, cx),
-                ))
-            } else {
-                None
-            };
+            let mut overlay: Option<(PickerKind, AnyElement)> =
+                if self.mounted_kind() == Some(PickerKind::ContextUsage) {
+                    let stats = self.state.read(cx).current_context_usage();
+                    let popover_theme = Theme::of(cx).clone();
+                    let content = crate::context_usage::render_context_popover(
+                        &stats,
+                        chat_harness,
+                        chat_model,
+                        &popover_theme,
+                    );
+                    Some((
+                        PickerKind::ContextUsage,
+                        self.popover_frame_flush(320.0, content, cx),
+                    ))
+                } else {
+                    None
+                };
 
             let right = div()
                 .flex()
@@ -2570,6 +2713,10 @@ impl Pickers {
                             this.models.clear();
                             this.ensure_harnesses(false, cx);
                         }
+                        PickerKind::Mcp => {
+                            this.mcp_servers = Loadable::Idle;
+                            this.ensure_mcp_servers(false, cx);
+                        }
                         // Projects/devices/context load nothing; no retry surface exists.
                         PickerKind::Space | PickerKind::Device | PickerKind::ContextUsage => {}
                     }))
@@ -2772,6 +2919,84 @@ impl Pickers {
                         )
                     }),
             )
+            .into_any_element()
+    }
+
+    fn render_mcp_popover(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::of(cx).clone();
+        match &self.mcp_servers {
+            Loadable::Idle | Loadable::Loading => {
+                return popover::skeleton_rows(
+                    "mcp-picker-skeleton",
+                    &theme,
+                    3,
+                    cx.entity_id(),
+                    cx,
+                );
+            }
+            Loadable::Error(message) => {
+                return self.retry_row("mcp-picker-retry", message, PickerKind::Mcp, &theme, cx);
+            }
+            Loadable::Ready(_) => {}
+        }
+        let rows = self.mcp_picker_rows();
+        if rows.is_empty() {
+            return div()
+                .p(px(Theme::SPACE_SM))
+                .text_size(px(12.0))
+                .text_color(theme.text_faint)
+                .child(SharedString::from(
+                    "No MCP servers yet — add one in Settings → MCP Servers.",
+                ))
+                .into_any_element();
+        }
+        let selected = self.effective_mcp_server_ids(cx);
+        let active = self.active;
+        let warning = mcp_unsupported_warning(self.effective_harness(cx));
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .children(warning.map(|message| {
+                div()
+                    .px(px(Theme::SPACE_SM))
+                    .py(px(6.0))
+                    .text_size(px(11.0))
+                    .text_color(theme.danger_muted)
+                    .child(SharedString::from(message))
+                    .into_any_element()
+            }))
+            .children(rows.into_iter().enumerate().map(|(ix, server)| {
+                let is_on = server.always_load || selected.iter().any(|id| id == &server.id);
+                let always_load = server.always_load;
+                let id = server.id.clone();
+                let name = server.name.clone();
+                popover::menu_row_nav(&theme, is_on, ix == active, format!("mcp-row-{ix}"))
+                    .id(("mcp-row", ix))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.toggle_mcp_server(id.clone(), always_load, cx);
+                    }))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .child(SharedString::from(name)),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(10.0))
+                            .text_color(theme.text_muted.opacity(0.45))
+                            .child(SharedString::from(if always_load {
+                                "always"
+                            } else if is_on {
+                                "on"
+                            } else {
+                                ""
+                            })),
+                    )
+            }))
             .into_any_element()
     }
 
@@ -3574,6 +3799,7 @@ impl Render for Pickers {
         // opens, and rail switches inside the picker are instant.
         self.ensure_harnesses(false, cx);
         self.prefetch_models(cx);
+        self.ensure_mcp_servers(false, cx);
         // A popover opened data-side (KOMET_OPEN_PICKER) never went through
         // `toggle`, so kick its loads here (all ensure_* are idempotent).
         if matches!(
@@ -3659,6 +3885,13 @@ impl Render for Pickers {
                     self.popover_frame_flush(240.0, content, cx),
                 ))
             }
+            Some(PickerKind::Mcp) => {
+                let content = self.render_mcp_popover(cx);
+                Some((
+                    PickerKind::Mcp,
+                    self.popover_frame_flush(240.0, content, cx),
+                ))
+            }
             // ContextUsage popover mounts on the footer's context chip.
             None => None,
         };
@@ -3705,6 +3938,25 @@ impl Render for Pickers {
                 cx,
             )
         });
+        let mcp_rows = self.mcp_picker_rows();
+        let show_mcp = !mcp_rows.is_empty() || matches!(self.mcp_servers, Loadable::Error(_));
+        let mcp_selected = self.effective_mcp_server_ids(cx);
+        let mcp_always = mcp_rows.iter().filter(|s| s.always_load).count();
+        let mcp_opted = mcp_selected
+            .iter()
+            .filter(|id| mcp_rows.iter().any(|s| s.id == **id && !s.always_load))
+            .count();
+        let mcp_chip = show_mcp.then(|| {
+            self.trigger_chip(
+                PickerKind::Mcp,
+                SharedString::from(session_mcp_chip_label(mcp_opted, mcp_always)),
+                mcp_opted + mcp_always > 0,
+                Some((crate::icons::CLOUD, None)),
+                None,
+                &theme,
+                cx,
+            )
+        });
         let right = div()
             .flex()
             .flex_row()
@@ -3728,6 +3980,9 @@ impl Render for Pickers {
                     "traits-popover",
                     closing,
                 )
+            }))
+            .children(mcp_chip.map(|chip| {
+                attach_overlay_end(chip, &mut overlay, PickerKind::Mcp, "mcp-popover", closing)
             }));
         div()
             .w_full()
@@ -4032,6 +4287,58 @@ mod tests {
         assert_eq!(config.harness, HarnessId::ClaudeCode);
         assert_eq!(config.model.as_deref(), Some("opus"));
         assert_eq!(config.sandbox, SandboxLevel::WorkspaceWrite);
+        assert!(config.mcp_server_ids.is_empty());
+        resolved.mcp_server_ids = vec!["gh".into()];
+        assert_eq!(
+            resolved.chat_config().unwrap().mcp_server_ids,
+            vec!["gh".to_string()]
+        );
+    }
+
+    fn public_mcp(id: &str, enabled: bool, always_load: bool) -> PublicMcpServerConfig {
+        PublicMcpServerConfig {
+            id: id.into(),
+            name: id.into(),
+            enabled,
+            transport: komet_engine::mcp::McpTransport::Stdio,
+            command: Some("npx".into()),
+            args: Vec::new(),
+            url: None,
+            always_load,
+            has_secrets: false,
+        }
+    }
+
+    #[test]
+    fn session_mcp_chip_counts_opt_in_and_always_load() {
+        assert_eq!(session_mcp_chip_label(0, 0), "MCP");
+        assert_eq!(session_mcp_chip_label(1, 0), "MCP · 1");
+        assert_eq!(session_mcp_chip_label(1, 1), "MCP · 2");
+    }
+
+    #[test]
+    fn mcp_unsupported_warning_for_providers_without_injection() {
+        assert!(mcp_unsupported_warning(Some(HarnessId::Codex)).is_some());
+        assert!(mcp_unsupported_warning(Some(HarnessId::Cursor)).is_some());
+        assert!(mcp_unsupported_warning(Some(HarnessId::ClaudeCode)).is_none());
+        assert!(mcp_unsupported_warning(Some(HarnessId::Opencode)).is_none());
+        assert!(mcp_unsupported_warning(None).is_none());
+    }
+
+    #[test]
+    fn sanitize_session_mcp_ids_drops_always_load_disabled_and_unknown() {
+        let servers = vec![
+            public_mcp("gh", true, false),
+            public_mcp("global", true, true),
+            public_mcp("off", false, false),
+        ];
+        assert_eq!(
+            sanitize_session_mcp_ids(
+                &["gh".into(), "global".into(), "off".into(), "gone".into()],
+                &servers
+            ),
+            vec!["gh".to_string()]
+        );
     }
 
     #[test]

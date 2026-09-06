@@ -35,6 +35,10 @@ use komet_proto::{
 };
 
 use crate::doc_host::{ChatDocHandle, DocHost};
+use crate::mcp::catalog::McpCatalog;
+use crate::mcp::host::EngineMcpHost;
+use crate::mcp::policy::McpPolicy;
+use crate::mcp::server::{AskDecision, McpEndpoint, RunningEndpoint};
 use crate::mcp::{McpRegistry, McpSecretStore, ResolvedMcpServer};
 use crate::registry::HarnessRegistry;
 use crate::run_journal::RunJournal;
@@ -289,11 +293,12 @@ impl SessionsEngine {
     /// Never persists secrets; resolved values are in-memory only for the harness launch.
     /// Public/UI view should use `PublicMcpServerConfig`.
     pub fn prepare_mcp_for_run(&self, chat_id: &str) -> Vec<ResolvedMcpServer> {
+        // Empty ids still resolve `always_load` servers — those are a global
+        // assignment, not a per-chat opt-in.
         let ids = self.mcp_ids_for_chat(chat_id);
-        if ids.is_empty() {
-            return Vec::new();
-        }
-        self.inner.mcp_registry.resolve(&ids, &self.inner.mcp_secrets)
+        self.inner
+            .mcp_registry
+            .resolve(&ids, &self.inner.mcp_secrets)
     }
 
     /// Build the `harness_mcp_servers` vector for the next harness launch.
@@ -304,6 +309,35 @@ impl SessionsEngine {
             .into_iter()
             .map(|r| r.into_harness_config())
             .collect()
+    }
+
+    /// Per-run localhost Komet MCP. Bind failure is visible then the run
+    /// continues without internal tools — externals are unaffected.
+    async fn start_internal_mcp(&self, chat_id: &str, run_id: &str) -> Option<RunningEndpoint> {
+        let Some(workspace) = self.inner.workspace() else {
+            tracing::warn!(chat = %chat_id, "internal MCP skipped: workspace not wired");
+            return None;
+        };
+        let catalog = Arc::new(McpCatalog::komet_default(Arc::new(EngineMcpHost::new(
+            self.clone(),
+            workspace,
+        ))));
+        match McpEndpoint::start(
+            run_id,
+            catalog,
+            McpPolicy::komet_default(),
+            Arc::new(|_| Box::pin(async { AskDecision::Deny })),
+        )
+        .await
+        {
+            Ok(endpoint) => Some(endpoint),
+            Err(err) => {
+                let message = format!("Komet MCP unavailable: {err}");
+                tracing::warn!(chat = %chat_id, error = %err, "internal MCP endpoint failed");
+                self.inner.publish(chat_id, &AgentEvent::Error { message });
+                None
+            }
+        }
     }
 
     /// Subscribe to a chat's live event stream: returns the journal replay after
@@ -577,6 +611,36 @@ impl SessionsEngine {
                 }
             })
             .collect();
+        if !proto_externals.is_empty() {
+            let (supported, reason) = komet_harness::capabilities::supports_dynamic_mcp(harness_id);
+            if !supported {
+                tracing::warn!(
+                    chat = %chat_id,
+                    harness = ?harness_id,
+                    servers = proto_externals.len(),
+                    "run rejected: provider cannot inject MCP"
+                );
+                let message = reason.to_string();
+                self.inner.publish(
+                    chat_id,
+                    &AgentEvent::Error {
+                        message: message.clone(),
+                    },
+                );
+                self.inner.publish(
+                    chat_id,
+                    &AgentEvent::Done {
+                        status: DoneStatus::Errored,
+                        result: None,
+                        error: Some(message.clone()),
+                        session_id: None,
+                        reason: None,
+                    },
+                );
+                self.set_status(chat_id, SessionStatus::Idle, false);
+                return Err(EngineError::Other(message));
+            }
+        }
         request.mcp_external = proto_externals;
         let handle = self.doc_handle(chat_id)?;
         let user_id = message_id.unwrap_or_else(new_id);
@@ -594,9 +658,16 @@ impl SessionsEngine {
             request.resume = self.inner.resume_for(chat_id, &request.cwd);
             resume_injected = request.resume.is_some();
         }
-        lock(&self.inner.last_requests).insert(chat_id.to_string(), request.clone());
-
         let run_id = new_id();
+        let internal_mcp = self.start_internal_mcp(chat_id, &run_id).await;
+        if let Some(endpoint) = internal_mcp.as_ref() {
+            request.mcp = Some(komet_proto::McpInjection {
+                server_name: "komet".into(),
+                url: endpoint.url().to_string(),
+                auth_token: endpoint.auth_token().to_string(),
+            });
+        }
+        lock(&self.inner.last_requests).insert(chat_id.to_string(), request.clone());
         let (steer_tx, steer_rx) = mpsc::channel::<SteerMessage>(32);
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let (engine_tx, engine_rx) = mpsc::unbounded_channel::<AgentEvent>();
@@ -664,11 +735,8 @@ impl SessionsEngine {
                             ) {
                                 // The doc part must resolve too, or a dead
                                 // approval panel would keep rendering.
-                                if let Ok(handle) =
-                                    watchdog_sessions.doc_handle(&watchdog_chat)
-                                {
-                                    let _ =
-                                        handle.doc().resolve_permission(&request_id.clone());
+                                if let Ok(handle) = watchdog_sessions.doc_handle(&watchdog_chat) {
+                                    let _ = handle.doc().resolve_permission(&request_id.clone());
                                 }
                                 tracing::info!(
                                     chat = %watchdog_chat,
@@ -733,6 +801,7 @@ impl SessionsEngine {
                 resume_injected,
                 startup_retry,
             },
+            internal_mcp,
         ));
         Ok(run_id)
     }
@@ -1004,13 +1073,14 @@ impl SessionsEngine {
             // stamped the doc + closed the journal above — but must NEVER spawn
             // a competing run: the host owns the run plane (§7 device routing).
             if let Some(host) = self.inner.doc_host()
-                && !host.is_host(&chat_id) {
-                    tracing::info!(
-                        chat = %chat_id,
-                        "auto-resume skipped: chat hosted by another device"
-                    );
-                    continue;
-                }
+                && !host.is_host(&chat_id)
+            {
+                tracing::info!(
+                    chat = %chat_id,
+                    "auto-resume skipped: chat hosted by another device"
+                );
+                continue;
+            }
             let attempt = self.inner.journal.note_resume_attempt(&chat_id);
             let (user_id, prompt_text) = prompt.expect("gated by will_resume");
             let sessions = self.clone();
@@ -1043,7 +1113,8 @@ impl SessionsEngine {
                             // that already has one (or doesn't need one).
                             worktree: None,
                             permission_timeout_ms: None,
-                            mcp: None, mcp_external: Vec::new(),
+                            mcp: None,
+                            mcp_external: Vec::new(),
                         })
                     });
                 let Some(mut request) = request else {
@@ -1466,6 +1537,7 @@ async fn drive_run(
     mut engine_rx: mpsc::UnboundedReceiver<AgentEvent>,
     mut cancel_rx: watch::Receiver<bool>,
     resume_state: RunResumeState,
+    _internal_mcp: Option<RunningEndpoint>,
 ) {
     let device_id = inner.device_id.clone();
     // Captured for post-run auto-titling (the request moves into the harness).

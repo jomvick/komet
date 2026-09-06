@@ -34,6 +34,9 @@ fn registry_persists_and_masks_secrets() {
     let reg2 = McpRegistry::load(dir.path()).unwrap();
     assert_eq!(reg2.list_public().len(), 1);
     assert_eq!(reg2.list_public()[0].id, "gh");
+    let persisted = std::fs::read_to_string(dir.path().join("mcp-servers.json")).unwrap();
+    assert!(!persisted.contains("s3cr3t-xyz-999"));
+    assert!(persisted.contains("GH_TOKEN"));
 }
 
 #[test]
@@ -71,15 +74,25 @@ fn registry_resolve_filters_enabled_and_resolves_secrets() {
     // store secrets
     let secrets_path = dir.path().join("mcp-secrets.json");
     let store = McpSecretStore::new(&secrets_path);
-    store.set_secret("gh", "Authorization", "Bearer resolved-secret").unwrap();
-    store.set_secret("gh", "GH_TOKEN", "resolved-token").unwrap();
+    store
+        .set_secret("gh", "Authorization", "Bearer resolved-secret")
+        .unwrap();
+    store
+        .set_secret("gh", "GH_TOKEN", "resolved-token")
+        .unwrap();
 
     let resolved = reg.resolve(&["gh".into(), "disabled".into(), "missing".into()], &store);
     // only enabled gh should be returned
     assert_eq!(resolved.len(), 1);
     assert_eq!(resolved[0].config.id, "gh");
-    assert_eq!(resolved[0].resolved_headers.get("Authorization").unwrap(), "Bearer resolved-secret");
-    assert_eq!(resolved[0].resolved_env.get("GH_TOKEN").unwrap(), "resolved-token");
+    assert_eq!(
+        resolved[0].resolved_headers.get("Authorization").unwrap(),
+        "Bearer resolved-secret"
+    );
+    assert_eq!(
+        resolved[0].resolved_env.get("GH_TOKEN").unwrap(),
+        "resolved-token"
+    );
     // ensure placeholder not leaked, resolved values correct
     assert!(!format!("{:?}", resolved[0].config).contains("resolved-secret"));
 }
@@ -202,4 +215,45 @@ fn registry_list_public_masks_and_logs() {
     assert_eq!(resolved.len(), 1);
     let cfg_debug = format!("{:?}", resolved[0].config);
     assert!(!cfg_debug.contains("super-secret"));
+}
+
+#[test]
+fn registry_resolve_includes_always_load_without_explicit_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let reg = McpRegistry::load(dir.path()).unwrap();
+    reg.save(&McpServerConfig {
+        id: "global".into(),
+        name: "Global".into(),
+        enabled: true,
+        transport: McpTransport::Stdio,
+        command: Some("npx".into()),
+        args: vec![],
+        url: None,
+        headers: Default::default(),
+        env: Default::default(),
+        always_load: true,
+    })
+    .unwrap();
+    reg.save(&McpServerConfig {
+        id: "opt-in".into(),
+        name: "Opt-in".into(),
+        enabled: true,
+        transport: McpTransport::Stdio,
+        command: Some("npx".into()),
+        args: vec![],
+        url: None,
+        headers: Default::default(),
+        env: Default::default(),
+        always_load: false,
+    })
+    .unwrap();
+    let store = McpSecretStore::new(dir.path().join("mcp-secrets.json"));
+    let resolved = reg.resolve(&[], &store);
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(resolved[0].config.id, "global");
+
+    let resolved = reg.resolve(&["opt-in".into()], &store);
+    let mut ids: Vec<_> = resolved.iter().map(|r| r.config.id.as_str()).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec!["global", "opt-in"]);
 }
