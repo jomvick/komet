@@ -195,7 +195,7 @@ fn serde_roundtrip_preserves_fields() {
 fn secret_store_resolve_and_set_secret() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("mcp-secrets.json");
-    let mut store = McpSecretStore::new(&path);
+    let store = McpSecretStore::new(&path);
     assert!(store.resolve("gh").is_empty());
     store.set_secret("gh", "GH_TOKEN", "secret123").unwrap();
     let resolved = store.resolve("gh");
@@ -213,7 +213,7 @@ fn secret_store_resolve_and_set_secret() {
 fn secret_store_file_has_600_perms_on_unix() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("mcp-secrets.json");
-    let mut store = McpSecretStore::new(&path);
+    let store = McpSecretStore::new(&path);
     store.set_secret("gh", "k", "v").unwrap();
     #[cfg(unix)]
     {
@@ -227,7 +227,7 @@ fn secret_store_file_has_600_perms_on_unix() {
 fn secret_store_partitioned_headers_and_env() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("mcp-secrets.json");
-    let mut store = McpSecretStore::new(&path);
+    let store = McpSecretStore::new(&path);
     store.set_secret("gh", "Authorization", "Bearer x").unwrap();
     store.set_secret("gh", "GH_TOKEN", "tok123").unwrap();
     // Unfiltered resolve returns both

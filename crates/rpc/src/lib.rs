@@ -141,6 +141,17 @@ pub mod methods {
     pub const APPLY_UPDATE: &str = "ApplyUpdate";
     /// Retrieve context & token usage metrics for a session thread.
     pub const GET_CONTEXT_USAGE: &str = "GetContextUsage";
+    // MCP external servers (ControlRpc, relay-forwardable — each device owns
+    // its local registry). Replies are secret-free (PublicMcpServerConfig):
+    // secret VALUES flow in via SaveMcpServer only, never back out.
+    pub const LIST_MCP_SERVERS: &str = "ListMcpServers";
+    pub const GET_MCP_SERVER: &str = "GetMcpServer";
+    pub const SAVE_MCP_SERVER: &str = "SaveMcpServer";
+    pub const DELETE_MCP_SERVER: &str = "DeleteMcpServer";
+    pub const SET_MCP_SERVER_ENABLED: &str = "SetMcpServerEnabled";
+    pub const TEST_MCP_SERVER: &str = "TestMcpServer";
+    pub const LIST_MCP_TOOLS: &str = "ListMcpTools";
+    pub const WATCH_MCP_STATUS: &str = "WatchMcpStatus";
 }
 
 #[derive(Debug, thiserror::Error)]

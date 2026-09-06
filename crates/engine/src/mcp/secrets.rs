@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 /// Local secret store for MCP servers.
 ///
@@ -7,29 +8,53 @@ use std::path::{Path, PathBuf};
 /// OS keychain fallback is noted but not required for Task 1 — file store is
 /// the canonical implementation. Secrets never leave this store except via
 /// `resolve` for in-memory provider launch.
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub struct McpSecretStore {
     path: PathBuf,
-    /// outer key = server id, inner = secret key -> value (header name or env var)
-    secrets: HashMap<String, HashMap<String, String>>,
+    /// outer key = server id, inner = secret key -> value (header name or env var).
+    /// Interior mutability: the store is shared as `Arc` between the sessions
+    /// engine (resolve at run time) and the RPC surface (write-only upserts —
+    /// secret values flow in via RPC, never back out).
+    secrets: Mutex<HashMap<String, HashMap<String, String>>>,
+}
+
+impl Clone for McpSecretStore {
+    /// Snapshot copy of the in-memory secrets (std `Mutex` is not `Clone`).
+    fn clone(&self) -> Self {
+        Self {
+            path: self.path.clone(),
+            secrets: Mutex::new(self.lock_secrets().clone()),
+        }
+    }
 }
 
 impl std::fmt::Debug for McpSecretStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("McpSecretStore")
             .field("path", &self.path)
-            .field("secrets", &format_args!("{{{} servers masked}}", self.secrets.len()))
+            .field(
+                "secrets",
+                &format_args!("{{{} servers masked}}", self.lock_secrets().len()),
+            )
             .finish()
     }
 }
 
 impl McpSecretStore {
+    /// Lock the inner map, recovering from poisoning (a panicked peer must not
+    /// wedge the MCP surface; individual entries remain valid).
+    fn lock_secrets(&self) -> std::sync::MutexGuard<'_, HashMap<String, HashMap<String, String>>> {
+        self.secrets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Create a store backed by the given path. Loads existing file if present.
     pub fn new(path: impl AsRef<Path>) -> Self {
         let path = path.as_ref().to_path_buf();
         let mut store = Self {
             path,
-            secrets: HashMap::new(),
+            secrets: Mutex::new(HashMap::new()),
         };
         // Best-effort load; empty on failure.
         let _ = store.load();
@@ -58,7 +83,7 @@ impl McpSecretStore {
         ));
         Self {
             path,
-            secrets: HashMap::new(),
+            secrets: Mutex::new(HashMap::new()),
         }
     }
 
@@ -87,7 +112,7 @@ impl McpSecretStore {
             return Ok(());
         }
         let parsed: HashMap<String, HashMap<String, String>> = serde_json::from_str(&data)?;
-        self.secrets = parsed;
+        *self.lock_secrets() = parsed;
         Ok(())
     }
 
@@ -95,7 +120,7 @@ impl McpSecretStore {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let data = serde_json::to_string_pretty(&self.secrets)?;
+        let data = serde_json::to_string_pretty(&*self.lock_secrets())?;
         std::fs::write(&self.path, data)?;
         #[cfg(unix)]
         {
@@ -104,14 +129,21 @@ impl McpSecretStore {
             perms.set_mode(0o600);
             std::fs::set_permissions(&self.path, perms)?;
         }
-        tracing::debug!(path = %self.path.display(), keys = self.secrets.len(), "mcp secrets saved (values masked)");
+        tracing::debug!(
+            path = %self.path.display(),
+            keys = self.lock_secrets().len(),
+            "mcp secrets saved (values masked)"
+        );
         Ok(())
     }
 
     /// Store or update a secret for a server id.
-    pub fn set_secret(&mut self, id: &str, key: &str, value: &str) -> anyhow::Result<()> {
-        let entry = self.secrets.entry(id.to_string()).or_default();
-        entry.insert(key.to_string(), value.to_string());
+    pub fn set_secret(&self, id: &str, key: &str, value: &str) -> anyhow::Result<()> {
+        {
+            let mut secrets = self.lock_secrets();
+            let entry = secrets.entry(id.to_string()).or_default();
+            entry.insert(key.to_string(), value.to_string());
+        }
         // Only persist if path is not ephemeral placeholder without parent? always try.
         // For ephemeral tests with tempdir, path will be overwritten to temp file; still persist.
         // If path is the hardcoded ephemeral tmp file, we allow save as well (isolated).
@@ -122,7 +154,7 @@ impl McpSecretStore {
 
     /// Resolve all secrets for a server id (headers + env merged — caller distinguishes via config).
     pub fn resolve(&self, id: &str) -> HashMap<String, String> {
-        self.secrets.get(id).cloned().unwrap_or_default()
+        self.lock_secrets().get(id).cloned().unwrap_or_default()
     }
 
     /// Alias for header resolution — currently same underlying merged map.
@@ -163,11 +195,14 @@ impl McpSecretStore {
     }
 
     /// Remove a secret.
-    pub fn remove_secret(&mut self, id: &str, key: &str) -> anyhow::Result<()> {
-        if let Some(map) = self.secrets.get_mut(id) {
-            map.remove(key);
-            if map.is_empty() {
-                self.secrets.remove(id);
+    pub fn remove_secret(&self, id: &str, key: &str) -> anyhow::Result<()> {
+        {
+            let mut secrets = self.lock_secrets();
+            if let Some(map) = secrets.get_mut(id) {
+                map.remove(key);
+                if map.is_empty() {
+                    secrets.remove(id);
+                }
             }
         }
         self.save()?;
