@@ -5,42 +5,10 @@ use tokio::sync::watch;
 use tokio::time::timeout;
 
 use crate::mcp::config::McpServerConfig;
+pub use crate::mcp::status::McpStatus;
 
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub const TOOLS_TIMEOUT: Duration = Duration::from_secs(10);
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum McpStatus {
-    Starting,
-    Ready,
-    Error(String),
-    Stopped,
-}
-
-impl Serialize for McpStatus {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        serializer.serialize_str(match self {
-            Self::Starting => "starting",
-            Self::Ready => "ready",
-            Self::Error(_) => "error",
-            Self::Stopped => "stopped",
-        })
-    }
-}
-
-impl std::fmt::Display for McpStatus {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Starting => write!(f, "starting"),
-            Self::Ready => write!(f, "ready"),
-            Self::Error(e) => write!(f, "error: {e}"),
-            Self::Stopped => write!(f, "stopped"),
-        }
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DiscoveredTool {
@@ -111,6 +79,8 @@ impl McpDiscovery {
     /// List tools for a server config using an ephemeral rmcp client.
     /// Enforces 5s connect + 10s tools/list timeouts, detects dead stdio,
     /// and closes transport cleanly on drop.
+    /// Timeouts are NOT nested: validate runs without timeout, then connect
+    /// is bounded by CONNECT_TIMEOUT, then tools/list by TOOLS_TIMEOUT separately.
     pub async fn list_tools(
         &self,
         config: &McpServerConfig,
@@ -118,60 +88,65 @@ impl McpDiscovery {
         // Mark starting
         let _ = self.status_tx.send(McpStatus::Starting);
 
-        // Validate config
+        // Validate config – no timeout (fast, local)
         if let Err(e) = config.validate() {
             let msg = e.to_string();
             let _ = self.status_tx.send(McpStatus::Error(msg.clone()));
             return Err(DiscoveryError::InvalidConfig(msg));
         }
 
-        // Ephemeral client with timeouts – simulated without real rmcp transport
-        // to keep compile light; real rmcp wiring would be:
-        //   timeout(CONNECT_TIMEOUT, rmcp::Client::connect(config)).await
-        //   timeout(TOOLS_TIMEOUT, client.list_tools()).await
-        let res = timeout(CONNECT_TIMEOUT, Self::connect_and_list(config)).await;
-
-        match res {
-            Ok(Ok(tools)) => {
-                let _ = self.status_tx.send(McpStatus::Ready);
-                Ok(tools)
-            }
-            Ok(Err(e)) => {
-                let msg = e.to_string();
-                let _ = self.status_tx.send(McpStatus::Error(msg.clone()));
-                Err(e)
-            }
+        // Connect phase – bounded by CONNECT_TIMEOUT only
+        let connect_res = timeout(CONNECT_TIMEOUT, Self::connect_phase(config)).await;
+        match connect_res {
             Err(_) => {
                 let _ = self
                     .status_tx
                     .send(McpStatus::Error("connection timeout".into()));
-                Err(DiscoveryError::ConnectTimeout(CONNECT_TIMEOUT))
+                return Err(DiscoveryError::ConnectTimeout(CONNECT_TIMEOUT));
+            }
+            Ok(Err(e)) => {
+                let msg = e.to_string();
+                let _ = self.status_tx.send(McpStatus::Error(msg.clone()));
+                return Err(e);
+            }
+            Ok(Ok(())) => {}
+        }
+
+        // tools/list phase – bounded by TOOLS_TIMEOUT separately (not inside connect timeout)
+        let tools_res = timeout(TOOLS_TIMEOUT, Self::fake_tools_list(config)).await;
+        match tools_res {
+            Ok(tools) => {
+                let _ = self.status_tx.send(McpStatus::Ready);
+                Ok(tools)
+            }
+            Err(_) => {
+                let msg = format!("tools/list timeout after {:?}", TOOLS_TIMEOUT);
+                let _ = self.status_tx.send(McpStatus::Error(msg.clone()));
+                Err(DiscoveryError::ToolsTimeout(TOOLS_TIMEOUT))
             }
         }
     }
 
-    async fn connect_and_list(
-        config: &McpServerConfig,
-    ) -> Result<Vec<DiscoveredTool>, DiscoveryError> {
+    async fn connect_phase(config: &McpServerConfig) -> Result<(), DiscoveryError> {
         // For stdio, simulate exit-code detection: if command is "false" or empty, treat as dead
         if let crate::mcp::McpTransport::Stdio = config.transport {
             if let Some(cmd) = &config.command {
                 if cmd == "__dead__" {
                     return Err(DiscoveryError::StdioExit(Some(1)));
                 }
-                // Simulate process spawn check – if command contains "exit1", fake exit
+                // Simulate process spawn check – if command contains "exit", fake exit
                 if cmd.contains("exit") {
                     return Err(DiscoveryError::StdioExit(Some(1)));
                 }
             }
         }
-
-        // Simulate tools/list with timeout
-        let tools_fut = Self::fake_tools_list(config);
-        match timeout(TOOLS_TIMEOUT, tools_fut).await {
-            Ok(tools) => Ok(tools),
-            Err(_) => Err(DiscoveryError::ToolsTimeout(TOOLS_TIMEOUT)),
+        // Simulate connect latency for deterministic tests: "slow-connect" → exceeds CONNECT_TIMEOUT
+        if let Some(url) = &config.url {
+            if url.contains("slow-connect") {
+                tokio::time::sleep(CONNECT_TIMEOUT + Duration::from_secs(1)).await;
+            }
         }
+        Ok(())
     }
 
     async fn fake_tools_list(config: &McpServerConfig) -> Vec<DiscoveredTool> {
