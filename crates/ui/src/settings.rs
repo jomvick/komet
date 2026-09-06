@@ -16,7 +16,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum RememberedNavigation {
-    Session { id: String },
+    Session {
+        id: String,
+    },
     NewTask {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         project_id: Option<String>,

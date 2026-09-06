@@ -115,6 +115,8 @@ pub struct ResolvedRunConfig {
     pub model: Option<String>,
     pub reasoning: Option<ReasoningLevel>,
     pub model_options: serde_json::Map<String, serde_json::Value>,
+    /// External MCP servers enabled for this session (ids only — never values).
+    pub mcp_server_ids: Vec<String>,
 }
 
 impl ResolvedRunConfig {
@@ -126,6 +128,8 @@ impl ResolvedRunConfig {
             reasoning: self.reasoning,
             model_options: self.model_options.clone(),
             sandbox: SandboxLevel::WorkspaceWrite,
+            // External MCP stays with the agent; Komet does not assign servers.
+            mcp_server_ids: Vec::new(),
         })
     }
 }
@@ -731,6 +735,7 @@ impl Pickers {
                 .or_else(|| self.effective_model_id(cx).map(str::to_string)),
             reasoning: self.effective_reasoning(cx),
             model_options: self.explicit_options(cx),
+            mcp_server_ids: Vec::new(),
         }
     }
 
@@ -1281,6 +1286,7 @@ impl Pickers {
             .and_then(|c| c.config.as_ref())
         {
             config.sandbox = existing.sandbox;
+            config.mcp_server_ids = existing.mcp_server_ids.clone();
         }
         change(&mut config);
         // Reasoning must stay concrete for whatever model the row now names —
@@ -1675,9 +1681,10 @@ impl Pickers {
             self.defaults.no_project = state.no_project;
         }
         if let Some(dir) = &self.data_dir
-            && let Err(err) = self.defaults.save(dir) {
-                tracing::warn!(error = %err, "composer-defaults save failed");
-            }
+            && let Err(err) = self.defaults.save(dir)
+        {
+            tracing::warn!(error = %err, "composer-defaults save failed");
+        }
     }
 
     /// Devices in picker order: this device first, then by name.
@@ -2331,24 +2338,23 @@ impl Pickers {
                     chat_harness,
                     &theme,
                 ));
-            let mut overlay: Option<(PickerKind, AnyElement)> = if self.mounted_kind()
-                == Some(PickerKind::ContextUsage)
-            {
-                let stats = self.state.read(cx).current_context_usage();
-                let popover_theme = Theme::of(cx).clone();
-                let content = crate::context_usage::render_context_popover(
-                    &stats,
-                    chat_harness,
-                    chat_model,
-                    &popover_theme,
-                );
-                Some((
-                    PickerKind::ContextUsage,
-                    self.popover_frame_flush(320.0, content, cx),
-                ))
-            } else {
-                None
-            };
+            let mut overlay: Option<(PickerKind, AnyElement)> =
+                if self.mounted_kind() == Some(PickerKind::ContextUsage) {
+                    let stats = self.state.read(cx).current_context_usage();
+                    let popover_theme = Theme::of(cx).clone();
+                    let content = crate::context_usage::render_context_popover(
+                        &stats,
+                        chat_harness,
+                        chat_model,
+                        &popover_theme,
+                    );
+                    Some((
+                        PickerKind::ContextUsage,
+                        self.popover_frame_flush(320.0, content, cx),
+                    ))
+                } else {
+                    None
+                };
 
             let right = div()
                 .flex()
@@ -4031,6 +4037,7 @@ mod tests {
         assert_eq!(config.harness, HarnessId::ClaudeCode);
         assert_eq!(config.model.as_deref(), Some("opus"));
         assert_eq!(config.sandbox, SandboxLevel::WorkspaceWrite);
+        assert!(config.mcp_server_ids.is_empty());
     }
 
     #[test]

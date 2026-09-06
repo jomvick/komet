@@ -6,12 +6,14 @@
 
 pub mod agent;
 pub mod entities;
+pub mod mcp;
 pub mod motion;
 pub mod view;
 pub mod workspace;
 
 pub use agent::*;
 pub use entities::*;
+pub use mcp::{McpServerConfig, McpTransport, PublicMcpServerConfig, ResolvedMcpServer};
 pub use workspace::*;
 
 /// Parse "0.2.12" (tolerating a `-suffix`/`+build` tail on the last part)

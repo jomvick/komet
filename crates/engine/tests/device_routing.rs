@@ -312,6 +312,7 @@ async fn target_device_id_routes_over_the_relay() {
             permission_timeout_ms: None,
             worktree: None,
             resume: None,
+            mcp: None, mcp_external: Vec::new(),
         },
         message_id: "m-a-1".into(),
     })

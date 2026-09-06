@@ -31,6 +31,7 @@ libc.workspace = true
 gethostname.workspace = true
 tokio-util = { workspace = true, features = ["rt"] }
 sha2.workspace = true
+dirs.workspace = true
 reqwest.workspace = true
 ignore.workspace = true
 nucleo-matcher.workspace = true

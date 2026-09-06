@@ -23,6 +23,7 @@ pub mod doc_host;
 pub mod instance_lock;
 pub mod legacy_home;
 pub mod local_import;
+pub mod mcp;
 pub mod profile;
 pub mod registry;
 pub mod repos;
@@ -113,6 +114,8 @@ pub struct EngineCore {
     pub doc_host: DocHost,
     pub workspace: WorkspaceHost,
     pub registry: Arc<HarnessRegistry>,
+    pub mcp_registry: Arc<crate::mcp::McpRegistry>,
+    pub mcp_secrets: Arc<crate::mcp::McpSecretStore>,
     pub repos: Repos,
     pub workspace_files: WorkspaceFiles,
     pub terminals: Terminals,
@@ -210,7 +213,22 @@ impl EngineCore {
         let store = Arc::new(DocsStore::open(profile.store_root())?);
         let store_for_import = store.clone();
         let journal = Arc::new(RunJournal::open(profile.store_root().join("journals"))?);
-        let sessions = SessionsEngine::new(device_id.clone(), journal, registry.clone());
+        let mcp_registry = Arc::new(
+            crate::mcp::McpRegistry::load(data_dir).unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "mcp registry load failed, starting empty");
+                crate::mcp::McpRegistry::empty(data_dir)
+            }),
+        );
+        let mcp_secrets = Arc::new(crate::mcp::McpSecretStore::new(
+            data_dir.join("mcp-secrets.json"),
+        ));
+        let sessions = SessionsEngine::new(
+            device_id.clone(),
+            journal,
+            registry.clone(),
+            mcp_registry.clone(),
+            mcp_secrets.clone(),
+        );
         let doc_host = DocHost::new(
             store.clone(),
             DocHostConfig {
@@ -285,6 +303,8 @@ impl EngineCore {
             doc_host,
             workspace,
             registry,
+            mcp_registry,
+            mcp_secrets,
             repos,
             workspace_files,
             terminals,
@@ -425,7 +445,8 @@ impl EngineCore {
             self.agent_accounts.clone(),
             self.workspace_scope,
         )
-        .with_auth(self.auth());
+        .with_auth(self.auth())
+        .with_mcp(self.mcp_registry.clone(), self.mcp_secrets.clone());
         if let Some(links) = self.links() {
             rpc = rpc.with_links(links);
         }
