@@ -1,8 +1,10 @@
 pub mod catalog;
 pub mod config;
+pub mod discovery;
 pub mod policy;
 pub mod registry;
 pub mod secrets;
+pub mod server;
 
 pub use config::{McpServerConfig, McpTransport, PublicMcpServerConfig};
 pub use registry::{McpRegistry, ResolvedMcpServer};
@@ -10,5 +12,7 @@ pub use secrets::McpSecretStore;
 
 #[cfg(test)]
 mod tests_config;
+#[cfg(test)]
+mod tests_policy;
 #[cfg(test)]
 mod tests_registry;
