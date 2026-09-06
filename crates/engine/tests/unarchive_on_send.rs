@@ -114,6 +114,7 @@ fn run_payload(message_id: &str) -> SessionCommandPayload {
             permission_timeout_ms: None,
             worktree: None,
             resume: None,
+            mcp: None, mcp_external: Vec::new(),
         },
         message_id: message_id.into(),
     }

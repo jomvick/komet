@@ -40,6 +40,7 @@ fn run_request(prompt: &str) -> RunRequest {
         permission_timeout_ms: None,
         worktree: None,
         resume: None,
+        mcp: None, mcp_external: Vec::new(),
     }
 }
 
@@ -1803,6 +1804,7 @@ async fn real_claude_sees_uploaded_image_inline() {
         permission_timeout_ms: None,
         worktree: None,
         resume: None,
+        mcp: None, mcp_external: Vec::new(),
     };
     core.doc_host
         .queue_command(

@@ -64,6 +64,7 @@ fn request_opencode(prompt: &str, model: Option<&str>) -> RunRequest {
         permission_timeout_ms: None,
         resume: None,
         worktree: None,
+        mcp: None, mcp_external: Vec::new(),
     }
 }
 
@@ -82,6 +83,7 @@ fn request(prompt: &str) -> RunRequest {
         permission_timeout_ms: None,
         resume: None,
         worktree: None,
+        mcp: None, mcp_external: Vec::new(),
     }
 }
 

@@ -106,6 +106,8 @@ pub struct AgentAccountsConfig {
     pub codex_home: PathBuf,
     /// Antigravity home (`$ANTIGRAVITY_HOME` or `~/.gemini/antigravity-cli`) — holds `auth.json`.
     pub antigravity_home: PathBuf,
+    /// Cursor SDK login (`~/.cursor/sdk/auth.json`) — separate from `cursor-agent`.
+    pub cursor_auth_file: PathBuf,
 }
 
 impl AgentAccountsConfig {
@@ -129,6 +131,8 @@ impl AgentAccountsConfig {
             codex_home: env_dir("CODEX_HOME").unwrap_or_else(|| home_dir().join(".codex")),
             antigravity_home: env_dir("ANTIGRAVITY_HOME")
                 .unwrap_or_else(|| home_dir().join(".gemini/antigravity-cli")),
+            cursor_auth_file: env_dir("CURSOR_AUTH_FILE")
+                .unwrap_or_else(|| home_dir().join(".cursor/sdk/auth.json")),
         }
     }
 
@@ -142,6 +146,10 @@ impl AgentAccountsConfig {
 
     fn antigravity_auth_file(&self) -> PathBuf {
         self.antigravity_home.join("auth.json")
+    }
+
+    fn cursor_auth_file(&self) -> PathBuf {
+        self.cursor_auth_file.clone()
     }
 
     fn root_dir(&self) -> PathBuf {
@@ -230,6 +238,19 @@ enum LoginFlow {
         /// Raw keyring secret captured before the login — success = it changed.
         initial: Option<String>,
     },
+    /// SDK browser login (`node <shim> login <store>`). The minted key should
+    /// land in `store`; some SDK builds also write the default
+    /// `~/.cursor/sdk/auth.json` — we treat either as success.
+    Cursor {
+        child: Arc<Mutex<Option<tokio::process::Child>>>,
+        store: PathBuf,
+        /// Digest of the live SDK auth file when the flow started (`None` if
+        /// missing). A new or changed live file means the browser login landed.
+        live_digest: Option<String>,
+        started_at: Instant,
+        output: Arc<Mutex<String>>,
+        exit: Arc<Mutex<Option<Option<i32>>>>,
+    },
 }
 
 impl LoginFlow {
@@ -237,7 +258,8 @@ impl LoginFlow {
         match self {
             LoginFlow::Claude { started_at, .. }
             | LoginFlow::Codex { started_at, .. }
-            | LoginFlow::Antigravity { started_at, .. } => *started_at,
+            | LoginFlow::Antigravity { started_at, .. }
+            | LoginFlow::Cursor { started_at, .. } => *started_at,
         }
     }
 }
@@ -335,6 +357,10 @@ impl AgentAccounts {
             active_keys.insert(HarnessId::Antigravity, detected.account_key.clone());
             self.snapshot_detected(HarnessId::Antigravity, &detected)?;
         }
+        if let Some(detected) = self.detect_cursor() {
+            active_keys.insert(HarnessId::Cursor, detected.account_key.clone());
+            self.snapshot_detected(HarnessId::Cursor, &detected)?;
+        }
 
         // Stable presentation order: provider, then slot creation order (never
         // active-first — switching must not reshuffle the cards).
@@ -343,6 +369,7 @@ impl AgentAccounts {
             HarnessId::ClaudeCode,
             HarnessId::Codex,
             HarnessId::Antigravity,
+            HarnessId::Cursor,
         ] {
             let active_key = active_keys.get(&harness).cloned();
             let slots = self.read_slots(harness);
@@ -410,6 +437,7 @@ impl AgentAccounts {
             HarnessId::ClaudeCode => self.activate_claude(&slot).await?,
             HarnessId::Codex => self.activate_codex(&slot)?,
             HarnessId::Antigravity => self.activate_antigravity(&slot).await?,
+            HarnessId::Cursor => self.activate_cursor(&slot)?,
             other => {
                 return Err(EngineError::Other(format!(
                     "agent accounts are not supported for {other:?}"
@@ -495,6 +523,16 @@ impl AgentAccounts {
         write_file_atomic(&self.inner.config.antigravity_auth_file(), json.as_bytes(), true)
     }
 
+    fn activate_cursor(&self, slot: &Slot) -> Result<(), EngineError> {
+        let file = self.inner.config.cursor_auth_file();
+        if let Some(parent) = file.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_string_pretty(&slot.credentials)
+            .map_err(|e| EngineError::Other(format!("serialize cursor auth: {e}")))?;
+        write_file_atomic(&file, json.as_bytes(), true)
+    }
+
     // ── forget ──────────────────────────────────────────────────────────────
 
     pub async fn forget(
@@ -539,6 +577,7 @@ impl AgentAccounts {
             HarnessId::ClaudeCode => Ok(self.start_claude_login()),
             HarnessId::Codex => self.start_codex_login().await,
             HarnessId::Antigravity => self.start_antigravity_login().await,
+            HarnessId::Cursor => self.start_cursor_login().await,
             other => Err(EngineError::Other(format!(
                 "agent logins are not supported for {other:?}"
             ))),
@@ -696,6 +735,132 @@ impl AgentAccounts {
         let deadline = Instant::now() + Duration::from_secs(5);
         let url = loop {
             if let Some(url) = scan_openai_url(&lock(&output)) {
+                break url;
+            }
+            if lock(&exit).is_some() || Instant::now() > deadline {
+                break String::new();
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        Ok(AgentLoginStart {
+            login_id,
+            url,
+            mode: AgentLoginMode::Browser,
+        })
+    }
+
+    async fn start_cursor_login(&self) -> Result<AgentLoginStart, EngineError> {
+        let stale: Vec<String> = lock(&self.inner.flows)
+            .iter()
+            .filter(|(_, f)| matches!(f, LoginFlow::Cursor { .. }))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in stale {
+            self.cancel_login(&id);
+        }
+
+        let login_id = new_id();
+        let home = self
+            .inner
+            .config
+            .root_dir()
+            .join(format!(".login-{login_id}"));
+        std::fs::create_dir_all(&home)?;
+        let store = home.join("auth.json");
+        let mut cmd = match komet_harness::cursor::login_command(&store).await {
+            Ok(cmd) => cmd,
+            Err(err) => {
+                let _ = std::fs::remove_dir_all(&home);
+                return Err(EngineError::Other(format!(
+                    "Could not start Cursor login: {err}"
+                )));
+            }
+        };
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(err) => {
+                let _ = std::fs::remove_dir_all(&home);
+                return Err(EngineError::Other(format!(
+                    "Could not start Cursor login: {err}"
+                )));
+            }
+        };
+
+        let output = Arc::new(Mutex::new(String::new()));
+        for pipe in [
+            child
+                .stdout
+                .take()
+                .map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Send + Unpin>),
+            child
+                .stderr
+                .take()
+                .map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Send + Unpin>),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let sink = output.clone();
+            tokio::spawn(async move {
+                use tokio::io::AsyncReadExt;
+                let mut pipe = pipe;
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = pipe.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    lock(&sink).push_str(&String::from_utf8_lossy(&buf[..n]));
+                }
+            });
+        }
+
+        let child = Arc::new(Mutex::new(Some(child)));
+        let exit: Arc<Mutex<Option<Option<i32>>>> = Arc::new(Mutex::new(None));
+        {
+            let child = child.clone();
+            let exit = exit.clone();
+            tokio::spawn(async move {
+                loop {
+                    {
+                        let mut slot = lock(&child);
+                        match slot.as_mut().map(|c| c.try_wait()) {
+                            None => break,
+                            Some(Ok(Some(status))) => {
+                                *lock(&exit) = Some(status.code());
+                                *slot = None;
+                                break;
+                            }
+                            Some(Ok(None)) => {}
+                            Some(Err(_)) => {
+                                *lock(&exit) = Some(None);
+                                *slot = None;
+                                break;
+                            }
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            });
+        }
+
+        lock(&self.inner.flows).insert(
+            login_id.clone(),
+            LoginFlow::Cursor {
+                child,
+                store,
+                live_digest: file_digest(&self.inner.config.cursor_auth_file()),
+                started_at: Instant::now(),
+                output: output.clone(),
+                exit: exit.clone(),
+            },
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let url = loop {
+            if let Some(url) = scan_cursor_auth_url(&lock(&output)) {
                 break url;
             }
             if lock(&exit).is_some() || Instant::now() > deadline {
@@ -1134,30 +1299,114 @@ impl AgentAccounts {
 
     pub async fn poll_login(&self, login_id: &str) -> Result<AgentLoginPoll, EngineError> {
         self.sweep_flows();
-        let (home, exit, output) = match lock(&self.inner.flows).get(login_id) {
-            None => {
-                return Err(EngineError::Other(
-                    "This sign-in attempt expired — start again.".into(),
-                ));
+        // Snapshot what we need, then drop `flows` before finish/cancel —
+        // those re-lock the same mutex (std Mutex is not reentrant).
+        let cursor = {
+            let flows = lock(&self.inner.flows);
+            match flows.get(login_id) {
+                None => {
+                    return Err(EngineError::Other(
+                        "This sign-in attempt expired — start again.".into(),
+                    ));
+                }
+                Some(LoginFlow::Claude { .. }) => {
+                    return Ok(AgentLoginPoll {
+                        status: AgentLoginStatus::Pending,
+                        message: None,
+                    });
+                }
+                Some(LoginFlow::Antigravity { .. }) => {
+                    // PasteCode mode drives completion through complete_login; the
+                    // poll path just stays Pending while the PTY flow is alive.
+                    return Ok(AgentLoginPoll {
+                        status: AgentLoginStatus::Pending,
+                        message: None,
+                    });
+                }
+                Some(LoginFlow::Cursor {
+                    store,
+                    live_digest,
+                    exit,
+                    output,
+                    ..
+                }) => Some((
+                    store.clone(),
+                    live_digest.clone(),
+                    exit.clone(),
+                    output.clone(),
+                )),
+                Some(LoginFlow::Codex {
+                    home, exit, output, ..
+                }) => {
+                    let tuple = (home.clone(), exit.clone(), output.clone());
+                    drop(flows);
+                    return self.poll_codex_login(login_id, tuple.0, tuple.1, tuple.2);
+                }
             }
-            Some(LoginFlow::Claude { .. }) => {
-                return Ok(AgentLoginPoll {
-                    status: AgentLoginStatus::Pending,
-                    message: None,
-                });
-            }
-            Some(LoginFlow::Antigravity { .. }) => {
-                // PasteCode mode drives completion through complete_login; the
-                // poll path just stays Pending while the PTY flow is alive.
-                return Ok(AgentLoginPoll {
-                    status: AgentLoginStatus::Pending,
-                    message: None,
-                });
-            }
-            Some(LoginFlow::Codex {
-                home, exit, output, ..
-            }) => (home.clone(), exit.clone(), output.clone()),
         };
+        if let Some((store, live_digest, exit, output)) = cursor {
+            let live = self.inner.config.cursor_auth_file();
+            let output_snapshot = lock(&output).clone();
+            let exited = *lock(&exit);
+            let from_throwaway = read_json(&store).and_then(parse_cursor_auth);
+            let live_changed = file_digest(&live).is_some_and(|now| Some(now) != live_digest);
+            let accept_live = live_changed
+                || scan_cursor_logged_in(&output_snapshot)
+                || matches!(exited, Some(Some(0)));
+            let from_live = accept_live
+                .then(|| read_json(&live).and_then(parse_cursor_auth))
+                .flatten();
+            if let Some(detected) = from_throwaway.or(from_live) {
+                self.finish_cursor_login(login_id, detected)?;
+                return Ok(AgentLoginPoll {
+                    status: AgentLoginStatus::Done,
+                    message: None,
+                });
+            }
+            if let Some(code) = exited {
+                self.cancel_login(login_id);
+                let message = if code == Some(0) {
+                    "Cursor login finished without credentials.".to_string()
+                } else {
+                    output_snapshot
+                        .trim()
+                        .lines()
+                        .rev()
+                        .find_map(|line| {
+                            serde_json::from_str::<serde_json::Value>(line).ok().and_then(
+                                |v| {
+                                    (v.get("ev").and_then(|e| e.as_str()) == Some("fatal"))
+                                        .then(|| {
+                                            v.get("message")
+                                                .and_then(|m| m.as_str())
+                                                .unwrap_or("sign-in failed")
+                                                .to_string()
+                                        })
+                                },
+                            )
+                        })
+                        .unwrap_or_else(|| "sign-in failed".into())
+                };
+                return Ok(AgentLoginPoll {
+                    status: AgentLoginStatus::Error,
+                    message: Some(message),
+                });
+            }
+            return Ok(AgentLoginPoll {
+                status: AgentLoginStatus::Pending,
+                message: None,
+            });
+        }
+        unreachable!("login flow was classified above");
+    }
+
+    fn poll_codex_login(
+        &self,
+        login_id: &str,
+        home: PathBuf,
+        exit: Arc<Mutex<Option<Option<i32>>>>,
+        output: Arc<Mutex<String>>,
+    ) -> Result<AgentLoginPoll, EngineError> {
         // Try antigravity first (shares same throwaway structure as codex)
         if let Some(detected) = read_json(&home.join("auth.json"))
             .and_then(|v| parse_antigravity_auth(v.clone()).or_else(|| parse_codex_auth(v)))
@@ -1226,6 +1475,14 @@ impl AgentAccounts {
                 }
                 let _ = std::fs::remove_dir_all(&home);
             }
+            Some(LoginFlow::Cursor { child, store, .. }) => {
+                if let Some(c) = lock(&child).as_mut() {
+                    let _ = c.start_kill();
+                }
+                if let Some(home) = store.parent() {
+                    let _ = std::fs::remove_dir_all(home);
+                }
+            }
             Some(LoginFlow::Antigravity {
                 killer, initial, ..
             }) => {
@@ -1260,6 +1517,19 @@ impl AgentAccounts {
     /// Tear down a flow after a SUCCESSFUL Antigravity login, WITHOUT restoring
     /// the prior keyring secret — the entry `agy` just wrote is the new account
     /// and must be left alone (unlike [`Self::cancel_login`], which restores it).
+    fn finish_cursor_login(&self, login_id: &str, detected: Detected) -> Result<(), EngineError> {
+        self.snapshot_detected(HarnessId::Cursor, &detected)?;
+        if let Some(slot) = self
+            .read_slots(HarnessId::Cursor)
+            .into_iter()
+            .find(|s| s.account_key == detected.account_key)
+        {
+            self.activate_cursor(&slot)?;
+        }
+        self.cancel_login(login_id);
+        Ok(())
+    }
+
     fn finish_antigravity_login(&self, login_id: &str) {
         if let Some(LoginFlow::Antigravity { killer, .. }) = lock(&self.inner.flows).remove(login_id)
             && let Some(k) = lock(&killer).as_mut()
@@ -1330,6 +1600,10 @@ impl AgentAccounts {
 
     fn detect_codex(&self) -> Option<Detected> {
         read_json(&self.inner.config.codex_auth_file()).and_then(parse_codex_auth)
+    }
+
+    fn detect_cursor(&self) -> Option<Detected> {
+        read_json(&self.inner.config.cursor_auth_file()).and_then(parse_cursor_auth)
     }
 
     async fn detect_antigravity(&self) -> Option<Detected> {
@@ -2445,6 +2719,74 @@ fn parse_when(value: Option<&serde_json::Value>) -> Option<DateTime<Utc>> {
     }
 }
 
+/// Parse the Cursor SDK store (`~/.cursor/sdk/auth.json` or a login throwaway).
+fn parse_cursor_auth(auth: serde_json::Value) -> Option<Detected> {
+    let key = str_field(&auth, "apiKey")
+        .or_else(|| str_field(&auth, "accessToken"))
+        .or_else(|| str_field(&auth, "token"))?;
+    if key.is_empty() {
+        return None;
+    }
+    let email = str_field(&auth, "email").unwrap_or_else(|| {
+        let tail: String = key
+            .chars()
+            .rev()
+            .take(4)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        format!("Cursor ·…{tail}")
+    });
+    let digest = Sha256::digest(key.as_bytes());
+    Some(Detected {
+        account_key: str_field(&auth, "email")
+            .unwrap_or_else(|| format!("cursor:{}", &crate::repos::hex(&digest)[..12])),
+        profile: SlotProfile {
+            email,
+            display_name: None,
+            organization: None,
+            plan: None,
+            auth_kind: AgentAuthKind::Oauth,
+        },
+        credentials: Some(auth),
+        claude_config: None,
+    })
+}
+
+fn file_digest(path: &Path) -> Option<String> {
+    let raw = std::fs::read(path).ok()?;
+    if raw.is_empty() {
+        return None;
+    }
+    Some(crate::repos::hex(&Sha256::digest(&raw)))
+}
+
+fn scan_cursor_logged_in(output: &str) -> bool {
+    output.lines().any(|line| {
+        serde_json::from_str::<serde_json::Value>(line.trim())
+            .ok()
+            .and_then(|v| v.get("ev").and_then(|e| e.as_str()).map(str::to_string))
+            .as_deref()
+            == Some("logged-in")
+    })
+}
+
+fn scan_cursor_auth_url(output: &str) -> Option<String> {
+    for line in output.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            continue;
+        };
+        if value.get("ev").and_then(|e| e.as_str()) == Some("auth-url")
+            && let Some(url) = value.get("url").and_then(|u| u.as_str())
+            && !url.is_empty()
+        {
+            return Some(url.to_string());
+        }
+    }
+    None
+}
+
 fn scan_openai_url(output: &str) -> Option<String> {
     let start = output.find("https://auth.openai.com/")?;
     let rest = &output[start..];
@@ -2746,6 +3088,187 @@ mod tests {
     }
 
     #[test]
+    fn cursor_auth_url_scan() {
+        assert_eq!(
+            scan_cursor_auth_url(
+                "{\"ev\":\"auth-url\",\"url\":\"https://cursor.com/login?x=1\"}\nnoise\n"
+            )
+            .as_deref(),
+            Some("https://cursor.com/login?x=1")
+        );
+        assert_eq!(scan_cursor_auth_url("nothing here"), None);
+    }
+
+    #[test]
+    fn cursor_logged_in_scan() {
+        assert!(scan_cursor_logged_in(
+            "{\"ev\":\"auth-url\",\"url\":\"https://x\"}\n{\"ev\":\"logged-in\",\"email\":\"a@b.c\"}\n"
+        ));
+        assert!(!scan_cursor_logged_in(
+            "{\"ev\":\"auth-url\",\"url\":\"https://x\"}\n"
+        ));
+    }
+
+    #[test]
+    fn file_digest_tracks_content() {
+        let dir = std::env::temp_dir().join(format!(
+            "komet-digest-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("auth.json");
+        assert_eq!(file_digest(&path), None);
+        std::fs::write(&path, r#"{"a":1}"#).unwrap();
+        let first = file_digest(&path);
+        std::fs::write(&path, r#"{"a":2}"#).unwrap();
+        let second = file_digest(&path);
+        assert!(first.is_some());
+        assert_ne!(first, second);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parse_cursor_store_shape() {
+        let detected = parse_cursor_auth(serde_json::json!({
+            "apiKey": "cur_secret",
+            "email": "dev@example.com",
+        }))
+        .expect("apiKey store");
+        assert_eq!(detected.profile.email, "dev@example.com");
+        assert_eq!(detected.account_key, "dev@example.com");
+        assert!(parse_cursor_auth(serde_json::json!({"unrelated": 1})).is_none());
+    }
+
+    #[tokio::test]
+    async fn cursor_store_is_listed_as_active_account() {
+        let root = std::env::temp_dir().join(format!(
+            "komet-cursor-detect-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let config = AgentAccountsConfig {
+            data_dir: root.join("data"),
+            claude_config_dir: root.join("claude"),
+            claude_config_file: root.join("claude.json"),
+            codex_home: root.join("codex"),
+            antigravity_home: root.join("antigravity"),
+            cursor_auth_file: root.join("sdk").join("auth.json"),
+        };
+        let live = config.cursor_auth_file.clone();
+        std::fs::create_dir_all(live.parent().unwrap()).unwrap();
+        std::fs::write(
+            &live,
+            r#"{"apiKey":"test-cursor-key","email":"dev@example.com"}"#,
+        )
+        .unwrap();
+        let accounts = AgentAccounts::new(config);
+        let snapshot = accounts.list(false).await.expect("list");
+        let cursor: Vec<_> = snapshot
+            .accounts
+            .iter()
+            .filter(|a| a.harness == HarnessId::Cursor)
+            .collect();
+        assert_eq!(cursor.len(), 1, "{snapshot:?}");
+        assert!(cursor[0].active);
+        assert_eq!(cursor[0].email.as_deref(), Some("dev@example.com"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn cursor_test_config(root: &std::path::Path) -> AgentAccountsConfig {
+        AgentAccountsConfig {
+            data_dir: root.join("data"),
+            claude_config_dir: root.join("claude"),
+            claude_config_file: root.join("claude.json"),
+            codex_home: root.join("codex"),
+            antigravity_home: root.join("antigravity"),
+            cursor_auth_file: root.join("sdk").join("auth.json"),
+        }
+    }
+
+    fn insert_cursor_flow(
+        accounts: &AgentAccounts,
+        login_id: &str,
+        store: PathBuf,
+        live_digest: Option<String>,
+        output: &str,
+        exit: Option<Option<i32>>,
+    ) {
+        lock(&accounts.inner.flows).insert(
+            login_id.to_string(),
+            LoginFlow::Cursor {
+                child: Arc::new(Mutex::new(None)),
+                store,
+                live_digest,
+                started_at: Instant::now(),
+                output: Arc::new(Mutex::new(output.to_string())),
+                exit: Arc::new(Mutex::new(exit)),
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn cursor_poll_done_when_live_store_appears() {
+        let root = std::env::temp_dir().join(format!(
+            "komet-cursor-poll-live-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let config = cursor_test_config(&root);
+        let live = config.cursor_auth_file.clone();
+        let throwaway = root.join("throwaway").join("auth.json");
+        std::fs::create_dir_all(throwaway.parent().unwrap()).unwrap();
+        let accounts = AgentAccounts::new(config);
+        insert_cursor_flow(&accounts, "login-live", throwaway, None, "", None);
+
+        let pending = accounts.poll_login("login-live").await.expect("pending");
+        assert_eq!(pending.status, AgentLoginStatus::Pending);
+
+        std::fs::create_dir_all(live.parent().unwrap()).unwrap();
+        std::fs::write(
+            &live,
+            r#"{"apiKey":"test-cursor-key","email":"dev@example.com"}"#,
+        )
+        .unwrap();
+        let done = accounts.poll_login("login-live").await.expect("done");
+        assert_eq!(done.status, AgentLoginStatus::Done);
+        assert!(lock(&accounts.inner.flows).get("login-live").is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn cursor_poll_done_on_logged_in_event() {
+        let root = std::env::temp_dir().join(format!(
+            "komet-cursor-poll-ev-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let config = cursor_test_config(&root);
+        let live = config.cursor_auth_file.clone();
+        std::fs::create_dir_all(live.parent().unwrap()).unwrap();
+        std::fs::write(
+            &live,
+            r#"{"apiKey":"test-cursor-key","email":"dev@example.com"}"#,
+        )
+        .unwrap();
+        let digest = file_digest(&live);
+        let throwaway = root.join("throwaway").join("auth.json");
+        std::fs::create_dir_all(throwaway.parent().unwrap()).unwrap();
+        let accounts = AgentAccounts::new(config);
+        insert_cursor_flow(
+            &accounts,
+            "login-ev",
+            throwaway,
+            digest,
+            "{\"ev\":\"logged-in\",\"email\":\"dev@example.com\"}\n",
+            None,
+        );
+        let done = accounts.poll_login("login-ev").await.expect("done");
+        assert_eq!(done.status, AgentLoginStatus::Done);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn openai_url_scan() {
         assert_eq!(
             scan_openai_url("open https://auth.openai.com/authorize?x=1 in your browser\n")
@@ -2831,6 +3354,7 @@ mod tests {
             claude_config_file: root.join("claude.json"),
             codex_home: root.join("codex"),
             antigravity_home: root.join("antigravity"),
+            cursor_auth_file: root.join("cursor-sdk-auth.json"),
         };
         let accounts = AgentAccounts::new(config);
 
@@ -2912,6 +3436,7 @@ mod tests {
             claude_config_file: root.join("claude.json"),
             codex_home: root.join("codex"),
             antigravity_home: root.join("antigravity"),
+            cursor_auth_file: root.join("cursor-sdk-auth.json"),
         };
         let accounts = AgentAccounts::new(config);
 

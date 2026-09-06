@@ -159,6 +159,7 @@ fn run_request(prompt: &str) -> RunRequest {
         permission_timeout_ms: None,
         worktree: None,
         resume: None,
+        mcp: None, mcp_external: Vec::new(),
     }
 }
 
@@ -520,6 +521,7 @@ async fn chat_config_selects_the_run_harness() {
                 reasoning: None,
                 model_options: Default::default(),
                 sandbox: SandboxLevel::WorkspaceWrite,
+                mcp_server_ids: Vec::new(),
             }),
             None,
         )

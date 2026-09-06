@@ -43,7 +43,7 @@ use crate::settings::harnesses::HarnessesPage;
 use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
 use crate::settings::{
-    KeymapConfig, RememberedNavigation, RIGHT_PANE_DEFAULT, RIGHT_PANE_MAX, RIGHT_PANE_MIN,
+    KeymapConfig, RIGHT_PANE_DEFAULT, RIGHT_PANE_MAX, RIGHT_PANE_MIN, RememberedNavigation,
     SAVE_DEBOUNCE_MS, SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, TERMINAL_DEFAULT_HEIGHT,
     UiSettings, platform_combo,
 };
@@ -2256,9 +2256,7 @@ impl Shell {
             }
         };
         if self.settings.last_session_by_device.get(&device_id) != Some(&nav) {
-            self.settings
-                .last_session_by_device
-                .insert(device_id, nav);
+            self.settings.last_session_by_device.insert(device_id, nav);
             self.schedule_save(cx);
         }
     }
@@ -5951,7 +5949,11 @@ impl Shell {
                 .gap(px(5.0))
                 .cursor_pointer()
                 .border_b_2()
-                .border_color(if is_active { theme.accent } else { gpui::transparent_black() })
+                .border_color(if is_active {
+                    theme.accent
+                } else {
+                    gpui::transparent_black()
+                })
                 // The old session-tab strip's solved carve-out: NOT
                 // `.occlude()` — a BlockMouse hitbox ends the hit test,
                 // so the scroll container behind the tabs never saw
@@ -5991,14 +5993,22 @@ impl Shell {
                         cx.new(|_| SurfaceTabGhost { title })
                     },
                 )
-                .child(icon(icon_path).size(px(13.0)).text_color(if is_active { theme.text } else { theme.text_muted.opacity(0.7) }))
+                .child(icon(icon_path).size(px(13.0)).text_color(if is_active {
+                    theme.text
+                } else {
+                    theme.text_muted.opacity(0.7)
+                }))
                 .child(
                     div()
                         .min_w_0()
                         .flex_1()
                         .truncate()
                         .text_size(px(12.0))
-                        .text_color(if is_active { theme.text } else { theme.text_muted })
+                        .text_color(if is_active {
+                            theme.text
+                        } else {
+                            theme.text_muted
+                        })
                         .child(title),
                 )
                 .child(
@@ -6017,7 +6027,11 @@ impl Shell {
                             cx.stop_propagation();
                             this.close_right_surface(surface, window, cx);
                         }))
-                        .child(icon(icons::CLOSE).size(px(10.0)).text_color(theme.text_muted)),
+                        .child(
+                            icon(icons::CLOSE)
+                                .size(px(10.0))
+                                .text_color(theme.text_muted),
+                        ),
                 );
             // Sliding transform while a sibling drags over (the terminal
             // drawer's exact recipe): animate 150ms between committed

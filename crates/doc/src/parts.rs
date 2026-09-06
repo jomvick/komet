@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use komet_proto::{AgentEvent, ToolCall, ToolDiff, UserInputQuestion};
+use komet_proto::{AgentEvent, SUBAGENT_MODEL_KEYS, ToolCall, ToolDiff, UserInputQuestion};
 
 use crate::constants::MSG_INLINE_MAX;
 
@@ -549,8 +549,8 @@ pub fn sidecar_payload(event: &AgentEvent) -> Option<SidecarPayload> {
 
 /// Render-only privacy policy — strip heavy/sensitive tool inputs before a call enters the doc.
 ///
-/// Keeps: command / path / pattern / url / query / todo items / server+tool names.
-/// Drops: WriteFile content, EditFile old/new strings, WebFetch prompt, Mcp/Unknown input.
+/// Keeps: command / path / pattern / url / query / todo items / server+tool names / Mcp subagent model keys.
+/// Drops: WriteFile content, EditFile old/new strings, WebFetch prompt, other Mcp/Unknown input.
 /// Full inputs remain only in the host's local run journal. Idempotent.
 pub fn sanitize_tool_call(call: &ToolCall) -> ToolCall {
     match call {
@@ -567,10 +567,24 @@ pub fn sanitize_tool_call(call: &ToolCall) -> ToolCall {
             url: url.clone(),
             prompt: None,
         },
-        ToolCall::Mcp { server, tool, .. } => ToolCall::Mcp {
+        ToolCall::Mcp {
+            server,
+            tool,
+            input,
+        } => ToolCall::Mcp {
             server: server.clone(),
             tool: tool.clone(),
-            input: None,
+            input: input.as_ref().and_then(|v| {
+                let kept: serde_json::Map<String, serde_json::Value> = SUBAGENT_MODEL_KEYS
+                    .iter()
+                    .filter_map(|k| v.get(*k).map(|val| (k.to_string(), val.clone())))
+                    .collect();
+                if kept.is_empty() {
+                    None
+                } else {
+                    Some(serde_json::Value::Object(kept))
+                }
+            }),
         },
         ToolCall::Unknown { name, .. } => ToolCall::Unknown {
             name: name.clone(),
@@ -754,6 +768,36 @@ mod tests {
             }
         );
         assert_eq!(sanitize_tool_call(&clean), clean);
+    }
+
+    #[test]
+    fn sanitize_mcp_keeps_only_subagent_model_keys() {
+        let call = ToolCall::Mcp {
+            server: "s".into(),
+            tool: "t".into(),
+            input: Some(serde_json::json!({"model": "sonnet", "prompt": "secret"})),
+        };
+        assert_eq!(
+            sanitize_tool_call(&call),
+            ToolCall::Mcp {
+                server: "s".into(),
+                tool: "t".into(),
+                input: Some(serde_json::json!({"model": "sonnet"})),
+            }
+        );
+        let no_model = ToolCall::Mcp {
+            server: "s".into(),
+            tool: "t".into(),
+            input: Some(serde_json::json!({"prompt": "secret"})),
+        };
+        assert_eq!(
+            sanitize_tool_call(&no_model),
+            ToolCall::Mcp {
+                server: "s".into(),
+                tool: "t".into(),
+                input: None,
+            }
+        );
     }
 
     #[test]

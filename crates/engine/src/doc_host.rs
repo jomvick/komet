@@ -2228,6 +2228,7 @@ impl DocHost {
                         reasoning: request.reasoning,
                         model_options: request.model_options.clone(),
                         sandbox: request.sandbox,
+                        mcp_server_ids: Vec::new(),
                     };
                     if let Err(err) = ws.set_chat_config(chat_id, &config) {
                         tracing::warn!(chat = %chat_id, error = %err, "run-config backfill failed");
@@ -2417,6 +2418,7 @@ impl DocHost {
             // even if we wanted to.
             worktree: None,
             permission_timeout_ms: None,
+            mcp: None, mcp_external: Vec::new(),
         })
     }
 
