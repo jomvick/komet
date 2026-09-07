@@ -1313,6 +1313,8 @@ pub enum ComposerInputEvent {
     MentionNavigate(isize),
     MentionAccept,
     MentionDismiss,
+    /// Escape with no mention popup — used by in-place prompt edit.
+    Cancelled,
     /// Images pasted from the clipboard (screenshots / copied image data) —
     /// the wrapper stages them as attachments (use-attachments.ts onPaste).
     PastedImages(Vec<gpui::Image>),
@@ -1362,6 +1364,9 @@ pub struct ComposerInput {
     /// File mentions are a composer feature, not a behavior of generic inputs
     /// (picker searches and rename fields also use this type).
     mentions_enabled: bool,
+    /// Escape with no mention popup emits [`ComposerInputEvent::Cancelled`]
+    /// instead of propagating (in-place prompt edit).
+    cancel_on_escape: bool,
     /// Bumped once per `layout_text` pass — the flip logic uses it to apply at
     /// most one compact↔expanded flip per layout (a flip is only re-evaluated
     /// after the input has been measured in the new mode).
@@ -1452,6 +1457,7 @@ impl ComposerInput {
             projection: TextProjection::default(),
             ghost: None,
             mentions_enabled: false,
+            cancel_on_escape: false,
             layout_epoch: 0,
             display_is_placeholder: true,
             blink_anchor: Instant::now(),
@@ -1558,9 +1564,13 @@ impl ComposerInput {
         cx.notify();
     }
 
-    fn enable_mentions(&mut self) {
+    pub(crate) fn enable_mentions(&mut self) {
         self.mentions_enabled = true;
         self.refresh_projection();
+    }
+
+    pub(crate) fn enable_escape_cancel(&mut self) {
+        self.cancel_on_escape = true;
     }
 
     fn refresh_projection(&mut self) {
@@ -2302,6 +2312,8 @@ impl ComposerInput {
     fn mention_escape(&mut self, _: &MentionEscape, _: &mut Window, cx: &mut Context<Self>) {
         if self.mention_open {
             cx.emit(ComposerInputEvent::MentionDismiss);
+        } else if self.cancel_on_escape {
+            cx.emit(ComposerInputEvent::Cancelled);
         } else {
             cx.propagate();
         }
@@ -3597,6 +3609,18 @@ impl Composer {
         &self.pickers
     }
 
+    /// Queue a prompt as a new turn (in-place prompt Edit → Send).
+    pub fn submit_text(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
+        let text = text.into().trim().to_string();
+        if text.is_empty() || self.sending || self.send_blocked(cx) || self.wizard.is_some() {
+            return;
+        }
+        if self.run_live(cx) {
+            self.interrupt(cx);
+        }
+        self.send(text, false, cx);
+    }
+
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let input = cx.new(|cx| {
             let mut input = ComposerInput::new("Do anything…", cx);
@@ -3650,6 +3674,7 @@ impl Composer {
                 this.add_staged(staged, cx);
             }
             ComposerInputEvent::PastedPaths(paths) => this.add_paths(paths.clone(), cx),
+            ComposerInputEvent::Cancelled => {}
         });
         let current_key = state.read(cx).selected_chat.clone().unwrap_or_default();
         let mut composer = Self {
