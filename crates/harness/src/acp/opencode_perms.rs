@@ -109,7 +109,10 @@ pub fn sandbox_runtime_config(perms: &OpenCodePerms, cwd: &str) -> Option<String
     }
     let mut deny_read: Vec<String> = perms.sensitive_read_deny.clone();
     if deny_read.is_empty() {
-        deny_read = komet_proto::OPCODE_SENSITIVE_READ_DENY.iter().map(|s| s.to_string()).collect();
+        deny_read = komet_proto::OPCODE_SENSITIVE_READ_DENY
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
     }
     let deny_write: Vec<String> = perms.read_only_paths.clone();
     let allow_write = vec![cwd.to_string(), "/tmp".to_string()];
@@ -239,7 +242,7 @@ mod tests {
             r#"{"permission":{"bash":{"*":"ask"}}}"#
         );
     }
-#[test]
+    #[test]
     fn bare_tool_fields_render_at_their_top_level_keys() {
         let p = OpenCodePerms {
             bash: BashPerms {

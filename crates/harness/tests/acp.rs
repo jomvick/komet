@@ -64,7 +64,8 @@ fn request_opencode(prompt: &str, model: Option<&str>) -> RunRequest {
         permission_timeout_ms: None,
         resume: None,
         worktree: None,
-        mcp: None, mcp_external: Vec::new(),
+        mcp: None,
+        mcp_external: Vec::new(),
     }
 }
 
@@ -83,7 +84,8 @@ fn request(prompt: &str) -> RunRequest {
         permission_timeout_ms: None,
         resume: None,
         worktree: None,
-        mcp: None, mcp_external: Vec::new(),
+        mcp: None,
+        mcp_external: Vec::new(),
     }
 }
 
@@ -1039,7 +1041,9 @@ async fn opencode_overlay_injected() {
     let (controls, _steer, _token) = controls();
     let events = run_to_end(&opencode_harness(), req, controls).await;
     assert!(
-        events.contains(&AgentEvent::TextDelta { text: "overlay ok".into() }),
+        events.contains(&AgentEvent::TextDelta {
+            text: "overlay ok".into()
+        }),
         "{events:?}"
     );
     assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);

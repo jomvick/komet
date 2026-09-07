@@ -19,7 +19,8 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 
 use komet_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SlashCommand, SteeringMode,
+    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SlashCommand,
+    SteeringMode,
 };
 
 use crate::{Harness, HarnessError, RunControls};
@@ -127,7 +128,8 @@ impl Harness for AntigravityHarness {
                 crate::compose_child_path(&mut cmd, &executable);
                 cmd.arg("models");
                 cmd.stdout(Stdio::piped()).stderr(Stdio::null());
-                if let Ok(Ok(output)) = tokio::time::timeout(std::time::Duration::from_secs(15), cmd.output()).await
+                if let Ok(Ok(output)) =
+                    tokio::time::timeout(std::time::Duration::from_secs(15), cmd.output()).await
                     && output.status.success()
                     && let Ok(text) = String::from_utf8(output.stdout)
                 {
@@ -161,7 +163,8 @@ impl Harness for AntigravityHarness {
             },
             SlashCommand {
                 name: "grill-me".into(),
-                description: "Interactive architectural interview to clarify design decisions".into(),
+                description: "Interactive architectural interview to clarify design decisions"
+                    .into(),
                 input_hint: None,
             },
             SlashCommand {

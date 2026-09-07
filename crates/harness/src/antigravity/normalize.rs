@@ -18,7 +18,8 @@ pub fn normalize_tool_call(name: &str, params: Option<&Value>) -> ToolCall {
     let p = params.unwrap_or(&Value::Null);
 
     match name {
-        "run_command" | "bash" | "exec" | "command_status" | "send_command_input" | "notebook_execution" => {
+        "run_command" | "bash" | "exec" | "command_status" | "send_command_input"
+        | "notebook_execution" => {
             let command = p
                 .get("CommandLine")
                 .or_else(|| p.get("command"))
@@ -55,7 +56,11 @@ pub fn normalize_tool_call(name: &str, params: Option<&Value>) -> ToolCall {
                 .map(str::to_string);
             ToolCall::WriteFile { path, content }
         }
-        "replace_file_content" | "edit_file" | "multi_replace_file_content" | "sed_file" | "notebook_edit" => {
+        "replace_file_content"
+        | "edit_file"
+        | "multi_replace_file_content"
+        | "sed_file"
+        | "notebook_edit" => {
             let path = p
                 .get("TargetFile")
                 .or_else(|| p.get("path"))
@@ -268,7 +273,11 @@ mod tests {
         });
         let call = normalize_tool_call("multi_replace_file_content", Some(&json));
         match call {
-            ToolCall::EditFile { path, old_string, new_string } => {
+            ToolCall::EditFile {
+                path,
+                old_string,
+                new_string,
+            } => {
                 assert_eq!(path, "/app/main.rs");
                 assert_eq!(old_string.as_deref(), Some("old"));
                 assert_eq!(new_string.as_deref(), Some("new"));

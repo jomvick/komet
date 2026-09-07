@@ -209,7 +209,10 @@ impl CodexHarness {
                 )
                 .await?;
             client.notify("initialized", None);
-            let skills = client.request("skills/list", json!({})).await.unwrap_or(Value::Null);
+            let skills = client
+                .request("skills/list", json!({}))
+                .await
+                .unwrap_or(Value::Null);
             let mut commands = catalog::static_commands();
             let discovered = parse_skill_commands(&skills);
             for cmd in discovered {

@@ -42,7 +42,8 @@ fn request(prompt: &str) -> RunRequest {
         permission_timeout_ms: None,
         worktree: None,
         resume: None,
-        mcp: None, mcp_external: Vec::new(),
+        mcp: None,
+        mcp_external: Vec::new(),
     }
 }
 
@@ -90,10 +91,29 @@ async fn happy_path_streams_deltas_and_completes() {
     let (ctrls, _steer, _tok) = controls();
     let events = collect_events(&h, request("scenario:happy"), ctrls).await;
 
-    assert!(events.iter().any(|e| matches!(e, AgentEvent::SessionStarted { .. })));
-    assert!(events.iter().any(|e| matches!(e, AgentEvent::TextDelta { text } if text.contains("Hello from Antigravity"))));
-    assert!(events.iter().any(|e| matches!(e, AgentEvent::Usage { input_tokens: 100, output_tokens: 20, .. })));
-    assert!(events.iter().any(|e| matches!(e, AgentEvent::Done { status: DoneStatus::Completed, .. })));
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::SessionStarted { .. }))
+    );
+    assert!(events.iter().any(
+        |e| matches!(e, AgentEvent::TextDelta { text } if text.contains("Hello from Antigravity"))
+    ));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::Usage {
+            input_tokens: 100,
+            output_tokens: 20,
+            ..
+        }
+    )));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::Done {
+            status: DoneStatus::Completed,
+            ..
+        }
+    )));
 }
 
 #[tokio::test]
@@ -103,12 +123,20 @@ async fn flags_include_dangerously_skip_permissions_and_add_dir() {
     let req = request("scenario:verify_flags");
     let events = collect_events(&h, req, ctrls).await;
 
-    let done = events.iter().find_map(|e| match e {
-        AgentEvent::Done { status, error, .. } => Some((status, error)),
-        _ => None,
-    }).expect("must have Done event");
+    let done = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::Done { status, error, .. } => Some((status, error)),
+            _ => None,
+        })
+        .expect("must have Done event");
 
-    assert_eq!(done.0, &DoneStatus::Completed, "Expected Completed, got error: {:?}", done.1);
+    assert_eq!(
+        done.0,
+        &DoneStatus::Completed,
+        "Expected Completed, got error: {:?}",
+        done.1
+    );
 }
 
 #[tokio::test]
@@ -118,10 +146,13 @@ async fn tool_lifecycle_deduplicates_and_emits_result() {
     let events = collect_events(&h, request("scenario:tool_lifecycle"), ctrls).await;
 
     // ToolCall must only be emitted once
-    let tool_calls: Vec<_> = events.iter().filter_map(|e| match e {
-        AgentEvent::ToolCall { id, call } => Some((id, call)),
-        _ => None,
-    }).collect();
+    let tool_calls: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolCall { id, call } => Some((id, call)),
+            _ => None,
+        })
+        .collect();
     assert_eq!(tool_calls.len(), 1, "ToolCall must be deduplicated");
     assert_eq!(tool_calls[0].0, "agy-step-1");
     match tool_calls[0].1 {
@@ -130,10 +161,18 @@ async fn tool_lifecycle_deduplicates_and_emits_result() {
     }
 
     // ToolResult must be emitted with the output
-    let tool_results: Vec<_> = events.iter().filter_map(|e| match e {
-        AgentEvent::ToolResult { id, is_error, output, .. } => Some((id, is_error, output)),
-        _ => None,
-    }).collect();
+    let tool_results: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolResult {
+                id,
+                is_error,
+                output,
+                ..
+            } => Some((id, is_error, output)),
+            _ => None,
+        })
+        .collect();
     assert_eq!(tool_results.len(), 1, "ToolResult must be emitted");
     assert_eq!(tool_results[0].0, "agy-step-1");
     assert!(!tool_results[0].1);
@@ -147,22 +186,45 @@ async fn tool_error_emits_error_result_and_captures_diagnostic() {
     let events = collect_events(&h, request("scenario:tool_error"), ctrls).await;
 
     // ToolResult must be emitted even on error state
-    let tool_results: Vec<_> = events.iter().filter_map(|e| match e {
-        AgentEvent::ToolResult { id, is_error, output, .. } => Some((id, is_error, output)),
-        _ => None,
-    }).collect();
+    let tool_results: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolResult {
+                id,
+                is_error,
+                output,
+                ..
+            } => Some((id, is_error, output)),
+            _ => None,
+        })
+        .collect();
     assert_eq!(tool_results.len(), 1, "ToolResult must be emitted on error");
     assert_eq!(tool_results[0].0, "agy-step-1");
     assert!(tool_results[0].1, "ToolResult must mark is_error = true");
-    assert!(tool_results[0].2.as_ref().unwrap().contains("bad_cmd: not found"));
+    assert!(
+        tool_results[0]
+            .2
+            .as_ref()
+            .unwrap()
+            .contains("bad_cmd: not found")
+    );
 
     // Done event should reflect error/cancellation with captured diagnostic
-    let done = events.iter().find_map(|e| match e {
-        AgentEvent::Done { status, error, .. } => Some((status, error)),
-        _ => None,
-    }).expect("Done event present");
+    let done = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::Done { status, error, .. } => Some((status, error)),
+            _ => None,
+        })
+        .expect("Done event present");
     assert_eq!(done.0, &DoneStatus::Errored);
-    assert!(done.1.as_ref().unwrap().contains("jetski: execution failed") || done.1.as_ref().unwrap().contains("CANCELED"));
+    assert!(
+        done.1
+            .as_ref()
+            .unwrap()
+            .contains("jetski: execution failed")
+            || done.1.as_ref().unwrap().contains("CANCELED")
+    );
 }
 
 #[tokio::test]
@@ -171,21 +233,30 @@ async fn process_crash_reports_stderr() {
     let (ctrls, _steer, _tok) = controls();
     let events = collect_events(&h, request("scenario:crash"), ctrls).await;
 
-    let done = events.iter().find_map(|e| match e {
-        AgentEvent::Done { status, error, .. } => Some((status, error)),
-        _ => None,
-    }).expect("Done event present");
+    let done = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::Done { status, error, .. } => Some((status, error)),
+            _ => None,
+        })
+        .expect("Done event present");
     assert_eq!(done.0, &DoneStatus::Errored);
     let err = done.1.as_ref().expect("error message present");
-    assert!(err.contains("Fatal runtime error in agy"), "Expected stderr tail in error, got: {err}");
+    assert!(
+        err.contains("Fatal runtime error in agy"),
+        "Expected stderr tail in error, got: {err}"
+    );
 }
 
 #[tokio::test]
 async fn interrupt_cancels_and_terminates() {
     let h = harness();
     let (ctrls, _steer, tok) = controls();
-    
-    let mut stream = h.run(request("scenario:hang"), ctrls).await.expect("run starts");
+
+    let mut stream = h
+        .run(request("scenario:hang"), ctrls)
+        .await
+        .expect("run starts");
     tokio::time::sleep(Duration::from_millis(50)).await;
     tok.cancel();
 
@@ -196,7 +267,10 @@ async fn interrupt_cancels_and_terminates() {
             }
         }
         None
-    }).await.expect("timeout").expect("done event");
+    })
+    .await
+    .expect("timeout")
+    .expect("done event");
 
     assert_eq!(done.0, DoneStatus::Interrupted);
     assert_eq!(done.1, Some(komet_proto::DoneReason::UserRequested));

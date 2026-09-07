@@ -47,11 +47,13 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
 
 use komet_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ModelOption, ModelOptionChoice, ReasoningLevel,
-    RunRequest, SteeringMode, TodoItem, ToolCall,
+    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SteeringMode, TodoItem,
+    ToolCall,
 };
 
 use crate::{Harness, HarnessError, RunControls, Signal, send_signal, shutdown_child};
+
+mod catalog;
 
 /// The pinned SDK (public beta 1.0.x line; inspected against 1.0.28's
 /// typings). Bump deliberately — see the module header.
@@ -109,8 +111,44 @@ impl CursorHarness {
         self
     }
 
+    /// `cursor-agent --list-models` is the account's real catalog. Skipped
+    /// when a test shim override is in play so fixtures stay deterministic.
+    async fn discover_cli_models(&self) -> Result<Vec<Model>, HarnessError> {
+        if self.uses_shim_override() {
+            return Err(HarnessError::Protocol(
+                "shim override skips CLI catalog".into(),
+            ));
+        }
+        let exe = crate::acp::find_on_paths("cursor-agent", cursor_cli_paths())
+            .ok_or_else(|| HarnessError::NotInstalled("cursor-agent".into()))?;
+        let mut cmd = Command::new(&exe);
+        crate::compose_child_path(&mut cmd, &exe);
+        cmd.arg("--list-models")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let run = async {
+            let output = cmd
+                .output()
+                .await
+                .map_err(|e| HarnessError::Protocol(format!("cursor-agent --list-models: {e}")))?;
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let models = catalog::fold_cli_models(&stdout);
+            if models.is_empty() {
+                return Err(HarnessError::Protocol(
+                    "cursor-agent --list-models returned no catalog".into(),
+                ));
+            }
+            Ok(models)
+        };
+        tokio::time::timeout(Duration::from_secs(20), run)
+            .await
+            .map_err(|_| HarnessError::Protocol("cursor-agent --list-models timed out".into()))?
+    }
+
     /// Spawn the shim in models mode and map its one catalog frame.
-    async fn discover_models(&self) -> Result<Vec<Model>, HarnessError> {
+    async fn discover_sdk_models(&self) -> Result<Vec<Model>, HarnessError> {
         let (exe, args) = self.resolve_shim().await?;
         let mut cmd = Command::new(&exe);
         cmd.args(&args);
@@ -134,11 +172,16 @@ impl CursorHarness {
                 .ok_or_else(|| {
                     HarnessError::Protocol("cursor models probe returned no catalog".into())
                 })?;
-            Ok::<_, HarnessError>(map_model_items(&items))
+            Ok::<_, HarnessError>(catalog::map_model_items(&items))
         };
         tokio::time::timeout(Duration::from_secs(15), run)
             .await
             .map_err(|_| HarnessError::Protocol("cursor models probe timed out".into()))?
+    }
+
+    fn uses_shim_override(&self) -> bool {
+        self.executable.is_some()
+            || std::env::var_os("CURSOR_SDK_SHIM_EXECUTABLE").is_some_and(|p| !p.is_empty())
     }
 
     /// (program, args) for the shim process: the test override, or node
@@ -205,20 +248,26 @@ impl Harness for CursorHarness {
         true
     }
 
-    /// Live catalog via the shim's models mode (`Cursor.models.list()` —
-    /// public, no auth; verified live on 1.0.28). Falls back to a minimal
-    /// static pair when the probe fails, UNCACHED so the next picker open
-    /// retries.
+    /// Cursor-native families (Auto / Composer / Grok) from
+    /// `cursor-agent --list-models`, then the SDK list, then the snapshot.
+    /// New Composer/Grok versions appear when the CLI lists them. A failed
+    /// live probe is UNCACHED so the next picker open retries.
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         if let Some(models) = self.models_cache.get() {
             return Ok(models.clone());
         }
-        match self.discover_models().await {
+        if let Ok(models) = self.discover_cli_models().await
+            && !models.is_empty()
+        {
+            let _ = self.models_cache.set(models.clone());
+            return Ok(models);
+        }
+        match self.discover_sdk_models().await {
             Ok(models) if !models.is_empty() => {
                 let _ = self.models_cache.set(models.clone());
                 Ok(models)
             }
-            Ok(_) | Err(_) => Ok(static_models()),
+            Ok(_) | Err(_) => Ok(catalog::static_models()),
         }
     }
 
@@ -276,7 +325,10 @@ impl Harness for CursorHarness {
             "op": "run",
             "prompt": request.prompt,
             "cwd": request.cwd,
-            "model": request.model,
+            "model": request
+                .model
+                .as_deref()
+                .map(catalog::sdk_model_id),
             // Typed parameter picks (thinking/context/effort/fast/…) — the
             // shim folds them into the SDK's ModelSelection params.
             "modelOptions": request.model_options,
@@ -303,111 +355,6 @@ impl Harness for CursorHarness {
         })
         .boxed())
     }
-}
-
-/// The fallback pair when discovery fails: well-known ids that resolve as
-/// aliases in Cursor's real catalog, so a degraded picker still runs.
-fn static_models() -> Vec<Model> {
-    vec![
-        Model {
-            id: "auto".into(),
-            label: "Auto".into(),
-            description: Some("Cursor picks the model per request".into()),
-            reasoning_levels: Vec::new(),
-            options: Vec::new(),
-        },
-        Model {
-            id: "composer-2.5".into(),
-            label: "Composer 2.5".into(),
-            description: Some("Cursor's own fast coding model".into()),
-            reasoning_levels: Vec::new(),
-            options: Vec::new(),
-        },
-    ]
-}
-
-/// `Cursor.models.list()` items → picker models. Item shape (1.0.28
-/// `options.d.ts` `ModelListItem`): `{id, displayName, description?,
-/// aliases?, parameters?: [{id, displayName?, values: [{value,
-/// displayName?}]}], variants?: [{params: [{id, value}], isDefault?}]}`.
-fn map_model_items(items: &Value) -> Vec<Model> {
-    let str_of = |v: &Value, key: &str| -> Option<String> {
-        v.get(key)
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-    };
-    items
-        .as_array()
-        .map(|a| a.as_slice())
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|item| {
-            let id = str_of(item, "id")?;
-            // `default` is a bare alias twin of the parameterized Auto entry
-            // (`auto-smart`) — two "Auto" rows would just confuse the picker.
-            if id == "default" {
-                return None;
-            }
-            let label = str_of(item, "displayName").unwrap_or_else(|| id.clone());
-            // A variant marked default carries the catalog's preferred value
-            // for each parameter (e.g. Auto's optimize_for=balanced).
-            let default_variant = item
-                .get("variants")
-                .and_then(Value::as_array)
-                .map(|a| a.as_slice())
-                .unwrap_or_default()
-                .iter()
-                .find(|v| v.get("isDefault").and_then(Value::as_bool) == Some(true))
-                .and_then(|v| v.get("params").and_then(Value::as_array).cloned())
-                .unwrap_or_default();
-            let options: Vec<ModelOption> = item
-                .get("parameters")
-                .and_then(Value::as_array)
-                .map(|a| a.as_slice())
-                .unwrap_or_default()
-                .iter()
-                .filter_map(|p| {
-                    let pid = str_of(p, "id")?;
-                    let choices: Vec<ModelOptionChoice> = p
-                        .get("values")
-                        .and_then(Value::as_array)
-                        .map(|a| a.as_slice())
-                        .unwrap_or_default()
-                        .iter()
-                        .filter_map(|c| {
-                            let cid = str_of(c, "value")?;
-                            Some(ModelOptionChoice {
-                                label: str_of(c, "displayName").unwrap_or_else(|| cid.clone()),
-                                id: cid,
-                            })
-                        })
-                        .collect();
-                    if choices.is_empty() {
-                        return None;
-                    }
-                    let default_choice = default_variant
-                        .iter()
-                        .find(|dv| dv.get("id").and_then(Value::as_str) == Some(pid.as_str()))
-                        .and_then(|dv| str_of(dv, "value"))
-                        .unwrap_or_else(|| choices[0].id.clone());
-                    Some(ModelOption {
-                        label: str_of(p, "displayName").unwrap_or_else(|| pid.clone()),
-                        id: pid,
-                        choices,
-                        default_choice,
-                    })
-                })
-                .collect();
-            Some(Model {
-                id,
-                label,
-                description: str_of(item, "description"),
-                reasoning_levels: Vec::new(),
-                options,
-            })
-        })
-        .collect()
 }
 
 async fn stdin_writer(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<String>) {

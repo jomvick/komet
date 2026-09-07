@@ -40,9 +40,7 @@ pub(crate) const STANDARD_LADDER: &[ReasoningLevel] = &[
     ReasoningLevel::High,
 ];
 
-pub(crate) const MINIMAL_LADDER: &[ReasoningLevel] = &[
-    ReasoningLevel::Low,
-];
+pub(crate) const MINIMAL_LADDER: &[ReasoningLevel] = &[ReasoningLevel::Low];
 
 fn model(
     id: &str,
@@ -122,7 +120,10 @@ pub fn parse_models(output: &str) -> Vec<Model> {
         }
         let id = parts[0];
         // Ensure id looks like a valid model identifier
-        if !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
+        if !id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+        {
             continue;
         }
         let label = if parts.len() > 1 {
@@ -299,7 +300,11 @@ mod tests {
     fn parse_models_handles_carriage_returns_and_spinners() {
         let sample = "⠋ Fetching available models...\r⠙ Fetching available models...\r\x1b[32mgemini-3.8-flash-high     Gemini 3.8 Flash (High)\x1b[0m\ngemini-3.8-flash-medium   Gemini 3.8 Flash (Medium)\nclaude-sonnet-4-6         Claude Sonnet 4.6 (Thinking)\n";
         let parsed = parse_models(sample);
-        assert!(parsed.iter().any(|m| m.id == "gemini-3.8-flash-high" && m.label == "Gemini 3.8 Flash (High)"));
+        assert!(
+            parsed
+                .iter()
+                .any(|m| m.id == "gemini-3.8-flash-high" && m.label == "Gemini 3.8 Flash (High)")
+        );
         assert!(parsed.iter().any(|m| m.id == "gemini-3.8-flash-medium"));
         assert!(parsed.iter().any(|m| m.id == "claude-sonnet-4-6"));
         assert!(parsed.iter().any(|m| m.id == default_model()));

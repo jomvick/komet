@@ -850,10 +850,7 @@ impl AcpHarness {
             if commands.is_empty() {
                 let cwd = std::env::var("HOME").unwrap_or_else(|_| "/".into());
                 let session = client
-                    .request(
-                        "session/new",
-                        build_acp_session_params(&cwd, None, vec![]),
-                    )
+                    .request("session/new", build_acp_session_params(&cwd, None, vec![]))
                     .await;
                 if session.is_ok() {
                     // The update usually arrives within milliseconds of the
@@ -1364,9 +1361,13 @@ impl Harness for AcpHarness {
                     // plugin (which reads from cwd, not OPENCODE_CONFIG_CONTENT) sees it.
                     // Overlay dir is temp; cwd copy is additive and never overwrites user file
                     // without explicit opt-in — we only write if the file doesn't exist.
-                    let cwd_sandbox = std::path::Path::new(&request.cwd).join(".opencode/sandbox.json");
+                    let cwd_sandbox =
+                        std::path::Path::new(&request.cwd).join(".opencode/sandbox.json");
                     if cwd_sandbox.parent().is_some_and(|p| p.exists()) && !cwd_sandbox.exists() {
-                        let _ = std::fs::write(&cwd_sandbox, std::fs::read(&sandbox_path).unwrap_or_default());
+                        let _ = std::fs::write(
+                            &cwd_sandbox,
+                            std::fs::read(&sandbox_path).unwrap_or_default(),
+                        );
                     }
                 }
                 (Some(dir), Some(path))

@@ -326,12 +326,7 @@ impl ClaudeHarness {
                         obj.insert(
                             "args".into(),
                             Value::Array(
-                                ext.config
-                                    .args
-                                    .iter()
-                                    .cloned()
-                                    .map(Value::String)
-                                    .collect(),
+                                ext.config.args.iter().cloned().map(Value::String).collect(),
                             ),
                         );
                         let env_src = if !ext.resolved_env.is_empty() {
@@ -428,7 +423,10 @@ impl ClaudeHarness {
             if !servers.is_empty() {
                 let config = serde_json::json!({"mcpServers": servers}).to_string();
                 cmd.args(["--mcp-config", &config]);
-                tracing::debug!(server_count=servers.len(), "claude mcpServers injected (values masked)");
+                tracing::debug!(
+                    server_count = servers.len(),
+                    "claude mcpServers injected (values masked)"
+                );
             }
         }
         if !request.cwd.is_empty() {
@@ -1265,7 +1263,8 @@ mod tests {
             permission_timeout_ms: None,
             worktree: None,
             resume: None,
-            mcp: None, mcp_external: Vec::new(),
+            mcp: None,
+            mcp_external: Vec::new(),
         }
     }
 
@@ -1396,7 +1395,9 @@ mod tests {
         let h = ClaudeHarness::new();
         let args = argv(&h.build_command(&PathBuf::from("claude"), &req));
         let settings = settings_json(&args);
-        let network = settings["sandbox"]["network"].as_object().expect("network object");
+        let network = settings["sandbox"]["network"]
+            .as_object()
+            .expect("network object");
         assert_eq!(network["strictAllowlist"], json!(true));
         assert_eq!(network["allowedDomains"], json!(["crates.io"]));
     }

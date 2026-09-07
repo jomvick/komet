@@ -4,16 +4,13 @@
 //! wire payloads (`sandboxPolicy`, `approvalPolicy`), and extracts
 //! [`komet_proto::PermissionKind`] from incoming approval requests.
 
-use serde_json::{Value, json};
 use komet_proto::{
     ApprovalPolicy, CodexSandbox, PermissionChoice, PermissionKind, SandboxMode, Scope,
 };
+use serde_json::{Value, json};
 
 /// Build the `(approval_policy, sandbox_mode_str, sandbox_policy)` tuple for Codex `turn/start`.
-pub fn build_codex_policies(
-    cx: &CodexSandbox,
-    cwd: &str,
-) -> (Value, &'static str, Value) {
+pub fn build_codex_policies(cx: &CodexSandbox, cwd: &str) -> (Value, &'static str, Value) {
     let mode = cx.sandbox_mode.unwrap_or(SandboxMode::WorkspaceWrite);
     let mut policy = serde_json::Map::new();
     policy.insert(
@@ -73,12 +70,10 @@ pub fn build_codex_policies(
     {
         let effective_exclude: Vec<String> = match &cx.shell_env_policy {
             Some(pol) if !pol.exclude.is_empty() => pol.exclude.clone(),
-            _ if mode != SandboxMode::DangerFullAccess => {
-                komet_proto::DEFAULT_CODEX_SHELL_EXCLUDE
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect()
-            }
+            _ if mode != SandboxMode::DangerFullAccess => komet_proto::DEFAULT_CODEX_SHELL_EXCLUDE
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             _ => vec![],
         };
         if !effective_exclude.is_empty() {
@@ -121,9 +116,7 @@ pub fn parse_approval_request(
 ) -> (PermissionKind, String, Vec<PermissionChoice>) {
     let choices = vec![
         PermissionChoice::Allow,
-        PermissionChoice::AllowAlways {
-            scope: Scope::Chat,
-        },
+        PermissionChoice::AllowAlways { scope: Scope::Chat },
         PermissionChoice::Deny,
     ];
 

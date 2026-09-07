@@ -13,8 +13,8 @@ use komet_harness::{
 };
 use komet_proto::{
     AgentEvent, ApprovalPolicy, CodexSandbox, DoneStatus, HarnessId, PermissionChoice,
-    PermissionKind, ReasoningLevel, RunRequest, SandboxLevel, SandboxMode, SandboxOptions, TodoItem,
-    ToolCall, UserInputAnswer,
+    PermissionKind, ReasoningLevel, RunRequest, SandboxLevel, SandboxMode, SandboxOptions,
+    TodoItem, ToolCall, UserInputAnswer,
 };
 
 fn fixture_path() -> PathBuf {
@@ -49,7 +49,8 @@ fn request(prompt: &str) -> RunRequest {
         permission_timeout_ms: None,
         worktree: None,
         resume: None,
-        mcp: None, mcp_external: Vec::new(),
+        mcp: None,
+        mcp_external: Vec::new(),
     }
 }
 
@@ -810,12 +811,18 @@ async fn commands_come_from_skills_list() {
     assert!(commands.iter().any(|c| c.name == "compact"));
     assert!(commands.iter().any(|c| c.name == "diff"));
 
-    let imagegen = commands.iter().find(|c| c.name == "imagegen").expect("imagegen skill");
+    let imagegen = commands
+        .iter()
+        .find(|c| c.name == "imagegen")
+        .expect("imagegen skill");
     assert_eq!(
         imagegen.description, "Generate or edit images",
         "interface.shortDescription wins over the model-facing paragraph"
     );
-    let bare = commands.iter().find(|c| c.name == "bare").expect("bare skill");
+    let bare = commands
+        .iter()
+        .find(|c| c.name == "bare")
+        .expect("bare skill");
     assert_eq!(
         bare.description, "No interface block",
         "top-level description is the fallback"
