@@ -33,14 +33,16 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, BorderStyle, ClipboardItem, Context, Entity, ListAlignment, ListOffset,
-    ListScrollEvent, ListState, ObjectFit, SharedString, StyledImage as _, StyledText,
-    Subscription, Task, TextRun, Window, canvas, div, img, list, prelude::*, px, quad,
+    AnyElement, App, BorderStyle, ClipboardItem, Context, Entity, Focusable as _, ListAlignment,
+    ListOffset, ListScrollEvent, ListState, MouseButton, ObjectFit, SharedString,
+    StyledImage as _, StyledText, Subscription, Task, TextRun, WeakEntity, Window, canvas, div,
+    img, list, prelude::*, px, quad,
 };
 
 use komet_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
 use komet_proto::ToolCall;
 
+use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::markdown::parser::{Block, BlockTree, IncrementalParser, parse_full};
 use crate::markdown::render::{self, RenderCache, RenderOptions};
 use crate::markdown::veil::RowVeil;
@@ -491,6 +493,10 @@ pub enum RowKind {
         /// prompt carries file mentions this is the *projected* display text —
         /// chip labels in place of the raw Markdown links.
         text: SharedString,
+        /// Raw prompt (mentions still Markdown links, attachment trailer
+        /// stripped). Edit loads this back into the composer; Copy uses the
+        /// clipboard form from [`prompt_clipboard_text`].
+        source: SharedString,
         /// File-mention chips over `text`, in display-byte terms. Computed
         /// once per entry change in [`rows_for_entry`] (rows are cached by
         /// fingerprint), never per frame. Empty for ordinary prompts.
@@ -564,6 +570,65 @@ where
             .to_string(),
         None => String::new(),
     }
+}
+
+/// Clipboard form of a sent prompt: mention chip bearings (`U+00A0`) are
+/// stripped so `@label` pastes cleanly. Ordinary prompts are unchanged.
+pub fn prompt_clipboard_text(display: &str, source: &str) -> String {
+    if display == source {
+        source.to_string()
+    } else {
+        display.replace('\u{00A0}', "")
+    }
+}
+
+/// Markdown source of an assistant turn: text parts joined, tools and chips
+/// skipped. Empty / whitespace-only parts drop out.
+pub fn assistant_output_text(entry: &SessionMessageEntry) -> String {
+    entry
+        .parts
+        .iter()
+        .filter_map(|p| match p {
+            MessagePart::Text { text, .. } if !text.trim().is_empty() => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn prompt_icon_button(
+    id: SharedString,
+    icon_path: &'static str,
+    copied: bool,
+    theme: &Theme,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .size(px(16.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(4.0))
+        .cursor_pointer()
+        // No `.occlude()`: BlockMouse stops the row hit-test, so the parent
+        // `on_hover` sees a leave the instant the pointer reaches the icon,
+        // unmounts this strip, remounts it, and the icons blink.
+        .hover(|s| s.bg(crate::theme::wash(0.11)))
+        .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
+        .on_click(move |event, window, cx| {
+            cx.stop_propagation();
+            on_click(event, window, cx);
+        })
+        .child(
+            crate::icons::icon(if copied {
+                crate::icons::CHECK
+            } else {
+                icon_path
+            })
+            .size(px(12.0))
+            .text_color(theme.text_muted.opacity(0.55)),
+        )
 }
 
 fn fnv1a(bytes: &[u8]) -> u64 {
@@ -663,6 +728,7 @@ pub fn rows_for_entry(
         // File mentions render as chips here too, not just in the composer.
         // The projection is pure over the text, so the raw-length row version
         // below stays a valid cache/diff key.
+        let source: SharedString = parsed.text.clone().into();
         let (text, mentions) = match crate::composer::sent_mention_display(&parsed.text) {
             Some((display, spans)) => (display, spans),
             None => (parsed.text, Vec::new()),
@@ -673,6 +739,7 @@ pub fn rows_for_entry(
             turn_start: true,
             kind: RowKind::User {
                 text: text.into(),
+                source,
                 mentions: Arc::new(mentions),
                 attachments: Arc::new(parsed.attachments),
                 pending,
@@ -1431,6 +1498,14 @@ pub struct Transcript {
     /// the companion task after ~1.2s.
     copied_code: Option<(SharedString, usize)>,
     copied_clear: Option<Task<()>>,
+    /// User prompt whose Copy action is showing the check, cleared after ~1.2s.
+    copied_prompt: Option<SharedString>,
+    copied_prompt_clear: Option<Task<()>>,
+    /// Composer that in-place Edit → Send queues through. Bound by the shell
+    /// after both entities exist — `None` until then (and in unit tests).
+    composer: Option<WeakEntity<crate::composer::Composer>>,
+    /// User prompt currently being edited in place.
+    prompt_edit: Option<PromptEdit>,
     /// Transcript attachment being viewed full-size (click a user thumbnail).
     attachment_preview: Option<crate::attachments::PreviewImage>,
     /// Focused while the lightbox is open so Escape reaches it.
@@ -1460,6 +1535,13 @@ enum BlobFetch {
     /// Failed with the affordance re-armed as a retry.
     Failed,
     Ready(Arc<ToolDetail>),
+}
+
+/// In-place edit of a sent user prompt (issue #8).
+struct PromptEdit {
+    row_id: SharedString,
+    input: Entity<ComposerInput>,
+    _events: Subscription,
 }
 
 impl Transcript {
@@ -1509,6 +1591,10 @@ impl Transcript {
             hovered_entry: None,
             copied_code: None,
             copied_clear: None,
+            copied_prompt: None,
+            copied_prompt_clear: None,
+            composer: None,
+            prompt_edit: None,
             attachment_preview: None,
             attachment_preview_focus: cx.focus_handle(),
             attachment_loads: HashMap::new(),
@@ -1520,6 +1606,63 @@ impl Transcript {
         };
         this.sync(cx);
         this
+    }
+
+    /// Wire Edit → Send to the chat composer. The shell calls this once both
+    /// entities exist; tests leave it unset (Send is then a no-op).
+    pub fn bind_composer(&mut self, composer: WeakEntity<crate::composer::Composer>) {
+        self.composer = Some(composer);
+    }
+
+    fn begin_prompt_edit(
+        &mut self,
+        row_id: SharedString,
+        source: String,
+        cx: &mut Context<Self>,
+    ) -> gpui::FocusHandle {
+        let input = cx.new(|cx| {
+            let mut input = ComposerInput::new("", cx);
+            input.enable_mentions();
+            input.enable_escape_cancel();
+            input.set_text(source, cx);
+            input
+        });
+        let events = cx.subscribe(&input, |this, _, event, cx| match event {
+            ComposerInputEvent::Submitted => this.submit_prompt_edit(cx),
+            ComposerInputEvent::Cancelled => this.cancel_prompt_edit(cx),
+            ComposerInputEvent::Edited => cx.notify(),
+            _ => {}
+        });
+        let focus = input.focus_handle(cx);
+        self.prompt_edit = Some(PromptEdit {
+            row_id,
+            input,
+            _events: events,
+        });
+        cx.notify();
+        focus
+    }
+
+    fn cancel_prompt_edit(&mut self, cx: &mut Context<Self>) {
+        self.prompt_edit = None;
+        cx.notify();
+    }
+
+    fn submit_prompt_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(edit) = self.prompt_edit.take() else {
+            return;
+        };
+        let text = edit.input.read(cx).text().trim().to_string();
+        if text.is_empty() {
+            self.prompt_edit = Some(edit);
+            return;
+        }
+        if let Some(composer) = self.composer.as_ref() {
+            composer
+                .update(cx, |composer, cx| composer.submit_text(text, cx))
+                .ok();
+        }
+        cx.notify();
     }
 
     // ---- rail plumbing (rendering lives in crate::rail) ----
@@ -2206,6 +2349,7 @@ impl Transcript {
             self.render_cache.borrow_mut().clear();
             self.highlights.entries.clear();
             self.list.reset(0);
+            self.prompt_edit = None;
             // A kept own-turn hold (send-created chat) owns the viewport;
             // otherwise the fresh attach pins to the bottom.
             self.pinned = self.own_turn.is_none();
@@ -2785,6 +2929,7 @@ impl Transcript {
                 mentions,
                 attachments,
                 pending,
+                ..
             } => {
                 let attachments = attachments.clone();
                 let text = text.clone();
@@ -2804,22 +2949,33 @@ impl Transcript {
                     // item can't shrink, `justify_end` pushes the overflow off the
                     // left edge, and long prompts render as one clipped line
                     // instead of wrapping inside the 80% column cap.
-                    column = column.child(
-                        div().w_full().flex().justify_end().child(
-                            div()
-                                .min_w_0()
-                                .max_w(px(MAX_CONTENT_WIDTH * 0.8))
-                                .bg(crate::theme::user_bubble_bg())
-                                .rounded(px(Theme::BUBBLE_RADIUS))
-                                .px(px(16.0))
-                                .py(px(10.0))
-                                .text_size(px(14.0))
-                                .line_height(px(22.0))
-                                .text_color(theme.text)
-                                .when(pending, |el| el.opacity(0.65))
-                                .child(user_bubble_text(&row.id, text, mentions, &theme)),
-                        ),
-                    );
+                    let editing = self
+                        .prompt_edit
+                        .as_ref()
+                        .is_some_and(|edit| edit.row_id == row.id);
+                    column = column.child(if editing {
+                        self.render_prompt_editor(&theme, cx)
+                    } else {
+                        div()
+                            .w_full()
+                            .flex()
+                            .justify_end()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .max_w(px(MAX_CONTENT_WIDTH * 0.8))
+                                    .bg(crate::theme::user_bubble_bg())
+                                    .rounded(px(Theme::BUBBLE_RADIUS))
+                                    .px(px(16.0))
+                                    .py(px(10.0))
+                                    .text_size(px(14.0))
+                                    .line_height(px(22.0))
+                                    .text_color(theme.text)
+                                    .when(pending, |el| el.opacity(0.65))
+                                    .child(user_bubble_text(&row.id, text, mentions, &theme)),
+                            )
+                            .into_any_element()
+                    });
                 }
                 column.into_any_element()
             }
@@ -2920,7 +3076,24 @@ impl Transcript {
         // a RESERVED 16px lane under the entry's last row — the label only
         // flips opacity, so revealing it never shifts the virtualizer's
         // layout. User entries align end (under the bubble), assistant start.
+        // User prompts get Copy / Edit; settled assistant turns get Copy
+        // (the reply markdown) in that same reserved lane.
         let is_user_row = matches!(row.kind, RowKind::User { .. });
+        let editing_row = self
+            .prompt_edit
+            .as_ref()
+            .is_some_and(|edit| edit.row_id == row.id);
+        let (copy_text, edit_source) = match &row.kind {
+            RowKind::User { text, source, .. } if !text.is_empty() && !editing_row => (
+                Some(SharedString::from(prompt_clipboard_text(
+                    text.as_ref(),
+                    source.as_ref(),
+                ))),
+                Some(source.clone()),
+            ),
+            _ if row.timestamp.is_some() => (self.assistant_copy_for(&row.entry_id, cx), None),
+            _ => (None, None),
+        };
         let hovered = self
             .hovered_entry
             .as_ref()
@@ -2935,7 +3108,7 @@ impl Transcript {
         // is all the gap the original has.
         let strip = row.timestamp.map(|ms| {
             div()
-                .h(px(if is_user_row { 16.0 } else { 20.0 }))
+                .h(px(20.0))
                 .when(!is_user_row, |el| el.pt(px(4.0)))
                 .w_full()
                 .flex()
@@ -2951,10 +3124,14 @@ impl Transcript {
                 .when(hovered, |el| {
                     el.child(motion::fade_quick(
                         SharedString::from(format!("ts-{}", row.id)),
-                        div()
-                            .text_size(px(11.0))
-                            .text_color(theme.text_muted.opacity(0.55))
-                            .child(SharedString::from(format_timestamp(ms, &chrono::Local))),
+                        self.hover_strip_contents(
+                            &row.id,
+                            ms,
+                            copy_text.clone(),
+                            edit_source.clone(),
+                            &theme,
+                            cx,
+                        ),
                     ))
                 })
         });
@@ -3004,6 +3181,188 @@ impl Transcript {
                     .children(trailer),
             )
             .into_any_element()
+    }
+
+    fn render_prompt_editor(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let Some(edit) = self.prompt_edit.as_ref() else {
+            return gpui::Empty.into_any_element();
+        };
+        let can_send = !edit.input.read(cx).text().trim().is_empty();
+        let entity = cx.weak_entity();
+        let cancel_entity = entity.clone();
+        let send_entity = entity;
+        div()
+            .w_full()
+            .flex()
+            .justify_end()
+            .child(
+                div()
+                    .id("prompt-edit-bubble")
+                    .min_w_0()
+                    .w_full()
+                    .max_w(px(MAX_CONTENT_WIDTH * 0.8))
+                    .bg(crate::theme::user_bubble_bg())
+                    .rounded(px(Theme::BUBBLE_RADIUS))
+                    .px(px(16.0))
+                    .pt(px(12.0))
+                    .pb(px(12.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(12.0))
+                    .occlude()
+                    .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
+                    .child(edit.input.clone())
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .flex_row()
+                            .justify_end()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(
+                                crate::popover::btn_ghost(theme, "Cancel", "prompt-edit-cancel")
+                                    .id("prompt-edit-cancel")
+                                    .occlude()
+                                    .on_mouse_down(MouseButton::Left, |_, window, _| {
+                                        window.prevent_default()
+                                    })
+                                    .on_click(move |_, _, cx| {
+                                        cancel_entity
+                                            .update(cx, |this, cx| this.cancel_prompt_edit(cx))
+                                            .ok();
+                                    }),
+                            )
+                            .child(
+                                crate::popover::btn_primary(theme, "Send")
+                                    .id("prompt-edit-send")
+                                    .rounded(px(999.0))
+                                    .when(!can_send, |el| el.opacity(0.4))
+                                    .occlude()
+                                    .on_mouse_down(MouseButton::Left, |_, window, _| {
+                                        window.prevent_default()
+                                    })
+                                    .on_click(move |_, _, cx| {
+                                        if can_send {
+                                            send_entity
+                                                .update(cx, |this, cx| this.submit_prompt_edit(cx))
+                                                .ok();
+                                        }
+                                    }),
+                            ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn assistant_copy_for(&self, entry_id: &SharedString, cx: &App) -> Option<SharedString> {
+        let text = self
+            .state
+            .read(cx)
+            .transcript
+            .iter()
+            .find(|entry| entry.id == entry_id.as_ref())
+            .map(assistant_output_text)?;
+        (!text.is_empty()).then(|| SharedString::from(text))
+    }
+
+    /// Hover contents under a row: Copy (+ Edit on user prompts) + timestamp.
+    /// Reserved-lane only — opacity flips, never a layout shift.
+    fn hover_strip_contents(
+        &self,
+        row_id: &SharedString,
+        timestamp_ms: i64,
+        copy_text: Option<SharedString>,
+        edit_source: Option<SharedString>,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
+        let copied = self.copied_prompt.as_ref() == Some(row_id);
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(4.0))
+            .children(copy_text.map(|clipboard| {
+                self.prompt_action_buttons(row_id, clipboard, edit_source, copied, theme, cx)
+            }))
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(theme.text_muted.opacity(0.55))
+                    .child(SharedString::from(format_timestamp(
+                        timestamp_ms,
+                        &chrono::Local,
+                    ))),
+            )
+    }
+
+    fn prompt_action_buttons(
+        &self,
+        row_id: &SharedString,
+        clipboard: SharedString,
+        edit_source: Option<SharedString>,
+        copied: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let copy_id = SharedString::from(format!("prompt-copy-{}", row_id));
+        let copy_row = row_id.clone();
+        let copy_entity = cx.weak_entity();
+        let copy_text = clipboard;
+        let edit = edit_source.map(|source| {
+            let edit_id = SharedString::from(format!("prompt-edit-{}", row_id));
+            let edit_row = row_id.clone();
+            let edit_entity = copy_entity.clone();
+            prompt_icon_button(
+                edit_id,
+                crate::icons::PEN,
+                false,
+                theme,
+                move |_, window, cx| {
+                    let row = edit_row.clone();
+                    let source = source.to_string();
+                    if let Ok(focus) = edit_entity.update(cx, |this, cx| {
+                        this.begin_prompt_edit(row, source, cx)
+                    }) {
+                        window.focus(&focus, cx);
+                    }
+                },
+            )
+        });
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(2.0))
+            .children(edit)
+            .child(prompt_icon_button(
+                copy_id,
+                crate::icons::COPY,
+                copied,
+                theme,
+                move |_, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(copy_text.to_string()));
+                    let row_key = copy_row.clone();
+                    copy_entity
+                        .update(cx, |this, cx| {
+                            this.copied_prompt = Some(row_key);
+                            this.copied_prompt_clear = Some(cx.spawn(async move |this, cx| {
+                                cx.background_executor()
+                                    .timer(Duration::from_millis(1200))
+                                    .await;
+                                this.update(cx, |this, cx| {
+                                    this.copied_prompt = None;
+                                    this.copied_prompt_clear = None;
+                                    cx.notify();
+                                })
+                                .ok();
+                            }));
+                            cx.notify();
+                        })
+                        .ok();
+                },
+            ))
     }
 
     /// Copy-button wiring for one row's code blocks ([`render::CopyUi`]):
@@ -4518,6 +4877,49 @@ mod tests {
         };
         assert_eq!(text.as_ref(), "no mentions here");
         assert!(mentions.is_empty());
+    }
+
+    #[test]
+    fn user_rows_keep_raw_source_for_edit() {
+        let raw = "look at [composer.rs](komet-file:crates/ui/src/composer.rs) please";
+        let mut entry = assistant("u4", MessageStatus::Complete, vec![]);
+        entry.role = MessageRole::User;
+        entry.status = None;
+        entry.parts = vec![text_part("t0", raw)];
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        let RowKind::User { text, source, .. } = &rows[0].kind else {
+            panic!("expected a user row");
+        };
+        assert_eq!(source.as_ref(), raw);
+        assert_ne!(text.as_ref(), raw);
+        let clip = prompt_clipboard_text(text, source);
+        assert!(!clip.contains('\u{00A0}'));
+        assert!(clip.contains("@composer.rs"));
+        assert!(!clip.contains("komet-file:"));
+        assert_eq!(prompt_clipboard_text("plain", "plain"), "plain");
+    }
+
+    #[test]
+    fn assistant_output_joins_text_and_skips_tools() {
+        let entry = assistant(
+            "a1",
+            MessageStatus::Complete,
+            vec![
+                text_part("t0", "first"),
+                tool_part("tool", "ls"),
+                text_part("t1", "second"),
+                text_part("t2", "   "),
+            ],
+        );
+        assert_eq!(assistant_output_text(&entry), "first\n\nsecond");
+        assert_eq!(
+            assistant_output_text(&assistant(
+                "a2",
+                MessageStatus::Complete,
+                vec![tool_part("tool", "ls")]
+            )),
+            ""
+        );
     }
 
     #[test]
