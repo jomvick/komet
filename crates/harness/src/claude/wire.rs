@@ -369,11 +369,20 @@ fn unwrap_response_payload(value: &Value) -> &Value {
 pub(crate) fn parse_context_usage_response(response: &Value) -> komet_proto::ContextUsage {
     let payload = unwrap_response_payload(response);
     let mut usage = komet_proto::ContextUsage {
-        total_tokens: payload.get("totalTokens").and_then(Value::as_u64).unwrap_or(0),
-        max_tokens: payload.get("maxTokens").and_then(Value::as_u64).unwrap_or(0),
+        total_tokens: payload
+            .get("totalTokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
+        max_tokens: payload
+            .get("maxTokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0),
         raw_max_tokens: payload.get("rawMaxTokens").and_then(Value::as_u64),
         percentage: payload.get("percentage").and_then(Value::as_f64),
-        model: payload.get("model").and_then(Value::as_str).map(str::to_owned),
+        model: payload
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
         ..Default::default()
     };
 
@@ -406,7 +415,10 @@ pub(crate) fn parse_context_usage_response(response: &Value) -> komet_proto::Con
             if let Some(name) = t.get("name").and_then(Value::as_str) {
                 usage.mcp_tools.push(komet_proto::ContextMcpTool {
                     name: name.to_owned(),
-                    server_name: t.get("serverName").and_then(Value::as_str).map(str::to_owned),
+                    server_name: t
+                        .get("serverName")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
                     tokens: t.get("tokens").and_then(Value::as_u64).unwrap_or(0),
                     is_loaded: t.get("isLoaded").and_then(Value::as_bool).unwrap_or(false),
                 });
@@ -423,9 +435,16 @@ pub(crate) fn parse_context_usage_response(response: &Value) -> komet_proto::Con
             if let Some(name) = s.get("name").and_then(Value::as_str) {
                 usage.skills.push(komet_proto::SkillFrontmatterItem {
                     name: name.to_owned(),
-                    source: s.get("source").and_then(Value::as_str).unwrap_or("userSettings").to_owned(),
+                    source: s
+                        .get("source")
+                        .and_then(Value::as_str)
+                        .unwrap_or("userSettings")
+                        .to_owned(),
                     tokens: s.get("tokens").and_then(Value::as_u64).unwrap_or(0),
-                    description: s.get("description").and_then(Value::as_str).map(str::to_owned),
+                    description: s
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
                 });
             }
         }
@@ -453,7 +472,11 @@ pub(crate) fn parse_skills_frontmatter(response: &Value) -> Vec<komet_proto::Sla
                 return None;
             }
             let source = s.get("source").and_then(Value::as_str).unwrap_or("");
-            let desc = s.get("description").and_then(Value::as_str).map(str::trim).filter(|d| !d.is_empty());
+            let desc = s
+                .get("description")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|d| !d.is_empty());
             let description = match (desc, source) {
                 (Some(d), _) => d.to_owned(),
                 (None, "built-in") => format!("Bundled skill ({name})"),

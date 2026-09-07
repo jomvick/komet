@@ -42,7 +42,8 @@ fn request(prompt: &str) -> RunRequest {
         permission_timeout_ms: None,
         worktree: None,
         resume: None,
-        mcp: None, mcp_external: Vec::new(),
+        mcp: None,
+        mcp_external: Vec::new(),
     }
 }
 
@@ -300,9 +301,10 @@ async fn shim_crash_mid_run_reports_stderr_tail() {
 #[tokio::test]
 async fn model_discovery_maps_the_live_catalog() {
     let models = harness().models().await.expect("models");
-    // Parameterized Auto first; its bare `default` alias twin skipped.
+    // Parameterized Auto first; the SDK's `default`/`auto-smart` aliases
+    // present as Cursor Agent's `auto`.
     assert_eq!(models.len(), 2, "{models:?}");
-    assert_eq!(models[0].id, "auto-smart");
+    assert_eq!(models[0].id, "auto");
     assert_eq!(models[0].label, "Auto");
     let optimize = &models[0].options[0];
     assert_eq!(optimize.id, "optimize_for");
@@ -317,9 +319,9 @@ async fn model_discovery_maps_the_live_catalog() {
     );
     // The default comes from the isDefault variant, not the first value.
     assert_eq!(optimize.default_choice, "balanced");
-    assert_eq!(models[1].id, "claude-fable-5");
-    assert_eq!(models[1].description.as_deref(), Some("Anthropic frontier"));
+    assert_eq!(models[1].id, "composer-2.5");
+    assert_eq!(models[1].description.as_deref(), Some("Cursor native"));
     // A parameter without displayName labels by id; default = first value.
-    assert_eq!(models[1].options[0].id, "thinking");
-    assert_eq!(models[1].options[0].default_choice, "enabled");
+    assert_eq!(models[1].options[0].id, "fast");
+    assert_eq!(models[1].options[0].default_choice, "false");
 }

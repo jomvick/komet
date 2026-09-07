@@ -58,7 +58,8 @@ async fn silent_agent_errors_via_the_prompt_stall_watchdog() {
         permission_timeout_ms: None,
         worktree: None,
         resume: None,
-        mcp: None, mcp_external: Vec::new(),
+        mcp: None,
+        mcp_external: Vec::new(),
     };
     let harness = AcpHarness::grok().with_executable(fixture_path());
     let stream = harness.run(request, controls).await.expect("run starts");
@@ -126,7 +127,8 @@ async fn opencode_stall_hint_names_the_provider() {
         permission_timeout_ms: None,
         worktree: None,
         resume: None,
-        mcp: None, mcp_external: Vec::new(),
+        mcp: None,
+        mcp_external: Vec::new(),
     };
     let harness = AcpHarness::opencode().with_executable(fixture_path());
     let stream = harness.run(request, controls).await.expect("run starts");

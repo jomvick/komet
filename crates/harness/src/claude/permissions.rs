@@ -4,13 +4,16 @@
 //! `--settings` format (`permissions`, `sandbox`, `credentials`, `network`),
 //! and extracts [`komet_proto::PermissionKind`] from incoming `can_use_tool` requests.
 
-use serde_json::Value;
 use komet_proto::{ClaudeSandbox, PermissionChoice, PermissionKind, Scope};
+use serde_json::Value;
 
 /// Build the `permissions` and `sandbox` maps for Claude CLI's `--settings` JSON.
 pub fn build_claude_settings_maps(
     c: &ClaudeSandbox,
-) -> (serde_json::Map<String, Value>, serde_json::Map<String, Value>) {
+) -> (
+    serde_json::Map<String, Value>,
+    serde_json::Map<String, Value>,
+) {
     let mut perms = serde_json::Map::new();
     perms.insert("defaultMode".into(), Value::String("default".into()));
 
@@ -80,18 +83,18 @@ pub fn build_claude_settings_maps(
     // ── settings.sandbox (unified) ────────────────────────────────
     let mut sandbox = serde_json::Map::new();
     if let Some(fs_sandbox) = c.settings.sandbox.clone()
-        && let Some(obj) = fs_sandbox.as_object() {
-            for (k, v) in obj {
-                // Skip network keys from settings.sandbox — overwritten
-                // by the generated restrictions below.
-                if k != "network" {
-                    sandbox.insert(k.clone(), v.clone());
-                }
+        && let Some(obj) = fs_sandbox.as_object()
+    {
+        for (k, v) in obj {
+            // Skip network keys from settings.sandbox — overwritten
+            // by the generated restrictions below.
+            if k != "network" {
+                sandbox.insert(k.clone(), v.clone());
             }
         }
+    }
 
-    let has_network =
-        !c.network.allowed_hosts.is_empty() || !c.network.denied_hosts.is_empty();
+    let has_network = !c.network.allowed_hosts.is_empty() || !c.network.denied_hosts.is_empty();
     if has_network || c.network.strict_allowlist.is_some() {
         let mut network = serde_json::Map::new();
         if !c.network.allowed_hosts.is_empty() {
@@ -213,9 +216,7 @@ pub fn parse_tool_permission(
 ) -> (PermissionKind, String, Vec<PermissionChoice>) {
     let choices = vec![
         PermissionChoice::Allow,
-        PermissionChoice::AllowAlways {
-            scope: Scope::Chat,
-        },
+        PermissionChoice::AllowAlways { scope: Scope::Chat },
         PermissionChoice::Deny,
     ];
 
@@ -308,7 +309,10 @@ mod tests {
         let (_, summary, _) = parse_tool_permission("Bash", &input);
         // 10 `;` separators → 11 segments → 10 further segments after the first.
         assert_eq!(summary, "Run `git status` (+10 more)");
-        assert!(summary.chars().count() < 40, "header must stay short: {summary}");
+        assert!(
+            summary.chars().count() < 40,
+            "header must stay short: {summary}"
+        );
     }
 
     #[test]
@@ -317,7 +321,10 @@ mod tests {
         let input = json!({ "command": long });
         let (_, summary, _) = parse_tool_permission("Bash", &input);
         assert!(summary.starts_with("Run `"));
-        assert!(summary.chars().count() <= 5 + SUMMARY_MAX_CHARS + 1 + 1, "{summary}");
+        assert!(
+            summary.chars().count() <= 5 + SUMMARY_MAX_CHARS + 1 + 1,
+            "{summary}"
+        );
         // The label is backtick-wrapped: `Run `……`` — the truncation ellipsis
         // sits right before the closing backtick.
         assert!(summary.ends_with("…`"));

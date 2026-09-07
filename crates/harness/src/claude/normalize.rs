@@ -1079,7 +1079,8 @@ mod tests {
     #[test]
     fn conversation_reset_re_arms_init_dedup_for_a_new_session() {
         let mut norm = Normalizer::new();
-        let init1 = r#"{"type":"system","subtype":"init","model":"m","cwd":"/x","session_id":"s1"}"#;
+        let init1 =
+            r#"{"type":"system","subtype":"init","model":"m","cwd":"/x","session_id":"s1"}"#;
         let ev = norm.normalize(crate::claude::wire::parse_frame(init1).unwrap(), false);
         assert_eq!(ev.len(), 1, "first init starts the session");
 
@@ -1090,7 +1091,8 @@ mod tests {
             "the reset frame itself carries no event"
         );
 
-        let init2 = r#"{"type":"system","subtype":"init","model":"m","cwd":"/x","session_id":"s2"}"#;
+        let init2 =
+            r#"{"type":"system","subtype":"init","model":"m","cwd":"/x","session_id":"s2"}"#;
         let ev = norm.normalize(crate::claude::wire::parse_frame(init2).unwrap(), false);
         assert!(
             matches!(

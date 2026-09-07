@@ -18,8 +18,8 @@ use tokio::sync::{mpsc, oneshot};
 pub use tokio_util::sync::CancellationToken;
 
 use komet_proto::{
-    AgentEvent, ContextUsage, HarnessId, Model, ReasoningLevel, RunRequest, SlashCommand, SteeringMode,
-    UserInputAnswer, UserInputQuestion,
+    AgentEvent, ContextUsage, HarnessId, Model, ReasoningLevel, RunRequest, SlashCommand,
+    SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -42,9 +42,8 @@ pub struct SteerMessage {
     pub message_id: Option<String>,
 }
 
-pub type RequestInputFn = Box<
-    dyn Fn(Vec<UserInputQuestion>) -> oneshot::Receiver<Vec<UserInputAnswer>> + Send + Sync,
->;
+pub type RequestInputFn =
+    Box<dyn Fn(Vec<UserInputQuestion>) -> oneshot::Receiver<Vec<UserInputAnswer>> + Send + Sync>;
 
 pub type RequestPermissionFn = Box<
     dyn Fn(
@@ -74,10 +73,12 @@ pub struct RunControls {
 }
 
 impl RunControls {
-    pub fn noop_permission(
-    ) -> Box<
-        dyn Fn(komet_proto::PermissionKind, String, Vec<komet_proto::PermissionChoice>)
-            -> oneshot::Receiver<komet_proto::PermissionChoice>
+    pub fn noop_permission() -> Box<
+        dyn Fn(
+                komet_proto::PermissionKind,
+                String,
+                Vec<komet_proto::PermissionChoice>,
+            ) -> oneshot::Receiver<komet_proto::PermissionChoice>
             + Send
             + Sync,
     > {
