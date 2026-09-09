@@ -126,7 +126,7 @@ struct Inner {
     /// (komet kept the same pair on `chats.harness_session_id`). An empty
     /// session id is the "do not resume" tombstone after a rejected resume.
     harness_sessions: Mutex<HashMap<String, HarnessSessionRef>>,
-    /// Cumulative context & token usage metrics per chat id.
+    /// Latest context-window snapshot per chat (replaced, not summed).
     usage_stats: Mutex<HashMap<String, komet_proto::ContextUsageStats>>,
     /// Auto-titler for untitled chats (wired at engine assembly; absent in bare tests).
     titles: OnceLock<crate::titles::TitleGenerator>,
@@ -1105,13 +1105,26 @@ impl SessionsEngine {
 impl Inner {
     /// Journal + broadcast one event (the two unconditional legs of the pipeline).
     fn publish(&self, chat_id: &str, event: &AgentEvent) -> u64 {
-        match event {
+        let usage_changed = match event {
             AgentEvent::SessionStarted { model, .. } => {
                 let mut usage_stats = lock(&self.usage_stats);
                 let default_limit = komet_proto::default_context_limit_for_model(model);
                 usage_stats
                     .entry(chat_id.to_string())
                     .or_insert_with(|| komet_proto::ContextUsageStats::new(default_limit));
+                true
+            }
+            AgentEvent::ContextWindow { stats } => {
+                let mut usage_stats = lock(&self.usage_stats);
+                let entry = usage_stats.entry(chat_id.to_string()).or_insert_with(|| {
+                    komet_proto::ContextUsageStats::new(if stats.context_limit > 0 {
+                        stats.context_limit
+                    } else {
+                        200_000
+                    })
+                });
+                entry.apply_snapshot(stats);
+                true
             }
             AgentEvent::Usage {
                 input_tokens,
@@ -1124,15 +1137,19 @@ impl Inner {
                 let entry = usage_stats.entry(chat_id.to_string()).or_insert_with(|| {
                     komet_proto::ContextUsageStats::new(context_limit.unwrap_or(200_000))
                 });
-                entry.ingest(
+                entry.apply_turn(
                     *input_tokens,
                     *cached_input_tokens,
                     *output_tokens,
                     *reasoning_tokens,
                     *context_limit,
                 );
+                true
             }
-            _ => {}
+            _ => false,
+        };
+        if usage_changed {
+            self.broadcast_usage(chat_id);
         }
         let seq = match self.journal.append(chat_id, event) {
             Ok(seq) => seq,
@@ -1170,6 +1187,7 @@ impl Inner {
                 return;
             }
             entry.updated_at = now;
+            self.attach_usage(chat_id, entry);
             let session = entry.clone();
             let mut list: Vec<Session> = statuses.values().cloned().collect();
             list.sort_by(|a, b| a.chat_id.cmp(&b.chat_id));
@@ -1179,6 +1197,24 @@ impl Inner {
         if let Some(ws) = self.workspace() {
             ws.record_session(&session);
         }
+    }
+
+    fn attach_usage(&self, chat_id: &str, session: &mut Session) {
+        session.context_usage = lock(&self.usage_stats).get(chat_id).cloned();
+    }
+
+    /// Push the latest context-window snapshot onto the live Session row so
+    /// WatchSessions (and the footer ring) see it without a status change.
+    fn broadcast_usage(&self, chat_id: &str) {
+        let stats = lock(&self.usage_stats).get(chat_id).cloned();
+        let mut statuses = lock(&self.statuses);
+        let Some(entry) = statuses.get_mut(chat_id) else {
+            return;
+        };
+        entry.context_usage = stats;
+        let mut list: Vec<Session> = statuses.values().cloned().collect();
+        list.sort_by(|a, b| a.chat_id.cmp(&b.chat_id));
+        self.sessions_tx.send_replace(list);
     }
 
     fn set_status(&self, chat_id: &str, status: SessionStatus, fresh_start: bool) {
@@ -1193,6 +1229,7 @@ impl Inner {
                     status,
                     started_at: None,
                     updated_at: now,
+                    context_usage: None,
                 });
             // `started_at` is the elapsed-timer base and must only ever mean
             // "this turn". Entering Working from a settled state always
@@ -1215,6 +1252,7 @@ impl Inner {
                     entry.started_at = None;
                 }
             }
+            self.attach_usage(chat_id, entry);
             let session = entry.clone();
             let mut list: Vec<Session> = statuses.values().cloned().collect();
             list.sort_by(|a, b| a.chat_id.cmp(&b.chat_id));
@@ -2223,5 +2261,172 @@ async fn drive_run(
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use komet_proto::{ContextUsageSource, ContextUsageStats};
+
+    fn test_engine() -> (tempfile::TempDir, SessionsEngine) {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(RunJournal::open(dir.path()).unwrap());
+        let registry = Arc::new(HarnessRegistry::new());
+        (
+            dir,
+            SessionsEngine::new_for_tests("dev".into(), journal, registry),
+        )
+    }
+
+    fn native_window(used: u64, input: u64, output: u64) -> AgentEvent {
+        AgentEvent::ContextWindow {
+            stats: ContextUsageStats::window(
+                used,
+                128_000,
+                ContextUsageSource::Native,
+                input,
+                0,
+                output,
+                0,
+            ),
+        }
+    }
+
+    fn turn_usage(input: u64, output: u64) -> AgentEvent {
+        AgentEvent::Usage {
+            input_tokens: input,
+            cached_input_tokens: 0,
+            output_tokens: output,
+            reasoning_tokens: 0,
+            context_limit: Some(128_000),
+        }
+    }
+
+    #[test]
+    fn context_window_replaces_gauge_and_usage_does_not_accumulate() {
+        let (_dir, engine) = test_engine();
+        let chat = "chat-1";
+        engine.set_status(chat, SessionStatus::Working, true);
+
+        engine
+            .inner
+            .publish(chat, &native_window(10_000, 10_000, 500));
+        let first = engine.usage_for(chat).expect("native snapshot");
+        assert_eq!(first.used(), 10_000);
+        assert_eq!(first.source, ContextUsageSource::Native);
+        assert_eq!(
+            engine
+                .session_status(chat)
+                .and_then(|s| s.context_usage)
+                .map(|s| s.used()),
+            Some(10_000),
+            "WatchSessions row carries the snapshot"
+        );
+
+        engine.inner.publish(chat, &turn_usage(3_000, 100));
+        let after_turn = engine.usage_for(chat).unwrap();
+        assert_eq!(after_turn.used(), 10_000);
+        assert_eq!(after_turn.input_tokens, 3_000);
+        assert_eq!(after_turn.output_tokens, 100);
+        assert_eq!(after_turn.source, ContextUsageSource::Native);
+
+        engine
+            .inner
+            .publish(chat, &native_window(20_000, 19_000, 1_000));
+        let second = engine.usage_for(chat).unwrap();
+        assert_eq!(second.used(), 20_000);
+        assert_eq!(second.input_tokens, 19_000);
+        assert_eq!(
+            engine
+                .watch_sessions()
+                .borrow()
+                .iter()
+                .find(|s| s.chat_id == chat)
+                .and_then(|s| s.context_usage.as_ref())
+                .map(|s| s.used()),
+            Some(20_000),
+        );
+    }
+
+    #[test]
+    fn approximate_usage_does_not_overwrite_native_window() {
+        let (_dir, engine) = test_engine();
+        let chat = "chat-2";
+        engine.set_status(chat, SessionStatus::Working, true);
+        engine.inner.publish(chat, &native_window(9_999, 9_999, 0));
+        engine.inner.publish(
+            chat,
+            &AgentEvent::ContextWindow {
+                stats: ContextUsageStats::window(
+                    3_000,
+                    0,
+                    ContextUsageSource::Approximate,
+                    3_000,
+                    0,
+                    40,
+                    0,
+                ),
+            },
+        );
+        let stats = engine.usage_for(chat).unwrap();
+        assert_eq!(stats.used(), 9_999);
+        assert_eq!(stats.source, ContextUsageSource::Native);
+        assert_eq!(stats.input_tokens, 9_999);
+    }
+
+    #[test]
+    fn billed_prompt_overshoot_is_capped_for_every_source() {
+        let (_dir, engine) = test_engine();
+        let chat = "chat-overshoot";
+        engine.set_status(chat, SessionStatus::Working, true);
+
+        engine.inner.publish(
+            chat,
+            &AgentEvent::SessionStarted {
+                harness: HarnessId::Grok,
+                model: "grok-4.5".into(),
+                tools: Vec::new(),
+                cwd: "/tmp".into(),
+                session_id: "s".into(),
+                assistant_message_id: "a".into(),
+            },
+        );
+        engine.inner.publish(
+            chat,
+            &AgentEvent::Usage {
+                input_tokens: 3_000_000,
+                cached_input_tokens: 0,
+                output_tokens: 18_000,
+                reasoning_tokens: 0,
+                context_limit: None,
+            },
+        );
+        let stats = engine.usage_for(chat).unwrap();
+        assert_eq!(stats.context_limit, 131_072);
+        assert_eq!(stats.used(), 0);
+        assert_eq!(stats.input_tokens, 3_000_000);
+        assert_eq!(stats.source, ContextUsageSource::Approximate);
+
+        let chat_native = "chat-native-overshoot";
+        engine.set_status(chat_native, SessionStatus::Working, true);
+        engine.inner.publish(
+            chat_native,
+            &AgentEvent::ContextWindow {
+                stats: ContextUsageStats::window(
+                    3_000_000,
+                    500_000,
+                    ContextUsageSource::Native,
+                    3_000_000,
+                    0,
+                    0,
+                    0,
+                ),
+            },
+        );
+        let native = engine.usage_for(chat_native).unwrap();
+        assert_eq!(native.used(), 500_000);
+        assert_eq!(native.input_tokens, 3_000_000);
+        assert_eq!(native.source, ContextUsageSource::Native);
     }
 }

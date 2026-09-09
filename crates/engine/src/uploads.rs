@@ -402,7 +402,10 @@ mod tests {
         uploads
             .append("upload-other", &BASE64.encode(b"aGk="), Some(0))
             .unwrap();
-        assert!(!racing.exists(), "abandoned empty staging dir must be swept");
+        assert!(
+            !racing.exists(),
+            "abandoned empty staging dir must be swept"
+        );
     }
 
     #[test]

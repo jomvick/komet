@@ -251,5 +251,9 @@ fn ephemeral_uses_unique_path() {
     let a = McpSecretStore::ephemeral();
     let b = McpSecretStore::ephemeral();
     assert_ne!(a.path(), b.path());
-    assert!(a.path().to_string_lossy().contains("komet-mcp-secrets-ephemeral"));
+    assert!(
+        a.path()
+            .to_string_lossy()
+            .contains("komet-mcp-secrets-ephemeral")
+    );
 }

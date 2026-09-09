@@ -248,7 +248,10 @@ impl HarnessRegistry {
         if let Some(cached) = self.models_cache_entries().get(&id).cloned() {
             let age = now - cached.discovered_at_ms;
             let has_obsolete = id == HarnessId::Antigravity
-                && cached.models.iter().any(|m| m.id == "gemini-3.7-flash" || m.id == "gemini-2.5-flash");
+                && cached
+                    .models
+                    .iter()
+                    .any(|m| m.id == "gemini-3.7-flash" || m.id == "gemini-2.5-flash");
             if age < ttl_ms && !has_obsolete {
                 if age >= refresh_after_ms
                     && let Ok(harness) = self.resolve(id)

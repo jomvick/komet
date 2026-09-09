@@ -26,7 +26,9 @@ pub(crate) enum Frame {
     /// new session, not the dedup-worthy kind a background-subagent wake
     /// turn re-sends with the SAME session id.
     ConversationReset(#[allow(dead_code)] ConversationResetFrame),
-    /// control_response / control_cancel_request / anything unknown.
+    /// Reply to a client `control_request` (Bucket C: `get_context_usage`, …).
+    ControlResponse(Value),
+    /// control_cancel_request / anything unknown.
     Other,
 }
 
@@ -167,6 +169,8 @@ pub(crate) struct ResultFrame {
     pub errors: Vec<Value>,
     #[serde(default)]
     pub usage: UsageBody,
+    #[serde(default, alias = "modelUsage")]
+    pub model_usage: Value,
     #[serde(default)]
     pub session_id: Option<String>,
 }
@@ -177,6 +181,10 @@ pub(crate) struct UsageBody {
     pub input_tokens: u64,
     #[serde(default)]
     pub output_tokens: u64,
+    #[serde(default, alias = "cacheReadInputTokens")]
+    pub cache_read_input_tokens: u64,
+    #[serde(default, alias = "cacheCreationInputTokens")]
+    pub cache_creation_input_tokens: u64,
 }
 
 /// A CLI→client control request (`can_use_tool` is the one we act on).
@@ -210,6 +218,7 @@ pub(crate) fn parse_frame(line: &str) -> Result<Frame, serde_json::Error> {
         "rate_limit_event" => Frame::RateLimit(serde_json::from_value(value)?),
         "result" => Frame::Result(serde_json::from_value(value)?),
         "control_request" => Frame::ControlRequest(serde_json::from_value(value)?),
+        "control_response" => Frame::ControlResponse(value),
         "conversation_reset" => Frame::ConversationReset(serde_json::from_value(value)?),
         _ => Frame::Other,
     };

@@ -14,6 +14,8 @@ fi
 # Verify arguments for normal run
 has_skip_perms=0
 has_add_dir=0
+has_sandbox=0
+mode=""
 prompt=""
 
 while [ $# -gt 0 ]; do
@@ -21,6 +23,14 @@ while [ $# -gt 0 ]; do
         --dangerously-skip-permissions)
             has_skip_perms=1
             shift
+            ;;
+        --sandbox)
+            has_sandbox=1
+            shift
+            ;;
+        --mode)
+            mode="$2"
+            shift 2
             ;;
         --add-dir)
             has_add_dir=1
@@ -71,6 +81,28 @@ case "$prompt" in
         emit '{"event":"init","conversation_id":"fake-flags","init":{"model":"gemini-3.8-flash","tools":[],"cwd":"/test/project"}}'
         emit '{"event":"step_update","step_update":{"conversation_id":"fake-flags","step_index":1,"state":"ACTIVE","step_type":"agent_response","text_delta":"flags ok"}}'
         emit '{"event":"result","result":{"conversation_id":"fake-flags","status":"SUCCESS","response":"flags ok"}}'
+        ;;
+    *scenario:verify_sandbox*)
+        if [ "$has_sandbox" -ne 1 ]; then
+            echo "Missing --sandbox" >&2
+            exit 4
+        fi
+        emit '{"event":"init","conversation_id":"fake-sandbox","init":{"model":"gemini-3.8-flash","tools":[],"cwd":"/test/project"}}'
+        emit '{"event":"step_update","step_update":{"conversation_id":"fake-sandbox","step_index":1,"state":"ACTIVE","step_type":"agent_response","text_delta":"sandbox ok"}}'
+        emit '{"event":"result","result":{"conversation_id":"fake-sandbox","status":"SUCCESS","response":"sandbox ok"}}'
+        ;;
+    *scenario:verify_readonly*)
+        if [ "$has_sandbox" -ne 1 ]; then
+            echo "Missing --sandbox" >&2
+            exit 4
+        fi
+        if [ "$mode" != "plan" ]; then
+            echo "Missing --mode plan (got: $mode)" >&2
+            exit 5
+        fi
+        emit '{"event":"init","conversation_id":"fake-readonly","init":{"model":"gemini-3.8-flash","tools":[],"cwd":"/test/project"}}'
+        emit '{"event":"step_update","step_update":{"conversation_id":"fake-readonly","step_index":1,"state":"ACTIVE","step_type":"agent_response","text_delta":"readonly ok"}}'
+        emit '{"event":"result","result":{"conversation_id":"fake-readonly","status":"SUCCESS","response":"readonly ok"}}'
         ;;
     *scenario:crash*)
         echo "Fatal runtime error in agy" >&2

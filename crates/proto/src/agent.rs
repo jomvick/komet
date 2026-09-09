@@ -1557,7 +1557,7 @@ pub enum AgentEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         diff: Option<ToolDiff>,
     },
-    /// Kept as a harness passthrough (rate-limit probes); never persisted to docs.
+    /// Last-turn token counts (cost / rate-limit probes); never persisted to docs.
     #[serde(rename_all = "camelCase")]
     Usage {
         input_tokens: u64,
@@ -1568,6 +1568,13 @@ pub enum AgentEvent {
         reasoning_tokens: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         context_limit: Option<u64>,
+    },
+    /// Context-window gauge snapshot for the live session (ACP `usage_update`,
+    /// Grok `_x.ai/session/info`, Codex `tokenUsage.total`, Claude
+    /// `get_context_usage`). Replaces the previous gauge; never persisted to docs.
+    #[serde(rename_all = "camelCase")]
+    ContextWindow {
+        stats: ContextUsageStats,
     },
     /// The agent advertised (or changed) its slash-command set — ACP
     /// `available_commands_update`. The engine caches the latest list per
@@ -1644,7 +1651,25 @@ pub enum AgentEvent {
     },
 }
 
-/// Cumulative provider-reported usage and context-window metrics for a chat.
+/// How the context-window gauge was produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ContextUsageSource {
+    /// Provider-native window (ACP `usage_update`, Grok `_x.ai/session/info`,
+    /// Codex `total` + `modelContextWindow`, Claude `get_context_usage`).
+    Native,
+    /// Last-turn prompt tokens used as a stand-in for the window.
+    Approximate,
+    /// Transcript character estimate (`chars / 4`) — last-resort UI fallback.
+    #[default]
+    Estimated,
+}
+
+/// Provider-reported usage and context-window metrics for a chat.
+///
+/// The ring reads [`Self::used`] vs `context_limit` (a snapshot). Breakdown
+/// fields are last-turn or thread totals when the wire supplies them — they
+/// are not summed across turns.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContextUsageStats {
@@ -1653,6 +1678,12 @@ pub struct ContextUsageStats {
     pub output_tokens: u64,
     pub reasoning_tokens: u64,
     pub context_limit: u64,
+    /// Occupied context window. Zero means "unset" — [`Self::used`] then
+    /// falls back to [`Self::total_tokens`].
+    #[serde(default)]
+    pub used_tokens: u64,
+    #[serde(default)]
+    pub source: ContextUsageSource,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compact_threshold: Option<u64>,
     #[serde(default)]
@@ -1675,17 +1706,77 @@ impl ContextUsageStats {
         }
     }
 
+    /// Native or approximate window snapshot with optional token breakdown.
+    /// A `limit` of 0 means "unset" — merge will keep the existing limit.
+    pub fn window(
+        used: u64,
+        limit: u64,
+        source: ContextUsageSource,
+        input: u64,
+        cached: u64,
+        output: u64,
+        reasoning: u64,
+    ) -> Self {
+        let mut stats = if limit > 0 {
+            Self::new(limit)
+        } else {
+            Self::default()
+        };
+        stats.used_tokens = used;
+        stats.source = source;
+        stats.input_tokens = input;
+        stats.cached_input_tokens = cached;
+        stats.output_tokens = output;
+        stats.reasoning_tokens = reasoning;
+        stats.clamp_gauge();
+        stats
+    }
+
+    pub fn compaction(reason: impl Into<String>) -> Self {
+        Self {
+            compactions_count: 1,
+            compactions_reason: Some(reason.into()),
+            ..Self::default()
+        }
+    }
+
     /// Cached and reasoning tokens are provider breakdowns already included
     /// in the input/output totals, so they are not counted a second time.
     pub fn total_tokens(&self) -> u64 {
         self.input_tokens.saturating_add(self.output_tokens)
     }
 
+    /// Occupied window for the ring. Prefers an explicit snapshot.
+    ///
+    /// [`ContextUsageSource::Estimated`] with no snapshot falls back to
+    /// billed/transcript totals (the UI's chars/4 heuristic). Native and
+    /// Approximate fills come only from a [`Self::window`] snapshot — last-turn
+    /// billed `inputTokens` are not occupancy (Grok/Cursor/Claude tool loops
+    /// accumulate them far past the window).
+    pub fn used(&self) -> u64 {
+        let raw = if self.used_tokens > 0 {
+            self.used_tokens
+        } else if self.source == ContextUsageSource::Estimated {
+            self.total_tokens()
+        } else {
+            0
+        };
+        Self::clamp_to_window(raw, self.context_limit)
+    }
+
+    fn clamp_to_window(used: u64, limit: u64) -> u64 {
+        if limit == 0 { used } else { used.min(limit) }
+    }
+
+    fn clamp_gauge(&mut self) {
+        self.used_tokens = Self::clamp_to_window(self.used_tokens, self.context_limit);
+    }
+
     pub fn context_ratio(&self) -> f32 {
         if self.context_limit == 0 {
             0.0
         } else {
-            (self.total_tokens() as f32 / self.context_limit as f32).clamp(0.0, 1.0)
+            (self.used() as f32 / self.context_limit as f32).clamp(0.0, 1.0)
         }
     }
 
@@ -1693,7 +1784,55 @@ impl ContextUsageStats {
         (self.context_ratio() * 100.0).round() as u32
     }
 
-    pub fn ingest(
+    /// Merge a context-window snapshot. Native gauges are not overwritten by
+    /// Approximate ones; compaction counts accumulate.
+    pub fn apply_snapshot(&mut self, incoming: &Self) {
+        let replace_gauge = incoming.source == ContextUsageSource::Native
+            || self.source != ContextUsageSource::Native;
+        if replace_gauge {
+            if incoming.used_tokens > 0 {
+                self.used_tokens = incoming.used_tokens;
+            }
+            if incoming.input_tokens > 0
+                || incoming.output_tokens > 0
+                || incoming.cached_input_tokens > 0
+                || incoming.reasoning_tokens > 0
+            {
+                self.input_tokens = incoming.input_tokens;
+                self.cached_input_tokens = incoming.cached_input_tokens;
+                self.output_tokens = incoming.output_tokens;
+                self.reasoning_tokens = incoming.reasoning_tokens;
+            }
+            if incoming.context_limit > 0 {
+                self.context_limit = incoming.context_limit;
+                self.compact_threshold = incoming
+                    .compact_threshold
+                    .or(Some(incoming.context_limit.saturating_mul(3) / 4));
+            }
+            match (self.source, incoming.source) {
+                (ContextUsageSource::Native, _) => {}
+                (_, ContextUsageSource::Native) => self.source = ContextUsageSource::Native,
+                (_, ContextUsageSource::Approximate) => {
+                    self.source = ContextUsageSource::Approximate;
+                }
+                _ => {}
+            }
+            self.clamp_gauge();
+        }
+        self.compactions_count = self
+            .compactions_count
+            .saturating_add(incoming.compactions_count);
+        if incoming.compactions_reason.is_some() {
+            self.compactions_reason = incoming.compactions_reason.clone();
+        }
+    }
+
+    /// Last-turn billed token counts for the popover breakdown.
+    ///
+    /// Never treats billed `input` as window occupancy — CLIs that compute
+    /// context (ACP `usage_update`, Grok `_x.ai/session/info`, Claude
+    /// `get_context_usage`, Codex `tokenUsage`) emit [`Self::window`].
+    pub fn apply_turn(
         &mut self,
         input: u64,
         cached: u64,
@@ -1701,13 +1840,16 @@ impl ContextUsageStats {
         reasoning: u64,
         limit: Option<u64>,
     ) {
-        self.input_tokens = self.input_tokens.saturating_add(input);
-        self.cached_input_tokens = self.cached_input_tokens.saturating_add(cached);
-        self.output_tokens = self.output_tokens.saturating_add(output);
-        self.reasoning_tokens = self.reasoning_tokens.saturating_add(reasoning);
+        self.input_tokens = input;
+        self.cached_input_tokens = cached;
+        self.output_tokens = output;
+        self.reasoning_tokens = reasoning;
         if let Some(limit) = limit.filter(|limit| *limit > 0) {
             self.context_limit = limit;
             self.compact_threshold = Some(limit.saturating_mul(3) / 4);
+        }
+        if self.source == ContextUsageSource::Estimated {
+            self.source = ContextUsageSource::Approximate;
         }
     }
 }
@@ -1939,13 +2081,94 @@ mod tests {
     }
 
     #[test]
-    fn context_usage_accumulates_without_double_counting_breakdowns() {
-        let mut stats = ContextUsageStats::new(128_000);
-        stats.ingest(10_000, 2_000, 500, 300, None);
-
+    fn context_usage_snapshot_replaces_and_turn_does_not_grow_native_gauge() {
+        let mut stats = ContextUsageStats::window(
+            10_000,
+            128_000,
+            ContextUsageSource::Native,
+            10_000,
+            2_000,
+            500,
+            300,
+        );
+        assert_eq!(stats.used(), 10_000);
         assert_eq!(stats.total_tokens(), 10_500);
         assert_eq!(stats.context_percent(), 8);
         assert_eq!(stats.compact_threshold, Some(96_000));
+
+        stats.apply_turn(3_000, 0, 100, 0, None);
+        assert_eq!(stats.used(), 10_000);
+        assert_eq!(stats.input_tokens, 3_000);
+        assert_eq!(stats.source, ContextUsageSource::Native);
+
+        stats.apply_snapshot(&ContextUsageStats::window(
+            20_000,
+            128_000,
+            ContextUsageSource::Native,
+            19_000,
+            0,
+            1_000,
+            0,
+        ));
+        assert_eq!(stats.used(), 20_000);
+        assert_eq!(stats.input_tokens, 19_000);
+
+        let mut approx = ContextUsageStats::new(128_000);
+        approx.apply_turn(4_000, 0, 10, 0, None);
+        assert_eq!(approx.used(), 0);
+        assert_eq!(approx.input_tokens, 4_000);
+        assert_eq!(approx.source, ContextUsageSource::Approximate);
+
+        let mut estimated = ContextUsageStats::new(128_000);
+        estimated.input_tokens = 4_000;
+        estimated.source = ContextUsageSource::Estimated;
+        assert_eq!(estimated.used(), 4_000);
+
+        // Grok/Cursor/Claude/Antigravity can bill *cumulative* prompt tokens
+        // across a long agent turn; that is not window occupancy.
+        let mut overshoot = ContextUsageStats::new(131_072);
+        overshoot.apply_turn(3_000_000, 0, 18_000, 0, None);
+        assert_eq!(overshoot.used(), 0);
+        assert_eq!(overshoot.used_tokens, 0);
+        assert_eq!(overshoot.context_percent(), 0);
+        assert_eq!(overshoot.input_tokens, 3_000_000);
+        assert_eq!(overshoot.total_tokens(), 3_018_000);
+
+        // Native ACP `usage_update` / Codex `totalTokens` can also overshoot.
+        let native_over = ContextUsageStats::window(
+            3_000_000,
+            131_072,
+            ContextUsageSource::Native,
+            3_000_000,
+            0,
+            18_000,
+            0,
+        );
+        assert_eq!(native_over.used(), 131_072);
+        assert_eq!(native_over.source, ContextUsageSource::Native);
+        assert_eq!(native_over.input_tokens, 3_000_000);
+
+        // Approximate snapshot with no limit, merged onto a session window
+        // (Claude result / Grok `_meta` after SessionStarted).
+        let mut session = ContextUsageStats::new(200_000);
+        session.apply_snapshot(&ContextUsageStats::window(
+            3_000_000,
+            0,
+            ContextUsageSource::Approximate,
+            3_000_000,
+            0,
+            1,
+            0,
+        ));
+        assert_eq!(session.used(), 200_000);
+        assert_eq!(session.input_tokens, 3_000_000);
+        assert_eq!(session.source, ContextUsageSource::Approximate);
+
+        let mut estimated = ContextUsageStats::new(128_000);
+        estimated.source = ContextUsageSource::Estimated;
+        estimated.input_tokens = 5_000_000;
+        assert_eq!(estimated.used(), 128_000);
+
         assert_eq!(default_context_limit_for_model("gemini-2.5-pro"), 1_000_000);
         assert_eq!(format_tokens(10_500), "10k");
     }

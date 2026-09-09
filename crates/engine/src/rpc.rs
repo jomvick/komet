@@ -1296,22 +1296,8 @@ impl RpcService for EngineRpc {
                 )))
             }
             methods::GET_CONTEXT_USAGE => {
-                if let Ok(p) = serde_json::from_value::<ChatParams>(params.clone())
-                    && let Some(usage) = self.sessions.usage_for(&p.chat_id) {
-                        return RpcReply::value(&usage);
-                    }
-                if let Ok(p) = serde_json::from_value::<ListModelsParams>(params) {
-                    let harness = self
-                        .registry
-                        .resolve(p.harness)
-                        .map_err(|e| RpcError::Failed(e.to_string()))?;
-                    let usage = harness
-                        .context_usage()
-                        .await
-                        .map_err(|e| RpcError::Failed(e.to_string()))?;
-                    return RpcReply::value(&usage);
-                }
-                RpcReply::value(&komet_proto::ContextUsage::default())
+                let p: ChatParams = parse_params(params)?;
+                RpcReply::value(&self.sessions.usage_for(&p.chat_id).unwrap_or_default())
             }
             methods::PROBE_SYNC => {
                 self.workspace.probe();

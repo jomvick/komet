@@ -548,12 +548,39 @@ impl Normalizer {
                 if let Some(id) = &f.session_id {
                     self.session_id = Some(id.clone());
                 }
+                let occupancy = f
+                    .usage
+                    .input_tokens
+                    .saturating_add(f.usage.cache_read_input_tokens)
+                    .saturating_add(f.usage.cache_creation_input_tokens);
+                let limit = f
+                    .model_usage
+                    .as_object()
+                    .and_then(|models| {
+                        models.values().find_map(|m| {
+                            m.get("contextWindow")
+                                .or_else(|| m.get("context_window"))
+                                .and_then(Value::as_u64)
+                        })
+                    })
+                    .unwrap_or(0);
                 let usage = AgentEvent::Usage {
                     input_tokens: f.usage.input_tokens,
-                    cached_input_tokens: 0,
+                    cached_input_tokens: f.usage.cache_read_input_tokens,
                     output_tokens: f.usage.output_tokens,
                     reasoning_tokens: 0,
-                    context_limit: None,
+                    context_limit: (limit > 0).then_some(limit),
+                };
+                let window = AgentEvent::ContextWindow {
+                    stats: komet_proto::ContextUsageStats::window(
+                        occupancy,
+                        limit,
+                        komet_proto::ContextUsageSource::Approximate,
+                        f.usage.input_tokens,
+                        f.usage.cache_read_input_tokens,
+                        f.usage.output_tokens,
+                        0,
+                    ),
                 };
                 let done = if f.subtype == "success" {
                     AgentEvent::Done {
@@ -618,11 +645,11 @@ impl Normalizer {
                         reason: None,
                     }
                 };
-                vec![usage, done]
+                vec![usage, window, done]
             }
 
             // Control frames are handled by the run loop, not normalized.
-            Frame::ControlRequest(_) | Frame::Other => Vec::new(),
+            Frame::ControlRequest(_) | Frame::ControlResponse(_) | Frame::Other => Vec::new(),
         }
     }
 }
@@ -1102,5 +1129,28 @@ mod tests {
             "the post-reset init must start a NEW session, not be deduped: {ev:?}"
         );
         assert_eq!(norm.session_id.as_deref(), Some("s2"));
+    }
+
+    #[test]
+    fn result_occupancy_includes_cache_and_model_window() {
+        let ev = normalize_one(
+            r#"{"type":"result","subtype":"success","result":"ok","errors":[],"usage":{"input_tokens":18,"cache_read_input_tokens":49648,"cache_creation_input_tokens":3719,"output_tokens":288},"modelUsage":{"claude-haiku-4-5-20251001":{"contextWindow":200000}},"session_id":"s"}"#,
+        );
+        assert!(ev.iter().any(|e| matches!(
+            e,
+            AgentEvent::ContextWindow { stats }
+                if stats.used() == 18 + 49648 + 3719
+                    && stats.context_limit == 200_000
+                    && stats.source == komet_proto::ContextUsageSource::Approximate
+        )));
+        assert!(ev.iter().any(|e| matches!(
+            e,
+            AgentEvent::Usage {
+                input_tokens: 18,
+                cached_input_tokens: 49648,
+                context_limit: Some(200_000),
+                ..
+            }
+        )));
     }
 }

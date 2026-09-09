@@ -140,6 +140,44 @@ async fn flags_include_dangerously_skip_permissions_and_add_dir() {
 }
 
 #[tokio::test]
+async fn workspace_write_enables_agy_sandbox() {
+    let h = harness();
+    let (ctrls, _steer, _tok) = controls();
+    let mut req = request("scenario:verify_sandbox");
+    req.sandbox = SandboxLevel::WorkspaceWrite;
+    let events = collect_events(&h, req, ctrls).await;
+    let ok = events.iter().any(|e| {
+        matches!(
+            e,
+            AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            }
+        )
+    });
+    assert!(ok, "workspace-write must pass --sandbox: {events:?}");
+}
+
+#[tokio::test]
+async fn read_only_enables_agy_plan_mode() {
+    let h = harness();
+    let (ctrls, _steer, _tok) = controls();
+    let mut req = request("scenario:verify_readonly");
+    req.sandbox = SandboxLevel::ReadOnly;
+    let events = collect_events(&h, req, ctrls).await;
+    let ok = events.iter().any(|e| {
+        matches!(
+            e,
+            AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            }
+        )
+    });
+    assert!(ok, "read-only must pass --sandbox --mode plan: {events:?}");
+}
+
+#[tokio::test]
 async fn tool_lifecycle_deduplicates_and_emits_result() {
     let h = harness();
     let (ctrls, _steer, _tok) = controls();
@@ -282,4 +320,12 @@ async fn dynamic_model_discovery() {
     let models = h.models().await.expect("models query succeeds");
     assert!(models.iter().any(|m| m.id == "gemini-3.8-flash-high"));
     assert!(models.iter().any(|m| m.id == "claude-sonnet-4-6"));
+}
+
+#[tokio::test]
+async fn commands_come_from_the_antigravity_catalog() {
+    let commands = harness().commands().await.expect("catalog");
+    assert!(commands.iter().any(|c| c.name == "goal"));
+    assert!(commands.iter().any(|c| c.name == "schedule"));
+    assert!(commands.iter().any(|c| c.name == "learn"));
 }

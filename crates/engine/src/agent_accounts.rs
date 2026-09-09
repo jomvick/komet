@@ -520,7 +520,11 @@ impl AgentAccounts {
             }
         }
         std::fs::create_dir_all(&self.inner.config.antigravity_home)?;
-        write_file_atomic(&self.inner.config.antigravity_auth_file(), json.as_bytes(), true)
+        write_file_atomic(
+            &self.inner.config.antigravity_auth_file(),
+            json.as_bytes(),
+            true,
+        )
     }
 
     fn activate_cursor(&self, slot: &Slot) -> Result<(), EngineError> {
@@ -945,8 +949,7 @@ impl AgentAccounts {
                         .downcast_ref::<std::io::Error>()
                         .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound);
                     return Err(EngineError::Other(if not_found {
-                        "The `agy` CLI was not found on this device — install it first."
-                            .into()
+                        "The `agy` CLI was not found on this device — install it first.".into()
                     } else {
                         format!("Could not start antigravity login: {err}")
                     }));
@@ -1238,9 +1241,9 @@ impl AgentAccounts {
             ));
         }
         let (writer, initial) = match lock(&self.inner.flows).get(login_id) {
-            Some(LoginFlow::Antigravity { writer, initial, .. }) => {
-                (writer.clone(), initial.clone())
-            }
+            Some(LoginFlow::Antigravity {
+                writer, initial, ..
+            }) => (writer.clone(), initial.clone()),
             _ => {
                 return Err(EngineError::Other(
                     "This sign-in attempt expired — start again.".into(),
@@ -1373,17 +1376,18 @@ impl AgentAccounts {
                         .lines()
                         .rev()
                         .find_map(|line| {
-                            serde_json::from_str::<serde_json::Value>(line).ok().and_then(
-                                |v| {
-                                    (v.get("ev").and_then(|e| e.as_str()) == Some("fatal"))
-                                        .then(|| {
+                            serde_json::from_str::<serde_json::Value>(line)
+                                .ok()
+                                .and_then(|v| {
+                                    (v.get("ev").and_then(|e| e.as_str()) == Some("fatal")).then(
+                                        || {
                                             v.get("message")
                                                 .and_then(|m| m.as_str())
                                                 .unwrap_or("sign-in failed")
                                                 .to_string()
-                                        })
-                                },
-                            )
+                                        },
+                                    )
+                                })
                         })
                         .unwrap_or_else(|| "sign-in failed".into())
                 };
@@ -1411,11 +1415,14 @@ impl AgentAccounts {
         if let Some(detected) = read_json(&home.join("auth.json"))
             .and_then(|v| parse_antigravity_auth(v.clone()).or_else(|| parse_codex_auth(v)))
         {
-            let harness = if parse_antigravity_auth(read_json(&home.join("auth.json")).unwrap_or_default()).is_some() {
-                HarnessId::Antigravity
-            } else {
-                HarnessId::Codex
-            };
+            let harness =
+                if parse_antigravity_auth(read_json(&home.join("auth.json")).unwrap_or_default())
+                    .is_some()
+                {
+                    HarnessId::Antigravity
+                } else {
+                    HarnessId::Codex
+                };
             self.snapshot_detected(harness, &detected)?;
             self.cancel_login(login_id);
             return Ok(AgentLoginPoll {
@@ -1531,7 +1538,8 @@ impl AgentAccounts {
     }
 
     fn finish_antigravity_login(&self, login_id: &str) {
-        if let Some(LoginFlow::Antigravity { killer, .. }) = lock(&self.inner.flows).remove(login_id)
+        if let Some(LoginFlow::Antigravity { killer, .. }) =
+            lock(&self.inner.flows).remove(login_id)
             && let Some(k) = lock(&killer).as_mut()
         {
             let _ = k.kill();
@@ -1913,10 +1921,7 @@ impl AgentAccounts {
         if let Some(tokens) = slot.credentials.get("tokens")
             && let Some(access) = str_field(tokens, "access_token")
         {
-            candidates.push((
-                access,
-                str_field(tokens, "account_id").unwrap_or_default(),
-            ));
+            candidates.push((access, str_field(tokens, "account_id").unwrap_or_default()));
         }
         if is_active {
             let live = std::fs::read_to_string(self.inner.config.codex_home.join("auth.json"))
@@ -1926,10 +1931,7 @@ impl AgentAccounts {
                 && let Some(access) = str_field(tokens, "access_token")
                 && !candidates.iter().any(|(t, _)| t == &access)
             {
-                candidates.push((
-                    access,
-                    str_field(tokens, "account_id").unwrap_or_default(),
-                ));
+                candidates.push((access, str_field(tokens, "account_id").unwrap_or_default()));
             }
         }
         for (access_token, account_id) in candidates {
@@ -1971,11 +1973,19 @@ impl AgentAccounts {
         None
     }
 
-    async fn antigravity_usage(&self, slot: &Slot, is_active: bool) -> Option<Vec<AgentUsageWindow>> {
+    async fn antigravity_usage(
+        &self,
+        slot: &Slot,
+        is_active: bool,
+    ) -> Option<Vec<AgentUsageWindow>> {
         // 1. If this slot is the active one, check local language_server Connect-RPC first
         if is_active {
-            if let Some((port, token)) = discover_language_server(&self.inner.config.antigravity_home) {
-                let url = format!("http://127.0.0.1:{port}/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary");
+            if let Some((port, token)) =
+                discover_language_server(&self.inner.config.antigravity_home)
+            {
+                let url = format!(
+                    "http://127.0.0.1:{port}/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary"
+                );
                 if let Ok(resp) = self
                     .inner
                     .http
@@ -2001,7 +2011,8 @@ impl AgentAccounts {
         // the keyring holds the live token — try the live keyring first so
         // the Accounts page quota bar (consumed/remaining + reset) renders
         // instead of "Usage unavailable".
-        const ENDPOINT: &str = "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary";
+        const ENDPOINT: &str =
+            "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary";
 
         async fn query_pa(
             http: &reqwest::Client,
@@ -2047,7 +2058,9 @@ impl AgentAccounts {
         };
         let is_expired = str_field(token_view, "expiry")
             .and_then(|exp| chrono::DateTime::parse_from_rfc3339(&exp).ok())
-            .map(|exp| exp.with_timezone(&chrono::Utc) < chrono::Utc::now() + chrono::Duration::seconds(30))
+            .map(|exp| {
+                exp.with_timezone(&chrono::Utc) < chrono::Utc::now() + chrono::Duration::seconds(30)
+            })
             .unwrap_or(false);
 
         if is_expired {
@@ -2111,7 +2124,9 @@ impl AgentAccounts {
 
     async fn refresh_antigravity_slot_once(&self, slot: &Slot) -> Option<String> {
         let raw = slot.credentials.as_object().map(|_| &slot.credentials)?;
-        let view = if str_field(raw, "refresh_token").is_some() || str_field(raw, "refreshToken").is_some() {
+        let view = if str_field(raw, "refresh_token").is_some()
+            || str_field(raw, "refreshToken").is_some()
+        {
             raw.clone()
         } else if let Some(inner) = raw.get("token").filter(|t| t.is_object()) {
             inner.clone()
@@ -2120,8 +2135,8 @@ impl AgentAccounts {
         } else {
             raw.clone()
         };
-        let refresh_token = str_field(&view, "refresh_token")
-            .or_else(|| str_field(&view, "refreshToken"))?;
+        let refresh_token =
+            str_field(&view, "refresh_token").or_else(|| str_field(&view, "refreshToken"))?;
         let body: serde_json::Value = self
             .inner
             .http
@@ -2313,8 +2328,11 @@ mod secretservice {
             }
         }
         // 2) ksecretd quirk: `search --all` works where `lookup` comes back empty.
-        let (ok, stdout, stderr) =
-            exec(&["search", "--all", "service", service, "username", account], None).await;
+        let (ok, stdout, stderr) = exec(
+            &["search", "--all", "service", service, "username", account],
+            None,
+        )
+        .await;
         if ok {
             // `--all` prints one item per block; take the last `secret =` line.
             for line in stdout.lines().rev() {
@@ -2370,8 +2388,7 @@ mod secretservice {
     /// `start_antigravity_login`): otherwise it silently answers as whichever
     /// account is already live instead of prompting a fresh sign-in.
     pub(super) async fn clear_credentials(service: &str, account: &str) -> Result<(), EngineError> {
-        let (ok, _, stderr) =
-            exec(&["clear", "service", service, "username", account], None).await;
+        let (ok, _, stderr) = exec(&["clear", "service", service, "username", account], None).await;
         // `secret-tool clear` on an already-absent item still exits non-zero on
         // some ksecretd versions but prints nothing — both "cleared" and
         // "already absent" are fine outcomes for our purpose (agy unauthenticated).
@@ -2485,7 +2502,7 @@ mod wincred {
 
     use windows_sys::Win32::Foundation::FILETIME;
     use windows_sys::Win32::Security::Credentials::{
-        CredFree, CredReadW, CredWriteW, CREDENTIALW, CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC,
+        CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC, CREDENTIALW, CredFree, CredReadW, CredWriteW,
     };
 
     fn target() -> Vec<u16> {
@@ -2826,7 +2843,9 @@ fn parse_antigravity_quota_response(body: &serde_json::Value) -> Vec<AgentUsageW
             };
             if let Some(buckets) = group.get("buckets").and_then(|b| b.as_array()) {
                 for bucket in buckets {
-                    if let Some(remaining) = bucket.get("remainingFraction").and_then(|v| v.as_f64()) {
+                    if let Some(remaining) =
+                        bucket.get("remainingFraction").and_then(|v| v.as_f64())
+                    {
                         let used = (1.0 - remaining).clamp(0.0, 1.0) as f32;
                         let resets_at = parse_when(bucket.get("resetTime"));
                         windows.push(AgentUsageWindow {
@@ -2841,7 +2860,12 @@ fn parse_antigravity_quota_response(body: &serde_json::Value) -> Vec<AgentUsageW
         }
     }
     if windows.is_empty() {
-        for bucket in resp.get("buckets").and_then(|b| b.as_array()).into_iter().flatten() {
+        for bucket in resp
+            .get("buckets")
+            .and_then(|b| b.as_array())
+            .into_iter()
+            .flatten()
+        {
             if let Some(remaining) = bucket.get("remainingFraction").and_then(|v| v.as_f64()) {
                 let name = str_field(bucket, "displayName")
                     .or_else(|| str_field(bucket, "modelId"))
@@ -2922,13 +2946,14 @@ fn discover_language_server(antigravity_home: &Path) -> Option<(u16, String)> {
 /// token back out of the raw keyring/file blob without re-deriving a whole
 /// [`Detected`].
 fn antigravity_access_token(auth: &serde_json::Value) -> Option<String> {
-    let view = if str_field(auth, "access_token").is_some() || str_field(auth, "accessToken").is_some() {
-        auth.clone()
-    } else if let Some(inner) = auth.get("token").filter(|t| t.is_object()) {
-        inner.clone()
-    } else {
-        auth.clone()
-    };
+    let view =
+        if str_field(auth, "access_token").is_some() || str_field(auth, "accessToken").is_some() {
+            auth.clone()
+        } else if let Some(inner) = auth.get("token").filter(|t| t.is_object()) {
+            inner.clone()
+        } else {
+            auth.clone()
+        };
     str_field(&view, "access_token").or_else(|| str_field(&view, "accessToken"))
 }
 
@@ -2997,7 +3022,9 @@ fn parse_antigravity_auth(auth: serde_json::Value) -> Option<Detected> {
     // Generic access_token present -> derive key from hash. Prefer the refresh
     // token for the identity key: access tokens rotate hourly, refresh tokens
     // are stable per account, so slots survive refreshes without duplicating.
-    if let Some(token) = str_field(&view, "access_token").or_else(|| str_field(&view, "accessToken")) {
+    if let Some(token) =
+        str_field(&view, "access_token").or_else(|| str_field(&view, "accessToken"))
+    {
         let key_source = str_field(&view, "refresh_token")
             .or_else(|| str_field(&view, "refreshToken"))
             .unwrap_or_else(|| token.clone());
@@ -3111,11 +3138,8 @@ mod tests {
 
     #[test]
     fn file_digest_tracks_content() {
-        let dir = std::env::temp_dir().join(format!(
-            "komet-digest-{}-{}",
-            std::process::id(),
-            now_ms()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("komet-digest-{}-{}", std::process::id(), now_ms()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("auth.json");
         assert_eq!(file_digest(&path), None);
@@ -3346,8 +3370,7 @@ mod tests {
 
     #[test]
     fn snapshot_detected_keeps_resolved_identity_over_opaque_placeholder() {
-        let root = std::env::temp_dir()
-            .join(format!("komet-agy-snapshot-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("komet-agy-snapshot-{}", std::process::id()));
         let config = AgentAccountsConfig {
             data_dir: root.join("data"),
             claude_config_dir: root.join("claude"),
@@ -3396,7 +3419,9 @@ mod tests {
         );
         // Tokens still refresh verbatim even when the profile is preserved.
         assert_eq!(
-            slots[0].credentials.get("token")
+            slots[0]
+                .credentials
+                .get("token")
                 .and_then(|t| t.get("access_token"))
                 .and_then(|v| v.as_str()),
             Some("ya29.v2"),
@@ -3474,7 +3499,10 @@ mod tests {
         let creds = detected.credentials.expect("credentials present");
         let token = creds.get("token").expect("keyring shape has `token`");
         assert!(token.get("access_token").is_some(), "access_token present");
-        assert!(token.get("refresh_token").is_some(), "refresh_token present");
+        assert!(
+            token.get("refresh_token").is_some(),
+            "refresh_token present"
+        );
 
         // Stable identity: a second detection derives the same account key
         // (refresh-token hash), so no duplicate slots on repeated list().

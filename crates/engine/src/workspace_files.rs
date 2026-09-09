@@ -10,9 +10,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
-use sha2::{Digest, Sha256};
-use tokio::sync::{Notify, broadcast, mpsc};
-use tokio_util::sync::CancellationToken;
 use komet_proto::{
     ListWorkspaceDirectoryRequest, ReadWorkspaceFileRequest, SearchWorkspaceFilesRequest,
     WatchWorkspaceFilesRequest, WorkspaceDirectoryPage, WorkspaceEntry, WorkspaceEntryKind,
@@ -23,6 +20,9 @@ use komet_proto::{
     WriteWorkspaceFileOutcome, WriteWorkspaceFileRequest,
 };
 use komet_rpc::RpcError;
+use sha2::{Digest, Sha256};
+use tokio::sync::{Notify, broadcast, mpsc};
+use tokio_util::sync::CancellationToken;
 
 use crate::{Repos, WorkspaceHost};
 

@@ -979,10 +979,18 @@ fn compare_file_matches(
         .then_with(|| featured_a.cmp(featured_b))
         .then_with(|| score_a.cmp(score_b))
         .then_with(|| {
-            if empty_query { path_a.split('/').count().cmp(&path_b.split('/').count()) } else { std::cmp::Ordering::Equal }
+            if empty_query {
+                path_a.split('/').count().cmp(&path_b.split('/').count())
+            } else {
+                std::cmp::Ordering::Equal
+            }
         })
         .then_with(|| {
-            if empty_query { dir_a.cmp(dir_b) } else { dir_b.cmp(dir_a) }
+            if empty_query {
+                dir_a.cmp(dir_b)
+            } else {
+                dir_b.cmp(dir_a)
+            }
         })
         .then_with(|| path_a.len().cmp(&path_b.len()))
         .then_with(|| path_a.cmp(path_b))

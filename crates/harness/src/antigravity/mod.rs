@@ -85,15 +85,33 @@ impl Default for AntigravityHarness {
     }
 }
 
-fn usage_event(usage: &Value) -> AgentEvent {
+fn usage_events(usage: &Value, model: &str) -> Vec<AgentEvent> {
     let count = |key| usage.get(key).and_then(Value::as_u64).unwrap_or_default();
-    AgentEvent::Usage {
-        input_tokens: count("input_tokens"),
-        cached_input_tokens: count("cache_read_tokens"),
-        output_tokens: count("output_tokens"),
-        reasoning_tokens: count("thinking_tokens"),
-        context_limit: None,
-    }
+    let input = count("input_tokens");
+    let cached = count("cache_read_tokens");
+    let output = count("output_tokens");
+    let reasoning = count("thinking_tokens");
+    let limit = komet_proto::default_context_limit_for_model(model);
+    vec![
+        AgentEvent::Usage {
+            input_tokens: input,
+            cached_input_tokens: cached,
+            output_tokens: output,
+            reasoning_tokens: reasoning,
+            context_limit: Some(limit),
+        },
+        AgentEvent::ContextWindow {
+            stats: komet_proto::ContextUsageStats::window(
+                input,
+                limit,
+                komet_proto::ContextUsageSource::Approximate,
+                input,
+                cached,
+                output,
+                reasoning,
+            ),
+        },
+    ]
 }
 
 #[async_trait]
@@ -211,12 +229,21 @@ impl Harness for AntigravityHarness {
         if let Some(effort) = catalog::to_effort(request.reasoning) {
             command.args(["--effort", effort]);
         }
-        if request.sandbox == komet_proto::SandboxLevel::ReadOnly {
-            command.arg("--sandbox");
+        match request.sandbox {
+            komet_proto::SandboxLevel::ReadOnly => {
+                command.arg("--sandbox");
+                command.args(["--mode", "plan"]);
+            }
+            komet_proto::SandboxLevel::WorkspaceWrite => {
+                command.arg("--sandbox");
+            }
+            komet_proto::SandboxLevel::DangerFullAccess => {}
         }
         // agy in non-interactive print mode (-p) cannot prompt for permissions over stdio;
         // any tool requiring review is auto-denied by agy causing premature cancellation.
         // Therefore --dangerously-skip-permissions is required to enable tool usage in normal runs.
+        // Read-only still needs it: `--mode plan` is the write gate, `--sandbox`
+        // is the OS boundary.
         command.arg("--dangerously-skip-permissions");
 
         let mut child = command.spawn().map_err(HarnessError::Io)?;
@@ -226,6 +253,10 @@ impl Harness for AntigravityHarness {
             .ok_or_else(|| HarnessError::Protocol("agy stdout unavailable".into()))?;
         let stderr = child.stderr.take();
         let (tx, rx) = mpsc::channel(128);
+        let model = request
+            .model
+            .clone()
+            .unwrap_or_else(|| catalog::default_model().to_string());
 
         let stderr_lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let stderr_lines_clone = std::sync::Arc::clone(&stderr_lines);
@@ -369,8 +400,11 @@ impl Harness for AntigravityHarness {
                                             if tx.send(Ok(AgentEvent::ToolResult { id, is_error, output, diff })).await.is_err() { break; }
                                         }
                                     }
-                                    if let Some(usage) = step.get("usage")
-                                        && tx.send(Ok(usage_event(usage))).await.is_err() { break; }
+                                    if let Some(usage) = step.get("usage") {
+                                        for ev in usage_events(usage, &model) {
+                                            if tx.send(Ok(ev)).await.is_err() { break; }
+                                        }
+                                    }
                                 }
                                 Some("result") => {
                                     let result = frame.get("result").unwrap_or(&Value::Null);
@@ -379,8 +413,11 @@ impl Harness for AntigravityHarness {
                                     if !saw_text
                                         && let Some(text) = response_text.filter(|text| !text.is_empty())
                                         && tx.send(Ok(AgentEvent::TextDelta { text: text.to_owned() })).await.is_err() { break; }
-                                    if let Some(usage) = result.get("usage")
-                                        && tx.send(Ok(usage_event(usage))).await.is_err() { break; }
+                                    if let Some(usage) = result.get("usage") {
+                                        for ev in usage_events(usage, &model) {
+                                            if tx.send(Ok(ev)).await.is_err() { break; }
+                                        }
+                                    }
 
                                     let status_str = result.get("status").and_then(Value::as_str).unwrap_or("");
                                     let success = status_str == "SUCCESS";
@@ -452,5 +489,34 @@ impl Harness for AntigravityHarness {
             rx.recv().await.map(|item| (item, rx))
         })
         .boxed())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn usage_overshoot_is_capped_to_the_model_window() {
+        let events = usage_events(
+            &json!({
+                "input_tokens": 3_000_000,
+                "output_tokens": 18_000,
+                "cache_read_tokens": 0,
+                "thinking_tokens": 0
+            }),
+            "gemini-2.5-pro",
+        );
+        let Some(AgentEvent::ContextWindow { stats }) = events
+            .iter()
+            .find(|e| matches!(e, AgentEvent::ContextWindow { .. }))
+        else {
+            panic!("expected ContextWindow: {events:?}");
+        };
+        assert_eq!(stats.context_limit, 1_000_000);
+        assert_eq!(stats.used(), 1_000_000);
+        assert_eq!(stats.input_tokens, 3_000_000);
+        assert_eq!(stats.source, komet_proto::ContextUsageSource::Approximate);
     }
 }

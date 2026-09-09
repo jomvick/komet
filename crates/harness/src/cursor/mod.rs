@@ -47,8 +47,8 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
 
 use komet_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SteeringMode, TodoItem,
-    ToolCall,
+    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SlashCommand,
+    SteeringMode, TodoItem, ToolCall,
 };
 
 use crate::{Harness, HarnessError, RunControls, Signal, send_signal, shutdown_child};
@@ -271,9 +271,12 @@ impl Harness for CursorHarness {
         }
     }
 
-    // No `commands()` override: @cursor/sdk 1.0.28 exposes no slash-command
-    // listing (the cursor-agent TUI's slash commands are client-side only),
-    // so the trait's empty default is the honest answer, not a gap.
+    /// cursor-agent TUI built-ins (Bucket A). `@cursor/sdk` 1.0.28 still has
+    /// no listing API, so the static catalog is the source — same prompt-line
+    /// shape as Claude/Codex (`/name` sent as the turn text).
+    async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
+        Ok(catalog::static_commands())
+    }
 
     async fn run(
         &self,
@@ -333,6 +336,7 @@ impl Harness for CursorHarness {
             // shim folds them into the SDK's ModelSelection params.
             "modelOptions": request.model_options,
             "resume": request.resume,
+            "sandbox": request.sandbox,
         });
         let _ = stdin_tx.send(first.to_string());
 
@@ -465,7 +469,7 @@ async fn run_session(session: Session) {
                             }
                         }
                         _ => {
-                            for ev in map_shim_frame(&frame, interrupted) {
+                            for ev in map_shim_frame(&frame, interrupted, &request_model) {
                                 let is_done = matches!(ev, AgentEvent::Done { .. });
                                 // Stamp the session id onto Dones the mapper
                                 // couldn't know.
@@ -699,7 +703,7 @@ fn decode_tool(name: &str, args: &Value) -> ToolCall {
 }
 
 /// Map one shim frame to events. `Done` session ids are stamped by the loop.
-fn map_shim_frame(frame: &Value, interrupted: bool) -> Vec<AgentEvent> {
+fn map_shim_frame(frame: &Value, interrupted: bool, model: &str) -> Vec<AgentEvent> {
     let text = || {
         frame
             .get("text")
@@ -799,13 +803,31 @@ fn map_shim_frame(frame: &Value, interrupted: bool) -> Vec<AgentEvent> {
                 _ => Vec::new(),
             }
         }
-        "usage" => vec![AgentEvent::Usage {
-            input_tokens: frame.get("input").and_then(Value::as_u64).unwrap_or(0),
-            cached_input_tokens: 0,
-            output_tokens: frame.get("output").and_then(Value::as_u64).unwrap_or(0),
-            reasoning_tokens: 0,
-            context_limit: None,
-        }],
+        "usage" => {
+            let input = frame.get("input").and_then(Value::as_u64).unwrap_or(0);
+            let output = frame.get("output").and_then(Value::as_u64).unwrap_or(0);
+            let limit = komet_proto::default_context_limit_for_model(model);
+            vec![
+                AgentEvent::Usage {
+                    input_tokens: input,
+                    cached_input_tokens: 0,
+                    output_tokens: output,
+                    reasoning_tokens: 0,
+                    context_limit: Some(limit),
+                },
+                AgentEvent::ContextWindow {
+                    stats: komet_proto::ContextUsageStats::window(
+                        input,
+                        limit,
+                        komet_proto::ContextUsageSource::Approximate,
+                        input,
+                        0,
+                        output,
+                        0,
+                    ),
+                },
+            ]
+        }
         "turn" => {
             let status = frame.get("status").and_then(Value::as_str).unwrap_or("");
             let error = frame
@@ -882,7 +904,7 @@ mod tests {
             r#"{"ev":"tool","phase":"start","id":"call_task_1","name":"task","args":{"description":"probe","prompt":"scan the fold path"}}"#,
         )
         .unwrap();
-        let events = map_shim_frame(&frame, false);
+        let events = map_shim_frame(&frame, false, "");
         assert!(matches!(
             &events[..],
             [
@@ -897,7 +919,28 @@ mod tests {
             r#"{"ev":"tool","phase":"start","id":"call_task_2","name":"task","args":{"prompt":"inner"},"parent":"call_task_1"}"#,
         )
         .unwrap();
-        assert_eq!(map_shim_frame(&nested, false).len(), 1);
+        assert_eq!(map_shim_frame(&nested, false, "").len(), 1);
+    }
+
+    #[test]
+    fn usage_overshoot_is_capped_to_the_model_window() {
+        let events = map_shim_frame(
+            &json!({"ev":"usage","input":3_000_000,"output":18_000}),
+            false,
+            "grok-4.6",
+        );
+        let Some(AgentEvent::ContextWindow { stats }) = events
+            .iter()
+            .find(|e| matches!(e, AgentEvent::ContextWindow { .. }))
+        else {
+            panic!("expected ContextWindow: {events:?}");
+        };
+        let limit = komet_proto::default_context_limit_for_model("grok-4.6");
+        assert_eq!(limit, 131_072);
+        assert_eq!(stats.context_limit, limit);
+        assert_eq!(stats.used(), limit);
+        assert_eq!(stats.input_tokens, 3_000_000);
+        assert_eq!(stats.source, komet_proto::ContextUsageSource::Approximate);
     }
 
     #[test]
@@ -906,7 +949,7 @@ mod tests {
             serde_json::from_str(r#"{"ev":"text","text":"sub says","parent":"call_task_1"}"#)
                 .unwrap();
         assert_eq!(
-            map_shim_frame(&frame, false),
+            map_shim_frame(&frame, false, ""),
             vec![AgentEvent::Subagent {
                 parent_tool_use_id: "call_task_1".into(),
                 event: Box::new(AgentEvent::TextDelta {

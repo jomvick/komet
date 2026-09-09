@@ -798,6 +798,30 @@ enum StdinMsg {
     Close,
 }
 
+const LIVE_CONTEXT_REQ_ID: &str = "komet-live-context";
+
+fn live_context_window(frame: &Value) -> Option<AgentEvent> {
+    let response = frame.get("response")?;
+    if response.get("request_id").and_then(Value::as_str) != Some(LIVE_CONTEXT_REQ_ID) {
+        return None;
+    }
+    if response.get("subtype").and_then(Value::as_str) == Some("error") {
+        return None;
+    }
+    let usage = wire::parse_context_usage_response(response);
+    Some(AgentEvent::ContextWindow {
+        stats: komet_proto::ContextUsageStats::window(
+            usage.total_tokens,
+            usage.max_tokens,
+            komet_proto::ContextUsageSource::Native,
+            usage.total_tokens,
+            0,
+            0,
+            0,
+        ),
+    })
+}
+
 /// Anthropic's API caps inline images at 5MB of raw bytes; larger files stay
 /// path refs only.
 const MAX_INLINE_IMAGE_BYTES: u64 = 5 * 1024 * 1024;
@@ -969,6 +993,15 @@ async fn run_session(session: Session) {
                         );
                         continue;
                     }
+                    if let Frame::ControlResponse(value) = frame {
+                        if let Some(ev) = live_context_window(&value) {
+                            if event_tx.send(Ok(ev)).await.is_err() {
+                                break 'main;
+                            }
+                        }
+                        continue;
+                    }
+                    let probe_context = matches!(&frame, Frame::Result(_));
                     for ev in norm.normalize(frame, interrupted) {
                         let is_done = matches!(ev, AgentEvent::Done { .. });
                         if event_tx.send(Ok(ev)).await.is_err() {
@@ -981,6 +1014,11 @@ async fn run_session(session: Session) {
                                 break 'main;
                             }
                         }
+                    }
+                    if probe_context {
+                        let _ = stdin_tx.send(StdinMsg::Line(wire::context_usage_request_line(
+                            LIVE_CONTEXT_REQ_ID,
+                        )));
                     }
                 }
                 Ok(None) => break 'main, // stdout EOF: the CLI exited
