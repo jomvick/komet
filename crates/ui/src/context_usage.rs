@@ -1,27 +1,30 @@
-//! Context & Token Usage telemetry visualization: circular progress sphere + dedicated CLI popovers.
+//! Context & Token Usage telemetry visualization: circular progress ring +
+//! a dedicated popover.
 //!
-//! Provides real-time visibility into thread token consumption, context window usage,
-//! compaction limits, and token breakdowns (input, cached input, output, reasoning),
-//! natively tailored to the active CLI engine (Claude Code, OpenCode, Codex, etc.).
+//! Provides real-time visibility into thread token consumption, context window
+//! usage, compaction limits, and token breakdowns (input, cached input, output,
+//! reasoning), natively tailored to the active CLI engine.
 
 use gpui::{
     AnyElement, IntoElement, ParentElement, PathBuilder, SharedString, Styled, canvas, div, hsla,
-    point, px,
+    point, prelude::FluentBuilder, px,
 };
-use komet_proto::{ContextUsageStats, HarnessId, format_tokens};
+use komet_proto::{ContextUsageSource, ContextUsageStats, HarnessId, format_tokens};
 
+use crate::popover;
 use crate::theme::Theme;
 
 const RING_DIAMETER: f32 = 20.0;
-const RING_STROKE: f32 = 1.6;
-const RING_INNER_RADIUS: f32 = (RING_DIAMETER / 2.0) - RING_STROKE;
+const RING_STROKE: f32 = 1.75;
+const ARC_SEGMENTS: u32 = 64;
 
 /// Telemetry profile and branding identity for a specific CLI engine.
 ///
-/// Only [`render_context_ring`] and [`render_hero_sphere`] read the brand
-/// color today — the popover itself (see [`render_context_popover`]) is
-/// deliberately unbranded, a plain "Context" card, per design reference
-/// 2026-09-01 (a prior branded/card redesign was reverted).
+/// Only [`render_context_ring`] reads a paint color today — the popover itself
+/// (see [`render_context_popover`]) is deliberately unbranded, a plain "Context"
+/// card, per design reference 2026-09-01 (a prior branded/card redesign was
+/// reverted).
+#[allow(dead_code)]
 pub struct HarnessContextProfile {
     pub display_name: &'static str,
     pub protocol_badge: &'static str,
@@ -42,8 +45,7 @@ impl HarnessContextProfile {
                 brand_icon: crate::icons::CLAUDE_MARK,
                 brand_color: crate::icons::claude_brand(),
                 telemetry_title: "Anthropic Prompt Caching & Auto-Compact",
-                telemetry_description:
-                    "Uses 5-min ephemeral prompt caching. Auto-compaction triggers at ~75-80% context window.",
+                telemetry_description: "Uses 5-min ephemeral prompt caching. Auto-compaction triggers at ~75-80% context window.",
                 caching_type: Some("Anthropic Prompt Cache (5m TTL)"),
                 default_compaction_rule: "Auto-compact at 150k / 75%",
             },
@@ -53,8 +55,7 @@ impl HarnessContextProfile {
                 brand_icon: crate::icons::OPENCODE_MARK,
                 brand_color: hsla(158.0 / 360.0, 0.85, 0.44, 1.0),
                 telemetry_title: "OpenCode ACP Runtime Telemetry",
-                telemetry_description:
-                    "Native ACP protocol telemetry across subagents, tool executions, and multi-model context.",
+                telemetry_description: "Native ACP protocol telemetry across subagents, tool executions, and multi-model context.",
                 caching_type: Some("ACP Turn Session Buffer"),
                 default_compaction_rule: "Turn boundary prune",
             },
@@ -64,8 +65,7 @@ impl HarnessContextProfile {
                 brand_icon: crate::icons::OPENAI_MARK,
                 brand_color: hsla(160.0 / 360.0, 0.82, 0.35, 1.0),
                 telemetry_title: "OpenAI App Protocol & CoT Telemetry",
-                telemetry_description:
-                    "Direct thread token telemetry with granular tracking for reasoning output (o1/o3/gpt-4o) and turn delta.",
+                telemetry_description: "Direct thread token telemetry with granular tracking for reasoning output (o1/o3/gpt-4o) and turn delta.",
                 caching_type: Some("OpenAI Prefix Caching"),
                 default_compaction_rule: "Sliding turn context window",
             },
@@ -75,8 +75,7 @@ impl HarnessContextProfile {
                 brand_icon: crate::icons::CURSOR_MARK,
                 brand_color: hsla(217.0 / 360.0, 0.91, 0.60, 1.0),
                 telemetry_title: "Cursor Agent Telemetry",
-                telemetry_description:
-                    "Cursor workspace index and agent tool execution telemetry.",
+                telemetry_description: "Cursor workspace index and agent tool execution telemetry.",
                 caching_type: Some("Workspace Index Cache"),
                 default_compaction_rule: "Context window boundary",
             },
@@ -86,8 +85,7 @@ impl HarnessContextProfile {
                 brand_icon: crate::icons::GROK_MARK,
                 brand_color: hsla(350.0 / 360.0, 0.80, 0.55, 1.0),
                 telemetry_title: "xAI Grok Agent Runtime",
-                telemetry_description:
-                    "Grok ACP stdio agent context window tracking and tool execution telemetry.",
+                telemetry_description: "Grok ACP stdio agent context window tracking and tool execution telemetry.",
                 caching_type: None,
                 default_compaction_rule: "Model context limit",
             },
@@ -97,8 +95,7 @@ impl HarnessContextProfile {
                 brand_icon: crate::icons::HERMES_MARK,
                 brand_color: hsla(270.0 / 360.0, 0.80, 0.65, 1.0),
                 telemetry_title: "Nous Research Hermes Runtime",
-                telemetry_description:
-                    "Hermes ACP turn execution and tool calling context window metrics.",
+                telemetry_description: "Hermes ACP turn execution and tool calling context window metrics.",
                 caching_type: None,
                 default_compaction_rule: "Turn boundary prune",
             },
@@ -108,8 +105,7 @@ impl HarnessContextProfile {
                 brand_icon: crate::icons::PI_MARK,
                 brand_color: hsla(38.0 / 360.0, 0.92, 0.50, 1.0),
                 telemetry_title: "Pi.dev Coding Agent",
-                telemetry_description:
-                    "Pi ACP adapter telemetry with session memory management.",
+                telemetry_description: "Pi ACP adapter telemetry with session memory management.",
                 caching_type: None,
                 default_compaction_rule: "Session limit",
             },
@@ -119,8 +115,7 @@ impl HarnessContextProfile {
                 brand_icon: crate::icons::ANTIGRAVITY_MARK,
                 brand_color: hsla(217.0 / 360.0, 0.90, 0.60, 1.0),
                 telemetry_title: "Antigravity Controller Telemetry",
-                telemetry_description:
-                    "Native multi-agent controller telemetry and subagent thread metrics.",
+                telemetry_description: "Native multi-agent controller telemetry and subagent thread metrics.",
                 caching_type: Some("Multi-turn state cache"),
                 default_compaction_rule: "Automatic context compaction",
             },
@@ -130,8 +125,7 @@ impl HarnessContextProfile {
                 brand_icon: crate::icons::KOMET_LOGO,
                 brand_color: hsla(215.0 / 360.0, 0.70, 0.55, 1.0),
                 telemetry_title: "Thread Context & Token Telemetry",
-                telemetry_description:
-                    "Cumulative provider-reported usage and context-window metrics.",
+                telemetry_description: "Cumulative provider-reported usage and context-window metrics.",
                 caching_type: None,
                 default_compaction_rule: "Auto threshold",
             },
@@ -139,231 +133,155 @@ impl HarnessContextProfile {
     }
 }
 
+fn usage_fill(ratio: f32, theme: &Theme) -> gpui::Hsla {
+    if ratio >= 0.90 {
+        theme.danger
+    } else if ratio >= 0.70 {
+        theme.warning
+    } else {
+        theme.text
+    }
+}
+
+fn compact_ratio(stats: &ContextUsageStats) -> f32 {
+    stats
+        .compact_threshold
+        .map(|t| (t as f32 / stats.context_limit.max(1) as f32).clamp(0.0, 1.0))
+        .unwrap_or(0.75)
+}
+
+fn paint_circle(cx: f32, cy: f32, radius: f32, segments: u32) -> PathBuilder {
+    let mut path = PathBuilder::fill();
+    path.move_to(point(px(cx + radius), px(cy)));
+    for i in 1..=segments {
+        let angle = std::f32::consts::PI * 2.0 * i as f32 / segments as f32;
+        path.line_to(point(
+            px(cx + radius * angle.cos()),
+            px(cy + radius * angle.sin()),
+        ));
+    }
+    path.close();
+    path
+}
+
+fn paint_ring_track(cx: f32, cy: f32, radius: f32, stroke: f32, segments: u32) -> PathBuilder {
+    let mut path = PathBuilder::stroke(px(stroke));
+    path.move_to(point(px(cx + radius), px(cy)));
+    for i in 1..=segments {
+        let angle = std::f32::consts::PI * 2.0 * i as f32 / segments as f32;
+        path.line_to(point(
+            px(cx + radius * angle.cos()),
+            px(cy + radius * angle.sin()),
+        ));
+    }
+    path.close();
+    path
+}
+
+fn paint_arc(
+    cx: f32,
+    cy: f32,
+    radius: f32,
+    start: f32,
+    end: f32,
+    stroke: f32,
+    segments: u32,
+) -> PathBuilder {
+    let mut path = PathBuilder::stroke(px(stroke));
+    path.move_to(point(
+        px(cx + radius * start.cos()),
+        px(cy + radius * start.sin()),
+    ));
+    let sweep = end - start;
+    for i in 1..=segments {
+        let t = i as f32 / segments as f32;
+        let angle = start + sweep * t;
+        path.line_to(point(
+            px(cx + radius * angle.cos()),
+            px(cy + radius * angle.sin()),
+        ));
+    }
+    path
+}
+
 /// Render the circular context usage ring indicator (trigger widget).
-/// Simple circle track with a white arc sweeping clockwise to show fill level.
+/// Track + clockwise arc from 12 o'clock, with a faint inner wash so fill
+/// reads at 20px. Optional percent sits beside it for at-a-glance reading.
 pub fn render_context_ring(
     stats: &ContextUsageStats,
     harness: Option<HarnessId>,
     theme: &Theme,
 ) -> AnyElement {
     let ratio = stats.context_ratio();
-    // Keep profile for popover but use only white fill for the ring
+    let percent = stats.context_percent();
+    let show_percent = stats.used() > 0;
     let _ = HarnessContextProfile::for_harness(harness, theme);
 
-    // Arc fill color: white at different opacities based on severity
-    let arc_color = if ratio >= 0.90 {
-        hsla(0.0 / 360.0, 0.80, 0.60, 1.0)  // red when critical
-    } else if ratio >= 0.70 {
-        hsla(38.0 / 360.0, 0.90, 0.65, 1.0) // amber when high
-    } else {
-        hsla(0.0, 0.0, 1.0, 0.90)            // clean white normally
-    };
-
-    canvas(
+    let ring = canvas(
         move |_bounds, _window, _cx| (),
         move |bounds, _, window, cx| {
             let theme = Theme::of(cx);
+            let fill = usage_fill(ratio, &theme);
             let center_x = f32::from(bounds.origin.x) + f32::from(bounds.size.width) / 2.0;
             let center_y = f32::from(bounds.origin.y) + f32::from(bounds.size.height) / 2.0;
-            let radius = RING_INNER_RADIUS;
+            let radius = (f32::from(bounds.size.width).min(f32::from(bounds.size.height)) / 2.0)
+                - RING_STROKE;
 
-            // 1. Track circle (dim background ring)
-            let mut track_path = PathBuilder::stroke(px(RING_STROKE));
-            track_path.move_to(point(px(center_x + radius), px(center_y)));
-            for i in 1..=32 {
-                let angle = std::f32::consts::PI * 2.0 * i as f32 / 32.0;
-                let x = center_x + radius * angle.cos();
-                let y = center_y + radius * angle.sin();
-                track_path.line_to(point(px(x), px(y)));
+            if let Ok(built) = paint_circle(center_x, center_y, radius - 1.5, 36).build() {
+                window.paint_path(built, fill.opacity((ratio * 0.18).clamp(0.04, 0.18)));
             }
-            track_path.close();
-            if let Ok(built) = track_path.build() {
+
+            if let Ok(built) =
+                paint_ring_track(center_x, center_y, radius, RING_STROKE, ARC_SEGMENTS).build()
+            {
                 window.paint_path(built, theme.border);
             }
 
-            // 2. White fill arc sweeping clockwise from 12 o'clock
             if ratio > 0.001 {
-                let mut progress_path = PathBuilder::stroke(px(RING_STROKE * 1.5));
-                let start_angle = -std::f32::consts::PI / 2.0; // 12 o'clock
-                let end_angle = start_angle + ratio * std::f32::consts::PI * 2.0;
-                let segments = 32;
-                progress_path.move_to(point(
-                    px(center_x + radius * start_angle.cos()),
-                    px(center_y + radius * start_angle.sin()),
-                ));
-                for i in 1..=segments {
-                    let t = i as f32 / segments as f32;
-                    let angle = start_angle + (end_angle - start_angle) * t;
-                    let x = center_x + radius * angle.cos();
-                    let y = center_y + radius * angle.sin();
-                    progress_path.line_to(point(px(x), px(y)));
-                }
-                if let Ok(built) = progress_path.build() {
-                    window.paint_path(built, arc_color);
+                let start = -std::f32::consts::PI / 2.0;
+                let end = start + ratio * std::f32::consts::PI * 2.0;
+                let segs = ((ARC_SEGMENTS as f32 * ratio).ceil() as u32).clamp(2, ARC_SEGMENTS);
+                if let Ok(built) = paint_arc(
+                    center_x,
+                    center_y,
+                    radius,
+                    start,
+                    end,
+                    RING_STROKE + 0.35,
+                    segs,
+                )
+                .build()
+                {
+                    window.paint_path(built, fill);
                 }
             }
         },
     )
-    .size(px(RING_DIAMETER))
-    .into_any_element()
+    .size(px(RING_DIAMETER));
+
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(px(5.0))
+        .child(ring)
+        .when(show_percent, |el| {
+            el.child(
+                div()
+                    .font_family(theme.font_mono.clone())
+                    .text_size(px(10.0))
+                    .text_color(theme.text_muted)
+                    .child(format!("{percent}%")),
+            )
+        })
+        .into_any_element()
 }
 
-/// Render the large Hero 3D Holographic Context Sphere for the detailed popover.
-pub fn render_hero_sphere(
-    stats: &ContextUsageStats,
-    profile: &HarnessContextProfile,
-    theme: &Theme,
-) -> AnyElement {
-    let ratio = stats.context_ratio();
-    let brand_color = profile.brand_color;
-
-    let fill_color = if ratio >= 0.90 {
-        hsla(0.0 / 360.0, 0.85, 0.55, 1.0)
-    } else if ratio >= 0.70 {
-        hsla(38.0 / 360.0, 0.92, 0.50, 1.0)
-    } else if ratio > 0.0 {
-        brand_color
-    } else {
-        theme.text_muted
-    };
-
-    let core_base_color = if ratio >= 0.90 {
-        hsla(0.0 / 360.0, 0.85, 0.50, 0.95)
-    } else if ratio >= 0.70 {
-        hsla(38.0 / 360.0, 0.92, 0.45, 0.90)
-    } else if ratio > 0.0 {
-        brand_color.opacity(0.85)
-    } else {
-        theme.text_muted.opacity(0.35)
-    };
-
-    let highlight_color = hsla(0.0, 0.0, 1.0, if ratio > 0.0 { 0.85 } else { 0.50 });
-    let threshold_ratio = stats
-        .compact_threshold
-        .map(|t| (t as f32 / stats.context_limit.max(1) as f32).clamp(0.0, 1.0))
-        .unwrap_or(0.75);
-
-    canvas(
-        move |_bounds, _window, _cx| (),
-        move |bounds, _, window, cx| {
-            let theme = Theme::of(cx);
-            let center_x = f32::from(bounds.origin.x) + f32::from(bounds.size.width) / 2.0;
-            let center_y = f32::from(bounds.origin.y) + f32::from(bounds.size.height) / 2.0;
-            let orbit_radius = 21.0;
-
-            // 1. Atmospheric Ambient Glow
-            let halo_radius = orbit_radius + 3.0;
-            let mut halo_path = PathBuilder::fill();
-            halo_path.move_to(point(px(center_x + halo_radius), px(center_y)));
-            for i in 1..=32 {
-                let angle = std::f32::consts::PI * 2.0 * i as f32 / 32.0;
-                let x = center_x + halo_radius * angle.cos();
-                let y = center_y + halo_radius * angle.sin();
-                halo_path.line_to(point(px(x), px(y)));
-            }
-            halo_path.close();
-            if let Ok(built) = halo_path.build() {
-                window.paint_path(built, brand_color.opacity(0.10));
-            }
-
-            // 2. Orbital Background Track
-            let mut orbit_track = PathBuilder::stroke(px(2.0));
-            orbit_track.move_to(point(px(center_x + orbit_radius), px(center_y)));
-            for i in 1..=48 {
-                let angle = std::f32::consts::PI * 2.0 * i as f32 / 48.0;
-                let x = center_x + orbit_radius * angle.cos();
-                let y = center_y + orbit_radius * angle.sin();
-                orbit_track.line_to(point(px(x), px(y)));
-            }
-            orbit_track.close();
-            if let Ok(built) = orbit_track.build() {
-                window.paint_path(built, theme.border);
-            }
-
-            // 3. Compaction threshold tick notch on orbit
-            let threshold_angle = -std::f32::consts::PI / 2.0 + threshold_ratio * std::f32::consts::PI * 2.0;
-            let tick_inner_r = orbit_radius - 3.5;
-            let tick_outer_r = orbit_radius + 3.5;
-            let mut tick_path = PathBuilder::stroke(px(1.5));
-            tick_path.move_to(point(
-                px(center_x + tick_inner_r * threshold_angle.cos()),
-                px(center_y + tick_inner_r * threshold_angle.sin()),
-            ));
-            tick_path.line_to(point(
-                px(center_x + tick_outer_r * threshold_angle.cos()),
-                px(center_y + tick_outer_r * threshold_angle.sin()),
-            ));
-            if let Ok(built) = tick_path.build() {
-                window.paint_path(built, hsla(38.0 / 360.0, 0.92, 0.50, 0.85));
-            }
-
-            // 4. Active Orbital Capacity Arc
-            if ratio > 0.001 {
-                let mut progress_path = PathBuilder::stroke(px(2.8));
-                let start_angle = -std::f32::consts::PI / 2.0; // 12 o'clock
-                let end_angle = start_angle + ratio * std::f32::consts::PI * 2.0;
-                let segments = 48;
-                progress_path.move_to(point(
-                    px(center_x + orbit_radius * start_angle.cos()),
-                    px(center_y + orbit_radius * start_angle.sin()),
-                ));
-                for i in 1..=segments {
-                    let t = i as f32 / segments as f32;
-                    let angle = start_angle + (end_angle - start_angle) * t;
-                    let x = center_x + orbit_radius * angle.cos();
-                    let y = center_y + orbit_radius * angle.sin();
-                    progress_path.line_to(point(px(x), px(y)));
-                }
-                if let Ok(built) = progress_path.build() {
-                    window.paint_path(built, fill_color);
-                }
-            }
-
-            // 5. 3D Glass Hero Sphere Core
-            let sphere_r = 13.0;
-            let mut sphere_path = PathBuilder::fill();
-            sphere_path.move_to(point(px(center_x + sphere_r), px(center_y)));
-            for i in 1..=36 {
-                let angle = std::f32::consts::PI * 2.0 * i as f32 / 36.0;
-                let x = center_x + sphere_r * angle.cos();
-                let y = center_y + sphere_r * angle.sin();
-                sphere_path.line_to(point(px(x), px(y)));
-            }
-            sphere_path.close();
-            if let Ok(built) = sphere_path.build() {
-                window.paint_path(built, core_base_color);
-            }
-
-            // 6. Large Specular Highlight (Reflection gleam top-left)
-            let hl_r = 4.2;
-            let hl_cx = center_x - 3.8;
-            let hl_cy = center_y - 3.8;
-            let mut hl_path = PathBuilder::fill();
-            hl_path.move_to(point(px(hl_cx + hl_r), px(hl_cy)));
-            for i in 1..=24 {
-                let angle = std::f32::consts::PI * 2.0 * i as f32 / 24.0;
-                let x = hl_cx + hl_r * angle.cos();
-                let y = hl_cy + hl_r * angle.sin();
-                hl_path.line_to(point(px(x), px(y)));
-            }
-            hl_path.close();
-            if let Ok(built) = hl_path.build() {
-                window.paint_path(built, highlight_color);
-            }
-        },
-    )
-    .size(px(52.0))
-    .into_any_element()
-}
-
-/// Render the detailed Context popover: a plain "Context" card — header +
-/// progress bar, a "Thread usage" breakdown, and a "Compactions" summary.
-/// Deliberately unbranded (no harness icon/name/telemetry box) — design
-/// reference 2026-09-01 reverted the earlier per-harness "hero card" look
-/// back to this flatter list style. `harness`/`model_name` are kept in the
-/// signature for call-site stability even though this rendering ignores
-/// them; [`render_context_ring`]/[`render_hero_sphere`] are where harness
-/// branding still shows up (the small trigger widget).
+/// Render the detailed Context popover: header + fluid progress bar, a
+/// "Thread usage" breakdown, and a compactations summary. Unbranded — same
+/// tokens as the other picker cards (hairline separators, mono figures,
+/// muted labels). `harness`/`model_name` stay in the signature for call-site
+/// stability.
 pub fn render_context_popover(
     stats: &ContextUsageStats,
     _harness: Option<HarnessId>,
@@ -372,160 +290,270 @@ pub fn render_context_popover(
 ) -> AnyElement {
     let ratio = stats.context_ratio();
     let percent = stats.context_percent();
+    let window_used = stats.used();
     let total_used = stats.total_tokens();
-
-    let fill_color = if ratio >= 0.90 {
-        hsla(0.0 / 360.0, 0.85, 0.55, 1.0)
-    } else if ratio >= 0.70 {
-        hsla(38.0 / 360.0, 0.92, 0.50, 1.0)
-    } else {
-        theme.text
-    };
-
-    let compact_threshold_str = stats
+    let fill_color = usage_fill(ratio, theme);
+    let threshold = compact_ratio(stats);
+    let compact_at = stats
         .compact_threshold
         .map(format_tokens)
         .unwrap_or_else(|| format_tokens(stats.context_limit.saturating_mul(3) / 4));
 
-    let compactions_reason_str = stats
-        .compactions_reason
-        .clone()
-        .unwrap_or_else(|| "cache expiry".to_string());
+    let has_breakdown =
+        total_used > 0 || stats.cached_input_tokens > 0 || stats.reasoning_tokens > 0;
+    let has_compactions = stats.compactions_count > 0 || stats.compactions_reason.is_some();
 
-    div()
-        .w(px(300.0))
+    let header = div()
         .flex()
         .flex_col()
-        .gap(px(14.0))
-        .p(px(14.0))
-        .text_sm()
+        .gap(px(8.0))
+        .px(px(8.0))
+        .pt(px(8.0))
+        .pb(px(6.0))
         .child(
-            // ── "Context" header, progress bar, compaction threshold ────
             div()
                 .flex()
-                .flex_col()
+                .flex_row()
+                .items_baseline()
+                .justify_between()
                 .gap(px(8.0))
                 .child(
                     div()
-                        .flex()
-                        .flex_row()
-                        .items_baseline()
-                        .justify_between()
-                        .child(
-                            div()
-                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                .text_color(theme.text)
-                                .child("Context"),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .font_family(theme.font_mono.clone())
-                                .text_color(theme.text_muted)
-                                .child(format!(
-                                    "{} / {} · {}%",
-                                    format_tokens(total_used),
-                                    format_tokens(stats.context_limit),
-                                    percent
-                                )),
-                        ),
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_size(px(13.0))
+                        .text_color(theme.text)
+                        .child("Context"),
                 )
                 .child(
                     div()
-                        .w_full()
-                        .h(px(4.0))
-                        .rounded_full()
-                        .bg(theme.border)
-                        .overflow_hidden()
-                        .child(
-                            div()
-                                .h_full()
-                                .w(px((272.0 * ratio).max(if ratio > 0.0 { 3.0 } else { 0.0 })))
-                                .rounded_full()
-                                .bg(fill_color),
-                        ),
-                )
-                .child(plain_row("Compacts at", compact_threshold_str, theme)),
-        )
-        .child(
-            // ── Thread usage breakdown ──────────────────────────────────
-            div()
-                .flex()
-                .flex_col()
-                .gap(px(6.0))
-                .child(section_header("Thread usage", format_tokens(total_used), theme))
-                .child(plain_row("Input", format_tokens(stats.input_tokens), theme))
-                .child(plain_row(
-                    "Cached input (included)",
-                    format_tokens(stats.cached_input_tokens),
-                    theme,
-                ))
-                .child(plain_row("Output", format_tokens(stats.output_tokens), theme))
-                .child(plain_row(
-                    "Reasoning output (included)",
-                    format_tokens(stats.reasoning_tokens),
-                    theme,
-                ))
-                .child(
-                    div()
-                        .pt(px(2.0))
-                        .text_xs()
-                        .text_color(theme.text_faint)
-                        .child(
-                            "Cumulative provider-reported usage in the current thread transcript.",
-                        ),
+                        .font_family(theme.font_mono.clone())
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_size(px(13.0))
+                        .text_color(fill_color)
+                        .child(format!("{percent}%")),
                 ),
         )
         .child(
-            // ── Compactions summary ─────────────────────────────────────
+            div()
+                .font_family(theme.font_mono.clone())
+                .text_size(px(11.0))
+                .text_color(theme.text_muted)
+                .child(format!(
+                    "{} / {}",
+                    format_tokens(window_used),
+                    format_tokens(stats.context_limit)
+                )),
+        )
+        .child(usage_track(ratio, threshold, fill_color, theme))
+        .child(plain_row("Compacts at", compact_at, theme));
+
+    let mut root = div().flex().flex_col().child(header);
+
+    if has_breakdown {
+        let input_share = if total_used == 0 {
+            0.0
+        } else {
+            stats.input_tokens as f32 / total_used as f32
+        };
+        let mut thread = div()
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .px(px(8.0))
+            .pb(px(6.0))
+            .child(section_header(
+                "Thread usage",
+                format_tokens(total_used),
+                theme,
+            ));
+        if total_used > 0 {
+            thread = thread.child(composition_track(input_share, theme));
+        }
+        thread = thread
+            .child(plain_row("Input", format_tokens(stats.input_tokens), theme))
+            .when(stats.cached_input_tokens > 0, |el| {
+                el.child(plain_row(
+                    "Cached",
+                    format_tokens(stats.cached_input_tokens),
+                    theme,
+                ))
+            })
+            .child(plain_row(
+                "Output",
+                format_tokens(stats.output_tokens),
+                theme,
+            ))
+            .when(stats.reasoning_tokens > 0, |el| {
+                el.child(plain_row(
+                    "Reasoning",
+                    format_tokens(stats.reasoning_tokens),
+                    theme,
+                ))
+            });
+        root = root.child(popover::menu_separator()).child(thread);
+    }
+
+    if has_compactions {
+        let reason = stats
+            .compactions_reason
+            .clone()
+            .unwrap_or_else(|| "cache expiry".to_string());
+        root = root.child(popover::menu_separator()).child(
             div()
                 .flex()
                 .flex_col()
-                .gap(px(6.0))
+                .gap(px(2.0))
+                .px(px(8.0))
+                .pb(px(6.0))
                 .child(section_header(
                     "Compactions",
                     stats.compactions_count.to_string(),
                     theme,
                 ))
-                .child(plain_row("Latest", compactions_reason_str, theme)),
-        )
-        .into_any_element()
+                .child(plain_row("Latest", reason, theme)),
+        );
+    }
+
+    root.child(
+        div()
+            .px(px(8.0))
+            .pt(px(2.0))
+            .pb(px(8.0))
+            .text_size(px(11.0))
+            .line_height(px(15.0))
+            .text_color(theme.text_faint)
+            .child(usage_source_copy(stats.source)),
+    )
+    .into_any_element()
 }
 
-/// A section title on the left, its running total on the right — same row
-/// shape as [`plain_row`] but bold, used once per section ("Context",
-/// "Thread usage", "Compactions").
+/// Full-width context fill with a compact-threshold tick. Widths are
+/// relative so the bar follows the card instead of a hardcoded px width.
+fn usage_track(ratio: f32, threshold: f32, fill: gpui::Hsla, theme: &Theme) -> impl IntoElement {
+    let fill_width = if ratio > 0.0 {
+        ratio.clamp(0.02, 1.0)
+    } else {
+        0.0
+    };
+    div()
+        .w_full()
+        .h(px(8.0))
+        .relative()
+        .child(
+            div()
+                .absolute()
+                .left_0()
+                .right_0()
+                .top(px(2.0))
+                .h(px(4.0))
+                .rounded_full()
+                .bg(theme.border)
+                .overflow_hidden()
+                .child(
+                    div()
+                        .h_full()
+                        .w(gpui::relative(fill_width))
+                        .rounded_full()
+                        .bg(fill),
+                ),
+        )
+        .child(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .flex_row()
+                .child(div().w(gpui::relative(threshold)).h_full())
+                .child(
+                    div()
+                        .w(px(1.5))
+                        .ml(px(-0.75))
+                        .h_full()
+                        .rounded_full()
+                        .bg(theme.warning.opacity(0.85)),
+                ),
+        )
+}
+
+/// Input vs output share of thread tokens — same track recipe, quieter fill.
+fn composition_track(input_share: f32, theme: &Theme) -> impl IntoElement {
+    let input = input_share.clamp(0.0, 1.0);
+    let output = (1.0 - input).max(0.0);
+    div()
+        .w_full()
+        .h(px(3.0))
+        .rounded_full()
+        .bg(theme.border)
+        .overflow_hidden()
+        .flex()
+        .flex_row()
+        .when(input > 0.0, |el| {
+            el.child(
+                div()
+                    .h_full()
+                    .w(gpui::relative(input))
+                    .bg(theme.text.opacity(0.85)),
+            )
+        })
+        .when(output > 0.0, |el| {
+            el.child(
+                div()
+                    .h_full()
+                    .w(gpui::relative(output))
+                    .bg(theme.text.opacity(0.35)),
+            )
+        })
+}
+
+fn usage_source_copy(source: ContextUsageSource) -> &'static str {
+    match source {
+        ContextUsageSource::Native => "Provider-reported context window for this session.",
+        ContextUsageSource::Approximate => {
+            "Approximate fill from agents that do not report a window (last-turn occupancy, capped)."
+        }
+        ContextUsageSource::Estimated => {
+            "Estimated from the transcript (about 4 characters per token)."
+        }
+    }
+}
+
 fn section_header(label: &'static str, value: String, theme: &Theme) -> impl IntoElement {
     div()
         .flex()
         .flex_row()
         .items_baseline()
         .justify_between()
+        .pt(px(2.0))
+        .pb(px(4.0))
         .child(
             div()
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .text_color(theme.text)
-                .child(label),
+                .text_size(px(10.0))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(theme.text_muted.opacity(0.7))
+                .child(SharedString::from(popover::tracked_upper(label))),
         )
         .child(
             div()
                 .font_family(theme.font_mono.clone())
+                .text_size(px(11.0))
                 .text_color(theme.text)
                 .child(SharedString::from(value)),
         )
 }
 
-/// One flat metric line: muted label left, mono value right.
 fn plain_row(label: &'static str, value: String, theme: &Theme) -> impl IntoElement {
     div()
         .flex()
         .flex_row()
         .items_center()
         .justify_between()
-        .text_xs()
-        .child(div().text_color(theme.text_muted).child(label))
+        .gap(px(8.0))
+        .py(px(2.0))
+        .text_size(px(12.0))
+        .child(div().min_w_0().text_color(theme.text_muted).child(label))
         .child(
             div()
+                .flex_none()
                 .font_family(theme.font_mono.clone())
                 .text_color(theme.text)
                 .child(SharedString::from(value)),
@@ -569,5 +597,13 @@ mod tests {
 
         let default_profile = HarnessContextProfile::for_harness(None, &theme);
         assert_eq!(default_profile.display_name, "Agent Session");
+    }
+
+    #[test]
+    fn usage_fill_follows_theme_tokens() {
+        let theme = Theme::dark();
+        assert_eq!(usage_fill(0.2, &theme), theme.text);
+        assert_eq!(usage_fill(0.75, &theme), theme.warning);
+        assert_eq!(usage_fill(0.95, &theme), theme.danger);
     }
 }

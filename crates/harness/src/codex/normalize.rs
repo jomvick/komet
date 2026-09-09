@@ -59,31 +59,110 @@ pub(crate) fn turn_error_message(params: &Value) -> Option<String> {
         })
 }
 
-/// `thread/tokenUsage/updated` → a [`AgentEvent::Usage`] snapshot of the LAST
-/// turn's tokens (held by the session loop, emitted before `Done`).
-pub(crate) fn usage_event(params: &Value) -> Option<AgentEvent> {
-    let last = field(params, &["tokenUsage", "token_usage"])?.get("last")?;
-    let count = |keys: &[&str]| {
-        field(last, keys)
-            .and_then(Value::as_u64)
-            .unwrap_or_default()
-    };
-    Some(AgentEvent::Usage {
-        input_tokens: count(&["inputTokens", "input_tokens"]),
-        cached_input_tokens: count(&["cachedInputTokens", "cached_input_tokens"]),
-        output_tokens: count(&["outputTokens", "output_tokens"]),
-        reasoning_tokens: count(&["reasoningTokens", "reasoning_tokens"]),
-        context_limit: field(
-            last,
-            &[
-                "contextWindow",
-                "context_window",
-                "contextLimit",
-                "context_limit",
-            ],
-        )
-        .and_then(Value::as_u64),
+/// `thread/tokenUsage/updated` → last-turn [`AgentEvent::Usage`] plus a
+/// [`AgentEvent::ContextWindow`] snapshot from `total` + `modelContextWindow`
+/// when the wire carries them.
+pub(crate) fn usage_events(params: &Value) -> Vec<AgentEvent> {
+    let usage = field(params, &["tokenUsage", "token_usage"]);
+    let last = usage.and_then(|u| u.get("last"));
+    let total = usage.and_then(|u| u.get("total"));
+    let window = field(
+        params,
+        &[
+            "modelContextWindow",
+            "model_context_window",
+            "contextWindow",
+            "context_window",
+        ],
+    )
+    .or_else(|| {
+        usage.and_then(|u| {
+            field(
+                u,
+                &[
+                    "modelContextWindow",
+                    "model_context_window",
+                    "contextWindow",
+                    "context_window",
+                ],
+            )
+        })
     })
+    .and_then(Value::as_u64);
+
+    let count =
+        |obj: &Value, keys: &[&str]| field(obj, keys).and_then(Value::as_u64).unwrap_or_default();
+
+    let mut events = Vec::new();
+    if let Some(last) = last {
+        events.push(AgentEvent::Usage {
+            input_tokens: count(last, &["inputTokens", "input_tokens"]),
+            cached_input_tokens: count(last, &["cachedInputTokens", "cached_input_tokens"]),
+            output_tokens: count(last, &["outputTokens", "output_tokens"]),
+            reasoning_tokens: count(
+                last,
+                &[
+                    "reasoningTokens",
+                    "reasoning_tokens",
+                    "reasoningOutputTokens",
+                    "reasoning_output_tokens",
+                ],
+            ),
+            context_limit: window.or_else(|| {
+                field(
+                    last,
+                    &[
+                        "contextWindow",
+                        "context_window",
+                        "contextLimit",
+                        "context_limit",
+                    ],
+                )
+                .and_then(Value::as_u64)
+            }),
+        });
+    }
+
+    let gauge = total.or(last);
+    if let Some(gauge) = gauge {
+        let used = count(gauge, &["totalTokens", "total_tokens"]);
+        let input = count(gauge, &["inputTokens", "input_tokens"]);
+        let used = if used > 0 { used } else { input };
+        if used > 0 || window.unwrap_or(0) > 0 {
+            let limit = window.unwrap_or(0);
+            let source = if limit > 0 {
+                komet_proto::ContextUsageSource::Native
+            } else {
+                komet_proto::ContextUsageSource::Approximate
+            };
+            events.push(AgentEvent::ContextWindow {
+                stats: komet_proto::ContextUsageStats::window(
+                    used,
+                    limit,
+                    source,
+                    input,
+                    count(gauge, &["cachedInputTokens", "cached_input_tokens"]),
+                    count(gauge, &["outputTokens", "output_tokens"]),
+                    count(
+                        gauge,
+                        &[
+                            "reasoningTokens",
+                            "reasoning_tokens",
+                            "reasoningOutputTokens",
+                            "reasoning_output_tokens",
+                        ],
+                    ),
+                ),
+            });
+        }
+    }
+    events
+}
+
+pub(crate) fn compacted_event() -> AgentEvent {
+    AgentEvent::ContextWindow {
+        stats: komet_proto::ContextUsageStats::compaction("thread compacted"),
+    }
 }
 
 /// Tool-shaped Codex items must always close the lifecycle they open: started
@@ -476,27 +555,90 @@ mod tests {
 
     #[test]
     fn usage_reads_last_snapshot_under_both_spellings() {
-        assert_eq!(
-            usage_event(&json!({"tokenUsage": {"last": {"inputTokens": 42, "outputTokens": 7}}})),
-            Some(AgentEvent::Usage {
-                input_tokens: 42,
-                output_tokens: 7,
-                cached_input_tokens: 0,
-                reasoning_tokens: 0,
-                context_limit: None,
-            })
+        let events =
+            usage_events(&json!({"tokenUsage": {"last": {"inputTokens": 42, "outputTokens": 7}}}));
+        assert!(matches!(
+            events.as_slice(),
+            [
+                AgentEvent::Usage {
+                    input_tokens: 42,
+                    output_tokens: 7,
+                    ..
+                },
+                AgentEvent::ContextWindow { .. },
+            ]
+        ));
+        let events = usage_events(
+            &json!({"token_usage": {"last": {"input_tokens": 1, "output_tokens": 2}}}),
         );
-        assert_eq!(
-            usage_event(&json!({"token_usage": {"last": {"input_tokens": 1, "output_tokens": 2}}})),
-            Some(AgentEvent::Usage {
+        assert!(matches!(
+            &events[0],
+            AgentEvent::Usage {
                 input_tokens: 1,
                 output_tokens: 2,
-                cached_input_tokens: 0,
-                reasoning_tokens: 0,
-                context_limit: None,
-            })
-        );
-        assert_eq!(usage_event(&json!({})), None);
+                ..
+            }
+        ));
+        assert!(usage_events(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn usage_emits_native_window_from_total_and_model_context() {
+        let events = usage_events(&json!({
+            "tokenUsage": {
+                "total": {
+                    "totalTokens": 13837,
+                    "inputTokens": 13747,
+                    "cachedInputTokens": 11008,
+                    "outputTokens": 90,
+                    "reasoningOutputTokens": 0
+                },
+                "last": {
+                    "totalTokens": 13837,
+                    "inputTokens": 13747,
+                    "outputTokens": 90
+                },
+                "modelContextWindow": 258400
+            }
+        }));
+        assert!(matches!(
+            &events[0],
+            AgentEvent::Usage {
+                input_tokens: 13747,
+                output_tokens: 90,
+                ..
+            }
+        ));
+        match &events[1] {
+            AgentEvent::ContextWindow { stats } => {
+                assert_eq!(stats.used(), 13837);
+                assert_eq!(stats.context_limit, 258400);
+                assert_eq!(stats.input_tokens, 13747);
+                assert_eq!(stats.cached_input_tokens, 11008);
+                assert_eq!(stats.source, komet_proto::ContextUsageSource::Native);
+            }
+            other => panic!("expected ContextWindow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn usage_overshoot_is_capped_to_the_model_window() {
+        let events = usage_events(&json!({
+            "tokenUsage": {
+                "total": { "totalTokens": 3_000_000, "inputTokens": 3_000_000, "outputTokens": 1 },
+                "last": { "inputTokens": 3_000_000, "outputTokens": 1 },
+                "modelContextWindow": 128000
+            }
+        }));
+        match &events[1] {
+            AgentEvent::ContextWindow { stats } => {
+                assert_eq!(stats.used(), 128_000);
+                assert_eq!(stats.context_limit, 128_000);
+                assert_eq!(stats.input_tokens, 3_000_000);
+                assert_eq!(stats.source, komet_proto::ContextUsageSource::Native);
+            }
+            other => panic!("expected ContextWindow, got {other:?}"),
+        }
     }
 
     #[test]

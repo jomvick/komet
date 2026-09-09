@@ -97,6 +97,21 @@ case "$promptline" in
     fi
     ;;
 
+  *scenario:overlay-level*)
+    # Access chip only (no sandbox_options table): ReadOnly from_level emits
+    # bash "*" deny. Must be matched BEFORE overlay* (this name contains it).
+    cfg="$OPENCODE_CONFIG_CONTENT"
+    if [ -z "$cfg" ] && [ -n "$OPENCODE_CONFIG" ] && [ -f "$OPENCODE_CONFIG" ]; then
+      cfg="$(cat "$OPENCODE_CONFIG")"
+    fi
+    if [ -n "$cfg" ] && printf '%s' "$cfg" | grep -q '"\*":"deny"' && printf '%s' "$cfg" | grep -q '"permission"'; then
+      update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"overlay level ok"}}'
+      emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+    else
+      emit "{\"id\":$pid,\"result\":{\"stopReason\":\"refusal\"}}"
+    fi
+    ;;
+
   *scenario:overlay*)
     # Verify the permission overlay reached us: OPENCODE_CONFIG_CONTENT carries
     # the generated opencode.json CONTENT (final-precedence runtime mechanism);

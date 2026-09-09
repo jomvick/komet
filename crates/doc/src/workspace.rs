@@ -694,6 +694,7 @@ impl From<RawSession> for Session {
             status: raw.status,
             started_at: raw.started_at.map(dt),
             updated_at: dt(raw.updated_at),
+            context_usage: None,
         }
     }
 }
@@ -766,6 +767,7 @@ mod tests {
             status,
             started_at: Some(ts(3_000)),
             updated_at: ts(3_500),
+            context_usage: None,
         }
     }
 

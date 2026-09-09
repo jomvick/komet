@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 
-use komet_proto::{Model, ModelOption, ModelOptionChoice};
+use komet_proto::{Model, ModelOption, ModelOptionChoice, SlashCommand};
 use serde_json::Value;
 
 /// Longer effort tokens first so `extra-high` wins over `high`.
@@ -53,6 +53,83 @@ pub(crate) fn is_native_cursor_model(id: &str) -> bool {
     matches!(id, "auto" | "default" | "auto-smart" | "composer" | "grok")
         || id.starts_with("composer-")
         || id.starts_with("grok-")
+}
+
+/// Built-in slash commands native to the cursor-agent TUI. Skip TUI-only
+/// dialogs (vim, quit, help, copy, logout, about, logs, update).
+pub(crate) fn static_commands() -> Vec<SlashCommand> {
+    vec![
+        SlashCommand {
+            name: "summarize".into(),
+            description: "Summarize the conversation to reduce context".into(),
+            input_hint: None,
+        },
+        SlashCommand {
+            name: "compress".into(),
+            description: "Summarize the conversation (alias of /summarize)".into(),
+            input_hint: None,
+        },
+        SlashCommand {
+            name: "plan".into(),
+            description: "Switch to Plan mode or submit a prompt in Plan mode".into(),
+            input_hint: Some("[prompt]".into()),
+        },
+        SlashCommand {
+            name: "ask".into(),
+            description: "Toggle Ask mode for read-only questions".into(),
+            input_hint: None,
+        },
+        SlashCommand {
+            name: "debug".into(),
+            description: "Toggle Debug mode or submit a prompt in Debug mode".into(),
+            input_hint: Some("[prompt]".into()),
+        },
+        SlashCommand {
+            name: "goal".into(),
+            description: "Give the agent a long-lived objective until complete".into(),
+            input_hint: Some("[objective]".into()),
+        },
+        SlashCommand {
+            name: "clear".into(),
+            description: "Start a new chat session".into(),
+            input_hint: None,
+        },
+        SlashCommand {
+            name: "rename".into(),
+            description: "Rename the current chat session".into(),
+            input_hint: Some("<name>".into()),
+        },
+        SlashCommand {
+            name: "rewind".into(),
+            description: "Jump back to a previous message".into(),
+            input_hint: None,
+        },
+        SlashCommand {
+            name: "fork".into(),
+            description: "Fork the current chat into a new session".into(),
+            input_hint: None,
+        },
+        SlashCommand {
+            name: "model".into(),
+            description: "Select a model".into(),
+            input_hint: Some("[filter]".into()),
+        },
+        SlashCommand {
+            name: "sandbox".into(),
+            description: "Configure sandbox mode and network access".into(),
+            input_hint: None,
+        },
+        SlashCommand {
+            name: "mcp".into(),
+            description: "Manage MCP servers and list tools".into(),
+            input_hint: Some("[list|list-tools] [identifier]".into()),
+        },
+        SlashCommand {
+            name: "shell".into(),
+            description: "Enter Shell Mode".into(),
+            input_hint: Some("[command]".into()),
+        },
+    ]
 }
 
 /// Fold `cursor-agent --list-models` text (`id - Label` lines) into picker rows.
@@ -610,5 +687,17 @@ Tip: use --model <id>
         let models = static_models();
         let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, vec!["auto", "composer-2.5", "cursor-grok-4.6"]);
+    }
+
+    #[test]
+    fn static_commands_cover_cursor_agent_tui_builtins() {
+        let commands = static_commands();
+        let names: Vec<&str> = commands.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"summarize"));
+        assert!(names.contains(&"plan"));
+        assert!(names.contains(&"goal"));
+        assert!(names.contains(&"clear"));
+        assert!(!names.contains(&"quit"));
+        assert!(!names.contains(&"vim"));
     }
 }

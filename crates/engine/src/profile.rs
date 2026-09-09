@@ -7,9 +7,9 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use komet_proto::WorkspaceScope;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-use komet_proto::WorkspaceScope;
 
 use crate::EngineError;
 

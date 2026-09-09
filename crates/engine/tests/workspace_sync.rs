@@ -159,7 +159,8 @@ fn run_request(prompt: &str) -> RunRequest {
         permission_timeout_ms: None,
         worktree: None,
         resume: None,
-        mcp: None, mcp_external: Vec::new(),
+        mcp: None,
+        mcp_external: Vec::new(),
     }
 }
 
@@ -678,6 +679,7 @@ async fn legacy_workspace_doc_migrates_instantly_on_first_boot() {
                 status: SessionStatus::Idle,
                 started_at: Some(now),
                 updated_at: now,
+                context_usage: None,
             })
             .unwrap();
         store

@@ -11,6 +11,20 @@ emit() { printf '%s\n' "$1"; }
 rid() { printf '%s' "$1" | sed 's/.*"id":\([0-9]*\).*/\1/'; }
 has() { case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac; }
 
+# Grok occupancy probe (`_x.ai/session/info`) can arrive between any two
+# scenario reads. Answer it here so it never steals a cancel/steer/prompt.
+read_rpc() {
+  __var=$1
+  while IFS= read -r __line || return 1; do
+    if has "$__line" '"method":"_x.ai/session/info"'; then
+      emit "{\"id\":$(rid "$__line"),\"result\":{\"result\":{\"turns\":1,\"turnIndex\":0,\"context\":{\"used\":42000,\"total\":131072,\"systemPromptTokens\":1200}}}}"
+      continue
+    fi
+    eval "$__var=\"\$__line\""
+    return 0
+  done
+}
+
 update() { # $1 = update json object body
   emit "{\"method\":\"session/update\",\"params\":{\"sessionId\":\"$SID\",\"update\":$1}}"
 }
@@ -59,11 +73,11 @@ fi
 
 # ---- config option sets (0..n), then the first turn -------------------------
 CONFIG_SETS=""
-read -r promptline || exit 1
+read_rpc promptline || exit 1
 while has "$promptline" '"method":"session/set_config_option"'; do
   emit "{\"id\":$(rid "$promptline"),\"result\":{}}"
   CONFIG_SETS="$CONFIG_SETS $promptline"
-  read -r promptline || exit 1
+  read_rpc promptline || exit 1
 done
 has "$promptline" '"method":"session/prompt"' || exit 1
 pid=$(rid "$promptline")
@@ -144,7 +158,7 @@ case "$promptline" in
   # user-facing choices — must round-trip through the input bridge, never
   # auto-accept. The test's bridge answers "Use tokio".
   emit "{\"id\":88,\"method\":\"session/request_permission\",\"params\":{\"sessionId\":\"$SID\",\"toolCall\":{\"toolCallId\":\"q1\",\"title\":\"Which async runtime should I use?\"},\"options\":[{\"optionId\":\"opt-tokio\",\"name\":\"Use tokio\"},{\"optionId\":\"opt-smol\",\"name\":\"Use smol\"}]}}"
-  read -r ans || exit 1
+  read_rpc ans || exit 1
   { has "$ans" '"id":88' && has "$ans" '"outcome":"selected"' && has "$ans" '"optionId":"opt-tokio"'; } ||
     { emit "{\"id\":$pid,\"result\":{\"stopReason\":\"refusal\"}}"; exit 0; }
   update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"answered"}}'
@@ -153,7 +167,7 @@ case "$promptline" in
 
 *scenario:permission*)
   emit "{\"id\":77,\"method\":\"session/request_permission\",\"params\":{\"sessionId\":\"$SID\",\"toolCall\":{\"toolCallId\":\"t1\"},\"options\":[{\"optionId\":\"once\",\"name\":\"Allow once\",\"kind\":\"allow_once\"},{\"optionId\":\"always\",\"name\":\"Always allow\",\"kind\":\"allow_always\"},{\"optionId\":\"no\",\"name\":\"Reject\",\"kind\":\"reject_once\"}]}}"
-  read -r ans || exit 1
+  read_rpc ans || exit 1
   { has "$ans" '"id":77' && has "$ans" '"outcome":"selected"' && has "$ans" '"optionId":"always"'; } ||
     { emit "{\"id\":$pid,\"result\":{\"stopReason\":\"refusal\"}}"; exit 0; }
   update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"approved"}}'
@@ -165,16 +179,25 @@ case "$promptline" in
   # option on the wire (NOT a silent allow, NOT a bare cancel when a reject
   # option exists).
   emit "{\"id\":78,\"method\":\"session/request_permission\",\"params\":{\"sessionId\":\"$SID\",\"toolCall\":{\"toolCallId\":\"t2\",\"title\":\"Run rm -rf\"},\"options\":[{\"optionId\":\"once\",\"name\":\"Allow once\",\"kind\":\"allow_once\"},{\"optionId\":\"always\",\"name\":\"Always allow\",\"kind\":\"allow_always\"},{\"optionId\":\"no\",\"name\":\"Reject\",\"kind\":\"reject_once\"}]}}"
-  read -r ans || exit 1
+  read_rpc ans || exit 1
   { has "$ans" '"id":78' && has "$ans" '"outcome":"selected"' && has "$ans" '"optionId":"no"'; } ||
     { emit "{\"id\":$pid,\"result\":{\"stopReason\":\"refusal\"}}"; exit 0; }
   update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"denied"}}'
   emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
   ;;
 
+*scenario:perm-readonly*)
+  emit "{\"id\":79,\"method\":\"session/request_permission\",\"params\":{\"sessionId\":\"$SID\",\"toolCall\":{\"toolCallId\":\"bash\",\"rawInput\":{\"command\":\"rm -rf /\"}},\"options\":[{\"optionId\":\"once\",\"name\":\"Allow once\",\"kind\":\"allow_once\"},{\"optionId\":\"always\",\"name\":\"Always allow\",\"kind\":\"allow_always\"},{\"optionId\":\"no\",\"name\":\"Reject\",\"kind\":\"reject_once\"}]}}"
+  read_rpc ans || exit 1
+  { has "$ans" '"id":79' && has "$ans" '"outcome":"selected"' && has "$ans" '"optionId":"no"'; } ||
+    { emit "{\"id\":$pid,\"result\":{\"stopReason\":\"refusal\"}}"; exit 0; }
+  update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"blocked"}}'
+  emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+  ;;
+
 *scenario:steer-ext*)
   update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"first"}}'
-  read -r steerline || exit 1
+  read_rpc steerline || exit 1
   sid=$(rid "$steerline")
   if has "$steerline" '"method":"_session/steering"' &&
     has "$steerline" 'redirect please' &&
@@ -190,7 +213,7 @@ case "$promptline" in
 
 *scenario:steer-race*)
   update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"first"}}'
-  read -r steerline || exit 1
+  read_rpc steerline || exit 1
   sid=$(rid "$steerline")
   has "$steerline" '"method":"_session/steering"' || exit 1
   # The exact turn-end race: the injection lands in the turn's tail and the
@@ -205,14 +228,14 @@ case "$promptline" in
 
 *scenario:steer-queue*)
   update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"first"}}'
-  read -r steerline || exit 1
+  read_rpc steerline || exit 1
   sid=$(rid "$steerline")
   has "$steerline" '"method":"_session/steering"' || exit 1
   # Reject: the harness must queue the text and deliver it as the next
   # session/prompt at the turn boundary (the no-extension path).
   emit "{\"id\":$sid,\"error\":{\"code\":-32601,\"message\":\"steering unsupported\"}}"
   emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
-  read -r followline || exit 1
+  read_rpc followline || exit 1
   fid=$(rid "$followline")
   if has "$followline" '"method":"session/prompt"' && has "$followline" 'redirect please'; then
     update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"boundary"}}'
@@ -228,12 +251,12 @@ case "$promptline" in
   # noRunningTurn — the harness must settle the dead turn after its grace
   # and promote the queued steer to a fresh session/prompt.
   update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"working"}}'
-  read -r steerline || exit 1
+  read_rpc steerline || exit 1
   sid=$(rid "$steerline")
   has "$steerline" '"method":"_session/steering"' || exit 1
   emit "{\"id\":$sid,\"result\":{\"outcome\":\"promptRequired\",\"reason\":\"noRunningTurn\"}}"
   # No response to $pid, ever. The next line must be the promoted prompt.
-  read -r followline || exit 1
+  read_rpc followline || exit 1
   fid=$(rid "$followline")
   if has "$followline" '"method":"session/prompt"' && has "$followline" 'what about now'; then
     update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"promoted"}}'
@@ -264,10 +287,10 @@ case "$promptline" in
   update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"first"}}'
   emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
   update '{"sessionUpdate":"tool_call","toolCallId":"sc-1","title":"self-continued work","kind":"execute","status":"pending","rawInput":{"command":"make"}}'
-  read -r cancelline || exit 1
+  read_rpc cancelline || exit 1
   has "$cancelline" '"method":"session/cancel"' || exit 1
   update '{"sessionUpdate":"tool_call_update","toolCallId":"sc-1","status":"completed","content":[]}'
-  read -r followline || exit 1
+  read_rpc followline || exit 1
   fid=$(rid "$followline")
   if has "$followline" '"method":"session/prompt"' && has "$followline" 'what about now'; then
     update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"fresh answer"}}'
@@ -285,7 +308,7 @@ case "$promptline" in
   update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"first"}}'
   emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
   update '{"sessionUpdate":"tool_call","toolCallId":"sc-2","title":"self-continued work","kind":"execute","status":"pending","rawInput":{"command":"make"}}'
-  read -r followline || exit 1
+  read_rpc followline || exit 1
   if has "$followline" '"method":"session/cancel"'; then
     # Cancelling would kill the agent's in-flight work: fail loudly.
     update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"CANCELLED-NATIVE-WORK"}}'
@@ -309,7 +332,7 @@ case "$promptline" in
   # not settle off it — the turn continues and ends via its real response:
   # exactly one Done, all text intact.
   update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"first"}}'
-  read -r steerline || exit 1
+  read_rpc steerline || exit 1
   sid=$(rid "$steerline")
   has "$steerline" '"method":"_session/steering"' || exit 1
   emit "{\"id\":$sid,\"result\":{\"outcome\":\"injected\"}}"
@@ -359,7 +382,7 @@ case "$promptline" in
 
 *scenario:interrupt*)
   update '{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"working"}}'
-  read -r intline || exit 1
+  read_rpc intline || exit 1
   if has "$intline" '"method":"session/cancel"'; then
     emit "{\"id\":$pid,\"result\":{\"stopReason\":\"cancelled\"}}"
   else
@@ -395,3 +418,12 @@ case "$promptline" in
   emit "{\"id\":$pid,\"result\":{\"stopReason\":\"refusal\"}}"
   ;;
 esac
+
+# Grok occupancy probe lands after the prompt result. Answer once, then
+# exit so the harness sees EOF and `run_to_end` can finish.
+while IFS= read -r __line || exit 0; do
+  if has "$__line" '"method":"_x.ai/session/info"'; then
+    emit "{\"id\":$(rid "$__line"),\"result\":{\"result\":{\"turns\":1,\"turnIndex\":0,\"context\":{\"used\":42000,\"total\":131072,\"systemPromptTokens\":1200}}}}"
+    exit 0
+  fi
+done

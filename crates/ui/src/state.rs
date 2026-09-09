@@ -777,6 +777,12 @@ impl AppState {
     }
 
     pub fn apply_sessions(&mut self, sessions: Vec<Session>) {
+        for session in &sessions {
+            if let Some(stats) = &session.context_usage {
+                self.context_usage
+                    .insert(session.chat_id.clone(), stats.clone());
+            }
+        }
         self.sessions = sessions;
     }
 
@@ -863,6 +869,7 @@ impl AppState {
             .unwrap_or("claude-3-7-sonnet");
         let limit = komet_proto::default_context_limit_for_model(model_name);
         let mut stats = komet_proto::ContextUsageStats::new(limit);
+        stats.source = komet_proto::ContextUsageSource::Estimated;
 
         let mut total_chars: usize = 0;
         for entry in &self.transcript {
@@ -2293,6 +2300,7 @@ mod tests {
             status,
             started_at: None,
             updated_at: now - TimeDelta::seconds(updated_secs_ago),
+            context_usage: None,
         }
     }
 
@@ -2542,6 +2550,26 @@ mod tests {
         // No spaces at all: selection clears.
         state.apply_spaces(vec![]);
         assert_eq!(state.selected_space, None);
+    }
+
+    #[test]
+    fn apply_sessions_stamps_context_usage_for_the_ring() {
+        let mut state = AppState::new();
+        state.selected_chat = Some("c1".into());
+        let mut sess = session("c1", SessionStatus::Working, 0, Utc::now());
+        sess.context_usage = Some(komet_proto::ContextUsageStats::window(
+            1_000,
+            10_000,
+            komet_proto::ContextUsageSource::Native,
+            900,
+            0,
+            100,
+            0,
+        ));
+        state.apply_sessions(vec![sess]);
+        let stats = state.current_context_usage();
+        assert_eq!(stats.used(), 1_000);
+        assert_eq!(stats.source, komet_proto::ContextUsageSource::Native);
     }
 
     #[test]

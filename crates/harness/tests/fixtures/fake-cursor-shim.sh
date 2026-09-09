@@ -84,6 +84,36 @@ case "$first" in
   exit 3
   ;;
 
+*scenario:sandbox-readonly*)
+  case "$first" in
+  *'"sandbox":"read-only"'*)
+    emit '{"ev":"ready","agentId":"agent-ro","model":"composer-2.5"}'
+    emit '{"ev":"text","text":"readonly ok"}'
+    emit '{"ev":"turn","status":"finished"}'
+    ;;
+  *)
+    emit '{"ev":"fatal","message":"expected sandbox read-only"}'
+    exit 1
+    ;;
+  esac
+  exit 0
+  ;;
+
+*scenario:sandbox*)
+  case "$first" in
+  *'"sandbox":"workspace-write"'*)
+    emit '{"ev":"ready","agentId":"agent-sbx","model":"composer-2.5"}'
+    emit '{"ev":"text","text":"sandbox ok"}'
+    emit '{"ev":"turn","status":"finished"}'
+    ;;
+  *)
+    emit '{"ev":"fatal","message":"expected sandbox workspace-write"}'
+    exit 1
+    ;;
+  esac
+  exit 0
+  ;;
+
 *)
   emit '{"ev":"fatal","message":"unknown scenario"}'
   exit 1

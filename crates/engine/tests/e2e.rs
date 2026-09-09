@@ -40,7 +40,8 @@ fn run_request(prompt: &str) -> RunRequest {
         permission_timeout_ms: None,
         worktree: None,
         resume: None,
-        mcp: None, mcp_external: Vec::new(),
+        mcp: None,
+        mcp_external: Vec::new(),
     }
 }
 
@@ -678,8 +679,8 @@ async fn recover_stale_journal_stamps_aborted_on_boot() {
 
 #[tokio::test]
 async fn recover_stale_does_not_resume_run_hosted_by_another_device() {
-    use komet_proto::{Chat, Space};
     use komet_doc::WorkspaceDoc;
+    use komet_proto::{Chat, Space};
 
     let dir = tempfile::tempdir().unwrap();
     let device_id = "dev-booting"; // THIS device's id (crashed here earlier)
@@ -788,8 +789,7 @@ async fn recover_stale_does_not_resume_run_hosted_by_another_device() {
     // even touched, and no run is dispatched (no new assistant entry, no
     // Running session, no second Done later on).
     assert!(
-        !dir
-            .path()
+        !dir.path()
             .join("orgs/dev-org/dev-user/journals")
             .join(format!("{CHAT}.resume"))
             .exists(),
@@ -802,7 +802,9 @@ async fn recover_stale_does_not_resume_run_hosted_by_another_device() {
     tokio::time::sleep(Duration::from_millis(300)).await;
     let all = entries(&core);
     assert_eq!(
-        all.iter().filter(|e| e.role == MessageRole::Assistant).count(),
+        all.iter()
+            .filter(|e| e.role == MessageRole::Assistant)
+            .count(),
         1,
         "no resumed run may append a second assistant entry"
     );
@@ -1804,7 +1806,8 @@ async fn real_claude_sees_uploaded_image_inline() {
         permission_timeout_ms: None,
         worktree: None,
         resume: None,
-        mcp: None, mcp_external: Vec::new(),
+        mcp: None,
+        mcp_external: Vec::new(),
     };
     core.doc_host
         .queue_command(

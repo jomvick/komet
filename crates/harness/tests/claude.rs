@@ -211,6 +211,12 @@ async fn happy_path_normalizes_events_and_tags_subagents() {
         reasoning_tokens: 0,
         context_limit: None,
     }));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::ContextWindow { stats }
+            if stats.used() == 10
+                && stats.source == komet_proto::ContextUsageSource::Approximate
+    )));
     assert_eq!(
         events.last(),
         Some(&AgentEvent::Done {
@@ -677,6 +683,19 @@ async fn context_usage_queries_metrics_and_skills() {
     assert_eq!(usage.skills[0].source, "userSettings");
     assert_eq!(usage.skills[1].name, "dataviz");
     assert_eq!(usage.skills[1].source, "built-in");
+}
+
+#[tokio::test]
+async fn live_session_probes_context_usage_after_result() {
+    let (controls, _steer, _token) = controls("A");
+    let events = run_to_end(&harness(), request("scenario:context-live"), controls).await;
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::ContextWindow { stats }
+            if stats.used() == 9999
+                && stats.context_limit == 200_000
+                && stats.source == komet_proto::ContextUsageSource::Native
+    )));
 }
 
 /// Live smoke against the real CLI: `cargo test -p komet-harness --test

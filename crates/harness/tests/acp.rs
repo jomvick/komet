@@ -248,8 +248,20 @@ async fn happy_path_maps_chunks_tools_diffs_plans_and_commands() {
         },
     }));
 
-    // usage_update maps to nothing (context gauge, not per-turn tokens).
+    // usage_update is a context-window snapshot, not per-turn tokens.
     assert!(!events.iter().any(|e| matches!(e, AgentEvent::Usage { .. })));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::ContextWindow { stats } if stats.used() == 1200 && stats.context_limit == 500_000
+    )));
+    // Grok `_x.ai/session/info` is the CLI's own occupancy (not billed input).
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::ContextWindow { stats }
+            if stats.used() == 42_000
+                && stats.context_limit == 131_072
+                && stats.source == komet_proto::ContextUsageSource::Native
+    )));
 
     assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
 }
@@ -365,6 +377,58 @@ async fn permission_bridge_deny_selects_the_reject_option() {
     // distinguishes an explicit rejection from an abandoned request.
     assert!(events.contains(&AgentEvent::TextDelta {
         text: "denied".into()
+    }));
+    assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
+}
+
+#[tokio::test]
+async fn full_access_auto_allows_without_the_permission_bridge() {
+    let (steer_tx, steer_rx) = mpsc::channel(8);
+    let token = CancellationToken::new();
+    let controls = RunControls {
+        request_input: Box::new(|_questions| {
+            let (tx, rx) = oneshot::channel();
+            let _ = tx.send(Vec::new());
+            rx
+        }),
+        request_permission: Box::new(|_kind, _summary, _choices| {
+            panic!("full access must auto-allow ACP permissions");
+        }),
+        steering: steer_rx,
+        interrupt: token.clone(),
+    };
+    let _keep = (steer_tx, token);
+    let mut req = request("scenario:permission");
+    req.sandbox = SandboxLevel::DangerFullAccess;
+    let events = run_to_end(&harness(), req, controls).await;
+    assert!(events.contains(&AgentEvent::TextDelta {
+        text: "approved".into()
+    }));
+    assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
+}
+
+#[tokio::test]
+async fn read_only_auto_denies_shell_without_the_permission_bridge() {
+    let (steer_tx, steer_rx) = mpsc::channel(8);
+    let token = CancellationToken::new();
+    let controls = RunControls {
+        request_input: Box::new(|_questions| {
+            let (tx, rx) = oneshot::channel();
+            let _ = tx.send(Vec::new());
+            rx
+        }),
+        request_permission: Box::new(|_kind, _summary, _choices| {
+            panic!("read-only must auto-deny shell without asking");
+        }),
+        steering: steer_rx,
+        interrupt: token.clone(),
+    };
+    let _keep = (steer_tx, token);
+    let mut req = request("scenario:perm-readonly");
+    req.sandbox = SandboxLevel::ReadOnly;
+    let events = run_to_end(&harness(), req, controls).await;
+    assert!(events.contains(&AgentEvent::TextDelta {
+        text: "blocked".into()
     }));
     assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
 }
@@ -620,13 +684,44 @@ async fn failed_load_falls_back_to_a_fresh_session() {
 async fn commands_discovery_scans_the_initialize_response() {
     let harness = harness();
     let commands = harness.commands().await.expect("discovery");
-    assert_eq!(commands.len(), 2, "{commands:?}");
-    assert_eq!(commands[0].name, "compact");
-    assert_eq!(commands[1].name, "goal");
-    assert_eq!(commands[1].input_hint.as_deref(), Some("the goal"));
+    assert!(
+        commands.len() >= 2,
+        "static grok builtins + initialize ads: {commands:?}"
+    );
+    assert!(commands.iter().any(|c| c.name == "compact"));
+    let goal = commands.iter().find(|c| c.name == "goal").expect("goal");
+    assert_eq!(goal.input_hint.as_deref(), Some("the goal"));
     // Cached: a second call must not respawn (same result, instant).
     let again = harness.commands().await.expect("cached");
     assert_eq!(again, commands);
+}
+
+#[tokio::test]
+async fn grok_hermes_pi_commands_include_static_builtins() {
+    let cases: [(_, &[&str]); 3] = [
+        (
+            AcpHarness::grok().with_executable(fixture_path()),
+            &["compact", "plan", "rewind", "clear"],
+        ),
+        (
+            AcpHarness::hermes().with_executable(fixture_path()),
+            &["reset", "tools", "compress", "steer"],
+        ),
+        (
+            AcpHarness::pi().with_executable(fixture_path()),
+            &["compact", "tree", "fork", "clone"],
+        ),
+    ];
+    for (harness, names) in cases {
+        let commands = harness.commands().await.expect("discovery");
+        for name in names {
+            assert!(
+                commands.iter().any(|c| c.name == *name),
+                "{name} missing from {:?}",
+                commands.iter().map(|c| &c.name).collect::<Vec<_>>()
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -1043,6 +1138,22 @@ async fn opencode_overlay_injected() {
     assert!(
         events.contains(&AgentEvent::TextDelta {
             text: "overlay ok".into()
+        }),
+        "{events:?}"
+    );
+    assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
+}
+
+#[tokio::test]
+async fn opencode_overlay_follows_sandbox_level_without_options_table() {
+    let mut req = request_opencode("scenario:overlay-level", None);
+    req.sandbox = SandboxLevel::ReadOnly;
+    req.sandbox_options = None;
+    let (controls, _steer, _token) = controls();
+    let events = run_to_end(&opencode_harness(), req, controls).await;
+    assert!(
+        events.contains(&AgentEvent::TextDelta {
+            text: "overlay level ok".into()
         }),
         "{events:?}"
     );

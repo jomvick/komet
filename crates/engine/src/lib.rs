@@ -213,12 +213,10 @@ impl EngineCore {
         let store = Arc::new(DocsStore::open(profile.store_root())?);
         let store_for_import = store.clone();
         let journal = Arc::new(RunJournal::open(profile.store_root().join("journals"))?);
-        let mcp_registry = Arc::new(
-            crate::mcp::McpRegistry::load(data_dir).unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "mcp registry load failed, starting empty");
-                crate::mcp::McpRegistry::empty(data_dir)
-            }),
-        );
+        let mcp_registry = Arc::new(crate::mcp::McpRegistry::load(data_dir).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "mcp registry load failed, starting empty");
+            crate::mcp::McpRegistry::empty(data_dir)
+        }));
         let mcp_secrets = Arc::new(crate::mcp::McpSecretStore::new(
             data_dir.join("mcp-secrets.json"),
         ));
@@ -297,7 +295,8 @@ impl EngineCore {
             turn_diff.note_turn_start(chat_id, cwd);
         }));
         let spaces_sync = SpacesSync::start(repos.clone(), workspace.clone(), &device_id);
-        let workspace_files = WorkspaceFiles::new(repos.clone(), workspace.clone(), device_id.clone());
+        let workspace_files =
+            WorkspaceFiles::new(repos.clone(), workspace.clone(), device_id.clone());
         Ok(Self {
             sessions,
             doc_host,
@@ -591,7 +590,10 @@ impl Engine {
     /// installations must be able to start locally without network access.
     pub async fn build_auth(config: &EngineConfig) -> Auth {
         let mut auth_config = AuthConfig::new(config.edge_url.clone(), config.data_dir.clone());
-        auth_config.sync_token = config.sync_token.clone().or_else(|| std::env::var("KOMET_SYNC_TOKEN").ok());
+        auth_config.sync_token = config
+            .sync_token
+            .clone()
+            .or_else(|| std::env::var("KOMET_SYNC_TOKEN").ok());
         if let Some(token) = &config.edge_token {
             auth_config.dev_user_id = token.clone();
         }

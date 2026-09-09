@@ -130,6 +130,21 @@ case "$first" in
   emit '{"type":"result","subtype":"error_max_turns","errors":[],"usage":{"input_tokens":1,"output_tokens":2},"session_id":"sess-err"}'
   ;;
 
+*scenario:context-live*)
+  emit '{"type":"system","subtype":"init","model":"claude-fable-5","tools":[],"cwd":"/tmp","session_id":"sess-ctx"}'
+  emit '{"type":"result","subtype":"success","result":"ok","errors":[],"usage":{"input_tokens":10,"output_tokens":2},"session_id":"sess-ctx"}'
+  read -r ctx || exit 1
+  case "$ctx" in
+  *'"subtype":"get_context_usage"'*)
+    rid=$(printf '%s\n' "$ctx" | sed 's/.*"request_id":"\([^"]*\)".*/\1/')
+    emit "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"$rid\",\"response\":{\"totalTokens\":9999,\"maxTokens\":200000}}}"
+    ;;
+  *)
+    emit '{"type":"result","subtype":"error_during_execution","errors":["expected get_context_usage"],"usage":{"input_tokens":0,"output_tokens":0},"session_id":"sess-ctx"}'
+    ;;
+  esac
+  ;;
+
 *)
   emit '{"type":"result","subtype":"error_during_execution","errors":["unknown scenario"],"usage":{"input_tokens":0,"output_tokens":0},"session_id":"sess-x"}'
   ;;

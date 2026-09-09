@@ -3,9 +3,9 @@
 //! zero-blobs-in-prod mystery (refs stamped, uploads absent, no warns).
 use std::sync::Arc;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use komet_engine::doc_host::{DocHost, DocHostConfig, EdgeConfig};
 use komet_sync::DocsStore;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::main]
 async fn main() {

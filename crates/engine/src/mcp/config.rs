@@ -41,7 +41,10 @@ impl std::fmt::Debug for McpServerConfig {
             .field("command", &self.command)
             .field("args", &self.args)
             .field("url", &self.url)
-            .field("headers", &format_args!("{{{} keys masked}}", self.headers.len()))
+            .field(
+                "headers",
+                &format_args!("{{{} keys masked}}", self.headers.len()),
+            )
             .field("env", &format_args!("{{{} keys masked}}", self.env.len()))
             .field("always_load", &self.always_load)
             .finish()

@@ -17,9 +17,13 @@
 //! - `session/prompt` owns the turn: its response's `stopReason` ends the
 //!   turn (`cancelled` → Interrupted, `refusal` → Errored, else Completed).
 //! - `session/update` notifications normalize per [`normalize::map_update`].
-//! - Permission requests auto-accept with the agent's preferred allow option
-//!   (komet sessions run unattended); question-shaped requests block on the
-//!   engine's input bridge.
+//! - Permission requests on a live run honor [`SandboxLevel`]: Full access
+//!   auto-allows, Read only auto-denies writes/commands, Sandboxed blocks on
+//!   the engine's permission bridge. Question-shaped requests always block
+//!   on the input bridge.
+//! - Grok's native `--sandbox` / `--permission-mode` / `--always-approve`
+//!   flags follow the same access chip. Hermes and Pi have no CLI sandbox, so
+//!   the ACP permission policy is their access control.
 //! - Steering: agents advertising `_session/steering` get mid-turn injection;
 //!   others queue steers and deliver them as the next `session/prompt` at the
 //!   turn boundary. The session stays parked between turns while the
@@ -48,12 +52,15 @@ use tokio::sync::mpsc;
 
 use komet_proto::{
     AgentEvent, DoneStatus, HarnessId, Model, ModelOption, ModelOptionChoice, ReasoningLevel,
-    RunRequest, SlashCommand, SteeringMode, UserInputAnswer, UserInputQuestion,
+    RunRequest, SandboxLevel, SlashCommand, SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
 use crate::jsonrpc::{Incoming, RpcClient};
 use crate::{Harness, HarnessError, RunControls, Signal, send_signal, shutdown_child};
-use normalize::{map_update, parse_commands, preferred_allow_option};
+use normalize::{
+    billed_usage_event, map_update, native_context_event, parse_commands, preferred_allow_option,
+    session_info_window,
+};
 use subagent::SubagentTracker;
 use subagent_opencode::OpencodeTracker;
 
@@ -230,6 +237,42 @@ fn grok_install_paths() -> Vec<PathBuf> {
     dirs.push(PathBuf::from("/opt/homebrew/bin/grok"));
     dirs.push(PathBuf::from("/usr/local/bin/grok"));
     dirs
+}
+
+/// Grok CLI access flags. `--sandbox` / `--permission-mode` are top-level
+/// (before `agent`); `--always-approve` lives on the `agent` subcommand
+/// (before `stdio`). Profiles verified against grok 1.0.24: `read-only`,
+/// `workspace` (not `workspace-write`), omit sandbox for full access.
+pub(crate) fn grok_args_for_sandbox(sandbox: SandboxLevel) -> Vec<String> {
+    let mut args = vec!["--no-auto-update".to_owned()];
+    match sandbox {
+        SandboxLevel::ReadOnly => {
+            args.extend([
+                "--sandbox".into(),
+                "read-only".into(),
+                "--permission-mode".into(),
+                "plan".into(),
+            ]);
+        }
+        SandboxLevel::WorkspaceWrite => {
+            args.extend([
+                "--sandbox".into(),
+                "workspace".into(),
+                "--permission-mode".into(),
+                "acceptEdits".into(),
+            ]);
+        }
+        SandboxLevel::DangerFullAccess => {
+            args.extend(["--permission-mode".into(), "bypassPermissions".into()]);
+        }
+    }
+    args.push("agent".into());
+    args.push("--no-leader".into());
+    if sandbox == SandboxLevel::DangerFullAccess {
+        args.push("--always-approve".into());
+    }
+    args.push("stdio".into());
+    args
 }
 
 fn grok_spec() -> AcpAgentSpec {
@@ -784,8 +827,14 @@ impl AcpHarness {
         block_on_install: bool,
         extra_args: &[String],
         opencode_config_overlay: Option<&std::path::Path>,
+        sandbox: Option<SandboxLevel>,
     ) -> Result<(Child, crate::StderrTail), HarnessError> {
-        let (exe, args) = self.resolve_program(block_on_install).await?;
+        let (exe, mut args) = self.resolve_program(block_on_install).await?;
+        if self.spec.id == HarnessId::Grok
+            && let Some(level) = sandbox
+        {
+            args = grok_args_for_sandbox(level);
+        }
         let mut cmd = Command::new(&exe);
         cmd.args(args);
         cmd.args(extra_args);
@@ -834,7 +883,7 @@ impl AcpHarness {
     /// refuses sessions before login still surfaces whatever the handshake
     /// advertised.
     async fn discover_commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
-        let (mut child, _stderr) = self.spawn_agent(None, false, &[], None).await?;
+        let (mut child, _stderr) = self.spawn_agent(None, false, &[], None, None).await?;
         let (client, mut incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
             _ => {
@@ -904,7 +953,7 @@ impl AcpHarness {
     /// wire is the source of truth — the spec's static catalog only enriches
     /// matching entries and names the pick when the agent advertises nothing.
     async fn discover_models(&self) -> Result<Vec<Model>, HarnessError> {
-        let (mut child, stderr_tail) = self.spawn_agent(None, false, &[], None).await?;
+        let (mut child, stderr_tail) = self.spawn_agent(None, false, &[], None, None).await?;
         let (client, _incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
             _ => {
@@ -1198,55 +1247,152 @@ fn trait_from_config_option(option: &Value) -> Option<ModelOption> {
     }
 }
 
-/// Built-in slash commands native to ACP agents (OpenCode built-ins).
+fn cmd(name: &str, description: &str, hint: Option<&str>) -> SlashCommand {
+    SlashCommand {
+        name: name.into(),
+        description: description.into(),
+        input_hint: hint.map(str::to_owned),
+    }
+}
+
+/// Built-in slash commands native to each ACP agent's own CLI / adapter.
+/// Discovery (`availableCommands`) overlays this list; these are the fallback
+/// when the probe is empty and the names already known to the TUI.
 pub(crate) fn static_commands(id: HarnessId) -> Vec<SlashCommand> {
     match id {
         HarnessId::Opencode => vec![
-            SlashCommand {
-                name: "compact".into(),
-                description: "Compact the conversation context".into(),
-                input_hint: None,
-            },
-            SlashCommand {
-                name: "clear".into(),
-                description: "Clear session history and reset context".into(),
-                input_hint: None,
-            },
-            SlashCommand {
-                name: "diff".into(),
-                description: "Show uncommitted git changes".into(),
-                input_hint: None,
-            },
-            SlashCommand {
-                name: "undo".into(),
-                description: "Undo last file modification".into(),
-                input_hint: None,
-            },
-            SlashCommand {
-                name: "redo".into(),
-                description: "Redo undone file modification".into(),
-                input_hint: None,
-            },
-            SlashCommand {
-                name: "model".into(),
-                description: "Switch active LLM model".into(),
-                input_hint: Some("[model_name]".into()),
-            },
-            SlashCommand {
-                name: "mode".into(),
-                description: "Switch execution mode (plan, build, review)".into(),
-                input_hint: Some("[mode]".into()),
-            },
-            SlashCommand {
-                name: "init".into(),
-                description: "Initialize project configuration".into(),
-                input_hint: None,
-            },
-            SlashCommand {
-                name: "review".into(),
-                description: "Review staged or unstaged code diffs".into(),
-                input_hint: None,
-            },
+            cmd("compact", "Compact the conversation context", None),
+            cmd("clear", "Clear session history and reset context", None),
+            cmd("diff", "Show uncommitted git changes", None),
+            cmd("undo", "Undo last file modification", None),
+            cmd("redo", "Redo undone file modification", None),
+            cmd("model", "Switch active LLM model", Some("[model_name]")),
+            cmd(
+                "mode",
+                "Switch execution mode (plan, build, review)",
+                Some("[mode]"),
+            ),
+            cmd("init", "Initialize project configuration", None),
+            cmd("review", "Review staged or unstaged code diffs", None),
+        ],
+        // Grok Build TUI (docs.x.ai/build/modes-and-commands). Skip pager-only
+        // dialogs (quit/help/theme/vim/copy/find/settings/mcp tabs).
+        HarnessId::Grok => vec![
+            cmd(
+                "compact",
+                "Compact conversation history to reclaim context",
+                Some("[context]"),
+            ),
+            cmd("context", "View context usage breakdown", None),
+            cmd(
+                "clear",
+                "Start a fresh session and clear conversation",
+                None,
+            ),
+            cmd("new", "Start a new session (alias of /clear)", None),
+            cmd("rewind", "Rewind to a previous turn", None),
+            cmd("rename", "Rename the current session", Some("<title>")),
+            cmd("export", "Export the conversation to a file", None),
+            cmd("fork", "Branch the current session into a peer agent", None),
+            cmd(
+                "plan",
+                "Enter plan mode with an optional goal",
+                Some("[description]"),
+            ),
+            cmd("view-plan", "View the current plan", None),
+            cmd(
+                "btw",
+                "Ask a side question without interrupting the turn",
+                Some("<question>"),
+            ),
+            cmd(
+                "loop",
+                "Run a prompt on a recurring interval",
+                Some("[interval] <prompt>"),
+            ),
+            cmd("remember", "Save a memory note", Some("<note>")),
+            cmd("memory", "Browse and manage memories", None),
+            cmd("flush", "Flush conversation memory to disk now", None),
+            cmd("model", "Switch the active model", Some("<model>")),
+            cmd("effort", "Set reasoning effort for the current model", None),
+            cmd(
+                "deep-research",
+                "Run a background research workflow",
+                Some("<query>"),
+            ),
+            cmd(
+                "create-workflow",
+                "Author and save a new workflow",
+                Some("[description]"),
+            ),
+            cmd(
+                "workflow",
+                "Launch or control a saved workflow",
+                Some("[name|pause|resume|stop]"),
+            ),
+            cmd("session-info", "Show session info and context usage", None),
+        ],
+        // Hermes ACP adapter intercepts these on the prompt line
+        // (NousResearch/hermes-agent acp_adapter). Both compact and compress
+        // are listed: older adapters advertise compact, current ones compress.
+        HarnessId::Hermes => vec![
+            cmd("compact", "Compress conversation context", None),
+            cmd("compress", "Compress conversation context", None),
+            cmd("context", "Show conversation context info", None),
+            cmd("reset", "Clear conversation history", None),
+            cmd(
+                "model",
+                "Show or change the current model",
+                Some("[model name]"),
+            ),
+            cmd("tools", "List available tools with descriptions", None),
+            cmd(
+                "steer",
+                "Inject guidance into the currently running turn",
+                Some("<guidance>"),
+            ),
+            cmd(
+                "queue",
+                "Queue a prompt to run after the current turn",
+                Some("<prompt>"),
+            ),
+            cmd("version", "Show Hermes version", None),
+        ],
+        // Pi coding-agent TUI (earendil-works/pi). Skip TUI-only
+        // login/logout/quit/hotkeys/theme/copy.
+        HarnessId::Pi => vec![
+            cmd(
+                "compact",
+                "Manually compact context",
+                Some("[instructions]"),
+            ),
+            cmd("model", "Switch models", None),
+            cmd("new", "Start a new session", None),
+            cmd("name", "Set session display name", Some("<name>")),
+            cmd("session", "Show session info, tokens, and cost", None),
+            cmd("tree", "Jump to any point in the session tree", None),
+            cmd(
+                "fork",
+                "Create a new session from a previous user message",
+                None,
+            ),
+            cmd(
+                "clone",
+                "Duplicate the current branch into a new session",
+                None,
+            ),
+            cmd("export", "Export session to HTML or JSONL", Some("[file]")),
+            cmd(
+                "import",
+                "Import and resume a session from JSONL",
+                Some("<file>"),
+            ),
+            cmd(
+                "reload",
+                "Reload keybindings, extensions, skills, and prompts",
+                None,
+            ),
+            cmd("resume", "Pick from previous sessions", None),
         ],
         _ => Vec::new(),
     }
@@ -1346,9 +1492,12 @@ impl Harness for AcpHarness {
         // until the child exits (the Session owns the TempDir via _opencode_overlay_dir).
         let (_opencode_overlay_dir, opencode_overlay_path) = if self.spec.id == HarnessId::Opencode
         {
-            if let Some(opts) = &request.sandbox_options
-                && let Some(perms) = &opts.opencode
-            {
+            let resolved_perms = request
+                .sandbox_options
+                .as_ref()
+                .and_then(|opts| opts.opencode.clone())
+                .or_else(|| komet_proto::SandboxOptions::from_level(request.sandbox).opencode);
+            if let Some(perms) = resolved_perms.as_ref() {
                 let dir = tempfile::tempdir().map_err(HarnessError::Io)?;
                 let path = dir.path().join("opencode.json");
                 let doc = opencode_perms::opencode_config_document(perms);
@@ -1383,6 +1532,7 @@ impl Harness for AcpHarness {
                 true,
                 &extra_args,
                 opencode_overlay_path.as_deref(),
+                Some(request.sandbox),
             )
             .await?;
         let stdin = child
@@ -1473,15 +1623,26 @@ fn initialize_params(_harness: HarnessId) -> Value {
     })
 }
 
+/// ACP `McpServerConfig` headers/env are arrays of `{name, value}`, not maps.
+/// OpenCode's Zod union fails HTTP first on a map, then reports stdio `env`
+/// as `expected array, received undefined`.
+fn acp_name_value_list(map: &std::collections::HashMap<String, String>) -> Vec<Value> {
+    map.iter()
+        .map(|(name, value)| json!({ "name": name, "value": value }))
+        .collect()
+}
+
 fn mcp_servers(injection: Option<&komet_proto::McpInjection>) -> Vec<Value> {
     injection
         .map(|injection| {
             vec![json!({
                 "type": "http",
+                "name": injection.server_name,
                 "url": injection.url,
-                "headers": {
-                    "Authorization": format!("Bearer {}", injection.auth_token),
-                },
+                "headers": [{
+                    "name": "Authorization",
+                    "value": format!("Bearer {}", injection.auth_token),
+                }],
             })]
         })
         .unwrap_or_default()
@@ -1501,15 +1662,17 @@ pub fn build_acp_session_params(
             komet_proto::McpTransport::Http => {
                 servers.push(json!({
                     "type": "http",
+                    "name": ext.config.id,
                     "url": ext.config.url,
-                    "headers": ext.resolved_headers
+                    "headers": acp_name_value_list(&ext.resolved_headers),
                 }));
             }
             komet_proto::McpTransport::Sse => {
                 servers.push(json!({
                     "type": "sse",
+                    "name": ext.config.id,
                     "url": ext.config.url,
-                    "headers": ext.resolved_headers
+                    "headers": acp_name_value_list(&ext.resolved_headers),
                 }));
             }
             komet_proto::McpTransport::Stdio => {
@@ -1517,7 +1680,7 @@ pub fn build_acp_session_params(
                     "name": ext.config.id,
                     "command": ext.config.command,
                     "args": ext.config.args,
-                    "env": ext.resolved_env
+                    "env": acp_name_value_list(&ext.resolved_env),
                 }));
             }
         }
@@ -1820,10 +1983,9 @@ impl SubagentObserver {
 
 /// The events of one notification, session-filtered. `session/update` maps
 /// per [`map_update`]; `_x.ai/session_notification` is grok's extension
-/// channel — same `{sessionId, update}` envelope, but its updates (the
-/// `subagent_*` lifecycle) render nothing directly. The subagent tracker sees
-/// both first (spawn/finished correlation + transcript tails); its tagged
-/// events flow from its own tasks, not this return value.
+/// channel — same `{sessionId, update}` envelope. Its updates used to be
+/// dropped (subagent lifecycle only); `turn_completed` / `session_info_update`
+/// now carry the CLI's own context gauge.
 fn session_update_events(
     method: &str,
     params: &Value,
@@ -1835,39 +1997,89 @@ fn session_update_events(
     }
     let update = params.get("update").unwrap_or(&Value::Null);
     match method {
-        "session/update" => {
+        "session/update" | "_x.ai/session_notification" | "_x.ai/session/update" => {
             subagents.observe(update);
             map_update(update)
-        }
-        "_x.ai/session_notification" => {
-            subagents.observe(update);
-            Vec::new()
         }
         _ => Vec::new(),
     }
 }
 
-/// Per-turn token usage from a settled `session/prompt` response, when the
-/// adapter attaches it (tolerant of both field spellings; absent → nothing).
-fn usage_from_response(res: &Result<Value, HarnessError>) -> Option<AgentEvent> {
-    let resp = res.as_ref().ok()?;
-    // Grok settles usage on the response `_meta` (inputTokens/outputTokens —
-    // verified live, 1.0.4); adapters used a first-class `usage` object.
-    let usage = resp.get("usage").or_else(|| resp.get("_meta"))?;
-    let count = |keys: &[&str]| {
-        keys.iter()
-            .find_map(|k| usage.get(*k))
-            .and_then(Value::as_u64)
+/// Per-turn token usage from a settled `session/prompt` response.
+/// Native occupancy (`context.{used,total}` / `used`+`size`) becomes a
+/// [`AgentEvent::ContextWindow`]; billed `_meta.inputTokens` stays
+/// [`AgentEvent::Usage`] and does not fill the ring.
+fn usage_events_from_response(res: &Result<Value, HarnessError>) -> Vec<AgentEvent> {
+    let Ok(resp) = res.as_ref() else {
+        return Vec::new();
     };
-    let input = count(&["inputTokens", "input_tokens"]);
-    let output = count(&["outputTokens", "output_tokens"]);
-    (input.is_some() || output.is_some()).then(|| AgentEvent::Usage {
-        input_tokens: input.unwrap_or(0),
-        cached_input_tokens: 0,
-        output_tokens: output.unwrap_or(0),
-        reasoning_tokens: 0,
-        context_limit: None,
-    })
+    let mut events = Vec::new();
+    if let Some(ev) = native_context_event(resp)
+        .or_else(|| resp.get("_meta").and_then(native_context_event))
+    {
+        events.push(ev);
+    }
+    let usage = resp.get("usage").or_else(|| resp.get("_meta"));
+    if let Some(usage) = usage
+        && let Some(ev) = billed_usage_event(usage)
+    {
+        events.push(ev);
+    }
+    events
+}
+
+async fn emit_usage_events(
+    event_tx: &mpsc::Sender<Result<AgentEvent, HarnessError>>,
+    res: &Result<Value, HarnessError>,
+) -> bool {
+    for ev in usage_events_from_response(res) {
+        if !send(event_tx, ev).await {
+            return false;
+        }
+    }
+    true
+}
+
+/// Grok's TUI reads occupancy from `_x.ai/session/info` — billed
+/// `inputTokens` on the prompt response is a cumulative cost counter, not
+/// the window. Best-effort: a missing method or a dead child is skipped.
+async fn emit_grok_session_info(
+    event_tx: &mpsc::Sender<Result<AgentEvent, HarnessError>>,
+    client: &RpcClient,
+    session_id: &str,
+    harness: HarnessId,
+) -> bool {
+    if harness != HarnessId::Grok {
+        return true;
+    }
+    match tokio::time::timeout(
+        Duration::from_millis(750),
+        client.request(
+            "_x.ai/session/info",
+            json!({ "sessionId": session_id }),
+        ),
+    )
+    .await
+    {
+        Ok(Ok(resp)) => {
+            if let Some(ev) = session_info_window(&resp) {
+                return send(event_tx, ev).await;
+            }
+        }
+        Ok(Err(e)) => {
+            tracing::debug!(
+                target: "komet_harness::acp",
+                "_x.ai/session/info failed (skipped): {e}"
+            );
+        }
+        Err(_) => {
+            tracing::debug!(
+                target: "komet_harness::acp",
+                "_x.ai/session/info timed out (skipped)"
+            );
+        }
+    }
+    true
 }
 
 /// Map a finished `session/prompt` result to the run's terminal status.
@@ -2089,20 +2301,34 @@ fn parse_acp_permission(tool_call: Option<&Value>) -> (komet_proto::PermissionKi
     )
 }
 
+/// How a live ACP tool-permission should be resolved for this access level.
+fn acp_auto_permission(
+    sandbox: SandboxLevel,
+    kind: &komet_proto::PermissionKind,
+) -> Option<komet_proto::PermissionChoice> {
+    match sandbox {
+        SandboxLevel::DangerFullAccess => Some(komet_proto::PermissionChoice::AllowAlways {
+            scope: komet_proto::Scope::Chat,
+        }),
+        SandboxLevel::ReadOnly => match kind {
+            komet_proto::PermissionKind::Command { .. }
+            | komet_proto::PermissionKind::FileWrite { .. } => {
+                Some(komet_proto::PermissionChoice::Deny)
+            }
+            komet_proto::PermissionKind::Tool { .. } => None,
+        },
+        SandboxLevel::WorkspaceWrite => None,
+    }
+}
+
 /// The live-run request handler. Three shapes:
 /// - non-permission methods → [`handle_server_request`];
 /// - question-shaped permission requests (options without allow/reject kinds)
-///   block on the engine's input bridge (in a subtask so the message loop
-///   keeps flowing) and answer with the option whose name matches the chosen
-///   label;
-/// - real tool permissions (every option carrying an allow/reject kind) BLOCK
-///   on the engine's permission bridge — Paseo parity: `request_permission`
-///   is awaited before `client.respond`, never auto-accepted. A dropped
-///   resolver degrades to Deny — never a silent allow.
-///
-/// The acp request kinds may legitimately repeat — codex sends two
-/// `allow_always` options ("Allow for Session" and a prefix-rule amendment)
-/// on every exec approval.
+///   block on the engine's input bridge;
+/// - real tool permissions honor [`SandboxLevel`]: Full access auto-allows,
+///   Read only auto-denies writes/commands, Sandboxed blocks on the engine's
+///   permission bridge. A dropped resolver degrades to Deny — never a silent
+///   allow.
 fn handle_server_request_live(
     client: &RpcClient,
     id: Value,
@@ -2111,6 +2337,7 @@ fn handle_server_request_live(
     request_input: &std::sync::Arc<RequestInputFn>,
     request_permission: &std::sync::Arc<RequestPermissionFn>,
     open_questions: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    sandbox: SandboxLevel,
 ) -> Vec<AgentEvent> {
     if method != "session/request_permission" {
         return handle_server_request(client, id, method, params);
@@ -2121,12 +2348,18 @@ fn handle_server_request_live(
         .cloned()
         .unwrap_or_default();
     if !is_user_question(&options) {
-        // Real tool permission: surface it through the permission bridge and
-        // block until the user's decision resolves the oneshot. Spawned so
-        // the message loop keeps flowing; the open-questions counter parks
-        // the quiet-settle while the agent awaits the decision.
         let tool_call = params.get("toolCall");
         let (kind, summary) = parse_acp_permission(tool_call);
+        if let Some(choice) = acp_auto_permission(sandbox, &kind) {
+            let outcome = match option_for_choice(&options, &choice) {
+                Some(option_id) => {
+                    json!({ "outcome": { "outcome": "selected", "optionId": option_id } })
+                }
+                None => json!({ "outcome": { "outcome": "cancelled" } }),
+            };
+            client.respond(&id, outcome);
+            return Vec::new();
+        }
         let choices = vec![
             komet_proto::PermissionChoice::Allow,
             komet_proto::PermissionChoice::AllowAlways {
@@ -2146,8 +2379,6 @@ fn handle_server_request_live(
                 Some(option_id) => {
                     json!({ "outcome": { "outcome": "selected", "optionId": option_id } })
                 }
-                // Deny without an explicit reject option (or a dropped
-                // resolver that already auto-denied): cancel — never allow.
                 None => json!({ "outcome": { "outcome": "cancelled" } }),
             };
             client.respond(&id, outcome);
@@ -2751,6 +2982,7 @@ async fn run_session(session: Session) {
                                         &request_input,
                                         &request_permission,
                                         &open_questions,
+                                        request.sandbox,
                                     ) {
                                         if !send(&event_tx, ev).await {
                                             consumer_gone = true;
@@ -2776,11 +3008,12 @@ async fn run_session(session: Session) {
                         {
                             break 'main;
                         }
-                        // Per-turn token usage, when the adapter settles the prompt
-                        // with it (claude-agent-acp and codex-acp both do).
-                        if let Some(usage) = usage_from_response(&res)
-                            && !send(&event_tx, usage).await
-                        {
+                        // Per-turn billed tokens (popover) + Grok's native
+                        // occupancy probe. Billed input is not the ring fill.
+                        if !emit_usage_events(&event_tx, &res).await {
+                            break 'main;
+                        }
+                        if !emit_grok_session_info(&event_tx, &client, &session_id, harness).await {
                             break 'main;
                         }
                         let (status, error) = stop_outcome(&res, interrupted);
@@ -2927,6 +3160,7 @@ async fn run_session(session: Session) {
                                 &request_input,
                                 &request_permission,
                                 &open_questions,
+                                request.sandbox,
                             ) {
                                 if !send(&event_tx, ev).await {
                                     break 'main;
@@ -2952,9 +3186,10 @@ async fn run_session(session: Session) {
                                     AgentEvent::AssistantMessageCompleted { assistant_message_id: prev },
                                 )
                                 .await;
-                                if let Some(usage) = usage_from_response(&res) {
-                                    let _ = send(&event_tx, usage).await;
-                                }
+                                let _ = emit_usage_events(&event_tx, &res).await;
+                                let _ =
+                                    emit_grok_session_info(&event_tx, &client, &session_id, harness)
+                                        .await;
                                 let (status, error) = stop_outcome(&res, interrupted);
                                 done_current = true;
                                 if interrupted {
@@ -3039,6 +3274,7 @@ async fn run_session(session: Session) {
                                                 &request_input,
                                                 &request_permission,
                                                 &open_questions,
+                                                request.sandbox,
                                             ) {
                                                 if !send(&event_tx, ev).await {
                                                     consumer_gone = true;
@@ -3493,11 +3729,101 @@ mod tests {
         assert_eq!(mcp_servers(None), Vec::<Value>::new());
         let servers = mcp_servers(Some(&injection));
         assert_eq!(servers[0]["type"], "http");
+        assert_eq!(servers[0]["name"], "komet");
         assert_eq!(servers[0]["url"], injection.url);
         assert_eq!(
-            servers[0]["headers"]["Authorization"],
-            "Bearer secret-token"
+            servers[0]["headers"],
+            json!([{ "name": "Authorization", "value": "Bearer secret-token" }])
         );
+    }
+
+    #[test]
+    fn grok_prompt_meta_billed_tokens_are_not_a_window() {
+        let billed = Ok(json!({
+            "stopReason": "end_turn",
+            "_meta": { "inputTokens": 3_000_000, "outputTokens": 18_000 }
+        }));
+        let events = usage_events_from_response(&billed);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ContextWindow { .. })),
+            "{events:?}"
+        );
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Usage {
+                input_tokens: 3_000_000,
+                output_tokens: 18_000,
+                ..
+            }
+        )));
+
+        let native = Ok(json!({
+            "stopReason": "end_turn",
+            "context": { "used": 42_000, "total": 131_072 },
+            "_meta": { "inputTokens": 3_000_000, "outputTokens": 36 }
+        }));
+        let events = usage_events_from_response(&native);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            AgentEvent::ContextWindow { stats }
+                if stats.used() == 42_000 && stats.context_limit == 131_072
+        )));
+    }
+
+    #[test]
+    fn grok_args_follow_sandbox_level() {
+        let read_only = grok_args_for_sandbox(SandboxLevel::ReadOnly);
+        assert_eq!(read_only[1], "--sandbox");
+        assert_eq!(read_only[2], "read-only");
+        assert!(
+            read_only
+                .windows(2)
+                .any(|w| w == ["--permission-mode", "plan"])
+        );
+        let workspace = grok_args_for_sandbox(SandboxLevel::WorkspaceWrite);
+        assert!(
+            workspace
+                .windows(2)
+                .any(|w| w == ["--sandbox", "workspace"])
+        );
+        assert!(
+            workspace
+                .windows(2)
+                .any(|w| w == ["--permission-mode", "acceptEdits"])
+        );
+        assert!(!workspace.iter().any(|a| a == "--always-approve"));
+        let full = grok_args_for_sandbox(SandboxLevel::DangerFullAccess);
+        assert!(!full.iter().any(|a| a == "--sandbox"));
+        assert!(
+            full.windows(2)
+                .any(|w| w == ["--permission-mode", "bypassPermissions"])
+        );
+        assert!(full.iter().any(|a| a == "--always-approve"));
+    }
+
+    #[test]
+    fn acp_access_level_auto_resolves_permissions() {
+        let write = komet_proto::PermissionKind::FileWrite {
+            path: "a.rs".into(),
+        };
+        let cmd = komet_proto::PermissionKind::Command {
+            cmdline: "rm".into(),
+        };
+        let tool = komet_proto::PermissionKind::Tool {
+            name: "read".into(),
+        };
+        assert!(matches!(
+            acp_auto_permission(SandboxLevel::DangerFullAccess, &write),
+            Some(komet_proto::PermissionChoice::AllowAlways { .. })
+        ));
+        assert!(matches!(
+            acp_auto_permission(SandboxLevel::ReadOnly, &cmd),
+            Some(komet_proto::PermissionChoice::Deny)
+        ));
+        assert!(acp_auto_permission(SandboxLevel::ReadOnly, &tool).is_none());
+        assert!(acp_auto_permission(SandboxLevel::WorkspaceWrite, &write).is_none());
     }
 
     #[test]
@@ -3664,11 +3990,11 @@ mod tests {
         let response = json!({
             "sessionId": "s-1",
             "models": {
-                "currentModelId": "gpt-5.6-sol low",
+                "currentModelId": "gpt-5.6-terra low",
                 "availableModels": [
-                    { "modelId": "gpt-5.6-sol low", "name": "GPT-5.6-Sol (low)" },
-                    { "modelId": "gpt-5.6-sol medium", "name": "GPT-5.6-Sol (medium)" },
                     { "modelId": "gpt-5.6-terra low", "name": "GPT-5.6-Terra (low)" },
+                    { "modelId": "gpt-5.6-terra medium", "name": "GPT-5.6-Terra (medium)" },
+                    { "modelId": "gpt-5.6-luna low", "name": "GPT-5.6-Luna (low)" },
                 ],
             },
             "configOptions": [
@@ -3689,10 +4015,10 @@ mod tests {
                     "name": "Model",
                     "category": "model",
                     "type": "select",
-                    "currentValue": "gpt-5.6-sol",
+                    "currentValue": "gpt-5.6-terra",
                     "options": [
-                        { "value": "gpt-5.6-sol", "name": "GPT-5.6-Sol", "description": "Frontier" },
-                        { "value": "gpt-5.6-terra", "name": "GPT-5.6-Terra" },
+                        { "value": "gpt-5.6-terra", "name": "GPT-5.6-Terra", "description": "Frontier" },
+                        { "value": "gpt-5.6-luna", "name": "GPT-5.6-Luna" },
                     ],
                 },
                 {
@@ -3724,11 +4050,11 @@ mod tests {
         // Two base models — never one row per effort variant.
         assert_eq!(
             models.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(),
-            vec!["gpt-5.6-sol", "gpt-5.6-terra"]
+            vec!["gpt-5.6-terra", "gpt-5.6-luna"]
         );
         // Catalog match keeps the curated per-model ladder; wire wins on
         // label/description.
-        assert_eq!(models[0].label, "GPT-5.6-Sol");
+        assert_eq!(models[0].label, "GPT-5.6-Terra");
         assert_eq!(models[0].description.as_deref(), Some("Frontier"));
         assert!(models[0].reasoning_levels.contains(&ReasoningLevel::Ultra));
         // Wire config options become traits; mode/model/thought_level do not.
@@ -3870,7 +4196,7 @@ mod tests {
             "sessionId": "s-1",
             "models": {
                 "availableModels": [
-                    { "modelId": "gpt-5.6-sol", "name": "GPT-5.6-Sol" },
+                    { "modelId": "gpt-5.6-terra", "name": "GPT-5.6-Terra" },
                     { "modelId": "gpt-x", "name": "GPT-X" },
                 ],
             },
@@ -3946,5 +4272,26 @@ mod tests {
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].name, "compact");
         assert!(scan_available_commands(&json!({ "protocolVersion": 1 })).is_empty());
+    }
+
+    #[test]
+    fn static_commands_cover_every_acp_agent() {
+        for id in [
+            HarnessId::Opencode,
+            HarnessId::Grok,
+            HarnessId::Hermes,
+            HarnessId::Pi,
+        ] {
+            let commands = static_commands(id);
+            assert!(!commands.is_empty(), "{id:?} missing native slash catalog");
+            assert!(
+                commands
+                    .iter()
+                    .any(|c| c.name == "compact" || c.name == "compress"),
+                "{id:?} should advertise compaction: {:?}",
+                commands.iter().map(|c| &c.name).collect::<Vec<_>>()
+            );
+        }
+        assert!(static_commands(HarnessId::Cursor).is_empty());
     }
 }

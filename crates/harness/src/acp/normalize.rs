@@ -8,7 +8,9 @@
 //! tagged `sessionUpdate`/snake_case; structs are camelCase; tool kinds and
 //! statuses are snake_case).
 
-use komet_proto::{AgentEvent, SlashCommand, TodoItem, ToolCall, ToolDiff};
+use komet_proto::{
+    AgentEvent, ContextUsageSource, ContextUsageStats, SlashCommand, TodoItem, ToolCall, ToolDiff,
+};
 use serde_json::Value;
 
 /// Byte cap applied to tool output text at the harness boundary. The doc-side
@@ -328,6 +330,84 @@ fn typed_call(update: &Value) -> ToolCall {
     }
 }
 
+fn u64_keys(v: &Value, keys: &[&str]) -> Option<u64> {
+    keys.iter().find_map(|k| v.get(*k).and_then(Value::as_u64))
+}
+
+/// Occupancy + window as computed by the agent itself.
+///
+/// Accepts ACP `usage_update` `{used,size}`, Grok `_x.ai/session/info`
+/// `{context:{used,total}}`, and a few nested aliases. Billed last-turn
+/// counters (`inputTokens` / `totalTokens`) are not occupancy — those
+/// ride [`billed_usage_event`].
+pub(crate) fn native_window(v: &Value) -> Option<(u64, u64)> {
+    let nested = v.get("context").or_else(|| {
+        v.get("usage").and_then(|usage| {
+            (usage.get("used").is_some() || usage.get("size").is_some()).then_some(usage)
+        })
+    });
+    let used = u64_keys(v, &["used", "tokensUsed", "tokens_used"])
+        .or_else(|| nested.and_then(|c| u64_keys(c, &["used", "tokens", "tokensUsed"])));
+    let size = u64_keys(
+        v,
+        &["size", "contextWindow", "context_window", "contextLimit"],
+    )
+    .or_else(|| {
+        nested.and_then(|c| u64_keys(c, &["total", "size", "max", "limit", "contextWindow"]))
+    });
+    match (used, size) {
+        (Some(used), Some(size)) if used > 0 || size > 0 => Some((used, size)),
+        (Some(used), None) if used > 0 => Some((used, 0)),
+        (None, Some(size)) if size > 0 => Some((0, size)),
+        _ => None,
+    }
+}
+
+pub(crate) fn native_context_event(v: &Value) -> Option<AgentEvent> {
+    let (used, size) = native_window(v)?;
+    Some(AgentEvent::ContextWindow {
+        stats: ContextUsageStats::window(
+            used,
+            size,
+            ContextUsageSource::Native,
+            used,
+            0,
+            0,
+            0,
+        ),
+    })
+}
+
+/// Grok `_x.ai/session/info` is double-wrapped (`{result:{context:…}}`)
+/// inside the JSON-RPC result; other agents return the object directly.
+pub(crate) fn session_info_window(resp: &Value) -> Option<AgentEvent> {
+    native_context_event(resp.get("result").unwrap_or(resp))
+        .or_else(|| native_context_event(resp))
+}
+
+pub(crate) fn billed_usage_event(usage: &Value) -> Option<AgentEvent> {
+    let input = u64_keys(usage, &["inputTokens", "input_tokens"]);
+    let output = u64_keys(usage, &["outputTokens", "output_tokens"]);
+    let cached = u64_keys(
+        usage,
+        &[
+            "cachedReadTokens",
+            "cached_input_tokens",
+            "cache_read_input_tokens",
+            "cacheReadInputTokens",
+        ],
+    )
+    .unwrap_or(0);
+    let reasoning = u64_keys(usage, &["reasoningTokens", "reasoning_tokens"]).unwrap_or(0);
+    (input.is_some() || output.is_some()).then(|| AgentEvent::Usage {
+        input_tokens: input.unwrap_or(0),
+        cached_input_tokens: cached,
+        output_tokens: output.unwrap_or(0),
+        reasoning_tokens: reasoning,
+        context_limit: None,
+    })
+}
+
 /// Map one `session/update` payload's `update` object to events.
 /// Message/thought chunks are handled here too (unlike codex, ACP has no
 /// separate delta channel).
@@ -412,12 +492,19 @@ pub(crate) fn map_update(update: &Value) -> Vec<AgentEvent> {
             let commands = parse_commands(update.get("availableCommands"));
             vec![AgentEvent::AvailableCommands { commands }]
         }
-        // Context-window gauge, not per-turn input/output tokens — komet's
-        // Usage event feeds rate-limit probes, so a wrong mapping is worse
-        // than none. Mode/config/session-info updates carry nothing we render.
-        "usage_update" | "current_mode_update" | "config_option_update" | "session_info_update" => {
-            Vec::new()
+        "usage_update" => native_context_event(update).into_iter().collect(),
+        // Grok's accurate occupancy lives here (`context.{used,total}`),
+        // not on billed `turn_completed.usage.inputTokens`.
+        "session_info_update" => native_context_event(update).into_iter().collect(),
+        "turn_completed" => {
+            let mut events: Vec<_> = native_context_event(update).into_iter().collect();
+            if let Some(usage) = billed_usage_event(update.get("usage").unwrap_or(update)) {
+                events.push(usage);
+            }
+            events
         }
+        // Mode/config updates carry nothing we render.
+        "current_mode_update" | "config_option_update" => Vec::new(),
         _ => Vec::new(),
     }
 }
@@ -678,6 +765,106 @@ mod tests {
                 ]
             }]
         );
+    }
+
+    #[test]
+    fn usage_update_maps_to_context_window() {
+        let events = map_update(&json!({
+            "sessionUpdate": "usage_update",
+            "used": 1200,
+            "size": 500000,
+        }));
+        match &events[..] {
+            [AgentEvent::ContextWindow { stats }] => {
+                assert_eq!(stats.used(), 1200);
+                assert_eq!(stats.context_limit, 500_000);
+                assert_eq!(stats.source, komet_proto::ContextUsageSource::Native);
+            }
+            other => panic!("expected ContextWindow, got {other:?}"),
+        }
+        assert!(map_update(&json!({"sessionUpdate": "current_mode_update"})).is_empty());
+    }
+
+    #[test]
+    fn grok_session_info_is_native_occupancy_not_billed_tokens() {
+        let events = map_update(&json!({
+            "sessionUpdate": "session_info_update",
+            "context": { "used": 42_000, "total": 131_072, "systemPromptTokens": 1_200 },
+        }));
+        match &events[..] {
+            [AgentEvent::ContextWindow { stats }] => {
+                assert_eq!(stats.used(), 42_000);
+                assert_eq!(stats.context_limit, 131_072);
+                assert_eq!(stats.source, komet_proto::ContextUsageSource::Native);
+            }
+            other => panic!("expected ContextWindow, got {other:?}"),
+        }
+
+        let wrapped = json!({
+            "result": { "turns": 3, "context": { "used": 18_000, "total": 131_072 } }
+        });
+        match session_info_window(&wrapped) {
+            Some(AgentEvent::ContextWindow { stats }) => {
+                assert_eq!(stats.used(), 18_000);
+                assert_eq!(stats.context_limit, 131_072);
+            }
+            other => panic!("expected session/info window, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn turn_completed_billed_usage_is_not_a_window() {
+        let events = map_update(&json!({
+            "sessionUpdate": "turn_completed",
+            "usage": {
+                "inputTokens": 3_000_000,
+                "outputTokens": 18_000,
+                "totalTokens": 3_018_000,
+                "cachedReadTokens": 5_376,
+            },
+        }));
+        match &events[..] {
+            [AgentEvent::Usage {
+                input_tokens: 3_000_000,
+                cached_input_tokens: 5_376,
+                output_tokens: 18_000,
+                ..
+            }] => {}
+            other => panic!("expected billed Usage only, got {other:?}"),
+        }
+
+        let with_context = map_update(&json!({
+            "sessionUpdate": "turn_completed",
+            "context": { "used": 24_000, "total": 131_072 },
+            "usage": { "inputTokens": 3_000_000, "outputTokens": 36 },
+        }));
+        assert!(with_context.iter().any(|e| matches!(
+            e,
+            AgentEvent::ContextWindow { stats }
+                if stats.used() == 24_000 && stats.context_limit == 131_072
+        )));
+        assert!(with_context.iter().any(|e| matches!(
+            e,
+            AgentEvent::Usage { input_tokens: 3_000_000, output_tokens: 36, .. }
+        )));
+    }
+
+    #[test]
+    fn usage_update_overshoot_is_capped_to_the_window() {
+        let events = map_update(&json!({
+            "sessionUpdate": "usage_update",
+            "used": 3_000_000,
+            "size": 128_000,
+        }));
+        match &events[..] {
+            [AgentEvent::ContextWindow { stats }] => {
+                assert_eq!(stats.used(), 128_000);
+                assert_eq!(stats.context_limit, 128_000);
+                assert_eq!(stats.input_tokens, 3_000_000);
+                assert_eq!(stats.source, komet_proto::ContextUsageSource::Native);
+            }
+            other => panic!("expected ContextWindow, got {other:?}"),
+        }
     }
 
     #[test]

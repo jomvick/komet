@@ -87,6 +87,34 @@ async fn run_to_first_done(
 }
 
 #[tokio::test]
+async fn workspace_write_is_forwarded_to_the_shim() {
+    let (controls, _steer, _token) = controls();
+    let mut req = request("scenario:sandbox");
+    req.sandbox = SandboxLevel::WorkspaceWrite;
+    let events = run_to_first_done(&harness(), req, controls).await;
+    assert!(
+        events.contains(&AgentEvent::TextDelta {
+            text: "sandbox ok".into()
+        }),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
+async fn read_only_is_forwarded_to_the_shim() {
+    let (controls, _steer, _token) = controls();
+    let mut req = request("scenario:sandbox-readonly");
+    req.sandbox = SandboxLevel::ReadOnly;
+    let events = run_to_first_done(&harness(), req, controls).await;
+    assert!(
+        events.contains(&AgentEvent::TextDelta {
+            text: "readonly ok".into()
+        }),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
 async fn happy_path_maps_shim_frames_and_tags_subagents() {
     let (controls, _steer, _token) = controls();
     let events = run_to_first_done(&harness(), request("scenario:happy"), controls).await;
@@ -158,8 +186,14 @@ async fn happy_path_maps_shim_frames_and_tags_subagents() {
         cached_input_tokens: 0,
         output_tokens: 5,
         reasoning_tokens: 0,
-        context_limit: None,
+        context_limit: Some(komet_proto::default_context_limit_for_model("")),
     }));
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::ContextWindow { stats }
+            if stats.source == komet_proto::ContextUsageSource::Approximate
+                && stats.input_tokens == 11
+    )));
     assert!(matches!(
         events.last(),
         Some(AgentEvent::Done {
@@ -324,4 +358,21 @@ async fn model_discovery_maps_the_live_catalog() {
     // A parameter without displayName labels by id; default = first value.
     assert_eq!(models[1].options[0].id, "fast");
     assert_eq!(models[1].options[0].default_choice, "false");
+}
+
+#[tokio::test]
+async fn commands_come_from_the_cursor_agent_catalog() {
+    let commands = harness().commands().await.expect("catalog");
+    assert!(
+        commands.len() >= 8,
+        "cursor-agent builtins present: {commands:?}"
+    );
+    assert!(commands.iter().any(|c| c.name == "summarize"));
+    assert!(commands.iter().any(|c| c.name == "plan"));
+    assert!(commands.iter().any(|c| c.name == "goal"));
+    assert!(commands.iter().any(|c| c.name == "clear"));
+    assert_eq!(
+        harness().commands().await.expect("no spawn on catalog"),
+        commands
+    );
 }

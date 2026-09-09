@@ -26,9 +26,15 @@ fn acp_session_params_merges_internal_and_external() {
     assert_eq!(params["env"], serde_json::json!([]));
     // internal komet server should be first, type http with Bearer
     assert_eq!(params["mcpServers"][0]["type"], "http");
+    assert_eq!(params["mcpServers"][0]["name"], "komet");
     assert_eq!(params["mcpServers"][0]["url"], "http://127.0.0.1/mcp");
+    assert_eq!(
+        params["mcpServers"][0]["headers"],
+        serde_json::json!([{ "name": "Authorization", "value": "Bearer t" }])
+    );
     // external http
     assert_eq!(params["mcpServers"][1]["type"], "http");
+    assert_eq!(params["mcpServers"][1]["name"], "gh");
     assert_eq!(params["mcpServers"][1]["url"], "https://mcp.github.com");
 }
 

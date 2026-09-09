@@ -4901,8 +4901,8 @@ impl Composer {
         let err_chat_id = chat_id.clone();
         let err_message_id = message_id.clone();
         let sandbox = self.state.read(cx).access_mode;
-        // Only populate sandbox_options for harnesses that support SandboxOptions.
-        // Unsupported harnesses: Cursor, Grok, Hermes, Pi, Antigravity.
+        // Access chip maps to SandboxOptions for Claude/Codex/OpenCode.
+        // Grok/Hermes/Pi/Cursor/Antigravity honor `sandbox` (SandboxLevel) natively.
         let harness_supports_sandbox = resolved.harness.as_ref().is_none_or(|h| {
             !matches!(
                 h,

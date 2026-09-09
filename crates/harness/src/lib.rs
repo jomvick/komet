@@ -116,12 +116,16 @@ pub trait Harness: Send + Sync {
         false
     }
     async fn models(&self) -> Result<Vec<Model>, HarnessError>;
-    /// Slash commands the agent advertises (ACP `availableCommands`); empty
-    /// for harnesses without them. May spawn a short-lived discovery process.
+    /// Slash commands the agent advertises. Native harnesses merge a curated
+    /// CLI catalog with a live probe when one exists (ACP
+    /// `availableCommands`, Claude `initialize` / skills, Codex
+    /// `skills/list`). Empty only for harnesses without a command surface.
     async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
         Ok(Vec::new())
     }
-    /// Structured context and token usage from the harness (Bucket C control request).
+    /// Out-of-session probe (Claude skill discovery via Bucket C
+    /// `get_context_usage`). The live footer ring reads
+    /// [`AgentEvent::ContextWindow`] from the running session, not this.
     async fn context_usage(&self) -> Result<ContextUsage, HarnessError> {
         Ok(ContextUsage::default())
     }

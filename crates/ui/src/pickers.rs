@@ -2322,7 +2322,7 @@ impl Pickers {
                 .flex()
                 .items_center()
                 .justify_center()
-                .px(px(4.0))
+                .px(px(6.0))
                 .py(px(2.0))
                 .rounded_lg()
                 .cursor_pointer()
@@ -2351,7 +2351,7 @@ impl Pickers {
                     );
                     Some((
                         PickerKind::ContextUsage,
-                        self.popover_frame_flush(320.0, content, cx),
+                        self.popover_frame(280.0, content, cx),
                     ))
                 } else {
                     None
@@ -2413,7 +2413,7 @@ impl Pickers {
                 );
                 Some((
                     PickerKind::ContextUsage,
-                    self.popover_frame_flush(320.0, content, cx),
+                    self.popover_frame(280.0, content, cx),
                 ))
             }
             // Space/Device popovers mount on the canvas selectors
@@ -2450,7 +2450,7 @@ impl Pickers {
             .flex()
             .items_center()
             .justify_center()
-            .px(px(4.0))
+            .px(px(6.0))
             .py(px(2.0))
             .rounded_lg()
             .cursor_pointer()

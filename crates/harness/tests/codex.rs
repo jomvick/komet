@@ -280,6 +280,11 @@ async fn happy_path_maps_deltas_items_usage_and_done() {
         .position(|e| matches!(e, AgentEvent::Done { .. }))
         .expect("done emitted");
     assert!(usage_pos < done_pos);
+    assert!(events.iter().any(|e| matches!(
+        e,
+        AgentEvent::ContextWindow { stats }
+            if stats.used() == 49 && stats.context_limit == 128_000
+    )));
     assert_eq!(
         events.last(),
         Some(&AgentEvent::Done {
@@ -602,7 +607,39 @@ async fn missing_binary_is_not_installed() {
 
 #[tokio::test]
 async fn models_returns_curated_catalog() {
+    // models() prefers the live `models_cache.json` under CODEX_HOME over the
+    // curated static catalog; pin a hermetic home so the assertions do not
+    // depend on the developer machine's cache shape. No other test in this
+    // binary reads CODEX_HOME (the fake server ignores the environment), so
+    // the process-global set here cannot skew them.
+    let home = tempfile::tempdir().expect("tempdir");
+    std::fs::write(
+        home.path().join("models_cache.json"),
+        r#"{
+            "models": [
+                { "slug": "gpt-5.6-sol", "display_name": "GPT-5.6-Sol", "description": "Frontier",
+                  "supported_reasoning_levels": [{ "effort": "low" }, { "effort": "ultra" }] },
+                { "slug": "gpt-5.6-terra", "display_name": "GPT-5.6-Terra", "description": "Balanced",
+                  "supported_reasoning_levels": [{ "effort": "low" }, { "effort": "ultra" }] },
+                { "slug": "gpt-5.6-luna", "display_name": "GPT-5.6-Luna", "description": "Fast",
+                  "supported_reasoning_levels": [{ "effort": "low" }, { "effort": "max" }] },
+                { "slug": "gpt-5.5", "display_name": "GPT-5.5", "description": "Frontier",
+                  "supported_reasoning_levels": [{ "effort": "high" }] },
+                { "slug": "gpt-5.4-mini", "display_name": "GPT-5.4-Mini", "description": "Small",
+                  "supported_reasoning_levels": [{ "effort": "high" }] },
+                { "slug": "gpt-5.3-xhigh", "display_name": "GPT-5.3-XHigh", "description": "Legacy",
+                  "supported_reasoning_levels": [{ "effort": "xhigh" }] },
+                { "slug": "codex-auto-review", "display_name": "Codex Auto Review", "description": "Reviews",
+                  "supported_reasoning_levels": [{ "effort": "max" }] }
+            ]
+        }"#,
+    )
+    .expect("write models cache");
+    // SAFETY: single-threaded setup for this test; nothing else in the binary
+    // consults CODEX_HOME while it is pinned.
+    unsafe { std::env::set_var("CODEX_HOME", home.path()) };
     let models = harness().models().await.expect("models");
+    unsafe { std::env::remove_var("CODEX_HOME") };
     assert_eq!(models.len(), 7);
     assert_eq!(models[0].id, "gpt-5.6-sol");
     assert!(models[0].reasoning_levels.contains(&ReasoningLevel::Ultra));

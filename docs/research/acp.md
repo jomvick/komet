@@ -81,8 +81,9 @@
   text and inline diffs** (16KB/64KB harness caps; 4KB/16KB doc caps in
   `parts.rs` — the session-load-size discipline); `plan` → `ToolCall::Todo`
   (stable id `acp-plan`); `available_commands_update` →
-  `AgentEvent::AvailableCommands`. `usage_update` is a context gauge, not
-  per-turn tokens — deliberately unmapped.
+  `AgentEvent::AvailableCommands`. `usage_update` is a context-window snapshot
+  (`used`/`size`) → `AgentEvent::ContextWindow`; it is not mapped to per-turn
+  `Usage`.
 - `session/request_permission` → auto-accept the preferred allow option
   (`allow_always` > `allow_once` > first) — parity with claude
   bypassPermissions / codex approvalPolicy never. Question-shaped means

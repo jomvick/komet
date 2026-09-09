@@ -11,7 +11,7 @@
 //
 // Protocol: JSONL, one frame per line.
 //   stdin  (engine → shim):
-//     {"op":"run","prompt","cwd","model"?,"modelOptions"?,"resume"?}   start / first turn
+//     {"op":"run","prompt","cwd","model"?,"modelOptions"?,"resume"?,"sandbox"?}   start / first turn
 //     {"op":"user","prompt"}                            next turn (parked)
 //     {"op":"interrupt"}                                cancel the live run
 //   stdout (shim → engine):
@@ -300,34 +300,59 @@ async function start(msg) {
     local.store = fresh.store;
     runDir = fresh.dir;
   }
+  const sandbox = msg.sandbox;
   const options = {
     model,
-    // askQuestion has no public answer channel in this SDK (SDKRequestMessage
-    // carries only a request id) — a question would block the run forever.
-    // generateImage has nowhere to land in a komet session (ACP parity).
     disallowedTools: ["askQuestion", "generateImage"],
     local,
   };
+  // Access chip → Cursor SDK: plan mode is read-only (no edits), sandbox
+  // enabled contains workspace-write, full access leaves both off.
+  // `autoReview` is classifier auto-approve — never use it for Read only.
+  if (sandbox === "read-only") {
+    local.sandboxOptions = { enabled: true };
+    options.mode = "plan";
+  } else if (sandbox === "workspace-write") {
+    local.sandboxOptions = { enabled: true };
+  }
   try {
     agent = msg.resume
       ? await Agent.resume(msg.resume, options)
       : await Agent.create(options);
   } catch (e) {
-    // Auth is the common cause: the SDK's credentials are SEPARATE from
-    // `cursor-agent login` (verified) — name the fix precisely.
-    const auth = await Cursor.auth.status().catch(() => null);
-    if (!process.env.CURSOR_API_KEY && auth?.status !== "logged-in") {
-      fatal(
-        "Cursor is not connected (its login is separate from " +
-          "`cursor-agent login`): connect it in Settings → Accounts, or set " +
-          `CURSOR_API_KEY from cursor.com/settings, then retry. (${e?.message ?? e})`,
-      );
+    const missingSandbox =
+      local.sandboxOptions?.enabled &&
+      /sandbox|bubblewrap|ConfigurationError/i.test(String(e?.message ?? e));
+    if (missingSandbox) {
+      delete local.sandboxOptions;
+      try {
+        agent = msg.resume
+          ? await Agent.resume(msg.resume, options)
+          : await Agent.create(options);
+      } catch (inner) {
+        await failStart(inner);
+        return;
+      }
+    } else {
+      await failStart(e);
+      return;
     }
-    fatal(`cursor agent failed to start: ${e?.message ?? e}`);
   }
   if (runDir) rememberAgentDir(agent.agentId, runDir);
   out({ ev: "ready", agentId: agent.agentId, model: agent.model?.id ?? model.id });
   await runTurn(msg.prompt ?? "");
+}
+
+async function failStart(e) {
+  const auth = await Cursor.auth.status().catch(() => null);
+  if (!process.env.CURSOR_API_KEY && auth?.status !== "logged-in") {
+    fatal(
+      "Cursor is not connected (its login is separate from " +
+        "`cursor-agent login`): connect it in Settings → Accounts, or set " +
+        `CURSOR_API_KEY from cursor.com/settings, then retry. (${e?.message ?? e})`,
+    );
+  }
+  fatal(`cursor agent failed to start: ${e?.message ?? e}`);
 }
 
 const rl = readline.createInterface({ input: process.stdin });

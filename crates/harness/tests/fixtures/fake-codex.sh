@@ -111,7 +111,7 @@ case "$turnline" in
   emit '{"method":"item/completed","params":{"item":{"id":"m2","type":"agentMessage","text":"unstreamed tail"}}}'
   # Unknown notification methods must be tolerated.
   emit '{"method":"some/unknownNotification","params":{"x":1}}'
-  emit '{"method":"thread/tokenUsage/updated","params":{"tokenUsage":{"last":{"inputTokens":42,"outputTokens":7}}}}'
+  emit '{"method":"thread/tokenUsage/updated","params":{"tokenUsage":{"total":{"totalTokens":49,"inputTokens":42,"outputTokens":7},"last":{"inputTokens":42,"outputTokens":7},"modelContextWindow":128000}}}'
   emit '{"method":"turn/completed","params":{"turn":{"id":"t-1"}}}'
   ;;
 

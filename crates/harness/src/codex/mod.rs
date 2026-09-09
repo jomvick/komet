@@ -13,7 +13,7 @@
 //!   `sandboxPolicy`, and approval policy.
 //! - Notifications map to [`AgentEvent`]s: agentMessage/reasoning deltas (both
 //!   `delta`/`textDelta` spellings), item lifecycles → typed ToolCall/ToolResult,
-//!   `thread/tokenUsage/updated` → Usage, turn/completed|failed|aborted → Done.
+//!   `thread/tokenUsage/updated` → Usage + ContextWindow, turn/completed|failed|aborted → Done.
 //! - Approvals + sandbox: legacy runs (no `sandbox_options`) are yolo mode:
 //!   the wire policy is `"never"` and the sandbox is forced to
 //!   `danger-full-access` — parity with the Claude adapter. An explicit
@@ -63,8 +63,9 @@ use crate::jsonrpc::{Incoming, RpcClient};
 use crate::{Harness, HarnessError, RunControls};
 use catalog::{REASONING_LEVELS, static_models, to_effort};
 use normalize::{
-    ChildRoute, Phase, delta_text, item_id, item_type, map_item, notification_thread_id,
-    route_child_notification, turn_error_message, turn_id, usage_event, user_message_text,
+    ChildRoute, Phase, compacted_event, delta_text, item_id, item_type, map_item,
+    notification_thread_id, route_child_notification, turn_error_message, turn_id, usage_events,
+    user_message_text,
 };
 
 /// Locate the device's installed Codex CLI: `CODEX_EXECUTABLE`, then our own
@@ -739,7 +740,7 @@ async fn run_session(session: Session) {
     // (item/completed only) still emits its text exactly once.
     let mut streamed_text: HashSet<String> = HashSet::new();
     // Token usage is held until the turn ends, emitted just before Done.
-    let mut pending_usage: Option<AgentEvent> = None;
+    let mut pending_usage: Vec<AgentEvent> = Vec::new();
     // Steers whose `turn/steer` lost the turn-completed race; delivered as the
     // next `turn/start` when the expected turn's end notification arrives.
     let mut queued_steers: VecDeque<String> = VecDeque::new();
@@ -1022,8 +1023,12 @@ async fn run_session(session: Session) {
                             }
 
                             "thread/tokenUsage/updated" => {
-                                if let Some(usage) = usage_event(&params) {
-                                    pending_usage = Some(usage);
+                                pending_usage = usage_events(&params);
+                            }
+
+                            "thread/compacted" => {
+                                if !send(&event_tx, compacted_event()).await {
+                                    break 'main;
                                 }
                             }
 
@@ -1033,10 +1038,10 @@ async fn run_session(session: Session) {
                                 // Item ids never span turns; without this the set grew
                                 // one entry per message for a persistent session's life.
                                 streamed_text.clear();
-                                if let Some(usage) = pending_usage.take()
-                                    && !send(&event_tx, usage).await
-                                {
-                                    break 'main;
+                                for usage in pending_usage.drain(..) {
+                                    if !send(&event_tx, usage).await {
+                                        break 'main;
+                                    }
                                 }
                                 let error = turn_error_message(&params).or_else(|| {
                                     (params
@@ -1094,10 +1099,10 @@ async fn run_session(session: Session) {
 
                             "turn/failed" => {
                                 router.note_completed(&turn_id(&params));
-                                if let Some(usage) = pending_usage.take()
-                                    && !send(&event_tx, usage).await
-                                {
-                                    break 'main;
+                                for usage in pending_usage.drain(..) {
+                                    if !send(&event_tx, usage).await {
+                                        break 'main;
+                                    }
                                 }
                                 done_current = true;
                                 if interrupted {

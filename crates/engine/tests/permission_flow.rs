@@ -12,8 +12,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures::stream::BoxStream;
 use futures::StreamExt;
+use futures::stream::BoxStream;
 
 use komet_doc::{MessagePart, MessageStatus, SessionMessageEntry};
 use komet_engine::{EngineCore, HarnessRegistry};
@@ -41,7 +41,8 @@ fn run_request(prompt: &str) -> RunRequest {
         worktree: None,
         resume: None,
         permission_timeout_ms: None,
-        mcp: None, mcp_external: Vec::new(),
+        mcp: None,
+        mcp_external: Vec::new(),
     }
 }
 
@@ -334,9 +335,11 @@ async fn permission_timeout_auto_denies_and_resolves() {
             ))),
         "the agent must not continue after a timeout auto-deny"
     );
-    let delivered = core
-        .sessions
-        .respond_permission(CHAT, request_id.as_ref().unwrap(), PermissionChoice::Allow);
+    let delivered = core.sessions.respond_permission(
+        CHAT,
+        request_id.as_ref().unwrap(),
+        PermissionChoice::Allow,
+    );
     assert!(
         !delivered.expect("respond_permission call"),
         "an auto-denied request must not be re-resolvable (already settled)"
