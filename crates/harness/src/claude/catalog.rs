@@ -203,10 +203,16 @@ pub(crate) fn supports_xhigh(model: &str) -> bool {
 /// model. The special modes don't translate directly: `ultrathink` is a prompt
 /// prefix (no flag), `ultracode` runs as `xhigh` plus the ultracode setting,
 /// and `ultra` is a Codex-only tier (Claude tops out at `max`).
+///
+/// Haiku (and any catalog model with an empty ladder) rejects `--effort`;
+/// thinking is the `thinking` toggle, not an effort flag.
 pub(crate) fn to_effort(
     reasoning: Option<ReasoningLevel>,
     model: Option<&str>,
 ) -> Option<&'static str> {
+    if model.is_some_and(rejects_effort) {
+        return None;
+    }
     let base = match reasoning? {
         ReasoningLevel::Ultrathink => return None,
         ReasoningLevel::Minimal | ReasoningLevel::Low => "low",
@@ -219,6 +225,14 @@ pub(crate) fn to_effort(
         return Some("max");
     }
     Some(base)
+}
+
+/// Haiku has no `--effort` ladder — hybrid thinking is the `thinking` toggle.
+fn rejects_effort(model: &str) -> bool {
+    model.contains("haiku")
+        || static_models()
+            .iter()
+            .any(|m| m.id == model && m.reasoning_levels.is_empty())
 }
 
 /// A boolean toggle rendered as an off/on select (the Rust `ModelOption` wire
@@ -382,6 +396,12 @@ mod tests {
             Some("max")
         );
         assert_eq!(to_effort(Some(ReasoningLevel::XHigh), None), Some("max"));
+        // Haiku: leftover picker values must not become --effort.
+        assert_eq!(
+            to_effort(Some(ReasoningLevel::High), Some("claude-haiku-4-5")),
+            None
+        );
+        assert_eq!(to_effort(Some(ReasoningLevel::Medium), Some("haiku")), None);
     }
 
     #[test]

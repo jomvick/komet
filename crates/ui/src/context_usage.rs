@@ -221,7 +221,7 @@ pub fn render_context_ring(
         move |_bounds, _window, _cx| (),
         move |bounds, _, window, cx| {
             let theme = Theme::of(cx);
-            let fill = usage_fill(ratio, &theme);
+            let fill = usage_fill(ratio, theme);
             let center_x = f32::from(bounds.origin.x) + f32::from(bounds.size.width) / 2.0;
             let center_y = f32::from(bounds.origin.y) + f32::from(bounds.size.height) / 2.0;
             let radius = (f32::from(bounds.size.width).min(f32::from(bounds.size.height)) / 2.0)

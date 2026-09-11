@@ -1087,10 +1087,6 @@ mod tests {
         assert_eq!(match_rank("", "anything"), Some(1));
     }
 
-
-
-
-
     #[test]
     fn key_classification() {
         assert_eq!(classify_key("up", false, false), MenuKey::Up);

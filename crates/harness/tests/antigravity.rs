@@ -8,7 +8,9 @@ use futures::StreamExt;
 use tokio::sync::{mpsc, oneshot};
 
 use komet_harness::{AntigravityHarness, CancellationToken, Harness, RunControls, SteerMessage};
-use komet_proto::{AgentEvent, DoneStatus, HarnessId, RunRequest, SandboxLevel, ToolCall};
+use komet_proto::{
+    AgentEvent, DoneStatus, HarnessId, ReasoningLevel, RunRequest, SandboxLevel, ToolCall,
+};
 
 fn fixture_path() -> PathBuf {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -328,4 +330,50 @@ async fn commands_come_from_the_antigravity_catalog() {
     assert!(commands.iter().any(|c| c.name == "goal"));
     assert!(commands.iter().any(|c| c.name == "schedule"));
     assert!(commands.iter().any(|c| c.name == "learn"));
+}
+
+#[tokio::test]
+async fn claude_does_not_forward_unsupported_effort() {
+    let h = harness();
+    let (ctrls, _steer, _tok) = controls();
+    let mut req = request("scenario:happy");
+    req.model = Some("claude-sonnet-4-6".into());
+    req.reasoning = Some(ReasoningLevel::Medium);
+    let events = collect_events(&h, req, ctrls).await;
+    let ok = events.iter().any(|e| {
+        matches!(
+            e,
+            AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            }
+        )
+    });
+    assert!(
+        ok,
+        "claude-sonnet-4-6 must not receive --effort: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn suffixed_gemini_does_not_forward_conflicting_effort() {
+    let h = harness();
+    let (ctrls, _steer, _tok) = controls();
+    let mut req = request("scenario:happy");
+    req.model = Some("gemini-3.7-flash-high".into());
+    req.reasoning = Some(ReasoningLevel::Medium);
+    let events = collect_events(&h, req, ctrls).await;
+    let ok = events.iter().any(|e| {
+        matches!(
+            e,
+            AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            }
+        )
+    });
+    assert!(
+        ok,
+        "gemini-3.8-flash-high must not receive --effort medium: {events:?}"
+    );
 }

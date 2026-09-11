@@ -65,6 +65,10 @@ const CLAUDE_TOKEN_URL: &str = "https://console.anthropic.com/v1/oauth/token";
 const CLAUDE_PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
 const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+// Codex CLI's public ChatGPT OAuth client (no secret; PKCE on login, refresh
+// is client_id + refresh_token). Same id the CLI posts to auth.openai.com.
+const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+const CODEX_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 // Antigravity's keyring blob carries NO identity (Task 0 discovery) — only
 // OAuth tokens. Resolve the real email via Google's own userinfo endpoint,
 // the same trick Claude's flow uses against CLAUDE_PROFILE_URL.
@@ -1914,14 +1918,30 @@ impl AgentAccounts {
     async fn codex_usage(&self, slot: &Slot, is_active: bool) -> Option<Vec<AgentUsageWindow>> {
         // Candidates: slot token first, then — for the active account — the
         // live ~/.codex/auth.json (the CLI refreshes it on every launch, the
-        // slot copy goes stale). First candidate that yields rate windows
-        // wins, so the Accounts page quota bar (used/left + reset) renders
+        // slot copy goes stale). Inactive slots have no live file: their
+        // access token expires like Claude's, so we refresh it the same way
+        // (never the active pair — the CLI owns that). First candidate that
+        // yields rate windows wins, so every card's quota bar renders
         // instead of "Usage unavailable".
+        let tokens = slot.credentials.get("tokens");
+        let account_id = tokens
+            .map(|t| codex_account_id(t, slot))
+            .unwrap_or_default();
+        let mut slot_access = tokens.and_then(|t| str_field(t, "access_token"));
+        let mut did_refresh = false;
+        if !is_active {
+            let expired = slot_access
+                .as_deref()
+                .is_none_or(codex_access_token_expired);
+            if expired && let Some(refreshed) = self.refresh_codex_slot(slot).await {
+                slot_access = Some(refreshed);
+                did_refresh = true;
+            }
+        }
+
         let mut candidates: Vec<(String, String)> = Vec::new();
-        if let Some(tokens) = slot.credentials.get("tokens")
-            && let Some(access) = str_field(tokens, "access_token")
-        {
-            candidates.push((access, str_field(tokens, "account_id").unwrap_or_default()));
+        if let Some(access) = slot_access {
+            candidates.push((access, account_id.clone()));
         }
         if is_active {
             let live = std::fs::read_to_string(self.inner.config.codex_home.join("auth.json"))
@@ -1931,46 +1951,50 @@ impl AgentAccounts {
                 && let Some(access) = str_field(tokens, "access_token")
                 && !candidates.iter().any(|(t, _)| t == &access)
             {
-                candidates.push((access, str_field(tokens, "account_id").unwrap_or_default()));
+                candidates.push((access, codex_account_id(tokens, slot)));
             }
         }
-        for (access_token, account_id) in candidates {
-            let body: serde_json::Value = self
-                .inner
-                .http
-                .get(CODEX_USAGE_URL)
-                .bearer_auth(&access_token)
-                .header("chatgpt-account-id", &account_id)
-                .send()
-                .await
-                .ok()?
-                .error_for_status()
-                .ok()?
-                .json()
-                .await
-                .ok()?;
-            let rl = body.get("rate_limit")?;
-            let mut windows = Vec::new();
-            for key in ["primary_window", "secondary_window"] {
-                if let Some(w) = rl.get(key)
-                    && let Some(used) = w.get("used_percent").and_then(|v| v.as_f64())
-                {
-                    let span = w
-                        .get("limit_window_seconds")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0);
-                    windows.push(AgentUsageWindow {
-                        label: if span > 86_400 { "Week" } else { "Session" }.to_string(),
-                        used_fraction: (used / 100.0) as f32,
-                        resets_at: parse_when(w.get("reset_at")),
-                    });
-                }
-            }
-            if !windows.is_empty() {
+        for (access_token, account_id) in &candidates {
+            if let Some(windows) = self.query_codex_usage(access_token, account_id).await {
                 return Some(windows);
             }
         }
+        // Token looked valid (or had no `exp`) but the probe still 401'd.
+        // Refresh once — never for the active login, never twice (refresh
+        // tokens are commonly single-use).
+        if !is_active
+            && !did_refresh
+            && let Some(refreshed) = self.refresh_codex_slot(slot).await
+        {
+            return self.query_codex_usage(&refreshed, &account_id).await;
+        }
         None
+    }
+
+    async fn query_codex_usage(
+        &self,
+        access_token: &str,
+        account_id: &str,
+    ) -> Option<Vec<AgentUsageWindow>> {
+        let mut req = self
+            .inner
+            .http
+            .get(CODEX_USAGE_URL)
+            .bearer_auth(access_token);
+        if !account_id.is_empty() {
+            req = req.header("chatgpt-account-id", account_id);
+        }
+        let body: serde_json::Value = req
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        let windows = parse_codex_usage_response(&body);
+        (!windows.is_empty()).then_some(windows)
     }
 
     async fn antigravity_usage(
@@ -1978,7 +2002,13 @@ impl AgentAccounts {
         slot: &Slot,
         is_active: bool,
     ) -> Option<Vec<AgentUsageWindow>> {
-        // 1. If this slot is the active one, check local language_server Connect-RPC first
+        const ENDPOINT: &str =
+            "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary";
+
+        // Active login: language_server first, then the live keyring token.
+        // NEVER refresh via the slot file alone for the active account — Google
+        // often rotates refresh tokens, and writing only the slot leaves the
+        // keyring with a dead token so the next `agy` run opens a login page.
         if is_active {
             if let Some((port, token)) =
                 discover_language_server(&self.inner.config.antigravity_home)
@@ -2004,115 +2034,110 @@ impl AgentAccounts {
                     }
                 }
             }
+
+            let (Some(raw), _) = self.read_antigravity_keyring().await else {
+                return None;
+            };
+            if let Some(live) = antigravity_access_token(&raw)
+                && let Some(windows) = self.query_antigravity_pa(ENDPOINT, &live).await
+            {
+                return Some(windows);
+            }
+            // Access expired/401: refresh in place and write BOTH keyring + slot
+            // so `agy` keeps a valid refresh token.
+            let token = self.refresh_antigravity_live(slot, &raw).await?;
+            return self.query_antigravity_pa(ENDPOINT, &token).await;
         }
 
-        // 2. Cloud Code PA endpoint with OAuth token. For the active slot the
-        // saved file copy is often stale (rotated on every agy launch) while
-        // the keyring holds the live token — try the live keyring first so
-        // the Accounts page quota bar (consumed/remaining + reset) renders
-        // instead of "Usage unavailable".
-        const ENDPOINT: &str =
-            "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary";
+        // Inactive slots: file copy only — refresh the slot when expired/401.
+        let raw = slot.credentials.as_object().map(|_| &slot.credentials)?;
+        let mut access_token = antigravity_access_token(raw)?;
+        let mut did_refresh = false;
 
-        async fn query_pa(
-            http: &reqwest::Client,
-            endpoint: &str,
-            token: &str,
-        ) -> Option<Vec<AgentUsageWindow>> {
-            let resp = http
-                .post(endpoint)
-                .bearer_auth(token)
-                .header("Content-Type", "application/json")
-                .header("User-Agent", "Antigravity/1.0")
-                .header("x-goog-api-client", "gl-go/1.22 gdcl/0.0.0")
-                .json(&serde_json::json!({
-                    "project": "aicode-consumers"
-                }))
-                .send()
-                .await
-                .ok()?;
-            let resp = resp.error_for_status().ok()?;
-            let body = resp.json::<serde_json::Value>().await.ok()?;
-            let windows = parse_antigravity_quota_response(&body);
-            (!windows.is_empty()).then_some(windows)
+        if antigravity_access_expired(raw)
+            && let Some(refreshed) = self.refresh_antigravity_slot(slot).await
+        {
+            access_token = refreshed;
+            did_refresh = true;
         }
 
-        if is_active
-            && let (Some(raw), _) = self.read_antigravity_keyring().await
-            && let Some(live) = antigravity_access_token(&raw)
-            && let Some(windows) = query_pa(&self.inner.http, ENDPOINT, &live).await
+        if let Some(windows) = self
+            .query_antigravity_pa(ENDPOINT, &access_token)
+            .await
         {
             return Some(windows);
         }
-
-        let raw = slot.credentials.as_object().map(|_| &slot.credentials)?;
-        let mut access_token = antigravity_access_token(raw)?;
-
-        // Check if token is expired (by expiry field)
-        let token_view = if let Some(inner) = raw.get("token").filter(|t| t.is_object()) {
-            inner
-        } else if let Some(inner) = raw.get("tokens").filter(|t| t.is_object()) {
-            inner
-        } else {
-            raw
-        };
-        let is_expired = str_field(token_view, "expiry")
-            .and_then(|exp| chrono::DateTime::parse_from_rfc3339(&exp).ok())
-            .map(|exp| {
-                exp.with_timezone(&chrono::Utc) < chrono::Utc::now() + chrono::Duration::seconds(30)
-            })
-            .unwrap_or(false);
-
-        if is_expired {
-            if let Some(refreshed) = self.refresh_antigravity_slot(slot).await {
-                access_token = refreshed;
-            }
+        if !did_refresh
+            && let Some(new_token) = self.refresh_antigravity_slot(slot).await
+        {
+            return self.query_antigravity_pa(ENDPOINT, &new_token).await;
         }
-
-        let send_pa = |token: &str| {
-            self.inner
-                .http
-                .post(ENDPOINT)
-                .bearer_auth(token)
-                .header("Content-Type", "application/json")
-                .header("User-Agent", "Antigravity/1.0")
-                .header("x-goog-api-client", "gl-go/1.22 gdcl/0.0.0")
-                .json(&serde_json::json!({
-                    "project": "aicode-consumers"
-                }))
-                .send()
-        };
-
-        match send_pa(&access_token).await {
-            Ok(resp) if resp.status() == reqwest::StatusCode::UNAUTHORIZED => {
-                // Try refreshing token and retry once
-                if let Some(new_token) = self.refresh_antigravity_slot(slot).await {
-                    if let Ok(retry_resp) = send_pa(&new_token).await
-                        && let Ok(retry_resp) = retry_resp.error_for_status()
-                        && let Ok(body) = retry_resp.json::<serde_json::Value>().await
-                    {
-                        let windows = parse_antigravity_quota_response(&body);
-                        if !windows.is_empty() {
-                            return Some(windows);
-                        }
-                    }
-                }
-            }
-            Ok(resp) if resp.status().is_success() => {
-                if let Ok(body) = resp.json::<serde_json::Value>().await {
-                    let windows = parse_antigravity_quota_response(&body);
-                    if !windows.is_empty() {
-                        return Some(windows);
-                    }
-                }
-            }
-            _ => {}
-        }
-
         None
     }
 
-    /// Refresh a saved Antigravity slot's expired access token so its usage stays queryable.
+    async fn query_antigravity_pa(
+        &self,
+        endpoint: &str,
+        token: &str,
+    ) -> Option<Vec<AgentUsageWindow>> {
+        let resp = self
+            .inner
+            .http
+            .post(endpoint)
+            .bearer_auth(token)
+            .header("Content-Type", "application/json")
+            .header("User-Agent", "Antigravity/1.0")
+            .header("x-goog-api-client", "gl-go/1.22 gdcl/0.0.0")
+            .json(&serde_json::json!({
+                "project": "aicode-consumers"
+            }))
+            .send()
+            .await
+            .ok()?;
+        let resp = resp.error_for_status().ok()?;
+        let body = resp.json::<serde_json::Value>().await.ok()?;
+        let windows = parse_antigravity_quota_response(&body);
+        (!windows.is_empty()).then_some(windows)
+    }
+
+    /// Refresh the live Antigravity keyring secret (active login only) and
+    /// mirror the new tokens into the matching slot. Single-flight per slot.
+    async fn refresh_antigravity_live(
+        &self,
+        slot: &Slot,
+        keyring: &serde_json::Value,
+    ) -> Option<String> {
+        if !lock(&self.inner.inflight_refreshes).insert(slot.id.clone()) {
+            return None;
+        }
+        let result = self.refresh_antigravity_live_once(slot, keyring).await;
+        lock(&self.inner.inflight_refreshes).remove(&slot.id);
+        result
+    }
+
+    async fn refresh_antigravity_live_once(
+        &self,
+        slot: &Slot,
+        keyring: &serde_json::Value,
+    ) -> Option<String> {
+        let (access_token, credentials) = exchange_antigravity_refresh(self, keyring).await?;
+        let mut updated = slot.clone();
+        updated.credentials = credentials;
+        updated.saved_at = now_ms();
+        if let Err(err) = self.activate_antigravity(&updated).await {
+            tracing::warn!(slot = %slot.id, error = %err, "refreshed antigravity keyring write failed");
+            return None;
+        }
+        if let Err(err) = self.write_slot(&updated) {
+            tracing::warn!(slot = %slot.id, error = %err, "refreshed antigravity slot write failed");
+        }
+        Some(access_token)
+    }
+
+    /// Refresh a saved (inactive) Antigravity slot's expired access token so
+    /// its usage stays queryable. NEVER called for the active login — that
+    /// path goes through [`Self::refresh_antigravity_live`] so the keyring
+    /// stays in sync (otherwise `agy` opens a Google login page).
     async fn refresh_antigravity_slot(&self, slot: &Slot) -> Option<String> {
         if !lock(&self.inner.inflight_refreshes).insert(slot.id.clone()) {
             return None;
@@ -2124,21 +2149,21 @@ impl AgentAccounts {
 
     async fn refresh_antigravity_slot_once(&self, slot: &Slot) -> Option<String> {
         let raw = slot.credentials.as_object().map(|_| &slot.credentials)?;
-        let view = if str_field(raw, "refresh_token").is_some()
-            || str_field(raw, "refreshToken").is_some()
-        {
-            raw.clone()
-        } else if let Some(inner) = raw.get("token").filter(|t| t.is_object()) {
-            inner.clone()
-        } else if let Some(inner) = raw.get("tokens").filter(|t| t.is_object()) {
-            inner.clone()
-        } else {
-            raw.clone()
-        };
-        let refresh_token =
-            str_field(&view, "refresh_token").or_else(|| str_field(&view, "refreshToken"))?;
-        let body: serde_json::Value = self
-            .inner
+        let (access_token, credentials) = exchange_antigravity_refresh(self, raw).await?;
+        let mut updated_slot = slot.clone();
+        updated_slot.credentials = credentials;
+        updated_slot.saved_at = now_ms();
+        if let Err(err) = self.write_slot(&updated_slot) {
+            tracing::warn!(slot = %slot.id, error = %err, "refreshed antigravity slot write failed");
+        }
+        Some(access_token)
+    }
+
+    async fn exchange_google_refresh(
+        &self,
+        refresh_token: &str,
+    ) -> Option<serde_json::Value> {
+        self.inner
             .http
             .post(GOOGLE_TOKEN_URL)
             .json(&serde_json::json!({
@@ -2154,40 +2179,7 @@ impl AgentAccounts {
             .ok()?
             .json()
             .await
-            .ok()?;
-        let access_token = str_field(&body, "access_token")?;
-        let expires_in = body
-            .get("expires_in")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(3600);
-        let mut updated_slot = slot.clone();
-        if let Some(map) = updated_slot.credentials.as_object_mut() {
-            let expiry = (chrono::Utc::now() + chrono::Duration::seconds(expires_in)).to_rfc3339();
-            if let Some(inner) = map.get_mut("token").and_then(|t| t.as_object_mut()) {
-                inner.insert("access_token".into(), serde_json::json!(access_token));
-                inner.insert("expiry".into(), serde_json::json!(expiry));
-                if let Some(new_rt) = str_field(&body, "refresh_token") {
-                    inner.insert("refresh_token".into(), serde_json::json!(new_rt));
-                }
-            } else if let Some(inner) = map.get_mut("tokens").and_then(|t| t.as_object_mut()) {
-                inner.insert("access_token".into(), serde_json::json!(access_token));
-                inner.insert("expiry".into(), serde_json::json!(expiry));
-                if let Some(new_rt) = str_field(&body, "refresh_token") {
-                    inner.insert("refresh_token".into(), serde_json::json!(new_rt));
-                }
-            } else {
-                map.insert("access_token".into(), serde_json::json!(access_token));
-                map.insert("expiry".into(), serde_json::json!(expiry));
-                if let Some(new_rt) = str_field(&body, "refresh_token") {
-                    map.insert("refresh_token".into(), serde_json::json!(new_rt));
-                }
-            }
-        }
-        updated_slot.saved_at = now_ms();
-        if let Err(err) = self.write_slot(&updated_slot) {
-            tracing::warn!(slot = %slot.id, error = %err, "refreshed antigravity slot write failed");
-        }
-        Some(access_token)
+            .ok()
     }
 
     /// Refresh a saved Claude slot's expired access token so its usage stays
@@ -2245,6 +2237,77 @@ impl AgentAccounts {
         refreshed.saved_at = now_ms();
         if let Err(err) = self.write_slot(&refreshed) {
             tracing::warn!(slot = %slot.id, error = %err, "refreshed slot write failed");
+        }
+        Some(access_token)
+    }
+
+    /// Refresh a saved Codex slot's expired ChatGPT access token so its usage
+    /// stays queryable. NEVER called for the active login (the CLI owns that
+    /// token pair). Single-flight per slot: OpenAI refresh tokens rotate, and
+    /// a concurrent second POST of the same one would revoke the family.
+    async fn refresh_codex_slot(&self, slot: &Slot) -> Option<String> {
+        if !lock(&self.inner.inflight_refreshes).insert(slot.id.clone()) {
+            return None;
+        }
+        let result = self.refresh_codex_slot_once(slot).await;
+        lock(&self.inner.inflight_refreshes).remove(&slot.id);
+        result
+    }
+
+    async fn refresh_codex_slot_once(&self, slot: &Slot) -> Option<String> {
+        let mut tokens = slot.credentials.get("tokens")?.clone();
+        let refresh_token = str_field(&tokens, "refresh_token")?;
+        let body: serde_json::Value = self
+            .inner
+            .http
+            .post(CODEX_TOKEN_URL)
+            .json(&serde_json::json!({
+                "client_id": CODEX_CLIENT_ID,
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+            }))
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        let access_token = str_field(&body, "access_token")?;
+        let filled_account_id = str_field(&tokens, "account_id")
+            .is_none()
+            .then(|| {
+                chatgpt_account_id_from_jwt(&access_token).or_else(|| {
+                    str_field(&tokens, "id_token")
+                        .as_deref()
+                        .and_then(chatgpt_account_id_from_jwt)
+                })
+            })
+            .flatten();
+        if let Some(map) = tokens.as_object_mut() {
+            map.insert("access_token".into(), serde_json::json!(access_token));
+            if let Some(rt) = str_field(&body, "refresh_token") {
+                map.insert("refresh_token".into(), serde_json::json!(rt));
+            }
+            if let Some(id_token) = str_field(&body, "id_token") {
+                map.insert("id_token".into(), serde_json::json!(id_token));
+            }
+            if let Some(id) = filled_account_id {
+                map.insert("account_id".into(), serde_json::json!(id));
+            }
+        }
+        let mut refreshed = slot.clone();
+        if let Some(creds) = refreshed.credentials.as_object_mut() {
+            creds.insert("tokens".into(), tokens);
+            creds.insert(
+                "last_refresh".into(),
+                serde_json::json!(chrono::Utc::now().to_rfc3339()),
+            );
+        }
+        refreshed.saved_at = now_ms();
+        if let Err(err) = self.write_slot(&refreshed) {
+            tracing::warn!(slot = %slot.id, error = %err, "refreshed codex slot write failed");
         }
         Some(access_token)
     }
@@ -2725,6 +2788,68 @@ fn parse_codex_auth(auth: serde_json::Value) -> Option<Detected> {
     })
 }
 
+/// ChatGPT `/wham/usage` → the meters the Accounts page draws.
+fn parse_codex_usage_response(body: &serde_json::Value) -> Vec<AgentUsageWindow> {
+    let Some(rl) = body.get("rate_limit") else {
+        return Vec::new();
+    };
+    let mut windows = Vec::new();
+    for key in ["primary_window", "secondary_window"] {
+        if let Some(w) = rl.get(key)
+            && let Some(used) = w.get("used_percent").and_then(|v| v.as_f64())
+        {
+            let span = w
+                .get("limit_window_seconds")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            windows.push(AgentUsageWindow {
+                label: if span > 86_400 { "Week" } else { "Session" }.to_string(),
+                used_fraction: (used / 100.0) as f32,
+                resets_at: parse_when(w.get("reset_at")),
+            });
+        }
+    }
+    windows
+}
+
+/// `chatgpt-account-id` header: stored `account_id`, then the JWT claim, then
+/// the slot key when it isn't an email (parse_codex_auth prefers the claim).
+fn codex_account_id(tokens: &serde_json::Value, slot: &Slot) -> String {
+    str_field(tokens, "account_id")
+        .or_else(|| {
+            str_field(tokens, "access_token")
+                .as_deref()
+                .and_then(chatgpt_account_id_from_jwt)
+        })
+        .or_else(|| {
+            str_field(tokens, "id_token")
+                .as_deref()
+                .and_then(chatgpt_account_id_from_jwt)
+        })
+        .or_else(|| {
+            (!slot.account_key.is_empty() && !slot.account_key.contains('@'))
+                .then(|| slot.account_key.clone())
+        })
+        .unwrap_or_default()
+}
+
+fn chatgpt_account_id_from_jwt(jwt: &str) -> Option<String> {
+    let claims = jwt_claims(jwt)?;
+    str_field(
+        claims.get("https://api.openai.com/auth")?,
+        "chatgpt_account_id",
+    )
+}
+
+/// True when the access token's JWT `exp` is already past (or within 30s).
+/// Unparseable tokens are treated as still valid so the usage probe runs first
+/// and a 401 can still trigger a refresh.
+fn codex_access_token_expired(access_token: &str) -> bool {
+    jwt_claims(access_token)
+        .and_then(|c| c.get("exp").and_then(|v| v.as_i64()))
+        .is_some_and(|exp| exp < (now_ms() / 1000) + 30)
+}
+
 /// ISO string (Claude) or unix seconds (Codex) → timestamp.
 fn parse_when(value: Option<&serde_json::Value>) -> Option<DateTime<Utc>> {
     match value? {
@@ -2946,15 +3071,71 @@ fn discover_language_server(antigravity_home: &Path) -> Option<(u16, String)> {
 /// token back out of the raw keyring/file blob without re-deriving a whole
 /// [`Detected`].
 fn antigravity_access_token(auth: &serde_json::Value) -> Option<String> {
-    let view =
-        if str_field(auth, "access_token").is_some() || str_field(auth, "accessToken").is_some() {
-            auth.clone()
-        } else if let Some(inner) = auth.get("token").filter(|t| t.is_object()) {
-            inner.clone()
-        } else {
-            auth.clone()
-        };
+    let view = antigravity_token_view(auth);
     str_field(&view, "access_token").or_else(|| str_field(&view, "accessToken"))
+}
+
+fn antigravity_token_view(auth: &serde_json::Value) -> serde_json::Value {
+    if str_field(auth, "access_token").is_some()
+        || str_field(auth, "accessToken").is_some()
+        || str_field(auth, "refresh_token").is_some()
+        || str_field(auth, "refreshToken").is_some()
+        || str_field(auth, "id_token").is_some()
+        || auth.get("tokens").is_some()
+        || auth.get("email").is_some()
+    {
+        auth.clone()
+    } else if let Some(inner) = auth.get("token").filter(|t| t.is_object()) {
+        inner.clone()
+    } else if let Some(inner) = auth.get("tokens").filter(|t| t.is_object()) {
+        inner.clone()
+    } else {
+        auth.clone()
+    }
+}
+
+/// True when the blob's `expiry` is already past (or within 30s). Missing or
+/// unparseable expiry is treated as still valid so the PA probe runs first.
+fn antigravity_access_expired(auth: &serde_json::Value) -> bool {
+    let view = antigravity_token_view(auth);
+    str_field(&view, "expiry")
+        .and_then(|exp| chrono::DateTime::parse_from_rfc3339(&exp).ok())
+        .is_some_and(|exp| {
+            exp.with_timezone(&chrono::Utc) < chrono::Utc::now() + chrono::Duration::seconds(30)
+        })
+}
+
+/// POST Google's token endpoint and patch `credentials` with the new access
+/// (and rotated refresh, when Google returns one). Returns `(access_token, updated_blob)`.
+async fn exchange_antigravity_refresh(
+    accounts: &AgentAccounts,
+    credentials: &serde_json::Value,
+) -> Option<(String, serde_json::Value)> {
+    let view = antigravity_token_view(credentials);
+    let refresh_token =
+        str_field(&view, "refresh_token").or_else(|| str_field(&view, "refreshToken"))?;
+    let body = accounts.exchange_google_refresh(&refresh_token).await?;
+    let access_token = str_field(&body, "access_token")?;
+    let expires_in = body
+        .get("expires_in")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(3600);
+    let expiry = (chrono::Utc::now() + chrono::Duration::seconds(expires_in)).to_rfc3339();
+    let mut updated = credentials.clone();
+    let map = updated.as_object_mut()?;
+    let target = if map.get("token").is_some_and(|t| t.is_object()) {
+        map.get_mut("token").and_then(|t| t.as_object_mut()).unwrap()
+    } else if map.get("tokens").is_some_and(|t| t.is_object()) {
+        map.get_mut("tokens").and_then(|t| t.as_object_mut()).unwrap()
+    } else {
+        map
+    };
+    target.insert("access_token".into(), serde_json::json!(access_token));
+    target.insert("expiry".into(), serde_json::json!(expiry));
+    if let Some(new_rt) = str_field(&body, "refresh_token") {
+        target.insert("refresh_token".into(), serde_json::json!(new_rt));
+    }
+    Some((access_token, updated))
 }
 
 /// `parse_antigravity_auth` derives this placeholder when the keyring secret
@@ -2969,18 +3150,7 @@ fn parse_antigravity_auth(auth: serde_json::Value) -> Option<Detected> {
     //   {"token":{access_token,refresh_token,expiry},"auth_method":"consumer"}
     // The OAuth fields sit one level down — look inside the `token` object, but
     // keep the FULL value as credentials (activate writes it back verbatim).
-    let view = if str_field(&auth, "access_token").is_some()
-        || str_field(&auth, "accessToken").is_some()
-        || str_field(&auth, "id_token").is_some()
-        || auth.get("tokens").is_some()
-        || auth.get("email").is_some()
-    {
-        auth.clone()
-    } else if let Some(inner) = auth.get("token").filter(|t| t.is_object()) {
-        inner.clone()
-    } else {
-        auth.clone()
-    };
+    let view = antigravity_token_view(&auth);
     // Try JWT id_token first (Google OAuth)
     if let Some(id_token) = view
         .get("tokens")
@@ -3557,5 +3727,87 @@ mod tests {
         assert_eq!(windows[1].label, "Claude/GPT");
         assert!((windows[1].used_fraction - 0.84).abs() < 0.01);
         assert!(windows[1].resets_at.is_some());
+    }
+
+    fn unsigned_jwt(payload: serde_json::Value) -> String {
+        let header = BASE64_URL.encode(br#"{"alg":"none"}"#);
+        let body = BASE64_URL.encode(payload.to_string().as_bytes());
+        format!("{header}.{body}.sig")
+    }
+
+    fn dummy_codex_slot(account_key: &str) -> Slot {
+        Slot {
+            id: "slot".into(),
+            harness: HarnessId::Codex,
+            account_key: account_key.into(),
+            profile: SlotProfile {
+                email: "a@b.c".into(),
+                display_name: None,
+                organization: None,
+                plan: Some("ChatGPT Free".into()),
+                auth_kind: AgentAuthKind::Oauth,
+            },
+            credentials: serde_json::json!({}),
+            claude_config: None,
+            saved_at: 0,
+            created_at: None,
+        }
+    }
+
+    #[test]
+    fn parse_codex_usage_response_extracts_windows() {
+        let json = serde_json::json!({
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 100.0,
+                    "limit_window_seconds": 604800,
+                    "reset_at": 1759600800
+                },
+                "secondary_window": {
+                    "used_percent": 12.5,
+                    "limit_window_seconds": 18000,
+                    "reset_at": 1759520000
+                }
+            }
+        });
+        let windows = parse_codex_usage_response(&json);
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].label, "Week");
+        assert!((windows[0].used_fraction - 1.0).abs() < f32::EPSILON);
+        assert!(windows[0].resets_at.is_some());
+        assert_eq!(windows[1].label, "Session");
+        assert!((windows[1].used_fraction - 0.125).abs() < 0.001);
+        assert!(parse_codex_usage_response(&serde_json::json!({"other": 1})).is_empty());
+    }
+
+    #[test]
+    fn codex_access_token_expired_reads_jwt_exp() {
+        let past = unsigned_jwt(serde_json::json!({"exp": 1}));
+        let future = unsigned_jwt(serde_json::json!({"exp": now_ms() / 1000 + 3600}));
+        assert!(codex_access_token_expired(&past));
+        assert!(!codex_access_token_expired(&future));
+        assert!(!codex_access_token_expired("not-a-jwt"));
+    }
+
+    #[test]
+    fn codex_account_id_prefers_tokens_then_jwt_then_slot_key() {
+        let slot = dummy_codex_slot("acct-from-slot");
+        assert_eq!(
+            codex_account_id(&serde_json::json!({"account_id": "stored"}), &slot),
+            "stored"
+        );
+        let jwt = unsigned_jwt(serde_json::json!({
+            "https://api.openai.com/auth": {"chatgpt_account_id": "from-jwt"}
+        }));
+        assert_eq!(
+            codex_account_id(&serde_json::json!({"id_token": jwt}), &slot),
+            "from-jwt"
+        );
+        assert_eq!(
+            codex_account_id(&serde_json::json!({}), &slot),
+            "acct-from-slot"
+        );
+        let email_slot = dummy_codex_slot("user@example.com");
+        assert_eq!(codex_account_id(&serde_json::json!({}), &email_slot), "");
     }
 }

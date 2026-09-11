@@ -111,9 +111,17 @@ pub fn format_reset(resets_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Opt
     Some(if diff.num_hours() < 22 {
         format!("resets {}", local.format("%-I:%M %p"))
     } else if diff.num_days() < 7 {
-        format!("resets {} {}", local.format("%a"), local.format("%-I:%M %p"))
+        format!(
+            "resets {} {}",
+            local.format("%a"),
+            local.format("%-I:%M %p")
+        )
     } else {
-        format!("resets {} {}", local.format("%b %-d"), local.format("%-I:%M %p"))
+        format!(
+            "resets {} {}",
+            local.format("%b %-d"),
+            local.format("%-I:%M %p")
+        )
     })
 }
 

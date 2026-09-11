@@ -366,23 +366,14 @@ pub(crate) fn native_window(v: &Value) -> Option<(u64, u64)> {
 pub(crate) fn native_context_event(v: &Value) -> Option<AgentEvent> {
     let (used, size) = native_window(v)?;
     Some(AgentEvent::ContextWindow {
-        stats: ContextUsageStats::window(
-            used,
-            size,
-            ContextUsageSource::Native,
-            used,
-            0,
-            0,
-            0,
-        ),
+        stats: ContextUsageStats::window(used, size, ContextUsageSource::Native, used, 0, 0, 0),
     })
 }
 
 /// Grok `_x.ai/session/info` is double-wrapped (`{result:{context:…}}`)
 /// inside the JSON-RPC result; other agents return the object directly.
 pub(crate) fn session_info_window(resp: &Value) -> Option<AgentEvent> {
-    native_context_event(resp.get("result").unwrap_or(resp))
-        .or_else(|| native_context_event(resp))
+    native_context_event(resp.get("result").unwrap_or(resp)).or_else(|| native_context_event(resp))
 }
 
 pub(crate) fn billed_usage_event(usage: &Value) -> Option<AgentEvent> {
@@ -824,12 +815,14 @@ mod tests {
             },
         }));
         match &events[..] {
-            [AgentEvent::Usage {
-                input_tokens: 3_000_000,
-                cached_input_tokens: 5_376,
-                output_tokens: 18_000,
-                ..
-            }] => {}
+            [
+                AgentEvent::Usage {
+                    input_tokens: 3_000_000,
+                    cached_input_tokens: 5_376,
+                    output_tokens: 18_000,
+                    ..
+                },
+            ] => {}
             other => panic!("expected billed Usage only, got {other:?}"),
         }
 
@@ -845,7 +838,11 @@ mod tests {
         )));
         assert!(with_context.iter().any(|e| matches!(
             e,
-            AgentEvent::Usage { input_tokens: 3_000_000, output_tokens: 36, .. }
+            AgentEvent::Usage {
+                input_tokens: 3_000_000,
+                output_tokens: 36,
+                ..
+            }
         )));
     }
 

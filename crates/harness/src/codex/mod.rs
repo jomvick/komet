@@ -61,7 +61,7 @@ use komet_proto::{
 
 use crate::jsonrpc::{Incoming, RpcClient};
 use crate::{Harness, HarnessError, RunControls};
-use catalog::{REASONING_LEVELS, static_models, to_effort};
+use catalog::REASONING_LEVELS;
 use normalize::{
     ChildRoute, Phase, compacted_event, delta_text, item_id, item_type, map_item,
     notification_thread_id, route_child_notification, turn_error_message, turn_id, usage_events,
@@ -317,20 +317,7 @@ impl Harness for CodexHarness {
     /// paging `model/list` (experimentalApi) exactly as codex.ts does.
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         self.resolve_executable()?;
-        if let Some(home) = std::env::var_os("CODEX_HOME")
-            .map(PathBuf::from)
-            .filter(|p| !p.as_os_str().is_empty())
-            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".codex")))
-        {
-            let cache = home.join("models_cache.json");
-            if let Ok(text) = std::fs::read_to_string(&cache)
-                && let Ok(value) = serde_json::from_str::<serde_json::Value>(&text)
-                && let Some(models) = catalog::parse_models_cache(&value)
-            {
-                return Ok(models);
-            }
-        }
-        Ok(static_models())
+        Ok(catalog::load_catalog())
     }
 
     /// Skills from a short-lived `skills/list` probe (see
@@ -574,7 +561,11 @@ async fn run_session(session: Session) {
                 json!({ "type": "dangerFullAccess" }),
             ),
         };
-    let effort = to_effort(request.reasoning);
+    let effort = catalog::to_effort(
+        request.reasoning,
+        request.model.as_deref(),
+        &catalog::load_catalog(),
+    );
     // Service tier rides thread-start and every turn (mirrors the Codex IDE
     // client). "default" means Standard — omit it entirely.
     let service_tier = request

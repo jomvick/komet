@@ -19,7 +19,8 @@
 //     {"ev":"text","text","parent"?}        parent = spawning task callId
 //     {"ev":"thinking","text","parent"?}
 //     {"ev":"tool","phase":"start"|"end","id","name","args"?,"error"?,"parent"?}
-//     {"ev":"usage","input","output"}
+//     {"ev":"usage","input","output","cacheRead"?,"cacheWrite"?,"reasoning"?}
+//     {"ev":"compact","reason"?}            SDK summarized the thread
 //     {"ev":"turn","status":"finished"|"error"|"cancelled","error"?}
 //     {"ev":"fatal","message"}              unrecoverable (auth, SDK init)
 //
@@ -202,11 +203,20 @@ function mapUpdate(u, parent) {
           ev: "usage",
           input: u.usage.inputTokens ?? 0,
           output: u.usage.outputTokens ?? 0,
+          cacheRead: u.usage.cacheReadTokens ?? 0,
+          cacheWrite: u.usage.cacheWriteTokens ?? 0,
+          reasoning: u.usage.reasoningTokens ?? 0,
         });
       }
       break;
+    case "summary-completed":
+      // Cursor auto-summarizes so the session can continue past the raw
+      // window. Surface it so the context ring can drop instead of pinning
+      // at 100% on cumulative billed tokens.
+      out({ ev: "compact", reason: "summarized" });
+      break;
     default:
-      // step-*/summary-*/token-delta/partial-tool-call/…: no consumer.
+      // step-*/summary-started/token-delta/partial-tool-call/…: no consumer.
       break;
   }
 }

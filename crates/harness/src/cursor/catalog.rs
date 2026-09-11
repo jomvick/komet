@@ -158,10 +158,10 @@ pub(crate) fn fold_cli_models(text: &str) -> Vec<Model> {
 pub(crate) fn merge_cli_with_sdk(cli: Vec<Model>, sdk: &[Model]) -> Vec<Model> {
     cli.into_iter()
         .map(|mut model| {
-            if let Some(sdk_row) = sdk.iter().find(|s| ids_match(&model.id, &s.id)) {
-                if !sdk_row.options.is_empty() {
-                    model.options = sdk_row.options.clone();
-                }
+            if let Some(sdk_row) = sdk.iter().find(|s| ids_match(&model.id, &s.id))
+                && !sdk_row.options.is_empty()
+            {
+                model.options = sdk_row.options.clone();
             }
             model
         })

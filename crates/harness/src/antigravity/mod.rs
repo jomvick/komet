@@ -132,7 +132,10 @@ impl Harness for AntigravityHarness {
         true
     }
     fn reasoning_levels(&self) -> &[ReasoningLevel] {
-        catalog::FULL_LADDER
+        // Effort is per-model: baked into Gemini/GPT ids, unsupported on Claude.
+        // An empty harness ladder stops the picker from falling back to
+        // Low/Medium/High and forwarding `--effort` to models that reject it.
+        &[]
     }
     fn installed(&self) -> bool {
         self.resolve_executable().is_ok()
@@ -219,14 +222,14 @@ impl Harness for AntigravityHarness {
         if let Some(conversation) = request.resume.as_deref().filter(|id| !id.is_empty()) {
             command.args(["--conversation", conversation]);
         }
-        if let Some(model) = request
-            .model
-            .as_deref()
-            .filter(|model| *model != catalog::default_model())
-        {
+        let model = match request.model.as_deref() {
+            Some(m) if !m.is_empty() => m,
+            _ => catalog::default_model(),
+        };
+        if model != catalog::default_model() {
             command.args(["--model", model]);
         }
-        if let Some(effort) = catalog::to_effort(request.reasoning) {
+        if let Some(effort) = catalog::to_effort(request.reasoning, Some(model)) {
             command.args(["--effort", effort]);
         }
         match request.sandbox {

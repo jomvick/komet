@@ -702,6 +702,24 @@ fn decode_tool(name: &str, args: &Value) -> ToolCall {
     }
 }
 
+fn u64_field(frame: &Value, keys: &[&str]) -> u64 {
+    keys.iter()
+        .find_map(|k| frame.get(*k).and_then(Value::as_u64))
+        .unwrap_or(0)
+}
+
+/// Occupancy for the context ring. Cursor's turn `inputTokens` accumulate
+/// across tool loops (cost, not window fill). Prefer a figure that still
+/// fits the model window: Claude-style prompt (input+cache), then cache
+/// alone, then input alone. `None` means "don't move the gauge".
+fn cursor_occupancy(input: u64, cache_read: u64, cache_write: u64, limit: u64) -> Option<u64> {
+    let cached = cache_read.saturating_add(cache_write);
+    let prompt = input.saturating_add(cached);
+    [prompt, cached, input]
+        .into_iter()
+        .find(|&n| n > 0 && (limit == 0 || n <= limit))
+}
+
 /// Map one shim frame to events. `Done` session ids are stamped by the loop.
 fn map_shim_frame(frame: &Value, interrupted: bool, model: &str) -> Vec<AgentEvent> {
     let text = || {
@@ -804,30 +822,47 @@ fn map_shim_frame(frame: &Value, interrupted: bool, model: &str) -> Vec<AgentEve
             }
         }
         "usage" => {
-            let input = frame.get("input").and_then(Value::as_u64).unwrap_or(0);
-            let output = frame.get("output").and_then(Value::as_u64).unwrap_or(0);
+            let input = u64_field(frame, &["input", "inputTokens"]);
+            let output = u64_field(frame, &["output", "outputTokens"]);
+            let cache_read = u64_field(frame, &["cacheRead", "cacheReadTokens"]);
+            let cache_write = u64_field(frame, &["cacheWrite", "cacheWriteTokens"]);
+            let reasoning = u64_field(frame, &["reasoning", "reasoningTokens"]);
             let limit = komet_proto::default_context_limit_for_model(model);
-            vec![
-                AgentEvent::Usage {
-                    input_tokens: input,
-                    cached_input_tokens: 0,
-                    output_tokens: output,
-                    reasoning_tokens: 0,
-                    context_limit: Some(limit),
-                },
-                AgentEvent::ContextWindow {
+            let mut events = vec![AgentEvent::Usage {
+                input_tokens: input,
+                cached_input_tokens: cache_read,
+                output_tokens: output,
+                reasoning_tokens: reasoning,
+                context_limit: Some(limit),
+            }];
+            // Billed `input` on a long Cursor turn is a cost counter (tool
+            // loops sum far past the window). The ring needs occupancy: the
+            // cache footprint, or input only while it still fits. Overshoot
+            // omits the snapshot so the gauge keeps the last in-window fill
+            // instead of pinning at 100% while the session continues.
+            if let Some(used) = cursor_occupancy(input, cache_read, cache_write, limit) {
+                events.push(AgentEvent::ContextWindow {
                     stats: komet_proto::ContextUsageStats::window(
-                        input,
+                        used,
                         limit,
                         komet_proto::ContextUsageSource::Approximate,
                         input,
-                        0,
+                        cache_read,
                         output,
-                        0,
+                        reasoning,
                     ),
-                },
-            ]
+                });
+            }
+            events
         }
+        "compact" => vec![AgentEvent::ContextWindow {
+            stats: komet_proto::ContextUsageStats::compaction(
+                frame
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .unwrap_or("summarized"),
+            ),
+        }],
         "turn" => {
             let status = frame.get("status").and_then(Value::as_str).unwrap_or("");
             let error = frame
@@ -923,9 +958,48 @@ mod tests {
     }
 
     #[test]
-    fn usage_overshoot_is_capped_to_the_model_window() {
+    fn usage_overshoot_does_not_pin_the_window_at_full() {
         let events = map_shim_frame(
             &json!({"ev":"usage","input":3_000_000,"output":18_000}),
+            false,
+            "grok-4.6",
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::ContextWindow { .. })),
+            "billed overshoot must not fill the ring: {events:?}"
+        );
+        let Some(AgentEvent::Usage {
+            input_tokens,
+            output_tokens,
+            context_limit,
+            ..
+        }) = events
+            .iter()
+            .find(|e| matches!(e, AgentEvent::Usage { .. }))
+        else {
+            panic!("expected Usage: {events:?}");
+        };
+        assert_eq!(*input_tokens, 3_000_000);
+        assert_eq!(*output_tokens, 18_000);
+        assert_eq!(
+            *context_limit,
+            Some(komet_proto::default_context_limit_for_model("grok-4.6"))
+        );
+    }
+
+    #[test]
+    fn usage_cache_footprint_fills_the_ring_when_billed_input_overshoots() {
+        let events = map_shim_frame(
+            &json!({
+                "ev": "usage",
+                "input": 1_800_000,
+                "output": 24_000,
+                "cacheRead": 80_000,
+                "cacheWrite": 4_000,
+                "reasoning": 12
+            }),
             false,
             "grok-4.6",
         );
@@ -935,12 +1009,44 @@ mod tests {
         else {
             panic!("expected ContextWindow: {events:?}");
         };
-        let limit = komet_proto::default_context_limit_for_model("grok-4.6");
-        assert_eq!(limit, 131_072);
-        assert_eq!(stats.context_limit, limit);
-        assert_eq!(stats.used(), limit);
-        assert_eq!(stats.input_tokens, 3_000_000);
+        assert_eq!(stats.used(), 84_000);
+        assert_eq!(stats.input_tokens, 1_800_000);
+        assert_eq!(stats.cached_input_tokens, 80_000);
+        assert_eq!(stats.reasoning_tokens, 12);
         assert_eq!(stats.source, komet_proto::ContextUsageSource::Approximate);
+        assert!(stats.context_percent() < 100);
+    }
+
+    #[test]
+    fn in_window_usage_still_fills_the_ring() {
+        let events = map_shim_frame(
+            &json!({"ev":"usage","input":11,"output":5}),
+            false,
+            "composer-2.5",
+        );
+        let Some(AgentEvent::ContextWindow { stats }) = events
+            .iter()
+            .find(|e| matches!(e, AgentEvent::ContextWindow { .. }))
+        else {
+            panic!("expected ContextWindow: {events:?}");
+        };
+        assert_eq!(stats.used(), 11);
+        assert_eq!(stats.input_tokens, 11);
+    }
+
+    #[test]
+    fn compact_frame_records_a_summarize() {
+        let events = map_shim_frame(
+            &json!({"ev":"compact","reason":"summarized"}),
+            false,
+            "auto",
+        );
+        let Some(AgentEvent::ContextWindow { stats }) = events.first() else {
+            panic!("expected ContextWindow: {events:?}");
+        };
+        assert_eq!(stats.compactions_count, 1);
+        assert_eq!(stats.compactions_reason.as_deref(), Some("summarized"));
+        assert_eq!(stats.used_tokens, 0);
     }
 
     #[test]

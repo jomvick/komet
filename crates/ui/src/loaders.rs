@@ -11,8 +11,8 @@
 
 use crate::icons;
 use gpui::{
-    AnyElement, App, EntityId, IntoElement, ParentElement, PathBuilder, SharedString, Styled, canvas,
-    div, point, px,
+    AnyElement, App, EntityId, IntoElement, ParentElement, PathBuilder, SharedString, Styled,
+    canvas, div, point, px,
 };
 
 use crate::motion::{self, GRADIENT_SPIN, KOMET_PULSE, PULSE_STAGGER, SPLASH_OUT};

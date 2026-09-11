@@ -13,8 +13,8 @@ use komet_harness::{
     CancellationToken, ClaudeHarness, Harness, HarnessError, RunControls, SteerMessage,
 };
 use komet_proto::{
-    AgentEvent, DoneStatus, HarnessId, RunRequest, SandboxLevel, ToolCall, UserInputAnswer,
-    UserInputQuestion,
+    AgentEvent, DoneStatus, HarnessId, ReasoningLevel, RunRequest, SandboxLevel, ToolCall,
+    UserInputAnswer, UserInputQuestion,
 };
 
 fn fixture_path() -> PathBuf {
@@ -226,6 +226,25 @@ async fn happy_path_normalizes_events_and_tags_subagents() {
             session_id: Some("sess-1".into()),
             reason: None,
         })
+    );
+}
+
+#[tokio::test]
+async fn haiku_does_not_forward_unsupported_effort() {
+    let (controls, _steer, _token) = controls("A");
+    let mut req = request("scenario:happy");
+    req.model = Some("claude-haiku-4-5".into());
+    req.reasoning = Some(ReasoningLevel::High);
+    let events = run_to_end(&harness(), req, controls).await;
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            }
+        )),
+        "haiku must not receive --effort: {events:?}"
     );
 }
 

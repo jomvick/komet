@@ -41,6 +41,19 @@ pub enum ReasoningLevel {
 }
 
 impl ReasoningLevel {
+    /// All defined reasoning levels in ascending order.
+    pub const ALL: &'static [Self] = &[
+        Self::Minimal,
+        Self::Low,
+        Self::Medium,
+        Self::High,
+        Self::XHigh,
+        Self::Max,
+        Self::Ultra,
+        Self::Ultracode,
+        Self::Ultrathink,
+    ];
+
     /// Map a UI thinkingOptionId onto the level ladder. Unknown ids return
     /// `None` — the caller decides whether to drop or downgrade.
     pub fn from_thinking_id(id: &str) -> Option<Self> {

@@ -890,7 +890,12 @@ pub async fn serve_ipc(
     port: u16,
     service: std::sync::Arc<dyn komet_rpc::RpcService>,
 ) -> std::io::Result<tokio::task::JoinHandle<()>> {
-    let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
+    let socket = tokio::net::TcpSocket::new_v4()?;
+    socket.set_reuseaddr(true)?;
+    #[cfg(unix)]
+    let _ = socket.set_reuseport(true);
+    socket.bind(std::net::SocketAddr::from(([127, 0, 0, 1], port)))?;
+    let listener = socket.listen(1024)?;
     tracing::info!(port, "IPC server listening");
     Ok(tokio::spawn(komet_rpc::serve_ws_listener(
         listener, service,

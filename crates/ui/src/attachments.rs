@@ -337,7 +337,9 @@ pub async fn upload_attachment(
                     attempt += 1;
                     tracing::warn!(error = %err, seq, attempt, "upload chunk retry");
                     executor
-                        .timer(std::time::Duration::from_millis(50 * (attempt as u64) * (seq + 1)))
+                        .timer(std::time::Duration::from_millis(
+                            50 * (attempt as u64) * (seq + 1),
+                        ))
                         .await;
                 }
                 Err(err) => return Err(err),
@@ -574,12 +576,12 @@ pub fn attachment_snapshot(device_id: &str, path: &str) -> AttachmentSnapshot {
             // so the send seeds the bytes under an alias and this fallback
             // resolves the rewritten ref instantly instead of blanking the
             // thumbnail into a skeleton while the bytes round-trip.
-            if let Some(image) = upload_alias_id8(path)
-                .and_then(|id8| match cache.map.get(&alias_key(device_id, &id8)) {
+            if let Some(image) = upload_alias_id8(path).and_then(|id8| {
+                match cache.map.get(&alias_key(device_id, &id8)) {
                     Some(CacheEntry::Loaded { image, .. }) => Some(image.clone()),
                     _ => None,
-                })
-            {
+                }
+            }) {
                 cache.insert_loaded(key(device_id, path), image.clone());
                 return AttachmentSnapshot::Loaded(image);
             }
@@ -594,9 +596,8 @@ pub fn attachment_snapshot(device_id: &str, path: &str) -> AttachmentSnapshot {
 fn upload_alias_id8(path: &str) -> Option<String> {
     let base = std::path::Path::new(path).file_name()?.to_str()?;
     let (id8, _) = base.split_at_checked(8)?;
-    (base.as_bytes().get(8) == Some(&b'-')
-        && id8.bytes().all(|b| b.is_ascii_alphanumeric()))
-    .then(|| id8.to_string())
+    (base.as_bytes().get(8) == Some(&b'-') && id8.bytes().all(|b| b.is_ascii_alphanumeric()))
+        .then(|| id8.to_string())
 }
 
 fn alias_key(device_id: &str, id8: &str) -> (String, String) {

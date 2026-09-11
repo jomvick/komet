@@ -662,11 +662,8 @@ reason: None,
             name: "Antigravity".into(),
             supports_steering: false,
             steering_mode: SteeringMode::TurnBoundary,
-            reasoning_levels: vec![
-                ReasoningLevel::Low,
-                ReasoningLevel::Medium,
-                ReasoningLevel::High,
-            ],
+            // Effort is per-model (baked into Gemini/GPT ids; unsupported on Claude).
+            reasoning_levels: vec![],
             installed: true,
             enabled: None,
         },
@@ -769,19 +766,9 @@ mod tests {
         assert_eq!(opencode.id(), HarnessId::Opencode);
         assert_eq!(opencode.display_name(), "OpenCode");
         assert_eq!(opencode.steering_mode(), SteeringMode::TurnBoundary);
-        // Komet divergence: opencode effort rides model variants, so the
-        // descriptor carries the full static ladder (unlike Comet's empty
-        // ladder until provider.list).
-        assert_eq!(
-            opencode.reasoning_levels(),
-            &[
-                ReasoningLevel::Low,
-                ReasoningLevel::Medium,
-                ReasoningLevel::High,
-                ReasoningLevel::XHigh,
-                ReasoningLevel::Max
-            ]
-        );
+        // Effort rides model variants on the wire; the picker must not invent
+        // a global Low/Medium/High ladder for variant-less Zen models.
+        assert!(opencode.reasoning_levels().is_empty());
         let pi = registry.resolve(HarnessId::Pi).unwrap();
         assert_eq!(pi.id(), HarnessId::Pi);
         assert_eq!(pi.display_name(), "Pi");
@@ -801,14 +788,14 @@ mod tests {
         assert_eq!(antigravity.id(), HarnessId::Antigravity);
         assert_eq!(antigravity.display_name(), "Antigravity CLI");
         assert_eq!(antigravity.steering_mode(), SteeringMode::TurnBoundary);
-        assert_eq!(
-            antigravity.reasoning_levels(),
-            &[
-                ReasoningLevel::Low,
-                ReasoningLevel::Medium,
-                ReasoningLevel::High,
-            ]
-        );
+        // Effort is per-model (baked into the id, or unsupported on Claude).
+        assert!(antigravity.reasoning_levels().is_empty());
+        let agy_desc = registry
+            .descriptors()
+            .into_iter()
+            .find(|d| d.id == HarnessId::Antigravity)
+            .expect("antigravity descriptor");
+        assert!(agy_desc.reasoning_levels.is_empty());
     }
 
     /// Catalogs serialized by engines that predate the `installed`/`enabled`

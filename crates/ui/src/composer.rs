@@ -5846,70 +5846,67 @@ impl Composer {
                 },
             };
             if let Some(engine) = this.state.read(cx).engine().cloned()
-                && let Some(chat_id) = this.state.read(cx).selected_chat.clone() {
-                    let params = serde_json::json!({
-                        "chatId": chat_id,
-                        "command": serde_json::to_value(&payload).unwrap_or_default()
-                    });
-                    let request_id_for_revert = rid.clone();
-                    cx.spawn(async move |this, cx| {
-                        let result = engine
-                            .client()
-                            .call(komet_rpc::methods::QUEUE_COMMAND, params)
-                            .await;
-                        if result.is_err() {
-                            // Send failed — unhide so user can retry
-                            this.update(cx, |composer, cx| {
-                                if composer.run_live(cx) {
-                                    composer.answered_requests.remove(&request_id_for_revert);
-                                }
-                                cx.notify();
-                            })
-                            .ok();
-                        } else {
-                            // Safety net: if doc didn't mark resolved within 2s, retry is needed
-                            cx.background_executor().timer(Duration::from_secs(2)).await;
-                            this.update(cx, |composer, cx| {
-                                let transcript = composer.state.read(cx).transcript.clone();
-                                let still_pending = pending_permission_request(&transcript)
-                                    .is_some_and(|(pid, _, _, _, _)| pid == request_id_for_revert);
-                                let resolved = permission_request_resolved(
-                                    &transcript,
-                                    &request_id_for_revert,
-                                );
-                                if still_pending && !resolved {
-                                    // Host hasn't resolved — allow retry, but keep hidden briefly
-                                    // Check again after another second before exposing
-                                    let rid2 = request_id_for_revert.clone();
-                                    cx.spawn(async move |this, cx| {
-                                        cx.background_executor()
-                                            .timer(Duration::from_secs(1))
-                                            .await;
-                                        this.update(cx, |composer, cx| {
-                                            let t = composer.state.read(cx).transcript.clone();
-                                            // Both retry paths unhide the same way:
-                                            // the request is still actionable.
-                                            if permission_request_resolved(&t, &rid2)
-                                                || pending_permission_request(&t)
-                                                    .is_some_and(|(p, _, _, _, _)| p == rid2)
-                                                    && composer.run_live(cx)
-                                            {
-                                                composer.answered_requests.remove(&rid2);
-                                            }
-                                            cx.notify();
-                                        })
-                                        .ok();
+                && let Some(chat_id) = this.state.read(cx).selected_chat.clone()
+            {
+                let params = serde_json::json!({
+                    "chatId": chat_id,
+                    "command": serde_json::to_value(&payload).unwrap_or_default()
+                });
+                let request_id_for_revert = rid.clone();
+                cx.spawn(async move |this, cx| {
+                    let result = engine
+                        .client()
+                        .call(komet_rpc::methods::QUEUE_COMMAND, params)
+                        .await;
+                    if result.is_err() {
+                        // Send failed — unhide so user can retry
+                        this.update(cx, |composer, cx| {
+                            if composer.run_live(cx) {
+                                composer.answered_requests.remove(&request_id_for_revert);
+                            }
+                            cx.notify();
+                        })
+                        .ok();
+                    } else {
+                        // Safety net: if doc didn't mark resolved within 2s, retry is needed
+                        cx.background_executor().timer(Duration::from_secs(2)).await;
+                        this.update(cx, |composer, cx| {
+                            let transcript = composer.state.read(cx).transcript.clone();
+                            let still_pending = pending_permission_request(&transcript)
+                                .is_some_and(|(pid, _, _, _, _)| pid == request_id_for_revert);
+                            let resolved =
+                                permission_request_resolved(&transcript, &request_id_for_revert);
+                            if still_pending && !resolved {
+                                // Host hasn't resolved — allow retry, but keep hidden briefly
+                                // Check again after another second before exposing
+                                let rid2 = request_id_for_revert.clone();
+                                cx.spawn(async move |this, cx| {
+                                    cx.background_executor().timer(Duration::from_secs(1)).await;
+                                    this.update(cx, |composer, cx| {
+                                        let t = composer.state.read(cx).transcript.clone();
+                                        // Both retry paths unhide the same way:
+                                        // the request is still actionable.
+                                        if permission_request_resolved(&t, &rid2)
+                                            || pending_permission_request(&t)
+                                                .is_some_and(|(p, _, _, _, _)| p == rid2)
+                                                && composer.run_live(cx)
+                                        {
+                                            composer.answered_requests.remove(&rid2);
+                                        }
+                                        cx.notify();
                                     })
-                                    .detach();
-                                } else if resolved {
-                                    // Keep hidden; will be cleared by on_state_changed latch
-                                }
-                            })
-                            .ok();
-                        }
-                    })
-                    .detach();
-                }
+                                    .ok();
+                                })
+                                .detach();
+                            } else if resolved {
+                                // Keep hidden; will be cleared by on_state_changed latch
+                            }
+                        })
+                        .ok();
+                    }
+                })
+                .detach();
+            }
             cx.notify();
         };
 

@@ -994,10 +994,10 @@ async fn run_session(session: Session) {
                         continue;
                     }
                     if let Frame::ControlResponse(value) = frame {
-                        if let Some(ev) = live_context_window(&value) {
-                            if event_tx.send(Ok(ev)).await.is_err() {
-                                break 'main;
-                            }
+                        if let Some(ev) = live_context_window(&value)
+                            && event_tx.send(Ok(ev)).await.is_err()
+                        {
+                            break 'main;
                         }
                         continue;
                     }

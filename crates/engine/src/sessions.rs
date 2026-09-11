@@ -278,12 +278,11 @@ impl SessionsEngine {
 
     /// IDs assigned to the chat for MCP servers (`ChatConfig.mcp_server_ids`).
     fn mcp_ids_for_chat(&self, chat_id: &str) -> Vec<String> {
-        if let Some(host) = self.inner.doc_host() {
-            if let Some(ws) = host.workspace() {
-                if let Some(cfg) = ws.chat_config(chat_id) {
-                    return cfg.mcp_server_ids;
-                }
-            }
+        if let Some(host) = self.inner.doc_host()
+            && let Some(ws) = host.workspace()
+            && let Some(cfg) = ws.chat_config(chat_id)
+        {
+            return cfg.mcp_server_ids;
         }
         Vec::new()
     }
@@ -477,25 +476,13 @@ impl SessionsEngine {
             self.set_status(chat_id, komet_proto::SessionStatus::Idle, false);
             return Err(EngineError::Other(message));
         }
-        // Symmetric reasoning validation: if a harness is targeted, the
-        // requested level must be in its ladder (Grok/Hermes/Pi = empty).
+        // Symmetric reasoning validation: a requested level must be a known
+        // unified id. Per-model support is enforced by each harness (omit the
+        // flag rather than fail the run — leftover Medium on Haiku/Claude-via-
+        // Antigravity/gpt-5.5 must not become "Run failed"). Grok/Pi advertise
+        // real ladders; do not treat them as empty.
         if let Some(level) = request.reasoning {
-            let supported: &[komet_proto::ReasoningLevel] = match request.harness {
-                Some(komet_proto::HarnessId::Grok)
-                | Some(komet_proto::HarnessId::Hermes)
-                | Some(komet_proto::HarnessId::Pi) => &[],
-                _ => &[
-                    komet_proto::ReasoningLevel::Minimal,
-                    komet_proto::ReasoningLevel::Low,
-                    komet_proto::ReasoningLevel::Medium,
-                    komet_proto::ReasoningLevel::High,
-                    komet_proto::ReasoningLevel::XHigh,
-                    komet_proto::ReasoningLevel::Max,
-                    komet_proto::ReasoningLevel::Ultra,
-                    komet_proto::ReasoningLevel::Ultracode,
-                    komet_proto::ReasoningLevel::Ultrathink,
-                ],
-            };
+            let supported = komet_proto::ReasoningLevel::ALL;
             if let Err(validation) = komet_proto::validate_reasoning(Some(level), supported) {
                 tracing::warn!(chat = %chat_id, ?validation, "run rejected: reasoning validation failed");
                 let message = validation.to_string();

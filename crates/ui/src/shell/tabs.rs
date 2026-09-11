@@ -24,53 +24,58 @@ impl Shell {
         // Try remembered navigation for the current device (pruned like open_tabs).
         let device_id = self.state.read(cx).local_device_id.clone();
         if let Some(device_id) = device_id
-            && let Some(nav) = self.settings.last_session_by_device.get(&device_id).cloned() {
-                match nav {
-                    RememberedNavigation::Session { id } => {
-                        let (exists, space_ok) = {
-                            let state = self.state.read(cx);
-                            let chat = state.chats.iter().find(|c| c.id == id);
-                            let exists = chat.is_some_and(|c| !c.archived);
-                            let space_ok = match chat.and_then(|c| c.space_id.as_deref()) {
-                                Some(sid) => state.space_row(sid).is_some(),
-                                None => true,
-                            };
-                            (exists, space_ok)
-                        };
-                        if exists && space_ok {
-                            self.state
-                                .update(cx, |s, cx| s.select_chat(Some(id.clone()), cx));
-                            return;
-                        }
-                        // Stale session -> prune and fall through to recency.
-                        self.settings.last_session_by_device.remove(&device_id);
-                        self.schedule_save(cx);
-                    }
-                    RememberedNavigation::NewTask { project_id } => {
-                        let valid = match &project_id {
+            && let Some(nav) = self
+                .settings
+                .last_session_by_device
+                .get(&device_id)
+                .cloned()
+        {
+            match nav {
+                RememberedNavigation::Session { id } => {
+                    let (exists, space_ok) = {
+                        let state = self.state.read(cx);
+                        let chat = state.chats.iter().find(|c| c.id == id);
+                        let exists = chat.is_some_and(|c| !c.archived);
+                        let space_ok = match chat.and_then(|c| c.space_id.as_deref()) {
+                            Some(sid) => state.space_row(sid).is_some(),
                             None => true,
-                            Some(pid) => self.state.read(cx).space_row(pid).is_some(),
                         };
-                        if valid {
-                            self.state.update(cx, |s, cx| {
-                                s.select_space(project_id.clone(), cx);
-                                // Ensure we stay on the new-task canvas.
-                                if s.selected_chat.is_some() {
-                                    s.select_chat(None, cx);
-                                } else {
-                                    // select_chat(None) is a no-op if already None (keeps auto_selected false),
-                                    // so set it explicitly to prevent recency fallback on next call.
-                                    s.auto_selected = true;
-                                }
-                                cx.notify();
-                            });
-                            return;
-                        }
-                        self.settings.last_session_by_device.remove(&device_id);
-                        self.schedule_save(cx);
+                        (exists, space_ok)
+                    };
+                    if exists && space_ok {
+                        self.state
+                            .update(cx, |s, cx| s.select_chat(Some(id.clone()), cx));
+                        return;
                     }
+                    // Stale session -> prune and fall through to recency.
+                    self.settings.last_session_by_device.remove(&device_id);
+                    self.schedule_save(cx);
+                }
+                RememberedNavigation::NewTask { project_id } => {
+                    let valid = match &project_id {
+                        None => true,
+                        Some(pid) => self.state.read(cx).space_row(pid).is_some(),
+                    };
+                    if valid {
+                        self.state.update(cx, |s, cx| {
+                            s.select_space(project_id.clone(), cx);
+                            // Ensure we stay on the new-task canvas.
+                            if s.selected_chat.is_some() {
+                                s.select_chat(None, cx);
+                            } else {
+                                // select_chat(None) is a no-op if already None (keeps auto_selected false),
+                                // so set it explicitly to prevent recency fallback on next call.
+                                s.auto_selected = true;
+                            }
+                            cx.notify();
+                        });
+                        return;
+                    }
+                    self.settings.last_session_by_device.remove(&device_id);
+                    self.schedule_save(cx);
                 }
             }
+        }
 
         // Fallback: most recently active visible chat (recency).
         let first = {

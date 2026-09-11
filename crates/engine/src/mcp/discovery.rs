@@ -129,22 +129,22 @@ impl McpDiscovery {
 
     async fn connect_phase(config: &McpServerConfig) -> Result<(), DiscoveryError> {
         // For stdio, simulate exit-code detection: if command is "false" or empty, treat as dead
-        if let crate::mcp::McpTransport::Stdio = config.transport {
-            if let Some(cmd) = &config.command {
-                if cmd == "__dead__" {
-                    return Err(DiscoveryError::StdioExit(Some(1)));
-                }
-                // Simulate process spawn check – if command contains "exit", fake exit
-                if cmd.contains("exit") {
-                    return Err(DiscoveryError::StdioExit(Some(1)));
-                }
+        if let crate::mcp::McpTransport::Stdio = config.transport
+            && let Some(cmd) = &config.command
+        {
+            if cmd == "__dead__" {
+                return Err(DiscoveryError::StdioExit(Some(1)));
+            }
+            // Simulate process spawn check – if command contains "exit", fake exit
+            if cmd.contains("exit") {
+                return Err(DiscoveryError::StdioExit(Some(1)));
             }
         }
         // Simulate connect latency for deterministic tests: "slow-connect" → exceeds CONNECT_TIMEOUT
-        if let Some(url) = &config.url {
-            if url.contains("slow-connect") {
-                tokio::time::sleep(CONNECT_TIMEOUT + Duration::from_secs(1)).await;
-            }
+        if let Some(url) = &config.url
+            && url.contains("slow-connect")
+        {
+            tokio::time::sleep(CONNECT_TIMEOUT + Duration::from_secs(1)).await;
         }
         Ok(())
     }
@@ -153,10 +153,10 @@ impl McpDiscovery {
         // In real impl, this would call rmcp client's tools/list.
         // Here we synthesize based on transport for tests – empty but ready.
         // To allow deterministic tests, if url contains "slow", delay beyond timeout.
-        if let Some(url) = &config.url {
-            if url.contains("slow") {
-                tokio::time::sleep(TOOLS_TIMEOUT + Duration::from_secs(1)).await;
-            }
+        if let Some(url) = &config.url
+            && url.contains("slow")
+        {
+            tokio::time::sleep(TOOLS_TIMEOUT + Duration::from_secs(1)).await;
         }
         // Return a placeholder list – callers can inspect that discovery succeeded.
         vec![DiscoveredTool {

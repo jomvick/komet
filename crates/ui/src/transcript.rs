@@ -34,9 +34,9 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     AnyElement, App, BorderStyle, ClipboardItem, Context, Entity, Focusable as _, ListAlignment,
-    ListOffset, ListScrollEvent, ListState, MouseButton, ObjectFit, SharedString,
-    StyledImage as _, StyledText, Subscription, Task, TextRun, WeakEntity, Window, canvas, div,
-    img, list, prelude::*, px, quad,
+    ListOffset, ListScrollEvent, ListState, MouseButton, ObjectFit, SharedString, StyledImage as _,
+    StyledText, Subscription, Task, TextRun, WeakEntity, Window, canvas, div, img, list,
+    prelude::*, px, quad,
 };
 
 use komet_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
@@ -2718,8 +2718,7 @@ impl Transcript {
             .pt(px(4.0));
         for (aix, att) in atts.iter().enumerate() {
             let state = self.attachment_state(&device_ids, &att.path, cx);
-            let sending =
-                att.path.starts_with("pending://") || att.path.starts_with("pending/");
+            let sending = att.path.starts_with("pending://") || att.path.starts_with("pending/");
             let uploading = sending
                 .then(|| self.state.read(cx).upload_progress_percent())
                 .flatten();
@@ -3322,9 +3321,9 @@ impl Transcript {
                 move |_, window, cx| {
                     let row = edit_row.clone();
                     let source = source.to_string();
-                    if let Ok(focus) = edit_entity.update(cx, |this, cx| {
-                        this.begin_prompt_edit(row, source, cx)
-                    }) {
+                    if let Ok(focus) =
+                        edit_entity.update(cx, |this, cx| this.begin_prompt_edit(row, source, cx))
+                    {
                         window.focus(&focus, cx);
                     }
                 },
@@ -3377,26 +3376,26 @@ impl Transcript {
         let row_key = row_id.clone();
         let entity = cx.weak_entity();
         let handler: render::CopyHandler = Rc::new(move |ix, code, _window, cx| {
-                cx.write_to_clipboard(ClipboardItem::new_string(code.to_string()));
-                let row_key = row_key.clone();
-                entity
-                    .update(cx, |this, cx| {
-                        this.copied_code = Some((row_key, ix));
-                        this.copied_clear = Some(cx.spawn(async move |this, cx| {
-                            cx.background_executor()
-                                .timer(Duration::from_millis(1200))
-                                .await;
-                            this.update(cx, |this, cx| {
-                                this.copied_code = None;
-                                this.copied_clear = None;
-                                cx.notify();
-                            })
-                            .ok();
-                        }));
-                        cx.notify();
-                    })
-                    .ok();
-            });
+            cx.write_to_clipboard(ClipboardItem::new_string(code.to_string()));
+            let row_key = row_key.clone();
+            entity
+                .update(cx, |this, cx| {
+                    this.copied_code = Some((row_key, ix));
+                    this.copied_clear = Some(cx.spawn(async move |this, cx| {
+                        cx.background_executor()
+                            .timer(Duration::from_millis(1200))
+                            .await;
+                        this.update(cx, |this, cx| {
+                            this.copied_code = None;
+                            this.copied_clear = None;
+                            cx.notify();
+                        })
+                        .ok();
+                    }));
+                    cx.notify();
+                })
+                .ok();
+        });
         render::CopyUi { handler, copied_ix }
     }
 
