@@ -880,6 +880,13 @@ fn hermes_and_pi_descriptor_surfaces_match_registry_expectations() {
             komet_proto::ReasoningLevel::Max,
         ]
     );
+
+    let opencode = AcpHarness::opencode();
+    assert_eq!(opencode.id(), HarnessId::Opencode);
+    assert!(
+        opencode.reasoning_levels().is_empty(),
+        "effort is per-model via wire variants, not a global ladder"
+    );
 }
 
 /// The 2026-08-12 stuck-Working wedge, end to end: a prompt whose turn was

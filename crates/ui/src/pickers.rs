@@ -1290,27 +1290,25 @@ impl Pickers {
             config.mcp_server_ids = existing.mcp_server_ids.clone();
         }
         change(&mut config);
-        // Reasoning must stay concrete for whatever model the row now names —
-        // same ladder resolution as [`Self::trait_ladder`] (model levels, else
-        // the harness's advertised ladder).
+        // Reasoning must stay concrete for whatever model the row now names.
+        // A catalog model's ladder is authoritative even when empty (Haiku,
+        // Antigravity Claude — those models reject `--effort`). The harness
+        // ladder is only used for a stale id the catalog no longer lists.
         if let Some(models) = self.models.get(&config.harness).and_then(|l| l.ready()) {
-            let mut ladder = config
+            let found = config
                 .model
                 .as_deref()
-                .and_then(|id| models.iter().find(|m| m.id == id))
-                .map(|m| m.reasoning_levels.clone())
-                .unwrap_or_default();
-            if ladder.is_empty()
-                && let Some(descriptor) = self
+                .and_then(|id| models.iter().find(|m| m.id == id));
+            let ladder = match found {
+                Some(model) => model.reasoning_levels.clone(),
+                None => self
                     .harnesses
                     .ready()
                     .and_then(|list| list.iter().find(|d| d.id == config.harness))
-            {
-                ladder = descriptor.reasoning_levels.clone();
-            }
-            if !ladder.is_empty() {
-                config.reasoning = clamp_reasoning(config.reasoning, &ladder);
-            }
+                    .map(|d| d.reasoning_levels.clone())
+                    .unwrap_or_default(),
+            };
+            config.reasoning = clamp_reasoning(config.reasoning, &ladder);
         }
         self.state.update(cx, |state, cx| {
             state.apply_chat_config(&chat_id, config.clone());
@@ -1333,22 +1331,12 @@ impl Pickers {
 
     // ---- keyboard ----
 
-    /// The traits popover's reasoning ladder (model levels, falling back to
-    /// the harness's advertised ladder) — shared by render and keyboard nav.
+    /// The traits popover's reasoning ladder. A catalog model's levels are
+    /// authoritative even when empty — falling back to the harness ladder is
+    /// what sent `--effort` to Haiku / Antigravity Claude.
     fn trait_ladder(&self, cx: &App) -> Vec<ReasoningLevel> {
-        let Some(model) = self.selected_model(cx) else {
-            return Vec::new();
-        };
-        if !model.reasoning_levels.is_empty() {
-            return model.reasoning_levels.clone();
-        }
-        self.effective_harness(cx)
-            .and_then(|h| {
-                self.harnesses
-                    .ready()
-                    .and_then(|list| list.iter().find(|d| d.id == h))
-                    .map(|d| d.reasoning_levels.clone())
-            })
+        self.selected_model(cx)
+            .map(|m| m.reasoning_levels.clone())
             .unwrap_or_default()
     }
 
@@ -4076,8 +4064,10 @@ mod tests {
         assert_eq!(default_reasoning(&[Minimal, Low, Medium]), Some(Medium));
         // Neither offered: first entry.
         assert_eq!(default_reasoning(&[Minimal, Low]), Some(Minimal));
-        // Ladder-less model (Haiku): no reasoning at all.
+        // Ladder-less model (Haiku): no reasoning at all — and a leftover
+        // High from another model must not survive (that became --effort).
         assert_eq!(default_reasoning(&[]), None);
+        assert_eq!(clamp_reasoning(Some(High), &[]), None);
     }
 
     #[test]

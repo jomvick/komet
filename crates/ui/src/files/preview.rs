@@ -2243,7 +2243,8 @@ impl FilesSurface {
             .preview
             .active_comment
             .as_deref()
-            .and_then(|id| comments.iter().find(|comment| comment.id == id)).cloned();
+            .and_then(|id| comments.iter().find(|comment| comment.id == id))
+            .cloned();
         if let Some(comment) = active_comment
             && let Some(top) = editor_comment_overlay_top(
                 &layout,

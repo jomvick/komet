@@ -521,23 +521,13 @@ fn opencode_spec() -> AcpAgentSpec {
         // No `_session/steering` extension (1.18.18): turn boundaries.
         steering_mode: SteeringMode::TurnBoundary,
         // Effort rides opencode's model VARIANTS: when the session's current
-        // model has variants (models.dev metadata, or `variants` in
-        // opencode.json), the session advertises an `effort` config option
-        // (category thought_level) whose values mirror them — verified live
-        // (1.18.18) end to end: set_config_option effort=high applies the
-        // variant's options to the provider request. Variant-less models
-        // (the Zen frees today) advertise no option and the run-start set
-        // skips, falling to the agent default — so the blanket ladder here
-        // is safe (pi precedent). The option is per-model and reactive;
-        // exact per-model ladders would need the sidecar's provider.list
-        // (model.variants) — follow-up.
-        reasoning_levels: &[
-            ReasoningLevel::Low,
-            ReasoningLevel::Medium,
-            ReasoningLevel::High,
-            ReasoningLevel::XHigh,
-            ReasoningLevel::Max,
-        ],
+        // model has variants, the session advertises an `effort` config option
+        // (category thought_level). Variant-less models (the Zen frees today)
+        // advertise no option and the run-start set skips. The harness ladder
+        // stays empty so the picker does not invent Low/Medium/High for those
+        // models — leftover reasoning is ignored, not forwarded as a rejected
+        // set_config_option.
+        reasoning_levels: &[],
         prompt_transform: identity_transform,
         effort_values: default_effort_values,
         ladder_extras: &[],
@@ -2014,8 +2004,8 @@ fn usage_events_from_response(res: &Result<Value, HarnessError>) -> Vec<AgentEve
         return Vec::new();
     };
     let mut events = Vec::new();
-    if let Some(ev) = native_context_event(resp)
-        .or_else(|| resp.get("_meta").and_then(native_context_event))
+    if let Some(ev) =
+        native_context_event(resp).or_else(|| resp.get("_meta").and_then(native_context_event))
     {
         events.push(ev);
     }
@@ -2054,10 +2044,7 @@ async fn emit_grok_session_info(
     }
     match tokio::time::timeout(
         Duration::from_millis(750),
-        client.request(
-            "_x.ai/session/info",
-            json!({ "sessionId": session_id }),
-        ),
+        client.request("_x.ai/session/info", json!({ "sessionId": session_id })),
     )
     .await
     {
@@ -2329,6 +2316,7 @@ fn acp_auto_permission(
 ///   Read only auto-denies writes/commands, Sandboxed blocks on the engine's
 ///   permission bridge. A dropped resolver degrades to Deny — never a silent
 ///   allow.
+#[allow(clippy::too_many_arguments)]
 fn handle_server_request_live(
     client: &RpcClient,
     id: Value,

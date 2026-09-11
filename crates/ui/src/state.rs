@@ -857,10 +857,23 @@ impl AppState {
 
     /// Derives or returns the current context usage metrics for the selected chat.
     pub fn current_context_usage(&self) -> komet_proto::ContextUsageStats {
+        let estimated = self.transcript_token_estimate();
         if let Some(chat_id) = &self.selected_chat
-            && let Some(stats) = self.context_usage.get(chat_id)
+            && let Some(mut stats) = self.context_usage.get(chat_id).cloned()
         {
-            return stats.clone();
+            // Cursor (and similar) bill tool-loop prompt tokens far past the
+            // window, then the adapter used to clamp that to 100%. That is
+            // not occupancy — the session keeps going. Prefer the transcript
+            // estimate so the ring can move instead of pinning full.
+            let billed_overshoot = stats.source == komet_proto::ContextUsageSource::Approximate
+                && stats.context_limit > 0
+                && stats.input_tokens > stats.context_limit
+                && stats.used() >= stats.context_limit;
+            if billed_overshoot && estimated > 0 {
+                stats.used_tokens = estimated;
+                stats.source = komet_proto::ContextUsageSource::Estimated;
+            }
+            return stats;
         }
         let model_name = self
             .selected_chat_row()
@@ -870,7 +883,11 @@ impl AppState {
         let limit = komet_proto::default_context_limit_for_model(model_name);
         let mut stats = komet_proto::ContextUsageStats::new(limit);
         stats.source = komet_proto::ContextUsageSource::Estimated;
+        stats.input_tokens = estimated;
+        stats
+    }
 
+    fn transcript_token_estimate(&self) -> u64 {
         let mut total_chars: usize = 0;
         for entry in &self.transcript {
             for part in &entry.parts {
@@ -887,9 +904,7 @@ impl AppState {
                 }
             }
         }
-        let estimated_tokens = (total_chars / 4) as u64;
-        stats.input_tokens = estimated_tokens;
-        stats
+        (total_chars / 4) as u64
     }
 
     pub fn apply_auth(&mut self, auth: AuthState) {
@@ -2570,6 +2585,41 @@ mod tests {
         let stats = state.current_context_usage();
         assert_eq!(stats.used(), 1_000);
         assert_eq!(stats.source, komet_proto::ContextUsageSource::Native);
+    }
+
+    #[test]
+    fn approximate_billed_overshoot_does_not_pin_the_ring_at_full() {
+        let mut state = AppState::new();
+        state.selected_chat = Some("c1".into());
+        state.transcript = vec![komet_doc::SessionMessageEntry {
+            id: "m1".into(),
+            role: komet_doc::MessageRole::User,
+            parts: vec![komet_doc::MessagePart::Text {
+                id: "p1".into(),
+                text: "x".repeat(40_000),
+            }],
+            created_at: 0,
+            device_id: "d".into(),
+            status: None,
+            continuation_of: None,
+        }];
+        state.apply_context_usage(
+            "c1",
+            komet_proto::ContextUsageStats::window(
+                131_072,
+                131_072,
+                komet_proto::ContextUsageSource::Approximate,
+                1_800_000,
+                0,
+                24_000,
+                0,
+            ),
+        );
+        let stats = state.current_context_usage();
+        assert_eq!(stats.source, komet_proto::ContextUsageSource::Estimated);
+        assert_eq!(stats.used(), 10_000);
+        assert!(stats.context_percent() < 100);
+        assert_eq!(stats.input_tokens, 1_800_000);
     }
 
     #[test]

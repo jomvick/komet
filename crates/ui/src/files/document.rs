@@ -326,9 +326,11 @@ impl FileDocument {
             .pending_save
             .as_ref()
             .map_or(0, |save| save.text.capacity());
-        let editor_text_bytes = if self
-            .editor
-            .is_some() { file_text_bytes } else { 0 };
+        let editor_text_bytes = if self.editor.is_some() {
+            file_text_bytes
+        } else {
+            0
+        };
 
         std::mem::size_of::<Self>()
             .saturating_add(file_text_bytes)

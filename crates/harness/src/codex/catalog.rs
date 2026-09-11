@@ -28,15 +28,40 @@ pub(crate) const REASONING_LEVELS: &[ReasoningLevel] = &[
 /// accept `max` and `ultra` natively (gpt-5.6+), so those pass straight
 /// through — only the levels Codex can't take are clamped to the nearest
 /// effort (port of codex.ts `toEffort`).
-pub(crate) fn to_effort(reasoning: Option<ReasoningLevel>) -> Option<&'static str> {
-    Some(match reasoning? {
+fn wire_effort(level: ReasoningLevel) -> &'static str {
+    match level {
         ReasoningLevel::Minimal | ReasoningLevel::Low => "low",
         ReasoningLevel::Medium => "medium",
         ReasoningLevel::High => "high",
         ReasoningLevel::XHigh | ReasoningLevel::Ultracode | ReasoningLevel::Ultrathink => "xhigh",
         ReasoningLevel::Max => "max",
         ReasoningLevel::Ultra => "ultra",
-    })
+    }
+}
+
+/// Map the unified level to the wire `effort` field. When `model` is a known
+/// catalog id, unsupported leftovers (e.g. Medium on a high-only model) are
+/// omitted — Codex rejects those the same way `agy` rejects `--effort` on Claude.
+pub(crate) fn to_effort(
+    reasoning: Option<ReasoningLevel>,
+    model: Option<&str>,
+    catalog: &[Model],
+) -> Option<&'static str> {
+    let mapped = wire_effort(reasoning?);
+    if let Some(id) = model.filter(|id| !id.is_empty())
+        && let Some(entry) = catalog.iter().find(|m| m.id == id)
+    {
+        let offered: Vec<&str> = entry
+            .reasoning_levels
+            .iter()
+            .copied()
+            .map(wire_effort)
+            .collect();
+        if !offered.contains(&mapped) {
+            return None;
+        }
+    }
+    Some(mapped)
 }
 
 /// `thread/start`'s `sandbox` param (kebab-case wire words).
@@ -73,30 +98,6 @@ pub(crate) fn sandbox_policy_value(sandbox: SandboxLevel) -> serde_json::Value {
     serde_json::Value::Object(policy)
 }
 
-const ULTRA_LADDER: &[ReasoningLevel] = &[
-    ReasoningLevel::Low,
-    ReasoningLevel::Medium,
-    ReasoningLevel::High,
-    ReasoningLevel::XHigh,
-    ReasoningLevel::Max,
-    ReasoningLevel::Ultra,
-];
-
-const MAX_LADDER: &[ReasoningLevel] = &[
-    ReasoningLevel::Low,
-    ReasoningLevel::Medium,
-    ReasoningLevel::High,
-    ReasoningLevel::XHigh,
-    ReasoningLevel::Max,
-];
-
-const XHIGH_LADDER: &[ReasoningLevel] = &[
-    ReasoningLevel::Low,
-    ReasoningLevel::Medium,
-    ReasoningLevel::High,
-    ReasoningLevel::XHigh,
-];
-
 /// The service-tier select the app server reports per model (`serviceTiers` /
 /// `additionalSpeedTiers` in `model/list`); "default" means Standard and is
 /// omitted from the wire params entirely.
@@ -118,25 +119,37 @@ fn service_tier() -> ModelOption {
     }
 }
 
-fn model(id: &str, label: &str, description: &str, ladder: &[ReasoningLevel]) -> Model {
+fn model(id: &str, label: &str, description: &str, ladder: Vec<ReasoningLevel>) -> Model {
     Model {
         id: id.into(),
         label: label.into(),
         description: (!description.is_empty()).then(|| description.into()),
-        reasoning_levels: ladder.to_vec(),
+        reasoning_levels: ladder,
         options: vec![service_tier()],
     }
 }
 
-/// Map a live `models_cache.json` effort list to the closest ladder.
-fn ladder_for_efforts(efforts: &[String]) -> &'static [ReasoningLevel] {
-    if efforts.iter().any(|e| e == "ultra") {
-        ULTRA_LADDER
-    } else if efforts.iter().any(|e| e == "max") {
-        MAX_LADDER
-    } else {
-        XHIGH_LADDER
+/// Map a live `models_cache.json` effort list to the exact levels Codex
+/// advertises — not the nearest full ladder. A high-only model (`gpt-5.5`)
+/// must not offer Medium/XHigh or the picker will send a rejected `effort`.
+fn ladder_for_efforts(efforts: &[String]) -> Vec<ReasoningLevel> {
+    let mut out = Vec::new();
+    for effort in efforts {
+        let level = match effort.as_str() {
+            "minimal" => ReasoningLevel::Minimal,
+            "low" => ReasoningLevel::Low,
+            "medium" => ReasoningLevel::Medium,
+            "high" => ReasoningLevel::High,
+            "xhigh" => ReasoningLevel::XHigh,
+            "max" => ReasoningLevel::Max,
+            "ultra" => ReasoningLevel::Ultra,
+            _ => continue,
+        };
+        if !out.contains(&level) {
+            out.push(level);
+        }
     }
+    out
 }
 
 /// Parse a `~/.codex/models_cache.json` document into models. `None` when the
@@ -174,40 +187,60 @@ pub(crate) fn parse_models_cache(value: &serde_json::Value) -> Option<Vec<Model>
     (!out.is_empty()).then_some(out)
 }
 
+/// Live `~/.codex/models_cache.json` first, curated snapshot as fallback.
+/// Shared by [`CodexHarness::models`] and [`to_effort`] so the picker and the
+/// wire never disagree on which efforts a slug accepts.
+pub(crate) fn load_catalog() -> Vec<Model> {
+    if let Some(home) = std::env::var_os("CODEX_HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".codex")))
+    {
+        let cache = home.join("models_cache.json");
+        if let Ok(text) = std::fs::read_to_string(&cache)
+            && let Ok(value) = serde_json::from_str::<serde_json::Value>(&text)
+            && let Some(models) = parse_models_cache(&value)
+        {
+            return models;
+        }
+    }
+    static_models()
+}
+
 /// The curated catalog: a snapshot of the live `models_cache.json` (codex-cli
 /// 0.147) — keep in sync; stale ids are rejected by the app server. Mirrors
-/// codex.ts's `CODEX_MODELS` fallback.
+/// codex.ts's `CODEX_MODELS` fallback. Ladders match `supported_reasoning_levels`.
 pub(crate) fn static_models() -> Vec<Model> {
     vec![
         model(
             "gpt-5.6-terra",
             "GPT-5.6-Terra",
             "Balanced agentic coding model for everyday work.",
-            ULTRA_LADDER,
+            vec![ReasoningLevel::Low, ReasoningLevel::Ultra],
         ),
         model(
             "gpt-5.6-luna",
             "GPT-5.6-Luna",
             "Fast and affordable agentic coding model.",
-            MAX_LADDER,
+            vec![ReasoningLevel::Low, ReasoningLevel::Max],
         ),
         model(
             "gpt-5.5",
             "GPT-5.5",
             "Frontier model for complex coding, research, and real-world work.",
-            XHIGH_LADDER,
+            vec![ReasoningLevel::High],
         ),
         model(
             "gpt-5.4-mini",
             "GPT-5.4-Mini",
             "Small, fast, and cost-efficient model for simpler coding tasks.",
-            XHIGH_LADDER,
+            vec![ReasoningLevel::High],
         ),
         model(
             "codex-auto-review",
             "Codex Auto Review",
             "Automatic approval review model for Codex.",
-            MAX_LADDER,
+            vec![ReasoningLevel::Max],
         ),
     ]
 }
@@ -264,12 +297,53 @@ mod tests {
 
     #[test]
     fn effort_clamps_like_codex_ts() {
-        assert_eq!(to_effort(None), None);
-        assert_eq!(to_effort(Some(ReasoningLevel::Minimal)), Some("low"));
-        assert_eq!(to_effort(Some(ReasoningLevel::Ultracode)), Some("xhigh"));
-        assert_eq!(to_effort(Some(ReasoningLevel::Ultrathink)), Some("xhigh"));
-        assert_eq!(to_effort(Some(ReasoningLevel::Max)), Some("max"));
-        assert_eq!(to_effort(Some(ReasoningLevel::Ultra)), Some("ultra"));
+        assert_eq!(to_effort(None, None, &static_models()), None);
+        assert_eq!(
+            to_effort(Some(ReasoningLevel::Minimal), None, &static_models()),
+            Some("low")
+        );
+        assert_eq!(
+            to_effort(Some(ReasoningLevel::Ultracode), None, &static_models()),
+            Some("xhigh")
+        );
+        assert_eq!(
+            to_effort(Some(ReasoningLevel::Ultrathink), None, &static_models()),
+            Some("xhigh")
+        );
+        assert_eq!(
+            to_effort(Some(ReasoningLevel::Max), None, &static_models()),
+            Some("max")
+        );
+        assert_eq!(
+            to_effort(Some(ReasoningLevel::Ultra), None, &static_models()),
+            Some("ultra")
+        );
+        // Known high-only model: leftover Medium must not go on the wire.
+        assert_eq!(
+            to_effort(
+                Some(ReasoningLevel::Medium),
+                Some("gpt-5.5"),
+                &static_models()
+            ),
+            None
+        );
+        assert_eq!(
+            to_effort(
+                Some(ReasoningLevel::High),
+                Some("gpt-5.5"),
+                &static_models()
+            ),
+            Some("high")
+        );
+        // Unknown slug: still forward (the server is the source of truth).
+        assert_eq!(
+            to_effort(
+                Some(ReasoningLevel::Ultra),
+                Some("gpt-5.6-sol"),
+                &static_models()
+            ),
+            Some("ultra")
+        );
     }
 
     #[test]
@@ -278,7 +352,8 @@ mod tests {
         assert_eq!(models.len(), 5);
         assert_eq!(models[0].id, "gpt-5.6-terra");
         assert!(models[0].reasoning_levels.contains(&ReasoningLevel::Ultra));
-        assert!(!models[2].reasoning_levels.contains(&ReasoningLevel::Max));
+        assert!(!models[0].reasoning_levels.contains(&ReasoningLevel::High));
+        assert_eq!(models[2].reasoning_levels, vec![ReasoningLevel::High]);
         for m in &models {
             let tier = m.options.iter().find(|o| o.id == "serviceTier");
             assert!(tier.is_some(), "{} missing serviceTier", m.id);
@@ -309,6 +384,24 @@ mod tests {
         let parsed = parse_models_cache(&value).expect("parses");
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].id, "gpt-5.6-terra");
-        assert!(parsed[0].reasoning_levels.contains(&ReasoningLevel::Ultra));
+        assert_eq!(
+            parsed[0].reasoning_levels,
+            vec![ReasoningLevel::Low, ReasoningLevel::Ultra]
+        );
+    }
+
+    #[test]
+    fn parse_models_cache_keeps_single_effort_ladders_exact() {
+        let value = serde_json::json!({
+            "models": [
+                {
+                    "slug": "gpt-5.5",
+                    "display_name": "GPT-5.5",
+                    "supported_reasoning_levels": [{"effort": "high"}]
+                }
+            ]
+        });
+        let parsed = parse_models_cache(&value).expect("parses");
+        assert_eq!(parsed[0].reasoning_levels, vec![ReasoningLevel::High]);
     }
 }

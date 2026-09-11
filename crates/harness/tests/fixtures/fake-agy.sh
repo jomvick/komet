@@ -15,6 +15,9 @@ fi
 has_skip_perms=0
 has_add_dir=0
 has_sandbox=0
+has_effort=0
+effort_val=""
+model=""
 mode=""
 prompt=""
 
@@ -36,6 +39,15 @@ while [ $# -gt 0 ]; do
             has_add_dir=1
             shift 2
             ;;
+        --model)
+            model="$2"
+            shift 2
+            ;;
+        --effort)
+            has_effort=1
+            effort_val="$2"
+            shift 2
+            ;;
         -p)
             prompt="$2"
             shift 2
@@ -45,6 +57,35 @@ while [ $# -gt 0 ]; do
             ;;
     esac
 done
+
+# Mirror live `agy` validation: Claude rejects --effort; suffixed Gemini/GPT
+# ids conflict with a mismatched --effort.
+case "$model" in
+    *claude*)
+        if [ "$has_effort" -eq 1 ]; then
+            echo "error: invalid model selection (--model \"$model\" --effort \"$effort_val\"): --effort is not supported for model \"$model\"" >&2
+            exit 2
+        fi
+        ;;
+    *-high)
+        if [ "$has_effort" -eq 1 ] && [ "$effort_val" != "high" ]; then
+            echo "error: invalid model selection (--model \"$model\" --effort \"$effort_val\"): --model $model conflicts with --effort=$effort_val" >&2
+            exit 2
+        fi
+        ;;
+    *-medium)
+        if [ "$has_effort" -eq 1 ] && [ "$effort_val" != "medium" ]; then
+            echo "error: invalid model selection (--model \"$model\" --effort \"$effort_val\"): --model $model conflicts with --effort=$effort_val" >&2
+            exit 2
+        fi
+        ;;
+    *-low)
+        if [ "$has_effort" -eq 1 ] && [ "$effort_val" != "low" ]; then
+            echo "error: invalid model selection (--model \"$model\" --effort \"$effort_val\"): --model $model conflicts with --effort=$effort_val" >&2
+            exit 2
+        fi
+        ;;
+esac
 
 case "$prompt" in
     *scenario:happy*)

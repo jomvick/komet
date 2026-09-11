@@ -7,6 +7,35 @@
 # mirror live captures from CLI 2.1.228. Driven by
 # crates/harness/tests/claude.rs.
 
+model=""
+effort=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --model)
+            model="$2"
+            shift 2
+            ;;
+        --effort)
+            effort="$2"
+            shift 2
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+
+# Haiku has no --effort ladder (thinking is a toggle). Mirror live CLI
+# rejection so leftover Medium/High from another model cannot slip through.
+case "$model" in
+    *haiku*)
+        if [ -n "$effort" ]; then
+            echo "error: --effort is not supported for model $model" >&2
+            exit 2
+        fi
+        ;;
+esac
+
 read -r first || exit 1
 
 emit() { printf '%s\n' "$1"; }

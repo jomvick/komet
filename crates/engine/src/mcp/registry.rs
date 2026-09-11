@@ -164,10 +164,10 @@ impl McpRegistry {
     }
 
     fn persist(&self, servers: &HashMap<String, McpServerConfig>) -> anyhow::Result<()> {
-        if let Some(parent) = self.file_path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
+        if let Some(parent) = self.file_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
         }
         // Persist as versioned wrapper for determinism and migration support
         // The registry stores only secret key names. Values belong exclusively
