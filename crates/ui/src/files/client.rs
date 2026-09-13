@@ -38,6 +38,34 @@ impl FilesRequestContext {
             checkout_id: chat.checkout_id.clone(),
         })
     }
+
+    pub fn for_space(state: &AppState, space: &komet_proto::Space) -> Self {
+        let target_device_id = (state.local_device_id.as_deref() != Some(&space.device_id))
+            .then(|| space.device_id.clone());
+        Self {
+            target: WorkspaceTarget {
+                chat_id: None,
+                space_id: Some(space.id.clone()),
+                checkout_path: None,
+            },
+            target_device_id,
+            cwd: space.path.clone(),
+            checkout_id: space.checkout_id.clone(),
+        }
+    }
+
+    /// Chat workspace when `chat_id` is a live session; otherwise the
+    /// new-session canvas's selected project (picker / Files / Terminal).
+    pub fn resolve(state: &AppState, chat_id: &str) -> Option<Self> {
+        if !chat_id.is_empty()
+            && let Some(context) = Self::for_chat(state, chat_id)
+        {
+            return Some(context);
+        }
+        state
+            .selected_space_row()
+            .map(|space| Self::for_space(state, space))
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -230,6 +258,32 @@ mod tests {
             space_id: None,
             checkout_path: None,
         }
+    }
+
+    #[test]
+    fn resolve_uses_the_selected_space_when_no_chat_exists() {
+        let mut state = AppState::new();
+        state.local_device_id = Some("dev".into());
+        state.selected_space = Some("space-1".into());
+        state.spaces = vec![komet_proto::Space {
+            id: "space-1".into(),
+            device_id: "dev".into(),
+            path: "/repo/ribo".into(),
+            name: Some("Ribo".into()),
+            git_detected: true,
+            git_checked_at: None,
+            checkout_id: Some("co-1".into()),
+            created_at: chrono::DateTime::parse_from_rfc3339("2026-07-19T12:00:00Z")
+                .unwrap()
+                .to_utc(),
+        }];
+
+        let context = FilesRequestContext::resolve(&state, "space-canvas:space-1").unwrap();
+        assert_eq!(context.target.space_id.as_deref(), Some("space-1"));
+        assert!(context.target.chat_id.is_none());
+        assert_eq!(context.cwd, "/repo/ribo");
+        assert!(context.target_device_id.is_none());
+        assert!(FilesRequestContext::resolve(&state, "").is_some());
     }
 
     #[test]

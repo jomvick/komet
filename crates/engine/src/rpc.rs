@@ -22,7 +22,7 @@
 //!   `CreateRepo {name}`, `ListBranches {repoPath}` (default branch first),
 //!   `ListFolders {path?}`, `CreateWorktree {repoPath, branch}`, `DeleteWorktree
 //!   {repoPath, worktreePath}`; `WatchCheckoutDiffs` → stream of `CheckoutDiff[]`
-//! - Terminals (§3.4): `OpenTerminal {chatId, cols, rows}` → `TerminalSession`,
+//! - Terminals (§3.4): `OpenTerminal {chatId?, spaceId?, cols, rows}` → `TerminalSession`,
 //!   `SubscribeTerminal {terminalId, afterSeq?}` → stream of `TerminalEvent`
 //!   (replay then live tail), `WriteTerminal {terminalId, data}`, `ResizeTerminal`,
 //!   `CloseTerminal`. M5 is single-user local: per-user owner checks land with
@@ -252,9 +252,36 @@ fn tool_file_path(call: &ToolCall) -> Option<&str> {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct OpenTerminalParams {
-    chat_id: String,
+    #[serde(default)]
+    chat_id: Option<String>,
+    #[serde(default)]
+    space_id: Option<String>,
     cols: u16,
     rows: u16,
+}
+
+fn terminal_cwd(
+    workspace: &WorkspaceHost,
+    chat_id: Option<&str>,
+    space_id: Option<&str>,
+) -> String {
+    if let Some(chat_id) = chat_id.filter(|id| !id.is_empty()) {
+        return workspace
+            .chat(chat_id)
+            .ok()
+            .flatten()
+            .and_then(|chat| chat.cwd)
+            .unwrap_or_else(|| home_dir().to_string_lossy().to_string());
+    }
+    if let Some(space_id) = space_id.filter(|id| !id.is_empty()) {
+        return workspace
+            .space(space_id)
+            .ok()
+            .flatten()
+            .map(|space| space.path)
+            .unwrap_or_else(|| home_dir().to_string_lossy().to_string());
+    }
+    home_dir().to_string_lossy().to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -1852,15 +1879,11 @@ impl RpcService for EngineRpc {
             }
             methods::OPEN_TERMINAL => {
                 let p: OpenTerminalParams = parse_params(params)?;
-                // The terminal runs in the chat's checkout; a chat with no cwd (or
-                // no row yet) gets the home directory.
-                let cwd = self
-                    .workspace
-                    .chat(&p.chat_id)
-                    .ok()
-                    .flatten()
-                    .and_then(|chat| chat.cwd)
-                    .unwrap_or_else(|| home_dir().to_string_lossy().to_string());
+                // Chat checkout when a session exists; otherwise the canvas
+                // project's folder. Missing both (or a row with no cwd) falls
+                // back to the home directory.
+                let cwd =
+                    terminal_cwd(&self.workspace, p.chat_id.as_deref(), p.space_id.as_deref());
                 let session = self
                     .terminals
                     .open(&cwd, p.cols, p.rows)
@@ -2033,6 +2056,33 @@ mod tests {
         assert!(forwardable(methods::QUEUE_COMMAND));
         assert!(forwardable(methods::SEARCH_FILES));
         assert!(forwardable(methods::FETCH_ALL));
+    }
+
+    #[test]
+    fn open_terminal_params_accept_space_without_chat() {
+        let p: OpenTerminalParams = parse_params(serde_json::json!({
+            "spaceId": "space-1",
+            "cols": 80,
+            "rows": 24,
+        }))
+        .expect("canvas OpenTerminal shape");
+        assert!(p.chat_id.is_none());
+        assert_eq!(p.space_id.as_deref(), Some("space-1"));
+        assert_eq!(p.cols, 80);
+        assert_eq!(p.rows, 24);
+    }
+
+    #[test]
+    fn open_terminal_params_still_accept_chat_only() {
+        let p: OpenTerminalParams = parse_params(serde_json::json!({
+            "chatId": "chat-1",
+            "cols": 120,
+            "rows": 40,
+        }))
+        .expect("session OpenTerminal shape");
+        assert_eq!(p.chat_id.as_deref(), Some("chat-1"));
+        assert!(p.space_id.is_none());
+        assert_eq!((p.cols, p.rows), (120, 40));
     }
 
     #[test]

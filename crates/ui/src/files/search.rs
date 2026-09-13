@@ -292,7 +292,7 @@ impl FilesSurface {
         });
         let Some(context) = self.request_context.clone() else {
             self.search_state.loading = false;
-            self.search_state.error = Some("No workspace available for this chat.".into());
+            self.search_state.error = Some("No workspace available.".into());
             cx.notify();
             return;
         };

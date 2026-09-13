@@ -741,7 +741,7 @@ impl FilesSurface {
         cx: &mut Context<Self>,
     ) {
         let Some(request_context) = self.request_context.clone() else {
-            self.error = Some("No workspace available for this chat.".into());
+            self.error = Some("No workspace available.".into());
             cx.notify();
             return;
         };
@@ -817,7 +817,7 @@ impl FilesSurface {
     }
 
     fn sync_target(&mut self, cx: &mut Context<Self>) -> bool {
-        let next = FilesRequestContext::for_chat(self.state.read(cx), &self.chat_id);
+        let next = FilesRequestContext::resolve(self.state.read(cx), &self.chat_id);
         if self.request_context == next {
             self.target_change_pending = false;
             self.pending_request_context = None;
@@ -858,7 +858,7 @@ impl FilesSurface {
         self.tree.reset();
         self.sync_tree_list();
         self.error = if next.is_none() {
-            Some("No workspace available for this chat.".into())
+            Some("No workspace available.".into())
         } else {
             None
         };

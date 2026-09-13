@@ -141,6 +141,15 @@ pub fn exit_message(code: i32) -> Vec<u8> {
     format!("\r\n\x1b[90m[process exited {code}]\x1b[0m\r\n").into_bytes()
 }
 
+/// Tab-map / panel key: a live chat id, or `space-canvas:{space}` on the
+/// new-session canvas so Terminal and Files share one per-project bucket.
+pub fn canvas_session_key(selected_chat: Option<&str>, selected_space: Option<&str>) -> String {
+    match selected_chat.filter(|id| !id.is_empty()) {
+        Some(chat) => chat.to_string(),
+        None => format!("space-canvas:{}", selected_space.unwrap_or_default()),
+    }
+}
+
 /// Tab title from the session's shell path ("/bin/zsh" → "zsh").
 pub fn shell_title(shell: &str) -> String {
     let name = shell.rsplit(['/', '\\']).next().unwrap_or(shell).trim();
@@ -343,9 +352,7 @@ impl TerminalPanel {
 
     /// `(key, title, exited)` for the selected chat's tabs, in tab order.
     pub fn tab_summaries(&self, cx: &App) -> Vec<(u64, SharedString, bool)> {
-        let Some(chat) = self.selected_chat(cx) else {
-            return Vec::new();
-        };
+        let chat = self.session_key(cx);
         self.chats
             .get(&chat)
             .map(|tabs| {
@@ -357,18 +364,16 @@ impl TerminalPanel {
             .unwrap_or_default()
     }
 
-    /// Open a fresh tab for the selected chat and return its key.
+    /// Open a fresh tab for the selected chat (or the canvas project) and
+    /// return its key.
     pub fn open_tab_for_selected(&mut self, cx: &mut Context<Self>) -> Option<u64> {
-        let chat = self.selected_chat(cx)?;
-        self.open_tab(chat, cx);
-        Some(self.tab_seq)
+        let chat = self.session_key(cx);
+        self.open_tab(chat, cx)
     }
 
     /// Make `key` the rendered tab of the selected chat.
     pub fn select_tab_by_key(&mut self, key: u64, cx: &mut Context<Self>) {
-        let Some(chat) = self.selected_chat(cx) else {
-            return;
-        };
+        let chat = self.session_key(cx);
         let Some(ix) = self
             .chats
             .get(&chat)
@@ -381,14 +386,12 @@ impl TerminalPanel {
 
     /// Close the selected chat's tab `key` (surface-tab ✕).
     pub fn close_tab_by_key(&mut self, key: u64, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(chat) = self.selected_chat(cx) else {
-            return;
-        };
+        let chat = self.session_key(cx);
         self.close_tab(&chat, key, window, cx);
     }
 
     fn on_state_changed(&mut self, cx: &mut Context<Self>) {
-        let selected = self.state.read(cx).selected_chat.clone();
+        let selected = Some(self.session_key(cx));
         let switched = selected != self.last_selected;
         if switched {
             self.last_selected = selected;
@@ -423,14 +426,41 @@ impl TerminalPanel {
         (state.local_device_id.as_deref() != Some(device.as_str())).then_some(device)
     }
 
-    fn selected_chat(&self, cx: &App) -> Option<String> {
-        self.state.read(cx).selected_chat.clone()
+    /// Tab-map key: the selected chat, or `space-canvas:{id}` on the
+    /// new-session canvas (same scheme as [`crate::shell::Shell`]'s panel
+    /// key) so Terminal / Files work before a session exists.
+    fn session_key(&self, cx: &App) -> String {
+        let state = self.state.read(cx);
+        canvas_session_key(
+            state.selected_chat.as_deref(),
+            state.selected_space.as_deref(),
+        )
+    }
+
+    fn session_target(&self, key: &str, cx: &App) -> Option<String> {
+        if let Some(target) = self.chat_target(key, cx) {
+            return Some(target);
+        }
+        let state = self.state.read(cx);
+        let space = state.selected_space_row()?;
+        (state.local_device_id.as_deref() != Some(space.device_id.as_str()))
+            .then(|| space.device_id.clone())
+    }
+
+    fn open_identity(&self, key: &str, cx: &App) -> (Option<String>, Option<String>) {
+        let state = self.state.read(cx);
+        if state.chats.iter().any(|chat| chat.id == key) {
+            (Some(key.to_string()), None)
+        } else {
+            (
+                None,
+                state.selected_space_row().map(|space| space.id.clone()),
+            )
+        }
     }
 
     fn ensure_tab(&mut self, cx: &mut Context<Self>) {
-        let Some(chat) = self.selected_chat(cx) else {
-            return;
-        };
+        let chat = self.session_key(cx);
         if self.chats.get(&chat).is_none_or(|c| c.tabs.is_empty()) {
             self.open_tab(chat, cx);
         }
@@ -445,17 +475,15 @@ impl TerminalPanel {
     }
 
     fn active_tab(&self, cx: &App) -> Option<&TerminalTab> {
-        let chat = self.state.read(cx).selected_chat.clone()?;
+        let chat = self.session_key(cx);
         let tabs = self.chats.get(&chat)?;
         tabs.tabs.get(tabs.active)
     }
 
     // ---- open / stream lifecycle ----
 
-    fn open_tab(&mut self, chat: String, cx: &mut Context<Self>) {
-        let Some(engine) = self.engine(cx) else {
-            return;
-        };
+    fn open_tab(&mut self, chat: String, cx: &mut Context<Self>) -> Option<u64> {
+        let engine = self.engine(cx)?;
         self.tab_seq += 1;
         let key = self.tab_seq;
         let entry = self.chats.entry(chat.clone()).or_default();
@@ -474,17 +502,21 @@ impl TerminalPanel {
         });
         entry.active = entry.tabs.len() - 1;
 
-        let target = self.chat_target(&chat, cx);
-        let run = Self::spawn_session(chat.clone(), key, engine, target, cx);
+        let target = self.session_target(&chat, cx);
+        let (chat_id, space_id) = self.open_identity(&chat, cx);
+        let run = Self::spawn_session(chat.clone(), chat_id, space_id, key, engine, target, cx);
         if let Some(tab) = self.tab_mut(&chat, key) {
             tab._run = Some(run);
         }
         cx.notify();
+        Some(key)
     }
 
     /// OpenTerminal, then pump SubscribeTerminal with reconnect backoff.
     fn spawn_session(
         chat: String,
+        chat_id: Option<String>,
+        space_id: Option<String>,
         key: u64,
         engine: EngineHandle,
         target: Option<String>,
@@ -500,14 +532,18 @@ impl TerminalPanel {
                 })
                 .unwrap_or((80, 24));
 
+            let mut params = serde_json::json!({ "cols": cols, "rows": rows });
+            if let Some(chat_id) = chat_id {
+                params["chatId"] = serde_json::Value::String(chat_id);
+            }
+            if let Some(space_id) = space_id {
+                params["spaceId"] = serde_json::Value::String(space_id);
+            }
             let opened = engine
                 .client()
                 .call_as::<TerminalSession>(
                     methods::OPEN_TERMINAL,
-                    with_target(
-                        serde_json::json!({ "chatId": chat, "cols": cols, "rows": rows }),
-                        &target,
-                    ),
+                    with_target(params, &target),
                 )
                 .await;
             let session = match opened {
@@ -674,9 +710,7 @@ impl TerminalPanel {
 
     /// Queue keyboard bytes on the active tab (12 ms coalescing window).
     fn queue_input(&mut self, bytes: &[u8], cx: &mut Context<Self>) {
-        let Some(chat) = self.selected_chat(cx) else {
-            return;
-        };
+        let chat = self.session_key(cx);
         let Some(tabs) = self.chats.get_mut(&chat) else {
             return;
         };
@@ -710,7 +744,7 @@ impl TerminalPanel {
         let Some(engine) = self.engine(cx) else {
             return;
         };
-        let target = self.chat_target(&chat, cx);
+        let target = self.session_target(&chat, cx);
         let Some(tab) = self.tab_mut(&chat, key) else {
             return;
         };
@@ -791,9 +825,7 @@ impl TerminalPanel {
         // which is almost all of them.
         self.geometry = Some(geometry);
         let (cols, rows) = (geometry.cols, geometry.rows);
-        let Some(chat) = self.selected_chat(cx) else {
-            return;
-        };
+        let chat = self.session_key(cx);
         let Some(tabs) = self.chats.get_mut(&chat) else {
             return;
         };
@@ -807,7 +839,7 @@ impl TerminalPanel {
         tab.emulator.resize(cols, rows);
         let key = tab.key;
         let engine = self.engine(cx);
-        let target = self.chat_target(&chat, cx);
+        let target = self.session_target(&chat, cx);
         if let (Some(engine), Some(tab)) = (engine, self.tab_mut(&chat, key)) {
             let id = tab.terminal_id.clone();
             tab.resize_task = Some(cx.spawn(async move |this, cx| {
@@ -860,7 +892,7 @@ impl TerminalPanel {
         cx: &App,
         f: impl FnOnce(&mut Emulator) -> R,
     ) -> Option<R> {
-        let chat = self.selected_chat(cx)?;
+        let chat = self.session_key(cx);
         let tabs = self.chats.get_mut(&chat)?;
         let active = tabs.active;
         tabs.tabs.get_mut(active).map(|tab| f(&mut tab.emulator))
@@ -1011,9 +1043,7 @@ impl TerminalPanel {
         if delta_lines == 0 {
             return;
         }
-        let Some(chat) = self.selected_chat(cx) else {
-            return;
-        };
+        let chat = self.session_key(cx);
         let Some(tabs) = self.chats.get_mut(&chat) else {
             return;
         };
@@ -1309,9 +1339,8 @@ impl TerminalPanel {
                     ))
                     .on_hover(motion::hover_listener("term-new-tab"))
                     .on_click(cx.listener(|this, _, _, cx| {
-                        if let Some(chat) = this.selected_chat(cx) {
-                            this.open_tab(chat, cx);
-                        }
+                        let chat = this.session_key(cx);
+                        this.open_tab(chat, cx);
                     }))
                     .child(
                         crate::icons::icon(crate::icons::PLUS)
@@ -1365,18 +1394,7 @@ impl Render for TerminalPanel {
         // fill here stacked another shade on the pane (user report); the
         // drawer keeps its own tone.
         let panel_bg: Option<gpui::Hsla> = (!self.embedded).then(|| terminal_panel_bg(&theme));
-        let Some(chat) = self.selected_chat(cx) else {
-            return div()
-                .size_full()
-                .when_some(panel_bg, |el, bg| el.bg(bg))
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_size(px(12.0))
-                .text_color(theme.text_faint)
-                .child(SharedString::from("Select a chat to open a terminal"))
-                .into_any_element();
-        };
+        let chat = self.session_key(cx);
         let focused = self.focus_handle.is_focused(window);
 
         // Embedded (right-pane surface host): the shell's surface tabs
@@ -1444,6 +1462,23 @@ mod tests {
         assert_eq!(backoff_ms(4), 8000);
         assert_eq!(backoff_ms(10), 8000);
         assert_eq!(backoff_ms(u32::MAX), 8000);
+    }
+
+    #[test]
+    fn canvas_session_key_prefers_the_chat_then_the_space() {
+        assert_eq!(
+            canvas_session_key(Some("chat-1"), Some("space-1")),
+            "chat-1"
+        );
+        assert_eq!(
+            canvas_session_key(None, Some("space-1")),
+            "space-canvas:space-1"
+        );
+        assert_eq!(
+            canvas_session_key(Some(""), Some("space-1")),
+            "space-canvas:space-1"
+        );
+        assert_eq!(canvas_session_key(None, None), "space-canvas:");
     }
 
     #[test]

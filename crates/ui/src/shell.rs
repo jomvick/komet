@@ -1707,9 +1707,6 @@ impl Shell {
     /// focus the existing surface instead of creating duplicate trees and
     /// duplicate workspace subscriptions.
     fn add_files_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.active_chat.is_empty() {
-            return;
-        }
         let key = self.panel_key(cx);
         if !self.files.contains_key(&key) {
             let delay = self.settings.files_autosave_delay_ms;
@@ -1719,7 +1716,7 @@ impl Shell {
             let files = cx.new(|cx| {
                 FilesSurface::new(
                     self.state.clone(),
-                    self.active_chat.clone(),
+                    key.clone(),
                     delay,
                     editor_font_size,
                     word_wrap,
@@ -1760,9 +1757,6 @@ impl Shell {
     /// a separate FilesSurface so its tree, search, watcher and split layout
     /// stay stable while users move among open files.
     fn add_file_surface(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
-        if self.active_chat.is_empty() {
-            return;
-        }
         let panel_key = self.panel_key(cx);
         let lookup = (panel_key.clone(), path.clone());
         if let Some(id) = self.file_surface_keys.get(&lookup).copied() {
@@ -1777,7 +1771,7 @@ impl Shell {
         let file = cx.new(|cx| {
             FilesSurface::new_editor(
                 self.state.clone(),
-                self.active_chat.clone(),
+                panel_key.clone(),
                 path.clone(),
                 self.settings.files_autosave_delay_ms,
                 self.settings.files_editor_font_size,
