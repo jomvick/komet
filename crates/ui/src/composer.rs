@@ -449,6 +449,27 @@ pub fn pending_permission_request(
         })
 }
 
+/// How many command / path lines the permission card keeps visible. A
+/// `gh issue create` body (or any multi-line argv) used to paint past the
+/// card — GPUI `max_h` + `overflow_hidden` does not clip unbounded text.
+const PERMISSION_DETAIL_MAX_LINES: usize = 6;
+
+fn permission_detail_lines(detail: &str) -> (Vec<SharedString>, usize) {
+    let mut lines: Vec<SharedString> = detail
+        .lines()
+        .map(|line| SharedString::from(line.to_string()))
+        .collect();
+    while lines.last().is_some_and(|line| line.is_empty()) {
+        lines.pop();
+    }
+    if lines.is_empty() && !detail.is_empty() {
+        lines.push(SharedString::from(detail.to_string()));
+    }
+    let truncated_by = lines.len().saturating_sub(PERMISSION_DETAIL_MAX_LINES);
+    lines.truncate(PERMISSION_DETAIL_MAX_LINES);
+    (lines, truncated_by)
+}
+
 pub fn permission_request_resolved(transcript: &[SessionMessageEntry], request_id: &str) -> bool {
     transcript.iter().any(|entry| {
         entry.parts.iter().any(|part| {
@@ -5925,6 +5946,9 @@ impl Composer {
                     cx,
                 )
             }))
+            .w_full()
+            .min_w_0()
+            .overflow_hidden()
             .flex()
             .flex_col()
             .gap(px(8.0))
@@ -5948,6 +5972,8 @@ impl Composer {
         };
         card = card.child(
             div()
+                .w_full()
+                .min_w_0()
                 .flex()
                 .flex_row()
                 .items_center()
@@ -5960,19 +5986,25 @@ impl Composer {
                 )
                 .child(
                     div()
+                        .min_w_0()
+                        .flex_1()
+                        .truncate()
                         .text_size(px(12.0))
                         .font_weight(gpui::FontWeight::MEDIUM)
                         .child(SharedString::from(summary)),
                 ),
         );
 
-        // Detail line (command / path), Paseo ToolCallDetailsContent analog.
-        // Monospace: this is code/a path, not prose — and it now visually
-        // matches the terminal icon above it instead of looking like a
-        // second, oddly-wrapped sentence.
+        // Detail (command / path), Paseo ToolCallDetailsContent analog.
+        // Monospace: this is code/a path, not prose. Each line is a fixed-
+        // height truncated row so a multi-line argv cannot blow the card.
         if let Some(detail) = &detail_line {
+            let (lines, truncated_by) = permission_detail_lines(detail);
             card = card.child(
                 div()
+                    .w_full()
+                    .min_w_0()
+                    .overflow_hidden()
                     .px(px(10.0))
                     .py(px(8.0))
                     .rounded(px(8.0))
@@ -5981,11 +6013,21 @@ impl Composer {
                     .border_color(theme.border.opacity(0.6))
                     .font_family(theme.font_mono.clone())
                     .text_size(px(11.0))
-                    .line_height(px(16.0))
                     .text_color(theme.text_muted)
-                    .max_h(px(120.0))
-                    .overflow_hidden()
-                    .child(SharedString::from(detail.clone())),
+                    .children(
+                        lines.into_iter().map(|line| {
+                            div().h(px(16.0)).w_full().min_w_0().truncate().child(line)
+                        }),
+                    )
+                    .when(truncated_by > 0, |block| {
+                        block.child(
+                            div()
+                                .h(px(16.0))
+                                .text_size(px(10.5))
+                                .text_color(theme.text_faint)
+                                .child(SharedString::from(format!("… {truncated_by} more lines"))),
+                        )
+                    }),
             );
         }
 
@@ -6388,7 +6430,7 @@ impl Render for Composer {
                 let panel = self.render_permission_panel(rid, kind, summary, choices, actions, cx);
                 return container.child(motion::fade_quick(
                     "composer-permission",
-                    div().child(panel),
+                    div().w_full().min_w_0().overflow_hidden().child(panel),
                 ));
             }
         }
@@ -7465,6 +7507,22 @@ mod tests {
         let t = vec![entry(Some(MessageStatus::Streaming), vec![resolved])];
         assert!(input_request_resolved(&t, "r1"));
         assert!(!input_request_resolved(&t, "other"));
+    }
+
+    #[test]
+    fn permission_detail_caps_multiline_commands() {
+        let (lines, rest) = permission_detail_lines("one\n\n");
+        assert_eq!(lines.len(), 1);
+        assert_eq!(rest, 0);
+
+        let body = (1..=20)
+            .map(|n| format!("line-{n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (lines, rest) = permission_detail_lines(&body);
+        assert_eq!(lines.len(), PERMISSION_DETAIL_MAX_LINES);
+        assert_eq!(rest, 20 - PERMISSION_DETAIL_MAX_LINES);
+        assert_eq!(lines[0].as_ref(), "line-1");
     }
 
     #[test]
