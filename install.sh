@@ -107,6 +107,14 @@ ln -sf "$APP_ROOT/current/komet" "$BIN_DIR/komet"
   cp -r "$TMP/unpacked/icons/hicolor" "$HOME/.local/share/icons/"
 }
 
+# Refresh icon + desktop caches so the launcher icon appears immediately
+# (without requiring a relogin / reboot). Failures are non-fatal — the icon
+# will appear after the next cache rebuild or session restart.
+command -v update-desktop-database >/dev/null 2>&1 \
+  && update-desktop-database "$HOME/.local/share/applications" 2>/dev/null || true
+command -v gtk-update-icon-cache >/dev/null 2>&1 \
+  && gtk-update-icon-cache -f -t "$HOME/.local/share/icons/hicolor" 2>/dev/null || true
+
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
   *)

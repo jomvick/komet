@@ -77,14 +77,14 @@ install -m 644 %{_sourcedir}/komet.png %{buildroot}%{_datadir}/pixmaps/komet.png
 if [ \$1 -eq 1 ]; then
     update-desktop-database &> /dev/null || :
     touch --no-create %{_datadir}/icons/hicolor &>/dev/null || :
-    gtk-update-icon-cache %{_datadir}/icons/hicolor &>/dev/null || :
+    gtk-update-icon-cache -f -t %{_datadir}/icons/hicolor &>/dev/null || :
 fi
 
 %postun
 if [ \$1 -eq 0 ]; then
     update-desktop-database &> /dev/null || :
     touch --no-create %{_datadir}/icons/hicolor &>/dev/null || :
-    gtk-update-icon-cache %{_datadir}/icons/hicolor &>/dev/null || :
+    gtk-update-icon-cache -f -t %{_datadir}/icons/hicolor &>/dev/null || :
 fi
 
 %files

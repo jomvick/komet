@@ -35,6 +35,47 @@ export APPDIR="$HERE"
 export PATH="$HERE/usr/bin:$PATH"
 export LD_LIBRARY_PATH="$HERE/usr/lib:$HERE/usr/lib64:${LD_LIBRARY_PATH:-}"
 export XDG_DATA_DIRS="$HERE/usr/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+
+# First-launch desktop integration (AppImage spec: the payload MAY install
+# a .desktop file). There is no Type 2 `--appimage-integrate` flag — do it
+# here. Skip when the user opted out or another integrator is in charge.
+# Failures are swallowed so the app always launches.
+DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+if [ -n "${APPIMAGE:-}" ] \
+   && [ -z "${DESKTOPINTEGRATION:-}" ] \
+   && [ ! -e "$DATA_HOME/appimagekit/no_desktopintegration" ] \
+   && [ ! -e "$HOME/.local/share/appimagekit/no_desktopintegration" ] \
+   && [ ! -e /usr/share/appimagekit/no_desktopintegration ] \
+   && [ ! -e /etc/appimagekit/no_desktopintegration ]; then
+  HASH="$(printf '%s' "$APPIMAGE" | md5sum | cut -c1-8)"
+  SENTINEL="${XDG_CONFIG_HOME:-$HOME/.config}/komet/appimage-integrated-$HASH"
+  if [ ! -f "$SENTINEL" ]; then
+    APPS="$DATA_HOME/applications"
+    ICONS="$DATA_HOME/icons"
+    mkdir -p "$APPS" "$ICONS" "$(dirname "$SENTINEL")" || true
+    if [ -d "$HERE/usr/share/icons/hicolor" ]; then
+      cp -r "$HERE/usr/share/icons/hicolor" "$ICONS/" || true
+    elif [ -f "$HERE/komet.png" ]; then
+      mkdir -p "$ICONS/hicolor/256x256/apps" || true
+      cp "$HERE/komet.png" "$ICONS/hicolor/256x256/apps/komet.png" || true
+    fi
+    DESKTOP_SRC="$HERE/usr/share/applications/komet.desktop"
+    [ -f "$DESKTOP_SRC" ] || DESKTOP_SRC="$HERE/komet.desktop"
+    if [ -f "$DESKTOP_SRC" ]; then
+      ESCAPED="$(printf '%s' "$APPIMAGE" | sed 's/\\/\\\\/g; s/"/\\"/g')"
+      {
+        grep -v -E '^(Exec|TryExec)=' "$DESKTOP_SRC" || true
+        printf 'Exec="%s" %%U\n' "$ESCAPED"
+      } >"$APPS/komet.desktop" || true
+    fi
+    command -v update-desktop-database >/dev/null 2>&1 \
+      && update-desktop-database "$APPS" 2>/dev/null || true
+    command -v gtk-update-icon-cache >/dev/null 2>&1 \
+      && gtk-update-icon-cache -f -t "$ICONS/hicolor" 2>/dev/null || true
+    touch "$SENTINEL" || true
+  fi
+fi
+
 exec "$HERE/usr/bin/komet" "$@"
 APPRUN
 chmod 755 "$APPDIR/AppRun"
