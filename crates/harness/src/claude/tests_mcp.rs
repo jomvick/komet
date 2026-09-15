@@ -100,6 +100,9 @@ fn capability_matrix_reports_codex_status() {
     assert_eq!(supports_dynamic_mcp(HarnessId::Grok), (true, ""));
     assert_eq!(supports_dynamic_mcp(HarnessId::Hermes), (true, ""));
     assert_eq!(supports_dynamic_mcp(HarnessId::Pi), (true, ""));
+    // Cline's native ACP server accepts `mcpServers` at `session/new` like
+    // the other ACP agents (verified live against `cline --acp` 3.0.62).
+    assert_eq!(supports_dynamic_mcp(HarnessId::Cline), (true, ""));
     assert_eq!(supports_dynamic_mcp(HarnessId::Mock), (true, ""));
     assert_eq!(
         supports_dynamic_mcp(HarnessId::Codex),

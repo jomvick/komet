@@ -4923,7 +4923,8 @@ impl Composer {
         let err_message_id = message_id.clone();
         let sandbox = self.state.read(cx).access_mode;
         // Access chip maps to SandboxOptions for Claude/Codex/OpenCode.
-        // Grok/Hermes/Pi/Cursor/Antigravity honor `sandbox` (SandboxLevel) natively.
+        // Grok/Hermes/Pi/Cursor/Antigravity/Cline honor `sandbox`
+        // (SandboxLevel) natively.
         let harness_supports_sandbox = resolved.harness.as_ref().is_none_or(|h| {
             !matches!(
                 h,
@@ -4932,6 +4933,7 @@ impl Composer {
                     | komet_proto::HarnessId::Hermes
                     | komet_proto::HarnessId::Pi
                     | komet_proto::HarnessId::Antigravity
+                    | komet_proto::HarnessId::Cline
             )
         });
         let sandbox_options = if harness_supports_sandbox {

@@ -2,10 +2,11 @@
 //! stdio, protocol v1) and maps its session updates onto [`AgentEvent`]s.
 //!
 //! KEPT ONLY for agents built ground-up on ACP: Grok ([`AcpHarness::grok`],
-//! `grok agent stdio`), Hermes ([`AcpHarness::hermes`], `hermes acp`) and
-//! opencode ([`AcpHarness::opencode`], `opencode acp`) — plus pi
-//! ([`AcpHarness::pi`]) via the community `pi-acp` adapter until a native
-//! driver exists. Claude, Codex and Cursor moved to native drivers
+//! `grok agent stdio`), Hermes ([`AcpHarness::hermes`], `hermes acp`),
+//! opencode ([`AcpHarness::opencode`], `opencode acp`) and Cline
+//! ([`AcpHarness::cline`], `cline --acp`) — plus pi ([`AcpHarness::pi`])
+//! via the community `pi-acp` adapter until a native driver exists.
+//! Claude, Codex and Cursor moved to native drivers
 //! ([`crate::ClaudeHarness`], [`crate::CodexHarness`], [`crate::CursorHarness`])
 //! after adapter-mediated ACP kept manufacturing done-status bugs the native
 //! wires don't have (turn-hold bookkeeping vs the CLI's own eager result).
@@ -80,6 +81,24 @@ fn opencode_startup_timeout() -> Duration {
         .filter(|seconds| *seconds > 0)
         .map(Duration::from_secs)
         .unwrap_or(DEFAULT_OPENCODE_STARTUP_TIMEOUT)
+}
+
+/// Cline's `session/new` fetches the full model catalog (300+ models) from
+/// its API before answering; a cold npm boot plus a slow fetch can outrun
+/// the 10s default discovery budget. Discovery errors are not masked by a
+/// static fallback for Cline, so a slow-but-healthy agent would otherwise
+/// show "sign in" instead of its models. 60s covers the observed ~5s warm
+/// handshake with a wide cold-start margin.
+const DEFAULT_CLINE_STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
+const CLINE_STARTUP_TIMEOUT_ENV: &str = "KOMET_CLINE_STARTUP_TIMEOUT_SECS";
+
+fn cline_startup_timeout() -> Duration {
+    std::env::var(CLINE_STARTUP_TIMEOUT_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_CLINE_STARTUP_TIMEOUT)
 }
 
 /// Per-agent configuration: which binary to spawn and what to tell the picker.
@@ -462,6 +481,85 @@ fn pi_spec() -> AcpAgentSpec {
     }
 }
 
+fn cline_install_paths() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        dirs.push(home.join(".local").join("bin").join("cline"));
+        dirs.push(home.join(".npm-global").join("bin").join("cline"));
+    }
+    dirs.push(PathBuf::from("/opt/homebrew/bin/cline"));
+    dirs.push(PathBuf::from("/usr/local/bin/cline"));
+    dirs
+}
+
+fn cline_spec() -> AcpAgentSpec {
+    AcpAgentSpec {
+        id: HarnessId::Cline,
+        display_name: "Cline",
+        executable: "cline",
+        env_override: "CLINE_EXECUTABLE",
+        // Verified live (cline 3.0.61 / ACP 3.0.62): `--acp` runs the Agent
+        // Client Protocol server over stdio — `initialize` (protocolVersion 1,
+        // fs/terminal capabilities declined) answers with `agentInfo`,
+        // `authMethods` (cline / cline-pass / openai-codex) and
+        // `agentCapabilities.loadSession: true`.
+        args: &["--acp"],
+        // The agent IS the npm package (`npm install -g cline`) — no separate
+        // adapter to prewarm or pin, so no managed-install path.
+        npm_package: None,
+        extra_paths: cline_install_paths,
+        cli_executable: "cline",
+        cli_extra_paths: cline_install_paths,
+        install_hint: "cline (searched PATH, the login shell's PATH, ~/.local/bin, \
+             ~/.npm-global/bin, /opt/homebrew/bin, /usr/local/bin, and \
+             fnm/nvm/volta/pnpm/bun install dirs; install with \
+             `npm install -g cline` and sign in once with `cline`; set \
+             CLINE_EXECUTABLE to override)",
+        // Discovery (ACP `session/new`) answers the live catalog (hundreds of
+        // rows on a signed-in account); this static entry only shows when
+        // discovery fails (e.g. not signed in — `session/new` rejects with
+        // "Authentication required" until `cline` has a login).
+        // `session/new` also advertises a `provider` select (cline /
+        // cline-pass / openai-codex) with category=model ahead of `model`;
+        // that select is a trait, and send-time set_config_option uses the
+        // CLI's lastUsedProvider so chats don't stick on empty Cline Credits.
+        models: || {
+            vec![Model {
+                id: "default".into(),
+                label: "Cline default".into(),
+                description: Some(
+                    "Runs the model configured in Cline (sign in with `cline`, then set the model/provider)".into(),
+                ),
+                reasoning_levels: vec![],
+                options: Vec::new(),
+            }]
+        },
+        // Cline's ACP advertises no `_session/steering` extension — steers
+        // deliver at turn boundaries. Modes (plan/act) ride Cline's own
+        // `modes` block, not komet's steering.
+        steering_mode: SteeringMode::TurnBoundary,
+        // Cline advertises no `thought_level` config option (the CLI's
+        // `--thinking none|low|medium|high|xhigh` has no ACP equivalent), so
+        // the ladder stays empty and the picker never invents levels.
+        reasoning_levels: &[],
+        prompt_transform: identity_transform,
+        effort_values: default_effort_values,
+        ladder_extras: &[],
+        prompt_complete_extension: false,
+        // A Node CLI with provider auth checks + a heavyweight boot: cold
+        // sessions can stay silent longer than pi/hermes before the first
+        // wire activity. Total silence past this is a wedge (a dead provider
+        // auth check) — surface a visible error chip instead of Working.
+        prompt_stall: Some(Duration::from_secs(60)),
+        stall_hint: "The agent process is likely wedged — a stale provider auth \
+             check in Cline's own config (~/.cline) or a hung model call. Try \
+             running `cline --acp` once in a terminal to see the raw error.",
+        // No HTTP sidecar: subagent transcripts (if any) ride `session/update`
+        // on the ACP wire, like grok/hermes/pi.
+        http_sidecar: false,
+    }
+}
+
 fn opencode_install_paths() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
@@ -668,6 +766,17 @@ impl AcpHarness {
     pub fn opencode() -> Self {
         let startup_timeout = opencode_startup_timeout();
         let mut harness = Self::with_spec(opencode_spec());
+        harness.handshake_timeout = startup_timeout;
+        harness.model_discovery_timeout = startup_timeout;
+        harness
+    }
+
+    /// Cline (`cline --acp`) — the autonomous coding agent CLI over ACP.
+    /// Handshake and model discovery share the Cline startup budget: the
+    /// catalog fetch inside `session/new` is the slow part of both paths.
+    pub fn cline() -> Self {
+        let startup_timeout = cline_startup_timeout();
+        let mut harness = Self::with_spec(cline_spec());
         harness.handshake_timeout = startup_timeout;
         harness.model_discovery_timeout = startup_timeout;
         harness
@@ -1017,9 +1126,11 @@ fn reasoning_from_value(value: &str) -> Option<ReasoningLevel> {
 /// a separate `thought_level` option. `[1m]`-suffixed long-context variants
 /// collapse into the base model's Context Window trait, matching the static
 /// catalogs. Traits come off the wire too — every select/boolean config
-/// option outside mode/model/thought_level becomes a `ModelOption` — so
-/// unmatched models keep fast mode etc.; the catalog only enriches matched
-/// ids with label/description/per-model ladders.
+/// option outside mode / the option named `model` / thought_level becomes a
+/// `ModelOption`. Sibling `category=model` selects (Cline's `provider`) are
+/// auth-routing traits, not models. Unmatched models keep fast mode etc.;
+/// the catalog only enriches matched ids with label/description/per-model
+/// ladders.
 fn models_from_session(session_response: &Value, catalog: &[Model]) -> Vec<Model> {
     let config_options = session_response
         .get("configOptions")
@@ -1087,7 +1198,21 @@ fn models_from_session(session_response: &Value, catalog: &[Model]) -> Vec<Model
 
     let model_select: Vec<&Value> = config_options
         .iter()
-        .find(|o| o.get("category").and_then(Value::as_str) == Some("model"))
+        // Prefer the option actually named `model`: Cline advertises a
+        // `provider` select (cline / cline-pass / openai-codex) with the same
+        // `model` category ahead of the real `model` select, and taking the
+        // first category match would have offered the auth providers as the
+        // model list. `models.availableModels` (used below when there is no
+        // select) carries the same rows.
+        .find(|o| {
+            o.get("id").and_then(Value::as_str) == Some("model")
+                && o.get("category").and_then(Value::as_str) == Some("model")
+        })
+        .or_else(|| {
+            config_options
+                .iter()
+                .find(|o| o.get("category").and_then(Value::as_str) == Some("model"))
+        })
         .and_then(|o| o.get("options").and_then(Value::as_array))
         .map(|opts| opts.iter().collect())
         .unwrap_or_default();
@@ -1176,13 +1301,19 @@ fn models_from_session(session_response: &Value, catalog: &[Model]) -> Vec<Model
 /// catalogs (komet never declares the boolean config capability, so adapters
 /// send selects, but handle the shape defensively).
 fn trait_from_config_option(option: &Value) -> Option<ModelOption> {
-    if matches!(
-        option.get("category").and_then(Value::as_str),
-        Some("mode" | "model" | "thought_level")
-    ) {
+    let id = option.get("id").and_then(Value::as_str)?;
+    let category = option.get("category").and_then(Value::as_str);
+    // Mode and thought_level have dedicated pickers. The option actually
+    // named `model` is the model list. Sibling category=model selects
+    // (Cline's `provider`: cline / cline-pass / openai-codex) are
+    // auth-routing traits — skipping every category=model option used to
+    // hide them, so chats stayed on Cline Credits even when the CLI's
+    // last-used provider was ClinePass.
+    if matches!(category, Some("mode" | "thought_level"))
+        || (category == Some("model") && id == "model")
+    {
         return None;
     }
-    let id = option.get("id").and_then(Value::as_str)?;
     let label = option.get("name").and_then(Value::as_str).unwrap_or(id);
     match option.get("type").and_then(Value::as_str)? {
         "select" => {
@@ -1202,11 +1333,17 @@ fn trait_from_config_option(option: &Value) -> Option<ModelOption> {
                     })
                 })
                 .collect();
-            let default_choice = option
+            let mut default_choice = option
                 .get("currentValue")
                 .and_then(Value::as_str)
                 .map(str::to_owned)
                 .or_else(|| choices.first().map(|c| c.id.clone()))?;
+            if id == "provider"
+                && let Some(last) = cline_last_used_provider()
+                && choices.iter().any(|c| c.id == last)
+            {
+                default_choice = last;
+            }
             (choices.len() > 1).then(|| ModelOption {
                 id: id.to_owned(),
                 label: label.to_owned(),
@@ -1423,9 +1560,11 @@ impl Harness for AcpHarness {
     /// ACP is the source of truth: a short-lived probe reads the agent's
     /// advertised model list (cached on success). The spec's static catalog
     /// answers when the agent advertises nothing. Most legacy ACP adapters also
-    /// use it when probing fails; OpenCode does not, because presenting two
-    /// static Zen models as a successful load permanently hides a slow or
-    /// failed plugin-backed catalog from the picker.
+    /// use it when probing fails; OpenCode and Cline do not, because
+    /// presenting a stale static catalog as a successful load permanently
+    /// hides a slow or failed handshake from the picker — for Cline the usual
+    /// cause is a missing sign-in (`session/new` rejects with
+    /// "Authentication required" until `cline` has a login).
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         self.resolve_launch()?;
         if let Some(models) = self.models_cache.get() {
@@ -1441,7 +1580,16 @@ impl Harness for AcpHarness {
                 Ok(self.models_cache.get().cloned().unwrap_or(models))
             }
             Ok(_) => Ok((self.spec.models)()),
-            Err(error) if self.spec.id == HarnessId::Opencode => Err(error),
+            // Never let a stale static catalog masquerade as a successful
+            // load: opencode's plugin-backed catalog and Cline's signed-in
+            // catalog (session/new rejects -32000 until `cline` has a login)
+            // would otherwise hide a slow or failed handshake from the picker.
+            // The error (and the agent's own wording) stays visible.
+            Err(error)
+                if self.spec.id == HarnessId::Opencode || self.spec.id == HarnessId::Cline =>
+            {
+                Err(error)
+            }
             Err(_) => Ok((self.spec.models)()),
         }
     }
@@ -1840,14 +1988,71 @@ fn first_class_model_change(
     Ok(Some(requested.to_owned()))
 }
 
+/// Cline's last-used auth provider (`cline` / `cline-pass` / `openai-codex`)
+/// from `~/.cline/data/settings/providers.json`. ACP `session/new` ignores
+/// this and defaults `provider` to Cline Credits (`cline`), which then
+/// hangs or errors ("Insufficient balance") instead of using ClinePass.
+/// Tests skip the on-disk file so discovery fixtures stay deterministic;
+/// `KOMET_CLINE_PROVIDER` overrides both.
+fn cline_last_used_provider() -> Option<String> {
+    if let Ok(value) = std::env::var("KOMET_CLINE_PROVIDER") {
+        return (!value.is_empty()).then_some(value);
+    }
+    if cfg!(test) {
+        return None;
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let text = std::fs::read_to_string(
+        home.join(".cline")
+            .join("data")
+            .join("settings")
+            .join("providers.json"),
+    )
+    .ok()?;
+    serde_json::from_str::<Value>(&text)
+        .ok()?
+        .get("lastUsedProvider")?
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+/// Value for a sibling `category=model` select that is NOT the model list
+/// itself (Cline's `provider`). Traits first, then a model-id prefix match
+/// (`cline-pass/glm-5.3` → `cline-pass`).
+fn auth_provider_value(
+    config_id: &str,
+    available: &[&str],
+    model: Option<&str>,
+    model_options: &serde_json::Map<String, Value>,
+) -> Option<String> {
+    if let Some(choice) = model_options
+        .get(config_id)
+        .and_then(Value::as_str)
+        .filter(|choice| available.contains(choice))
+    {
+        return Some(choice.to_owned());
+    }
+    let model = model?;
+    available
+        .iter()
+        .copied()
+        .find(|provider| model == *provider || model.starts_with(&format!("{provider}/")))
+        .map(str::to_owned)
+}
+
 /// The `session/set_config_option` calls a session response's `configOptions`
 /// warrant for this run:
-/// - the requested model (category `model`; a `contextWindow: "1m"` model
-///   option composes the `<model>[1m]` id first, the CLI's own convention),
+/// - the requested model (the option named `model`, not every `category=model`
+///   select — Cline advertises `provider` with that category too; a
+///   `contextWindow: "1m"` model option composes the `<model>[1m]` id first),
+/// - sibling category=model selects (Cline `provider`) from Traits or the
+///   model-id prefix,
 /// - the effort (category `thought_level`, first advertised value from the
 ///   spec's preference list),
 /// - any remaining `model_options` matched by normalized id — selects take
-///   the choice id, booleans take `on`/`true` truthiness (fastMode, thinking).
+///   the choice id, booleans take `on`/`true` truthiness (fastMode, thinking,
+///   Cline `auto_approve`).
 ///
 /// Matched against advertised values and skipped when already current. Pure
 /// so it's testable; the returned value is the request's flattened `value`
@@ -1868,6 +2073,20 @@ fn config_option_sets(
         .get("contextWindow")
         .and_then(Value::as_str)
         .is_some_and(|w| w.eq_ignore_ascii_case("1m"));
+    // Same preference as discovery: the option named `model` wins over the
+    // first category=model select (Cline's `provider`).
+    let model_select_id = options
+        .iter()
+        .find(|option| {
+            option.get("id").and_then(Value::as_str) == Some("model")
+                && option.get("category").and_then(Value::as_str) == Some("model")
+        })
+        .or_else(|| {
+            options
+                .iter()
+                .find(|option| option.get("category").and_then(Value::as_str) == Some("model"))
+        })
+        .and_then(|option| option.get("id").and_then(Value::as_str));
     let mut sets = Vec::new();
     for option in options {
         let Some(config_id) = option.get("id").and_then(Value::as_str) else {
@@ -1886,9 +2105,12 @@ fn config_option_sets(
             .collect();
 
         let wanted: Option<Value> = match (kind, category) {
-            ("select", Some("model")) => model
+            ("select", Some("model")) if Some(config_id) == model_select_id => model
                 .and_then(|m| pick_model_value(m, &available, context_1m))
                 .map(Value::String),
+            ("select", Some("model")) => {
+                auth_provider_value(config_id, &available, model, model_options).map(Value::String)
+            }
             // Unattended parity with the retired custom adapters (claude
             // bypassPermissions / codex approvalPolicy never): pick the
             // no-prompts mode when the agent offers one. claude-agent-acp
@@ -2629,12 +2851,26 @@ async fn run_session(session: Session) {
         let efforts = effort_values(request.reasoning, request.model.as_deref());
         let requested_model = request.model.as_deref();
         let options_snapshot = session_response;
-        for (config_id, payload) in config_option_sets(
-            &options_snapshot,
-            requested_model,
-            &efforts,
-            &request.model_options,
-        ) {
+        let mut model_options = request.model_options.clone();
+        // Cline's ACP session/new defaults `provider` to Cline Credits even
+        // when the CLI last used ClinePass. Inject that last-used value so
+        // set_config_option runs before the prompt (prefix inference still
+        // covers `cline-pass/...` model ids without this file).
+        if harness == HarnessId::Cline
+            && !model_options.contains_key("provider")
+            && let Some(provider) = cline_last_used_provider()
+        {
+            model_options.insert("provider".into(), json!(provider));
+        }
+        // Cline's `auto_approve` boolean defaults false; without it the hub
+        // parks tool calls on an approval that komet never surfaces. Full
+        // access is unattended — same as auto-allowing session/request_permission.
+        if request.sandbox == SandboxLevel::DangerFullAccess {
+            model_options.insert("auto_approve".into(), json!(true));
+        }
+        for (config_id, payload) in
+            config_option_sets(&options_snapshot, requested_model, &efforts, &model_options)
+        {
             let mut params = serde_json::Map::new();
             params.insert("sessionId".into(), session_id.clone().into());
             params.insert("configId".into(), config_id.clone().into());
@@ -2654,6 +2890,36 @@ async fn run_session(session: Session) {
                 tracing::debug!(
                     target: "komet_harness::acp",
                     "session/set_config_option {config_id}={payload} rejected (agent default runs): {e}"
+                );
+            }
+        }
+        // After a Cline provider switch the advertised model ids change
+        // (`zai/glm-5.3` on Credits → `cline-pass/glm-5.3` on ClinePass).
+        // The initial session/new catalog can't see those ids, so retry the
+        // same model under the provider prefix; a rejection falls through
+        // to the provider's own default.
+        if harness == HarnessId::Cline
+            && let Some(provider) = model_options.get("provider").and_then(Value::as_str)
+            && let Some(model) = requested_model
+            && !model.starts_with(&format!("{provider}/"))
+            && let Some((_, name)) = model.rsplit_once('/')
+        {
+            let prefixed = format!("{provider}/{name}");
+            let mut params = serde_json::Map::new();
+            params.insert("sessionId".into(), session_id.clone().into());
+            params.insert("configId".into(), "model".into());
+            params.insert("value".into(), json!(prefixed));
+            if let Err(e) = request_draining(
+                &client,
+                &mut incoming,
+                "session/set_config_option",
+                Value::Object(params),
+            )
+            .await
+            {
+                tracing::debug!(
+                    target: "komet_harness::acp",
+                    "session/set_config_option model={prefixed} rejected (agent default runs): {e}"
                 );
             }
         }
@@ -3920,6 +4186,117 @@ mod tests {
         assert_eq!(
             config_option_sets(&json!({"sessionId": "s"}), Some("x"), &["high"], &no_opts),
             Vec::new()
+        );
+    }
+
+    fn cline_two_tier_session() -> Value {
+        json!({
+            "sessionId": "s-cline",
+            "configOptions": [
+                {
+                    "id": "provider",
+                    "name": "Provider",
+                    "category": "model",
+                    "type": "select",
+                    "currentValue": "cline",
+                    "options": [
+                        { "value": "cline", "name": "Cline Usage-Billing" },
+                        { "value": "cline-pass", "name": "ClinePass" },
+                        { "value": "openai-codex", "name": "OpenAI ChatGPT Subscription" },
+                    ],
+                },
+                {
+                    "id": "model",
+                    "name": "Model",
+                    "category": "model",
+                    "type": "select",
+                    "currentValue": "zai/glm-5.3",
+                    "options": [
+                        { "value": "zai/glm-5.3", "name": "GLM 5.3" },
+                        { "value": "cline-pass/glm-5.3", "name": "GLM 5.3" },
+                    ],
+                },
+                {
+                    "id": "auto_approve",
+                    "name": "Auto-approve",
+                    "type": "boolean",
+                    "currentValue": false,
+                },
+            ],
+        })
+    }
+
+    #[test]
+    fn cline_provider_is_a_trait_not_a_model() {
+        let models = models_from_session(&cline_two_tier_session(), &[]);
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["zai/glm-5.3", "cline-pass/glm-5.3"], "{ids:?}");
+        assert!(
+            !ids.iter()
+                .any(|id| *id == "cline" || *id == "cline-pass" || *id == "openai-codex"),
+            "provider ids must never surface as models: {ids:?}"
+        );
+        let provider = models[0]
+            .options
+            .iter()
+            .find(|o| o.id == "provider")
+            .expect("provider trait");
+        assert_eq!(provider.default_choice, "cline");
+        assert_eq!(
+            provider
+                .choices
+                .iter()
+                .map(|c| c.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["cline", "cline-pass", "openai-codex"]
+        );
+    }
+
+    #[test]
+    fn cline_two_tier_sets_provider_from_model_prefix() {
+        let no_opts = serde_json::Map::new();
+        let sets = config_option_sets(
+            &cline_two_tier_session(),
+            Some("cline-pass/glm-5.3"),
+            &[],
+            &no_opts,
+        );
+        assert!(
+            sets.iter()
+                .any(|(id, v)| id == "provider" && v["value"] == "cline-pass"),
+            "{sets:?}"
+        );
+        assert!(
+            sets.iter()
+                .any(|(id, v)| id == "model" && v["value"] == "cline-pass/glm-5.3"),
+            "{sets:?}"
+        );
+    }
+
+    #[test]
+    fn cline_two_tier_sets_provider_from_trait_choice() {
+        let mut opts = serde_json::Map::new();
+        opts.insert("provider".into(), json!("cline-pass"));
+        let sets = config_option_sets(&cline_two_tier_session(), Some("zai/glm-5.3"), &[], &opts);
+        assert!(
+            sets.iter()
+                .any(|(id, v)| id == "provider" && v["value"] == "cline-pass"),
+            "{sets:?}"
+        );
+        // Model already current — only the provider switch is sent.
+        assert!(!sets.iter().any(|(id, _)| id == "model"), "{sets:?}");
+    }
+
+    #[test]
+    fn cline_full_access_sets_auto_approve() {
+        let mut opts = serde_json::Map::new();
+        opts.insert("auto_approve".into(), json!(true));
+        let sets = config_option_sets(&cline_two_tier_session(), Some("zai/glm-5.3"), &[], &opts);
+        assert!(
+            sets.iter().any(|(id, v)| id == "auto_approve"
+                && v["type"] == "boolean"
+                && v["value"] == true),
+            "{sets:?}"
         );
     }
 

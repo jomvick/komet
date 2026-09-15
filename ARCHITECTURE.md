@@ -2,7 +2,7 @@
 
 > Fork of [komet/komet](https://github.com/komet/komet) — MIT, Copyright Wing. See `LICENSE` and `THIRD_PARTY_NOTICES.md`.
 
-A native controller for coding agents (Claude Code, Codex, Cursor, Grok, Hermes, OpenCode, Pi) —
+A native controller for coding agents (Claude Code, Codex, Cursor, Grok, Hermes, OpenCode, Pi, Cline) —
 Rust engine + gpui UI, single binary. **100% local by default**: no account, no login
 screen, no network calls. Multi-device sync is built (Loro CRDT docs through the self-hosted
 `komet-sync` server) but **disabled by default** — see "Multi-device sync" in the README.
@@ -142,7 +142,7 @@ komet/
                                  # ephemeral presence, DocsStore (SQLite snapshots +
                                  # processed-command ledger)
     harness/      komet-harness  # Harness trait over the ACP protocol (claude/codex/cursor/
-                                 # grok/hermes/pi/opencode via org-maintained
+                                 # grok/hermes/pi/opencode/cline via org-maintained
                                  # adapters + managed npm install), mock; steering mailbox,
                                  # requestInput, models/reasoning/options catalogs
     engine/       komet-engine   # sessions engine (pub/sub, run journal, recovery, stall
@@ -274,7 +274,7 @@ Status legend: ✅ shipped · 🟡 shipped with named gaps (see `docs/PARITY.md`
   nudge wakes host A, A executes (mock harness), transcript + session status sync back to B.
 - 🟡 **M5 Full surface** — terminals, diff pane, repo/branch/folder pickers + worktrees,
   agent accounts UI, settings (devices/shortcuts/archived), Codex + Cursor + Grok + Hermes +
-  OpenCode + Pi harnesses. Gaps: composer attachment UI (engine upload RPCs exist).
+  OpenCode + Pi + Cline harnesses. Gaps: composer attachment UI (engine upload RPCs exist).
 - 🟡 **M6 Polish** — wire reconciliation (proto AuthState on the wire, `LocalDevice`),
   two-device e2e smoke, keyboard map, clippy/fmt sweep, Linux packaging
   (`scripts/package-linux.sh` + release profile), macOS bundling config (`dist/macos/`,

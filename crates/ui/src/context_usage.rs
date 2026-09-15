@@ -119,6 +119,17 @@ impl HarnessContextProfile {
                 caching_type: Some("Multi-turn state cache"),
                 default_compaction_rule: "Automatic context compaction",
             },
+            Some(HarnessId::Cline) => Self {
+                display_name: "Cline",
+                protocol_badge: "Native ACP",
+                brand_icon: crate::icons::CLINE_MARK,
+                brand_color: hsla(14.0 / 360.0, 0.80, 0.55, 1.0),
+                telemetry_title: "Cline ACP Runtime Telemetry",
+                telemetry_description: "Cline's autonomous coding agent over ACP: provider/model \
+                    config options, tool execution telemetry and plan/act modes.",
+                caching_type: None,
+                default_compaction_rule: "Turn boundary prune",
+            },
             _ => Self {
                 display_name: "Agent Session",
                 protocol_badge: "Session Telemetry",

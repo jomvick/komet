@@ -19,6 +19,8 @@ pub enum HarnessId {
     /// SST's opencode agent, driven over ACP (`opencode acp`).
     #[serde(alias = "open-code")]
     Opencode,
+    /// Cline's autonomous coding agent CLI, driven over ACP (`cline --acp`).
+    Cline,
     /// Test harness; never shown in production pickers.
     Mock,
     Antigravity,
