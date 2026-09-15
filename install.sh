@@ -74,6 +74,19 @@ if $IS_MACOS; then
   exit 0
 fi
 
+# The tarball is wrapped in a versioned top-level directory
+# (scripts/package-linux.sh tars the whole stage dir), so splice those
+# contents up a level when the binary isn't at the extraction root. A flat
+# tarball passes through untouched — and the same nesting is expected by
+# crates/update (stage_headless), which unpacks with --strip-components=1.
+if [ ! -f "$TMP/unpacked/komet" ]; then
+  INNER="$(find "$TMP/unpacked" -mindepth 1 -maxdepth 1 -type d -name 'komet-*' | head -n 1)"
+  if [ -n "$INNER" ]; then
+    cp -R "$INNER/." "$TMP/unpacked/"
+    rm -rf "$INNER"
+  fi
+fi
+
 [ -f "$TMP/unpacked/komet" ] || die "tarball did not contain a komet binary"
 
 # --- install into the managed layout ----------------------------------------
