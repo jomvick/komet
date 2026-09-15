@@ -34,7 +34,15 @@
 //! list, 60s cache), native only hits the network when `force_usage` is set —
 //! the default list stays offline-fast and deterministic; the UI passes
 //! `forceUsage` on page mount/refresh. Cached results (60s TTL) are served to
-//! non-forced lists in between.
+//! non-forced lists in between; misses are never cached.
+//!
+//! Antigravity's windows come from Cloud Code's
+//! `v1internal:retrieveUserQuotaSummary` (body `{"project":"aicode-consumers"}`,
+//! an empty body is refused 403) or, for the ACTIVE login, from the running
+//! `language_server` when it can be found. Only an explicit 401 (or a locally
+//! expired `expiry`) may rotate tokens: the endpoint answers 403
+//! PERMISSION_DENIED once the plan/quota is exhausted, which used to be
+//! mistaken for an expired token and rewrote the live keyring on every probe.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -227,8 +235,9 @@ enum LoginFlow {
     /// `agy` behind a real PTY (headless print-mode auth): it prints the Google
     /// authorize URL, we paste the user's code into the PTY, and the flow
     /// completes when the global keyring item changes (see complete_login).
-    // `master`/`output`/`exit` are written at spawn and re-read by future
-    // poll paths; for now they exist to hold the PTY alive and feed cancel.
+    // `exit`/`output` drive the completion path's fail-fast (a dead `agy` must
+    // not spin the dialog for a full minute); `master` only exists to hold the
+    // PTY alive until the flow is torn down.
     #[allow(dead_code)]
     Antigravity {
         /// PTY master — held alive for the flow's lifetime (dropping it EOFs the child).
@@ -272,6 +281,23 @@ impl LoginFlow {
 
 /// Cached usage probe result: the windows (or a remembered miss) + fetch time.
 type CachedUsage = (Option<Vec<AgentUsageWindow>>, Instant);
+
+/// Outcome of a Cloud Code PA quota probe.
+///
+/// The distinction is load-bearing: an "unavailable" quota has several very
+/// different causes, and only ONE of them justifies rotating the account's
+/// tokens (see `AgentAccounts::antigravity_usage`).
+enum PaProbe {
+    /// The provider answered with usable windows.
+    Windows(Vec<AgentUsageWindow>),
+    /// The provider rejected the ACCESS TOKEN itself (HTTP 401) — a
+    /// refresh-token exchange is the only way forward.
+    Unauthorized,
+    /// Network hiccup, malformed body, or a provider-side refusal unrelated to
+    /// the token (HTTP 403 "no valid license" when the plan/quota is
+    /// exhausted). Never triggers a token refresh.
+    Failed,
+}
 
 struct Inner {
     config: AgentAccountsConfig,
@@ -919,14 +945,19 @@ impl AgentAccounts {
             if let Some(live) = self.detect_antigravity().await {
                 self.snapshot_detected(HarnessId::Antigravity, &live)?;
             }
+            // Fingerprint the CURRENT secret BEFORE clearing it — this snapshot
+            // is both the completion baseline (the flow is done when the item
+            // changes) and the only copy `cancel_login` can restore. Reading it
+            // after the clear captured `None`, so every cancelled/timed-out
+            // attempt silently left the user signed out of `agy` (and the
+            // Accounts page showed no active Antigravity row until a switch).
+            let (initial_value, _) = self.read_antigravity_keyring().await;
+            let initial = initial_value.map(|v| v.to_string());
             if let Err(err) =
                 secretservice::clear_credentials(AGY_KEYRING_SERVICE, AGY_KEYRING_USER).await
             {
                 tracing::warn!(error = %err, "antigravity keyring clear failed before add-account");
             }
-            // Fingerprint the current secret — the flow completes when it changes.
-            let (initial_value, _) = self.read_antigravity_keyring().await;
-            let initial = initial_value.map(|v| v.to_string());
             let login_id = new_id();
             let pty = portable_pty::native_pty_system();
             let pair = pty
@@ -1244,10 +1275,19 @@ impl AgentAccounts {
                 "That code looks empty — paste the whole code.".into(),
             ));
         }
-        let (writer, initial) = match lock(&self.inner.flows).get(login_id) {
+        let (writer, initial, exit, output) = match lock(&self.inner.flows).get(login_id) {
             Some(LoginFlow::Antigravity {
-                writer, initial, ..
-            }) => (writer.clone(), initial.clone()),
+                writer,
+                initial,
+                exit,
+                output,
+                ..
+            }) => (
+                writer.clone(),
+                initial.clone(),
+                exit.clone(),
+                output.clone(),
+            ),
             _ => {
                 return Err(EngineError::Other(
                     "This sign-in attempt expired — start again.".into(),
@@ -1272,7 +1312,7 @@ impl AgentAccounts {
         }
         #[cfg(not(target_os = "linux"))]
         {
-            let _ = initial;
+            let _ = (initial, exit, output);
             return Err(EngineError::Other(
                 "Antigravity sign-in completion is Linux-only in this version.".into(),
             ));
@@ -1282,16 +1322,37 @@ impl AgentAccounts {
             let deadline = Instant::now() + Duration::from_secs(60);
             loop {
                 if let (Some(value), _) = self.read_antigravity_keyring().await
-                    && initial.as_deref() != Some(value.to_string().as_str())
-                    && let Some(mut detected) = parse_antigravity_auth(value.clone())
+                    && self
+                        .adopt_antigravity_secret(login_id, initial.as_deref(), value)
+                        .await?
                 {
-                    self.enrich_antigravity_profile(&mut detected, &value).await;
-                    self.snapshot_detected(HarnessId::Antigravity, &detected)?;
-                    // NOT cancel_login: that path restores the OLD keyring
-                    // secret, which would immediately undo this successful
-                    // sign-in.
-                    self.finish_antigravity_login(login_id);
                     return self.list(false).await;
+                }
+                // `agy` exited without rewriting the keyring: the pasted code
+                // was rejected (or the flow died). Report its own last line
+                // instead of spinning for the full 60s — and go through
+                // cancel_login, which is the RESTORING path, so the login that
+                // was live before this attempt comes back.
+                if (*lock(&exit)).is_some() {
+                    // Re-read once: `agy` writes the secret before exiting, so a
+                    // read that happened just before the exit must not be
+                    // mistaken for a failure (that would restore the OLD secret
+                    // over a brand-new successful login).
+                    if let (Some(value), _) = self.read_antigravity_keyring().await
+                        && self
+                            .adopt_antigravity_secret(login_id, initial.as_deref(), value)
+                            .await?
+                    {
+                        return self.list(false).await;
+                    }
+                    let tail = last_output_line(&lock(&output));
+                    self.cancel_login(login_id);
+                    return Err(EngineError::Other(match tail {
+                        Some(line) => format!("Antigravity sign-in failed: {line}"),
+                        None => "Antigravity sign-in failed — `agy` exited without a new \
+                                 login. Check the code and try again."
+                            .into(),
+                    }));
                 }
                 if Instant::now() > deadline {
                     return Err(EngineError::Other(
@@ -1302,6 +1363,31 @@ impl AgentAccounts {
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
         }
+    }
+
+    /// Adopt a freshly-written Antigravity keyring secret as the new slot.
+    ///
+    /// Returns `true` once `value` is a usable login that DIFFERS from the
+    /// pre-flow `initial` snapshot (already the same secret ⇒ not landed yet).
+    /// A successful adoption tears the flow down through
+    /// [`Self::finish_antigravity_login`] — never `cancel_login`, which would
+    /// restore the OLD secret and immediately undo the sign-in.
+    async fn adopt_antigravity_secret(
+        &self,
+        login_id: &str,
+        initial: Option<&str>,
+        value: serde_json::Value,
+    ) -> Result<bool, EngineError> {
+        if initial == Some(value.to_string().as_str()) {
+            return Ok(false);
+        }
+        let Some(mut detected) = parse_antigravity_auth(value.clone()) else {
+            return Ok(false);
+        };
+        self.enrich_antigravity_profile(&mut detected, &value).await;
+        self.snapshot_detected(HarnessId::Antigravity, &detected)?;
+        self.finish_antigravity_login(login_id);
+        Ok(true)
     }
 
     pub async fn poll_login(&self, login_id: &str) -> Result<AgentLoginPoll, EngineError> {
@@ -1868,7 +1954,13 @@ impl AgentAccounts {
             HarnessId::Antigravity => self.antigravity_usage(slot, is_active).await,
             _ => None,
         };
-        lock(&self.inner.usage_cache).insert(key, (usage.clone(), Instant::now()));
+        // Cache successes only. Remembering a miss made a transient failure
+        // (offline, provider 403, expired token) stick as "Usage unavailable"
+        // for the whole TTL — and every non-forced list (Switch/Forget) then
+        // re-served that stale miss instead of retrying.
+        if usage.is_some() {
+            lock(&self.inner.usage_cache).insert(key, (usage.clone(), Instant::now()));
+        }
         usage
     }
 
@@ -1878,12 +1970,12 @@ impl AgentAccounts {
         let expires_at = oauth.get("expiresAt").and_then(|v| v.as_i64());
         if let Some(expires_at) = expires_at
             && expires_at < now_ms() + 30_000
+            && !is_active
         {
-            if is_active {
-                // The CLI owns this token pair — rotating its refresh token out
-                // from under a running Claude Code could force a re-login.
-                return None;
-            }
+            // The CLI owns the active pair — rotating its refresh token out
+            // from under a running Claude Code could force a re-login. Still
+            // probe with the current token below: returning None here hid the
+            // meters on the signed-in account the moment access aged past 30s.
             access_token = self.refresh_claude_slot(slot).await?;
         }
         let body: serde_json::Value = self
@@ -1903,11 +1995,11 @@ impl AgentAccounts {
         let mut windows = Vec::new();
         for (key, label) in [("five_hour", "Session"), ("seven_day", "Week")] {
             if let Some(w) = body.get(key)
-                && let Some(utilization) = w.get("utilization").and_then(|v| v.as_f64())
+                && let Some(utilization) = w.get("utilization").and_then(json_f64)
             {
                 windows.push(AgentUsageWindow {
                     label: label.to_string(),
-                    used_fraction: (utilization / 100.0) as f32,
+                    used_fraction: (utilization / 100.0).clamp(0.0, 1.0) as f32,
                     resets_at: parse_when(w.get("resets_at")),
                 });
             }
@@ -2010,22 +2102,23 @@ impl AgentAccounts {
         // often rotates refresh tokens, and writing only the slot leaves the
         // keyring with a dead token so the next `agy` run opens a login page.
         if is_active {
-            if let Some((port, token)) =
-                discover_language_server(&self.inner.config.antigravity_home)
-            {
+            // Local language_server (fast, no token exchange). Every candidate
+            // is tried: the port recorded in `language_server.log` survives
+            // restarts and is regularly stale, so the process's own listening
+            // sockets are the ground truth (see `discover_language_servers`).
+            for (port, csrf) in discover_language_servers(&self.inner.config.antigravity_home) {
                 let url = format!(
                     "http://127.0.0.1:{port}/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary"
                 );
-                if let Ok(resp) = self
+                let mut request = self
                     .inner
                     .http
                     .post(&url)
-                    .header("Content-Type", "application/json")
-                    .header("x-codeium-csrf-token", &token)
-                    .body("{}")
-                    .send()
-                    .await
-                    && let Ok(resp) = resp.error_for_status()
+                    .header("Content-Type", "application/json");
+                if let Some(csrf) = csrf {
+                    request = request.header("x-codeium-csrf-token", csrf);
+                }
+                if let Ok(resp) = request.body("{}").send().await
                     && let Ok(body) = resp.json::<serde_json::Value>().await
                 {
                     let windows = parse_antigravity_quota_response(&body);
@@ -2038,15 +2131,32 @@ impl AgentAccounts {
             let (Some(raw), _) = self.read_antigravity_keyring().await else {
                 return None;
             };
-            if let Some(live) = antigravity_access_token(&raw)
-                && let Some(windows) = self.query_antigravity_pa(ENDPOINT, &live).await
-            {
-                return Some(windows);
+            // An access token we already know is past its `expiry` would only
+            // earn a 401: refresh straight away (that path also keeps the
+            // keyring in sync so `agy` keeps working).
+            let probe = if antigravity_access_expired(&raw) {
+                PaProbe::Unauthorized
+            } else {
+                match antigravity_access_token(&raw) {
+                    Some(live) => self.query_antigravity_pa(ENDPOINT, &live).await,
+                    None => PaProbe::Unauthorized,
+                }
+            };
+            match probe {
+                PaProbe::Windows(windows) => return Some(windows),
+                // A provider refusal or a network hiccup is NOT a token
+                // problem. Treating it as one made every Refresh click rewrite
+                // the live keyring and burn a Google refresh-token exchange
+                // (which can desync a running `agy`), while still rendering
+                // "Usage unavailable".
+                PaProbe::Failed => return None,
+                PaProbe::Unauthorized => {}
             }
-            // Access expired/401: refresh in place and write BOTH keyring + slot
-            // so `agy` keeps a valid refresh token.
             let token = self.refresh_antigravity_live(slot, &raw).await?;
-            return self.query_antigravity_pa(ENDPOINT, &token).await;
+            return match self.query_antigravity_pa(ENDPOINT, &token).await {
+                PaProbe::Windows(windows) => Some(windows),
+                _ => None,
+            };
         }
 
         // Inactive slots: file copy only — refresh the slot when expired/401.
@@ -2061,43 +2171,97 @@ impl AgentAccounts {
             did_refresh = true;
         }
 
-        if let Some(windows) = self
-            .query_antigravity_pa(ENDPOINT, &access_token)
-            .await
-        {
-            return Some(windows);
+        match self.query_antigravity_pa(ENDPOINT, &access_token).await {
+            PaProbe::Windows(windows) => return Some(windows),
+            PaProbe::Failed => return None,
+            PaProbe::Unauthorized => {}
         }
-        if !did_refresh
-            && let Some(new_token) = self.refresh_antigravity_slot(slot).await
-        {
-            return self.query_antigravity_pa(ENDPOINT, &new_token).await;
+        // Only an explicit 401 justifies touching the saved token pair.
+        if !did_refresh && let Some(new_token) = self.refresh_antigravity_slot(slot).await {
+            return match self.query_antigravity_pa(ENDPOINT, &new_token).await {
+                PaProbe::Windows(windows) => Some(windows),
+                _ => None,
+            };
         }
         None
     }
 
-    async fn query_antigravity_pa(
+    /// Quota probe against the Cloud Code PA endpoint.
+    ///
+    /// The request body is load-bearing for some tiers: `{"project":"aicode-consumers"}`
+    /// is what the consumer login answers 200 to — an empty body can come back
+    /// 403 PERMISSION_DENIED "You do not have a valid license of this product"
+    /// (measured against a live `agy` token on 2026-09-15). Workspace accounts
+    /// refuse that project id the other way around, so we retry the official
+    /// TUI body (`{"project":" "}`) and an empty body before giving up.
+    ///
+    /// The CLI identifies as `antigravity`; unrecognized User-Agents are
+    /// refused 403 the same way, which used to look like "Usage unavailable"
+    /// on every account that could not hit a local language_server.
+    async fn query_antigravity_pa(&self, endpoint: &str, token: &str) -> PaProbe {
+        let bodies = [
+            serde_json::json!({ "project": "aicode-consumers" }),
+            serde_json::json!({ "project": " " }),
+            serde_json::json!({}),
+        ];
+        let mut last = PaProbe::Failed;
+        for body in &bodies {
+            last = self.query_antigravity_pa_once(endpoint, token, body).await;
+            match &last {
+                PaProbe::Windows(_) | PaProbe::Unauthorized => return last,
+                PaProbe::Failed => {}
+            }
+        }
+        last
+    }
+
+    async fn query_antigravity_pa_once(
         &self,
         endpoint: &str,
         token: &str,
-    ) -> Option<Vec<AgentUsageWindow>> {
-        let resp = self
+        body: &serde_json::Value,
+    ) -> PaProbe {
+        let resp = match self
             .inner
             .http
             .post(endpoint)
             .bearer_auth(token)
             .header("Content-Type", "application/json")
-            .header("User-Agent", "Antigravity/1.0")
+            .header("User-Agent", "antigravity")
             .header("x-goog-api-client", "gl-go/1.22 gdcl/0.0.0")
-            .json(&serde_json::json!({
-                "project": "aicode-consumers"
-            }))
+            .json(body)
             .send()
             .await
-            .ok()?;
-        let resp = resp.error_for_status().ok()?;
-        let body = resp.json::<serde_json::Value>().await.ok()?;
-        let windows = parse_antigravity_quota_response(&body);
-        (!windows.is_empty()).then_some(windows)
+        {
+            Ok(resp) => resp,
+            Err(err) => {
+                tracing::debug!(error = %err, "antigravity quota probe failed");
+                return PaProbe::Failed;
+            }
+        };
+        let status = resp.status();
+        let json = resp.json::<serde_json::Value>().await.unwrap_or_default();
+        // Parse before classifying the status: an exhausted plan answers 403
+        // with the quota still in the body. Skipping that hid the meters.
+        let windows = parse_antigravity_quota_response(&json);
+        if !windows.is_empty() {
+            return PaProbe::Windows(windows);
+        }
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return PaProbe::Unauthorized;
+        }
+        if !status.is_success() {
+            tracing::debug!(
+                status = %status,
+                detail = %json
+                    .get("error")
+                    .and_then(|e| e.get("message"))
+                    .and_then(|m| m.as_str())
+                    .unwrap_or(""),
+                "antigravity quota probe rejected"
+            );
+        }
+        PaProbe::Failed
     }
 
     /// Refresh the live Antigravity keyring secret (active login only) and
@@ -2159,10 +2323,7 @@ impl AgentAccounts {
         Some(access_token)
     }
 
-    async fn exchange_google_refresh(
-        &self,
-        refresh_token: &str,
-    ) -> Option<serde_json::Value> {
+    async fn exchange_google_refresh(&self, refresh_token: &str) -> Option<serde_json::Value> {
         self.inner
             .http
             .post(GOOGLE_TOKEN_URL)
@@ -2662,6 +2823,7 @@ fn harness_slug(harness: HarnessId) -> &'static str {
         HarnessId::Opencode => "opencode",
         HarnessId::Pi => "pi",
         HarnessId::Antigravity => "antigravity",
+        HarnessId::Cline => "cline",
         HarnessId::Mock => "mock",
     }
 }
@@ -2796,7 +2958,7 @@ fn parse_codex_usage_response(body: &serde_json::Value) -> Vec<AgentUsageWindow>
     let mut windows = Vec::new();
     for key in ["primary_window", "secondary_window"] {
         if let Some(w) = rl.get(key)
-            && let Some(used) = w.get("used_percent").and_then(|v| v.as_f64())
+            && let Some(used) = w.get("used_percent").and_then(json_f64)
         {
             let span = w
                 .get("limit_window_seconds")
@@ -2968,11 +3130,9 @@ fn parse_antigravity_quota_response(body: &serde_json::Value) -> Vec<AgentUsageW
             };
             if let Some(buckets) = group.get("buckets").and_then(|b| b.as_array()) {
                 for bucket in buckets {
-                    if let Some(remaining) =
-                        bucket.get("remainingFraction").and_then(|v| v.as_f64())
-                    {
-                        let used = (1.0 - remaining).clamp(0.0, 1.0) as f32;
-                        let resets_at = parse_when(bucket.get("resetTime"));
+                    if let Some(used) = bucket_used_fraction(bucket) {
+                        let resets_at = parse_when(bucket.get("resetTime"))
+                            .or_else(|| parse_when(bucket.get("reset_time")));
                         windows.push(AgentUsageWindow {
                             label: short_label.to_string(),
                             used_fraction: used,
@@ -2991,12 +3151,12 @@ fn parse_antigravity_quota_response(body: &serde_json::Value) -> Vec<AgentUsageW
             .into_iter()
             .flatten()
         {
-            if let Some(remaining) = bucket.get("remainingFraction").and_then(|v| v.as_f64()) {
+            if let Some(used) = bucket_used_fraction(bucket) {
                 let name = str_field(bucket, "displayName")
                     .or_else(|| str_field(bucket, "modelId"))
                     .unwrap_or_else(|| "Quota".to_string());
-                let used = (1.0 - remaining).clamp(0.0, 1.0) as f32;
-                let resets_at = parse_when(bucket.get("resetTime"));
+                let resets_at = parse_when(bucket.get("resetTime"))
+                    .or_else(|| parse_when(bucket.get("reset_time")));
                 windows.push(AgentUsageWindow {
                     label: name,
                     used_fraction: used,
@@ -3008,62 +3168,207 @@ fn parse_antigravity_quota_response(body: &serde_json::Value) -> Vec<AgentUsageW
     windows
 }
 
-/// Discover running Antigravity `language_server` HTTP port and CSRF token.
-fn discover_language_server(antigravity_home: &Path) -> Option<(u16, String)> {
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(entries) = std::fs::read_dir("/proc") {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if !path.is_dir() {
-                    continue;
-                }
-                let Ok(cmdline_bytes) = std::fs::read(path.join("cmdline")) else {
-                    continue;
-                };
-                let cmdline = String::from_utf8_lossy(&cmdline_bytes);
-                if cmdline.contains("language_server") {
-                    let args: Vec<&str> = cmdline.split('\0').collect();
-                    let mut csrf_token = None;
-                    for (i, &arg) in args.iter().enumerate() {
-                        if arg == "--csrf_token" && i + 1 < args.len() {
-                            csrf_token = Some(args[i + 1].to_string());
-                            break;
-                        }
-                    }
-                    if let Some(token) = csrf_token {
-                        let log_candidates = [
-                            home_dir().join(".config/Antigravity/logs/language_server.log"),
-                            antigravity_home.join("logs/language_server.log"),
-                            home_dir().join(".gemini/antigravity/logs/language_server.log"),
-                        ];
-                        for log_path in &log_candidates {
-                            if let Ok(log_content) = std::fs::read_to_string(log_path) {
-                                let mut last_port = None;
-                                for line in log_content.lines() {
-                                    if let Some(pos) = line.find("for HTTP") {
-                                        let before = &line[..pos];
-                                        if let Some(at_pos) = before.rfind(" at ") {
-                                            let port_str = before[at_pos + 4..].trim();
-                                            if let Ok(port) = port_str.parse::<u16>() {
-                                                last_port = Some(port);
-                                            }
-                                        }
-                                    }
-                                }
-                                if let Some(port) = last_port {
-                                    return Some((port, token));
-                                }
-                            }
-                        }
-                    }
-                }
+/// Number-or-string JSON float (protobuf JSON sometimes encodes doubles as
+/// strings; language_server may wrap them as `{ "value": … }`).
+fn json_f64(value: &serde_json::Value) -> Option<f64> {
+    match value {
+        serde_json::Value::Number(n) => n.as_f64(),
+        serde_json::Value::String(s) => s.parse().ok(),
+        serde_json::Value::Object(map) => map.get("value").and_then(json_f64),
+        _ => None,
+    }
+}
+
+fn bucket_used_fraction(bucket: &serde_json::Value) -> Option<f32> {
+    for key in ["remainingFraction", "remaining_fraction"] {
+        if let Some(remaining) = bucket.get(key).and_then(json_f64) {
+            return Some((1.0 - remaining).clamp(0.0, 1.0) as f32);
+        }
+    }
+    for key in ["usedFraction", "used_fraction"] {
+        if let Some(used) = bucket.get(key).and_then(json_f64) {
+            let used = if used > 1.0 { used / 100.0 } else { used };
+            return Some(used.clamp(0.0, 1.0) as f32);
+        }
+    }
+    None
+}
+
+/// Last meaningful line of a PTY transcript — the `agy` failure message to show
+/// instead of a generic timeout. Lines carrying ANSI/control sequences are
+/// skipped (they are TUI repaints, not messages) while still serving as a
+/// last-resort fallback.
+#[cfg(target_os = "linux")]
+fn last_output_line(output: &str) -> Option<String> {
+    let mut fallback: Option<String> = None;
+    for line in output.lines().rev() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if !line.contains('\u{1b}') {
+            return Some(line.to_string());
+        }
+        fallback.get_or_insert_with(|| line.to_string());
+    }
+    fallback
+}
+
+/// CSRF token from a `language_server` argv, accepting both `--csrf_token <v>`
+/// and the `--csrf_token=<v>` spelling some builds emit. Defensive: a missed
+/// token used to disable the whole local probe path (`csrf_token` came back
+/// `None` ⇒ no probe at all), which is what a bare cmdline produces.
+#[cfg(target_os = "linux")]
+fn parse_csrf_token(args: &[&str]) -> Option<String> {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if let Some(value) = arg.strip_prefix("--csrf_token=")
+            && !value.is_empty()
+        {
+            return Some(value.to_string());
+        }
+        if *arg == "--csrf_token"
+            && let Some(value) = iter.next()
+            && !value.is_empty()
+        {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+/// The port of the LAST `… at <port> for HTTP` line in a language_server log.
+/// `for HTTPS (gRPC)` lines are ignored: they match a naive `"for HTTP"`
+/// search but speak TLS, so probing them with plain HTTP can never work.
+#[cfg(target_os = "linux")]
+fn last_http_port(log: &str) -> Option<u16> {
+    let mut last = None;
+    for line in log.lines() {
+        let Some(pos) = line.find("for HTTP") else {
+            continue;
+        };
+        if line[pos..].starts_with("for HTTPS") {
+            continue;
+        }
+        let before = &line[..pos];
+        if let Some(at) = before.rfind(" at ")
+            && let Ok(port) = before[at + 4..].trim().parse::<u16>()
+        {
+            last = Some(port);
+        }
+    }
+    last
+}
+
+/// Discovery of the running Antigravity `language_server` quota endpoints,
+/// best first as `(port, csrf_token)`.
+/// Loopback TCP ports this process is LISTENING on, read straight from
+/// `/proc/<pid>/fd` (socket inodes) ∩ `/proc/net/tcp{,6}`. `/proc/<pid>/net/tcp`
+/// is namespace-wide, so matching the process's own socket inodes is the only
+/// way to attribute a port to a pid without extra dependencies.
+#[cfg(target_os = "linux")]
+fn listening_ports(proc_dir: &Path) -> Vec<u16> {
+    let mut inodes: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let Ok(fds) = std::fs::read_dir(proc_dir.join("fd")) else {
+        return Vec::new();
+    };
+    for fd in fds.flatten() {
+        if let Ok(link) = std::fs::read_link(fd.path())
+            && let Some(inode) = link
+                .to_str()
+                .and_then(|s| s.strip_prefix("socket:["))
+                .and_then(|s| s.strip_suffix(']'))
+        {
+            inodes.insert(inode.to_string());
+        }
+    }
+    if inodes.is_empty() {
+        return Vec::new();
+    }
+    let mut ports = Vec::new();
+    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let Ok(content) = std::fs::read_to_string(table) else {
+            continue;
+        };
+        for line in content.lines().skip(1) {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            // [1] local addr:port, [3] state (0A = LISTEN), [9] socket inode.
+            if fields.len() < 10 || fields[3] != "0A" || !inodes.contains(fields[9]) {
+                continue;
+            }
+            let Some((addr, port_hex)) = fields[1].rsplit_once(':') else {
+                continue;
+            };
+            // Loopback only — this endpoint is never remote.
+            let loopback = addr == "0100007F" || addr == "00000000000000000000000001000000";
+            if !loopback {
+                continue;
+            }
+            if let Ok(port) = u16::from_str_radix(port_hex, 16) {
+                ports.push(port);
             }
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    ports.sort_unstable();
+    ports.dedup();
+    ports
+}
+
+/// Ports come from the process's OWN listening sockets; the last
+/// `at <port> for HTTP` line of the language_server logs is appended as a
+/// fallback (it outlives restarts, so it is frequently stale — probing a dead
+/// port first only costs one refused connection). The CSRF token is optional:
+/// several builds pass no `--csrf_token` at all (observed on Antigravity CLI
+/// 1.2.2), and the request is then simply attempted without the header.
+#[cfg(target_os = "linux")]
+fn discover_language_servers(antigravity_home: &Path) -> Vec<(u16, Option<String>)> {
+    let mut candidates: Vec<(u16, Option<String>)> = Vec::new();
+    let mut process_token: Option<String> = None;
+    if let Ok(entries) = std::fs::read_dir("/proc") {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Ok(cmdline_bytes) = std::fs::read(path.join("cmdline")) else {
+                continue;
+            };
+            let cmdline = String::from_utf8_lossy(&cmdline_bytes);
+            if !cmdline.contains("language_server") {
+                continue;
+            }
+            let args: Vec<&str> = cmdline.split('\0').filter(|a| !a.is_empty()).collect();
+            let token = parse_csrf_token(&args);
+            process_token = process_token.or_else(|| token.clone());
+            for port in listening_ports(&path) {
+                candidates.push((port, token.clone()));
+            }
+        }
+    }
+    for log_path in [
+        home_dir().join(".config/Antigravity/logs/language_server.log"),
+        antigravity_home.join("logs/language_server.log"),
+        home_dir().join(".gemini/antigravity/logs/language_server.log"),
+    ] {
+        if let Ok(log) = std::fs::read_to_string(&log_path)
+            && let Some(port) = last_http_port(&log)
+        {
+            candidates.push((port, process_token.clone()));
+        }
+    }
+    // De-duplicate on the port, keeping the first (token-bearing) entry.
+    let mut seen = std::collections::HashSet::new();
+    candidates.retain(|(port, _)| seen.insert(*port));
+    candidates
+}
+
+/// Non-Linux stub: the discovery contract is Linux-only (`/proc`), so the
+/// active account's quota probe falls straight through to the network path
+/// (`query_antigravity_pa`).
+#[cfg(not(target_os = "linux"))]
+fn discover_language_servers(antigravity_home: &Path) -> Vec<(u16, Option<String>)> {
     let _ = antigravity_home;
-    None
+    Vec::new()
 }
 
 /// Same `{"token": {...}}` unwrap `parse_antigravity_auth` does internally,
@@ -3124,9 +3429,13 @@ async fn exchange_antigravity_refresh(
     let mut updated = credentials.clone();
     let map = updated.as_object_mut()?;
     let target = if map.get("token").is_some_and(|t| t.is_object()) {
-        map.get_mut("token").and_then(|t| t.as_object_mut()).unwrap()
+        map.get_mut("token")
+            .and_then(|t| t.as_object_mut())
+            .unwrap()
     } else if map.get("tokens").is_some_and(|t| t.is_object()) {
-        map.get_mut("tokens").and_then(|t| t.as_object_mut()).unwrap()
+        map.get_mut("tokens")
+            .and_then(|t| t.as_object_mut())
+            .unwrap()
     } else {
         map
     };
@@ -3727,6 +4036,92 @@ mod tests {
         assert_eq!(windows[1].label, "Claude/GPT");
         assert!((windows[1].used_fraction - 0.84).abs() < 0.01);
         assert!(windows[1].resets_at.is_some());
+    }
+
+    #[test]
+    fn parse_antigravity_quota_accepts_string_and_snake_case_fractions() {
+        let json = serde_json::json!({
+            "userQuotaSummary": {
+                "groups": [
+                    {
+                        "displayName": "Gemini Models",
+                        "buckets": [
+                            {
+                                "bucketId": "gemini-weekly",
+                                "remaining_fraction": "0.25",
+                                "reset_time": "2026-09-11T01:56:05Z"
+                            }
+                        ]
+                    },
+                    {
+                        "displayName": "Claude and GPT models",
+                        "buckets": [
+                            {
+                                "bucketId": "3p-weekly",
+                                "usedFraction": { "value": 0.4 }
+                            }
+                        ]
+                    }
+                ]
+            }
+        });
+        let windows = parse_antigravity_quota_response(&json);
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].label, "Gemini");
+        assert!((windows[0].used_fraction - 0.75).abs() < 0.01);
+        assert!(windows[0].resets_at.is_some());
+        assert_eq!(windows[1].label, "Claude/GPT");
+        assert!((windows[1].used_fraction - 0.4).abs() < 0.01);
+    }
+
+    // ── antigravity language_server discovery (Linux /proc contract) ───────
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn csrf_token_parses_both_flag_spellings() {
+        assert_eq!(
+            parse_csrf_token(&["--x", "--csrf_token", "abc", "--y"]).as_deref(),
+            Some("abc")
+        );
+        assert_eq!(
+            parse_csrf_token(&["--csrf_token=abc"]).as_deref(),
+            Some("abc")
+        );
+        // A bare cmdline is what Antigravity CLI 1.2.2 actually shows — no
+        // token must not mean "no local probe at all".
+        assert_eq!(parse_csrf_token(&["/usr/bin/language_server"]), None);
+        assert_eq!(parse_csrf_token(&["--csrf_token="]), None);
+        assert_eq!(parse_csrf_token(&["--csrf_token"]), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn http_port_skips_the_grpc_line_and_takes_the_last() {
+        let log = concat!(
+            "I0915 12:07:57.234028 1 server.go:576] Language server listening on random port at 46709 for HTTPS (gRPC)\n",
+            "I0915 12:07:57.234707 1 server.go:584] Language server listening on random port at 39631 for HTTP\n",
+            "I0915 12:08:10.000000 1 server.go:584] Language server listening on random port at 41234 for HTTP\n",
+        );
+        // The gRPC line must never win (naive `contains("for HTTP")` matched
+        // it), and the LAST HTTP line is the freshest one.
+        assert_eq!(last_http_port(log), Some(41234));
+        assert_eq!(last_http_port("nothing here"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn last_output_line_skips_tui_repaints() {
+        assert_eq!(last_output_line(""), None);
+        assert_eq!(last_output_line("done\n\n"), Some("done".to_string()));
+        assert_eq!(
+            last_output_line("\u{1b}[2Jrepaint\ninvalid code\n"),
+            Some("invalid code".to_string())
+        );
+        // Repaint-only output still yields something (last resort).
+        assert_eq!(
+            last_output_line("\u{1b}[2Jonly"),
+            Some("\u{1b}[2Jonly".to_string())
+        );
     }
 
     fn unsigned_jwt(payload: serde_json::Value) -> String {

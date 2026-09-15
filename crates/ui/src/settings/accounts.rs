@@ -86,13 +86,18 @@ pub enum LoadTrigger {
 /// design expects the UI to force "on page mount/refresh"). The visit's first
 /// list (mount, or retry after a failure) must force, or every first open
 /// renders "Usage unavailable" until a manual Refresh — the old app fetched
-/// usage on every list. Post-Switch/Forget lists ride the still-warm cache.
+/// usage on every list. Post-Switch/Forget lists force too: a switch changes
+/// which account is ACTIVE, and the active account is probed through a
+/// different path (live keyring / local language_server) than the saved-slot
+/// copy, so riding the warm cache showed the previous account's numbers — or a
+/// stale miss — right after switching.
 pub fn force_usage_for(trigger: LoadTrigger) -> bool {
     match trigger {
-        LoadTrigger::Mount | LoadTrigger::Retry | LoadTrigger::Refresh | LoadTrigger::PostLogin => {
-            true
-        }
-        LoadTrigger::PostAction => false,
+        LoadTrigger::Mount
+        | LoadTrigger::Retry
+        | LoadTrigger::Refresh
+        | LoadTrigger::PostLogin
+        | LoadTrigger::PostAction => true,
     }
 }
 
@@ -744,25 +749,37 @@ impl AccountsPage {
                     .child(SharedString::from(window.label.clone())),
             )
             .child(
+                // Absolute track so `relative()` fill has a definite parent
+                // width (`flex_1` + content-sized fill used to collapse).
+                // Always paint the track: unused windows are 0% fill, and
+                // hiding that child made Gemini/Session look like "no gauge".
                 div()
                     .flex_1()
                     .min_w(px(56.0))
                     .max_w(px(220.0))
                     .h(px(5.0))
-                    .rounded_full()
-                    .overflow_hidden()
-                    .bg(crate::theme::ink(0.07))
-                    .when(fraction > 0.0, |el| {
-                        el.child(
-                            div()
-                                .h_full()
-                                // A 1.5% floor keeps tiny non-zero usage
-                                // visible (komet `max(used, 1.5)%`).
-                                .w(gpui::relative(fraction.max(0.015)))
-                                .rounded_full()
-                                .bg(fill),
-                        )
-                    }),
+                    .relative()
+                    .child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .rounded_full()
+                            .overflow_hidden()
+                            .bg(theme.border)
+                            .child(
+                                div()
+                                    .h_full()
+                                    // A 1.5% floor keeps tiny non-zero usage
+                                    // visible (komet `max(used, 1.5)%`).
+                                    .w(gpui::relative(if fraction > 0.0 {
+                                        fraction.max(0.015)
+                                    } else {
+                                        0.0
+                                    }))
+                                    .rounded_full()
+                                    .bg(fill),
+                            ),
+                    ),
             )
             .child(
                 div()
@@ -942,12 +959,18 @@ impl AccountsPage {
                             )
                         } else {
                             el.child(
-                                div().mt(px(6.0)).flex().flex_col().gap(px(4.0)).children(
-                                    account
-                                        .usage_windows
-                                        .iter()
-                                        .map(|w| self.render_usage_meter(w, theme, now)),
-                                ),
+                                div()
+                                    .mt(px(6.0))
+                                    .w_full()
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(4.0))
+                                    .children(
+                                        account
+                                            .usage_windows
+                                            .iter()
+                                            .map(|w| self.render_usage_meter(w, theme, now)),
+                                    ),
                             )
                         }
                     }),
@@ -1530,8 +1553,10 @@ mod tests {
         // Explicit refresh and a just-completed login always re-probe.
         assert!(force_usage_for(LoadTrigger::Refresh));
         assert!(force_usage_for(LoadTrigger::PostLogin));
-        // Switch/Forget re-lists ride the still-warm 60s cache.
-        assert!(!force_usage_for(LoadTrigger::PostAction));
+        // Switch/Forget re-probe too: the switch moved the LIVE login, so the
+        // cache entry the previous list filled describes the account that is
+        // no longer active.
+        assert!(force_usage_for(LoadTrigger::PostAction));
     }
 
     #[test]
