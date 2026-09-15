@@ -106,6 +106,13 @@ pub fn mac_app_artifact(version: &str) -> String {
     format!("komet-{version}-macos-{arch}-app.tar.gz")
 }
 
+pub fn release_url(version: &str) -> String {
+    format!(
+        "https://github.com/{}/releases/tag/v{version}",
+        release_repo()
+    )
+}
+
 /// Strictly-newer dotted-numeric compare (`0.1.10` > `0.1.9` > `0.1`).
 /// Unparseable versions never count as newer — a garbage `latest.txt` must not
 /// trigger an update loop.
@@ -521,6 +528,9 @@ pub struct UpdateStatus {
     pub checked_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Artifact names advertised by the release manifest.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub available_assets: Vec<String>,
 }
 
 impl UpdateStatus {
@@ -531,6 +541,7 @@ impl UpdateStatus {
             update_available: false,
             checked_at: None,
             error: None,
+            available_assets: Vec::new(),
         }
     }
 }
@@ -689,6 +700,7 @@ impl Updater {
                     latest_version: Some(manifest.version),
                     checked_at: Some(now_ms()),
                     error: None,
+                    available_assets: manifest.files.keys().cloned().collect(),
                 };
                 if status.update_available {
                     tracing::info!(
