@@ -537,6 +537,32 @@ enum UpdateFlow {
     Failed(SharedString),
 }
 
+fn newly_detected_update(
+    observed_version: Option<&str>,
+    status: &komet_update::UpdateStatus,
+) -> Option<String> {
+    status
+        .update_available
+        .then(|| status.latest_version.as_deref())
+        .flatten()
+        .filter(|version| Some(*version) != observed_version)
+        .map(str::to_owned)
+}
+
+fn update_notification_allowed(enabled: bool, background_only: bool, app_focused: bool) -> bool {
+    enabled && !(background_only && app_focused)
+}
+
+fn update_modal_should_show(
+    version: &str,
+    dismissed_version: Option<&str>,
+    status: &komet_update::UpdateStatus,
+) -> bool {
+    status.update_available
+        && status.latest_version.as_deref() == Some(version)
+        && dismissed_version != Some(version)
+}
+
 /// Account lifecycle owned by this process. Sign-in on a local workspace
 /// flows through the in-place switch wizard (offer → switch → import → done);
 /// `RestartPending` survives only as the fallback when the in-place swap
@@ -902,6 +928,10 @@ pub struct Shell {
     /// Version whose update strip the user dismissed (advisory installs only —
     /// a newer release shows the strip again).
     update_dismissed: Option<String>,
+    /// Version currently shown in the proactive update modal.
+    update_modal_version: Option<String>,
+    /// Newest version already processed for notification/modal detection.
+    update_observed: Option<String>,
     /// How this binary was installed — decides the strip's click behavior.
     /// Cached: `detect_install` stats `current_exe` and this renders per frame.
     install: komet_update::InstallKind,
@@ -1135,6 +1165,8 @@ impl Shell {
             update_flow: UpdateFlow::Idle,
             update_task: None,
             update_dismissed: None,
+            update_modal_version: None,
+            update_observed: None,
             install: komet_update::detect_install(),
             org: None,
             sync_flow: SyncFlow::Idle,
@@ -1181,6 +1213,29 @@ impl Shell {
     // ---- splash ----
 
     fn on_state_changed(&mut self, state: &Entity<AppState>, cx: &mut Context<Self>) {
+        let update_status = state.read(cx).update.clone();
+        if let Some(status) = update_status.as_ref() {
+            if let Some(version) = newly_detected_update(self.update_observed.as_deref(), status) {
+                self.update_observed = Some(version.clone());
+                if update_modal_should_show(&version, self.update_dismissed.as_deref(), status) {
+                    self.update_modal_version = Some(version);
+                }
+                if update_notification_allowed(
+                    self.settings.notifications_enabled,
+                    self.settings.notifications_background_only,
+                    cx.active_window().is_some(),
+                ) {
+                    crate::notify::post(
+                        "Komet update available",
+                        &format!(
+                            "Version {} is ready to review",
+                            status.latest_version.as_deref().unwrap_or("")
+                        ),
+                    );
+                }
+                cx.notify();
+            }
+        }
         let next_sync_flow = {
             let state = state.read(cx);
             sync_flow_after_auth(self.sync_flow, state.workspace_scope, state.auth.as_ref())
@@ -4165,6 +4220,113 @@ impl Shell {
         Some(strip.into_any_element())
     }
 
+    fn render_update_modal(
+        &mut self,
+        viewport: gpui::Size<Pixels>,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let version = self.update_modal_version.clone()?;
+        let status = self.state.read(cx).update.clone()?;
+        if status.latest_version.as_deref() != Some(version.as_str()) || !status.update_available {
+            return None;
+        }
+        let expected_asset = match &self.install {
+            komet_update::InstallKind::MacApp { .. } => {
+                Some(komet_update::mac_app_artifact(&version))
+            }
+            komet_update::InstallKind::Managed { .. } => {
+                Some(komet_update::headless_artifact(&version))
+            }
+            komet_update::InstallKind::Unmanaged => None,
+        };
+        let asset_missing = expected_asset.as_ref().is_some_and(|asset| {
+            !status.available_assets.is_empty() && !status.available_assets.contains(asset)
+        });
+        let kind = self.install.clone();
+        let release_url = komet_update::release_url(&version);
+        let mut card = popover::dialog_card(theme)
+            .child(popover::dialog_title(theme, "Komet update available"))
+            .child(div().mt(px(8.0)).child(popover::dialog_body(
+                theme,
+                format!(
+                    "You are running v{}. Version v{} is available.",
+                    status.current_version, version
+                ),
+            )));
+        let install_hint = match &self.install {
+            komet_update::InstallKind::MacApp { .. } => None,
+            komet_update::InstallKind::Managed { .. } => {
+                Some("This install is managed; run `komet update` to update it.")
+            }
+            komet_update::InstallKind::Unmanaged => {
+                Some("This install is unmanaged; download a release manually.")
+            }
+        };
+        if let Some(hint) = install_hint {
+            card = card.child(div().mt(px(8.0)).text_color(theme.text_muted).child(hint));
+        }
+        if asset_missing {
+            card = card.child(div().mt(px(8.0)).text_color(theme.danger).child(format!(
+                "No compatible {} asset was published.",
+                expected_asset.as_deref().unwrap_or("platform")
+            )));
+        } else if let Some(expected_asset) = expected_asset.as_deref()
+            && !status.available_assets.is_empty()
+        {
+            card = card.child(
+                div()
+                    .mt(px(8.0))
+                    .text_color(theme.text_muted)
+                    .child(format!("Platform asset: {expected_asset}")),
+            );
+        }
+        let action = match kind {
+            komet_update::InstallKind::MacApp { .. } if !asset_missing => {
+                let label = match self.update_flow {
+                    UpdateFlow::Downloading => "Downloading…",
+                    UpdateFlow::Ready(_) => "Restart to apply",
+                    _ => "Download and restart",
+                };
+                let enabled = !matches!(self.update_flow, UpdateFlow::Downloading);
+                let mut button = popover::btn_primary(theme, label).id("update-modal-action");
+                if enabled {
+                    button = button.on_click(cx.listener(|this, _, _, cx| {
+                        this.on_update_strip_click(cx);
+                    }));
+                }
+                button
+            }
+            _ => popover::btn_primary(theme, "View release notes")
+                .id("update-modal-release")
+                .on_click(cx.listener(move |_, _, cx| cx.open_url(&release_url))),
+        };
+        let dismiss_version = version.clone();
+        card = card.child(
+            div()
+                .mt(px(16.0))
+                .flex()
+                .flex_row()
+                .justify_end()
+                .gap(px(8.0))
+                .child(
+                    popover::btn_ghost(theme, "Later", "update-modal-later")
+                        .id("update-modal-later")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.update_dismissed = Some(dismiss_version.clone());
+                            this.update_modal_version = None;
+                            cx.notify();
+                        })),
+                )
+                .child(action),
+        );
+        Some(popover::modal(
+            "update-modal",
+            viewport,
+            card.into_any_element(),
+        ))
+    }
+
     /// Idle → download; Ready → swap + relaunch; Failed → retry; advisory
     /// installs → dismiss for this version.
     fn on_update_strip_click(&mut self, cx: &mut Context<Self>) {
@@ -4949,6 +5111,9 @@ impl Shell {
 
         if let Some(sync) = self.render_sync_overlay(viewport, cx) {
             overlays.push(sync);
+        }
+        if let Some(update) = self.render_update_modal(viewport, &theme, cx) {
+            overlays.push(update);
         }
 
         overlays
@@ -7144,6 +7309,55 @@ impl Render for Shell {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn update_status(version: &str, available: bool) -> komet_update::UpdateStatus {
+        komet_update::UpdateStatus {
+            current_version: "1.0.0".into(),
+            latest_version: Some(version.into()),
+            update_available: available,
+            checked_at: None,
+            error: None,
+            available_assets: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn update_detection_is_once_per_version_and_resets_for_newer_release() {
+        let first = update_status("1.1.0", true);
+        assert_eq!(
+            newly_detected_update(None, &first).as_deref(),
+            Some("1.1.0")
+        );
+        assert_eq!(
+            newly_detected_update(Some("1.1.0"), &first),
+            None,
+            "repeated frames must not notify again"
+        );
+        let newer = update_status("1.2.0", true);
+        assert_eq!(
+            newly_detected_update(Some("1.1.0"), &newer).as_deref(),
+            Some("1.2.0")
+        );
+    }
+
+    #[test]
+    fn update_modal_dismissal_is_version_scoped() {
+        let status = update_status("1.1.0", true);
+        assert!(!update_modal_should_show("1.1.0", Some("1.1.0"), &status));
+        assert!(update_modal_should_show(
+            "1.2.0",
+            Some("1.1.0"),
+            &update_status("1.2.0", true)
+        ));
+    }
+
+    #[test]
+    fn update_notification_preferences_gate_background_pings() {
+        assert!(update_notification_allowed(true, false, true));
+        assert!(!update_notification_allowed(true, true, true));
+        assert!(update_notification_allowed(true, true, false));
+        assert!(!update_notification_allowed(false, false, false));
+    }
 
     #[tokio::test]
     async fn remote_shutdown_waits_for_ipc_release() {
