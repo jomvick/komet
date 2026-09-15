@@ -4232,11 +4232,17 @@ impl Shell {
             return None;
         }
         let expected_asset = match &self.install {
-            komet_update::InstallKind::MacApp { .. } => komet_update::mac_app_artifact(&version),
-            _ => komet_update::headless_artifact(&version),
+            komet_update::InstallKind::MacApp { .. } => {
+                Some(komet_update::mac_app_artifact(&version))
+            }
+            komet_update::InstallKind::Managed { .. } => {
+                Some(komet_update::headless_artifact(&version))
+            }
+            komet_update::InstallKind::Unmanaged => None,
         };
-        let asset_missing = !status.available_assets.is_empty()
-            && !status.available_assets.contains(&expected_asset);
+        let asset_missing = expected_asset.as_ref().is_some_and(|asset| {
+            !status.available_assets.is_empty() && !status.available_assets.contains(asset)
+        });
         let kind = self.install.clone();
         let release_url = komet_update::release_url(&version);
         let mut card = popover::dialog_card(theme)
@@ -4262,9 +4268,12 @@ impl Shell {
         }
         if asset_missing {
             card = card.child(div().mt(px(8.0)).text_color(theme.danger).child(format!(
-                "No compatible {expected_asset} asset was published."
+                "No compatible {} asset was published.",
+                expected_asset.as_deref().unwrap_or("platform")
             )));
-        } else if !status.available_assets.is_empty() {
+        } else if let Some(expected_asset) = expected_asset.as_deref()
+            && !status.available_assets.is_empty()
+        {
             card = card.child(
                 div()
                     .mt(px(8.0))
