@@ -873,6 +873,9 @@ fn inside_cwd(path: &str, cwd: &std::path::Path) -> bool {
 /// over the coarse `sandbox` level entirely — danger status comes from the
 /// codex table's own `sandbox_mode`, never from `request.sandbox`, and
 /// `auto_approve` never grants anything the options table denies.
+///
+/// Native-first access mapping (ARCHITECTURE.md §6), branch 3: harnesses
+/// without a native options surface reject here instead of silently no-op'ing.
 pub fn validate_run_request(request: &RunRequest) -> Result<(), ValidationError> {
     let Some(options) = &request.sandbox_options else {
         return Ok(());

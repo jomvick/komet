@@ -25,6 +25,9 @@
 //! - Grok's native `--sandbox` / `--permission-mode` / `--always-approve`
 //!   flags follow the same access chip. Hermes and Pi have no CLI sandbox, so
 //!   the ACP permission policy is their access control.
+//! - Native-first access mapping (ARCHITECTURE.md §6): branch 1 = drive the
+//!   agent's own control, branch 2 = this module's permission bridge fallback,
+//!   branch 3 = reject/hide unsupported surfaces loudly.
 //! - Steering: agents advertising `_session/steering` get mid-turn injection;
 //!   others queue steers and deliver them as the next `session/prompt` at the
 //!   turn boundary. The session stays parked between turns while the

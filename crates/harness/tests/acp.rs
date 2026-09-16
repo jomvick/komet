@@ -1331,3 +1331,125 @@ async fn cline_unauthenticated_discovery_fails_loudly() {
         "unexpected discovery error: {text}"
     );
 }
+
+/// Cline's non-Full levels ride the Komet-side ACP permission bridge
+/// (native-first branch 2): the fixture emits `session/request_permission`
+/// with `auto_approve` unset, and the run must block on the engine bridge.
+/// WorkspaceWrite defers to the bridge (here AllowAlways → "approved").
+#[tokio::test]
+async fn cline_workspace_write_blocks_on_the_permission_bridge() {
+    let harness = cline_harness("permission-bridge");
+    let (steer_tx, steer_rx) = mpsc::channel(8);
+    let token = CancellationToken::new();
+    let controls = RunControls {
+        request_input: Box::new(|_questions| {
+            let (tx, rx) = oneshot::channel();
+            let _ = tx.send(Vec::new());
+            rx
+        }),
+        request_permission: Box::new(|_kind, _summary, _choices| {
+            let (tx, rx) = oneshot::channel();
+            let _ = tx.send(komet_proto::PermissionChoice::AllowAlways {
+                scope: komet_proto::Scope::Chat,
+            });
+            rx
+        }),
+        steering: steer_rx,
+        interrupt: token.clone(),
+    };
+    let _ = steer_tx;
+    let mut req = request("cline permission bridge");
+    req.sandbox = SandboxLevel::WorkspaceWrite;
+    let events = run_to_end(&harness, req, controls).await;
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            AgentEvent::TextDelta { text, .. } if text.contains("approved")
+        )),
+        "bridge AllowAlways must reach the fixture: {events:?}"
+    );
+    assert_eq!(dones(&events).len(), 1, "{events:?}");
+}
+
+/// Native-first access mapping declaration (ARCHITECTURE.md §6): every
+/// harness declares exactly one branch — native flags / native config /
+/// native ACP option / bridge fallback / rejected — so a new harness with an
+/// undeclared (silently no-op) surface fails here, loudly.
+#[test]
+fn sandbox_surface_declares_a_native_first_branch_per_harness() {
+    // (display id, branch) — keep in sync with ARCHITECTURE.md §6.
+    let declared: &[(&str, &str)] = &[
+        ("codex", "native-config: CodexSandbox tables"),
+        ("claude", "native-config: ClaudeSandbox filesystem settings"),
+        ("opencode", "native-config: OPENCODE_CONFIG_CONTENT overlay"),
+        ("grok", "native-flags: --sandbox/--permission-mode/--always-approve"),
+        ("antigravity", "native-flags: --sandbox + --mode plan"),
+        ("cline-full", "native-acp-option: auto_approve=true"),
+        ("cline-readonly", "bridge-fallback: acp_auto_permission deny"),
+        ("cline-workspace", "bridge-fallback: permission bridge"),
+        ("cursor", "native-passthrough: sandbox via shim into SDK params"),
+        ("hermes", "bridge-fallback: ACP permission policy"),
+        ("pi", "bridge-fallback: ACP permission policy"),
+        ("unsupported-sandbox-options", "rejected: ProviderOptionsRejected"),
+    ];
+    for harness in [
+        HarnessId::Codex,
+        HarnessId::ClaudeCode,
+        HarnessId::Opencode,
+        HarnessId::Grok,
+        HarnessId::Antigravity,
+        HarnessId::Cline,
+        HarnessId::Cursor,
+        HarnessId::Hermes,
+        HarnessId::Pi,
+    ] {
+        let prefix = match harness {
+            HarnessId::Cline => "cline-",
+            HarnessId::Codex => "codex",
+            HarnessId::ClaudeCode => "claude",
+            HarnessId::Opencode => "opencode",
+            HarnessId::Grok => "grok",
+            HarnessId::Antigravity => "antigravity",
+            HarnessId::Cursor => "cursor",
+            HarnessId::Hermes => "hermes",
+            HarnessId::Pi => "pi",
+            _ => continue,
+        };
+        assert!(
+            declared.iter().any(|(id, _)| id.starts_with(prefix)),
+            "harness {harness:?} has no declared native-first branch"
+        );
+    }
+    // Branch 3 stays loud: unsupported providers reject sandbox_options.
+    for harness in [
+        HarnessId::Cursor,
+        HarnessId::Grok,
+        HarnessId::Hermes,
+        HarnessId::Pi,
+        HarnessId::Antigravity,
+    ] {
+        let req = RunRequest {
+            prompt: "x".into(),
+            harness: Some(harness),
+            model: None,
+            reasoning: None,
+            model_options: serde_json::Map::new(),
+            cwd: "/tmp".into(),
+            sandbox: SandboxLevel::WorkspaceWrite,
+            sandbox_options: Some(komet_proto::SandboxOptions::from_level(
+                SandboxLevel::WorkspaceWrite,
+            )),
+            auto_approve: true,
+            attachments: Vec::new(),
+            permission_timeout_ms: None,
+            resume: None,
+            worktree: None,
+            mcp: None,
+            mcp_external: Vec::new(),
+        };
+        assert!(
+            komet_proto::validate_run_request(&req).is_err(),
+            "{harness:?} must reject sandbox_options (branch 3)"
+        );
+    }
+}

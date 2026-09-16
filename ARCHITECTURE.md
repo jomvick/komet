@@ -245,6 +245,43 @@ Direct ports of komet behaviors (spec: feature-inventory §3):
   configured** ⇒ pure local scope; setting `KOMET_EDGE_URL` + `KOMET_SYNC_TOKEN`
   enables the synced profile.
 
+## 6. Native-first access mapping
+
+**Rule.** For every harness, each access control (sandbox level, permission,
+approval behavior) must map through exactly one of three branches, chosen in
+order:
+
+1. **Native mechanism exists → use it.** If the agent exposes its own control
+   (CLI flag, config file, ACP config option, permission request protocol),
+   Komet must drive that mechanism — never a parallel reinvention.
+2. **No native mechanism → a dedicated Komet-side fallback, documented as
+   such.** Today that fallback is the ACP permission bridge
+   (`acp_auto_permission`, `crates/harness/src/acp/mod.rs`): Full access
+   auto-allows, Read only auto-denies `Command`/`FileWrite`, WorkspaceWrite
+   defers to the user-facing permission bridge. A dropped resolver degrades
+   to Deny — never a silent allow.
+3. **Neither → leave it out, loudly.** Unsupported surfaces must be rejected
+   (`ValidationError::ProviderOptionsRejected`) or hidden from the UI — never
+   accepted and silently no-op'd.
+
+Live reference matrix (branch + mechanism):
+
+| Harness | Branch | Mechanism (all native unless noted) |
+| --- | --- | --- |
+| Codex | 1 | `sandbox_mode` / `approval_policy` / `writable_roots` / `network_access` (`CodexSandbox`) |
+| Claude | 1 | sandbox settings: `filesystem` allow/deny, `allow_unsandboxed_commands` (`ClaudeSandbox`) |
+| OpenCode | 1 | native permission config via `opencode.json` overlay (`OPENCODE_CONFIG_CONTENT`) + opt-in sandbox runtime |
+| Grok | 1 | native CLI flags `--sandbox` / `--permission-mode` / `--always-approve` (`grok_args_for_sandbox`) |
+| Antigravity | 1 | native CLI `--sandbox` + `--mode plan` (`crates/harness/src/antigravity/mod.rs`) |
+| Cline | 1 (partial) | native `auto_approve` boolean on Full access + native `provider` select injection; ReadOnly/WorkspaceWrite rely on branch 2 |
+| Cursor | 1 | `sandbox` passed through the shim into SDK params (`crates/harness/src/cursor/mod.rs`) |
+| Hermes / Pi | 2 | documented "no CLI sandbox, so the ACP permission policy is their access control" (branch-2 fallback) |
+| Any | 3 | `sandbox_options` for unsupported providers → `ProviderOptionsRejected` (`crates/proto/src/agent.rs`) |
+
+A new harness must declare its branch explicitly (see the "sandbox surface"
+declaration test, pattern of `cline_descriptor_surface_matches_registry_expectations`
+in `crates/harness/tests/acp.rs`); a silent no-op must never ship unnoticed.
+
 ## 7. Parity exclusions & deliberate changes
 
 - **Excluded**: token-usage display (profile heatmap, lifetime stats, per-message token columns,

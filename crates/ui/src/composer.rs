@@ -4923,8 +4923,12 @@ impl Composer {
         let err_message_id = message_id.clone();
         let sandbox = self.state.read(cx).access_mode;
         // Access chip maps to SandboxOptions for Claude/Codex/OpenCode.
-        // Grok/Hermes/Pi/Cursor/Antigravity/Cline honor `sandbox`
-        // (SandboxLevel) natively.
+        // Native-first access mapping (ARCHITECTURE.md §6): Grok/Antigravity
+        // drive native CLI sandbox flags, Cursor passes `sandbox` through the
+        // shim into SDK params, Cline maps Full access natively via
+        // `auto_approve` while ReadOnly/WorkspaceWrite ride the Komet-side
+        // ACP permission bridge, and Hermes/Pi have no native sandbox so the
+        // bridge IS their access control.
         let harness_supports_sandbox = resolved.harness.as_ref().is_none_or(|h| {
             !matches!(
                 h,

@@ -14,6 +14,9 @@
 #   model-only — only the model select (existing-agent behaviour)
 #   unauthed   — session/new rejects with -32000 Authentication required
 #                (an unsigned-in `cline`), handshake must fail loudly
+#   permission-bridge — two-tier catalog, then one turn that emits
+#                session/request_permission with allow/reject kinds
+#                (proves Cline's non-Full levels ride the Komet-side bridge)
 
 # The spec launches with `cline --acp`; refuse anything else.
 [ "$1" = "--acp" ] || exit 1
@@ -48,3 +51,39 @@ else
   done
   emit "{\"id\":$(rid "$line"),\"result\":{\"sessionId\":\"$SID\",\"configOptions\":[{\"id\":\"provider\",\"name\":\"Provider\",\"description\":\"The authentication provider to use\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":\"cline\",\"options\":[{\"value\":\"cline\",\"name\":\"Cline Usage-Billing\"},{\"value\":\"cline-pass\",\"name\":\"ClinePass\"},{\"value\":\"openai-codex\",\"name\":\"OpenAI ChatGPT Subscription\"}]},{\"id\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":\"some/model-001\",\"options\":[$models]}]}}"
 fi
+
+# Discovery-only scenarios end here (models() never sends a prompt).
+if [ "${SCENARIO:-two-tier}" != "permission-bridge" ]; then
+  exit 0
+fi
+
+# ---- permission-bridge turn ----------------------------------------------
+# Accept 0..n set_config_option (auto_approve on Full access, provider
+# injection), then expect session/prompt and emit one tool permission.
+while read -r line; do
+  case "$line" in
+    *'"method":"session/set_config_option"'*)
+      emit "{\"id\":$(rid "$line"),\"result\":{}}"
+      ;;
+    *'"method":"session/prompt"'*)
+      pid=$(rid "$line")
+      break
+      ;;
+  esac
+done
+emit "{\"id\":77,\"method\":\"session/request_permission\",\"params\":{\"sessionId\":\"$SID\",\"toolCall\":{\"toolCallId\":\"t1\"},\"options\":[{\"optionId\":\"once\",\"name\":\"Allow once\",\"kind\":\"allow_once\"},{\"optionId\":\"always\",\"name\":\"Always allow\",\"kind\":\"allow_always\"},{\"optionId\":\"no\",\"name\":\"Reject\",\"kind\":\"reject_once\"}]}}"
+read -r ans || exit 1
+case "$ans" in
+  *'"id":77'*'"outcome":"selected"'*'"optionId":"no"'*)
+    emit "{\"method\":\"session/update\",\"params\":{\"sessionId\":\"$SID\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"denied\"}}}}"
+    ;;
+  *'"id":77'*'"outcome":"selected"'*)
+    emit "{\"method\":\"session/update\",\"params\":{\"sessionId\":\"$SID\",\"update\":{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"approved\"}}}}"
+    ;;
+  *)
+    emit "{\"id\":$pid,\"result\":{\"stopReason\":\"refusal\"}}"
+    exit 0
+    ;;
+esac
+emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+exit 0
