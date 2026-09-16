@@ -4301,7 +4301,6 @@ impl Shell {
                 .id("update-modal-release")
                 .on_click(cx.listener(move |_, _, cx| cx.open_url(&release_url))),
         };
-        let dismiss_version = version.clone();
         card = card.child(
             div()
                 .mt(px(16.0))
@@ -4313,7 +4312,6 @@ impl Shell {
                     popover::btn_ghost(theme, "Later", "update-modal-later")
                         .id("update-modal-later")
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.update_dismissed = Some(dismiss_version.clone());
                             this.update_modal_version = None;
                             cx.notify();
                         })),
