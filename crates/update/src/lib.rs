@@ -157,12 +157,11 @@ pub async fn fetch_latest() -> anyhow::Result<Manifest> {
     }
     let manifest_url = release_asset_url(&repo, &version, "manifest.json");
     let files: BTreeMap<String, FileMeta> = match client.get(&manifest_url).send().await {
-        Ok(resp) if resp.status().is_success() => {
-            resp.json::<Manifest>()
-                .await
-                .with_context(|| "parsing manifest.json".to_string())?
-                .files
-        }
+        Ok(resp) if resp.status().is_success() => resp
+            .json::<Manifest>()
+            .await
+            .with_context(|| "parsing manifest.json".to_string())?
+            .files,
         Ok(resp) => {
             tracing::debug!(status = %resp.status(), "manifest.json unavailable; downloads will skip verification");
             BTreeMap::new()
@@ -308,7 +307,10 @@ fn run(program: &str, args: &[&str]) -> anyhow::Result<()> {
 
 /// Download + unpack the headless tarball into `app_root/<ver>` (idempotent —
 /// an already-staged version is reused). Returns the versioned dir.
-pub async fn stage_headless(manifest: &Manifest, app_root: &Path) -> anyhow::Result<PathBuf> {
+pub async fn stage_headless(
+    manifest: &Manifest,
+    app_root: &Path,
+) -> anyhow::Result<PathBuf> {
     let version = &manifest.version;
     let dest = app_root.join(version);
     if dest.join("komet").exists() {
@@ -409,7 +411,10 @@ pub fn restart_service() -> anyhow::Result<()> {
 
 /// Download + unpack the app tarball into `{data_dir}/updates/<ver>/Komet.app`
 /// (idempotent). Returns the staged bundle path.
-pub async fn stage_mac_app(manifest: &Manifest, data_dir: &Path) -> anyhow::Result<PathBuf> {
+pub async fn stage_mac_app(
+    manifest: &Manifest,
+    data_dir: &Path,
+) -> anyhow::Result<PathBuf> {
     let version = &manifest.version;
     let dir = data_dir.join("updates").join(version);
     let staged = dir.join("Komet.app");
