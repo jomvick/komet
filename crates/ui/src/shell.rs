@@ -1227,10 +1227,7 @@ impl Shell {
                 ) {
                     crate::notify::post(
                         "Komet update available",
-                        &format!(
-                            "Version {} is ready to review",
-                            status.latest_version.as_deref().unwrap_or("")
-                        ),
+                        &format!("Version {version} is ready to review"),
                     );
                 }
                 cx.notify();
