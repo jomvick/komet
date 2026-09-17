@@ -543,7 +543,7 @@ fn newly_detected_update(
 ) -> Option<String> {
     status
         .update_available
-        .then(|| status.latest_version.as_deref())
+        .then_some(status.latest_version.as_deref())
         .flatten()
         .filter(|version| Some(*version) != observed_version)
         .map(str::to_owned)
@@ -1214,24 +1214,24 @@ impl Shell {
 
     fn on_state_changed(&mut self, state: &Entity<AppState>, cx: &mut Context<Self>) {
         let update_status = state.read(cx).update.clone();
-        if let Some(status) = update_status.as_ref() {
-            if let Some(version) = newly_detected_update(self.update_observed.as_deref(), status) {
-                self.update_observed = Some(version.clone());
-                if update_modal_should_show(&version, self.update_dismissed.as_deref(), status) {
-                    self.update_modal_version = Some(version);
-                }
-                if update_notification_allowed(
-                    self.settings.notifications_enabled,
-                    self.settings.notifications_background_only,
-                    cx.active_window().is_some(),
-                ) {
-                    crate::notify::post(
-                        "Komet update available",
-                        &format!("Version {version} is ready to review"),
-                    );
-                }
-                cx.notify();
+        if let Some(status) = update_status.as_ref()
+            && let Some(version) = newly_detected_update(self.update_observed.as_deref(), status)
+        {
+            self.update_observed = Some(version.clone());
+            if update_modal_should_show(&version, self.update_dismissed.as_deref(), status) {
+                self.update_modal_version = Some(version.clone());
             }
+            if update_notification_allowed(
+                self.settings.notifications_enabled,
+                self.settings.notifications_background_only,
+                cx.active_window().is_some(),
+            ) {
+                crate::notify::post(
+                    "Komet update available",
+                    &format!("Version {version} is ready to review"),
+                );
+            }
+            cx.notify();
         }
         let next_sync_flow = {
             let state = state.read(cx);
@@ -4296,7 +4296,7 @@ impl Shell {
             }
             _ => popover::btn_primary(theme, "View release notes")
                 .id("update-modal-release")
-                .on_click(cx.listener(move |_, _, cx| cx.open_url(&release_url))),
+                .on_click(cx.listener(move |_, _, _, cx| cx.open_url(&release_url))),
         };
         card = card.child(
             div()
