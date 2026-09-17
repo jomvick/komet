@@ -3624,7 +3624,31 @@ pub struct Composer {
 
 impl EventEmitter<ComposerEvent> for Composer {}
 
+/// The level the access chip moves to on click.
+fn next_access(level: komet_proto::SandboxLevel) -> komet_proto::SandboxLevel {
+    match level {
+        komet_proto::SandboxLevel::WorkspaceWrite => komet_proto::SandboxLevel::DangerFullAccess,
+        komet_proto::SandboxLevel::DangerFullAccess => komet_proto::SandboxLevel::ReadOnly,
+        komet_proto::SandboxLevel::ReadOnly => komet_proto::SandboxLevel::WorkspaceWrite,
+    }
+}
+
 impl Composer {
+    /// Advance the access chip. In an existing chat the new level is saved to
+    /// that chat, so it reopens at this level on every device. On the new-chat
+    /// screen it applies to the draft only and leaves the Security default as is.
+    fn cycle_access_mode(&mut self, cx: &mut Context<Self>) {
+        let next = next_access(self.state.read(cx).access_mode);
+        if self.state.read(cx).selected_chat.is_some() {
+            self.pickers
+                .update(cx, |pickers, cx| pickers.set_chat_sandbox(next, cx));
+        }
+        // Also set it directly: a chat without a saved configuration (unknown
+        // harness) cannot be written, but its next message still uses this level.
+        self.state.update(cx, |state, _| state.access_mode = next);
+        cx.notify();
+    }
+
     /// The picker entity, for the shell's canvas target selectors.
     pub fn pickers(&self) -> &Entity<Pickers> {
         &self.pickers
@@ -5127,7 +5151,7 @@ impl Composer {
                                 serde_json::Value::String(branch.clone()),
                             );
                         }
-                        if let Some(config) = resolved.chat_config()
+                        if let Some(config) = resolved.chat_config(sandbox)
                             && let Ok(config) = serde_json::to_value(&config)
                         {
                             object.insert("config".into(), config);
@@ -6600,19 +6624,7 @@ impl Render for Composer {
                                 .text_color(theme.text_muted)
                                 .cursor_pointer()
                                 .on_click(cx.listener(|this, _, _, cx| {
-                                    let next = match this.state.read(cx).access_mode {
-                                        komet_proto::SandboxLevel::DangerFullAccess => {
-                                            komet_proto::SandboxLevel::ReadOnly
-                                        }
-                                        komet_proto::SandboxLevel::ReadOnly => {
-                                            komet_proto::SandboxLevel::WorkspaceWrite
-                                        }
-                                        komet_proto::SandboxLevel::WorkspaceWrite => {
-                                            komet_proto::SandboxLevel::DangerFullAccess
-                                        }
-                                    };
-                                    this.state.update(cx, |state, _| state.access_mode = next);
-                                    cx.notify();
+                                    this.cycle_access_mode(cx);
                                 }))
                                 .child(match self.state.read(cx).access_mode {
                                     komet_proto::SandboxLevel::DangerFullAccess => "Full access",
@@ -6682,20 +6694,7 @@ impl Render for Composer {
                                         .text_color(theme.text_muted)
                                         .cursor_pointer()
                                         .on_click(cx.listener(|this, _, _, cx| {
-                                            let next = match this.state.read(cx).access_mode {
-                                                komet_proto::SandboxLevel::DangerFullAccess => {
-                                                    komet_proto::SandboxLevel::ReadOnly
-                                                }
-                                                komet_proto::SandboxLevel::ReadOnly => {
-                                                    komet_proto::SandboxLevel::WorkspaceWrite
-                                                }
-                                                komet_proto::SandboxLevel::WorkspaceWrite => {
-                                                    komet_proto::SandboxLevel::DangerFullAccess
-                                                }
-                                            };
-                                            this.state
-                                                .update(cx, |state, _| state.access_mode = next);
-                                            cx.notify();
+                                            this.cycle_access_mode(cx);
                                         }))
                                         .child(match self.state.read(cx).access_mode {
                                             komet_proto::SandboxLevel::DangerFullAccess => {
@@ -6762,6 +6761,14 @@ impl Render for Composer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn access_chip_cycles_through_every_level() {
+        use komet_proto::SandboxLevel::*;
+        assert_eq!(next_access(WorkspaceWrite), DangerFullAccess);
+        assert_eq!(next_access(DangerFullAccess), ReadOnly);
+        assert_eq!(next_access(ReadOnly), WorkspaceWrite);
+    }
 
     fn tooltip_target(range: Range<usize>, path: &str) -> MentionTooltipTarget {
         MentionTooltipTarget {
