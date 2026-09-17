@@ -115,6 +115,22 @@ pub fn read(dir: &Path, port: u16) -> io::Result<String> {
     Ok(token.trim().to_string())
 }
 
+/// The port of a `ws://` URL that points at this machine (`127.0.0.1`,
+/// `localhost` or `[::1]`), or `None` for any other URL. Tools that take a URL
+/// from the command line use this before sending a token, so the token never
+/// leaves the machine.
+pub fn loopback_port(url: &str) -> Option<u16> {
+    let authority = url.strip_prefix("ws://")?.trim_end_matches('/');
+    if authority.contains(['/', '@', '?', '#']) {
+        return None;
+    }
+    let (host, port) = authority.rsplit_once(':')?;
+    if !matches!(host, "127.0.0.1" | "localhost" | "[::1]") {
+        return None;
+    }
+    port.parse().ok()
+}
+
 /// Read the token of the engine on `port` from [`default_dir`].
 pub fn read_default(port: u16) -> io::Result<String> {
     read(&default_dir()?, port)

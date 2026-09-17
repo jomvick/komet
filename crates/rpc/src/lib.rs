@@ -429,6 +429,34 @@ mod tests {
         }
     }
 
+    // The token is only ever sent to this machine's engine.
+    #[test]
+    fn loopback_port_is_extracted_only_for_local_urls() {
+        assert_eq!(
+            ipc_token::loopback_port("ws://127.0.0.1:27654"),
+            Some(27654)
+        );
+        assert_eq!(
+            ipc_token::loopback_port("ws://localhost:27801/"),
+            Some(27801)
+        );
+        assert_eq!(ipc_token::loopback_port("ws://[::1]:27654"), Some(27654));
+        assert_eq!(
+            ipc_token::loopback_port("ws://attacker.example:27654"),
+            None
+        );
+        assert_eq!(
+            ipc_token::loopback_port("ws://127.0.0.1.attacker.example:27654"),
+            None
+        );
+        assert_eq!(
+            ipc_token::loopback_port("ws://localhost@attacker.example:27654"),
+            None
+        );
+        assert_eq!(ipc_token::loopback_port("wss://127.0.0.1:27654"), None);
+        assert_eq!(ipc_token::loopback_port("ws://127.0.0.1"), None);
+    }
+
     #[test]
     fn stopping_an_engine_removes_only_its_own_token_file() {
         let dir = tempfile::tempdir().unwrap();

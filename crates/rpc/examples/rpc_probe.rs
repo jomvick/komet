@@ -14,11 +14,13 @@ async fn main() {
         std::process::exit(2);
     };
     let params: serde_json::Value = serde_json::from_str(params).expect("params json");
-    let port = url
-        .rsplit(':')
-        .next()
-        .and_then(|p| p.trim_end_matches('/').parse().ok())
-        .expect("url must end with the engine port");
+    // The engine token is only sent to an engine on this machine.
+    let Some(port) = komet_rpc::ipc_token::loopback_port(url) else {
+        eprintln!(
+            "rpc_probe only connects to ws://127.0.0.1:<port>, ws://localhost:<port> or ws://[::1]:<port>"
+        );
+        std::process::exit(2);
+    };
     let token = komet_rpc::ipc_token::read_default(port).expect("engine token");
     let client = connect_ws(url, &token).await.expect("connect");
     if rest.first().map(String::as_str) == Some("--stream") {
