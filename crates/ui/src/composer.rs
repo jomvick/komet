@@ -3642,6 +3642,21 @@ impl Composer {
         self.send(text, false, cx);
     }
 
+    /// In-place Edit → Send on an already-sent prompt (transcript bubble).
+    /// When a run is live this steers the current run instead of killing it
+    /// and opening a brand-new turn (which read as "le prompt est renvoyé"
+    /// next to the original). When idle it falls back to a plain new turn —
+    /// true rewind-and-rerun needs backend truncation support (doc entries
+    /// are append-only), so the edited text goes out as a follow-up.
+    pub fn submit_edit(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
+        let text = text.into().trim().to_string();
+        if text.is_empty() || self.sending || self.send_blocked(cx) || self.wizard.is_some() {
+            return;
+        }
+        let steer = self.run_live(cx);
+        self.send(text, steer, cx);
+    }
+
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let input = cx.new(|cx| {
             let mut input = ComposerInput::new("Do anything…", cx);

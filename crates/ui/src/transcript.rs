@@ -1659,7 +1659,7 @@ impl Transcript {
         }
         if let Some(composer) = self.composer.as_ref() {
             composer
-                .update(cx, |composer, cx| composer.submit_text(text, cx))
+                .update(cx, |composer, cx| composer.submit_edit(text, cx))
                 .ok();
         }
         cx.notify();
