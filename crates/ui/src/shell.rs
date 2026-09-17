@@ -41,6 +41,7 @@ use crate::settings::devices::DevicesPage;
 use crate::settings::files::FilesSettingsPage;
 use crate::settings::harnesses::HarnessesPage;
 use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
+use crate::settings::security::{SecurityDefaults, SecurityEvent, SecurityPage};
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
 use crate::settings::{
     KeymapConfig, RIGHT_PANE_DEFAULT, RIGHT_PANE_MAX, RIGHT_PANE_MIN, RememberedNavigation,
@@ -178,10 +179,11 @@ pub enum SettingsSection {
     Shortcuts,
     Archived,
     Sync,
+    Security,
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 9] = [
+    pub const ALL: [SettingsSection; 10] = [
         SettingsSection::Devices,
         SettingsSection::Harnesses,
         SettingsSection::Agents,
@@ -191,6 +193,7 @@ impl SettingsSection {
         SettingsSection::Shortcuts,
         SettingsSection::Archived,
         SettingsSection::Sync,
+        SettingsSection::Security,
     ];
 
     /// Sidebar + header label (komet settings-sidebar.tsx SECTIONS / __root.tsx
@@ -206,6 +209,7 @@ impl SettingsSection {
             SettingsSection::Shortcuts => "Shortcuts",
             SettingsSection::Archived => "Archived sessions",
             SettingsSection::Sync => "Sync",
+            SettingsSection::Security => "Security",
         }
     }
 }
@@ -881,8 +885,10 @@ pub struct Shell {
     shortcuts_page: Option<Entity<ShortcutsPage>>,
     accounts_page: Option<Entity<AccountsPage>>,
     harnesses_page: Option<Entity<HarnessesPage>>,
+    security_page: Option<Entity<SecurityPage>>,
     shortcuts_sub: Option<Subscription>,
     notifications_sub: Option<Subscription>,
+    security_sub: Option<Subscription>,
     /// Session-row context menu: (chat id, window position).
     chat_menu: popover::Popup<(String, Point<Pixels>)>,
     rename_dialog: Option<RenameChatDialog>,
@@ -1075,6 +1081,7 @@ impl Shell {
             Some("settings/notifications") => Route::Settings(SettingsSection::Notifications),
             Some("settings/shortcuts") => Route::Settings(SettingsSection::Shortcuts),
             Some("settings/archived") => Route::Settings(SettingsSection::Archived),
+            Some("settings/security") => Route::Settings(SettingsSection::Security),
             // `new` pins the new-chat canvas (suppresses boot auto-select).
             Some("new") => {
                 state.update(cx, |s, _| s.auto_selected = true);
@@ -1139,8 +1146,10 @@ impl Shell {
             shortcuts_page: None,
             accounts_page: None,
             harnesses_page: None,
+            security_page: None,
             shortcuts_sub: None,
             notifications_sub: None,
+            security_sub: None,
             chat_menu: popover::Popup::default(),
             rename_dialog: None,
             delete_confirm: None,
@@ -2571,6 +2580,44 @@ impl Shell {
                 }
             }
             SettingsSection::Sync => crate::settings::sync::render_sync_settings(cx),
+            SettingsSection::Security => {
+                if self.security_page.is_none() {
+                    let level = self
+                        .state
+                        .read(cx)
+                        .data_dir
+                        .as_deref()
+                        .map(SecurityDefaults::load)
+                        .unwrap_or_default()
+                        .default_sandbox;
+                    let page = cx.new(|cx| SecurityPage::new(level, cx));
+                    self.security_sub = Some(cx.subscribe(
+                        &page,
+                        |this: &mut Shell, _, event: &SecurityEvent, cx| {
+                            let SecurityEvent::DefaultSandboxChanged(level) = *event;
+                            if let Some(data_dir) =
+                                this.state.read(cx).data_dir.clone()
+                            {
+                                let defaults = SecurityDefaults {
+                                    default_sandbox: level,
+                                };
+                                if let Err(err) = defaults.save(&data_dir) {
+                                    tracing::warn!(error = %err, "security-defaults save failed");
+                                }
+                            }
+                            this.state.update(cx, |s, _| {
+                                s.access_mode = level;
+                            });
+                            cx.notify();
+                        },
+                    ));
+                    self.security_page = Some(page);
+                }
+                match &self.security_page {
+                    Some(page) => page.clone().into_any_element(),
+                    None => Empty.into_any_element(),
+                }
+            }
         }
     }
 
@@ -3541,6 +3588,7 @@ impl Shell {
             SettingsSection::Shortcuts => icons::KEYBOARD,
             SettingsSection::Archived => icons::ARCHIVE_MINIMALISTIC,
             SettingsSection::Sync => icons::GLOBAL,
+            SettingsSection::Security => icons::KEY_MINIMALISTIC,
         };
         // Match the user's dragged sidebar width — the pane container clips to
         // it, so a hardcoded default here left hover washes stopping short of
@@ -7920,5 +7968,12 @@ mod tests {
             Some(NavEntry::Settings(SettingsSection::Devices))
         );
         assert_eq!(nav.back(), Some(chat("a")));
+    }
+
+    #[test]
+    fn settings_sections_include_security() {
+        assert_eq!(SettingsSection::ALL.len(), 10);
+        assert!(SettingsSection::ALL.contains(&SettingsSection::Security));
+        assert_eq!(SettingsSection::Security.label(), "Security");
     }
 }

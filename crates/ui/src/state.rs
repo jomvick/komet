@@ -628,7 +628,8 @@ pub struct AppState {
     /// revision that has not reached disk yet. A chat remains blocked until
     /// every surface waiting on a workspace write has finished or cancelled.
     review_comment_flushes: HashMap<String, HashSet<u64>>,
-    /// Data directory (`ui-settings.json`, `composer-defaults.json`); set at
+    /// Data directory (`ui-settings.json`, `composer-defaults.json`,
+    /// `security-defaults.json`); set at
     /// bootstrap so child views can persist small preference files.
     pub data_dir: Option<PathBuf>,
     pub workspace_state: Option<komet_proto::WorkspaceState>,
@@ -1330,7 +1331,9 @@ impl AppState {
             s.connection = ConnectionStatus::Connecting;
             s.workspace_scope = None;
             s.auth = None;
-            s.data_dir = Some(data_dir);
+            s.data_dir = Some(data_dir.clone());
+            s.access_mode = crate::settings::security::SecurityDefaults::load(&data_dir)
+                .default_sandbox;
             s.boot_config = Some(boot_config);
             cx.notify();
         });
