@@ -18,6 +18,7 @@ use komet_sync::DocsStore;
 pub mod agent_accounts;
 pub mod auth;
 pub mod chat2_host;
+pub mod crash_shield;
 pub mod diff_sync;
 pub mod doc_host;
 pub mod instance_lock;
@@ -197,6 +198,10 @@ impl EngineCore {
     ) -> Result<Self, EngineError> {
         let data_dir = profile.device_root();
         std::fs::create_dir_all(data_dir)?;
+        // Crash shield first: report a previous crashed run (and clear its
+        // marker) before any store opens, then arm the panic hook. Every
+        // construction path funnels through here.
+        crash_shield::install(data_dir);
         // One-time legacy `~/.komet` → `~/.komet` sweep (Cursor resume stores,
         // managed adapters, worktrees). Best-effort, before anything reads
         // those roots; never blocks boot.
