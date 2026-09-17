@@ -158,7 +158,7 @@ fn main() -> anyhow::Result<()> {
         }
         Some(Command::SyncServer { port }) => {
             let runtime = tokio::runtime::Runtime::new()?;
-            let token = std::env::var("KOMET_SYNC_TOKEN").ok();
+            let token = komet_sync_server::require_token(std::env::var("KOMET_SYNC_TOKEN").ok())?;
             let data_dir = std::env::var_os("KOMET_DATA_DIR").map(std::path::PathBuf::from).unwrap_or_else(dirs_data_dir);
             runtime.block_on(komet_sync_server::serve(data_dir, token, port))
         }

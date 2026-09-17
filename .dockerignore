@@ -1,0 +1,6 @@
+# Keep the sync server image build context small.
+target/
+.git/
+data-sync/
+.gstack/
+.devcontainer/

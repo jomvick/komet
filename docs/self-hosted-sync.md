@@ -27,7 +27,14 @@ komet
 
 ## Variables
 - `KOMET_EDGE_URL` : URL du sync server (aucun défaut — non configuré = 100% local)
-- `KOMET_SYNC_TOKEN` : shared-secret Bearer (vide = open LAN)
+- `KOMET_SYNC_TOKEN` : shared bearer token. Required: the server refuses to start when it is unset or blank.
+- `KOMET_SYNC_PORT` : port of the container image binary (default 8787).
+
+## Upgrading an existing Docker deployment
+The image now runs as the unprivileged user `komet` (uid 10001). Give it the existing data directory once:
+```bash
+sudo chown -R 10001:10001 ./data-sync
+```
 
 ## Stockage
 - `data/rooms/*.db` : SQLite par room (frames)

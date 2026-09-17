@@ -16,7 +16,8 @@ use tracing::info;
 #[derive(Clone)]
 pub struct AppState {
     pub data_dir: PathBuf,
-    pub token: Option<String>,
+    /// Shared bearer token; never empty (see [`require_token`]).
+    pub token: String,
     pub rooms: Arc<RwLock<HashMap<String, Room>>>,
 }
 
@@ -37,16 +38,35 @@ fn open_room_db(path: &std::path::Path) -> rusqlite::Connection {
     conn
 }
 
+/// Validate the configured server token. Unset or blank tokens are refused, so
+/// a server can never run without authentication by accident.
+pub fn require_token(token: Option<String>) -> anyhow::Result<String> {
+    let token = token.map(|t| t.trim().to_string()).unwrap_or_default();
+    if token.is_empty() {
+        anyhow::bail!(
+            "KOMET_SYNC_TOKEN is not set. Generate one with `komet sync-init` and \
+             set it on the server and on every device."
+        );
+    }
+    Ok(token)
+}
+
 fn check_auth(state: &AppState, headers: &HeaderMap) -> bool {
-    let Some(expected) = &state.token else {
-        return true;
-    };
     let got = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .or_else(|| headers.get("x-komet-token").and_then(|v| v.to_str().ok()));
-    got == Some(expected.as_str())
+    got.is_some_and(|got| constant_time_eq(got.as_bytes(), state.token.as_bytes()))
+}
+
+/// Compare two byte strings without stopping at the first difference, so the
+/// response time does not reveal how much of a guessed token was right.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |diff, (x, y)| diff | (x ^ y)) == 0
 }
 
 async fn health() -> impl IntoResponse {
@@ -202,7 +222,7 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-pub async fn serve(data_dir: PathBuf, token: Option<String>, port: u16) -> anyhow::Result<()> {
+pub async fn serve(data_dir: PathBuf, token: String, port: u16) -> anyhow::Result<()> {
     tokio::fs::create_dir_all(data_dir.join("rooms")).await.ok();
     tokio::fs::create_dir_all(data_dir.join("blobs")).await.ok();
     let state = AppState {
@@ -231,7 +251,7 @@ mod tests {
     fn test_state(data_dir: &std::path::Path) -> AppState {
         AppState {
             data_dir: data_dir.to_path_buf(),
-            token: Some(TOKEN.to_string()),
+            token: TOKEN.to_string(),
             rooms: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -307,6 +327,48 @@ mod tests {
             assert_eq!(get.status(), StatusCode::OK, "{part}");
             let body = get.into_body().collect().await.unwrap().to_bytes();
             assert_eq!(&body[..], b"output");
+        }
+    }
+
+    // Finding 2: a server must never start without a real token.
+    #[test]
+    fn server_token_must_be_set_and_non_blank() {
+        assert!(require_token(None).is_err());
+        assert!(require_token(Some(String::new())).is_err());
+        assert!(require_token(Some("   ".into())).is_err());
+        assert_eq!(require_token(Some(" abc ".into())).unwrap(), "abc");
+    }
+
+    fn blob_get(auth: Option<(&'static str, String)>) -> Request<Body> {
+        let mut builder = Request::builder().uri("/blob/chat-1/missing");
+        if let Some((name, value)) = auth {
+            builder = builder.header(name, value);
+        }
+        builder.body(Body::empty()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn requests_without_the_exact_token_are_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let app = router(test_state(root.path()));
+
+        for auth in [
+            None,
+            Some(("authorization", "Bearer ".to_string())),
+            Some(("x-komet-token", String::new())),
+            Some(("authorization", "Bearer wrong".to_string())),
+            Some(("authorization", format!("Bearer {TOKEN}x"))),
+        ] {
+            let response = app.clone().oneshot(blob_get(auth.clone())).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{auth:?}");
+        }
+        // The right token passes authentication (the blob itself is missing).
+        for auth in [
+            ("authorization", format!("Bearer {TOKEN}")),
+            ("x-komet-token", TOKEN.to_string()),
+        ] {
+            let response = app.clone().oneshot(blob_get(Some(auth))).await.unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
         }
     }
 }
