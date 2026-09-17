@@ -14,7 +14,13 @@ async fn main() {
         std::process::exit(2);
     };
     let params: serde_json::Value = serde_json::from_str(params).expect("params json");
-    let client = connect_ws(url).await.expect("connect");
+    let port = url
+        .rsplit(':')
+        .next()
+        .and_then(|p| p.trim_end_matches('/').parse().ok())
+        .expect("url must end with the engine port");
+    let token = komet_rpc::ipc_token::read_default(port).expect("engine token");
+    let client = connect_ws(url, &token).await.expect("connect");
     if rest.first().map(String::as_str) == Some("--stream") {
         let count: usize = rest.get(1).and_then(|n| n.parse().ok()).unwrap_or(1);
         let mut rx = client.subscribe(method, params).await.expect("subscribe");
