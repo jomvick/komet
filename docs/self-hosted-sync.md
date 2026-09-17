@@ -9,6 +9,10 @@ Par défaut Komet est 100% local. Le user qui veut sync déploie lui-même `kome
 ```bash
 komet sync-init  # génère KOMET_SYNC_TOKEN
 # editer .env avec le token
+# The container runs as uid 10001: create the data directory it writes to.
+# Otherwise Docker creates it owned by root and the server cannot write.
+mkdir -p ./data-sync
+sudo chown 10001:10001 ./data-sync
 docker compose -f docker-compose.sync.yml up -d
 ```
 
@@ -31,7 +35,7 @@ komet
 - `KOMET_SYNC_PORT` : port of the container image binary (default 8787).
 
 ## Upgrading an existing Docker deployment
-The image now runs as the unprivileged user `komet` (uid 10001). Give it the existing data directory once:
+The image now runs as the unprivileged user `komet` (uid 10001). Give it the existing data directory once (new deployments do this in the steps above):
 ```bash
 sudo chown -R 10001:10001 ./data-sync
 ```
