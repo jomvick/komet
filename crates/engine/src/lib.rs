@@ -891,9 +891,10 @@ pub async fn serve_ipc(
     service: std::sync::Arc<dyn komet_rpc::RpcService>,
 ) -> std::io::Result<tokio::task::JoinHandle<()>> {
     let socket = tokio::net::TcpSocket::new_v4()?;
+    // SO_REUSEADDR lets a restarted engine bind while old connections are in
+    // TIME_WAIT. SO_REUSEPORT is deliberately not set: it would let a second
+    // engine bind the same port and replace the first engine's token file.
     socket.set_reuseaddr(true)?;
-    #[cfg(unix)]
-    let _ = socket.set_reuseport(true);
     socket.bind(std::net::SocketAddr::from(([127, 0, 0, 1], port)))?;
     let listener = socket.listen(1024)?;
     // Published only after the bind succeeded, so a losing engine never
