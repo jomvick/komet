@@ -105,22 +105,28 @@ download_verified() {
   mv "$dest.partial" "$dest"
 }
 
+# ensure_verified <url> <dest> <sha256>: reuse <dest> only when it matches the
+# checksum; otherwise (missing, modified or partial) download it again.
+ensure_verified() {
+  local url="$1" dest="$2" expected="$3"
+  if [[ -f "$dest" ]] && echo "$expected  $dest" | sha256sum -c --quiet - 2>/dev/null; then
+    return 0
+  fi
+  echo "Downloading $url..."
+  rm -f "$dest"
+  download_verified "$url" "$dest" "$expected"
+}
+
 TOOL="$OUT_DIR/appimagetool-$APPIMAGETOOL_VERSION.AppImage"
-if [[ ! -x "$TOOL" ]]; then
-  echo "Downloading appimagetool $APPIMAGETOOL_VERSION..."
-  download_verified \
-    "https://github.com/AppImage/appimagetool/releases/download/$APPIMAGETOOL_VERSION/appimagetool-x86_64.AppImage" \
-    "$TOOL" "$APPIMAGETOOL_SHA256"
-  chmod +x "$TOOL"
-fi
+ensure_verified \
+  "https://github.com/AppImage/appimagetool/releases/download/$APPIMAGETOOL_VERSION/appimagetool-x86_64.AppImage" \
+  "$TOOL" "$APPIMAGETOOL_SHA256"
+chmod +x "$TOOL"
 
 RUNTIME="$OUT_DIR/runtime-$RUNTIME_VERSION-$ARCH"
-if [[ ! -f "$RUNTIME" ]]; then
-  echo "Downloading runtime $RUNTIME_VERSION for $ARCH..."
-  download_verified \
-    "https://github.com/AppImage/type2-runtime/releases/download/$RUNTIME_VERSION/runtime-$ARCH" \
-    "$RUNTIME" "$RUNTIME_SHA256"
-fi
+ensure_verified \
+  "https://github.com/AppImage/type2-runtime/releases/download/$RUNTIME_VERSION/runtime-$ARCH" \
+  "$RUNTIME" "$RUNTIME_SHA256"
 
 EXTRA_ARGS=()
 if [[ -f "$RUNTIME" && -s "$RUNTIME" ]]; then
