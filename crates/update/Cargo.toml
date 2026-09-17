@@ -9,6 +9,8 @@ publish.workspace = true
 anyhow.workspace = true
 futures.workspace = true
 reqwest.workspace = true
+# Ed25519 release manifest signatures; already in Cargo.lock through rustls.
+ring = "0.17"
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

@@ -3860,6 +3860,7 @@ dependencies = [
  "anyhow",
  "futures",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "sha2",
