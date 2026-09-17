@@ -126,6 +126,30 @@ async fn handle_socket(state: AppState, room: String, socket: WebSocket) {
     info!(room=%room, "client disconnected");
 }
 
+/// The file for a blob, or `None` when either segment could leave
+/// `data_dir/blobs`. Accepts exactly what clients send (see `fetch_tool_blob`
+/// in `crates/engine/src/doc_host.rs`): chat ids of letters, digits, `_` and
+/// `-`; part ids that may also contain `.`, `:`, `#` and `~` but never start
+/// with a dot, which rules out `.` and `..`. The final check also catches a
+/// Windows drive prefix such as `C:name`, which `join` would treat as a new root.
+fn blob_path(data_dir: &std::path::Path, chat: &str, part: &str) -> Option<PathBuf> {
+    let chat_valid = (1..=128).contains(&chat.len())
+        && chat
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+    let part_valid = (1..=200).contains(&part.len())
+        && !part.starts_with('.')
+        && part
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._:#~-".contains(&b));
+    if !(chat_valid && part_valid) {
+        return None;
+    }
+    let chat_dir = data_dir.join("blobs").join(chat);
+    let path = chat_dir.join(part);
+    path.starts_with(&chat_dir).then_some(path)
+}
+
 async fn get_blob(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -134,7 +158,9 @@ async fn get_blob(
     if !check_auth(&state, &headers) {
         return Err((StatusCode::UNAUTHORIZED, "unauthorized"));
     }
-    let path = state.data_dir.join("blobs").join(&chat).join(&part);
+    let Some(path) = blob_path(&state.data_dir, &chat, &part) else {
+        return Err((StatusCode::BAD_REQUEST, "invalid blob path"));
+    };
     match tokio::fs::read(&path).await {
         Ok(b) => Ok(b.into_response()),
         Err(_) => Err((StatusCode::NOT_FOUND, "not_found")),
@@ -150,9 +176,12 @@ async fn put_blob(
     if !check_auth(&state, &headers) {
         return Err((StatusCode::UNAUTHORIZED, "unauthorized"));
     }
-    let dir = state.data_dir.join("blobs").join(&chat);
-    let _ = tokio::fs::create_dir_all(&dir).await;
-    let path = dir.join(&part);
+    let Some(path) = blob_path(&state.data_dir, &chat, &part) else {
+        return Err((StatusCode::BAD_REQUEST, "invalid blob path"));
+    };
+    if let Some(dir) = path.parent() {
+        let _ = tokio::fs::create_dir_all(dir).await;
+    }
     match tokio::fs::write(&path, &body).await {
         Ok(_) => Ok(Json(serde_json::json!({"ok":true, "bytes": body.len()})).into_response()),
         Err(e) => Err((
@@ -187,4 +216,97 @@ pub async fn serve(data_dir: PathBuf, token: Option<String>, port: u16) -> anyho
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Method, Request};
+    use http_body_util::BodyExt;
+    use tower::ServiceExt;
+
+    const TOKEN: &str = "test-token";
+
+    fn test_state(data_dir: &std::path::Path) -> AppState {
+        AppState {
+            data_dir: data_dir.to_path_buf(),
+            token: Some(TOKEN.to_string()),
+            rooms: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    fn request(method: Method, uri: &str, body: &'static str) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", format!("Bearer {TOKEN}"))
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    // Finding 1: an encoded `../` in either segment must not reach the file
+    // system outside `data_dir/blobs`.
+    #[tokio::test]
+    async fn blob_put_rejects_paths_outside_the_blob_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let data_dir = root.path().join("data");
+        let app = router(test_state(&data_dir));
+        let escaped = root.path().join("escaped.txt");
+
+        for uri in [
+            "/blob/..%2F..%2F/escaped.txt",
+            "/blob/chat-1/..%2F..%2F..%2Fescaped.txt",
+            "/blob/chat-1/.hidden",
+            "/blob/chat-1/..",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(request(Method::PUT, uri, "owned"))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+        }
+        assert!(!escaped.exists());
+    }
+
+    #[tokio::test]
+    async fn blob_get_rejects_paths_outside_the_blob_directory() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("secret.txt"), "secret").unwrap();
+        let app = router(test_state(&root.path().join("data")));
+
+        let response = app
+            .oneshot(request(Method::GET, "/blob/..%2F..%2F/secret.txt", ""))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // The ids real clients send still work: a uuid chat id with a tool call
+    // part and its `.diff` companion (see `doc_host.rs` `upload_tool_sidecar`).
+    #[tokio::test]
+    async fn blob_round_trip_accepts_real_client_ids() {
+        let root = tempfile::tempdir().unwrap();
+        let app = router(test_state(root.path()));
+        let chat = "0b7f1c4e-9d2a-4e55-8a61-3c9f0e2d7b11";
+
+        for part in ["toolu_01ABC:call#1", "toolu_01ABC:call#1.diff"] {
+            let uri = format!("/blob/{chat}/{}", part.replace('#', "%23"));
+            let put = app
+                .clone()
+                .oneshot(request(Method::PUT, &uri, "output"))
+                .await
+                .unwrap();
+            assert_eq!(put.status(), StatusCode::OK, "{part}");
+            let get = app
+                .clone()
+                .oneshot(request(Method::GET, &uri, ""))
+                .await
+                .unwrap();
+            assert_eq!(get.status(), StatusCode::OK, "{part}");
+            let body = get.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(&body[..], b"output");
+        }
+    }
 }
