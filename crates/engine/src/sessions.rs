@@ -451,6 +451,7 @@ impl SessionsEngine {
                     | komet_proto::HarnessId::Hermes
                     | komet_proto::HarnessId::Pi
                     | komet_proto::HarnessId::Antigravity
+                    | komet_proto::HarnessId::Cline
             )
         {
             let validation = komet_proto::ValidationError::ProviderOptionsRejected {

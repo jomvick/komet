@@ -239,7 +239,6 @@ fn open_main_window(state: gpui::Entity<state::AppState>, boot: EngineBootConfig
             // change and never comes back.
             window_background: theme::Theme::of(cx).window_background_appearance(),
             app_id: Some("komet".into()),
-            icon: load_window_icon(),
             ..Default::default()
         },
         move |window, cx| {
@@ -255,10 +254,4 @@ fn open_main_window(state: gpui::Entity<state::AppState>, boot: EngineBootConfig
     // `WindowOptions` value is applied during creation, before the view is
     // attached; re-pushing it here means a window is never left opaque.
     appearance::reapply_window_background(cx);
-}
-
-fn load_window_icon() -> Option<std::sync::Arc<image::RgbaImage>> {
-    let bytes = include_bytes!("../../../dist/komet.png");
-    let img = image::load_from_memory(bytes).ok()?.to_rgba8();
-    Some(std::sync::Arc::new(img))
 }

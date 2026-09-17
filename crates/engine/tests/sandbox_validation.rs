@@ -257,6 +257,7 @@ async fn other_provider_with_options_rejected() {
         HarnessId::Hermes,
         HarnessId::Pi,
         HarnessId::Antigravity,
+        HarnessId::Cline,
     ] {
         let mut req = base_request();
         req.harness = Some(provider);

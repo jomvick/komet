@@ -3425,6 +3425,8 @@ pub(crate) fn harness_brand_icon(harness: HarnessId) -> (&'static str, Option<gp
         // Google Antigravity's mark, sourced from the LobeHub icons set
         // (lobehub.com/icons, `@lobehub/icons-static-svg`), monochrome.
         HarnessId::Antigravity => (crate::icons::ANTIGRAVITY_MARK, None),
+        // Cline's official brand mark (same LobeHub set), monochrome.
+        HarnessId::Cline => (crate::icons::CLINE_MARK, None),
     }
 }
 

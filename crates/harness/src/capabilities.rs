@@ -13,6 +13,9 @@ pub fn supports_dynamic_mcp(id: HarnessId) -> (bool, &'static str) {
         | HarnessId::Grok
         | HarnessId::Hermes
         | HarnessId::Pi
+        // Cline accepts `mcpServers` at ACP `session/new` like the other
+        // native ACP agents (verified live against `cline --acp` 3.0.62).
+        | HarnessId::Cline
         | HarnessId::Mock => (true, ""),
         _ => (
             false,

@@ -255,6 +255,32 @@ struct TabGhost {
     title: SharedString,
 }
 
+/// Right-click menu availability: Copy needs a live selection, Paste needs
+/// clipboard text. Pure so the gating is unit-testable (EditorMenuAvailability
+/// pattern). Snapshotted at open time — the rows grey out from this snapshot
+/// instead of re-probing the emulator mid-menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TerminalMenuAvailability {
+    copy: bool,
+    paste: bool,
+}
+
+impl TerminalMenuAvailability {
+    fn new(has_selection: bool, clipboard_has_text: bool) -> Self {
+        Self {
+            copy: has_selection,
+            paste: clipboard_has_text,
+        }
+    }
+}
+
+/// The open right-click menu's state (Copy/Paste). The position is the
+/// window-space click point; `menu_at` anchors the popover there.
+struct TerminalContextMenu {
+    position: gpui::Point<Pixels>,
+    availability: TerminalMenuAvailability,
+}
+
 impl Render for TabGhost {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx);
@@ -293,6 +319,8 @@ pub struct TerminalPanel {
     geometry: Option<GridGeometry>,
     /// Left-button gesture in flight, if any.
     selection_drag: Option<SelectionDrag>,
+    /// Open right-click Copy/Paste menu, if any.
+    context_menu: crate::popover::Popup<TerminalContextMenu>,
     _observe: Subscription,
 }
 
@@ -310,6 +338,7 @@ impl TerminalPanel {
             last_selected: None,
             geometry: None,
             selection_drag: None,
+            context_menu: crate::popover::Popup::default(),
             _observe: observe,
         }
     }
@@ -1026,6 +1055,111 @@ impl TerminalPanel {
         self.selection_drag = None;
     }
 
+    /// Right-click opens the Copy/Paste context menu at the click point.
+    /// Focus rides along so typing keeps routing to the terminal once the
+    /// menu closes; the selection is untouched — Copy needs it alive until
+    /// the row actually runs (a right-click must never clear a selection
+    /// the user is about to copy).
+    fn on_context_menu(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&self.focus_handle, cx);
+        let has_selection = self
+            .with_active_emulator(cx, |emu| emu.has_selection())
+            .unwrap_or(false);
+        let clipboard_has_text = cx
+            .read_from_clipboard()
+            .is_some_and(|item| item.text().is_some());
+        self.context_menu.open(TerminalContextMenu {
+            position: event.position,
+            availability: TerminalMenuAvailability::new(has_selection, clipboard_has_text),
+        });
+        cx.notify();
+    }
+
+    fn close_context_menu(&mut self, cx: &mut Context<Self>) {
+        if self.context_menu.begin_close() {
+            crate::popover::reap_popup(cx, |panel: &mut Self| &mut panel.context_menu);
+            cx.notify();
+        }
+    }
+
+    /// Copy from the menu row: the availability gate already proved a
+    /// selection exists, the bool return is irrelevant here.
+    fn copy_from_menu(&mut self, cx: &mut Context<Self>) {
+        let _ = self.copy_selection(cx);
+    }
+
+    /// Paste from the menu row (bracketed-paste aware, same as Ctrl+Shift+V).
+    fn paste_from_menu(&mut self, cx: &mut Context<Self>) {
+        self.paste_clipboard(cx);
+    }
+
+    fn context_menu_row(
+        theme: &Theme,
+        id: &'static str,
+        label: &'static str,
+        enabled: bool,
+        run: fn(&mut Self, &mut Context<Self>),
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        crate::popover::menu_row(theme, false, id)
+            .id(id)
+            .when(!enabled, |row| row.opacity(0.38).cursor_default())
+            .when(enabled, |row| {
+                row.on_click(cx.listener(move |this, _, _, cx| {
+                    this.close_context_menu(cx);
+                    run(this, cx);
+                }))
+            })
+            .child(label)
+            .into_any_element()
+    }
+
+    fn render_context_menu(
+        &mut self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let menu = self.context_menu.get()?;
+        let position = menu.position;
+        let availability = menu.availability;
+        let closing = self.context_menu.closing_since();
+
+        let card = crate::popover::popover_card(theme)
+            .w(px(150.0))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_context_menu(cx)))
+            .flex()
+            .flex_col()
+            .child(Self::context_menu_row(
+                theme,
+                "terminal-context-copy",
+                "Copy",
+                availability.copy,
+                Self::copy_from_menu,
+                cx,
+            ))
+            .child(Self::context_menu_row(
+                theme,
+                "terminal-context-paste",
+                "Paste",
+                availability.paste,
+                Self::paste_from_menu,
+                cx,
+            ))
+            .into_any_element();
+
+        Some(crate::popover::menu_at(
+            "terminal-context-menu",
+            position,
+            card,
+            closing,
+        ))
+    }
+
     /// Copy the selection. Returns whether anything was copied, so the caller
     /// can decide whether to swallow the keystroke.
     fn copy_selection(&mut self, cx: &mut Context<Self>) -> bool {
@@ -1407,6 +1541,7 @@ impl Render for TerminalPanel {
             .flex_col()
             .when_some(panel_bg, |el, bg| el.bg(bg))
             .children(tab_bar)
+            .children(self.render_context_menu(&theme, cx))
             .child(
                 div()
                     .id("terminal-body")
@@ -1416,6 +1551,7 @@ impl Render for TerminalPanel {
                     .track_focus(&self.focus_handle)
                     .on_key_down(cx.listener(Self::on_key_down))
                     .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+                    .on_mouse_down(MouseButton::Right, cx.listener(Self::on_context_menu))
                     .on_mouse_move(cx.listener(Self::on_mouse_move))
                     // Bound on the window, not the element: a drag that ends
                     // outside the panel still has to end the gesture, or the
@@ -1442,6 +1578,36 @@ impl Render for TerminalPanel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn menu_availability_tracks_selection_and_clipboard() {
+        // Selection + clipboard text: both rows live.
+        assert_eq!(
+            TerminalMenuAvailability::new(true, true),
+            TerminalMenuAvailability {
+                copy: true,
+                paste: true,
+            }
+        );
+        // No selection: Copy greys out, Paste still offered.
+        assert_eq!(
+            TerminalMenuAvailability::new(false, true),
+            TerminalMenuAvailability {
+                copy: false,
+                paste: true,
+            }
+        );
+        // Empty clipboard: Paste greys out, Copy still offered.
+        assert_eq!(
+            TerminalMenuAvailability::new(true, false),
+            TerminalMenuAvailability {
+                copy: true,
+                paste: false,
+            }
+        );
+        assert!(!TerminalMenuAvailability::new(false, false).copy);
+        assert!(!TerminalMenuAvailability::new(false, false).paste);
+    }
 
     #[test]
     fn height_clamps_between_160_and_55vh() {

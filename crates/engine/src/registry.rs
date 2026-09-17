@@ -670,6 +670,25 @@ reason: None,
         Box::new(|| komet_harness::AntigravityHarness::new().installed()),
         Box::new(|| Ok(Arc::new(komet_harness::AntigravityHarness::new()) as Arc<dyn Harness>)),
     );
+    // Cline over its native ACP server (`cline --acp`), same lazy pattern:
+    // turn-boundary steering and no `thought_level` config option, so the
+    // reasoning ladder stays empty. `installed` stays a real CLI probe: Cline
+    // requires the npm-installed `cline` binary (npm install -g cline) and a
+    // one-time sign-in (`cline` in a terminal); the ACP agent IS the package,
+    // so there is no opencode-style always-show row.
+    registry.register_lazy(
+        HarnessDescriptor {
+            id: HarnessId::Cline,
+            name: "Cline".into(),
+            supports_steering: true,
+            steering_mode: SteeringMode::TurnBoundary,
+            reasoning_levels: vec![],
+            installed: true,
+            enabled: None,
+        },
+        Box::new(|| komet_harness::AcpHarness::cline().installed()),
+        Box::new(|| Ok(Arc::new(komet_harness::AcpHarness::cline()) as Arc<dyn Harness>)),
+    );
     registry
 }
 
@@ -729,6 +748,7 @@ mod tests {
                 HarnessId::Opencode,
                 HarnessId::Pi,
                 HarnessId::Antigravity,
+                HarnessId::Cline,
             ]
         );
         assert!(registry.resolve(HarnessId::Mock).is_ok());
@@ -790,6 +810,22 @@ mod tests {
         assert_eq!(antigravity.steering_mode(), SteeringMode::TurnBoundary);
         // Effort is per-model (baked into the id, or unsupported on Claude).
         assert!(antigravity.reasoning_levels().is_empty());
+        // Cline mirrors its ACP spec the same way: native `cline --acp`,
+        // turn-boundary steers, no advertised thought_level.
+        let cline = registry.resolve(HarnessId::Cline).unwrap();
+        assert_eq!(cline.id(), HarnessId::Cline);
+        assert_eq!(cline.display_name(), "Cline");
+        assert_eq!(cline.steering_mode(), SteeringMode::TurnBoundary);
+        // Cline's `--thinking` CLI tiers have no ACP `thought_level`
+        // equivalent (verified against session/new): the picker must not
+        // invent a ladder.
+        assert!(cline.reasoning_levels().is_empty());
+        let cline_desc = registry
+            .descriptors()
+            .into_iter()
+            .find(|d| d.id == HarnessId::Cline)
+            .expect("cline descriptor");
+        assert!(cline_desc.reasoning_levels.is_empty());
         let agy_desc = registry
             .descriptors()
             .into_iter()
