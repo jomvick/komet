@@ -2595,9 +2595,7 @@ impl Shell {
                         &page,
                         |this: &mut Shell, _, event: &SecurityEvent, cx| {
                             let SecurityEvent::DefaultSandboxChanged(level) = *event;
-                            if let Some(data_dir) =
-                                this.state.read(cx).data_dir.clone()
-                            {
+                            if let Some(data_dir) = this.state.read(cx).data_dir.clone() {
                                 let defaults = SecurityDefaults {
                                     default_sandbox: level,
                                 };
@@ -2606,7 +2604,10 @@ impl Shell {
                                 }
                             }
                             this.state.update(cx, |s, _| {
-                                s.access_mode = level;
+                                // The default only seeds NEW chats; the level of
+                                // the chat currently open (if any) is its own.
+                                s.new_chat_access = level;
+                                s.sync_access_mode();
                             });
                             cx.notify();
                         },

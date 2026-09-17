@@ -121,13 +121,15 @@ pub struct ResolvedRunConfig {
 
 impl ResolvedRunConfig {
     /// The `ChatConfig` recorded on `Mutate createChat` (needs a known harness).
-    pub fn chat_config(&self) -> Option<ChatConfig> {
+    /// `sandbox` is the level the chat runs at, saved so the chat reopens at
+    /// that level on every device.
+    pub fn chat_config(&self, sandbox: SandboxLevel) -> Option<ChatConfig> {
         Some(ChatConfig {
             harness: self.harness?,
             model: self.model.clone(),
             reasoning: self.reasoning,
             model_options: self.model_options.clone(),
-            sandbox: SandboxLevel::WorkspaceWrite,
+            sandbox,
             // External MCP stays with the agent; Komet does not assign servers.
             mcp_server_ids: Vec::new(),
         })
@@ -1266,6 +1268,13 @@ impl Pickers {
         cx.notify();
     }
 
+    /// Save `level` as the selected chat's sandbox level. Uses the same save
+    /// path as the model pickers, so the chat reopens at this level on every
+    /// device.
+    pub fn set_chat_sandbox(&mut self, level: SandboxLevel, cx: &mut Context<Self>) {
+        self.update_chat_config(cx, |config| config.sandbox = level);
+    }
+
     /// Apply `change` to the selected chat's effective config and persist it:
     /// optimistic row stamp (chips update on click) + `Mutate setChatConfig`
     /// (LWW workspace write — restarts and other devices see it). The written
@@ -1276,7 +1285,9 @@ impl Pickers {
             return;
         };
         let resolved = self.resolved(cx);
-        let Some(mut config) = resolved.chat_config() else {
+        // A chat without a saved configuration records its current level.
+        let current_access = self.state.read(cx).access_mode;
+        let Some(mut config) = resolved.chat_config(current_access) else {
             return; // harness unknown (catalog + chat row both missing) — nothing safe to write
         };
         // Preserve fields the pickers don't own.
@@ -4020,14 +4031,17 @@ mod tests {
     #[test]
     fn resolved_chat_config_requires_harness() {
         let mut resolved = ResolvedRunConfig::default();
-        assert!(resolved.chat_config().is_none());
+        assert!(resolved.chat_config(SandboxLevel::ReadOnly).is_none());
         resolved.harness = Some(HarnessId::ClaudeCode);
         resolved.model = Some("opus".into());
         resolved.reasoning = Some(ReasoningLevel::High);
-        let config = resolved.chat_config().expect("harness set");
+        let config = resolved
+            .chat_config(SandboxLevel::ReadOnly)
+            .expect("harness set");
         assert_eq!(config.harness, HarnessId::ClaudeCode);
         assert_eq!(config.model.as_deref(), Some("opus"));
-        assert_eq!(config.sandbox, SandboxLevel::WorkspaceWrite);
+        // The chosen level is saved as given, not replaced by WorkspaceWrite.
+        assert_eq!(config.sandbox, SandboxLevel::ReadOnly);
         assert!(config.mcp_server_ids.is_empty());
     }
 

@@ -123,21 +123,12 @@ impl SecurityPage {
             .flex_none()
             .rounded_full()
             .border_2()
-            .border_color(if selected {
-                theme.accent
-            } else {
-                theme.border
-            })
+            .border_color(if selected { theme.accent } else { theme.border })
             .flex()
             .items_center()
             .justify_center()
             .when(selected, |el| {
-                el.child(
-                    div()
-                        .size(px(8.0))
-                        .rounded_full()
-                        .bg(theme.accent),
-                )
+                el.child(div().size(px(8.0)).rounded_full().bg(theme.accent))
             });
         widgets::card_row(theme, first)
             .cursor_pointer()
@@ -203,15 +194,12 @@ impl Render for SecurityPage {
                     .child(self.row(&theme, SandboxLevel::WorkspaceWrite, false, cx))
                     .child(self.row(&theme, SandboxLevel::DangerFullAccess, false, cx)),
             )
-            .when(
-                self.level == SandboxLevel::DangerFullAccess,
-                |el| {
-                    el.child(widgets::warning_strip(
-                        &theme,
-                        "Full access lets the agent run unsandboxed commands on this device.",
-                    ))
-                },
-            )
+            .when(self.level == SandboxLevel::DangerFullAccess, |el| {
+                el.child(widgets::warning_strip(
+                    &theme,
+                    "Full access lets the agent run unsandboxed commands on this device.",
+                ))
+            })
     }
 }
 
