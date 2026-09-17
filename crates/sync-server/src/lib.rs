@@ -222,7 +222,10 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// Run the sync server. A blank `token` is refused here as well as in
+/// [`require_token`], so no caller can start a server without authentication.
 pub async fn serve(data_dir: PathBuf, token: String, port: u16) -> anyhow::Result<()> {
+    let token = require_token(Some(token))?;
     tokio::fs::create_dir_all(data_dir.join("rooms")).await.ok();
     tokio::fs::create_dir_all(data_dir.join("blobs")).await.ok();
     let state = AppState {
@@ -337,6 +340,21 @@ mod tests {
         assert!(require_token(Some(String::new())).is_err());
         assert!(require_token(Some("   ".into())).is_err());
         assert_eq!(require_token(Some(" abc ".into())).unwrap(), "abc");
+    }
+
+    // Library callers that skip require_token still cannot start an open server.
+    #[tokio::test]
+    async fn serve_refuses_a_blank_token() {
+        let root = tempfile::tempdir().unwrap();
+        for token in ["", "   "] {
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                serve(root.path().to_path_buf(), token.to_string(), 0),
+            )
+            .await
+            .expect("serve must return immediately for a blank token");
+            assert!(result.is_err(), "{token:?}");
+        }
     }
 
     fn blob_get(auth: Option<(&'static str, String)>) -> Request<Body> {
