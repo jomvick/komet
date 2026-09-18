@@ -15,7 +15,7 @@ BIN_DIR="$HOME/.local/bin"
 # Ed25519 public key of the release signing key, 64 hex characters (see
 # docs/release-signing.md). Only files listed in a manifest signed by this key
 # are installed. Not affected by KOMET_RELEASE_REPO.
-RELEASE_PUBLIC_KEY=""
+RELEASE_PUBLIC_KEY="44590602bb4f311d5c80b19f20486470a7115b52d38f2d337d61f7ab685dd330"
 
 say() { printf '%s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
