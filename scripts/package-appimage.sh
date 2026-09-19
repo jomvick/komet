@@ -80,19 +80,53 @@ exec "$HERE/usr/bin/komet" "$@"
 APPRUN
 chmod 755 "$APPDIR/AppRun"
 
-# Download appimagetool if needed
-TOOL="$OUT_DIR/appimagetool.AppImage"
-if [[ ! -x "$TOOL" ]]; then
-  echo "Downloading appimagetool..."
-  curl -fsSL -o "$TOOL" https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
-  chmod +x "$TOOL"
-fi
+# Build tools are pinned to fixed releases and checked against their sha256,
+# because both end up inside the published AppImage. Update version and
+# checksum together (the checksums are listed on each GitHub release).
+APPIMAGETOOL_VERSION="1.9.1"
+APPIMAGETOOL_SHA256="ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"
+RUNTIME_VERSION="20251108"
+case "$ARCH" in
+  x86_64) RUNTIME_SHA256="2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d" ;;
+  aarch64) RUNTIME_SHA256="00cbdfcf917cc6c0ff6d3347d59e0ca1f7f45a6df1a428a0d6d8a78664d87444" ;;
+  *) echo "no pinned AppImage runtime for $ARCH" >&2; exit 1 ;;
+esac
 
-RUNTIME="$OUT_DIR/runtime-$ARCH"
-if [[ ! -f "$RUNTIME" ]]; then
-  echo "Downloading runtime-$ARCH..."
-  curl -fsSL -o "$RUNTIME" "https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-$ARCH" 2>/dev/null || true
-fi
+# download_verified <url> <dest> <sha256>: fetch to a temporary file and keep
+# it only when the checksum matches.
+download_verified() {
+  local url="$1" dest="$2" expected="$3"
+  curl -fsSL -o "$dest.partial" "$url"
+  if ! echo "$expected  $dest.partial" | sha256sum -c --quiet -; then
+    rm -f "$dest.partial"
+    echo "checksum mismatch for $url" >&2
+    exit 1
+  fi
+  mv "$dest.partial" "$dest"
+}
+
+# ensure_verified <url> <dest> <sha256>: reuse <dest> only when it matches the
+# checksum; otherwise (missing, modified or partial) download it again.
+ensure_verified() {
+  local url="$1" dest="$2" expected="$3"
+  if [[ -f "$dest" ]] && echo "$expected  $dest" | sha256sum -c --quiet - 2>/dev/null; then
+    return 0
+  fi
+  echo "Downloading $url..."
+  rm -f "$dest"
+  download_verified "$url" "$dest" "$expected"
+}
+
+TOOL="$OUT_DIR/appimagetool-$APPIMAGETOOL_VERSION.AppImage"
+ensure_verified \
+  "https://github.com/AppImage/appimagetool/releases/download/$APPIMAGETOOL_VERSION/appimagetool-x86_64.AppImage" \
+  "$TOOL" "$APPIMAGETOOL_SHA256"
+chmod +x "$TOOL"
+
+RUNTIME="$OUT_DIR/runtime-$RUNTIME_VERSION-$ARCH"
+ensure_verified \
+  "https://github.com/AppImage/type2-runtime/releases/download/$RUNTIME_VERSION/runtime-$ARCH" \
+  "$RUNTIME" "$RUNTIME_SHA256"
 
 EXTRA_ARGS=()
 if [[ -f "$RUNTIME" && -s "$RUNTIME" ]]; then

@@ -12,8 +12,89 @@ REPO="${KOMET_RELEASE_REPO:-jomvick/komet}"
 PREFIX="$HOME/.komet"
 BIN_DIR="$HOME/.local/bin"
 
+# Ed25519 public key of the release signing key, 64 hex characters (see
+# docs/release-signing.md). Only files listed in a manifest signed by this key
+# are installed. Not affected by KOMET_RELEASE_REPO.
+RELEASE_PUBLIC_KEY="44590602bb4f311d5c80b19f20486470a7115b52d38f2d337d61f7ab685dd330"
+
 say() { printf '%s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+# --- release verification ---------------------------------------------------
+# find_openssl: print an OpenSSL 3 binary able to verify Ed25519 signatures.
+# macOS ships LibreSSL as `openssl`, so Homebrew's OpenSSL 3 is tried first.
+find_openssl() {
+  for candidate in "${KOMET_OPENSSL:-}" /opt/homebrew/opt/openssl@3/bin/openssl \
+    /usr/local/opt/openssl@3/bin/openssl openssl; do
+    [ -n "$candidate" ] || continue
+    command -v "$candidate" >/dev/null 2>&1 || continue
+    if "$candidate" version 2>/dev/null | grep -q '^OpenSSL [3-9]'; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# verify_manifest_signature <manifest> <signature> <public key hex>
+verify_manifest_signature() {
+  printf '%s' "$3" | grep -Eq '^[0-9a-f]{64}$' || return 1
+  openssl_bin="$(find_openssl)" || return 1
+  der="$(mktemp)"
+  # DER prefix of an Ed25519 SubjectPublicKeyInfo, followed by the raw key,
+  # written as bytes through octal escapes (the only ones POSIX printf has).
+  hex="302a300506032b6570032100$3"
+  escapes=""
+  while [ -n "$hex" ]; do
+    pair="$(printf '%s' "$hex" | cut -c1-2)"
+    hex="$(printf '%s' "$hex" | cut -c3-)"
+    escapes="$escapes$(printf '\\0%o' "0x$pair")"
+  done
+  printf '%b' "$escapes" >"$der"
+  if "$openssl_bin" pkeyutl -verify -rawin -pubin -keyform DER -inkey "$der" \
+    -in "$1" -sigfile "$2" >/dev/null 2>&1; then
+    rm -f "$der"
+    return 0
+  fi
+  rm -f "$der"
+  return 1
+}
+
+# manifest_sha256 <manifest> <file name> <version>: print the checksum listed
+# for exactly that file, or fail when the manifest is for another version or
+# does not list the file. Only call on a manifest whose signature was verified.
+manifest_sha256() {
+  flat="$(tr -d ' \t\r\n' <"$1")"
+  case "$flat" in
+    *"\"version\":\"$3\""*) ;;
+    *) return 1 ;;
+  esac
+  key="\"$2\":{\"sha256\":\""
+  case "$flat" in
+    *"$key"*) ;;
+    *) return 1 ;;
+  esac
+  sha="$(printf '%s' "${flat#*"$key"}" | cut -c1-64)"
+  printf '%s' "$sha" | grep -Eq '^[0-9a-f]{64}$' || return 1
+  printf '%s\n' "$sha"
+}
+
+# sha256_of <file>
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | cut -d' ' -f1
+  else
+    shasum -a 256 "$1" | cut -d' ' -f1
+  fi
+}
+
+# verify_download <file> <expected sha256>
+verify_download() {
+  [ "$(sha256_of "$1")" = "$2" ]
+}
+
+# Tests load the functions above without installing anything.
+[ "${KOMET_INSTALL_SOURCE_ONLY:-}" = 1 ] && return 0
 
 command -v curl >/dev/null 2>&1 || command -v wget >/dev/null 2>&1 \
   || die "curl or wget is required"
@@ -58,7 +139,21 @@ else
   TARBALL="komet-$VERSION-$PLATFORM.tar.gz"
 fi
 URL="https://github.com/$REPO/releases/download/v$VERSION/$TARBALL"
+RELEASE_URL="https://github.com/$REPO/releases/download/v$VERSION"
+printf '%s' "$RELEASE_PUBLIC_KEY" | grep -Eq '^[0-9a-f]{64}$' \
+  || die "this install.sh has no release public key, so the download cannot be verified"
+find_openssl >/dev/null \
+  || die "OpenSSL 3 is required to verify the release (macOS: brew install openssl@3)"
+fetch "$RELEASE_URL/manifest.json" "$TMP/manifest.json" || die "download failed: $RELEASE_URL/manifest.json"
+fetch "$RELEASE_URL/manifest.json.sig" "$TMP/manifest.json.sig" \
+  || die "download failed: $RELEASE_URL/manifest.json.sig"
+verify_manifest_signature "$TMP/manifest.json" "$TMP/manifest.json.sig" "$RELEASE_PUBLIC_KEY" \
+  || die "manifest.json signature is not valid for the release key; nothing was installed"
+EXPECTED_SHA256="$(manifest_sha256 "$TMP/manifest.json" "$TARBALL" "$VERSION")" \
+  || die "the signed manifest does not list $TARBALL for version $VERSION"
 fetch "$URL" "$TMP/$TARBALL" || die "download failed: $URL"
+verify_download "$TMP/$TARBALL" "$EXPECTED_SHA256" \
+  || die "checksum mismatch for $TARBALL; nothing was installed"
 mkdir -p "$TMP/unpacked"
 tar -xzf "$TMP/$TARBALL" -C "$TMP/unpacked"
 

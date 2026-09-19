@@ -365,7 +365,8 @@ fn request_stop() -> anyhow::Result<()> {
         .unwrap_or(27654);
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async {
-        let client = komet_rpc::connect_ws(&format!("ws://127.0.0.1:{ipc_port}")).await?;
+        let token = komet_rpc::ipc_token::read_default(ipc_port)?;
+        let client = komet_rpc::connect_ws(&format!("ws://127.0.0.1:{ipc_port}"), &token).await?;
         client
             .call(komet_rpc::methods::STOP_ENGINE, serde_json::json!({}))
             .await?;

@@ -212,9 +212,18 @@ async fn route_frame(shared: &Arc<Shared>, out: &mpsc::Sender<String>, frame: Se
 /// stranger on port 27654 would hang the app at boot rather than degrade it.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Dial a WebSocket RPC server (`ws://127.0.0.1:{ipc_port}`).
-pub async fn connect_ws(url: &str) -> Result<RpcClient, RpcError> {
-    let (ws, _) = tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(url))
+/// Dial a WebSocket RPC server (`ws://127.0.0.1:{ipc_port}`), presenting the
+/// engine token (see [`crate::ipc_token::read`]).
+pub async fn connect_ws(url: &str, token: &str) -> Result<RpcClient, RpcError> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut request = url
+        .into_client_request()
+        .map_err(|e| RpcError::Transport(e.to_string()))?;
+    let header = format!("Bearer {token}")
+        .parse()
+        .map_err(|_| RpcError::Transport("engine token is not a valid header value".into()))?;
+    request.headers_mut().insert("authorization", header);
+    let (ws, _) = tokio::time::timeout(CONNECT_TIMEOUT, tokio_tungstenite::connect_async(request))
         .await
         .map_err(|_| RpcError::Transport(format!("timed out dialing {url}")))?
         .map_err(|e| RpcError::Transport(e.to_string()))?;

@@ -20,4 +20,5 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+tempfile.workspace = true
 komet-doc.workspace = true
