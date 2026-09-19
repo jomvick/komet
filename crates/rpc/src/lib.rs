@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 
 mod client;
 pub mod device_room;
+pub mod ipc_token;
 mod server;
 
 pub use client::{RpcClient, connect_ws};
@@ -297,13 +298,21 @@ mod tests {
         assert!(matches!(err, RpcError::Failed(m) if m == "boom"));
     }
 
+    const TOKEN: &str = "test-ipc-token";
+
     #[tokio::test]
     async fn websocket_round_trip() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        tokio::spawn(serve_ws_listener(listener, Arc::new(TestService)));
+        tokio::spawn(serve_ws_listener(
+            listener,
+            Arc::new(TestService),
+            TOKEN.into(),
+        ));
 
-        let client = connect_ws(&format!("ws://127.0.0.1:{port}")).await.unwrap();
+        let client = connect_ws(&format!("ws://127.0.0.1:{port}"), TOKEN)
+            .await
+            .unwrap();
         let echoed = client
             .call("Echo", serde_json::json!("hello"))
             .await
@@ -325,7 +334,11 @@ mod tests {
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        tokio::spawn(serve_ws_listener(listener, Arc::new(TestService)));
+        tokio::spawn(serve_ws_listener(
+            listener,
+            Arc::new(TestService),
+            TOKEN.into(),
+        ));
 
         // A browser page opening ws://127.0.0.1:{port} always sends Origin;
         // the server must refuse the handshake before serving any RPC.
@@ -334,6 +347,8 @@ mod tests {
             .unwrap();
         req.headers_mut()
             .insert("origin", "https://evil.example".parse().unwrap());
+        req.headers_mut()
+            .insert("authorization", format!("Bearer {TOKEN}").parse().unwrap());
         let result = tokio_tungstenite::connect_async(req).await;
         assert!(
             result.is_err(),
@@ -342,9 +357,123 @@ mod tests {
 
         // A native viewport (no Origin) still connects and can call RPC — the
         // reject must not be a blanket denial.
-        let client = connect_ws(&format!("ws://127.0.0.1:{port}")).await.unwrap();
+        let client = connect_ws(&format!("ws://127.0.0.1:{port}"), TOKEN)
+            .await
+            .unwrap();
         let echoed = client.call("Echo", serde_json::json!("ok")).await.unwrap();
         assert_eq!(echoed, serde_json::json!("ok"));
+    }
+
+    // Audit finding 5: another local user can reach 127.0.0.1, so a connection
+    // without the token from the private token file must not be served.
+    #[tokio::test]
+    async fn handshake_without_the_right_token_is_rejected() {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(serve_ws_listener(
+            listener,
+            Arc::new(TestService),
+            TOKEN.into(),
+        ));
+        let url = format!("ws://127.0.0.1:{port}");
+
+        let bare = tokio_tungstenite::connect_async(url.as_str()).await;
+        assert!(
+            bare.is_err(),
+            "a handshake without a token must be rejected"
+        );
+
+        for wrong in ["Bearer ", "Bearer wrong", "test-ipc-token"] {
+            let mut req = url.as_str().into_client_request().unwrap();
+            req.headers_mut()
+                .insert("authorization", wrong.parse().unwrap());
+            let result = tokio_tungstenite::connect_async(req).await;
+            assert!(result.is_err(), "{wrong:?} must be rejected");
+        }
+
+        assert!(connect_ws(&url, "wrong").await.is_err());
+        let client = connect_ws(&url, TOKEN).await.unwrap();
+        let echoed = client.call("Echo", serde_json::json!("ok")).await.unwrap();
+        assert_eq!(echoed, serde_json::json!("ok"));
+    }
+
+    #[test]
+    fn ipc_token_file_is_private_and_fresh_per_launch() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = ipc_token::publish(dir.path(), 27654).unwrap();
+        assert_eq!(ipc_token::read(dir.path(), 27654).unwrap(), first.token());
+        assert!(
+            first.token().len() >= 64,
+            "token must carry at least 244 random bits"
+        );
+
+        let second = ipc_token::publish(dir.path(), 27654).unwrap();
+        assert_ne!(first.token(), second.token());
+        assert_eq!(ipc_token::read(dir.path(), 27654).unwrap(), second.token());
+
+        // Engines on other ports (two devices on one machine) keep their own.
+        let other = ipc_token::publish(dir.path(), 27802).unwrap();
+        assert_ne!(other.token(), second.token());
+        assert_eq!(ipc_token::read(dir.path(), 27654).unwrap(), second.token());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |path: &std::path::Path| {
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+            };
+            assert_eq!(mode(&ipc_token::path(dir.path(), 27654)), 0o600);
+            assert_eq!(mode(dir.path()), 0o700);
+        }
+    }
+
+    // The token is only ever sent to this machine's engine.
+    #[test]
+    fn loopback_port_is_extracted_only_for_local_urls() {
+        assert_eq!(
+            ipc_token::loopback_port("ws://127.0.0.1:27654"),
+            Some(27654)
+        );
+        assert_eq!(
+            ipc_token::loopback_port("ws://localhost:27801/"),
+            Some(27801)
+        );
+        assert_eq!(ipc_token::loopback_port("ws://[::1]:27654"), Some(27654));
+        assert_eq!(
+            ipc_token::loopback_port("ws://attacker.example:27654"),
+            None
+        );
+        assert_eq!(
+            ipc_token::loopback_port("ws://127.0.0.1.attacker.example:27654"),
+            None
+        );
+        assert_eq!(
+            ipc_token::loopback_port("ws://localhost@attacker.example:27654"),
+            None
+        );
+        assert_eq!(ipc_token::loopback_port("wss://127.0.0.1:27654"), None);
+        assert_eq!(ipc_token::loopback_port("ws://127.0.0.1"), None);
+    }
+
+    #[test]
+    fn stopping_an_engine_removes_only_its_own_token_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = ipc_token::publish(dir.path(), 27654).unwrap();
+        let current = ipc_token::publish(dir.path(), 27654).unwrap();
+        // The replaced engine stopping must not delete the current token.
+        drop(old);
+        assert_eq!(ipc_token::read(dir.path(), 27654).unwrap(), current.token());
+        drop(current);
+        assert!(!ipc_token::path(dir.path(), 27654).exists());
+    }
+
+    #[test]
+    fn missing_ipc_token_file_reports_a_clear_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = ipc_token::read(dir.path(), 27654).unwrap_err();
+        assert!(err.to_string().contains("ipc-27654.token"), "{err}");
     }
 
     #[tokio::test]

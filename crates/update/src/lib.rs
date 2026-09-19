@@ -63,14 +63,80 @@ fn release_asset_url(repo: &str, version: &str, file: &str) -> String {
     format!("https://github.com/{repo}/releases/download/v{version}/{file}")
 }
 
-/// Release asset manifest — published as a release asset by the workflow.
+/// Hex encoded Ed25519 public key of the release signing key, set at build
+/// time by the release workflow. Deliberately not affected by
+/// `KOMET_RELEASE_REPO`: a fork must build with its own key to update from
+/// its own releases. See docs/release-signing.md.
+const RELEASE_PUBLIC_KEY: Option<&str> = option_env!("KOMET_RELEASE_PUBLIC_KEY");
+
+/// Release asset manifest, published with a detached signature
+/// (`manifest.json.sig`) by the release workflow.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Manifest {
     pub version: String,
-    /// Artifact file name → metadata. Empty for pre-manifest releases resolved
-    /// via `latest.txt` — downloads then skip checksum verification (with a log).
+    /// Artifact file name to metadata. A file missing here is never installed.
     #[serde(default)]
     pub files: BTreeMap<String, FileMeta>,
+}
+
+/// Parse the 32 byte Ed25519 public key from its hex form.
+fn parse_public_key(hex: &str) -> anyhow::Result<[u8; 32]> {
+    let hex = hex.trim();
+    if hex.len() != 64 {
+        bail!(
+            "release public key must be 64 hex characters, got {}",
+            hex.len()
+        );
+    }
+    let mut key = [0u8; 32];
+    for (i, byte) in key.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16)
+            .context("release public key is not valid hex")?;
+    }
+    Ok(key)
+}
+
+/// The public key compiled into this build, or an error explaining that this
+/// build cannot verify (and therefore cannot install) updates.
+fn release_public_key() -> anyhow::Result<[u8; 32]> {
+    let hex = RELEASE_PUBLIC_KEY.filter(|k| !k.trim().is_empty()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "this build has no release signing key (KOMET_RELEASE_PUBLIC_KEY), so updates cannot be verified"
+        )
+    })?;
+    parse_public_key(hex)
+}
+
+/// Check the detached Ed25519 `signature` of the raw manifest bytes against
+/// `public_key`, then parse it. The manifest must describe `tag_version`, so a
+/// validly signed manifest of an older release cannot be replayed under a
+/// newer tag.
+fn verify_manifest(
+    bytes: &[u8],
+    signature: &[u8],
+    public_key: &[u8; 32],
+    tag_version: &str,
+) -> anyhow::Result<Manifest> {
+    ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, public_key)
+        .verify(bytes, signature)
+        .map_err(|_| anyhow::anyhow!("manifest.json signature is not valid for the release key"))?;
+    let manifest: Manifest = serde_json::from_slice(bytes).context("parsing manifest.json")?;
+    if manifest.version != tag_version {
+        bail!(
+            "manifest.json describes version {} but the release is {tag_version}",
+            manifest.version
+        );
+    }
+    Ok(manifest)
+}
+
+/// The sha256 a release file must match. Files without one are refused.
+fn expected_checksum<'a>(manifest: &'a Manifest, file: &str) -> anyhow::Result<&'a str> {
+    manifest
+        .files
+        .get(file)
+        .and_then(|meta| meta.sha256.as_deref())
+        .ok_or_else(|| anyhow::anyhow!("release {} has no checksum for {file}", manifest.version))
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -133,11 +199,11 @@ pub fn version_newer(latest: &str, current: &str) -> bool {
     }
 }
 
-/// Fetch the newest release metadata: the latest tag from the GitHub API plus
-/// the release's `manifest.json` asset (sha256 per artifact). A release without
-/// a manifest yields an empty file map — downloads then skip checksum
-/// verification (with a log).
+/// Fetch the newest release metadata: the latest tag from the GitHub API, then
+/// `manifest.json` and its signature. Fails unless the manifest is signed by
+/// the release key compiled into this build.
 pub async fn fetch_latest() -> anyhow::Result<Manifest> {
+    let public_key = release_public_key()?;
     let repo = release_repo();
     let client = http_client()?;
     let api_url = format!("https://api.github.com/repos/{repo}/releases/latest");
@@ -155,23 +221,29 @@ pub async fn fetch_latest() -> anyhow::Result<Manifest> {
     if version.is_empty() {
         bail!("GitHub release has an empty tag_name");
     }
-    let manifest_url = release_asset_url(&repo, &version, "manifest.json");
-    let files: BTreeMap<String, FileMeta> = match client.get(&manifest_url).send().await {
-        Ok(resp) if resp.status().is_success() => resp
-            .json::<Manifest>()
-            .await
-            .with_context(|| "parsing manifest.json".to_string())?
-            .files,
-        Ok(resp) => {
-            tracing::debug!(status = %resp.status(), "manifest.json unavailable; downloads will skip verification");
-            BTreeMap::new()
-        }
-        Err(err) => {
-            tracing::debug!(error = %err, "manifest.json fetch failed; downloads will skip verification");
-            BTreeMap::new()
-        }
-    };
-    Ok(Manifest { version, files })
+    let manifest = fetch_release_asset(&client, &repo, &version, "manifest.json").await?;
+    let signature = fetch_release_asset(&client, &repo, &version, "manifest.json.sig").await?;
+    verify_manifest(&manifest, &signature, &public_key, &version)
+}
+
+async fn fetch_release_asset(
+    client: &reqwest::Client,
+    repo: &str,
+    version: &str,
+    file: &str,
+) -> anyhow::Result<Vec<u8>> {
+    let url = release_asset_url(repo, version, file);
+    let bytes = client
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("fetching {url}"))?
+        .error_for_status()
+        .with_context(|| format!("fetching {url}"))?
+        .bytes()
+        .await
+        .with_context(|| format!("reading {url}"))?;
+    Ok(bytes.to_vec())
 }
 
 /// GitHub API shape of a release (only the fields we need).
@@ -236,22 +308,16 @@ fn detect_install_from(exe: &Path, home: Option<&Path>) -> InstallKind {
 // Download + verify
 // ---------------------------------------------------------------------------
 
-/// Stream the release asset `<file>` to `dest`, verifying the manifest sha256
-/// when present. Writes through a `.partial` sidecar so an interrupted download
-/// never leaves a plausible-looking artifact behind.
+/// Stream the release asset `<file>` to `dest`, verifying it against the
+/// signed manifest's sha256. Writes through a `.partial` sidecar so an
+/// interrupted or rejected download never leaves a plausible artifact behind.
 pub async fn download_release_file(
     manifest: &Manifest,
     file: &str,
     dest: &Path,
 ) -> anyhow::Result<()> {
     let url = release_asset_url(&release_repo(), &manifest.version, file);
-    let expected = manifest.files.get(file).and_then(|m| m.sha256.as_deref());
-    if expected.is_none() {
-        tracing::warn!(
-            file,
-            "no checksum in release metadata; skipping verification"
-        );
-    }
+    let expected = expected_checksum(manifest, file)?;
     let partial = dest.with_extension("partial");
     let resp = http_client()?
         .get(&url)
@@ -272,12 +338,10 @@ pub async fn download_release_file(
     }
     out.flush().await.ok();
     drop(out);
-    if let Some(expected) = expected {
-        let actual = format!("{:x}", hasher.finalize());
-        if !actual.eq_ignore_ascii_case(expected.trim()) {
-            tokio::fs::remove_file(&partial).await.ok();
-            bail!("checksum mismatch for {file}: expected {expected}, got {actual}");
-        }
+    let actual = format!("{:x}", hasher.finalize());
+    if !actual.eq_ignore_ascii_case(expected.trim()) {
+        tokio::fs::remove_file(&partial).await.ok();
+        bail!("checksum mismatch for {file}: expected {expected}, got {actual}");
     }
     tokio::fs::rename(&partial, dest)
         .await
@@ -833,6 +897,99 @@ mod tests {
         );
         let bare: Manifest = serde_json::from_str(r#"{"version":"0.1.1"}"#).unwrap();
         assert!(bare.files.is_empty());
+    }
+
+    /// A fresh Ed25519 key pair: (signing key, 32 byte public key).
+    fn test_key_pair() -> (ring::signature::Ed25519KeyPair, [u8; 32]) {
+        use ring::signature::KeyPair;
+        let pkcs8 =
+            ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+                .unwrap();
+        let pair = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let public: [u8; 32] = pair.public_key().as_ref().try_into().unwrap();
+        (pair, public)
+    }
+
+    const SIGNED_MANIFEST: &[u8] =
+        br#"{"version":"0.2.0","files":{"komet-0.2.0-linux-x86_64.tar.gz":{"sha256":"abc"}}}"#;
+
+    // Audit finding 3: only a manifest signed by the release key is trusted.
+    #[test]
+    fn signed_manifest_is_accepted() {
+        let (pair, public) = test_key_pair();
+        let signature = pair.sign(SIGNED_MANIFEST);
+        let manifest =
+            verify_manifest(SIGNED_MANIFEST, signature.as_ref(), &public, "0.2.0").unwrap();
+        assert_eq!(manifest.version, "0.2.0");
+        assert_eq!(
+            manifest.files["komet-0.2.0-linux-x86_64.tar.gz"]
+                .sha256
+                .as_deref(),
+            Some("abc")
+        );
+    }
+
+    #[test]
+    fn tampered_or_foreign_manifests_are_rejected() {
+        let (pair, public) = test_key_pair();
+        let (other_pair, _) = test_key_pair();
+        let signature = pair.sign(SIGNED_MANIFEST);
+
+        let mut tampered = SIGNED_MANIFEST.to_vec();
+        tampered[20] ^= 1;
+        assert!(verify_manifest(&tampered, signature.as_ref(), &public, "0.2.0").is_err());
+
+        let foreign = other_pair.sign(SIGNED_MANIFEST);
+        assert!(verify_manifest(SIGNED_MANIFEST, foreign.as_ref(), &public, "0.2.0").is_err());
+
+        assert!(
+            verify_manifest(SIGNED_MANIFEST, &signature.as_ref()[..63], &public, "0.2.0").is_err()
+        );
+        assert!(verify_manifest(SIGNED_MANIFEST, &[], &public, "0.2.0").is_err());
+    }
+
+    // The release workflow signs with `openssl pkeyutl -sign -rawin`. These
+    // fixtures were produced by that exact command with a throwaway key whose
+    // private half was deleted, so they pin the format the updater accepts.
+    #[test]
+    fn openssl_signed_manifest_fixture_verifies() {
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let manifest = std::fs::read(fixtures.join("manifest.json")).unwrap();
+        let signature = std::fs::read(fixtures.join("manifest.json.sig")).unwrap();
+        let key_hex = std::fs::read_to_string(fixtures.join("release-public-key.hex")).unwrap();
+        let key = parse_public_key(&key_hex).unwrap();
+        let verified = verify_manifest(&manifest, &signature, &key, "0.2.0").unwrap();
+        assert_eq!(verified.version, "0.2.0");
+    }
+
+    // A correctly signed manifest from an older release must not be served
+    // under a newer tag to force a downgrade.
+    #[test]
+    fn manifest_version_must_match_the_release_tag() {
+        let (pair, public) = test_key_pair();
+        let signature = pair.sign(SIGNED_MANIFEST);
+        let err =
+            verify_manifest(SIGNED_MANIFEST, signature.as_ref(), &public, "0.3.0").unwrap_err();
+        assert!(format!("{err:#}").contains("0.3.0"), "{err:#}");
+    }
+
+    #[test]
+    fn release_public_key_parses_from_hex() {
+        let (_, public) = test_key_pair();
+        let hex: String = public.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(parse_public_key(&hex).unwrap(), public);
+        assert!(parse_public_key("abcd").is_err());
+        assert!(parse_public_key(&"zz".repeat(32)).is_err());
+    }
+
+    #[test]
+    fn a_file_without_a_checksum_is_never_downloaded() {
+        let manifest = Manifest {
+            version: "0.2.0".into(),
+            files: BTreeMap::new(),
+        };
+        let err = expected_checksum(&manifest, "komet-0.2.0-linux-x86_64.tar.gz").unwrap_err();
+        assert!(format!("{err:#}").contains("komet-0.2.0-linux-x86_64.tar.gz"));
     }
 
     #[cfg(unix)]

@@ -896,15 +896,22 @@ pub async fn serve_ipc(
     service: std::sync::Arc<dyn komet_rpc::RpcService>,
 ) -> std::io::Result<tokio::task::JoinHandle<()>> {
     let socket = tokio::net::TcpSocket::new_v4()?;
+    // SO_REUSEADDR lets a restarted engine bind while old connections are in
+    // TIME_WAIT. SO_REUSEPORT is deliberately not set: it would let a second
+    // engine bind the same port and replace the first engine's token file.
     socket.set_reuseaddr(true)?;
-    #[cfg(unix)]
-    let _ = socket.set_reuseport(true);
     socket.bind(std::net::SocketAddr::from(([127, 0, 0, 1], port)))?;
     let listener = socket.listen(1024)?;
+    // Published only after the bind succeeded, so a losing engine never
+    // replaces the token of the engine that owns the port.
+    let published = komet_rpc::ipc_token::publish(&komet_rpc::ipc_token::default_dir()?, port)?;
+    let token: std::sync::Arc<str> = published.token().into();
     tracing::info!(port, "IPC server listening");
-    Ok(tokio::spawn(komet_rpc::serve_ws_listener(
-        listener, service,
-    )))
+    Ok(tokio::spawn(async move {
+        // Held for the server's lifetime; dropping it removes the token file.
+        let _published = published;
+        komet_rpc::serve_ws_listener(listener, service, token).await;
+    }))
 }
 
 /// Block until the WorkOS session is signed in AND org-scoped. On a TTY, print the

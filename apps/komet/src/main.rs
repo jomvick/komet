@@ -158,7 +158,7 @@ fn main() -> anyhow::Result<()> {
         }
         Some(Command::SyncServer { port }) => {
             let runtime = tokio::runtime::Runtime::new()?;
-            let token = std::env::var("KOMET_SYNC_TOKEN").ok();
+            let token = komet_sync_server::require_token(std::env::var("KOMET_SYNC_TOKEN").ok())?;
             let data_dir = std::env::var_os("KOMET_DATA_DIR").map(std::path::PathBuf::from).unwrap_or_else(dirs_data_dir);
             runtime.block_on(komet_sync_server::serve(data_dir, token, port))
         }
@@ -267,7 +267,9 @@ fn dirs_data_dir() -> std::path::PathBuf {
 /// The introspection surface every 2026-08 incident was missing — "is this
 /// device's workspace room actually receiving?" as a one-liner.
 async fn sync_cli(ipc_port: u16) -> anyhow::Result<()> {
-    let client = komet_rpc::connect_ws(&format!("ws://127.0.0.1:{ipc_port}"))
+    let token = komet_rpc::ipc_token::read_default(ipc_port)
+        .map_err(|e| anyhow::anyhow!("no engine token for port {ipc_port} ({e}); is komet running?"))?;
+    let client = komet_rpc::connect_ws(&format!("ws://127.0.0.1:{ipc_port}"), &token)
         .await
         .map_err(|e| {
             anyhow::anyhow!("no engine listening on 127.0.0.1:{ipc_port} ({e}) — is komet running?")

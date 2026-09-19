@@ -119,10 +119,14 @@ async fn main() {
         .parse()
         .expect("B port");
 
-    let a = connect_ws(&format!("ws://127.0.0.1:{a_port}"))
+    let a_token = komet_rpc::ipc_token::read_default(a_port)
+        .unwrap_or_else(|err| fail(&format!("read engine token :{a_port}: {err}")));
+    let a = connect_ws(&format!("ws://127.0.0.1:{a_port}"), &a_token)
         .await
         .unwrap_or_else(|err| fail(&format!("connect device A ipc :{a_port}: {err}")));
-    let b = connect_ws(&format!("ws://127.0.0.1:{b_port}"))
+    let b_token = komet_rpc::ipc_token::read_default(b_port)
+        .unwrap_or_else(|err| fail(&format!("read engine token :{b_port}: {err}")));
+    let b = connect_ws(&format!("ws://127.0.0.1:{b_port}"), &b_token)
         .await
         .unwrap_or_else(|err| fail(&format!("connect device B ipc :{b_port}: {err}")));
 

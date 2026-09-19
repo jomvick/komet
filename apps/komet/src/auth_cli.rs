@@ -194,7 +194,8 @@ pub async fn status(config: EngineConfig) -> anyhow::Result<()> {
 /// derivation is correct when no engine is listening and tolerant of old
 /// daemons that predate EngineInfo.
 async fn live_engine_scope(ipc_port: u16) -> Option<WorkspaceScope> {
-    let client = komet_rpc::connect_ws(&format!("ws://127.0.0.1:{ipc_port}"))
+    let token = komet_rpc::ipc_token::read_default(ipc_port).ok()?;
+    let client = komet_rpc::connect_ws(&format!("ws://127.0.0.1:{ipc_port}"), &token)
         .await
         .ok()?;
     let value = client

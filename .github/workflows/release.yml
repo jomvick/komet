@@ -7,8 +7,21 @@ name: release
 #   - Linux .rpm via scripts/package-rpm.sh
 #   - macOS dmg (Apple silicon) via scripts/package-macos.sh
 #   - Windows zip + exe via scripts/package-windows.sh
-# plus a manifest.json (version + per-artifact sha256) that the auto-updater
-# (crates/update) verifies downloads against.
+# plus a manifest.json (version + per-artifact sha256) signed with the
+# release key (manifest.json.sig). The auto-updater (crates/update) and
+# install.sh only install files listed in a correctly signed manifest.
+#
+# Release signing (see docs/release-signing.md):
+#   vars.KOMET_RELEASE_PUBLIC_KEY  hex Ed25519 public key, compiled into the
+#     binaries so they can verify updates. Required for tag builds.
+#   secrets.RELEASE_SIGNING_KEY    PEM Ed25519 private key, used only by the
+#     publish job's signing step.
+#   vars.KOMET_RELEASE_SIGNING_PUBLIC_KEY  optional, only during a key
+#     rotation: the public key of RELEASE_SIGNING_KEY when it differs from
+#     KOMET_RELEASE_PUBLIC_KEY.
+#
+# Third-party actions are pinned to commit SHAs; the comment names the
+# release. Update both together.
 #
 # Trigger: push a tag `v<version>` matching the workspace version in
 # Cargo.toml (bump it in the same commit), or run manually via
@@ -20,10 +33,30 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+env:
+  KOMET_RELEASE_PUBLIC_KEY: ${{ vars.KOMET_RELEASE_PUBLIC_KEY }}
 
 jobs:
+  # Binaries built without the public key cannot verify updates, so a tagged
+  # release must never ship without it.
+  signing-key:
+    runs-on: ubuntu-latest
+    steps:
+      - name: check release public key
+        run: |
+          if printf '%s' "$KOMET_RELEASE_PUBLIC_KEY" | grep -Eq '^[0-9a-f]{64}$'; then
+            echo "release public key configured"
+          elif [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "vars.KOMET_RELEASE_PUBLIC_KEY is missing or not 64 lowercase hex characters"
+            exit 1
+          else
+            echo "::warning::no release public key; these artifacts cannot verify updates"
+          fi
+
   linux:
+    needs: signing-key
     strategy:
       fail-fast: false
       matrix:
@@ -32,7 +65,7 @@ jobs:
           - runner: ubuntu-24.04-arm # aarch64
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: gpui system deps
         run: |
           sudo apt-get update -qq
@@ -44,7 +77,7 @@ jobs:
             python3-pil rpm
       - name: rust toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: generate icons from master logo
         run: python3 scripts/gen-icons.py
       - name: package tarball
@@ -56,7 +89,7 @@ jobs:
         run: scripts/package-deb.sh
       - name: package rpm
         run: scripts/package-rpm.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: linux-${{ runner.arch }}
           path: |
@@ -78,26 +111,34 @@ jobs:
   #     key (raw .p8 contents), for notarytool. All three present → the package
   #     script notarizes and staples the app + dmg (no Gatekeeper warning).
   macos:
+    needs: signing-key
     runs-on: macos-latest # Apple silicon
     continue-on-error: true
-    env:
-      MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
-      MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
-      AC_API_KEY_P8: ${{ secrets.AC_API_KEY_P8 }}
-      AC_API_KEY_ID: ${{ secrets.AC_API_KEY_ID }}
-      AC_API_ISSUER_ID: ${{ secrets.AC_API_ISSUER_ID }}
+    # Signing secrets are passed only to the steps that use them, never to
+    # the whole job, so build tools and third-party actions cannot read them.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: rust toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: generate icons from master logo
         run: |
-          python3 -m pip install --quiet --user pillow 2>/dev/null \
-            || python3 -m pip install --quiet --user --break-system-packages pillow
+          python3 -m pip install --quiet --user pillow==12.3.0 2>/dev/null \
+            || python3 -m pip install --quiet --user --break-system-packages pillow==12.3.0
           python3 scripts/gen-icons.py
+      - name: detect signing secrets
+        id: secrets-present
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          AC_API_KEY_P8: ${{ secrets.AC_API_KEY_P8 }}
+        run: |
+          echo "certificate=$([ -n "$MACOS_CERT_P12" ] && echo true || echo false)" >>"$GITHUB_OUTPUT"
+          echo "notary=$([ -n "$AC_API_KEY_P8" ] && echo true || echo false)" >>"$GITHUB_OUTPUT"
       - name: import Developer ID certificate
-        if: env.MACOS_CERT_P12 != ''
+        if: steps.secrets-present.outputs.certificate == 'true'
+        env:
+          MACOS_CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
         run: |
           keychain="$RUNNER_TEMP/release.keychain-db"
           pass="$(openssl rand -hex 16)"
@@ -117,7 +158,11 @@ jobs:
           [ -n "$identity" ] || { echo "p12 contains no Developer ID Application identity"; exit 1; }
           echo "CODESIGN_IDENTITY=$identity" >>"$GITHUB_ENV"
       - name: notary credentials
-        if: env.AC_API_KEY_P8 != ''
+        if: steps.secrets-present.outputs.notary == 'true'
+        env:
+          AC_API_KEY_P8: ${{ secrets.AC_API_KEY_P8 }}
+          AC_API_KEY_ID: ${{ secrets.AC_API_KEY_ID }}
+          AC_API_ISSUER_ID: ${{ secrets.AC_API_ISSUER_ID }}
         run: |
           printf '%s' "$AC_API_KEY_P8" >"$RUNNER_TEMP/ac_api_key.p8"
           {
@@ -127,7 +172,7 @@ jobs:
           } >>"$GITHUB_ENV"
       - name: package dmg
         run: scripts/package-macos.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: macos-${{ runner.arch }}
           path: |
@@ -136,17 +181,18 @@ jobs:
           if-no-files-found: error
 
   windows:
+    needs: signing-key
     runs-on: windows-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: rust toolchain (rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: package windows
         shell: bash
         run: scripts/package-windows.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: windows-${{ runner.arch }}
           path: |
@@ -158,8 +204,10 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [linux, macos, windows]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist-release
           merge-multiple: true
@@ -183,7 +231,31 @@ jobs:
               '.files[$name] = {sha256: $sha}' <<<"$manifest")
           done
           printf '%s\n' "$manifest" > dist-release/manifest.json
-      - uses: softprops/action-gh-release@v2
+      # Detached Ed25519 signature over the exact manifest bytes. The key only
+      # exists in this step, in a file readable by the runner user, and the
+      # signature is checked against the public key before anything is uploaded.
+      - name: sign manifest.json
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+          KOMET_RELEASE_SIGNING_PUBLIC_KEY: ${{ vars.KOMET_RELEASE_SIGNING_PUBLIC_KEY }}
+        run: |
+          [ -n "$RELEASE_SIGNING_KEY" ] || { echo "secrets.RELEASE_SIGNING_KEY is not set"; exit 1; }
+          umask 077
+          key="$RUNNER_TEMP/release-signing-key.pem"
+          printf '%s\n' "$RELEASE_SIGNING_KEY" >"$key"
+          openssl pkeyutl -sign -rawin -inkey "$key" \
+            -in dist-release/manifest.json -out dist-release/manifest.json.sig
+          rm -f "$key"
+          # The signature is checked against the key the manifest is signed
+          # with. That is KOMET_RELEASE_PUBLIC_KEY, except in a rotation release
+          # (see docs/release-signing.md), which declares the old key here.
+          verify_key="${KOMET_RELEASE_SIGNING_PUBLIC_KEY:-$KOMET_RELEASE_PUBLIC_KEY}"
+          # DER prefix of an Ed25519 SubjectPublicKeyInfo, then the raw key.
+          printf '302a300506032b6570032100%s' "$verify_key" | xxd -r -p >"$RUNNER_TEMP/release-public-key.der"
+          openssl pkeyutl -verify -rawin -pubin -keyform DER \
+            -inkey "$RUNNER_TEMP/release-public-key.der" \
+            -in dist-release/manifest.json -sigfile dist-release/manifest.json.sig
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: dist-release/*
           generate_release_notes: true

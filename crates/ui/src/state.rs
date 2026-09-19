@@ -389,7 +389,14 @@ impl EngineHandle {
             return None;
         }
         tracing::info!(%url, "engine daemon detected; connecting");
-        match connect_ws(&url).await {
+        let token = match komet_rpc::ipc_token::read_default(ipc_port) {
+            Ok(token) => token,
+            Err(err) => {
+                tracing::warn!(error = %err, "engine port is in use but its token is unreadable");
+                return None;
+            }
+        };
+        match connect_ws(&url, &token).await {
             Ok(client) => match query_engine_info(&client).await {
                 Ok(engine_info) => {
                     let client = Arc::new(client);
@@ -1916,13 +1923,21 @@ mod tests {
         );
     }
 
+    /// Publish an engine token for a test server the way `serve_ipc` does, so
+    /// the viewport's attach path can read it. The file is removed on drop.
+    fn publish_engine_token(port: u16) -> komet_rpc::ipc_token::PublishedToken {
+        komet_rpc::ipc_token::publish(&komet_rpc::ipc_token::default_dir().unwrap(), port).unwrap()
+    }
+
     #[tokio::test]
     async fn remote_viewport_treats_legacy_daemon_as_ready() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
+        let published = publish_engine_token(port);
         let server = tokio::spawn(komet_rpc::serve_ws_listener(
             listener,
             Arc::new(LegacyIdentityRpc),
+            published.token().into(),
         ));
         let dir = tempfile::tempdir().unwrap();
         let handle = EngineHandle::bootstrap(EngineBootConfig {
@@ -2036,6 +2051,7 @@ mod tests {
     async fn remote_viewport_observes_deferred_engine_failure() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
+        let published = publish_engine_token(port);
         let (state_tx, state_rx) = tokio::sync::watch::channel(DeferredEngineState::Waiting);
         let server = tokio::spawn(komet_rpc::serve_ws_listener(
             listener,
@@ -2046,6 +2062,7 @@ mod tests {
                 },
                 state: state_rx,
             }),
+            published.token().into(),
         ));
 
         let dir = tempfile::tempdir().unwrap();
@@ -2101,7 +2118,8 @@ mod tests {
         assert_eq!(handle.mode(), EngineMode::InProcess);
 
         // Attach the way an external viewport would, and speak the same protocol.
-        let attached = connect_ws(&format!("ws://127.0.0.1:{port}"))
+        let token = komet_rpc::ipc_token::read_default(port).unwrap();
+        let attached = connect_ws(&format!("ws://127.0.0.1:{port}"), &token)
             .await
             .expect("a second viewport must be able to attach");
         let harnesses = attached
@@ -2272,7 +2290,12 @@ mod tests {
         .unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        tokio::spawn(komet_rpc::serve_ws_listener(listener, core.rpc_service()));
+        let published = publish_engine_token(port);
+        tokio::spawn(komet_rpc::serve_ws_listener(
+            listener,
+            core.rpc_service(),
+            published.token().into(),
+        ));
 
         let ui_dir = tempfile::tempdir().unwrap();
         let handle = EngineHandle::bootstrap(EngineBootConfig {

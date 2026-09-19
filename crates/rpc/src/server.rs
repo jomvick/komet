@@ -121,13 +121,18 @@ async fn handle_request(
     }
 }
 
-/// Accept WebSocket connections forever, serving each with `service`.
-pub async fn serve_ws_listener(listener: TcpListener, service: Arc<dyn RpcService>) {
+/// Accept WebSocket connections forever, serving each with `service`. Every
+/// handshake must present `token` (see [`crate::ipc_token`]).
+pub async fn serve_ws_listener(
+    listener: TcpListener,
+    service: Arc<dyn RpcService>,
+    token: Arc<str>,
+) {
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
                 tracing::debug!(%peer, "rpc: connection accepted");
-                tokio::spawn(serve_ws_socket(stream, service.clone()));
+                tokio::spawn(serve_ws_socket(stream, service.clone(), token.clone()));
             }
             Err(err) => {
                 tracing::warn!(error = %err, "rpc: accept failed");
@@ -137,7 +142,7 @@ pub async fn serve_ws_listener(listener: TcpListener, service: Arc<dyn RpcServic
     }
 }
 
-async fn serve_ws_socket(stream: TcpStream, service: Arc<dyn RpcService>) {
+async fn serve_ws_socket(stream: TcpStream, service: Arc<dyn RpcService>, token: Arc<str>) {
     // Native viewports dial this socket with a bare `connect_async` and send
     // no `Origin` header. A browser always attaches `Origin` to a WebSocket
     // handshake and cannot forge or suppress it from script, and WebSockets
@@ -156,6 +161,19 @@ async fn serve_ws_socket(stream: TcpStream, service: Arc<dyn RpcService>) {
             );
             let mut err = ErrorResponse::new(Some("origin not allowed on local IPC".to_string()));
             *err.status_mut() = StatusCode::FORBIDDEN;
+            return Err(err);
+        }
+        // Loopback is reachable by every local user, so the caller must also
+        // prove it can read this user's token file.
+        let presented = req
+            .headers()
+            .get("authorization")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "));
+        if !presented.is_some_and(|p| crate::ipc_token::matches(p.as_bytes(), token.as_bytes())) {
+            tracing::warn!("rpc: rejecting handshake without a valid engine token");
+            let mut err = ErrorResponse::new(Some("missing or invalid engine token".to_string()));
+            *err.status_mut() = StatusCode::UNAUTHORIZED;
             return Err(err);
         }
         Ok(resp)
