@@ -3645,7 +3645,10 @@ impl Composer {
         }
         // Also set it directly: a chat without a saved configuration (unknown
         // harness) cannot be written, but its next message still uses this level.
-        self.state.update(cx, |state, _| state.access_mode = next);
+        self.state.update(cx, |state, cx| {
+            state.set_access_mode(next);
+            cx.notify();
+        });
         cx.notify();
     }
 

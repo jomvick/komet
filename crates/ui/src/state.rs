@@ -646,6 +646,14 @@ pub struct AppState {
     pub access_mode: komet_proto::SandboxLevel,
     /// The level new chats start at, from the Security settings.
     pub new_chat_access: komet_proto::SandboxLevel,
+    /// Access-chip click for the current selection (`None` = new-chat canvas).
+    /// Held until the persisted row (or Security default) catches up, so a
+    /// chats watch frame cannot snap Full access back to Sandboxed.
+    pending_access: Option<(Option<String>, komet_proto::SandboxLevel)>,
+    /// In-flight `setChatConfig` echo. A chats watch frame that left before
+    /// the mutate landed would otherwise replace the stamped row and snap
+    /// the access chip back to Sandboxed.
+    pending_chat_config: Option<(String, komet_proto::ChatConfig)>,
     engine: Option<EngineHandle>,
     boot_config: Option<EngineBootConfig>,
     watch_tasks: Vec<Task<()>>,
@@ -685,6 +693,8 @@ impl AppState {
             workspace_state: None,
             access_mode: komet_proto::SandboxLevel::WorkspaceWrite,
             new_chat_access: komet_proto::SandboxLevel::WorkspaceWrite,
+            pending_access: None,
+            pending_chat_config: None,
             engine: None,
             boot_config: None,
             watch_tasks: Vec::new(),
@@ -778,6 +788,21 @@ impl AppState {
 
     pub fn apply_chats(&mut self, mut chats: Vec<Chat>) {
         sort_chats(&mut chats);
+        // Keep the optimistic setChatConfig stamp until the watch frame
+        // carries the same config (or the chat disappears). Otherwise a
+        // snapshot that left before the mutate landed snaps the access chip
+        // from Full access back to Sandboxed.
+        self.pending_chat_config = match self.pending_chat_config.take() {
+            Some((id, pending)) => match chats.iter_mut().find(|c| c.id == id) {
+                Some(chat) if chat.config.as_ref() == Some(&pending) => None,
+                Some(chat) => {
+                    chat.config = Some(pending.clone());
+                    Some((id, pending))
+                }
+                None => None,
+            },
+            None => None,
+        };
         self.chats = chats;
         self.chats_synced = true;
         if let Some(selected) = &self.selected_chat
@@ -785,6 +810,7 @@ impl AppState {
         {
             // Selected chat vanished (deleted elsewhere): drop selection + transcript.
             self.selected_chat = None;
+            self.pending_access = None;
             self.transcript.clear();
             self.transcript_task = None;
         }
@@ -795,11 +821,42 @@ impl AppState {
 
     /// Recompute [`AppState::access_mode`] from the current selection.
     pub fn sync_access_mode(&mut self) {
-        self.access_mode = access_for_selection(
+        let resolved = access_for_selection(
             &self.chats,
             self.selected_chat.as_deref(),
             self.new_chat_access,
         );
+        let pending = self.pending_access.take();
+        self.access_mode = match pending {
+            Some((owner, level)) if owner.as_deref() == self.selected_chat.as_deref() => {
+                if resolved == level {
+                    resolved
+                } else {
+                    // Click has not landed in the saved row yet (new-chat draft,
+                    // unknown harness, or a stale chats frame).
+                    self.pending_access = Some((owner, level));
+                    level
+                }
+            }
+            _ => resolved,
+        };
+    }
+
+    /// Advance the access chip. Watch frames keep this level until the open
+    /// chat's saved config (or the new-chat default) matches it.
+    pub fn set_access_mode(&mut self, level: komet_proto::SandboxLevel) {
+        self.pending_access = Some((self.selected_chat.clone(), level));
+        self.access_mode = level;
+    }
+
+    /// Security-settings default. On the new-chat screen the chip follows
+    /// the value the user just picked.
+    pub fn set_new_chat_access(&mut self, level: komet_proto::SandboxLevel) {
+        self.new_chat_access = level;
+        if self.selected_chat.is_none() {
+            self.pending_access = None;
+        }
+        self.sync_access_mode();
     }
 
     pub fn apply_sessions(&mut self, sessions: Vec<Session>) {
@@ -840,8 +897,16 @@ impl AppState {
     /// value once the engine applies the LWW write.
     pub fn apply_chat_config(&mut self, chat_id: &str, config: komet_proto::ChatConfig) {
         if let Some(chat) = self.chats.iter_mut().find(|c| c.id == chat_id) {
-            chat.config = Some(config);
+            chat.config = Some(config.clone());
         }
+        self.pending_chat_config = Some((chat_id.to_string(), config));
+        self.sync_access_mode();
+    }
+
+    /// Drop an in-flight config echo (mutate failed) so the next watch frame
+    /// is allowed to replace the stamped row.
+    pub fn discard_pending_chat_config(&mut self) {
+        self.pending_chat_config = None;
         self.sync_access_mode();
     }
 
@@ -1285,6 +1350,8 @@ impl AppState {
         self.selected_device = None;
         self.selected_chat = None;
         self.auto_selected = false;
+        self.pending_access = None;
+        self.pending_chat_config = None;
         self.sync_access_mode();
         self.chats_synced = false;
         self.spaces_synced = false;
@@ -1361,6 +1428,7 @@ impl AppState {
             s.data_dir = Some(data_dir.clone());
             s.new_chat_access =
                 crate::settings::security::SecurityDefaults::load(&data_dir).default_sandbox;
+            s.pending_access = None;
             s.sync_access_mode();
             s.boot_config = Some(boot_config);
             cx.notify();
@@ -1459,7 +1527,9 @@ impl AppState {
         }
         self.selected_chat = chat_id.clone();
         self.auto_selected = true;
-        // Each chat uses its own level; the new-chat screen uses the default.
+        // Each chat uses its own level; a fresh new-chat screen uses the
+        // Security default (drop any leftover canvas click).
+        self.pending_access = None;
         self.sync_access_mode();
         self.transcript.clear();
         self.transcript_task = None;
@@ -2790,6 +2860,71 @@ mod tests {
         // The open chat is deleted on another device: back to the default.
         state.apply_chats(Vec::new());
         assert_eq!(state.access_mode, DangerFullAccess);
+    }
+
+    #[test]
+    fn new_chat_access_chip_survives_chats_watch_frames() {
+        use komet_proto::SandboxLevel::*;
+        let mut state = AppState::new();
+        state.new_chat_access = WorkspaceWrite;
+        state.apply_chats(vec![chat("a", 0, None)]);
+        assert_eq!(state.access_mode, WorkspaceWrite);
+        state.set_access_mode(DangerFullAccess);
+        assert_eq!(state.access_mode, DangerFullAccess);
+        // A sidebar refresh must not snap Full access back to Sandboxed.
+        state.apply_chats(vec![chat("a", 0, None)]);
+        assert_eq!(state.access_mode, DangerFullAccess);
+    }
+
+    #[test]
+    fn access_chip_survives_watch_when_chat_config_is_not_saved() {
+        use komet_proto::SandboxLevel::*;
+        let mut state = AppState::new();
+        state.apply_chats(vec![chat("a", 0, None)]);
+        state.selected_chat = Some("a".into());
+        state.sync_access_mode();
+        assert_eq!(state.access_mode, WorkspaceWrite);
+        // Unknown harness: the click cannot be written, but the next message
+        // still uses this level — a watch frame must not snap it back.
+        state.set_access_mode(DangerFullAccess);
+        state.apply_chats(vec![chat("a", 0, None)]);
+        assert_eq!(state.access_mode, DangerFullAccess);
+    }
+
+    #[test]
+    fn set_chat_config_echo_survives_a_stale_chats_frame() {
+        use komet_proto::SandboxLevel::*;
+        let mut state = AppState::new();
+        state.apply_chats(vec![chat_at("a", WorkspaceWrite)]);
+        state.selected_chat = Some("a".into());
+        state.sync_access_mode();
+        assert_eq!(state.access_mode, WorkspaceWrite);
+        state.apply_chat_config("a", chat_at("a", DangerFullAccess).config.unwrap());
+        assert_eq!(state.access_mode, DangerFullAccess);
+        // Watch frame that left before the mutate landed.
+        state.apply_chats(vec![chat_at("a", WorkspaceWrite)]);
+        assert_eq!(state.access_mode, DangerFullAccess);
+        // Engine caught up: the echo is released.
+        state.apply_chats(vec![chat_at("a", DangerFullAccess)]);
+        assert_eq!(state.access_mode, DangerFullAccess);
+        // A later remote change is not stuck behind the echo.
+        state.apply_chats(vec![chat_at("a", ReadOnly)]);
+        assert_eq!(state.access_mode, ReadOnly);
+    }
+
+    #[test]
+    fn discarded_chat_config_echo_lets_the_watch_win() {
+        use komet_proto::SandboxLevel::*;
+        let mut state = AppState::new();
+        state.apply_chats(vec![chat_at("a", WorkspaceWrite)]);
+        state.selected_chat = Some("a".into());
+        state.sync_access_mode();
+        state.apply_chat_config("a", chat_at("a", DangerFullAccess).config.unwrap());
+        state.discard_pending_chat_config();
+        // Local stamp still shows the click until a watch frame arrives.
+        assert_eq!(state.access_mode, DangerFullAccess);
+        state.apply_chats(vec![chat_at("a", WorkspaceWrite)]);
+        assert_eq!(state.access_mode, WorkspaceWrite);
     }
 
     #[test]

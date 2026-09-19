@@ -2606,8 +2606,7 @@ impl Shell {
                             this.state.update(cx, |s, _| {
                                 // The default only seeds NEW chats; the level of
                                 // the chat currently open (if any) is its own.
-                                s.new_chat_access = level;
-                                s.sync_access_mode();
+                                s.set_new_chat_access(level);
                             });
                             cx.notify();
                         },
@@ -3589,7 +3588,7 @@ impl Shell {
             SettingsSection::Shortcuts => icons::KEYBOARD,
             SettingsSection::Archived => icons::ARCHIVE_MINIMALISTIC,
             SettingsSection::Sync => icons::GLOBAL,
-            SettingsSection::Security => icons::KEY_MINIMALISTIC,
+            SettingsSection::Security => icons::SHIELD,
         };
         // Match the user's dragged sidebar width — the pane container clips to
         // it, so a hardcoded default here left hover washes stopping short of
