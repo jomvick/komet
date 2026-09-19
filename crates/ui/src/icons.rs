@@ -72,6 +72,9 @@ icon_assets![
     // scale transform at the pinned rev, so the flip is baked into the asset.
     (SIDEBAR_MINIMALISTIC_LEFT, "sidebar-minimalistic-left"),
     (KEY_MINIMALISTIC, "key-minimalistic"),
+    // Hand-drawn shield-check glyph in the Solar Linear style (like the
+    // terminal/plus/return ports) — the set has no shield icon.
+    (SHIELD, "shield"),
     (KEYBOARD, "keyboard"),
     (ARROW_LEFT, "arrow-left"),
     (ARROW_RIGHT, "arrow-right"),

@@ -1328,7 +1328,7 @@ impl Pickers {
         let Some(engine) = self.engine(cx) else {
             return;
         };
-        self.mutate_task = Some(cx.spawn(async move |_, _| {
+        self.mutate_task = Some(cx.spawn(async move |this, cx| {
             let params = serde_json::json!({
                 "op": "setChatConfig",
                 "chatId": chat_id,
@@ -1336,6 +1336,13 @@ impl Pickers {
             });
             if let Err(err) = engine.client().call(methods::MUTATE, params).await {
                 tracing::warn!(error = %err, "setChatConfig mutate failed");
+                this.update(cx, |pickers, cx| {
+                    pickers.state.update(cx, |state, cx| {
+                        state.discard_pending_chat_config();
+                        cx.notify();
+                    });
+                })
+                .ok();
             }
         }));
     }
@@ -1371,9 +1378,10 @@ impl Pickers {
     /// The model rows the picker currently shows, flat and in render order —
     /// keyboard nav, ⌘N jumps, Enter and the render walk THE SAME list.
     ///
-    /// A live search spans every ready harness (t3: the sidebar hides and
-    /// the query ignores it); otherwise the rail selection decides —
-    /// favorites across harnesses, or the effective harness's list with its
+    /// A live search is scoped to the effective harness (user report: picking
+    /// opencode then searching surfaced Cline's 300+ catalog); with no harness
+    /// resolved it spans every ready one. Otherwise the rail selection decides
+    /// — favorites across harnesses, or the effective harness's list with its
     /// starred rows floated to the top (t3 `groupFavorites`). A locked chat
     /// restricts every view to its own harness.
     fn visible_model_rows(&self, cx: &App) -> Vec<ModelRowData> {
@@ -1389,6 +1397,11 @@ impl Pickers {
         };
         let query = self.search.read(cx).text().trim().to_string();
         if !query.is_empty() {
+            // Scope the query to the harness the picker is actually on —
+            // searching opencode's models must not surface Cline rows.
+            if let Some(effective) = effective {
+                descriptors.retain(|d| d.id == effective);
+            }
             // Rank: label prefix < label substring < harness-name hit;
             // stars, then input order, break ties (t3 modelPickerSearch's
             // field ladder + favorite boost, collapsed to our ranks).
@@ -2788,8 +2801,8 @@ impl Pickers {
     /// harness rail on the left (favorites star on top), a search box over
     /// the model list on the right. Rows are two lines — model name over the
     /// harness icon + name (t3 `showProvider`, replacing the description) —
-    /// with a ⌘N jump chip and a star toggle trailing. Searching hides the
-    /// rail and spans every harness.
+    /// with a ⌘N jump chip and a star toggle trailing. Searching stays scoped
+    /// to the viewed harness (the rail stays up and re-scopes on a click).
     fn render_harness_model_popover(&mut self, cx: &mut Context<Self>) -> AnyElement {
         const HEIGHT: f32 = 346.0; // t3 max-h-86.5
 
@@ -2840,9 +2853,10 @@ impl Pickers {
 
         // ── rail: icons only (t3 ModelPickerSidebar) — the favorites star,
         //    a divider, one brand icon per harness. The selected tab wears a
-        //    3px accent bar hugging the rail's right edge. Hidden while a
-        //    search is live (the query spans every harness).
-        let rail: Option<AnyElement> = (!searching).then(|| {
+        //    3px accent bar hugging the rail's right edge. Stays visible
+        //    while a search is live — the query is scoped to the viewed
+        //    harness, and clicking another icon re-scopes it.
+        let rail: Option<AnyElement> = Some({
             let mut column = div()
                 .w(px(44.0))
                 .flex_none()
