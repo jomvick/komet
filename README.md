@@ -110,6 +110,17 @@ Learn more: [`ARCHITECTURE.md`](ARCHITECTURE.md) · [`docs/`](docs/)
 
 ---
 
+## Development
+
+```bash
+cargo run --bin komet             # main app (UI + engine)
+cargo run --bin komet-sync-server # standalone sync server
+```
+
+> `cargo run` alone fails: the workspace exposes two binaries, so `--bin` is required.
+
+---
+
 ## Credits
 
 Komet is a fork of [zeronsh/comet](https://github.com/zeronsh/comet) — same MIT license, same author (Wing). The fork diverges on local-first sync, self-hosted `komet-sync-server`, and gpui UI refinements. Upstream history is preserved via the `upstream` git remote (`git fetch upstream`).
