@@ -341,6 +341,16 @@ impl AgentAccounts {
             .timeout(HTTP_TIMEOUT)
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
+        // Persisted Google userinfo identities: the keyring secret carries no
+        // email, so without this every restart fell back to the opaque
+        // `Antigravity ·…hash` placeholder until userinfo succeeded again
+        // (accounts appearing/disappearing across restarts).
+        let profile_cache_file = root.join("antigravity-profiles.json");
+        let antigravity_profile_cache: HashMap<String, (String, Option<String>)> =
+            std::fs::read_to_string(&profile_cache_file)
+                .ok()
+                .and_then(|raw| serde_json::from_str(&raw).ok())
+                .unwrap_or_default();
         Self {
             inner: Arc::new(Inner {
                 config,
@@ -348,7 +358,7 @@ impl AgentAccounts {
                 flows: Mutex::new(HashMap::new()),
                 usage_cache: Mutex::new(HashMap::new()),
                 inflight_refreshes: Mutex::new(std::collections::HashSet::new()),
-                antigravity_profile_cache: Mutex::new(HashMap::new()),
+                antigravity_profile_cache: Mutex::new(antigravity_profile_cache),
             }),
         }
     }
@@ -358,7 +368,12 @@ impl AgentAccounts {
     /// Detect both CLIs, auto-snapshot the live logins, and assemble the view.
     pub async fn list(&self, force_usage: bool) -> Result<AgentAccountsSnapshot, EngineError> {
         if force_usage {
-            lock(&self.inner.usage_cache).clear();
+            // Per-harness invalidation happens in `usage_for` callers via fresh
+            // probes; a full clear forced every Refresh to re-probe all 6
+            // accounts at once (partial timeouts => some cards with gauges,
+            // others "Usage unavailable"). Keep warm successes, drop only
+            // entries older than the TTL so forced lists still refresh.
+            lock(&self.inner.usage_cache).retain(|_, (_, at)| at.elapsed() < USAGE_TTL);
         }
         let mut warnings: Vec<AgentAccountWarning> = Vec::new();
         let mut active_keys: HashMap<HarnessId, String> = HashMap::new();
@@ -390,6 +405,56 @@ impl AgentAccounts {
         if let Some(detected) = self.detect_cursor() {
             active_keys.insert(HarnessId::Cursor, detected.account_key.clone());
             self.snapshot_detected(HarnessId::Cursor, &detected)?;
+        }
+
+        // Dedupe: a re-login mints a NEW refresh token, so `account_key`
+        // (hash of the refresh token) changes and `snapshot_detected` writes a
+        // SECOND slot for the same email. The old refresh token is then usually
+        // revoked, so the stale row can never refresh and sits forever at
+        // "Usage unavailable" — the duplicate-`doriankoanda` bug. Same
+        // normalized non-opaque email => keep the freshest slot, delete older
+        // files. Opaque placeholders (`Antigravity ·…hash`) are never merged:
+        // two of them may be two different accounts.
+        for harness in [
+            HarnessId::ClaudeCode,
+            HarnessId::Codex,
+            HarnessId::Antigravity,
+            HarnessId::Cursor,
+        ] {
+            let mut by_email: HashMap<String, Vec<Slot>> = HashMap::new();
+            for slot in self.read_slots(harness) {
+                if harness == HarnessId::Antigravity
+                    && is_opaque_antigravity_email(&slot.profile.email)
+                {
+                    continue;
+                }
+                by_email
+                    .entry(slot.profile.email.to_lowercase())
+                    .or_default()
+                    .push(slot);
+            }
+            for slots in by_email.values().filter(|v| v.len() > 1) {
+                let newest = slots.iter().max_by_key(|s| s.saved_at).unwrap();
+                for stale in slots.iter().filter(|s| s.id != newest.id) {
+                    let file = match self.slots_dir(harness) {
+                        Ok(dir) => dir.join(format!("{}.json", stale.id)),
+                        Err(_) => continue,
+                    };
+                    match std::fs::remove_file(&file) {
+                        Ok(()) => tracing::info!(
+                            harness = ?harness,
+                            email = %stale.profile.email,
+                            removed = %stale.id,
+                            kept = %newest.id,
+                            "agent-accounts: removed duplicate slot for same email",
+                        ),
+                        Err(err) => tracing::warn!(
+                            file = %file.display(), error = %err,
+                            "agent-accounts: could not remove duplicate slot",
+                        ),
+                    }
+                }
+            }
         }
 
         // Stable presentation order: provider, then slot creation order (never
@@ -1534,16 +1599,35 @@ impl AgentAccounts {
         let exited = *lock(&exit);
         if let Some(code) = exited {
             self.cancel_login(login_id);
-            let message = if code == Some(0) {
-                "codex login finished without credentials.".to_string()
-            } else {
-                lock(&output)
-                    .trim()
-                    .lines()
-                    .last()
-                    .unwrap_or("sign-in failed")
-                    .to_string()
+            let tail = lock(&output)
+                .trim()
+                .lines()
+                .last()
+                .unwrap_or("sign-in failed")
+                .to_string();
+            // Surface whether the throwaway home got ANY file: a present but
+            // unparseable auth.json (new CLI shape) vs nothing at all are two
+            // different bugs — the message must distinguish them.
+            let home_state = match std::fs::read_dir(&home) {
+                Err(_) => "throwaway home vanished",
+                Ok(entries) => {
+                    let names: Vec<String> = entries
+                        .flatten()
+                        .map(|e| e.file_name().to_string_lossy().to_string())
+                        .collect();
+                    if names.is_empty() {
+                        "throwaway home empty — login never completed in the browser"
+                    } else {
+                        "throwaway home has files but no parseable auth — new CLI shape?"
+                    }
+                }
             };
+            let message = if code == Some(0) {
+                format!("codex login finished without credentials. {home_state}. ({tail})")
+            } else {
+                format!("{tail} ({home_state})")
+            };
+            tracing::warn!(login_id, code = ?code, home = %home.display(), output_tail = %tail, "{home_state}");
             return Ok(AgentLoginPoll {
                 status: AgentLoginStatus::Error,
                 message: Some(message),
@@ -1567,6 +1651,22 @@ impl AgentAccounts {
         let flow = lock(&self.inner.flows).remove(login_id);
         match flow {
             Some(LoginFlow::Codex { child, home, .. }) => {
+                // Adopt-on-cancel: the user often completes the browser login
+                // then closes the dialog before the 1.5s poll notices (or the
+                // poll already errored on a slow write). If the throwaway home
+                // holds a parseable auth, save it instead of deleting it —
+                // deleting a completed login is the "j'ai add mais ça
+                // s'affiche pas" bug. Parse failure still falls through to
+                // cleanup (logged by the poll path).
+                if let Some(detected) =
+                    read_json(&home.join("auth.json")).and_then(parse_codex_auth)
+                {
+                    if let Err(err) = self.snapshot_detected(HarnessId::Codex, &detected) {
+                        tracing::warn!(error = %err, "adopt-on-cancel: snapshot failed");
+                    } else {
+                        tracing::info!(email = %detected.profile.email, "adopt-on-cancel: saved codex login closed before poll noticed");
+                    }
+                }
                 if let Some(c) = lock(&child).as_mut() {
                     let _ = c.start_kill();
                 }
@@ -1754,6 +1854,18 @@ impl AgentAccounts {
         if let Some((email, name)) = self.fetch_google_userinfo(&token).await {
             lock(&self.inner.antigravity_profile_cache)
                 .insert(detected.account_key.clone(), (email.clone(), name.clone()));
+            // Best-effort persist so the real identity survives restarts.
+            let snapshot: HashMap<String, (String, Option<String>)> =
+                lock(&self.inner.antigravity_profile_cache).clone();
+            let file = self
+                .inner
+                .config
+                .root_dir()
+                .join("antigravity-profiles.json");
+            if let Ok(json) = serde_json::to_string_pretty(&snapshot) {
+                let _ = std::fs::create_dir_all(self.inner.config.root_dir());
+                let _ = write_file_atomic(&file, json.as_bytes(), false);
+            }
             detected.profile.email = email;
             detected.profile.display_name = name;
         }
@@ -1899,7 +2011,13 @@ impl AgentAccounts {
             // One malformed slot file must skip THAT slot, not brick the page.
             if let Some(slot) = std::fs::read_to_string(&path)
                 .ok()
-                .and_then(|raw| serde_json::from_str::<Slot>(&raw).ok())
+                .and_then(|raw| match serde_json::from_str::<Slot>(&raw) {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        tracing::warn!(path = %path.display(), error = %e, "agent-accounts: skipping malformed slot file");
+                        None
+                    }
+                })
             {
                 slots.push(slot);
             }
@@ -2160,9 +2278,20 @@ impl AgentAccounts {
         }
 
         // Inactive slots: file copy only — refresh the slot when expired/401.
+        // A slot with no usable access token at all (e.g. saved before the
+        // access token was captured) must still try the refresh-token path
+        // instead of returning None immediately — that early-`?` hid every
+        // such account behind "Usage unavailable" without one network call.
         let raw = slot.credentials.as_object().map(|_| &slot.credentials)?;
-        let mut access_token = antigravity_access_token(raw)?;
+        let mut access_token = antigravity_access_token(raw);
         let mut did_refresh = false;
+        if access_token.is_none()
+            && let Some(refreshed) = self.refresh_antigravity_slot(slot).await
+        {
+            access_token = Some(refreshed);
+            did_refresh = true;
+        }
+        let mut access_token = access_token?;
 
         if antigravity_access_expired(raw)
             && let Some(refreshed) = self.refresh_antigravity_slot(slot).await
@@ -2829,10 +2958,32 @@ fn harness_slug(harness: HarnessId) -> &'static str {
 }
 
 fn read_json(file: &Path) -> Option<serde_json::Value> {
-    let raw = std::fs::read_to_string(file).ok()?;
-    serde_json::from_str(&raw)
-        .ok()
-        .filter(serde_json::Value::is_object)
+    read_json_resilient(file, 3)
+}
+
+/// Torn-write tolerant read: the CLIs rewrite `auth.json` frequently; a `list()`
+/// racing a write must retry instead of reporting "no login" for one frame
+/// (account flapping). Only the final failure returns `None`.
+fn read_json_resilient(file: &Path, attempts: u32) -> Option<serde_json::Value> {
+    for attempt in 0..attempts.max(1) {
+        match std::fs::read_to_string(file) {
+            Err(_) => return None, // missing file: no point retrying
+            Ok(raw) => match serde_json::from_str::<serde_json::Value>(&raw)
+                .ok()
+                .filter(serde_json::Value::is_object)
+            {
+                Some(v) => return Some(v),
+                None if attempt + 1 < attempts.max(1) => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                None => {
+                    tracing::warn!(path = %file.display(), "agent-accounts: skipping torn/unparseable auth file");
+                    return None;
+                }
+            },
+        }
+    }
+    None
 }
 
 fn str_field(value: &serde_json::Value, key: &str) -> Option<String> {

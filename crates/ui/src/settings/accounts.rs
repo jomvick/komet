@@ -193,6 +193,23 @@ impl LoginFlow {
     }
 }
 
+/// `codex` binary lookup without a new dependency: scan `PATH` for an
+/// executable `codex` file. Pure enough to unit-test via `PATH` manipulation.
+fn codex_on_path() -> bool {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    for dir in std::env::split_paths(&path) {
+        let candidate = dir.join("codex");
+        if candidate.is_file() {
+            return true;
+        }
+        #[cfg(windows)]
+        if dir.join("codex.exe").is_file() {
+            return true;
+        }
+    }
+    false
+}
+
 pub struct AccountsPage {
     state: Entity<AppState>,
     /// Which device's logins are shown; `None` = this device (no passthrough).
@@ -459,7 +476,31 @@ impl AccountsPage {
             this.update(cx, |page, cx| {
                 page.snapshot = match result {
                     Ok(value) => match serde_json::from_value::<AgentAccountsSnapshot>(value) {
-                        Ok(snapshot) => Loadable::Ready(snapshot),
+                        Ok(mut snapshot) => {
+                            // Merge: a non-forced re-list returns empty
+                            // `usage_windows` (engine never hits the network
+                            // unless forced). Overwriting wholesale made gauges
+                            // flicker to "Usage unavailable" after every
+                            // Switch/Forget/watch frame — keep the previous
+                            // windows when the fresh ones are empty.
+                            if let Some(prev) = page.snapshot.ready() {
+                                let prev = prev.clone();
+                                for account in &mut snapshot.accounts {
+                                    if !account.usage_windows.is_empty() {
+                                        continue;
+                                    }
+                                    if let Some(old) = prev
+                                        .accounts
+                                        .iter()
+                                        .find(|a| a.id == account.id)
+                                        .filter(|a| !a.usage_windows.is_empty())
+                                    {
+                                        account.usage_windows = old.usage_windows.clone();
+                                    }
+                                }
+                            }
+                            Loadable::Ready(snapshot)
+                        }
                         Err(err) => Loadable::Error(err.to_string()),
                     },
                     Err(err) => Loadable::Error(err.to_string()),
@@ -519,10 +560,22 @@ impl AccountsPage {
 
     fn start_login(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.error = Some("Engine is not running — reopen the Accounts page.".into());
+            cx.notify();
             return;
         };
         self.login = Some(LoginFlow::Starting { harness });
         self.error = None;
+        // Preflight hint only (never blocking): the page may target a REMOTE
+        // device (`targetDeviceId` passthrough) while this check runs on the
+        // local daemon — a missing local `codex` says nothing about the remote.
+        if harness == HarnessId::Codex && !codex_on_path() {
+            self.error = Some(
+                "Local `codex` CLI not found on this device's PATH — if the target device lacks it too, run `codex login` there manually, then Refresh."
+                    .into(),
+            );
+            // Fall through: the relayed RPC is the ground truth.
+        }
         let params = self.params(serde_json::json!({ "harness": harness }));
         self.action_task = Some(cx.spawn(async move |this, cx| {
             let result = engine
@@ -560,7 +613,13 @@ impl AccountsPage {
                     }
                     Err(err) => {
                         page.login = None;
-                        page.error = Some(format!("Login failed to start: {err}").into());
+                        let mut message = format!("Login failed to start: {err}");
+                        if harness == HarnessId::Codex {
+                            message.push_str(
+                                " — fallback: run `codex login` in a terminal, then Refresh.",
+                            );
+                        }
+                        page.error = Some(message.into());
                     }
                 }
                 cx.notify();
@@ -951,11 +1010,18 @@ impl AccountsPage {
                                     .truncate()
                                     .text_size(px(11.5))
                                     .text_color(theme.text_muted.opacity(0.6))
-                                    .child(SharedString::from(if account.switchable {
-                                        "Usage unavailable"
-                                    } else {
-                                        "Credentials unavailable"
-                                    })),
+                                    .child(SharedString::from(
+                                        if account.harness == HarnessId::Cursor {
+                                            // The engine never probes Cursor quotas
+                                            // (`usage_for` returns None) — don't
+                                            // imply a failure, state the support gap.
+                                            "Quota not tracked for this provider"
+                                        } else if account.switchable {
+                                            "Usage unavailable"
+                                        } else {
+                                            "Credentials unavailable"
+                                        },
+                                    )),
                             )
                         } else {
                             el.child(
