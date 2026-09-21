@@ -4937,6 +4937,11 @@ impl Composer {
             status: None,
             continuation_of: None,
         };
+        // Snapshot the draft's access before selecting a newly created chat.
+        // Until its CreateChat mutation arrives, that selected row has no
+        // config and resolves to WorkspaceWrite; taking this after
+        // `select_chat` would silently downgrade a Full access first run.
+        let sandbox = self.state.read(cx).access_mode;
         self.state.update(cx, |s, cx| {
             if is_new {
                 s.select_chat(Some(chat_id.clone()), cx);
@@ -4963,7 +4968,6 @@ impl Composer {
         let restore_text = text.clone();
         let err_chat_id = chat_id.clone();
         let err_message_id = message_id.clone();
-        let sandbox = self.state.read(cx).access_mode;
         // Access chip maps to SandboxOptions for Claude/Codex/OpenCode.
         // Native-first access mapping (ARCHITECTURE.md §6): Grok/Antigravity
         // drive native CLI sandbox flags, Cursor passes `sandbox` through the

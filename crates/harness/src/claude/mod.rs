@@ -57,7 +57,7 @@ use komet_proto::{
 };
 
 use crate::{Harness, HarnessError, RunControls, Signal, send_signal, shutdown_child};
-use catalog::{apply_ultrathink, static_models, to_effort};
+use catalog::{apply_ultrathink, to_effort};
 use normalize::Normalizer;
 use wire::{ControlRequestFrame, Frame, allow_response, control_response_line};
 
@@ -125,6 +125,8 @@ pub struct ClaudeHarness {
     /// Command discovery cache: only a successful probe is cached, so a
     /// broken CLI retries on the next picker open (ACP-harness parity).
     commands: tokio::sync::OnceCell<Vec<SlashCommand>>,
+    /// Model discovery cache: live probe cached on success.
+    models: tokio::sync::OnceCell<Vec<Model>>,
 }
 
 impl Default for ClaudeHarness {
@@ -134,6 +136,7 @@ impl Default for ClaudeHarness {
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
             commands: tokio::sync::OnceCell::new(),
+            models: tokio::sync::OnceCell::new(),
         }
     }
 }
@@ -546,6 +549,84 @@ impl ClaudeHarness {
         }
     }
 
+    /// Live model discovery via Claude control channel (`supported_models`).
+    pub(crate) async fn discover_live_models(&self) -> Result<Vec<Model>, HarnessError> {
+        let exe = self.resolve_executable()?;
+        let mut cmd = Command::new(&exe);
+        crate::compose_child_path(&mut cmd, &exe);
+        cmd.args([
+            "--print",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+        ]);
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let mut child = cmd.spawn().map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                HarnessError::NotInstalled(exe.display().to_string())
+            } else {
+                HarnessError::Io(e)
+            }
+        })?;
+        let (Some(mut stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+            shutdown_child(&mut child, self.kill_grace).await;
+            return Err(HarnessError::Protocol("claude child has no stdio".into()));
+        };
+
+        const MODELS_PROBE_ID: &str = "komet-models-probe";
+        let discovery = async {
+            let req = serde_json::json!({
+                "type": "control_request",
+                "request_id": MODELS_PROBE_ID,
+                "request": { "subtype": "supported_models" },
+            });
+            stdin
+                .write_all(format!("{req}\n").as_bytes())
+                .await
+                .map_err(HarnessError::Io)?;
+            stdin.flush().await.map_err(HarnessError::Io)?;
+
+            let mut discovered_models: Vec<Model> = Vec::new();
+            let mut lines = BufReader::new(stdout).lines();
+            while let Some(line) = lines.next_line().await.map_err(HarnessError::Io)? {
+                let Ok(frame) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                if frame.get("type").and_then(Value::as_str) != Some("control_response") {
+                    continue;
+                }
+                let response = frame.get("response").cloned().unwrap_or(Value::Null);
+                let req_id = response.get("request_id").and_then(Value::as_str);
+                if req_id == Some(MODELS_PROBE_ID) {
+                    if response.get("subtype").and_then(Value::as_str) != Some("error") {
+                        let resp_body = response.get("response").unwrap_or(&response);
+                        discovered_models = catalog::parse_discovered_models(resp_body);
+                    }
+                    break;
+                }
+            }
+
+            if discovered_models.is_empty() {
+                return Err(HarnessError::Protocol(
+                    "claude supported_models returned no usable models".into(),
+                ));
+            }
+            Ok::<Vec<Model>, HarnessError>(discovered_models)
+        };
+
+        let result = tokio::time::timeout(Duration::from_secs(10), discovery).await;
+        shutdown_child(&mut child, self.kill_grace).await;
+        match result {
+            Ok(inner) => inner,
+            Err(_) => Err(HarnessError::Protocol("claude model discovery timed out".into())),
+        }
+    }
+
     /// Query structured context usage (tokens, categories, loaded files, MCP tools, skills)
     /// from the CLI via `get_context_usage` control request.
     pub async fn get_context_usage(&self) -> Result<komet_proto::ContextUsage, HarnessError> {
@@ -681,12 +762,41 @@ impl Harness for ClaudeHarness {
         true
     }
 
-    /// The curated static catalog (see [`catalog`]); requires an installed CLI
-    /// so an absent binary surfaces as [`HarnessError::NotInstalled`] here,
-    /// like the discovery call would.
+    /// Dynamic model discovery via control-channel probe first, falling back
+    /// to curated static catalog on error or empty response.
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         self.resolve_executable()?;
-        Ok(static_models())
+        self.models
+            .get_or_try_init(|| async {
+                match self.discover_live_models().await {
+                    Ok(models) if !models.is_empty() => {
+                        tracing::info!(
+                            target: "komet_harness::claude",
+                            count = models.len(),
+                            "discovered live Claude models from control channel"
+                        );
+                        Ok(models)
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "komet_harness::claude",
+                            source = "static-fallback",
+                            "Claude live model discovery failed; falling back to static catalog: {e}"
+                        );
+                        Ok(catalog::static_models())
+                    }
+                    Ok(_) => {
+                        tracing::warn!(
+                            target: "komet_harness::claude",
+                            source = "static-fallback",
+                            "Claude live model discovery returned 0 models; falling back to static catalog"
+                        );
+                        Ok(catalog::static_models())
+                    }
+                }
+            })
+            .await
+            .cloned()
     }
 
     /// Slash commands from the CLI's `initialize` control-request handshake —

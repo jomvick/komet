@@ -635,11 +635,23 @@ async fn models_returns_curated_catalog() {
         }"#,
     )
     .expect("write models cache");
+    let failing_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("fake-codex-fail-models.sh");
     // SAFETY: single-threaded setup for this test; nothing else in the binary
     // consults CODEX_HOME while it is pinned.
-    unsafe { std::env::set_var("CODEX_HOME", home.path()) };
-    let models = harness().models().await.expect("models");
-    unsafe { std::env::remove_var("CODEX_HOME") };
+    unsafe {
+        std::env::set_var("CODEX_HOME", home.path());
+    };
+    let models = CodexHarness::new()
+        .with_executable(failing_path)
+        .models()
+        .await
+        .expect("models");
+    unsafe {
+        std::env::remove_var("CODEX_HOME");
+    };
     assert_eq!(models.len(), 7);
     assert_eq!(models[0].id, "gpt-5.6-sol");
     assert!(models[0].reasoning_levels.contains(&ReasoningLevel::Ultra));
@@ -658,6 +670,22 @@ async fn models_returns_curated_catalog() {
     // lazy descriptor must stay in lockstep).
     assert_eq!(missing.display_name(), "Codex");
     assert_eq!(missing.reasoning_levels().len(), 7);
+}
+
+#[tokio::test]
+async fn models_live_discovery_via_app_server() {
+    // Tests live model/list discovery via app-server with pagination.
+    let models = harness().models().await.expect("models");
+    assert_eq!(models.len(), 2);
+    assert_eq!(models[0].id, "gpt-5.6-terra");
+    assert_eq!(models[0].label, "GPT-5.6-Terra");
+    assert_eq!(
+        models[0].reasoning_levels,
+        vec![ReasoningLevel::Low, ReasoningLevel::Ultra]
+    );
+    assert_eq!(models[1].id, "gpt-5.5");
+    assert_eq!(models[1].label, "GPT-5.5");
+    assert_eq!(models[1].reasoning_levels, vec![ReasoningLevel::High]);
 }
 
 #[tokio::test]

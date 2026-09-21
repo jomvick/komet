@@ -369,9 +369,122 @@ pub fn static_models() -> Vec<Model> {
     ]
 }
 
+/// Parse dynamically discovered models from Claude control response (`supported_models`).
+/// Overlays curated effort ladders and model options.
+pub(crate) fn parse_discovered_models(value: &serde_json::Value) -> Vec<Model> {
+    let raw_list = if let Some(arr) = value.as_array() {
+        arr.as_slice()
+    } else if let Some(arr) = value.get("models").and_then(serde_json::Value::as_array) {
+        arr.as_slice()
+    } else if let Some(arr) = value
+        .get("response")
+        .and_then(|r| r.get("models"))
+        .and_then(serde_json::Value::as_array)
+    {
+        arr.as_slice()
+    } else {
+        &[]
+    };
+
+    if raw_list.is_empty() {
+        return Vec::new();
+    }
+
+    let static_list = static_models();
+    let mut out = Vec::new();
+    for item in raw_list {
+        let id = item
+            .get("id")
+            .or_else(|| item.get("value"))
+            .or_else(|| item.get("model"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let Some(id) = id else { continue };
+
+        if out.iter().any(|m: &Model| m.id == id) {
+            continue;
+        }
+
+        let label = item
+            .get("name")
+            .or_else(|| item.get("displayName"))
+            .or_else(|| item.get("display_name"))
+            .or_else(|| item.get("label"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(id);
+
+        let description = item
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+
+        // Overlay with curated static catalog if known
+        if let Some(matched) = static_list.iter().find(|m| m.id == id) {
+            out.push(Model {
+                id: id.to_owned(),
+                label: if label != id {
+                    label.to_owned()
+                } else {
+                    matched.label.clone()
+                },
+                description: if !description.is_empty() {
+                    Some(description.to_owned())
+                } else {
+                    matched.description.clone()
+                },
+                reasoning_levels: matched.reasoning_levels.clone(),
+                options: matched.options.clone(),
+            });
+        } else {
+            // New/unrecognized model: derive ladder & options
+            let ladder = if id.contains("haiku") {
+                Vec::new()
+            } else if id.contains("opus-4-7") || id.contains("sonnet-5") {
+                XHIGH_LADDER.to_vec()
+            } else {
+                FULL_LADDER.to_vec()
+            };
+
+            let mut options = Vec::new();
+            if id.contains("haiku") {
+                options.push(toggle("thinking", "Thinking"));
+            } else {
+                options.push(context_window());
+                if id.contains("opus") {
+                    options.push(toggle("fastMode", "Fast Mode"));
+                }
+            }
+
+            out.push(model(id, label, description, &ladder, options));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_discovered_models_overlays_static_ladders() {
+        let payload = serde_json::json!({
+            "models": [
+                { "id": "claude-opus-5", "name": "Opus 5 (Live)" },
+                { "id": "claude-haiku-4-5", "name": "Haiku 4.5" },
+                { "id": "claude-custom-new", "name": "Custom Model" }
+            ]
+        });
+        let models = parse_discovered_models(&payload);
+        assert_eq!(models.len(), 3);
+        assert_eq!(models[0].id, "claude-opus-5");
+        assert_eq!(models[0].label, "Opus 5 (Live)");
+        assert_eq!(models[0].reasoning_levels, FULL_LADDER);
+        assert_eq!(models[1].id, "claude-haiku-4-5");
+        assert!(models[1].reasoning_levels.is_empty());
+        assert_eq!(models[2].id, "claude-custom-new");
+        assert_eq!(models[2].reasoning_levels, FULL_LADDER);
+    }
 
     #[test]
     fn effort_maps_special_modes() {

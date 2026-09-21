@@ -717,6 +717,33 @@ async fn live_session_probes_context_usage_after_result() {
     )));
 }
 
+#[tokio::test]
+async fn models_live_discovery_via_control_channel() {
+    let models = harness().models().await.expect("models discovery");
+    assert_eq!(models.len(), 3);
+    assert_eq!(models[0].id, "claude-fable-5");
+    assert_eq!(models[0].label, "Fable 5 (Live)");
+    assert_eq!(models[1].id, "claude-opus-5");
+    assert_eq!(models[1].label, "Opus 5 (Live)");
+    assert_eq!(models[2].id, "claude-haiku-4-5");
+    assert!(models[2].reasoning_levels.is_empty());
+}
+
+#[tokio::test]
+async fn models_falls_back_to_static_on_failure() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("fake-claude-fail-models.sh");
+    let failing_harness = ClaudeHarness::new().with_executable(path);
+    let models = failing_harness.models().await.expect("models fallback");
+    assert!(!models.is_empty());
+    // Static fallback has 6 models
+    assert_eq!(models.len(), 6);
+    assert_eq!(models[0].id, "claude-fable-5");
+    assert_eq!(models[0].label, "Fable 5");
+}
+
 /// Live smoke against the real CLI: `cargo test -p komet-harness --test
 /// claude -- --ignored live_commands`. No model turn, no API cost.
 #[tokio::test]

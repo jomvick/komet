@@ -187,9 +187,65 @@ pub(crate) fn parse_models_cache(value: &serde_json::Value) -> Option<Vec<Model>
     (!out.is_empty()).then_some(out)
 }
 
+/// Parse items from `model/list` JSON-RPC response (Codex app-server).
+/// Supports both camelCase and snake_case representations.
+pub(crate) fn parse_model_list_items(items: &[serde_json::Value]) -> Vec<Model> {
+    let mut out = Vec::new();
+    for m in items {
+        let id = m.get("id")
+            .or_else(|| m.get("slug"))
+            .or_else(|| m.get("model"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let Some(id) = id else { continue };
+
+        if m.get("visibility")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|v| v == "hidden")
+        {
+            continue;
+        }
+
+        let label = m
+            .get("displayName")
+            .or_else(|| m.get("display_name"))
+            .or_else(|| m.get("name"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(id);
+
+        let description = m
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+
+        let mut efforts = Vec::new();
+        let levels_val = m.get("supportedReasoningEfforts")
+            .or_else(|| m.get("supported_reasoning_levels"))
+            .or_else(|| m.get("supportedReasoningLevels"))
+            .and_then(serde_json::Value::as_array);
+
+        if let Some(arr) = levels_val {
+            for item in arr {
+                if let Some(s) = item.as_str() {
+                    efforts.push(s.to_string());
+                } else if let Some(e) = item.get("effort").and_then(serde_json::Value::as_str) {
+                    efforts.push(e.to_string());
+                }
+            }
+        }
+
+        out.push(model(id, label, description, ladder_for_efforts(&efforts)));
+    }
+    out
+}
+
 /// Live `~/.codex/models_cache.json` first, curated snapshot as fallback.
 /// Shared by [`CodexHarness::models`] and [`to_effort`] so the picker and the
 /// wire never disagree on which efforts a slug accepts.
+///
+/// This function only reads the local file cache. For a fully live probe via
+/// the app-server's `model/list` RPC, call [`CodexHarness::discover_live_models`].
 pub(crate) fn load_catalog() -> Vec<Model> {
     if let Some(home) = std::env::var_os("CODEX_HOME")
         .map(std::path::PathBuf::from)
@@ -201,9 +257,32 @@ pub(crate) fn load_catalog() -> Vec<Model> {
             && let Ok(value) = serde_json::from_str::<serde_json::Value>(&text)
             && let Some(models) = parse_models_cache(&value)
         {
+            tracing::info!(
+                target: "komet_harness::codex",
+                count = models.len(),
+                path = %cache.display(),
+                "loaded Codex models from local cache"
+            );
             return models;
         }
+        tracing::warn!(
+            target: "komet_harness::codex",
+            source = "static-fallback",
+            cache_path = %home.join("models_cache.json").display(),
+            "~/.codex/models_cache.json absent or unparseable; falling back to static catalog"
+        );
+    } else {
+        tracing::warn!(
+            target: "komet_harness::codex",
+            source = "static-fallback",
+            "no CODEX_HOME or HOME found; falling back to static catalog"
+        );
     }
+    tracing::warn!(
+        target: "komet_harness::codex",
+        source = "static-fallback",
+        "serving static Codex model catalog"
+    );
     static_models()
 }
 
@@ -403,5 +482,39 @@ mod tests {
         });
         let parsed = parse_models_cache(&value).expect("parses");
         assert_eq!(parsed[0].reasoning_levels, vec![ReasoningLevel::High]);
+    }
+
+    #[test]
+    fn parse_model_list_items_handles_both_casing_styles() {
+        let items = vec![
+            serde_json::json!({
+                "id": "gpt-5.6-terra",
+                "displayName": "GPT-5.6 Terra",
+                "description": "Balanced coding model",
+                "supportedReasoningEfforts": ["low", "ultra"],
+                "visibility": "list"
+            }),
+            serde_json::json!({
+                "slug": "gpt-5.5",
+                "display_name": "GPT-5.5",
+                "supported_reasoning_levels": [{"effort": "high"}],
+                "visibility": "list"
+            }),
+            serde_json::json!({
+                "id": "hidden-one",
+                "displayName": "Hidden",
+                "visibility": "hidden"
+            }),
+        ];
+        let models = parse_model_list_items(&items);
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "gpt-5.6-terra");
+        assert_eq!(models[0].label, "GPT-5.6 Terra");
+        assert_eq!(
+            models[0].reasoning_levels,
+            vec![ReasoningLevel::Low, ReasoningLevel::Ultra]
+        );
+        assert_eq!(models[1].id, "gpt-5.5");
+        assert_eq!(models[1].reasoning_levels, vec![ReasoningLevel::High]);
     }
 }
