@@ -121,6 +121,8 @@ pub struct CodexHarness {
     /// Command discovery cache: only a successful probe is cached, so a
     /// broken CLI retries on the next picker open (ACP-harness parity).
     commands: tokio::sync::OnceCell<Vec<SlashCommand>>,
+    /// Model discovery cache: live app-server model/list cached on success.
+    models: tokio::sync::OnceCell<Vec<Model>>,
 }
 
 impl Default for CodexHarness {
@@ -130,6 +132,7 @@ impl Default for CodexHarness {
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
             commands: tokio::sync::OnceCell::new(),
+            models: tokio::sync::OnceCell::new(),
         }
     }
 }
@@ -230,6 +233,82 @@ impl CodexHarness {
             Err(_) => Err(HarnessError::Protocol("command discovery timed out".into())),
         }
     }
+
+    /// Live model discovery via `codex app-server` + `model/list` (experimentalApi).
+    /// Pages through all results (mirrors the logic the Codex IDE extension uses).
+    pub(crate) async fn discover_live_models(&self) -> Result<Vec<Model>, HarnessError> {
+        let exe = self.resolve_executable()?;
+        let mut cmd = Command::new(&exe);
+        cmd.arg("app-server");
+        crate::compose_child_path(&mut cmd, &exe);
+        cmd.stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let mut child = cmd.spawn().map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                HarnessError::NotInstalled(exe.display().to_string())
+            } else {
+                HarnessError::Io(e)
+            }
+        })?;
+        let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+            shutdown_child(&mut child, self.kill_grace).await;
+            return Err(HarnessError::Protocol("codex child has no stdio".into()));
+        };
+        let (client, _incoming) = RpcClient::new(stdin, stdout);
+        let discovery = async {
+            client
+                .request(
+                    "initialize",
+                    json!({
+                        "clientInfo": {
+                            "name": "komet-native",
+                            "title": "Komet",
+                            "version": env!("CARGO_PKG_VERSION"),
+                        },
+                        "capabilities": { "experimentalApi": true },
+                    }),
+                )
+                .await?;
+            client.notify("initialized", None);
+
+            let mut all_items: Vec<Value> = Vec::new();
+            let mut cursor: Option<String> = None;
+            loop {
+                let params = match &cursor {
+                    Some(c) => json!({ "cursor": c }),
+                    None => json!({}),
+                };
+                let page = client.request("model/list", params).await?;
+                if let Some(items) = page.get("data").and_then(Value::as_array) {
+                    all_items.extend(items.iter().cloned());
+                }
+                cursor = page
+                    .get("nextCursor")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned);
+                if cursor.is_none() {
+                    break;
+                }
+            }
+
+            let models = catalog::parse_model_list_items(&all_items);
+            if models.is_empty() {
+                return Err(HarnessError::Protocol(
+                    "codex model/list returned no usable models".into(),
+                ));
+            }
+            Ok::<Vec<Model>, HarnessError>(models)
+        };
+        let result = tokio::time::timeout(Duration::from_secs(15), discovery).await;
+        shutdown_child(&mut child, self.kill_grace).await;
+        match result {
+            Ok(inner) => inner,
+            Err(_) => Err(HarnessError::Protocol("codex model/list timed out".into())),
+        }
+    }
 }
 
 /// `skills/list` result → picker commands. `data` groups skills by cwd; the
@@ -309,15 +388,42 @@ impl Harness for CodexHarness {
         true
     }
 
-    /// Live `~/.codex/models_cache.json` first (what the CLI itself offers),
-    /// curated snapshot as fallback — so the picker never proposes stale ids
-    /// the app server rejects. Requires an installed CLI so an absent binary
-    /// surfaces as [`HarnessError::NotInstalled`] here.
-    /// This is the seam for live discovery: a short-lived `codex app-server`
-    /// paging `model/list` (experimentalApi) exactly as codex.ts does.
+    /// Model discovery: live `codex app-server` `model/list` first,
+    /// local `~/.codex/models_cache.json` as second tier, curated snapshot as fallback.
+    /// Requires an installed CLI so an absent binary surfaces as [`HarnessError::NotInstalled`].
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         self.resolve_executable()?;
-        Ok(catalog::load_catalog())
+        self.models
+            .get_or_try_init(|| async {
+                match self.discover_live_models().await {
+                    Ok(models) if !models.is_empty() => {
+                        tracing::info!(
+                            target: "komet_harness::codex",
+                            count = models.len(),
+                            "discovered live Codex models from app-server"
+                        );
+                        Ok(models)
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "komet_harness::codex",
+                            source = "static-fallback",
+                            "Codex live model discovery failed; falling back to local cache: {e}"
+                        );
+                        Ok(catalog::load_catalog())
+                    }
+                    Ok(_) => {
+                        tracing::warn!(
+                            target: "komet_harness::codex",
+                            source = "static-fallback",
+                            "Codex live model discovery returned 0 models; falling back to local cache"
+                        );
+                        Ok(catalog::load_catalog())
+                    }
+                }
+            })
+            .await
+            .cloned()
     }
 
     /// Skills from a short-lived `skills/list` probe (see

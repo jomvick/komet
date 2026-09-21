@@ -27,6 +27,23 @@ has "$line" '"method":"initialized"' || exit 1
 # ---- thread start / resume -------------------------------------------------
 read -r line || exit 1
 thread_line="$line"
+if has "$line" '"method":"model/list"'; then
+  if [ "$CODEX_FAIL_MODEL_LIST" = "1" ]; then
+    emit "{\"id\":$(rid "$line"),\"error\":{\"code\":-32601,\"message\":\"Method not found\"}}"
+    exit 1
+  fi
+  curr="$line"
+  while :; do
+    if has "$curr" '"cursor":"page-2"'; then
+      emit "{\"id\":$(rid "$curr"),\"result\":{\"data\":[{\"id\":\"gpt-5.5\",\"displayName\":\"GPT-5.5\",\"supportedReasoningEfforts\":[\"high\"]}],\"nextCursor\":null}}"
+      break
+    else
+      emit "{\"id\":$(rid "$curr"),\"result\":{\"data\":[{\"id\":\"gpt-5.6-terra\",\"displayName\":\"GPT-5.6-Terra\",\"supportedReasoningEfforts\":[\"low\",\"ultra\"]}],\"nextCursor\":\"page-2\"}}"
+      read -r curr || break
+    fi
+  done
+  exec sleep 30
+fi
 if has "$line" '"method":"skills/list"'; then
   # Command discovery probe: answer with two cwd groups sharing one skill
   # (dedupe by name) and settle; no thread ever starts.

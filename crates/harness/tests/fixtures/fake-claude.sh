@@ -130,8 +130,8 @@ case "$first" in
   exec sleep 30
   ;;
 
-*'"subtype":"initialize"'*|*'"subtype":"get_context_usage"'*)
-  # Command discovery and context usage probes.
+*'"subtype":"initialize"'*|*'"subtype":"get_context_usage"'*|*'"subtype":"supported_models"'*|*'"subtype":"supportedModels"'*)
+  # Command discovery, context usage, and model discovery probes.
   line="$first"
   while [ -n "$line" ]; do
     case "$line" in
@@ -142,6 +142,14 @@ case "$first" in
     *'"subtype":"get_context_usage"'*)
       rid=$(printf '%s\n' "$line" | sed 's/.*"request_id":"\([^"]*\)".*/\1/')
       emit "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"$rid\",\"response\":{\"totalTokens\":1234,\"maxTokens\":200000,\"categories\":[{\"name\":\"Skills\",\"tokens\":500,\"color\":\"warning\"}],\"memoryFiles\":[{\"path\":\"/tmp/CLAUDE.md\",\"type\":\"Project\",\"tokens\":100}],\"mcpTools\":[{\"name\":\"search\",\"serverName\":\"codegraph\",\"tokens\":50,\"isLoaded\":true}],\"skills\":{\"skillFrontmatter\":[{\"name\":\"custom-skill\",\"source\":\"userSettings\",\"tokens\":50},{\"name\":\"dataviz\",\"source\":\"built-in\",\"tokens\":382}]}}}}"
+      ;;
+    *'"subtype":"supported_models"'*|*'"subtype":"supportedModels"'*)
+      rid=$(printf '%s\n' "$line" | sed 's/.*"request_id":"\([^"]*\)".*/\1/')
+      if [ "$CLAUDE_FAIL_MODELS" = "1" ]; then
+        emit "{\"type\":\"control_response\",\"response\":{\"subtype\":\"error\",\"request_id\":\"$rid\",\"error\":\"unsupported\"}}"
+      else
+        emit "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"$rid\",\"response\":{\"models\":[{\"id\":\"claude-fable-5\",\"name\":\"Fable 5 (Live)\"},{\"id\":\"claude-opus-5\",\"name\":\"Opus 5 (Live)\"},{\"id\":\"claude-haiku-4-5\",\"name\":\"Haiku 4.5\"}]}}}"
+      fi
       ;;
     esac
     read -r -t 1 line || break

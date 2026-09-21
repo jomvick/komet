@@ -2876,6 +2876,54 @@ mod tests {
         assert_eq!(state.access_mode, DangerFullAccess);
     }
 
+    /// Regression (2026-09-21): the composer must snapshot `access_mode`
+    /// BEFORE calling `select_chat` on a newly-minted chat id.
+    ///
+    /// `select_chat` clears `pending_access` and calls `sync_access_mode`.
+    /// For a brand-new chat whose row has not yet arrived from the engine the
+    /// sync falls back to `new_chat_access` (WorkspaceWrite by default),
+    /// silently downgrading a Full Access first run even when the user had
+    /// explicitly clicked the chip before sending.
+    #[test]
+    fn access_mode_snapshot_before_select_chat_preserves_full_access() {
+        use komet_proto::SandboxLevel::*;
+        let mut state = AppState::new();
+
+        // User clicks the access chip to Full access on the new-chat canvas.
+        state.set_access_mode(DangerFullAccess);
+        assert_eq!(state.access_mode, DangerFullAccess);
+
+        // CORRECT (fixed) order: snapshot THEN select.
+        let sandbox_before = state.access_mode;
+
+        // Simulate select_chat with a brand-new UUID that has no row yet:
+        // it clears pending_access and syncs (falling back to new_chat_access).
+        state.selected_chat = Some("new-uuid".into());
+        state.pending_access = None;
+        state.sync_access_mode(); // resolves to new_chat_access = WorkspaceWrite
+
+        assert_eq!(state.access_mode, WorkspaceWrite); // row hasn't landed yet
+        assert_eq!(sandbox_before, DangerFullAccess); // snapshot is still correct
+
+        // BAD (old) order: snapshot AFTER select — simulates the pre-fix bug.
+        state.selected_chat = None;
+        state.pending_access = None;
+        state.sync_access_mode();
+        state.set_access_mode(DangerFullAccess);
+        assert_eq!(state.access_mode, DangerFullAccess);
+
+        state.selected_chat = Some("new-uuid-2".into());
+        state.pending_access = None;
+        state.sync_access_mode(); // access_mode reset to WorkspaceWrite
+
+        let sandbox_after = state.access_mode; // taken AFTER — was the bug
+        assert_eq!(
+            sandbox_after,
+            WorkspaceWrite,
+            "old order reads WorkspaceWrite instead of DangerFullAccess"
+        );
+    }
+
     #[test]
     fn access_chip_survives_watch_when_chat_config_is_not_saved() {
         use komet_proto::SandboxLevel::*;
