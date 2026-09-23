@@ -7,6 +7,6 @@ Exec=komet %U
 TryExec=komet
 Icon=komet
 Terminal=false
-Categories=Development;
+Categories=TextEditor;Development;IDE;
 Keywords=agent;claude;codex;ai;coding;
 StartupWMClass=komet
