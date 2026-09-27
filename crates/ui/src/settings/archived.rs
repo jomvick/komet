@@ -322,6 +322,7 @@ mod tests {
             device_id: "d".into(),
             title: None,
             archived,
+            pinned: false,
             cwd: None,
             branch: None,
             checkout_id: None,

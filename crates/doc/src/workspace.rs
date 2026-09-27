@@ -8,7 +8,7 @@
 //! - `devices`: LoroMap keyed by deviceId → row map {id, name, platform, lastSeenAt}
 //! - `spaces`: LoroMap keyed by spaceId → row map {id, deviceId, path, name?,
 //!   gitDetected, gitCheckedAt?, checkoutId?, createdAt}
-//! - `chats`: LoroMap keyed by chatId → row map {id, deviceId, title?, archived, cwd?,
+//! - `chats`: LoroMap keyed by chatId → row map {id, deviceId, title?, archived, pinned, cwd?,
 //!   branch?, checkoutId?, config?(json), lastMessagePreview?, lastMessageAt?, createdAt,
 //!   harnessSessionId?, harnessSessionCwd?, spaceId?, lastSeenAt?}
 //! - `sessions`: LoroMap keyed by chatId → row map {chatId, deviceId, status, startedAt?,
@@ -241,6 +241,7 @@ impl WorkspaceDoc {
         row.insert("deviceId", chat.device_id.as_str())?;
         set_opt_str(&row, "title", chat.title.as_deref())?;
         row.insert("archived", chat.archived)?;
+        row.insert("pinned", chat.pinned)?;
         set_opt_str(&row, "cwd", chat.cwd.as_deref())?;
         set_opt_str(&row, "branch", chat.branch.as_deref())?;
         set_opt_str(&row, "checkoutId", chat.checkout_id.as_deref())?;
@@ -330,6 +331,16 @@ impl WorkspaceDoc {
             return Ok(false);
         };
         row.insert("archived", archived)?;
+        self.doc.commit();
+        Ok(true)
+    }
+
+    /// LWW pinned flag from any device. `false` when no such row.
+    pub fn set_chat_pinned(&self, chat_id: &str, pinned: bool) -> Result<bool, DocError> {
+        let Some(row) = self.existing_row("chats", chat_id) else {
+            return Ok(false);
+        };
+        row.insert("pinned", pinned)?;
         self.doc.commit();
         Ok(true)
     }
@@ -626,6 +637,8 @@ pub(crate) struct RawChat {
     #[serde(default)]
     archived: bool,
     #[serde(default)]
+    pinned: bool,
+    #[serde(default)]
     cwd: Option<String>,
     #[serde(default)]
     branch: Option<String>,
@@ -658,6 +671,7 @@ impl From<RawChat> for Chat {
             device_id: raw.device_id,
             title: raw.title,
             archived: raw.archived,
+            pinned: raw.pinned,
             cwd: raw.cwd,
             branch: raw.branch,
             checkout_id: raw.checkout_id,
@@ -725,6 +739,7 @@ mod tests {
             device_id: device_id.into(),
             title: Some("First chat".into()),
             archived: false,
+            pinned: false,
             cwd: Some("/tmp/repo".into()),
             branch: Some("main".into()),
             checkout_id: None,

@@ -2414,6 +2414,7 @@ mod tests {
             device_id: "dev".into(),
             title: None,
             archived: false,
+            pinned: false,
             cwd: None,
             branch: None,
             checkout_id: None,

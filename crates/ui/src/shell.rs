@@ -2705,6 +2705,22 @@ impl Shell {
         cx.notify();
     }
 
+    fn toggle_chat_pinned(&mut self, chat_id: String, cx: &mut Context<Self>) {
+        let pinned = self
+            .state
+            .read(cx)
+            .chats
+            .iter()
+            .find(|c| c.id == chat_id)
+            .is_some_and(|c| c.pinned);
+        self.close_chat_menu(cx);
+        self.mutate(
+            serde_json::json!({ "op": "setChatPinned", "chatId": chat_id, "pinned": !pinned }),
+            cx,
+        );
+        cx.notify();
+    }
+
     fn delete_chat(&mut self, chat_id: String, cx: &mut Context<Self>) {
         self.delete_confirm = None;
         if self.state.read(cx).selected_chat.as_deref() == Some(chat_id.as_str()) {
@@ -4991,7 +5007,17 @@ impl Shell {
             let chat_menu_closing = self.chat_menu.closing_since();
             let rename_id = chat_id.clone();
             let archive_id = chat_id.clone();
+            let pin_id = chat_id.clone();
             let delete_id = chat_id.clone();
+            let pin_label = self
+                .state
+                .read(cx)
+                .chats
+                .iter()
+                .find(|c| c.id == chat_id)
+                .is_some_and(|c| c.pinned)
+                .then_some("Unpin")
+                .unwrap_or("Pin");
             let menu = popover::popover_card(&theme)
                 .w(px(170.0))
                 .on_mouse_down_out(cx.listener(|this, _, _, cx| {
@@ -5007,6 +5033,14 @@ impl Shell {
                         }))
                         .child(icon(icons::PEN).size(px(16.0)).text_color(theme.text_muted))
                         .child(SharedString::from("Rename…")),
+                )
+                .child(
+                    popover::menu_row(&theme, false, format!("chat-menu-pin-{chat_id}"))
+                        .id("chat-menu-pin")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.toggle_chat_pinned(pin_id.clone(), cx)
+                        }))
+                        .child(SharedString::from(pin_label)),
                 )
                 .child(
                     popover::menu_row(&theme, false, format!("chat-menu-archive-{chat_id}"))

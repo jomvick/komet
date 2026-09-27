@@ -719,6 +719,7 @@ impl WorkspaceHost {
                 device_id: host_device.clone(),
                 title: None,
                 archived: false,
+                pinned: false,
                 cwd: Some(cwd.unwrap_or_else(|| {
                     space
                         .as_ref()
@@ -887,6 +888,10 @@ impl WorkspaceHost {
 
     pub fn set_chat_archived(&self, chat_id: &str, archived: bool) -> Result<bool, EngineError> {
         Ok(self.mutate(|doc| doc.set_chat_archived(chat_id, archived))?)
+    }
+
+    pub fn set_chat_pinned(&self, chat_id: &str, pinned: bool) -> Result<bool, EngineError> {
+        Ok(self.mutate(|doc| doc.set_chat_pinned(chat_id, pinned))?)
     }
 
     /// LWW full-config replace on the chat row (komet `SetChatConfig` — the

@@ -122,14 +122,18 @@ pub fn sort_spaces(spaces: &mut [Space]) {
     });
 }
 
-/// Sidebar order: `last_message_at` desc, falling back to `created_at`; ties
-/// break by `created_at` desc then id so the sort is total and stable across
-/// devices. Pure.
+/// Sidebar order: pinned first, then `last_message_at` desc, falling back to
+/// `created_at`; ties break by `created_at` desc then id so the sort is total
+/// and stable across devices. Pure.
 pub fn sort_chats(chats: &mut [Chat]) {
     chats.sort_by(|a, b| {
-        let ka = a.last_message_at.unwrap_or(a.created_at);
-        let kb = b.last_message_at.unwrap_or(b.created_at);
-        kb.cmp(&ka)
+        b.pinned
+            .cmp(&a.pinned)
+            .then_with(|| {
+                let ka = a.last_message_at.unwrap_or(a.created_at);
+                let kb = b.last_message_at.unwrap_or(b.created_at);
+                kb.cmp(&ka)
+            })
             .then_with(|| b.created_at.cmp(&a.created_at))
             .then_with(|| a.id.cmp(&b.id))
     });
@@ -600,5 +604,58 @@ mod checkout_tests {
             checkout_label(CheckoutKind::NewWorktree, Some(&plain("main"))),
             "New worktree"
         );
+    }
+}
+
+#[cfg(test)]
+mod sort_chats_tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn chat(id: &str, pinned: bool, last_msg_min: i64, created_min: i64) -> Chat {
+        let base = Utc.with_ymd_and_hms(2026, 7, 19, 12, 0, 0).unwrap();
+        Chat {
+            id: id.into(),
+            device_id: "dev".into(),
+            title: None,
+            archived: false,
+            pinned,
+            cwd: None,
+            branch: None,
+            checkout_id: None,
+            config: None,
+            last_message_preview: None,
+            last_message_at: Some(base + chrono::TimeDelta::minutes(last_msg_min)),
+            created_at: base + chrono::TimeDelta::minutes(created_min),
+            harness_session_id: None,
+            harness_session_cwd: None,
+            space_id: None,
+            last_seen_at: None,
+            room_gen: None,
+        }
+    }
+
+    #[test]
+    fn pinned_older_sorts_before_unpinned_newer() {
+        let mut chats = vec![chat("new", false, 10, 10), chat("old", true, 0, 0)];
+        sort_chats(&mut chats);
+        assert_eq!(chats.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), vec!["old", "new"]);
+    }
+
+    #[test]
+    fn pinned_rows_keep_recency_between_them() {
+        let mut chats = vec![chat("old-pin", true, 0, 0), chat("new-pin", true, 10, 10)];
+        sort_chats(&mut chats);
+        assert_eq!(chats.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), vec!["new-pin", "old-pin"]);
+    }
+
+    #[test]
+    fn legacy_chat_json_without_pinned_defaults_false() {
+        let value = serde_json::json!({
+            "id": "c1", "deviceId": "d", "title": null, "archived": false,
+            "createdAt": "2026-07-19T12:00:00Z",
+        });
+        let chat: Chat = serde_json::from_value(value).unwrap();
+        assert!(!chat.pinned);
     }
 }
