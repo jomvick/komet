@@ -826,6 +826,7 @@ impl RegistryDoc {
             ("deviceId", json!(chat.device_id)),
             ("title", opt_str(chat.title.as_deref())),
             ("archived", json!(chat.archived)),
+            ("pinned", json!(chat.pinned)),
             ("cwd", opt_str(chat.cwd.as_deref())),
             ("branch", opt_str(chat.branch.as_deref())),
             ("checkoutId", opt_str(chat.checkout_id.as_deref())),
@@ -939,6 +940,19 @@ impl RegistryDoc {
             chat_id,
             OpKind::Update,
             fields([("archived", json!(archived))]),
+        );
+        Ok(true)
+    }
+
+    pub fn set_chat_pinned(&mut self, chat_id: &str, pinned: bool) -> Result<bool, DocError> {
+        if !self.row_exists(KIND_CHATS, chat_id) {
+            return Ok(false);
+        }
+        self.write(
+            KIND_CHATS,
+            chat_id,
+            OpKind::Update,
+            fields([("pinned", json!(pinned))]),
         );
         Ok(true)
     }
@@ -1187,6 +1201,7 @@ impl RegistryDoc {
                     ("deviceId", json!(chat.device_id)),
                     ("title", opt_str(chat.title.as_deref())),
                     ("archived", json!(chat.archived)),
+                    ("pinned", json!(chat.pinned)),
                     ("cwd", opt_str(chat.cwd.as_deref())),
                     ("branch", opt_str(chat.branch.as_deref())),
                     ("checkoutId", opt_str(chat.checkout_id.as_deref())),

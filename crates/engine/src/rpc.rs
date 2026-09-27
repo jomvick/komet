@@ -11,7 +11,7 @@
 //! - `WatchSessions` → stream of `Session[]`: this engine's live statuses merged with
 //!   remote devices' workspace session rows
 //! - `Mutate {op, …}` → `{ok}` — workspace entity mutations (createChat, renameChat,
-//!   setChatArchived, deleteChat, renameDevice, markChatSeen)
+//!   setChatArchived, setChatPinned, deleteChat, renameDevice, markChatSeen)
 //! - `EngineInfo` → `{deviceId, workspaceScope}` — this runtime's fixed identity
 //!   and data boundary (never forwarded)
 //! - `LocalDevice` → `{deviceId}` — legacy engine identity (never forwarded)
@@ -455,6 +455,8 @@ enum MutateParams {
     SetChatHost { chat_id: String, device_id: String },
     #[serde(rename_all = "camelCase")]
     SetChatArchived { chat_id: String, archived: bool },
+    #[serde(rename_all = "camelCase")]
+    SetChatPinned { chat_id: String, pinned: bool },
     /// Full-config replace on the chat row (komet `SetChatConfig`): the
     /// composer's mid-session model / reasoning / options changes, LWW-synced
     /// so they survive restarts and reach every device.
@@ -809,6 +811,11 @@ impl EngineRpc {
             MutateParams::SetChatArchived { chat_id, archived } => self
                 .workspace
                 .set_chat_archived(&chat_id, archived)
+                .map_err(failed)
+                .map(drop),
+            MutateParams::SetChatPinned { chat_id, pinned } => self
+                .workspace
+                .set_chat_pinned(&chat_id, pinned)
                 .map_err(failed)
                 .map(drop),
             MutateParams::SetChatConfig { chat_id, config } => self

@@ -254,6 +254,7 @@ fn chat(id: &str, device_id: &str) -> Chat {
         device_id: device_id.into(),
         title: Some("First chat".into()),
         archived: false,
+        pinned: false,
         cwd: Some("/tmp/repo".into()),
         branch: Some("main".into()),
         checkout_id: None,
@@ -377,6 +378,7 @@ fn field_mutators_round_trip() {
 
     assert!(ws.rename_chat("chat-1", "Renamed").unwrap());
     assert!(ws.set_chat_archived("chat-1", true).unwrap());
+    assert!(ws.set_chat_pinned("chat-1", true).unwrap());
     assert!(
         ws.set_chat_last_message("chat-1", "preview text", ts(5_000))
             .unwrap()
@@ -385,11 +387,13 @@ fn field_mutators_round_trip() {
     assert!(ws.set_device_last_seen("dev-a", ts(6_000)).unwrap());
     assert!(!ws.rename_chat("nope", "x").unwrap());
     assert!(!ws.set_chat_archived("nope", true).unwrap());
+    assert!(!ws.set_chat_pinned("nope", true).unwrap());
     assert!(!ws.rename_device("nope", "x").unwrap());
 
     let chat = ws.chat("chat-1").unwrap().unwrap();
     assert_eq!(chat.title.as_deref(), Some("Renamed"));
     assert!(chat.archived);
+    assert!(chat.pinned);
     assert_eq!(chat.last_message_preview.as_deref(), Some("preview text"));
     assert_eq!(chat.last_message_at, Some(ts(5_000)));
     let dev = &ws.read_devices().unwrap()[0];

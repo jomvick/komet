@@ -744,6 +744,7 @@ async fn recover_stale_does_not_resume_run_hosted_by_another_device() {
             device_id: host_device.into(),
             title: Some("hosted elsewhere".into()),
             archived: false,
+            pinned: false,
             cwd: Some("/tmp/other".into()),
             branch: None,
             checkout_id: None,
