@@ -708,6 +708,22 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_delta_produces_zero_parts() {
+        // Issue #31 guard: reasoning streams live-only; the fold must keep
+        // dropping it so nothing new lands in the synced doc.
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ReasoningDelta {
+                text: "thinking out loud".into(),
+            },
+        );
+        assert!(parts.is_empty());
+        fold_event_into_parts(&mut parts, &text_delta("visible"));
+        assert_eq!(parts.len(), 1);
+    }
+
+    #[test]
     fn tool_call_refresh_is_idempotent() {
         let call = AgentEvent::ToolCall {
             id: "t".into(),

@@ -46,7 +46,7 @@
 //! piping items. To make another method device-addressable, nothing per-method is needed
 //! beyond listing it in [`forwardable`] (and [`is_stream_method`] if it streams);
 //! handlers stay transport-agnostic. Currently routed: `ListHarnesses`, `ListModels`,
-//! `QueueCommand`, and `WatchDocMessages`.
+//! `QueueCommand`, `WatchDocMessages`, `WatchReasoning`, and `GetToolDetail`.
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -57,7 +57,7 @@ use std::time::Duration;
 use tokio::sync::watch;
 
 use komet_doc::{MessagePart, SessionCommandPayload};
-use komet_proto::{ChatConfig, EngineInfo, HarnessId, ToolCall, WorkspaceScope};
+use komet_proto::{AgentEvent, ChatConfig, EngineInfo, HarnessId, ToolCall, WorkspaceScope};
 use komet_rpc::{LinkCache, RpcError, RpcReply, RpcService, methods, parse_params};
 
 use crate::agent_accounts::AgentAccounts;
@@ -177,6 +177,13 @@ struct TestMcpOverride {
 struct QueueCommandParams {
     chat_id: String,
     command: SessionCommandPayload,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolDetailParams {
+    chat_id: String,
+    part_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1011,6 +1018,8 @@ fn forwardable(method: &str) -> bool {
             | methods::LIST_COMMANDS
             | methods::QUEUE_COMMAND
             | methods::WATCH_DOC_MESSAGES
+            | methods::WATCH_REASONING
+            | methods::GET_TOOL_DETAIL
             // Repos/worktrees/folders are device-local filesystem state.
             | methods::LIST_REPOS
             | methods::ADD_REPO
@@ -1077,12 +1086,55 @@ fn is_stream_method(method: &str) -> bool {
     matches!(
         method,
         methods::WATCH_DOC_MESSAGES
+            | methods::WATCH_REASONING
             | methods::SUBSCRIBE_TERMINAL
             | methods::WATCH_CHECKOUT_DIFFS
             | methods::WATCH_WORKSPACE_FILES
             | methods::UPDATE_STATUS
             | methods::WATCH_MCP_STATUS
     )
+}
+
+/// Live reasoning stream (issue #31): `ReasoningDelta` text only, from an
+/// already-subscribed hub receiver. Anything else on the hub is ignored; the
+/// stream ends (no empty tail) at `Done`. Extracted so tests can drive it
+/// with a synthetic broadcast channel, no engine needed.
+fn reasoning_stream(
+    rx: tokio::sync::broadcast::Receiver<crate::sessions::JournaledEvent>,
+) -> BoxStream<'static, serde_json::Value> {
+    futures::stream::unfold(rx, |mut rx| async move {
+        loop {
+            let je = match rx.recv().await {
+                Ok(je) => je,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(_) => return None,
+            };
+            match &je.event {
+                AgentEvent::ReasoningDelta { text } => {
+                    return Some((serde_json::json!({ "text": text }), rx));
+                }
+                AgentEvent::Done { .. } => return None,
+                _ => continue,
+            }
+        }
+    })
+    .boxed()
+}
+
+/// `GetToolDetail` reply (issue #10): `ok` with rebuilt request/response,
+/// or explicit `unavailable` when the journal has nothing for the part —
+/// host offline, file absent/rotated, unknown id. Pure so the Unavailable
+/// path is unit-testable without a journal on disk.
+fn tool_detail_reply(events: &[AgentEvent]) -> serde_json::Value {
+    if events.is_empty() {
+        return serde_json::json!({ "status": "unavailable" });
+    }
+    let view = komet_proto::view::format_tool_detail(events);
+    serde_json::json!({
+        "status": "ok",
+        "request": view.request,
+        "response": view.response,
+    })
 }
 
 /// A watch receiver as a stream: current value first, then every change.
@@ -1332,6 +1384,27 @@ impl RpcService for EngineRpc {
             methods::GET_CONTEXT_USAGE => {
                 let p: ChatParams = parse_params(params)?;
                 RpcReply::value(&self.sessions.usage_for(&p.chat_id).unwrap_or_default())
+            }
+            // Live reasoning stream (issue #31): ReasoningDelta only, from
+            // "now" (no history replay), quiet after Done. Same hub as the
+            // doc path, second consumer — the fold is untouched.
+            methods::WATCH_REASONING => {
+                let p: ChatParams = parse_params(params)?;
+                let from = self.sessions.latest_seq(&p.chat_id);
+                let (_replay, rx) = self
+                    .sessions
+                    .subscribe(&p.chat_id, from)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                Ok(RpcReply::Stream(reasoning_stream(rx)))
+            }
+            // Per-tool request/response detail from the journal (issue #10,
+            // complement of #31): explicit Unavailable when the journal has
+            // nothing — host offline, file absent/rotated, unknown id. Never
+            // panics, never blocks.
+            methods::GET_TOOL_DETAIL => {
+                let p: ToolDetailParams = parse_params(params)?;
+                let events = self.sessions.tool_events(&p.chat_id, &p.part_id);
+                RpcReply::value(&tool_detail_reply(&events))
             }
             methods::PROBE_SYNC => {
                 self.workspace.probe();
@@ -2063,6 +2136,134 @@ mod tests {
         assert!(forwardable(methods::QUEUE_COMMAND));
         assert!(forwardable(methods::SEARCH_FILES));
         assert!(forwardable(methods::FETCH_ALL));
+        // Issues #31 + #10 ride the same hub/philosophy as WatchDocMessages.
+        assert!(forwardable(methods::WATCH_REASONING));
+        assert!(forwardable(methods::GET_TOOL_DETAIL));
+        assert!(is_stream_method(methods::WATCH_REASONING));
+        assert!(!is_stream_method(methods::GET_TOOL_DETAIL));
+    }
+
+    use crate::sessions::JournaledEvent;
+    use futures::StreamExt as _;
+
+    fn reasoning_event(text: &str) -> AgentEvent {
+        AgentEvent::ReasoningDelta { text: text.into() }
+    }
+
+    fn done_event() -> AgentEvent {
+        AgentEvent::Done {
+            status: komet_proto::DoneStatus::Completed,
+            result: None,
+            error: None,
+            session_id: None,
+            reason: None,
+        }
+    }
+
+    async fn collect_texts(
+        mut stream: futures::stream::BoxStream<'static, serde_json::Value>,
+    ) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Some(v) = stream.next().await {
+            out.push(
+                v.get("text")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            );
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn reasoning_stream_passes_deltas_and_goes_quiet_after_done() {
+        let (tx, rx) = tokio::sync::broadcast::channel::<JournaledEvent>(16);
+        let stream = reasoning_stream(rx);
+        tx.send(JournaledEvent {
+            seq: 1,
+            event: reasoning_event("a"),
+        })
+        .unwrap();
+        tx.send(JournaledEvent {
+            seq: 2,
+            event: AgentEvent::TextDelta {
+                text: "ignored".into(),
+            },
+        })
+        .unwrap();
+        tx.send(JournaledEvent {
+            seq: 3,
+            event: reasoning_event("b"),
+        })
+        .unwrap();
+        tx.send(JournaledEvent {
+            seq: 4,
+            event: done_event(),
+        })
+        .unwrap();
+        drop(tx);
+        // Non-reasoning events are ignored, Done ends the stream cleanly.
+        assert_eq!(
+            collect_texts(stream).await,
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn reasoning_stream_feeds_two_simultaneous_subscribers() {
+        let (tx, _) = tokio::sync::broadcast::channel::<JournaledEvent>(16);
+        let s1 = reasoning_stream(tx.subscribe());
+        let s2 = reasoning_stream(tx.subscribe());
+        for (seq, text) in [(1, "x"), (2, "y")] {
+            tx.send(JournaledEvent {
+                seq,
+                event: reasoning_event(text),
+            })
+            .unwrap();
+        }
+        drop(tx);
+        // Broadcast hub: every consumer gets the full stream.
+        assert_eq!(
+            collect_texts(s1).await,
+            vec!["x".to_string(), "y".to_string()]
+        );
+        assert_eq!(
+            collect_texts(s2).await,
+            vec!["x".to_string(), "y".to_string()]
+        );
+    }
+
+    #[test]
+    fn tool_detail_reply_is_unavailable_without_journal_events() {
+        // Host offline / file absent / rotated / unknown id: explicit
+        // Unavailable, never a panic nor a block.
+        let reply = tool_detail_reply(&[]);
+        assert_eq!(
+            reply.get("status").and_then(|s| s.as_str()),
+            Some("unavailable")
+        );
+
+        let events = vec![
+            AgentEvent::ToolCall {
+                id: "t1".into(),
+                call: ToolCall::Exec {
+                    command: "ls".into(),
+                },
+            },
+            AgentEvent::ToolResult {
+                id: "t1".into(),
+                is_error: false,
+                output: Some("a\nb".into()),
+                diff: None,
+            },
+        ];
+        let reply = tool_detail_reply(&events);
+        assert_eq!(reply.get("status").and_then(|s| s.as_str()), Some("ok"));
+        assert_eq!(
+            reply.get("request").and_then(|r| r.as_str()),
+            Some("Run: ls")
+        );
+        assert_eq!(reply.get("response").and_then(|r| r.as_str()), Some("a\nb"));
     }
 
     #[test]

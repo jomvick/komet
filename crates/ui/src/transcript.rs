@@ -224,6 +224,10 @@ pub struct ToolItem {
     pub call: ToolCall,
     pub is_error: bool,
     pub resolved: bool,
+    /// Journal part id (`MessagePart::Tool.id`, the tool call id): key for
+    /// the on-demand `GetToolDetail` fetch (issue #10). Additive — existing
+    /// rendering paths ignore it.
+    pub part_id: SharedString,
     /// Expandable detail: a code-block of output lines, or a real diff
     /// section rendered by the changes pane's component (ACP harnesses).
     /// Precomputed here because rows are cached by fingerprint — diffing and
@@ -781,6 +785,7 @@ pub fn rows_for_entry(
     for (part_ix, part) in entry.parts.iter().enumerate() {
         match part {
             MessagePart::Tool {
+                id,
                 call,
                 is_error,
                 resolved,
@@ -793,6 +798,7 @@ pub fn rows_for_entry(
                 ..
             } => {
                 pending_group.push(ToolItem {
+                    part_id: SharedString::from(id.clone()),
                     call: call.clone(),
                     is_error: *is_error,
                     resolved: *resolved,
@@ -1129,6 +1135,24 @@ pub fn detail_height(detail: &ToolDetail) -> f32 {
 /// open detail whose full payload lives in the sidecar (chat2-sync A3).
 pub const BLOB_AFFORDANCE_HEIGHT: f32 = 24.0;
 
+/// Height of a journal-detail section label ("Request"/"Response", issue
+/// #10). Fixed, like the affordance row, so the analytic card height matches
+/// the render exactly.
+const JOURNAL_LABEL_H: f32 = 18.0;
+
+/// Section label inside an open chip's journal-detail block.
+fn journal_label(text: &str, theme: &Theme) -> gpui::Div {
+    div()
+        .h(px(JOURNAL_LABEL_H))
+        .flex_none()
+        .px(px(12.0))
+        .flex()
+        .items_center()
+        .text_size(px(10.5))
+        .text_color(theme.text_faint)
+        .child(SharedString::from(text.to_owned()))
+}
+
 /// Line cap for a FETCHED full output (a defensive ceiling, not a doc cap —
 /// the harness bounds outputs at 4KiB, so this is rarely reached).
 const FULL_OUTPUT_MAX_LINES: usize = 400;
@@ -1157,6 +1181,27 @@ fn blob_detail(text: &str, is_diff: bool) -> Option<ToolDetail> {
         lines,
         truncated_by,
     })
+}
+
+/// Build an output [`ToolDetail`] from raw text with a line cap (shared by
+/// sidecar blob upgrades and journal-detail fetches).
+fn output_lines(text: &str, max_lines: usize) -> ToolDetail {
+    let mut lines: Vec<SharedString> = text
+        .lines()
+        .map(|l| SharedString::from(l.to_owned()))
+        .collect();
+    while lines.last().is_some_and(|l| l.trim().is_empty()) {
+        lines.pop();
+    }
+    if lines.is_empty() {
+        lines.push(SharedString::from("(no output)"));
+    }
+    let truncated_by = lines.len().saturating_sub(max_lines);
+    lines.truncate(max_lines);
+    ToolDetail::Output {
+        lines,
+        truncated_by,
+    }
 }
 
 /// Compact byte size for the fetch affordance label ("812 B", "12 KB").
@@ -1521,6 +1566,20 @@ pub struct Transcript {
     /// Deliberately NOT cleared on chat switch: refs are chat-qualified and a
     /// fetched blob stays valid.
     blob_details: HashMap<SharedString, BlobFetch>,
+    /// Live reasoning text (issue #31): accumulated `WatchReasoning` deltas
+    /// for the selected chat, shown while the turn is Working. Local only —
+    /// never written to the doc, cleared on Done / chat switch / unmount.
+    reasoning_text: String,
+    /// The chat the live reasoning belongs to (`None` = no watch running).
+    reasoning_chat: Option<String>,
+    /// The live reasoning subscription task. Dropped on chat switch, which
+    /// cancels the server-side stream like every other watch in this file.
+    reasoning_task: Option<Task<()>>,
+    /// Per-tool journal detail (issue #10, complement of #31), keyed
+    /// `{chatId}/{partId}`: request/response rebuilt from the run journal
+    /// via `GetToolDetail`. `Unavailable` renders nothing — the chip falls
+    /// back to the summary already displayed.
+    journal_details: HashMap<SharedString, JournalDetail>,
     /// Monotonic fetch order per blob ref: when a tool has BOTH a diff and
     /// an output blob fetched, the chip shows the one requested most
     /// recently (click "Show full output" after a diff → see the output).
@@ -1535,6 +1594,28 @@ enum BlobFetch {
     /// Failed with the affordance re-armed as a retry.
     Failed,
     Ready(Arc<ToolDetail>),
+}
+
+/// One journal-detail fetch's lifecycle (issue #10). Unlike blobs there is
+/// no retry affordance: `Unavailable` (host offline, journal absent/rotated,
+/// unknown id) is terminal and the chip keeps its existing summary.
+enum JournalDetail {
+    Loading(#[allow(dead_code)] Task<()>),
+    Unavailable,
+    Ready {
+        request: Arc<ToolDetail>,
+        response: Arc<ToolDetail>,
+    },
+}
+
+/// Whether a journal-detail state renders its own section in an open chip.
+/// `Unavailable` (and no fetch yet) render nothing — the chip falls back to
+/// the summary already displayed.
+fn journal_section_visible(fetch: Option<&JournalDetail>) -> bool {
+    matches!(
+        fetch,
+        Some(JournalDetail::Loading(_)) | Some(JournalDetail::Ready { .. })
+    )
 }
 
 /// In-place edit of a sent user prompt (issue #8).
@@ -1600,6 +1681,10 @@ impl Transcript {
             attachment_loads: HashMap::new(),
             attachment_retries: HashMap::new(),
             blob_details: HashMap::new(),
+            reasoning_text: String::new(),
+            reasoning_chat: None,
+            reasoning_task: None,
+            journal_details: HashMap::new(),
             blob_fetch_order: HashMap::new(),
             blob_fetch_counter: 0,
             _observe: observe,
@@ -2345,6 +2430,10 @@ impl Transcript {
             self.live_parsers.clear();
             self.tree_cache.clear();
             self.folds.clear();
+            // A chat switch drops the live reasoning watch: its stream
+            // belongs to the previous chat (same rule as every watch here —
+            // dropping the task cancels the subscription).
+            self.stop_reasoning();
             self.veils.clear();
             self.render_cache.borrow_mut().clear();
             self.highlights.entries.clear();
@@ -2460,6 +2549,9 @@ impl Transcript {
             }
             self.spring_kick = true;
         }
+        // Live reasoning watch follows the selected chat's Working state:
+        // starts it mid-turn, clears it at Done, never subscribes otherwise.
+        self.maybe_start_reasoning(cx);
         cx.notify();
     }
 
@@ -2547,6 +2639,160 @@ impl Transcript {
             .ok();
         });
         self.blob_details.insert(blob_ref, BlobFetch::Loading(task));
+    }
+
+    /// Journal key for a tool part: chat-qualified like blob refs, so entries
+    /// never collide across chats.
+    fn journal_key(chat_id: &str, part_id: &str) -> SharedString {
+        SharedString::from(format!("{chat_id}/{part_id}"))
+    }
+
+    /// Fetch a tool's request/response from the run journal (`GetToolDetail`,
+    /// issue #10) and cache it as render-ready [`ToolDetail`] blocks.
+    /// Re-entry while Loading/Ready is a no-op; `Unavailable` is terminal —
+    /// the chip keeps its existing summary (no retry affordance).
+    fn spawn_journal_fetch(&mut self, chat_id: String, part_id: String, cx: &mut Context<Self>) {
+        let key = Self::journal_key(&chat_id, &part_id);
+        match self.journal_details.get(&key) {
+            Some(JournalDetail::Ready { .. }) | Some(JournalDetail::Loading(_)) => return,
+            Some(JournalDetail::Unavailable) | None => {}
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let fetch_key = key.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let reply = crate::attachments::call_with_timeout(
+                &engine,
+                cx.background_executor(),
+                komet_rpc::methods::GET_TOOL_DETAIL,
+                serde_json::json!({ "chatId": chat_id, "partId": part_id }),
+                Duration::from_secs(20),
+            )
+            .await;
+            let fetched = match reply {
+                Ok(value) if value.get("status").and_then(|s| s.as_str()) == Some("ok") => {
+                    let request = value
+                        .get("request")
+                        .and_then(|r| r.as_str())
+                        .unwrap_or("(unknown call)");
+                    let response = value.get("response").and_then(|r| r.as_str()).unwrap_or("");
+                    JournalDetail::Ready {
+                        request: Arc::new(output_lines(request, 1)),
+                        response: Arc::new(output_lines(response, OUTPUT_DETAIL_MAX_LINES)),
+                    }
+                }
+                _ => JournalDetail::Unavailable,
+            };
+            this.update(cx, |this, cx| {
+                this.journal_details.insert(fetch_key, fetched);
+                cx.notify();
+            })
+            .ok();
+        });
+        self.journal_details
+            .insert(key, JournalDetail::Loading(task));
+    }
+
+    /// Drop the live reasoning subscription and clear its text (chat switch,
+    /// end of turn, unmount-equivalent paths). Render-local like `folds`.
+    fn stop_reasoning(&mut self) {
+        self.reasoning_task = None;
+        self.reasoning_chat = None;
+        self.reasoning_text.clear();
+    }
+
+    /// Start the live reasoning watch (issue #31) when the selected chat is
+    /// Working and no watch runs for it; clear the text when the turn ended.
+    /// Called from [`Self::sync`]: guarded so a frame never restarts a live
+    /// watch, and never subscribes for a finished chat.
+    fn maybe_start_reasoning(&mut self, cx: &mut Context<Self>) {
+        let Some(chat_id) = self.chat_id.clone() else {
+            if !self.reasoning_text.is_empty() || self.reasoning_task.is_some() {
+                self.stop_reasoning();
+            }
+            return;
+        };
+        let working = self
+            .state
+            .read(cx)
+            .indicator_for(&chat_id, chrono::Utc::now())
+            == crate::state::Indicator::Working;
+        if !working {
+            if !self.reasoning_text.is_empty() || self.reasoning_task.is_some() {
+                self.stop_reasoning();
+                cx.notify();
+            }
+            return;
+        }
+        if self.reasoning_chat.as_deref() == Some(chat_id.as_str()) {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        self.reasoning_task = None;
+        self.reasoning_chat = Some(chat_id.clone());
+        self.reasoning_text.clear();
+        let task = cx.spawn(async move |this, cx| {
+            const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+            loop {
+                let mut rx = match engine
+                    .client()
+                    .subscribe(
+                        komet_rpc::methods::WATCH_REASONING,
+                        serde_json::json!({ "chatId": chat_id }),
+                    )
+                    .await
+                {
+                    Ok(rx) => rx,
+                    Err(_) => {
+                        cx.background_executor().timer(RETRY_DELAY).await;
+                        let alive = this
+                            .update(cx, |this, _| {
+                                this.reasoning_chat.as_deref() == Some(chat_id.as_str())
+                            })
+                            .unwrap_or(false);
+                        if !alive {
+                            return;
+                        }
+                        continue;
+                    }
+                };
+                while let Some(value) = rx.recv().await {
+                    let alive = this
+                        .update(cx, |this, cx| {
+                            if this.reasoning_chat.as_deref() != Some(chat_id.as_str()) {
+                                return false;
+                            }
+                            if let Some(text) = value.get("text").and_then(|t| t.as_str()) {
+                                this.reasoning_text.push_str(text);
+                                cx.notify();
+                            }
+                            true
+                        })
+                        .unwrap_or(false);
+                    if !alive {
+                        return;
+                    }
+                }
+                // Stream ended: the turn is Done (the server closes the
+                // stream there) — clear the block and stop, no resubscribe.
+                let cleared = this
+                    .update(cx, |this, cx| {
+                        if this.reasoning_chat.as_deref() == Some(chat_id.as_str()) {
+                            this.stop_reasoning();
+                            cx.notify();
+                        }
+                    })
+                    .is_ok();
+                if !cleared {
+                    return;
+                }
+                return;
+            }
+        });
+        self.reasoning_task = Some(task);
     }
 
     fn toggle_fold(&mut self, row_id: SharedString, open_height: f32, auto_open: bool) {
@@ -2885,6 +3131,40 @@ impl Transcript {
         )
     }
 
+    /// Live reasoning block (issue #31): the in-progress turn's accumulated
+    /// `WatchReasoning` text, muted + italic like a "thinking" block. `None`
+    /// when empty (turn ended, chat switched, or never Working) — nothing
+    /// renders and nothing persists.
+    fn render_reasoning_block(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.reasoning_text.trim().is_empty() {
+            return None;
+        }
+        let theme = Theme::of(cx).clone();
+        Some(
+            div()
+                .w_full()
+                .pt(px(6.0))
+                .pl(px(12.0))
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .text_size(px(10.5))
+                        .text_color(theme.text_faint)
+                        .child(SharedString::from("thinking")),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.0))
+                        .italic()
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from(self.reasoning_text.clone())),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn render_row(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(row) = self.rows.get(ix).cloned() else {
             return gpui::Empty.into_any_element();
@@ -2920,6 +3200,11 @@ impl Transcript {
         // clearance pad), so it sits right beneath the working reply.
         let trailer = (ix + 1 == self.rows.len())
             .then(|| self.render_working_trailer(cx))
+            .flatten();
+        // Live reasoning (issue #31) rides just above the loader: muted,
+        // italic, gone at Done. Render-local state — never doc-derived.
+        let reasoning = (ix + 1 == self.rows.len())
+            .then(|| self.render_reasoning_block(cx))
             .flatten();
 
         let inner: AnyElement = match &row.kind {
@@ -3177,6 +3462,7 @@ impl Transcript {
                     .min_w_0()
                     .child(inner)
                     .children(strip)
+                    .children(reasoning)
                     .children(trailer),
             )
             .into_any_element()
@@ -3584,14 +3870,37 @@ impl Transcript {
                     .and_then(|detail| self.tool_diff_highlight_for(row_id, ix, detail, cx))
             })
             .collect();
+        // Journal-detail height per chip (issue #10): Ready renders two
+        // labeled Output blocks, Loading one fixed row, Unavailable nothing.
+        // Gated by the chip's detail fold at the use sites, like `details`.
+        let journal_extras: Vec<f32> = tools
+            .iter()
+            .map(|tool| {
+                let key = self
+                    .chat_id
+                    .as_deref()
+                    .map(|c| Self::journal_key(c, tool.part_id.as_ref()));
+                match key.and_then(|k| self.journal_details.get(&k)) {
+                    Some(JournalDetail::Ready { request, response }) => {
+                        JOURNAL_LABEL_H
+                            + detail_height(request)
+                            + JOURNAL_LABEL_H
+                            + detail_height(response)
+                    }
+                    Some(JournalDetail::Loading(_)) => BLOB_AFFORDANCE_HEIGHT,
+                    _ => 0.0,
+                }
+            })
+            .collect();
         let open_height = chips_height(tools.len())
             + details
                 .iter()
                 .zip(&invocations)
                 .zip(&affordances)
                 .zip(&detail_opens)
-                .filter(|(_, open)| **open)
-                .map(|(((detail, invocation), affordance), _)| {
+                .zip(&journal_extras)
+                .filter(|((((_, _), _), open), _)| **open)
+                .map(|((((detail, invocation), affordance), _), extra)| {
                     invocation.as_deref().map_or(0.0, detail_height)
                         + detail.as_deref().map_or(0.0, detail_height)
                         + if affordance.is_some() {
@@ -3599,6 +3908,7 @@ impl Transcript {
                         } else {
                             0.0
                         }
+                        + extra
                 })
                 .sum::<f32>();
         let target = if open { open_height } else { 0.0 };
@@ -3668,6 +3978,14 @@ impl Transcript {
                 let open = detail_opens[ix];
                 let dfold = detail_folds[ix];
                 let key = SharedString::from(format!("{row_id}#d{ix}"));
+                // Journal detail for this chip (issue #10): fetch on expand,
+                // render when open. `Unavailable`/absent renders nothing —
+                // the chip falls back to the summary already displayed.
+                let journal_key = self
+                    .chat_id
+                    .as_deref()
+                    .map(|c| Self::journal_key(c, tool.part_id.as_ref()));
+                let journal_extra = if open { journal_extras[ix] } else { 0.0 };
                 // Expandable chip: ONE card whose header row is the chip and
                 // whose body is the detail — not a floating card below it.
                 // The guide rail stretches with the row, so an open detail
@@ -3683,7 +4001,8 @@ impl Transcript {
                 let open_h = CHIP_CARD_HEIGHT
                     + invocation.as_deref().map_or(0.0, detail_height)
                     + detail.as_deref().map_or(0.0, detail_height)
-                    + affordance_h;
+                    + affordance_h
+                    + journal_extra;
                 let card_target = if open { open_h } else { closed_h };
                 let animating = dfold.epoch > 0
                     && dfold
@@ -3691,6 +4010,11 @@ impl Transcript {
                         .is_some_and(|at| at.elapsed() < FOLD_TWEEN_WINDOW);
                 let toggle_key = key.clone();
                 let group_key = row_id.clone();
+                // Journal fetch fires on expand (issue #10): the open body
+                // shows Loading, then Request/Response, or nothing when
+                // Unavailable (fallback = the summary already displayed).
+                let journal_chat = self.chat_id.clone();
+                let journal_part = tool.part_id.to_string();
                 let mut card = div()
                     .my(px((CHIP_HEIGHT - CHIP_CARD_HEIGHT) / 2.0))
                     .ml(px(12.0))
@@ -3732,6 +4056,13 @@ impl Transcript {
                                 group.from = open_height;
                                 group.epoch += 1;
                                 group.toggled_at = Some(Instant::now());
+                                if let (Some(chat_id), part_id) =
+                                    (journal_chat.clone(), journal_part.clone())
+                                {
+                                    if !part_id.is_empty() {
+                                        this.spawn_journal_fetch(chat_id, part_id, cx);
+                                    }
+                                }
                                 cx.notify();
                             }))
                             .child(chip_header(tool, open, theme)),
@@ -3759,6 +4090,47 @@ impl Transcript {
                                     .bg(crate::theme::hairline(0.06)),
                             )
                             .child(detail_body(detail, detail_highlights[ix].clone(), theme));
+                    }
+                    // Journal request/response (issue #10): Loading shows a
+                    // fixed row, Ready two labeled blocks, Unavailable/absent
+                    // renders nothing — fallback is the summary above.
+                    let journal_fetch = journal_key
+                        .as_ref()
+                        .and_then(|k| self.journal_details.get(k));
+                    match journal_fetch {
+                        Some(JournalDetail::Loading(_)) => {
+                            card = card.child(
+                                div()
+                                    .h(px(BLOB_AFFORDANCE_HEIGHT))
+                                    .flex_none()
+                                    .px(px(12.0))
+                                    .flex()
+                                    .items_center()
+                                    .text_size(px(10.5))
+                                    .text_color(theme.text_faint)
+                                    .child(SharedString::from("Loading request/response…")),
+                            );
+                        }
+                        Some(JournalDetail::Ready { request, response }) => {
+                            card = card
+                                .child(
+                                    div()
+                                        .h(px(DETAIL_SEPARATOR))
+                                        .flex_none()
+                                        .bg(crate::theme::hairline(0.06)),
+                                )
+                                .child(journal_label("Request", theme))
+                                .child(detail_body(request, None, theme))
+                                .child(
+                                    div()
+                                        .h(px(DETAIL_SEPARATOR))
+                                        .flex_none()
+                                        .bg(crate::theme::hairline(0.06)),
+                                )
+                                .child(journal_label("Response", theme))
+                                .child(detail_body(response, None, theme));
+                        }
+                        Some(JournalDetail::Unavailable) | None => {}
                     }
                     if let Some((blob_ref, label)) = affordance {
                         let loading = matches!(
@@ -5045,6 +5417,7 @@ mod tests {
     #[test]
     fn tool_group_summaries() {
         let exec = |c: &str| ToolItem {
+            part_id: SharedString::from("t"),
             call: ToolCall::Exec { command: c.into() },
             is_error: false,
             resolved: true,
@@ -5055,6 +5428,7 @@ mod tests {
             diff_ref: None,
         };
         let edit = |p: &str| ToolItem {
+            part_id: SharedString::from("t"),
             call: ToolCall::EditFile {
                 path: p.into(),
                 old_string: None,
@@ -5089,6 +5463,7 @@ mod tests {
         // Reads / searches / misc.
         let tools = vec![
             ToolItem {
+                part_id: SharedString::from("t"),
                 call: ToolCall::ReadFile { path: "x".into() },
                 is_error: false,
                 resolved: true,
@@ -5099,6 +5474,7 @@ mod tests {
                 diff_ref: None,
             },
             ToolItem {
+                part_id: SharedString::from("t"),
                 call: ToolCall::Glob {
                     pattern: "*.rs".into(),
                 },
@@ -5111,6 +5487,7 @@ mod tests {
                 diff_ref: None,
             },
             ToolItem {
+                part_id: SharedString::from("t"),
                 call: ToolCall::WebSearch { query: "q".into() },
                 is_error: false,
                 resolved: true,
@@ -5357,5 +5734,32 @@ mod tests {
             vec![text_part("t0", ""), text_part("t1", "   ")],
         );
         assert!(rows_for_entry(&entry, false, &mut parse).is_empty());
+    }
+
+    #[test]
+    fn journal_section_renders_only_for_loading_or_ready() {
+        // Issue #10: Unavailable (and no fetch yet) render nothing — the
+        // chip falls back to the summary already displayed.
+        assert!(!journal_section_visible(None));
+        assert!(!journal_section_visible(Some(&JournalDetail::Unavailable)));
+        // Loading holds a live Task (only constructible with a cx), so it is
+        // covered by inspection of the match arms above, not instantiated here.
+        let ready = JournalDetail::Ready {
+            request: Arc::new(output_lines("Run: ls", 1)),
+            response: Arc::new(output_lines("ok", OUTPUT_DETAIL_MAX_LINES)),
+        };
+        assert!(journal_section_visible(Some(&ready)));
+    }
+
+    #[test]
+    fn journal_key_is_chat_qualified() {
+        assert_eq!(
+            Transcript::journal_key("chat-a", "t1").as_ref(),
+            "chat-a/t1"
+        );
+        assert_ne!(
+            Transcript::journal_key("chat-a", "t1"),
+            Transcript::journal_key("chat-b", "t1")
+        );
     }
 }
