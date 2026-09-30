@@ -42,6 +42,12 @@ pub mod methods {
     pub const LIST_COMMANDS: &str = "ListCommands";
     pub const QUEUE_COMMAND: &str = "QueueCommand";
     pub const WATCH_DOC_MESSAGES: &str = "WatchDocMessages";
+    /// Live reasoning stream (issue #31): text deltas of the in-progress
+    /// turn, never persisted to the doc. Params `{chatId}`.
+    pub const WATCH_REASONING: &str = "WatchReasoning";
+    /// Per-tool request/response detail rebuilt from the run journal
+    /// (issue #10, complement of #31). Params `{chatId, partId}`.
+    pub const GET_TOOL_DETAIL: &str = "GetToolDetail";
     /// Nudge every open room client to verify liveness NOW (window focus,
     /// app foregrounded). No params; IPC-only. Each room ignores the hint
     /// unless it has been broadcast-quiet ≥30s, so this is cheap to spam.

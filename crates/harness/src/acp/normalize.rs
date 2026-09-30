@@ -323,11 +323,46 @@ fn typed_call(update: &Value) -> ToolCall {
                 }),
             input: raw.cloned(),
         },
+        // OpenCode's todo tracker (kind "todowrite", or title like "2 todos"
+        // with rawInput.todos of content/status/priority): normalize to a
+        // real Todo chip instead of an Unknown JSON dump. Kept after the
+        // task/agent arms so spawns win.
+        _ if kind == "todowrite" || kind == "TodoWrite" || todo_items(raw).is_some() => {
+            ToolCall::Todo {
+                items: todo_items(raw).unwrap_or_default(),
+            }
+        }
         _ => ToolCall::Unknown {
             name: if title.is_empty() { kind.into() } else { title },
             input: raw.cloned(),
         },
     }
+}
+
+/// Todo items from a raw input carrying a `todos` array of
+/// `{content, status}` (OpenCode todowrite/tracker, plan entries).
+/// `Some` (possibly empty) when the shape matches, `None` otherwise.
+fn todo_items(raw: Option<&serde_json::Value>) -> Option<Vec<TodoItem>> {
+    let items = raw?.get("todos")?.as_array()?;
+    if !items
+        .iter()
+        .all(|t| t.get("content").and_then(Value::as_str).is_some())
+    {
+        return None;
+    }
+    Some(
+        items
+            .iter()
+            .map(|t| TodoItem {
+                text: t
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                done: t.get("status").and_then(Value::as_str) == Some("completed"),
+            })
+            .collect(),
+    )
 }
 
 fn u64_keys(v: &Value, keys: &[&str]) -> Option<u64> {
@@ -558,6 +593,54 @@ pub(crate) fn preferred_allow_option(options: &[Value]) -> Option<String> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn opencode_todo_tracker_maps_to_todo_chip() {
+        // Shape seen live: title "2 todos", rawInput.todos with
+        // content/status/priority — must not fall to Unknown JSON dump.
+        let update = json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "t-todo",
+            "status": "completed",
+            "kind": "other",
+            "title": "2 todos",
+            "rawInput": {
+                "todos": [
+                    { "content": "a", "status": "completed", "priority": "high" },
+                    { "content": "b", "status": "in_progress", "priority": "high" },
+                ],
+            },
+        });
+        let events = map_update(&update);
+        assert!(matches!(
+            &events[0],
+            AgentEvent::ToolCall {
+                call: ToolCall::Todo { items },
+                ..
+            } if items == &vec![
+                TodoItem { text: "a".into(), done: true },
+                TodoItem { text: "b".into(), done: false },
+            ]
+        ));
+    }
+
+    #[test]
+    fn todowrite_kind_without_raw_maps_to_empty_todo() {
+        // Opening update: kind only, no rawInput yet — Todo, not Unknown.
+        let update = json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "t-todo",
+            "kind": "todowrite",
+        });
+        let events = map_update(&update);
+        assert!(matches!(
+            &events[0],
+            AgentEvent::ToolCall {
+                call: ToolCall::Todo { items },
+                ..
+            } if items.is_empty()
+        ));
+    }
 
     #[test]
     fn message_and_thought_chunks_map_to_deltas() {

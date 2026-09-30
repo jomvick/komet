@@ -170,6 +170,29 @@ impl RunJournal {
         Ok(read_lines(&path)?.into_iter().next_back())
     }
 
+    /// Targeted lookup (issue #10): the `ToolCall` + `ToolResult` events for
+    /// one tool part, in journal order. No full replay — one linear scan of
+    /// the chat's file, keeping only matching lines. Unknown id or missing /
+    /// rotated file yields an empty vec, never an error.
+    pub fn events_for_part(&self, chat_id: &str, part_id: &str) -> Vec<AgentEvent> {
+        let path = self.path_for(chat_id);
+        if !path.exists() {
+            return Vec::new();
+        }
+        let lines = read_lines(&path).unwrap_or_default();
+        lines
+            .into_iter()
+            .filter_map(|(_, event)| match &event {
+                AgentEvent::ToolCall { id, .. } | AgentEvent::ToolResult { id, .. }
+                    if id == part_id =>
+                {
+                    Some(event)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Crash-recovery scan: chat ids whose journal's last event is NOT a `Done` — their
     /// runs died mid-stream and need recovery (stamp `aborted`, close the journal).
     pub fn stale_sessions(&self) -> Result<Vec<String>, JournalError> {
@@ -348,5 +371,48 @@ mod tests {
         let all = journal.replay("chat-1", 0).unwrap();
         assert_eq!(all.len(), 2);
         assert_eq!(all[1].0, 2);
+    }
+
+    fn tool_call(id: &str) -> AgentEvent {
+        AgentEvent::ToolCall {
+            id: id.into(),
+            call: komet_proto::ToolCall::Exec {
+                command: format!("run {id}"),
+            },
+        }
+    }
+
+    fn tool_result(id: &str) -> AgentEvent {
+        AgentEvent::ToolResult {
+            id: id.into(),
+            is_error: false,
+            output: Some(format!("out {id}")),
+            diff: None,
+        }
+    }
+
+    #[test]
+    fn events_for_part_round_trips_call_and_result_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        journal.append("chat-1", &text("hello")).unwrap();
+        journal.append("chat-1", &tool_call("t1")).unwrap();
+        journal.append("chat-1", &tool_call("t2")).unwrap();
+        journal.append("chat-1", &tool_result("t1")).unwrap();
+        journal.append("chat-1", &done()).unwrap();
+
+        let got = journal.events_for_part("chat-1", "t1");
+        assert_eq!(got.len(), 2);
+        assert!(matches!(&got[0], AgentEvent::ToolCall { id, .. } if id == "t1"));
+        assert!(matches!(&got[1], AgentEvent::ToolResult { id, .. } if id == "t1"));
+    }
+
+    #[test]
+    fn events_for_part_unknown_id_or_chat_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::open(dir.path()).unwrap();
+        journal.append("chat-1", &tool_call("t1")).unwrap();
+        assert!(journal.events_for_part("chat-1", "nope").is_empty());
+        assert!(journal.events_for_part("missing-chat", "t1").is_empty());
     }
 }
