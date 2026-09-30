@@ -73,10 +73,12 @@ enum DaemonCommand {
 const DEFAULT_EDGE_URL: &str = "https://edge.komet.sh";
 
 fn edge_url_from_env() -> String {
-    std::env::var("KOMET_EDGE_URL")
+    let url = std::env::var("KOMET_EDGE_URL")
         .ok()
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_EDGE_URL.into())
+        .unwrap_or_else(|| DEFAULT_EDGE_URL.into());
+    komet_sync_server::warn_if_insecure_sync_url(&url);
+    url
 }
 
 
@@ -152,8 +154,9 @@ fn main() -> anyhow::Result<()> {
             let mut token = String::new();
             for b in uuid::Uuid::new_v4().as_bytes() { let _ = write!(token, "{b:02x}"); }
             println!("KOMET_SYNC_TOKEN={token}");
-            println!("KOMET_EDGE_URL=http://YOUR_VPS_IP:8787");
-            println!("\nSur chaque device: export KOMET_SYNC_TOKEN={token} KOMET_EDGE_URL=http://YOUR_VPS_IP:8787");
+            println!("KOMET_EDGE_URL=https://YOUR_VPS_HOST:8787");
+            println!("\nSur chaque device: export KOMET_SYNC_TOKEN={token} KOMET_EDGE_URL=https://YOUR_VPS_HOST:8787");
+            println!("Exposez le serveur via un reverse proxy TLS (voir docs/self-hosted-sync.md).");
             Ok(())
         }
         Some(Command::SyncServer { port }) => {

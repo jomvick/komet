@@ -51,6 +51,53 @@ pub fn require_token(token: Option<String>) -> anyhow::Result<String> {
     Ok(token)
 }
 
+/// True when `url` would send the sync bearer token over plain HTTP to a
+/// non-local host. `https://` and local dev (`localhost`, `127.0.0.1`,
+/// `::1`) are fine; anything else over `http://` leaks the token on the
+/// network path (issue #24).
+pub fn sync_url_is_insecure(url: &str) -> bool {
+    let url = url.trim();
+    let rest = match url.split_once("://") {
+        Some((scheme, rest)) if scheme.eq_ignore_ascii_case("http") => rest,
+        _ => return false,
+    };
+    let host = rest
+        .split_once(['/', '?', '#'])
+        .map(|(h, _)| h)
+        .unwrap_or(rest);
+    let host = host.rsplit('@').next().unwrap_or(host);
+    let host = host.strip_prefix('[').and_then(|h| h.split_once(']')).map(|(h, _)| h).unwrap_or_else(|| host.split_once(':').map(|(h, _)| h).unwrap_or(host));
+    let host = host.trim().to_lowercase();
+    !(host.is_empty()
+        || host == "localhost"
+        || host == "127.0.0.1"
+        || host == "::1")
+}
+
+/// Warn when a token would be sent over insecure HTTP. LAN setups can opt
+/// in explicitly with `KOMET_SYNC_ALLOW_INSECURE_HTTP=1`.
+pub fn warn_if_insecure_sync_url(url: &str) {
+    if !sync_url_is_insecure(url) {
+        return;
+    }
+    if std::env::var("KOMET_SYNC_ALLOW_INSECURE_HTTP")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        tracing::warn!(
+            url = url,
+            "sync token sent over plain HTTP (KOMET_SYNC_ALLOW_INSECURE_HTTP=1); prefer HTTPS via a reverse proxy"
+        );
+        return;
+    }
+    tracing::warn!(
+        url = url,
+        "KOMET_SYNC_TOKEN will be sent over plain HTTP which anyone on the network can read. \
+         Put the sync server behind TLS (see docs/self-hosted-sync.md) or set \
+         KOMET_SYNC_ALLOW_INSECURE_HTTP=1 for trusted LAN use."
+    );
+}
+
 fn check_auth(state: &AppState, headers: &HeaderMap) -> bool {
     let got = headers
         .get("authorization")
@@ -388,5 +435,15 @@ mod tests {
             let response = app.clone().oneshot(blob_get(Some(auth))).await.unwrap();
             assert_eq!(response.status(), StatusCode::NOT_FOUND);
         }
+    }
+
+    #[test]
+    fn insecure_url_detection() {
+        assert!(!sync_url_is_insecure("https://example.com:8787"));
+        assert!(!sync_url_is_insecure("http://localhost:8787"));
+        assert!(!sync_url_is_insecure("http://127.0.0.1:8787"));
+        assert!(!sync_url_is_insecure("http://[::1]:8787"));
+        assert!(sync_url_is_insecure("http://192.168.1.10:8787"));
+        assert!(sync_url_is_insecure("http://vps.example.com:8787"));
     }
 }
