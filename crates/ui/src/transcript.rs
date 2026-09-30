@@ -2761,22 +2761,34 @@ impl Transcript {
                 Duration::from_secs(20),
             )
             .await;
-            let fetched = match reply {
+            let fetched: Option<JournalDetail> = match reply {
                 Ok(value) if value.get("status").and_then(|s| s.as_str()) == Some("ok") => {
                     let request = value
                         .get("request")
                         .and_then(|r| r.as_str())
                         .unwrap_or("(unknown call)");
                     let response = value.get("response").and_then(|r| r.as_str()).unwrap_or("");
-                    JournalDetail::Ready {
+                    Some(JournalDetail::Ready {
                         request: Arc::new(output_lines(request, 1)),
                         response: Arc::new(output_lines(response, OUTPUT_DETAIL_MAX_LINES)),
-                    }
+                    })
                 }
-                _ => JournalDetail::Unavailable,
+                // Successful reply with non-ok status (e.g. unavailable):
+                // terminal, no retry.
+                Ok(_) => Some(JournalDetail::Unavailable),
+                // Transport error / timeout: don't cache — drop the entry so
+                // the next expand retries.
+                Err(_) => None,
             };
             this.update(cx, |this, cx| {
-                this.journal_details.insert(fetch_key, fetched);
+                match fetched {
+                    Some(detail) => {
+                        this.journal_details.insert(fetch_key, detail);
+                    }
+                    None => {
+                        this.journal_details.remove(&fetch_key);
+                    }
+                }
                 cx.notify();
             })
             .ok();
