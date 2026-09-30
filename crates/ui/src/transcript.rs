@@ -2651,6 +2651,9 @@ impl Transcript {
                 };
                 let diff = komet_proto::view::diff_todos(self.todo_cursor.as_deref(), items);
                 tool.invocation = todo_diff_detail(&diff).map(Arc::new);
+                // The harness output for todos is the same list as raw JSON —
+                // the diff above replaces it, so it never renders as a dump.
+                tool.detail = None;
                 self.todo_cursor = Some(items.clone());
             }
         }
