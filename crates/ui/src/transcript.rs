@@ -40,6 +40,7 @@ use gpui::{
 };
 
 use komet_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
+use komet_proto::TodoItem;
 use komet_proto::ToolCall;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
@@ -1183,6 +1184,34 @@ fn blob_detail(text: &str, is_diff: bool) -> Option<ToolDetail> {
     })
 }
 
+/// One diff line's glyph: checked green-ish completed, filled in-progress
+/// dot is N/A (`TodoItem` is boolean — see `diff_todos`), `+` added,
+/// `○` reopened, `−` removed.
+fn todo_diff_glyph(kind: komet_proto::view::TodoDiffKind) -> &'static str {
+    use komet_proto::view::TodoDiffKind;
+    match kind {
+        TodoDiffKind::Added => "+",
+        TodoDiffKind::Completed => "✓",
+        TodoDiffKind::Reopened => "○",
+        TodoDiffKind::Removed => "−",
+    }
+}
+
+/// Render a todo diff as an output block (one glyph-prefixed line per
+/// change). Empty diff → `None`, so an unchanged repeat call collapses to
+/// its one-line summary instead of re-dumping the list.
+fn todo_diff_detail(diff: &[komet_proto::view::TodoDiffLine]) -> Option<ToolDetail> {
+    if diff.is_empty() {
+        return None;
+    }
+    let text = diff
+        .iter()
+        .map(|line| format!("{} {}", todo_diff_glyph(line.kind), line.text))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(output_lines(&text, OUTPUT_DETAIL_MAX_LINES))
+}
+
 /// Build an output [`ToolDetail`] from raw text with a line cap (shared by
 /// sidecar blob upgrades and journal-detail fetches).
 fn output_lines(text: &str, max_lines: usize) -> ToolDetail {
@@ -1580,6 +1609,11 @@ pub struct Transcript {
     /// via `GetToolDetail`. `Unavailable` renders nothing — the chip falls
     /// back to the summary already displayed.
     journal_details: HashMap<SharedString, JournalDetail>,
+    /// Last `Todo` list seen while building rows (top-to-bottom): Todo items
+    /// ship complete in the doc, so each chip renders the diff against the
+    /// previous call instead of the full dump. Reset at the start of every
+    /// [`Self::sync`] pass — derivation is deterministic over entry order.
+    todo_cursor: Option<Vec<TodoItem>>,
     /// Monotonic fetch order per blob ref: when a tool has BOTH a diff and
     /// an output blob fetched, the chip shows the one requested most
     /// recently (click "Show full output" after a diff → see the output).
@@ -1685,6 +1719,7 @@ impl Transcript {
             reasoning_chat: None,
             reasoning_task: None,
             journal_details: HashMap::new(),
+            todo_cursor: None,
             blob_fetch_order: HashMap::new(),
             blob_fetch_counter: 0,
             _observe: observe,
@@ -2450,6 +2485,9 @@ impl Transcript {
         }
 
         let mut new_rows: Vec<Row> = Vec::new();
+        // Todo diffs derive from entry order: restart the cursor so every
+        // pass computes the same diffs whether rows came from cache or not.
+        self.todo_cursor = None;
         for entry in &entries {
             new_rows.extend(self.rows_for(entry, false));
         }
@@ -2563,7 +2601,9 @@ impl Transcript {
             && let Some(cached) = self.row_cache.get(&entry.id)
             && cached.fingerprint == fingerprint
         {
-            return cached.rows.clone();
+            let mut rows = cached.rows.clone();
+            self.apply_todo_diffs(&mut rows);
+            return rows;
         }
 
         let live_parsers = &mut self.live_parsers;
@@ -2573,7 +2613,7 @@ impl Transcript {
             // rows whose content hash changed are spliced — the reparsed tail).
             parse_for_row(streaming, key, text, live_parsers, tree_cache).0
         };
-        let rows = rows_for_entry(entry, pending, &mut parse);
+        let mut rows = rows_for_entry(entry, pending, &mut parse);
 
         if !streaming {
             self.row_cache.insert(
@@ -2584,7 +2624,36 @@ impl Transcript {
                 },
             );
         }
+        self.apply_todo_diffs(&mut rows);
         rows
+    }
+
+    /// Replace each Todo chip's full-list invocation with the diff against
+    /// the previous Todo call (Cursor-style live checklist instead of a
+    /// repeated dump). Todo items ship complete in the doc, so no fetch is
+    /// needed — pure derivation over row order. An empty diff clears the
+    /// invocation, collapsing the chip back to its one-line summary.
+    fn apply_todo_diffs(&mut self, rows: &mut Vec<Row>) {
+        for row in rows.iter_mut() {
+            let RowKind::ToolGroup { tools, .. } = &mut row.kind else {
+                continue;
+            };
+            if !tools
+                .iter()
+                .any(|t| matches!(t.call, ToolCall::Todo { .. }))
+            {
+                continue;
+            }
+            let tools_mut = Arc::make_mut(tools);
+            for tool in tools_mut.iter_mut() {
+                let ToolCall::Todo { items } = &tool.call else {
+                    continue;
+                };
+                let diff = komet_proto::view::diff_todos(self.todo_cursor.as_deref(), items);
+                tool.invocation = todo_diff_detail(&diff).map(Arc::new);
+                self.todo_cursor = Some(items.clone());
+            }
+        }
     }
 
     /// Fetch a sidecar blob (full tool output or diff) and build its upgraded
@@ -3981,10 +4050,16 @@ impl Transcript {
                 // Journal detail for this chip (issue #10): fetch on expand,
                 // render when open. `Unavailable`/absent renders nothing —
                 // the chip falls back to the summary already displayed.
-                let journal_key = self
-                    .chat_id
-                    .as_deref()
-                    .map(|c| Self::journal_key(c, tool.part_id.as_ref()));
+                // Todo chips skip it: their items ship complete in the doc
+                // and render as a local diff instead (no fetch needed).
+                let is_todo = matches!(tool.call, ToolCall::Todo { .. });
+                let journal_key = (!is_todo)
+                    .then(|| {
+                        self.chat_id
+                            .as_deref()
+                            .map(|c| Self::journal_key(c, tool.part_id.as_ref()))
+                    })
+                    .flatten();
                 let journal_extra = if open { journal_extras[ix] } else { 0.0 };
                 // Expandable chip: ONE card whose header row is the chip and
                 // whose body is the detail — not a floating card below it.
@@ -4013,7 +4088,9 @@ impl Transcript {
                 // Journal fetch fires on expand (issue #10): the open body
                 // shows Loading, then Request/Response, or nothing when
                 // Unavailable (fallback = the summary already displayed).
-                let journal_chat = self.chat_id.clone();
+                // Todo chips skip it: items ship complete in the doc and
+                // render as a local diff instead.
+                let journal_chat = if is_todo { None } else { self.chat_id.clone() };
                 let journal_part = tool.part_id.to_string();
                 let mut card = div()
                     .my(px((CHIP_HEIGHT - CHIP_CARD_HEIGHT) / 2.0))
@@ -5760,6 +5837,36 @@ mod tests {
         assert_ne!(
             Transcript::journal_key("chat-a", "t1"),
             Transcript::journal_key("chat-b", "t1")
+        );
+    }
+
+    #[test]
+    fn todo_diff_detail_collapses_unchanged_repeats() {
+        use komet_proto::view::{TodoDiffKind, TodoDiffLine};
+        // Empty diff (identical repeat call) → None: the chip falls back to
+        // its one-line summary instead of re-dumping the list.
+        assert!(todo_diff_detail(&[]).is_none());
+        let diff = vec![
+            TodoDiffLine {
+                text: "new".into(),
+                kind: TodoDiffKind::Added,
+            },
+            TodoDiffLine {
+                text: "done".into(),
+                kind: TodoDiffKind::Completed,
+            },
+        ];
+        let Some(ToolDetail::Output {
+            lines,
+            truncated_by,
+        }) = todo_diff_detail(&diff)
+        else {
+            panic!("expected an output block");
+        };
+        assert_eq!(truncated_by, 0);
+        assert_eq!(
+            lines.iter().map(|l| l.as_ref()).collect::<Vec<_>>(),
+            vec!["+ new", "✓ done"]
         );
     }
 }
