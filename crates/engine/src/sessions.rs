@@ -364,6 +364,25 @@ impl SessionsEngine {
         Ok((replay, rx))
     }
 
+    /// Latest journal seq for a chat (0 when the journal is missing/empty).
+    /// Lets live-only streams (issue #31) subscribe from "now" without a
+    /// full replay.
+    pub fn latest_seq(&self, chat_id: &str) -> u64 {
+        self.inner
+            .journal
+            .last_event(chat_id)
+            .ok()
+            .flatten()
+            .map(|(seq, _)| seq)
+            .unwrap_or(0)
+    }
+
+    /// Targeted journal lookup for one tool part (issue #10): empty when the
+    /// journal is missing, rotated, or simply has no such id — never an error.
+    pub fn tool_events(&self, chat_id: &str, part_id: &str) -> Vec<AgentEvent> {
+        self.inner.journal.events_for_part(chat_id, part_id)
+    }
+
     /// Start (or route) a run for `chat_id`.
     ///
     /// - The user message entry is written to the doc immediately (id = `message_id`).
