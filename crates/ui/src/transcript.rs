@@ -2732,13 +2732,30 @@ impl Transcript {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
+        let target = self
+            .state
+            .read(cx)
+            .selected_chat_row()
+            .map(|chat| chat.device_id.clone())
+            .filter(|device_id| {
+                self.state.read(cx).local_device_id.as_deref() != Some(device_id.as_str())
+            });
         let fetch_key = key.clone();
         let task = cx.spawn(async move |this, cx| {
+            let mut payload = serde_json::json!({ "chatId": chat_id, "partId": part_id });
+            if let Some(target) = target
+                && let Some(obj) = payload.as_object_mut()
+            {
+                obj.insert(
+                    "targetDeviceId".to_string(),
+                    serde_json::Value::String(target),
+                );
+            }
             let reply = crate::attachments::call_with_timeout(
                 &engine,
                 cx.background_executor(),
                 komet_rpc::methods::GET_TOOL_DETAIL,
-                serde_json::json!({ "chatId": chat_id, "partId": part_id }),
+                payload,
                 Duration::from_secs(20),
             )
             .await;
@@ -2803,18 +2820,32 @@ impl Transcript {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
+        let target = self
+            .state
+            .read(cx)
+            .selected_chat_row()
+            .map(|chat| chat.device_id.clone())
+            .filter(|device_id| {
+                self.state.read(cx).local_device_id.as_deref() != Some(device_id.as_str())
+            });
         self.reasoning_task = None;
         self.reasoning_chat = Some(chat_id.clone());
         self.reasoning_text.clear();
         let task = cx.spawn(async move |this, cx| {
             const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
             loop {
+                let mut payload = serde_json::json!({ "chatId": chat_id });
+                if let Some(target) = target.clone()
+                    && let Some(obj) = payload.as_object_mut()
+                {
+                    obj.insert(
+                        "targetDeviceId".to_string(),
+                        serde_json::Value::String(target),
+                    );
+                }
                 let mut rx = match engine
                     .client()
-                    .subscribe(
-                        komet_rpc::methods::WATCH_REASONING,
-                        serde_json::json!({ "chatId": chat_id }),
-                    )
+                    .subscribe(komet_rpc::methods::WATCH_REASONING, payload)
                     .await
                 {
                     Ok(rx) => rx,
@@ -4095,6 +4126,7 @@ impl Transcript {
                 // render as a local diff instead.
                 let journal_chat = if is_todo { None } else { self.chat_id.clone() };
                 let journal_part = tool.part_id.to_string();
+                let journal_resolved = tool.resolved;
                 let mut card = div()
                     .my(px((CHIP_HEIGHT - CHIP_CARD_HEIGHT) / 2.0))
                     .ml(px(12.0))
@@ -4139,7 +4171,7 @@ impl Transcript {
                                 if let (Some(chat_id), part_id) =
                                     (journal_chat.clone(), journal_part.clone())
                                 {
-                                    if !part_id.is_empty() {
+                                    if journal_resolved && !part_id.is_empty() {
                                         this.spawn_journal_fetch(chat_id, part_id, cx);
                                     }
                                 }
