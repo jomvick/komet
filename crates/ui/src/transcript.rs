@@ -1645,6 +1645,7 @@ enum JournalDetail {
 /// Whether a journal-detail state renders its own section in an open chip.
 /// `Unavailable` (and no fetch yet) render nothing — the chip falls back to
 /// the summary already displayed.
+#[cfg(test)]
 fn journal_section_visible(fetch: Option<&JournalDetail>) -> bool {
     matches!(
         fetch,

@@ -287,16 +287,42 @@ type CachedUsage = (Option<Vec<AgentUsageWindow>>, Instant);
 /// The distinction is load-bearing: an "unavailable" quota has several very
 /// different causes, and only ONE of them justifies rotating the account's
 /// tokens (see `AgentAccounts::antigravity_usage`).
-enum PaProbe {
+///
+/// Shared by the Claude (`/usage`) and Codex (`/wham/usage`) probes as well:
+/// both classify the HTTP status the same way so callers can tell a
+/// rate-limit (retry later) from an exhausted plan (stop hammering) from a
+/// dead token (refresh once).
+#[derive(Debug, Clone, PartialEq)]
+enum UsageProbeOutcome {
     /// The provider answered with usable windows.
     Windows(Vec<AgentUsageWindow>),
+    /// Transient provider hammering us (HTTP 429) — back off, never refresh.
+    RateLimited,
     /// The provider rejected the ACCESS TOKEN itself (HTTP 401) — a
     /// refresh-token exchange is the only way forward.
     Unauthorized,
-    /// Network hiccup, malformed body, or a provider-side refusal unrelated to
-    /// the token (HTTP 403 "no valid license" when the plan/quota is
-    /// exhausted). Never triggers a token refresh.
+    /// The plan/quota is exhausted (HTTP 403 PERMISSION_DENIED / license
+    /// refusal) — never triggers a token refresh.
+    QuotaExhausted,
+    /// Network hiccup, malformed body, or any other refusal unrelated to
+    /// the token. Never triggers a token refresh.
     Failed,
+}
+
+/// Historic alias kept for the Antigravity call sites.
+type PaProbe = UsageProbeOutcome;
+
+/// Classify an HTTP status for any usage probe (Claude, Codex, Antigravity).
+fn classify_probe_status(status: reqwest::StatusCode) -> Option<UsageProbeOutcome> {
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        Some(UsageProbeOutcome::RateLimited)
+    } else if status == reqwest::StatusCode::UNAUTHORIZED {
+        Some(UsageProbeOutcome::Unauthorized)
+    } else if status == reqwest::StatusCode::FORBIDDEN {
+        Some(UsageProbeOutcome::QuotaExhausted)
+    } else {
+        None
+    }
 }
 
 struct Inner {
@@ -1801,7 +1827,22 @@ impl AgentAccounts {
     }
 
     fn detect_cursor(&self) -> Option<Detected> {
-        read_json(&self.inner.config.cursor_auth_file()).and_then(parse_cursor_auth)
+        if let Some(detected) =
+            read_json(&self.inner.config.cursor_auth_file()).and_then(parse_cursor_auth)
+        {
+            return Some(detected);
+        }
+        // Fallback: Cursor's own Electron/VSCode store — `state.vscdb`
+        // (SQLite, `ItemTable`) holds the Workos session token even when no
+        // SDK `auth.json` exists. Read-only, never panics on SQLITE_BUSY.
+        for db in cursor_state_db_paths() {
+            if let Some(token) = read_cursor_sqlite_token(&db)
+                && let Some(detected) = parse_cursor_session_token(&token)
+            {
+                return Some(detected);
+            }
+        }
+        None
     }
 
     async fn detect_antigravity(&self) -> Option<Detected> {
@@ -2267,7 +2308,7 @@ impl AgentAccounts {
                 // the live keyring and burn a Google refresh-token exchange
                 // (which can desync a running `agy`), while still rendering
                 // "Usage unavailable".
-                PaProbe::Failed => return None,
+                PaProbe::Failed | PaProbe::RateLimited | PaProbe::QuotaExhausted => return None,
                 PaProbe::Unauthorized => {}
             }
             let token = self.refresh_antigravity_live(slot, &raw).await?;
@@ -2302,7 +2343,7 @@ impl AgentAccounts {
 
         match self.query_antigravity_pa(ENDPOINT, &access_token).await {
             PaProbe::Windows(windows) => return Some(windows),
-            PaProbe::Failed => return None,
+            PaProbe::Failed | PaProbe::RateLimited | PaProbe::QuotaExhausted => return None,
             PaProbe::Unauthorized => {}
         }
         // Only an explicit 401 justifies touching the saved token pair.
@@ -2337,8 +2378,10 @@ impl AgentAccounts {
         for body in &bodies {
             last = self.query_antigravity_pa_once(endpoint, token, body).await;
             match &last {
-                PaProbe::Windows(_) | PaProbe::Unauthorized => return last,
-                PaProbe::Failed => {}
+                PaProbe::Windows(_)
+                | PaProbe::Unauthorized
+                | PaProbe::RateLimited => return last,
+                PaProbe::Failed | PaProbe::QuotaExhausted => {}
             }
         }
         last
@@ -2376,8 +2419,8 @@ impl AgentAccounts {
         if !windows.is_empty() {
             return PaProbe::Windows(windows);
         }
-        if status == reqwest::StatusCode::UNAUTHORIZED {
-            return PaProbe::Unauthorized;
+        if let Some(outcome) = classify_probe_status(status) {
+            return outcome;
         }
         if !status.is_success() {
             tracing::debug!(
@@ -2942,6 +2985,226 @@ mod wincred {
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
+// ── Cursor SQLite store (state.vscdb) ─────────────────────────────────────
+//
+// Cursor (Electron/VSCode heritage) keeps its session in a SQLite `state.vscdb`
+// (`ItemTable`, key `workos.cursor.com/session-token` family). The exact key
+// spelling varies by build, so we match the exact known keys first, then a
+// `LIKE '%SessionToken%'` sweep. Read-only open; any lock/contention degrades
+// to `None` (unavailable) — never a panic.
+
+/// Candidate `state.vscdb` locations for the current device.
+fn cursor_state_db_paths() -> Vec<PathBuf> {
+    let home = home_dir();
+    let mut paths = Vec::new();
+    if let Ok(env) = std::env::var("CURSOR_STATE_DB") {
+        if !env.is_empty() {
+            paths.push(PathBuf::from(env));
+        }
+    }
+    paths.push(home.join(".config/Cursor/User/globalStorage/state.vscdb"));
+    paths.push(home.join(".cursor-server-data/User/globalStorage/state.vscdb"));
+    #[cfg(target_os = "macos")]
+    paths.push(home.join("Library/Application Support/Cursor/User/globalStorage/state.vscdb"));
+    #[cfg(target_os = "windows")]
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        paths.push(
+            PathBuf::from(appdata).join("Cursor/User/globalStorage/state.vscdb"),
+        );
+    }
+    paths
+}
+
+/// Read the Workos session token from a `state.vscdb` copy/live file.
+///
+/// Opens `SQLITE_OPEN_READ_ONLY` with a zero busy-timeout and one short retry:
+/// Cursor is usually running (WAL) while we read. `SQLITE_BUSY`/missing
+/// table/key all map to `None`.
+fn read_cursor_sqlite_token(db: &Path) -> Option<String> {
+    use rusqlite::OpenFlags;
+    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let mut attempt = 0;
+    loop {
+        match read_cursor_sqlite_token_once(db, flags) {
+            Some(token) => return Some(token),
+            None => {
+                attempt += 1;
+                if attempt >= 2 {
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    }
+}
+
+fn read_cursor_sqlite_token_once(
+    db: &Path,
+    flags: rusqlite::OpenFlags,
+) -> Option<String> {
+    let conn = rusqlite::Connection::open_with_flags(db, flags).ok()?;
+    conn.busy_timeout(std::time::Duration::from_millis(0)).ok()?;
+    // Exact keys first (cheap, index-friendly), then a LIKE sweep for
+    // build-variant spellings (`WorkosCursorSessionToken`, …).
+    for key in [
+        "workos.cursor.com/session-token",
+        "workos.cursor.com/sessionToken",
+        "WorkosCursorSessionToken",
+    ] {
+        match conn.query_row(
+            "SELECT value FROM ItemTable WHERE key = ?1",
+            rusqlite::params![key],
+            |row| row.get::<_, String>(0),
+        ) {
+            Ok(v) if !v.trim().is_empty() => return Some(v),
+            _ => {}
+        }
+    }
+    let mut stmt = conn
+        .prepare("SELECT value FROM ItemTable WHERE key LIKE '%SessionToken%' LIMIT 5")
+        .ok()?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .ok()?;
+    for value in rows.flatten() {
+        if !value.trim().is_empty() {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// Build a [`Detected`] from a raw Workos session JWT (identity mined from
+/// the payload the same way `parse_codex_auth` does — no verification).
+fn parse_cursor_session_token(token: &str) -> Option<Detected> {
+    let token = token.trim().trim_matches('"');
+    if token.is_empty() {
+        return None;
+    }
+    let claims = jwt_claims(token).unwrap_or_else(|| serde_json::json!({}));
+    let email = str_field(&claims, "email").unwrap_or_else(|| {
+        let tail: String = token
+            .chars()
+            .rev()
+            .take(4)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        format!("Cursor ·…{tail}")
+    });
+    let account_key = str_field(&claims, "sub").unwrap_or_else(|| {
+        if email.contains('@') {
+            email.clone()
+        } else {
+            let digest = Sha256::digest(token.as_bytes());
+            format!("cursor:{}", &crate::repos::hex(&digest)[..12])
+        }
+    });
+    Some(Detected {
+        account_key,
+        profile: SlotProfile {
+            email,
+            display_name: str_field(&claims, "name"),
+            organization: None,
+            plan: None,
+            auth_kind: AgentAuthKind::Oauth,
+        },
+        credentials: Some(serde_json::json!({
+            "sessionToken": token,
+            "source": "state.vscdb",
+        })),
+        claude_config: None,
+    })
+}
+
+// ── /proc/net/tcp listening-port parser (pure, testable) ────────────────────
+//
+// Port of Swift `ProcNetTCPListeningPortParser`: parse `/proc/{pid}/net/tcp`
+// (or tcp6) tables — columns `[1] local addr:port`, `[3] state (0A = LISTEN)`,
+// `[9] inode` — restricted to loopback addresses and to the socket inodes of
+// the target process.
+
+/// Loopback addresses as they appear hex-encoded in `/proc/net/tcp{,6}`.
+fn is_loopback_hex(addr: &str) -> bool {
+    addr == "0100007F" || addr == "00000000000000000000000001000000"
+}
+
+/// Pure parser over `/proc/net/tcp` content: loopback LISTEN ports whose
+/// inode belongs to `inodes`.
+fn parse_proc_net_tcp_listening(
+    content: &str,
+    inodes: &std::collections::HashSet<String>,
+) -> Vec<u16> {
+    let mut ports = Vec::new();
+    for line in content.lines().skip(1) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() < 10 || fields[3] != "0A" || !inodes.contains(fields[9]) {
+            continue;
+        }
+        let Some((addr, port_hex)) = fields[1].rsplit_once(':') else {
+            continue;
+        };
+        if !is_loopback_hex(addr) {
+            continue;
+        }
+        if let Ok(port) = u16::from_str_radix(port_hex, 16) {
+            ports.push(port);
+        }
+    }
+    ports.sort_unstable();
+    ports.dedup();
+    ports
+}
+
+/// `lsof` fallback (same class of call as `resolve_claude_executable`: PATH
+/// lookup, bounded, best-effort). Used when `/proc` attribution yields
+/// nothing (non-Linux, containers without /proc, permission gaps).
+#[cfg(target_os = "linux")]
+fn listening_ports_lsof(pid: u32) -> Vec<u16> {
+    let out = std::process::Command::new("lsof")
+        .args([
+            "-a",
+            "-p",
+            &pid.to_string(),
+            "-iTCP",
+            "-sTCP:LISTEN",
+            "-P",
+            "-n",
+        ])
+        .output();
+    parse_lsof_listening(&out.map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default())
+}
+
+/// Pure parser over `lsof -P -n` output: trailing `:port` on loopback lines.
+#[cfg(any(target_os = "linux", test))]
+fn parse_lsof_listening(output: &str) -> Vec<u16> {
+    let mut ports = Vec::new();
+    for line in output.lines().skip(1) {
+        if !(line.contains("127.0.0.1") || line.contains("localhost") || line.contains("[::1]")) {
+            continue;
+        }
+        // NAME column holds `127.0.0.1:port (LISTEN)` — the address token is
+        // the last whitespace token containing a ':'.
+        let addr_token = line
+            .split_whitespace()
+            .rev()
+            .find(|t| t.contains(':'))
+            .unwrap_or("");
+        let after_colon = addr_token.rsplit(':').next().unwrap_or("");
+        let port_str: String = after_colon
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        if let Ok(port) = port_str.parse::<u16>() {
+            ports.push(port);
+        }
+    }
+    ports.sort_unstable();
+    ports.dedup();
+    ports
+}
+
 fn harness_slug(harness: HarnessId) -> &'static str {
     match harness {
         HarnessId::ClaudeCode => "claude-code",
@@ -3441,24 +3704,7 @@ fn listening_ports(proc_dir: &Path) -> Vec<u16> {
         let Ok(content) = std::fs::read_to_string(table) else {
             continue;
         };
-        for line in content.lines().skip(1) {
-            let fields: Vec<&str> = line.split_whitespace().collect();
-            // [1] local addr:port, [3] state (0A = LISTEN), [9] socket inode.
-            if fields.len() < 10 || fields[3] != "0A" || !inodes.contains(fields[9]) {
-                continue;
-            }
-            let Some((addr, port_hex)) = fields[1].rsplit_once(':') else {
-                continue;
-            };
-            // Loopback only — this endpoint is never remote.
-            let loopback = addr == "0100007F" || addr == "00000000000000000000000001000000";
-            if !loopback {
-                continue;
-            }
-            if let Ok(port) = u16::from_str_radix(port_hex, 16) {
-                ports.push(port);
-            }
-        }
+        ports.extend(parse_proc_net_tcp_listening(&content, &inodes));
     }
     ports.sort_unstable();
     ports.dedup();
@@ -3491,7 +3737,18 @@ fn discover_language_servers(antigravity_home: &Path) -> Vec<(u16, Option<String
             let args: Vec<&str> = cmdline.split('\0').filter(|a| !a.is_empty()).collect();
             let token = parse_csrf_token(&args);
             process_token = process_token.or_else(|| token.clone());
-            for port in listening_ports(&path) {
+            let mut ports = listening_ports(&path);
+            if ports.is_empty()
+                && let Some(pid) = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .and_then(|n| n.parse::<u32>().ok())
+            {
+                // /proc attribution came back empty (permissions, timing) —
+                // fall back to lsof for this pid (bounded, best-effort).
+                ports = listening_ports_lsof(pid);
+            }
+            for port in ports {
                 candidates.push((port, token.clone()));
             }
         }
@@ -4257,6 +4514,91 @@ mod tests {
         // it), and the LAST HTTP line is the freshest one.
         assert_eq!(last_http_port(log), Some(41234));
         assert_eq!(last_http_port("nothing here"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_net_tcp_parser_filters_state_addr_and_inode() {
+        let content = concat!(
+            "  sl  local_address rem_address   st tx_queue:rx_queue tr:tm->when retrnsmt uid timeout inode\n",
+            "   0: 0100007F:9A5F 00000000:0000 0A 00000000:00000000 00:00000000 00000000 0 0 1111 0\n",
+            "   1: 0100007F:9A60 00000000:0000 01 00000000:00000000 00:00000000 00000000 0 0 1111 0\n",
+            "   2: 00000000:9A61 00000000:0000 0A 00000000:00000000 00:00000000 00000000 0 0 1111 0\n",
+            "   3: 0100007F:9A62 00000000:0000 0A 00000000:00000000 00:00000000 00000000 0 0 2222 0\n",
+        );
+        let inodes: std::collections::HashSet<String> =
+            ["1111".to_string()].into_iter().collect();
+        // 0x9A5F = 39519; established/remote/other-inode lines are dropped.
+        assert_eq!(parse_proc_net_tcp_listening(content, &inodes), vec![39519]);
+        assert!(parse_proc_net_tcp_listening("garbage", &inodes).is_empty());
+    }
+
+    #[test]
+    fn lsof_parser_reads_loopback_ports_only() {
+        let out = concat!(
+            "COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME\n",
+            "language_server 123 u 10u IPv4 1 0t0 TCP 127.0.0.1:39631 (LISTEN)\n",
+            "language_server 123 u 11u IPv4 2 0t0 TCP *:8080 (LISTEN)\n",
+        );
+        assert_eq!(parse_lsof_listening(out), vec![39631]);
+        assert!(parse_lsof_listening("").is_empty());
+    }
+
+    #[test]
+    fn probe_status_classification() {
+        use reqwest::StatusCode;
+        assert_eq!(
+            classify_probe_status(StatusCode::TOO_MANY_REQUESTS),
+            Some(UsageProbeOutcome::RateLimited)
+        );
+        assert_eq!(
+            classify_probe_status(StatusCode::UNAUTHORIZED),
+            Some(UsageProbeOutcome::Unauthorized)
+        );
+        assert_eq!(
+            classify_probe_status(StatusCode::FORBIDDEN),
+            Some(UsageProbeOutcome::QuotaExhausted)
+        );
+        assert_eq!(classify_probe_status(StatusCode::OK), None);
+    }
+
+    #[test]
+    fn cursor_sqlite_fixture_and_missing_key() {
+        let dir =
+            std::env::temp_dir().join(format!("komet-cursor-vscdb-{}-{}", std::process::id(), now_ms()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("state.vscdb");
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch("CREATE TABLE ItemTable(key TEXT PRIMARY KEY, value TEXT);").unwrap();
+            conn.execute(
+                "INSERT INTO ItemTable(key, value) VALUES(?1, ?2)",
+                rusqlite::params!["WorkosCursorSessionToken", "tok-abc"],
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            read_cursor_sqlite_token(&db).as_deref(),
+            Some("tok-abc")
+        );
+        // Missing key → unavailable, no panic.
+        let empty = dir.join("empty.vscdb");
+        {
+            let conn = rusqlite::Connection::open(&empty).unwrap();
+            conn.execute_batch("CREATE TABLE ItemTable(key TEXT PRIMARY KEY, value TEXT);").unwrap();
+        }
+        assert_eq!(read_cursor_sqlite_token(&empty), None);
+        // Missing file → unavailable, no panic.
+        assert_eq!(read_cursor_sqlite_token(&dir.join("nope.vscdb")), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cursor_session_token_parses_jwt_email() {
+        // `tok-abc` is opaque → placeholder identity, never None-panic.
+        let d = parse_cursor_session_token("tok-abc").expect("opaque token");
+        assert!(d.profile.email.starts_with("Cursor ·…"));
+        assert!(parse_cursor_session_token("  ").is_none());
     }
 
     #[cfg(target_os = "linux")]

@@ -2144,7 +2144,6 @@ mod tests {
     }
 
     use crate::sessions::JournaledEvent;
-    use futures::StreamExt as _;
 
     fn reasoning_event(text: &str) -> AgentEvent {
         AgentEvent::ReasoningDelta { text: text.into() }
