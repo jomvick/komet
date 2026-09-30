@@ -448,6 +448,47 @@ pub fn tool_group_summary(tools: &[(crate::ToolCall, bool)]) -> String {
     summary
 }
 
+/// Per-tool request/response detail rebuilt from journal events (issue #10,
+/// complement of #31). Pure and viewport-agnostic, next to
+/// [`tool_chip_content`] — which it does not modify.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolDetailView {
+    pub request: String,
+    pub response: String,
+}
+
+/// Rebuild a tool's request + response text from its journal events. The
+/// request is the full call (via [`tool_chip_content`]); the response is the
+/// result output, or a placeholder when no result was journaled yet.
+pub fn format_tool_detail(events: &[crate::AgentEvent]) -> ToolDetailView {
+    use crate::AgentEvent;
+    let mut request = String::new();
+    let mut response = String::new();
+    for event in events {
+        match event {
+            AgentEvent::ToolCall { call, .. } => {
+                let (label, detail) = tool_chip_content(call);
+                request = format!("{label}: {detail}");
+            }
+            AgentEvent::ToolResult {
+                output, is_error, ..
+            } => {
+                let body = output.as_deref().unwrap_or("(no output)");
+                response = if *is_error {
+                    format!("error: {body}")
+                } else {
+                    body.to_string()
+                };
+            }
+            _ => {}
+        }
+    }
+    if request.is_empty() {
+        request = "(unknown call)".to_string();
+    }
+    ToolDetailView { request, response }
+}
+
 /// The status-dot palette, as oklch triples (L, C, H°).
 ///
 /// Colors live here rather than in the viewport because the *meaning* of a
@@ -657,5 +698,39 @@ mod sort_chats_tests {
         });
         let chat: Chat = serde_json::from_value(value).unwrap();
         assert!(!chat.pinned);
+    }
+
+    #[test]
+    fn format_tool_detail_rebuilds_request_and_response() {
+        use crate::{AgentEvent, ToolCall};
+        let events = vec![
+            AgentEvent::ToolCall {
+                id: "t1".into(),
+                call: ToolCall::Exec {
+                    command: "cargo test".into(),
+                },
+            },
+            AgentEvent::ToolResult {
+                id: "t1".into(),
+                is_error: false,
+                output: Some("ok".into()),
+                diff: None,
+            },
+        ];
+        let view = format_tool_detail(&events);
+        assert_eq!(view.request, "Run: cargo test");
+        assert_eq!(view.response, "ok");
+    }
+
+    #[test]
+    fn format_tool_detail_missing_result_leaves_response_empty() {
+        use crate::{AgentEvent, ToolCall};
+        let events = vec![AgentEvent::ToolCall {
+            id: "t1".into(),
+            call: ToolCall::ReadFile { path: "a.rs".into() },
+        }];
+        let view = format_tool_detail(&events);
+        assert_eq!(view.request, "Read: a.rs");
+        assert!(view.response.is_empty());
     }
 }
