@@ -10,18 +10,22 @@
 
 pub mod commands;
 pub mod constants;
+pub mod export;
 pub mod parts;
 pub mod rebuild;
 pub mod registry;
 pub mod schema;
+pub mod stats;
 pub mod transcript_delta;
 pub mod workspace;
 
 pub use commands::*;
 pub use constants::*;
+pub use export::*;
 pub use parts::*;
 pub use rebuild::*;
 pub use registry::*;
 pub use schema::*;
+pub use stats::*;
 pub use transcript_delta::*;
 pub use workspace::*;

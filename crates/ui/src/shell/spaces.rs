@@ -634,6 +634,7 @@ impl Shell {
                     status,
                     is_selected,
                     false,
+                    chat.pinned,
                     theme,
                     cx,
                 );
