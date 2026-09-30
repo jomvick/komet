@@ -107,6 +107,7 @@ icon_assets![
     (EYE_CLOSED, "eye-closed"),
     (PAPERCLIP, "paperclip"),
     (PEN, "pen"),
+    (PIN, "pin"),
     (ARCHIVE_MINIMALISTIC, "archive-minimalistic"),
     (TRASH_BIN_MINIMALISTIC, "trash-bin-minimalistic"),
     (SETTINGS_MINIMALISTIC, "settings-minimalistic"),
