@@ -470,13 +470,19 @@ pub struct ToolDetailView {
 /// result output, or a placeholder when no result was journaled yet.
 pub fn format_tool_detail(events: &[crate::AgentEvent]) -> ToolDetailView {
     use crate::AgentEvent;
-    let mut request = String::new();
     let mut response = String::new();
+    // Refresh chains re-emit the call per update; a title-only completion
+    // arrives as Unknown — prefer the last TYPED call so the request never
+    // degrades to a bare Unknown label when a better one was journaled.
+    let mut last_call: Option<&crate::ToolCall> = None;
+    let mut last_typed: Option<&crate::ToolCall> = None;
     for event in events {
         match event {
             AgentEvent::ToolCall { call, .. } => {
-                let (label, detail) = tool_chip_content(call);
-                request = format!("{label}: {detail}");
+                last_call = Some(call);
+                if !matches!(call, crate::ToolCall::Unknown { .. }) {
+                    last_typed = Some(call);
+                }
             }
             AgentEvent::ToolResult {
                 output, is_error, ..
@@ -491,6 +497,13 @@ pub fn format_tool_detail(events: &[crate::AgentEvent]) -> ToolDetailView {
             _ => {}
         }
     }
+    let mut request = match last_typed.or(last_call) {
+        Some(call) => {
+            let (label, detail) = tool_chip_content(call);
+            format!("{label}: {detail}")
+        }
+        None => "(unknown call)".to_string(),
+    };
     if request.is_empty() {
         request = "(unknown call)".to_string();
     }
@@ -856,5 +869,25 @@ mod sort_chats_tests {
     fn diff_todos_identical_calls_have_empty_diff() {
         let list = vec![todo("a", false), todo("b", true)];
         assert!(diff_todos(Some(&list), &list).is_empty());
+    }
+
+    #[test]
+    fn format_tool_detail_prefers_last_typed_call_over_unknown_refresh() {
+        use crate::{AgentEvent, ToolCall};
+        let events = vec![
+            AgentEvent::ToolCall {
+                id: "t1".into(),
+                call: ToolCall::Todo { items: vec![] },
+            },
+            AgentEvent::ToolCall {
+                id: "t1".into(),
+                call: ToolCall::Unknown {
+                    name: "3 todos".into(),
+                    input: None,
+                },
+            },
+        ];
+        let view = format_tool_detail(&events);
+        assert!(view.request.starts_with("Todo:"));
     }
 }

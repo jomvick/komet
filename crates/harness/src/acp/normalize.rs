@@ -323,12 +323,15 @@ fn typed_call(update: &Value) -> ToolCall {
                 }),
             input: raw.cloned(),
         },
-        // OpenCode's todo tracker (title like "2 todos", rawInput.todos with
-        // content/status/priority): normalize to a real Todo chip instead of
-        // an Unknown JSON dump. Kept after the task/agent arms so spawns win.
-        _ if todo_items(raw).is_some() => ToolCall::Todo {
-            items: todo_items(raw).unwrap_or_default(),
-        },
+        // OpenCode's todo tracker (kind "todowrite", or title like "2 todos"
+        // with rawInput.todos of content/status/priority): normalize to a
+        // real Todo chip instead of an Unknown JSON dump. Kept after the
+        // task/agent arms so spawns win.
+        _ if kind == "todowrite" || kind == "TodoWrite" || todo_items(raw).is_some() => {
+            ToolCall::Todo {
+                items: todo_items(raw).unwrap_or_default(),
+            }
+        }
         _ => ToolCall::Unknown {
             name: if title.is_empty() { kind.into() } else { title },
             input: raw.cloned(),
@@ -618,6 +621,24 @@ mod tests {
                 TodoItem { text: "a".into(), done: true },
                 TodoItem { text: "b".into(), done: false },
             ]
+        ));
+    }
+
+    #[test]
+    fn todowrite_kind_without_raw_maps_to_empty_todo() {
+        // Opening update: kind only, no rawInput yet — Todo, not Unknown.
+        let update = json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "t-todo",
+            "kind": "todowrite",
+        });
+        let events = map_update(&update);
+        assert!(matches!(
+            &events[0],
+            AgentEvent::ToolCall {
+                call: ToolCall::Todo { items },
+                ..
+            } if items.is_empty()
         ));
     }
 
