@@ -182,8 +182,16 @@ mod gate_tests {
 
     #[test]
     fn ready_engine_never_requires_legacy_authentication() {
-        for scope in [None, Some(WorkspaceScope::Local), Some(WorkspaceScope::Synced), Some(WorkspaceScope::Development)] {
-            assert_eq!(gate_phase(&ConnectionStatus::Ready, scope, None), GatePhase::Ready);
+        for scope in [
+            None,
+            Some(WorkspaceScope::Local),
+            Some(WorkspaceScope::Synced),
+            Some(WorkspaceScope::Development),
+        ] {
+            assert_eq!(
+                gate_phase(&ConnectionStatus::Ready, scope, None),
+                GatePhase::Ready
+            );
         }
     }
 }
@@ -489,6 +497,62 @@ pub fn format_tool_detail(events: &[crate::AgentEvent]) -> ToolDetailView {
     ToolDetailView { request, response }
 }
 
+/// How one todo item changed since the previous `Todo` call in the same chat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TodoDiffKind {
+    Added,
+    Completed,
+    Reopened,
+    Removed,
+}
+
+/// One changed todo item: only what moved since the previous call (unchanged
+/// items are omitted, so a repeated full list renders as nothing).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TodoDiffLine {
+    pub text: String,
+    pub kind: TodoDiffKind,
+}
+
+/// Diff the current todo list against the previous `Todo` call (`None` = first
+/// call: everything is `Added`). Matched by exact `text` — order may shift
+/// between calls, content is the stablest identity (`TodoItem` is
+/// `{ text, done }`, no status/priority beyond the boolean).
+pub fn diff_todos(
+    previous: Option<&[crate::TodoItem]>,
+    current: &[crate::TodoItem],
+) -> Vec<TodoDiffLine> {
+    let mut out = Vec::new();
+    for item in current {
+        match previous.and_then(|prev| prev.iter().find(|old| old.text == item.text)) {
+            None => out.push(TodoDiffLine {
+                text: item.text.clone(),
+                kind: TodoDiffKind::Added,
+            }),
+            Some(old) if old.done != item.done => out.push(TodoDiffLine {
+                text: item.text.clone(),
+                kind: if item.done {
+                    TodoDiffKind::Completed
+                } else {
+                    TodoDiffKind::Reopened
+                },
+            }),
+            Some(_) => {}
+        }
+    }
+    if let Some(prev) = previous {
+        for old in prev {
+            if !current.iter().any(|item| item.text == old.text) {
+                out.push(TodoDiffLine {
+                    text: old.text.clone(),
+                    kind: TodoDiffKind::Removed,
+                });
+            }
+        }
+    }
+    out
+}
+
 /// The status-dot palette, as oklch triples (L, C, H°).
 ///
 /// Colors live here rather than in the viewport because the *meaning* of a
@@ -680,14 +744,20 @@ mod sort_chats_tests {
     fn pinned_older_sorts_before_unpinned_newer() {
         let mut chats = vec![chat("new", false, 10, 10), chat("old", true, 0, 0)];
         sort_chats(&mut chats);
-        assert_eq!(chats.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), vec!["old", "new"]);
+        assert_eq!(
+            chats.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            vec!["old", "new"]
+        );
     }
 
     #[test]
     fn pinned_rows_keep_recency_between_them() {
         let mut chats = vec![chat("old-pin", true, 0, 0), chat("new-pin", true, 10, 10)];
         sort_chats(&mut chats);
-        assert_eq!(chats.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), vec!["new-pin", "old-pin"]);
+        assert_eq!(
+            chats.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+            vec!["new-pin", "old-pin"]
+        );
     }
 
     #[test]
@@ -727,10 +797,64 @@ mod sort_chats_tests {
         use crate::{AgentEvent, ToolCall};
         let events = vec![AgentEvent::ToolCall {
             id: "t1".into(),
-            call: ToolCall::ReadFile { path: "a.rs".into() },
+            call: ToolCall::ReadFile {
+                path: "a.rs".into(),
+            },
         }];
         let view = format_tool_detail(&events);
         assert_eq!(view.request, "Read: a.rs");
         assert!(view.response.is_empty());
+    }
+
+    fn todo(text: &str, done: bool) -> crate::TodoItem {
+        crate::TodoItem {
+            text: text.into(),
+            done,
+        }
+    }
+
+    #[test]
+    fn diff_todos_first_call_marks_everything_added() {
+        let current = vec![
+            todo("a", false),
+            todo("b", true),
+            todo("c", false),
+            todo("d", false),
+        ];
+        let diff = diff_todos(None, &current);
+        assert_eq!(diff.len(), 4);
+        assert!(diff.iter().all(|l| l.kind == TodoDiffKind::Added));
+    }
+
+    #[test]
+    fn diff_todos_reports_only_the_item_that_changed() {
+        let prev = vec![todo("a", false), todo("b", false)];
+        let curr = vec![todo("a", false), todo("b", true)];
+        let diff = diff_todos(Some(&prev), &curr);
+        assert_eq!(diff.len(), 1);
+        assert_eq!(diff[0].text, "b");
+        assert_eq!(diff[0].kind, TodoDiffKind::Completed);
+    }
+
+    #[test]
+    fn diff_todos_reports_removed_and_reopened() {
+        let prev = vec![todo("a", true), todo("gone", false)];
+        let curr = vec![todo("a", false)];
+        let diff = diff_todos(Some(&prev), &curr);
+        assert_eq!(diff.len(), 2);
+        assert!(
+            diff.iter()
+                .any(|l| l.text == "a" && l.kind == TodoDiffKind::Reopened)
+        );
+        assert!(
+            diff.iter()
+                .any(|l| l.text == "gone" && l.kind == TodoDiffKind::Removed)
+        );
+    }
+
+    #[test]
+    fn diff_todos_identical_calls_have_empty_diff() {
+        let list = vec![todo("a", false), todo("b", true)];
+        assert!(diff_todos(Some(&list), &list).is_empty());
     }
 }
