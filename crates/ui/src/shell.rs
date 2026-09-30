@@ -2714,6 +2714,12 @@ impl Shell {
             .find(|c| c.id == chat_id)
             .is_some_and(|c| c.pinned);
         self.close_chat_menu(cx);
+        self.state.update(cx, |state, _cx| {
+            if let Some(chat) = state.chats.iter_mut().find(|c| c.id == chat_id) {
+                chat.pinned = !pinned;
+            }
+            crate::state::sort_chats(&mut state.chats);
+        });
         self.mutate(
             serde_json::json!({ "op": "setChatPinned", "chatId": chat_id, "pinned": !pinned }),
             cx,
@@ -3715,6 +3721,7 @@ impl Shell {
         status: komet_proto::ChatIndicator,
         selected: bool,
         archived: bool,
+        pinned: bool,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -3924,6 +3931,14 @@ impl Shell {
                             .text_color(subline)
                             .child(space_name),
                     )
+                    .when(pinned, |el| {
+                        el.child(
+                            icon(icons::PIN)
+                                .size(px(11.0))
+                                .flex_none()
+                                .text_color(theme.text_muted.opacity(0.8)),
+                        )
+                    })
                     .child(div().text_color(subline).child(corner)),
             )
             // Line 2: the session title, flush left (t3code card line 2).
@@ -5040,6 +5055,7 @@ impl Shell {
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.toggle_chat_pinned(pin_id.clone(), cx)
                         }))
+                        .child(icon(icons::PIN).size(px(16.0)).text_color(theme.text_muted))
                         .child(SharedString::from(pin_label)),
                 )
                 .child(

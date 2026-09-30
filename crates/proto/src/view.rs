@@ -87,18 +87,25 @@ pub fn attention_rank(status: ChatIndicator) -> u8 {
 // ---------------------------------------------------------------------------
 
 /// Active-list order: pure recency (`last_message_at` desc, `created_at`
-/// fallback), id tiebreak so the sort is total. Deliberately NOT
-/// attention-bucketed: status drives the DOT, never the position — bucketing
-/// meant that merely OPENING a completed session (completed → seen → idle)
-/// dropped its row under the pointer (user report: "their position in the
-/// scrollbar changes"). Matches the old sidebar, which rendered chats in
-/// recency order and let the dots carry urgency; [`attention_rank`] still
-/// aggregates the space rows' urgency dot.
+/// Sidebar order for active sessions: pinned first, then recency order
+/// (`last_message_at` desc, falling back to `created_at`), id tiebreak so the
+/// sort is total. Deliberately NOT attention-bucketed: status drives the DOT,
+/// never the position — bucketing meant that merely OPENING a completed session
+/// (completed → seen → idle) dropped its row under the pointer (user report:
+/// "their position in the scrollbar changes"). Matches the old sidebar, which
+/// rendered chats in recency order and let the dots carry urgency;
+/// [`attention_rank`] still aggregates the space rows' urgency dot.
 pub fn sort_active(rows: &mut Vec<(ChatIndicator, &Chat)>) {
     rows.sort_by(|(_, a), (_, b)| {
-        let ka = a.last_message_at.unwrap_or(a.created_at);
-        let kb = b.last_message_at.unwrap_or(b.created_at);
-        kb.cmp(&ka).then_with(|| a.id.cmp(&b.id))
+        b.pinned
+            .cmp(&a.pinned)
+            .then_with(|| {
+                let ka = a.last_message_at.unwrap_or(a.created_at);
+                let kb = b.last_message_at.unwrap_or(b.created_at);
+                kb.cmp(&ka)
+            })
+            .then_with(|| b.created_at.cmp(&a.created_at))
+            .then_with(|| a.id.cmp(&b.id))
     });
 }
 
@@ -771,6 +778,19 @@ mod sort_chats_tests {
             chats.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
             vec!["new-pin", "old-pin"]
         );
+    }
+
+    #[test]
+    fn sort_active_prioritizes_pinned() {
+        let c_new = chat("new", false, 10, 10);
+        let c_old_pin = chat("old-pin", true, 0, 0);
+        let mut rows = vec![
+            (crate::ChatIndicator::Idle, &c_new),
+            (crate::ChatIndicator::Idle, &c_old_pin),
+        ];
+        sort_active(&mut rows);
+        assert_eq!(rows[0].1.id, "old-pin");
+        assert_eq!(rows[1].1.id, "new");
     }
 
     #[test]
