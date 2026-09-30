@@ -86,19 +86,23 @@ pub fn attention_rank(status: ChatIndicator) -> u8 {
 // Sort orders
 // ---------------------------------------------------------------------------
 
-/// Active-list order: pure recency (`last_message_at` desc, `created_at`
-/// fallback), id tiebreak so the sort is total. Deliberately NOT
-/// attention-bucketed: status drives the DOT, never the position — bucketing
-/// meant that merely OPENING a completed session (completed → seen → idle)
-/// dropped its row under the pointer (user report: "their position in the
-/// scrollbar changes"). Matches the old sidebar, which rendered chats in
-/// recency order and let the dots carry urgency; [`attention_rank`] still
-/// aggregates the space rows' urgency dot.
+/// Active-list order: pinned first, then pure recency (`last_message_at` desc,
+/// `created_at` fallback), ties break by `created_at` desc then id so the sort is
+/// total and stable across devices. Deliberately NOT attention-bucketed: status
+/// drives the DOT, never the position — bucketing meant that merely OPENING a
+/// completed session (completed → seen → idle) dropped its row under the pointer
+/// (user report: "their position in the scrollbar changes"). Matches [`sort_chats`].
 pub fn sort_active(rows: &mut Vec<(ChatIndicator, &Chat)>) {
     rows.sort_by(|(_, a), (_, b)| {
-        let ka = a.last_message_at.unwrap_or(a.created_at);
-        let kb = b.last_message_at.unwrap_or(b.created_at);
-        kb.cmp(&ka).then_with(|| a.id.cmp(&b.id))
+        b.pinned
+            .cmp(&a.pinned)
+            .then_with(|| {
+                let ka = a.last_message_at.unwrap_or(a.created_at);
+                let kb = b.last_message_at.unwrap_or(b.created_at);
+                kb.cmp(&ka)
+            })
+            .then_with(|| b.created_at.cmp(&a.created_at))
+            .then_with(|| a.id.cmp(&b.id))
     });
 }
 
@@ -647,6 +651,36 @@ mod sort_chats_tests {
         let mut chats = vec![chat("old-pin", true, 0, 0), chat("new-pin", true, 10, 10)];
         sort_chats(&mut chats);
         assert_eq!(chats.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), vec!["new-pin", "old-pin"]);
+    }
+
+    #[test]
+    fn sort_active_pinned_older_sorts_before_unpinned_newer() {
+        let old_pinned = chat("old-pin", true, 0, 0);
+        let new_unpinned = chat("new-unpin", false, 10, 10);
+        let mut rows = vec![
+            (ChatIndicator::Idle, &new_unpinned),
+            (ChatIndicator::Idle, &old_pinned),
+        ];
+        sort_active(&mut rows);
+        assert_eq!(
+            rows.iter().map(|(_, c)| c.id.as_str()).collect::<Vec<_>>(),
+            vec!["old-pin", "new-unpin"]
+        );
+    }
+
+    #[test]
+    fn sort_active_pinned_rows_keep_recency_between_them() {
+        let old_pinned = chat("old-pin", true, 0, 0);
+        let new_pinned = chat("new-pin", true, 10, 10);
+        let mut rows = vec![
+            (ChatIndicator::Idle, &old_pinned),
+            (ChatIndicator::Idle, &new_pinned),
+        ];
+        sort_active(&mut rows);
+        assert_eq!(
+            rows.iter().map(|(_, c)| c.id.as_str()).collect::<Vec<_>>(),
+            vec!["new-pin", "old-pin"]
+        );
     }
 
     #[test]
