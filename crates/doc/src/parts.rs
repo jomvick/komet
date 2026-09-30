@@ -288,7 +288,15 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                 } if pid == id => Some(c),
                 _ => None,
             }) {
-                *existing = call.clone();
+                // Never downgrade a typed call to Unknown: completion updates
+                // often carry title-only shape (no kind/rawInput), which would
+                // clobber e.g. a Todo chip into a JSON dump. Unknown existing
+                // still refreshes (titles carry live progress like "3 todos").
+                let incoming_unknown = matches!(call, ToolCall::Unknown { .. });
+                let existing_known = !matches!(existing, ToolCall::Unknown { .. });
+                if !(incoming_unknown && existing_known) {
+                    *existing = call.clone();
+                }
             } else {
                 out.push(MessagePart::Tool {
                     id: id.clone(),
@@ -736,6 +744,65 @@ mod tests {
         let mut twice = once.clone();
         fold_event_into_parts(&mut twice, &call);
         assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn tool_call_refresh_never_downgrades_to_unknown() {
+        // Title-only completion updates (no kind/rawInput) must not clobber
+        // a typed chip — e.g. a Todo into an "N todos" JSON dump.
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ToolCall {
+                id: "t".into(),
+                call: ToolCall::Todo { items: vec![] },
+            },
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ToolCall {
+                id: "t".into(),
+                call: ToolCall::Unknown {
+                    name: "3 todos".into(),
+                    input: None,
+                },
+            },
+        );
+        assert!(matches!(
+            &parts[0],
+            MessagePart::Tool {
+                call: ToolCall::Todo { .. },
+                ..
+            }
+        ));
+        // Unknown-to-Unknown still refreshes (titles carry live progress).
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ToolCall {
+                id: "u".into(),
+                call: ToolCall::Unknown {
+                    name: "old".into(),
+                    input: None,
+                },
+            },
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ToolCall {
+                id: "u".into(),
+                call: ToolCall::Unknown {
+                    name: "new".into(),
+                    input: None,
+                },
+            },
+        );
+        assert!(matches!(
+            &parts[1],
+            MessagePart::Tool {
+                call: ToolCall::Unknown { name, .. },
+                ..
+            } if name == "new"
+        ));
     }
 
     #[test]
