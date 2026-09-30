@@ -2726,8 +2726,10 @@ impl Transcript {
     fn spawn_journal_fetch(&mut self, chat_id: String, part_id: String, cx: &mut Context<Self>) {
         let key = Self::journal_key(&chat_id, &part_id);
         match self.journal_details.get(&key) {
-            Some(JournalDetail::Ready { .. }) | Some(JournalDetail::Loading(_)) => return,
-            Some(JournalDetail::Unavailable) | None => {}
+            Some(JournalDetail::Ready { .. })
+            | Some(JournalDetail::Loading(_))
+            | Some(JournalDetail::Unavailable) => return,
+            None => {}
         }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
