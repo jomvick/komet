@@ -357,6 +357,14 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     })
 }
 
+/// Shared handles behind a spawned login child: the killable child, the merged
+/// stdout+stderr buffer, and the reaped exit code.
+type SpawnedLoginChild = (
+    Arc<Mutex<Option<tokio::process::Child>>>,
+    Arc<Mutex<String>>,
+    Arc<Mutex<Option<Option<i32>>>>,
+);
+
 /// Spawn a login child, pipe stdout+stderr into one buffer, and monitor exit —
 /// the shared shape behind Codex's `codex login` and Cursor's SDK shim.
 ///
@@ -364,13 +372,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// helper only spawns, drains both pipes into `output`, and polls `try_wait`
 /// every 200ms into `exit` so the child is reaped without owning it (the
 /// cancel path needs concurrent kill access).
-fn spawn_login_child(
-    cmd: &mut tokio::process::Command,
-) -> std::io::Result<(
-    Arc<Mutex<Option<tokio::process::Child>>>,
-    Arc<Mutex<String>>,
-    Arc<Mutex<Option<Option<i32>>>>,
-)> {
+fn spawn_login_child(cmd: &mut tokio::process::Command) -> std::io::Result<SpawnedLoginChild> {
     let mut child = cmd.spawn()?;
     let output = Arc::new(Mutex::new(String::new()));
     for pipe in [
