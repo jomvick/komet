@@ -46,7 +46,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -73,6 +73,9 @@ const CLAUDE_TOKEN_URL: &str = "https://console.anthropic.com/v1/oauth/token";
 const CLAUDE_PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
 const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+// Cursor's usage dashboard API — returns `{usage: {requestCount, requestLimit,
+// tokenCount, tokenLimit}, requestWindowSeconds}` for the billing period.
+const CURSOR_USAGE_URL: &str = "https://www.cursor.com/api/usage";
 // Codex CLI's public ChatGPT OAuth client (no secret; PKCE on login, refresh
 // is client_id + refresh_token). Same id the CLI posts to auth.openai.com.
 const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -91,6 +94,11 @@ const ANTIGRAVITY_CLIENT_SECRET: &str = concat!("GOCSPX-", "K58FWR486LdLJ1mLB8sX
 // The keyring item `agy` (zalando/go-keyring) reads/writes its live Google
 // token — discovered by introspecting the Secret Service (Task 0 of
 // docs/superpowers/plans/2026-09-02-antigravity-pty-login.md).
+//
+// This item is not exclusively owned by komet — running `agy` directly in a
+// terminal during an add-account flow races the same secret. The
+// snapshot-before-clear + restore-on-cancel logic mitigates komet's own
+// internal races only.
 #[cfg(target_os = "linux")]
 const AGY_KEYRING_SERVICE: &str = "gemini";
 #[cfg(target_os = "linux")]
@@ -341,7 +349,86 @@ struct Inner {
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+    mutex.lock().unwrap_or_else(|poisoned| {
+        tracing::error!(
+            "agent-accounts: recovered from a poisoned mutex — a prior panic left shared login/account state in an unknown condition"
+        );
+        poisoned.into_inner()
+    })
+}
+
+/// Spawn a login child, pipe stdout+stderr into one buffer, and monitor exit —
+/// the shared shape behind Codex's `codex login` and Cursor's SDK shim.
+///
+/// The caller configures `cmd` beforehand (notably piped stdout/stderr); this
+/// helper only spawns, drains both pipes into `output`, and polls `try_wait`
+/// every 200ms into `exit` so the child is reaped without owning it (the
+/// cancel path needs concurrent kill access).
+fn spawn_login_child(
+    cmd: &mut tokio::process::Command,
+) -> std::io::Result<(
+    Arc<Mutex<Option<tokio::process::Child>>>,
+    Arc<Mutex<String>>,
+    Arc<Mutex<Option<Option<i32>>>>,
+)> {
+    let mut child = cmd.spawn()?;
+    let output = Arc::new(Mutex::new(String::new()));
+    for pipe in [
+        child
+            .stdout
+            .take()
+            .map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Send + Unpin>),
+        child
+            .stderr
+            .take()
+            .map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Send + Unpin>),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let sink = output.clone();
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut pipe = pipe;
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = pipe.read(&mut buf).await {
+                if n == 0 {
+                    break;
+                }
+                lock(&sink).push_str(&String::from_utf8_lossy(&buf[..n]));
+            }
+        });
+    }
+
+    let child = Arc::new(Mutex::new(Some(child)));
+    let exit: Arc<Mutex<Option<Option<i32>>>> = Arc::new(Mutex::new(None));
+    {
+        let child = child.clone();
+        let exit = exit.clone();
+        tokio::spawn(async move {
+            loop {
+                {
+                    let mut slot = lock(&child);
+                    match slot.as_mut().map(|c| c.try_wait()) {
+                        None => break,
+                        Some(Ok(Some(status))) => {
+                            *lock(&exit) = Some(status.code());
+                            *slot = None;
+                            break;
+                        }
+                        Some(Ok(None)) => {}
+                        Some(Err(_)) => {
+                            *lock(&exit) = Some(None);
+                            *slot = None;
+                            break;
+                        }
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        });
+    }
+    Ok((child, output, exit))
 }
 
 #[derive(Clone)]
@@ -544,11 +631,30 @@ impl AgentAccounts {
         harness: HarnessId,
         account_id: &str,
     ) -> Result<AgentAccountsSnapshot, EngineError> {
+        // Capture AVANT list() — le dédup qu'il déclenche peut supprimer ce fichier
+        // s'il est un doublon par email, mais l'identité de compte, elle, survit
+        // toujours sous le slot gardé.
+        let target_key = self
+            .read_slots(harness)
+            .into_iter()
+            .find(|s| s.id == account_id)
+            .map(|s| s.account_key)
+            .filter(|k| !k.is_empty());
         self.list(false).await?;
         let slot = self
             .read_slots(harness)
             .into_iter()
             .find(|s| s.id == account_id)
+            // Fallback : le slot a été dédupliqué entre les deux lectures — même
+            // compte, nouvel id. Le retrouver par account_key plutôt que d'échouer.
+            // `target_key` est `None` pour un id inventé (aucune clé à suivre) et
+            // filtré quand vide : pas de faux positif vers un slot existant.
+            .or_else(|| {
+                let key = target_key?;
+                self.read_slots(harness)
+                    .into_iter()
+                    .find(|s| s.account_key == key)
+            })
             .ok_or_else(|| {
                 EngineError::Other(
                     "That saved login no longer exists — refresh and try again.".into(),
@@ -763,15 +869,14 @@ impl AgentAccounts {
             .root_dir()
             .join(format!(".login-{login_id}"));
         std::fs::create_dir_all(&home)?;
-        let mut child = match tokio::process::Command::new("codex")
-            .arg("login")
+        let mut cmd = tokio::process::Command::new("codex");
+        cmd.arg("login")
             .env("CODEX_HOME", &home)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-        {
-            Ok(child) => child,
+            .stderr(std::process::Stdio::piped());
+        let (child, output, exit) = match spawn_login_child(&mut cmd) {
+            Ok(t) => t,
             Err(err) => {
                 let _ = std::fs::remove_dir_all(&home);
                 return Err(EngineError::Other(
@@ -787,64 +892,6 @@ impl AgentAccounts {
         // codex prints the authorize URL (to stderr as of 0.142 — scan both
         // streams) and usually opens the browser itself; grab it so the app can
         // open it too.
-        let output = Arc::new(Mutex::new(String::new()));
-        for pipe in [
-            child
-                .stdout
-                .take()
-                .map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Send + Unpin>),
-            child
-                .stderr
-                .take()
-                .map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Send + Unpin>),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            let sink = output.clone();
-            tokio::spawn(async move {
-                use tokio::io::AsyncReadExt;
-                let mut pipe = pipe;
-                let mut buf = [0u8; 4096];
-                while let Ok(n) = pipe.read(&mut buf).await {
-                    if n == 0 {
-                        break;
-                    }
-                    lock(&sink).push_str(&String::from_utf8_lossy(&buf[..n]));
-                }
-            });
-        }
-
-        let child = Arc::new(Mutex::new(Some(child)));
-        let exit: Arc<Mutex<Option<Option<i32>>>> = Arc::new(Mutex::new(None));
-        {
-            // Monitor: poll try_wait so the child is reaped without owning it —
-            // the cancel path needs concurrent kill access.
-            let child = child.clone();
-            let exit = exit.clone();
-            tokio::spawn(async move {
-                loop {
-                    {
-                        let mut slot = lock(&child);
-                        match slot.as_mut().map(|c| c.try_wait()) {
-                            None => break,
-                            Some(Ok(Some(status))) => {
-                                *lock(&exit) = Some(status.code());
-                                *slot = None;
-                                break;
-                            }
-                            Some(Ok(None)) => {}
-                            Some(Err(_)) => {
-                                *lock(&exit) = Some(None);
-                                *slot = None;
-                                break;
-                            }
-                        }
-                    }
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                }
-            });
-        }
 
         lock(&self.inner.flows).insert(
             login_id.clone(),
@@ -904,8 +951,8 @@ impl AgentAccounts {
         cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
-        let mut child = match cmd.spawn() {
-            Ok(child) => child,
+        let (child, output, exit) = match spawn_login_child(&mut cmd) {
+            Ok(t) => t,
             Err(err) => {
                 let _ = std::fs::remove_dir_all(&home);
                 return Err(EngineError::Other(format!(
@@ -913,63 +960,6 @@ impl AgentAccounts {
                 )));
             }
         };
-
-        let output = Arc::new(Mutex::new(String::new()));
-        for pipe in [
-            child
-                .stdout
-                .take()
-                .map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Send + Unpin>),
-            child
-                .stderr
-                .take()
-                .map(|s| Box::new(s) as Box<dyn tokio::io::AsyncRead + Send + Unpin>),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            let sink = output.clone();
-            tokio::spawn(async move {
-                use tokio::io::AsyncReadExt;
-                let mut pipe = pipe;
-                let mut buf = [0u8; 4096];
-                while let Ok(n) = pipe.read(&mut buf).await {
-                    if n == 0 {
-                        break;
-                    }
-                    lock(&sink).push_str(&String::from_utf8_lossy(&buf[..n]));
-                }
-            });
-        }
-
-        let child = Arc::new(Mutex::new(Some(child)));
-        let exit: Arc<Mutex<Option<Option<i32>>>> = Arc::new(Mutex::new(None));
-        {
-            let child = child.clone();
-            let exit = exit.clone();
-            tokio::spawn(async move {
-                loop {
-                    {
-                        let mut slot = lock(&child);
-                        match slot.as_mut().map(|c| c.try_wait()) {
-                            None => break,
-                            Some(Ok(Some(status))) => {
-                                *lock(&exit) = Some(status.code());
-                                *slot = None;
-                                break;
-                            }
-                            Some(Ok(None)) => {}
-                            Some(Err(_)) => {
-                                *lock(&exit) = Some(None);
-                                *slot = None;
-                                break;
-                            }
-                        }
-                    }
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                }
-            });
-        }
 
         lock(&self.inner.flows).insert(
             login_id.clone(),
@@ -1000,6 +990,12 @@ impl AgentAccounts {
         })
     }
 
+    /// Start an Antigravity add-account flow behind a PTY.
+    ///
+    /// This item is not exclusively owned by komet — running `agy` directly in
+    /// a terminal during an add-account flow races the same secret. The
+    /// snapshot-before-clear + restore-on-cancel logic mitigates komet's own
+    /// internal races only.
     async fn start_antigravity_login(&self) -> Result<AgentLoginStart, EngineError> {
         // The live token lives in ONE global keyring item (`gemini`/`antigravity`,
         // go-keyring schema), so at most one flow at a time — a new login
@@ -1463,6 +1459,11 @@ impl AgentAccounts {
     /// A successful adoption tears the flow down through
     /// [`Self::finish_antigravity_login`] — never `cancel_login`, which would
     /// restore the OLD secret and immediately undo the sign-in.
+    ///
+    /// The keyring item is shared with an external `agy` running in a terminal:
+    /// a changed-but-unparseable secret is logged distinctly instead of being
+    /// silently skipped — it may be a third account written concurrently rather
+    /// than the login this flow just completed.
     async fn adopt_antigravity_secret(
         &self,
         login_id: &str,
@@ -1473,6 +1474,9 @@ impl AgentAccounts {
             return Ok(false);
         }
         let Some(mut detected) = parse_antigravity_auth(value.clone()) else {
+            tracing::warn!(
+                "agent-accounts: antigravity keyring changed to an unrecognized shape during login — possible concurrent `agy` write; waiting for the flow's own secret"
+            );
             return Ok(false);
         };
         self.enrich_antigravity_profile(&mut detected, &value).await;
@@ -2111,6 +2115,7 @@ impl AgentAccounts {
             HarnessId::ClaudeCode => self.claude_usage(slot, is_active).await,
             HarnessId::Codex => self.codex_usage(slot, is_active).await,
             HarnessId::Antigravity => self.antigravity_usage(slot, is_active).await,
+            HarnessId::Cursor => self.cursor_usage(slot).await,
             _ => None,
         };
         // Cache successes only. Remembering a miss made a transient failure
@@ -2245,6 +2250,66 @@ impl AgentAccounts {
             .await
             .ok()?;
         let windows = parse_codex_usage_response(&body);
+        (!windows.is_empty()).then_some(windows)
+    }
+
+    // ── Cursor usage ────────────────────────────────────────────────────────
+    //
+    // Cursor's usage endpoint (`/api/usage`) returns per-billing-period request
+    // and token quotas for the authenticated Workos account. The session token
+    // stored in the slot's credentials is sent as a Bearer — the same value
+    // `read_cursor_sqlite_token` extracted from `state.vscdb`.
+    //
+    // Unlike Claude/Codex there is no refresh-token path for inactive slots:
+    // Cursor issues a new session interactively. If the slot token has gone
+    // stale we fall back to a fresh SQLite read (Cursor may have re-authed in
+    // the meantime) before giving up.
+    async fn cursor_usage(&self, slot: &Slot) -> Option<Vec<AgentUsageWindow>> {
+        // Primary: token stored in the slot credentials by detect_cursor.
+        let slot_token = str_field(&slot.credentials, "sessionToken")
+            .or_else(|| str_field(&slot.credentials, "accessToken"));
+
+        if let Some(token) = slot_token.as_deref() {
+            if let Some(windows) = self.query_cursor_usage(token).await {
+                return Some(windows);
+            }
+        }
+
+        // Fallback: try a fresh read from the local SQLite store (Cursor may
+        // have silently refreshed its session since the slot was last saved).
+        for db in cursor_state_db_paths() {
+            if let Some(token) = read_cursor_sqlite_token(&db) {
+                if slot_token.as_deref() == Some(token.as_str()) {
+                    // Same stale token — no point trying again.
+                    continue;
+                }
+                if let Some(windows) = self.query_cursor_usage(&token).await {
+                    return Some(windows);
+                }
+            }
+        }
+        None
+    }
+
+    async fn query_cursor_usage(&self, session_token: &str) -> Option<Vec<AgentUsageWindow>> {
+        let body: serde_json::Value = self
+            .inner
+            .http
+            .get(CURSOR_USAGE_URL)
+            .bearer_auth(session_token)
+            // Cursor's dashboard page sets these; mimic it to avoid bot
+            // detection that might return an empty or error response.
+            .header("Accept", "application/json")
+            .header("Referer", "https://www.cursor.com/settings")
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        let windows = parse_cursor_usage_response(&body);
         (!windows.is_empty()).then_some(windows)
     }
 
@@ -3385,6 +3450,65 @@ fn parse_codex_usage_response(body: &serde_json::Value) -> Vec<AgentUsageWindow>
             });
         }
     }
+    windows
+}
+
+/// Cursor `/api/usage` → request-count and token-count meters.
+///
+/// Response shape (as of 2026-09):
+/// ```json
+/// {
+///   "usage": {
+///     "requestCount": 42,
+///     "requestLimit": 500,
+///     "tokenCount": 1_800_000,
+///     "tokenLimit": 10_000_000
+///   },
+///   "requestWindowSeconds": 2592000
+/// }
+/// ```
+/// `requestWindowSeconds` > 86 400 → label "Month", otherwise "Session".
+fn parse_cursor_usage_response(body: &serde_json::Value) -> Vec<AgentUsageWindow> {
+    let Some(usage) = body.get("usage") else {
+        return Vec::new();
+    };
+    let span = body
+        .get("requestWindowSeconds")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let label = if span > 86_400 { "Month" } else { "Session" };
+    let mut windows = Vec::new();
+
+    // Request quota window.
+    if let (Some(count), Some(limit)) = (
+        usage.get("requestCount").and_then(json_f64),
+        usage.get("requestLimit").and_then(json_f64),
+    ) {
+        if limit > 0.0 {
+            windows.push(AgentUsageWindow {
+                label: format!("{label} Requests"),
+                used_fraction: (count / limit).clamp(0.0, 1.0) as f32,
+                resets_at: parse_when(body.get("resetsAt")).or_else(|| {
+                    parse_when(body.get("resetAt"))
+                }),
+            });
+        }
+    }
+
+    // Token quota window (optional — not all Cursor plans expose it).
+    if let (Some(count), Some(limit)) = (
+        usage.get("tokenCount").and_then(json_f64),
+        usage.get("tokenLimit").and_then(json_f64),
+    ) {
+        if limit > 0.0 {
+            windows.push(AgentUsageWindow {
+                label: format!("{label} Tokens"),
+                used_fraction: (count / limit).clamp(0.0, 1.0) as f32,
+                resets_at: None,
+            });
+        }
+    }
+
     windows
 }
 
@@ -4697,5 +4821,214 @@ mod tests {
         );
         let email_slot = dummy_codex_slot("user@example.com");
         assert_eq!(codex_account_id(&serde_json::json!({}), &email_slot), "");
+    }
+
+    // ── parse_cursor_usage_response ─────────────────────────────────────────
+
+    #[test]
+    fn parse_cursor_usage_response_request_window_only() {
+        let json = serde_json::json!({
+            "usage": {
+                "requestCount": 100,
+                "requestLimit": 500,
+            },
+            "requestWindowSeconds": 86400
+        });
+        let windows = parse_cursor_usage_response(&json);
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].label, "Session Requests");
+        assert!((windows[0].used_fraction - 0.2).abs() < 0.001);
+    }
+
+    #[test]
+    fn parse_cursor_usage_response_requests_and_tokens() {
+        let json = serde_json::json!({
+            "usage": {
+                "requestCount": 250,
+                "requestLimit": 500,
+                "tokenCount": 5_000_000,
+                "tokenLimit": 10_000_000,
+            },
+            "requestWindowSeconds": 2_592_000
+        });
+        let windows = parse_cursor_usage_response(&json);
+        assert_eq!(windows.len(), 2);
+        // Monthly label when window > 86 400 s.
+        assert_eq!(windows[0].label, "Month Requests");
+        assert!((windows[0].used_fraction - 0.5).abs() < 0.001);
+        assert_eq!(windows[1].label, "Month Tokens");
+        assert!((windows[1].used_fraction - 0.5).abs() < 0.001);
+    }
+
+    #[test]
+    fn parse_cursor_usage_response_overshoot_clamped_to_one() {
+        let json = serde_json::json!({
+            "usage": { "requestCount": 600, "requestLimit": 500 }
+        });
+        let windows = parse_cursor_usage_response(&json);
+        assert_eq!(windows.len(), 1);
+        assert!((windows[0].used_fraction - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn parse_cursor_usage_response_empty_on_missing_usage_key() {
+        assert!(parse_cursor_usage_response(&serde_json::json!({"other": 1})).is_empty());
+        // Zero limit — divide-by-zero guard; must produce no window.
+        let json = serde_json::json!({"usage": {"requestCount": 10, "requestLimit": 0}});
+        assert!(parse_cursor_usage_response(&json).is_empty());
+    }
+
+    // ── Phase 0 — filet de sécurité : course dédup/switch ────────────────
+    //
+    // `list()` déduplique par email (garde le plus récent) AVANT qu'`activate()`
+    // ne résolve le slot visé : activer l'id du doublon supprimé échoue avec le
+    // "no longer exists" générique alors que l'identité de compte a survécu
+    // sous le slot gardé. Ce test documente le comportement attendu (fallback
+    // vers le survivant quand `account_key` est identique) — il échoue avant la
+    // Phase 3 et passe après.
+
+    fn dedup_test_slot(id: &str, account_key: &str, email: &str, saved_at: i64) -> Slot {
+        Slot {
+            id: id.into(),
+            harness: HarnessId::Cursor,
+            account_key: account_key.into(),
+            profile: SlotProfile {
+                email: email.into(),
+                display_name: None,
+                organization: None,
+                plan: None,
+                auth_kind: AgentAuthKind::Oauth,
+            },
+            credentials: serde_json::json!({
+                "apiKey": "cur_secret",
+                "email": email,
+            }),
+            claude_config: None,
+            saved_at,
+            created_at: None,
+        }
+    }
+
+    fn dedup_test_config(root: &std::path::Path) -> AgentAccountsConfig {
+        AgentAccountsConfig {
+            data_dir: root.join("data"),
+            claude_config_dir: root.join("claude"),
+            claude_config_file: root.join("claude.json"),
+            codex_home: root.join("codex"),
+            antigravity_home: root.join("antigravity"),
+            cursor_auth_file: root.join("sdk").join("auth.json"),
+        }
+    }
+
+    #[test]
+    fn lock_recovers_from_poisoned_mutex_without_cascading_panic() {
+        let mutex = Mutex::new(41u32);
+        // Panic volontaire sous verrou → empoisonne le mutex.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = lock(&mutex);
+            panic!("intentional poison for lock() test");
+        }));
+        assert!(mutex.is_poisoned(), "the mutex must be poisoned for this test");
+        // L'appel suivant ne doit pas re-paniquer : il logue et récupère.
+        *lock(&mutex) = 42;
+        assert_eq!(*lock(&mutex), 42);
+    }
+
+    #[tokio::test]
+    async fn activate_falls_back_to_survivor_when_target_slot_was_just_deduped() {
+        let root = std::env::temp_dir().join(format!(
+            "komet-activate-dedup-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let accounts = AgentAccounts::new(dedup_test_config(&root));
+        // Même identité (même account_key + même email), deux fichiers : le
+        // dédup de list() garde le plus récent et supprime l'ancien.
+        accounts
+            .write_slot(&dedup_test_slot(
+                "aaaaaaaaaaaaaaaa",
+                "dup@example.com",
+                "dup@example.com",
+                1000,
+            ))
+            .unwrap();
+        accounts
+            .write_slot(&dedup_test_slot(
+                "bbbbbbbbbbbbbbbb",
+                "dup@example.com",
+                "dup@example.com",
+                2000,
+            ))
+            .unwrap();
+
+        // Activer l'ancien id (celui que le dédup va supprimer) doit résoudre
+        // vers le slot survivant — même compte, nouvel id — plutôt que
+        // d'échouer avec le "no longer exists" générique. L'id final est
+        // canonique (`slot_id_for`) après re-snapshot, donc on assert sur
+        // l'identité (email + actif), pas sur l'id de fichier initial.
+        let snapshot = accounts
+            .activate(HarnessId::Cursor, "aaaaaaaaaaaaaaaa")
+            .await
+            .expect("activate should follow the deduped slot to its survivor");
+        assert!(
+            snapshot.accounts.iter().any(|a| a.harness == HarnessId::Cursor
+                && a.email.as_deref() == Some("dup@example.com")
+                && a.active),
+            "survivor identity must remain listed as active: {snapshot:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn activate_still_fails_for_a_truly_unknown_id() {
+        let root = std::env::temp_dir().join(format!(
+            "komet-activate-unknown-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let accounts = AgentAccounts::new(dedup_test_config(&root));
+        accounts
+            .write_slot(&dedup_test_slot(
+                "bbbbbbbbbbbbbbbb",
+                "dup@example.com",
+                "dup@example.com",
+                2000,
+            ))
+            .unwrap();
+
+        // Garde-fou anti faux positif : un id inventé (aucune clé à suivre) ne
+        // doit jamais être "résolu" vers un slot existant.
+        let err = accounts
+            .activate(HarnessId::Cursor, "cccccccccccccccc")
+            .await
+            .expect_err("unknown id must still fail");
+        assert!(
+            err.to_string().contains("no longer exists"),
+            "unexpected error: {err:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn adopt_antigravity_secret_ignores_unparseable_changed_secret() {
+        let root = std::env::temp_dir().join(format!(
+            "komet-agy-adopt-garbage-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let accounts = AgentAccounts::new(dedup_test_config(&root));
+        // Changé par rapport à `initial` mais incohérent (ni l'ancien secret,
+        // ni un login utilisable — ex. écriture concurrente d'un `agy` externe)
+        // : ne doit pas être adopté, juste ignoré avec un avertissement.
+        let adopted = accounts
+            .adopt_antigravity_secret(
+                "no-such-flow",
+                Some(r#"{"token":{"access_token":"old"}}"#),
+                serde_json::json!({"unrelated": 1}),
+            )
+            .await
+            .expect("adopt probe");
+        assert!(!adopted, "garbage secret must not be adopted as a login");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
