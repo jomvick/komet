@@ -349,12 +349,19 @@ struct Inner {
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| {
-        tracing::error!(
-            "agent-accounts: recovered from a poisoned mutex — a prior panic left shared login/account state in an unknown condition"
-        );
-        poisoned.into_inner()
-    })
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            tracing::error!(
+                "agent-accounts: recovered from a poisoned mutex — a prior panic left shared login/account state in an unknown condition"
+            );
+            // Un mutex empoisonné le reste : sans clear, chaque lock() suivant
+            // relogue (boucle de poll à 200ms ⇒ ~5 lignes/s/flow). On ne logue
+            // qu'une fois.
+            mutex.clear_poison();
+            poisoned.into_inner()
+        }
+    }
 }
 
 /// Shared handles behind a spawned login child: the killable child, the merged
@@ -635,27 +642,32 @@ impl AgentAccounts {
     ) -> Result<AgentAccountsSnapshot, EngineError> {
         // Capture AVANT list() — le dédup qu'il déclenche peut supprimer ce fichier
         // s'il est un doublon par email, mais l'identité de compte, elle, survit
-        // toujours sous le slot gardé.
-        let target_key = self
+        // toujours sous le slot gardé. Le dédup est par EMAIL (un re-login change
+        // l'account_key), donc le fallback suit l'email normalisé — pas la clé.
+        // Les placeholders opaques Antigravity sont exclus : deux placeholders
+        // peuvent être deux comptes différents.
+        let target_email = self
             .read_slots(harness)
             .into_iter()
             .find(|s| s.id == account_id)
-            .map(|s| s.account_key)
-            .filter(|k| !k.is_empty());
+            .filter(|s| {
+                !(harness == HarnessId::Antigravity
+                    && is_opaque_antigravity_email(&s.profile.email))
+            })
+            .map(|s| s.profile.email.to_lowercase());
         self.list(false).await?;
         let slot = self
             .read_slots(harness)
             .into_iter()
             .find(|s| s.id == account_id)
             // Fallback : le slot a été dédupliqué entre les deux lectures — même
-            // compte, nouvel id. Le retrouver par account_key plutôt que d'échouer.
-            // `target_key` est `None` pour un id inventé (aucune clé à suivre) et
-            // filtré quand vide : pas de faux positif vers un slot existant.
+            // email, nouvel id. `target_email` est `None` pour un id inventé
+            // (aucun email à suivre) : pas de faux positif vers un slot existant.
             .or_else(|| {
-                let key = target_key?;
+                let email = target_email?;
                 self.read_slots(harness)
                     .into_iter()
-                    .find(|s| s.account_key == key)
+                    .find(|s| s.profile.email.to_lowercase() == email)
             })
             .ok_or_else(|| {
                 EngineError::Other(
@@ -4892,8 +4904,8 @@ mod tests {
     // ne résolve le slot visé : activer l'id du doublon supprimé échoue avec le
     // "no longer exists" générique alors que l'identité de compte a survécu
     // sous le slot gardé. Ce test documente le comportement attendu (fallback
-    // vers le survivant quand `account_key` est identique) — il échoue avant la
-    // Phase 3 et passe après.
+    // vers le survivant par email normalisé) — il échoue avant la Phase 3 et
+    // passe après.
 
     fn dedup_test_slot(id: &str, account_key: &str, email: &str, saved_at: i64) -> Slot {
         Slot {
@@ -4950,32 +4962,26 @@ mod tests {
             now_ms()
         ));
         let accounts = AgentAccounts::new(dedup_test_config(&root));
-        // Même identité (même account_key + même email), deux fichiers : le
-        // dédup de list() garde le plus récent et supprime l'ancien.
+        // Le vrai scénario de doublon : un re-login génère un NOUVEAU refresh
+        // token donc un nouvel account_key, mais le même email. Le dédup de
+        // list() garde le plus récent et supprime l'ancien. Ids canoniques via
+        // slot_id_for (l'id est une fonction de la clé — deux slots de même
+        // clé partageraient le même fichier).
+        let old_id = slot_id_for(HarnessId::Cursor, "k1");
+        let new_id = slot_id_for(HarnessId::Cursor, "k2");
+        assert_ne!(old_id, new_id);
         accounts
-            .write_slot(&dedup_test_slot(
-                "aaaaaaaaaaaaaaaa",
-                "dup@example.com",
-                "dup@example.com",
-                1000,
-            ))
+            .write_slot(&dedup_test_slot(&old_id, "k1", "dup@example.com", 1000))
             .unwrap();
         accounts
-            .write_slot(&dedup_test_slot(
-                "bbbbbbbbbbbbbbbb",
-                "dup@example.com",
-                "dup@example.com",
-                2000,
-            ))
+            .write_slot(&dedup_test_slot(&new_id, "k2", "dup@example.com", 2000))
             .unwrap();
 
         // Activer l'ancien id (celui que le dédup va supprimer) doit résoudre
-        // vers le slot survivant — même compte, nouvel id — plutôt que
-        // d'échouer avec le "no longer exists" générique. L'id final est
-        // canonique (`slot_id_for`) après re-snapshot, donc on assert sur
-        // l'identité (email + actif), pas sur l'id de fichier initial.
+        // vers le slot survivant — même email, nouvel id — plutôt que
+        // d'échouer avec le "no longer exists" générique.
         let snapshot = accounts
-            .activate(HarnessId::Cursor, "aaaaaaaaaaaaaaaa")
+            .activate(HarnessId::Cursor, &old_id)
             .await
             .expect("activate should follow the deduped slot to its survivor");
         assert!(
