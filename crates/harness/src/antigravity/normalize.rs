@@ -1,4 +1,4 @@
-use komet_proto::{AgentEvent, ToolCall, UserInputQuestion};
+use komet_proto::{AgentEvent, ToolCall, TodoItem, UserInputQuestion};
 use serde_json::Value;
 
 pub fn normalize_line(line: &str) -> Option<AgentEvent> {
@@ -11,6 +11,38 @@ pub fn normalize_line(line: &str) -> Option<AgentEvent> {
     Some(AgentEvent::TextDelta {
         text: t.to_string(),
     })
+}
+
+/// Extract `TodoItem`s from a params value carrying `todos: [{content, status}]`.
+///
+/// Returns `Some` (possibly empty) when the `todos` key exists with an array
+/// where every element has a `content` string, `None` otherwise (so the
+/// shape-detection fallback only fires when the params actually look like a
+/// todo call, not on arbitrary objects that happen to have unrelated fields).
+fn todo_items(params: Option<&Value>) -> Option<Vec<TodoItem>> {
+    let items = params?.get("todos")?.as_array()?;
+    // Require every element to have a `content` string — this is the
+    // discriminant that distinguishes a real todo list from other array params.
+    if !items
+        .iter()
+        .all(|t| t.get("content").and_then(Value::as_str).is_some())
+    {
+        return None;
+    }
+    Some(
+        items
+            .iter()
+            .map(|t| TodoItem {
+                text: t
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned(),
+                done: t.get("status").and_then(Value::as_str) == Some("completed")
+                    || t.get("completed").and_then(Value::as_bool) == Some(true),
+            })
+            .collect(),
+    )
 }
 
 /// Normalize an Antigravity tool invocation to a typed `ToolCall`.
@@ -173,10 +205,26 @@ pub fn normalize_tool_call(name: &str, params: Option<&Value>) -> ToolCall {
                 input: params.cloned(),
             }
         }
-        other => ToolCall::Unknown {
-            name: other.to_string(),
-            input: params.cloned(),
+        // Explicit todo-write tools: Antigravity / AGY emits these when the
+        // agent writes its task plan. Kept after invoke_subagent so spawns win.
+        "TodoWrite" | "todo_write" | "write_todo" | "update_todos" => ToolCall::Todo {
+            items: todo_items(params).unwrap_or_default(),
         },
+        // Shape-detection fallback: any tool not matched above whose params
+        // carry a well-formed `todos` array is normalized to a Todo chip
+        // rather than falling through to an Unknown JSON dump. This makes the
+        // feature resilient to future tool-name changes in AGY without
+        // requiring a code change.
+        other => {
+            if let Some(items) = todo_items(params) {
+                ToolCall::Todo { items }
+            } else {
+                ToolCall::Unknown {
+                    name: other.to_string(),
+                    input: params.cloned(),
+                }
+            }
+        }
     }
 }
 
@@ -302,5 +350,79 @@ mod tests {
         assert_eq!(questions[0].question, "Which option?");
         assert_eq!(questions[0].options, vec!["First", "Second"]);
         assert!(!questions[0].multi_select);
+    }
+
+    // ── Todo normalization ────────────────────────────────────────────────────
+
+    #[test]
+    fn agy_todo_write_explicit_name_maps_to_todo_chip() {
+        // AGY native name with content/status shape.
+        let json = serde_json::json!({
+            "todos": [
+                { "content": "Set up repo", "status": "completed", "priority": "high" },
+                { "content": "Write tests",  "status": "in_progress", "priority": "medium" },
+            ]
+        });
+        let call = normalize_tool_call("TodoWrite", Some(&json));
+        match call {
+            ToolCall::Todo { items } => {
+                assert_eq!(items.len(), 2);
+                assert!(items[0].done);
+                assert!(!items[1].done);
+                assert_eq!(items[0].text, "Set up repo");
+            }
+            other => panic!("expected Todo, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agy_todo_write_alias_todo_write_maps_to_todo_chip() {
+        // snake_case alias.
+        let json = serde_json::json!({
+            "todos": [{ "content": "Deploy", "status": "pending" }]
+        });
+        let call = normalize_tool_call("todo_write", Some(&json));
+        assert!(matches!(call, ToolCall::Todo { .. }));
+    }
+
+    #[test]
+    fn agy_unknown_tool_with_todo_shape_maps_to_todo_chip() {
+        // Future / renamed tool: unknown name but well-formed todos array.
+        let json = serde_json::json!({
+            "todos": [
+                { "content": "a", "status": "completed" },
+                { "content": "b", "status": "open" },
+            ]
+        });
+        let call = normalize_tool_call("some_future_plan_tool", Some(&json));
+        match call {
+            ToolCall::Todo { items } => {
+                assert_eq!(items.len(), 2);
+                assert!(items[0].done);
+                assert!(!items[1].done);
+            }
+            other => panic!("expected Todo via shape-detection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agy_unknown_tool_without_todo_shape_stays_unknown() {
+        // A tool that has an array but NOT a `todos` key — must not become Todo.
+        let json = serde_json::json!({ "items": [{ "id": 1 }] });
+        let call = normalize_tool_call("some_other_tool", Some(&json));
+        assert!(matches!(call, ToolCall::Unknown { .. }));
+    }
+
+    #[test]
+    fn agy_todo_write_explicit_name_with_malformed_items_yields_empty_todo() {
+        // Malformed todos (no `content`) must not produce a Todo chip.
+        let json = serde_json::json!({
+            "todos": [{ "text": "oops", "status": "pending" }]
+        });
+        let call = normalize_tool_call("TodoWrite", Some(&json));
+        // `todo_items` returns None → falls back to empty vec via unwrap_or_default
+        // for the named arm, so still Todo but empty items (acceptable — rather
+        // than Unknown JSON dump).
+        assert!(matches!(call, ToolCall::Todo { .. }));
     }
 }
