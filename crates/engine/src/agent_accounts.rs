@@ -2117,7 +2117,7 @@ impl AgentAccounts {
             HarnessId::ClaudeCode => self.claude_usage(slot, is_active).await,
             HarnessId::Codex => self.codex_usage(slot, is_active).await,
             HarnessId::Antigravity => self.antigravity_usage(slot, is_active).await,
-            HarnessId::Cursor => self.cursor_usage(slot).await,
+            HarnessId::Cursor => self.cursor_usage(slot, is_active).await,
             _ => None,
         };
         // Cache successes only. Remembering a miss made a transient failure
@@ -2266,7 +2266,7 @@ impl AgentAccounts {
     // Cursor issues a new session interactively. If the slot token has gone
     // stale we fall back to a fresh SQLite read (Cursor may have re-authed in
     // the meantime) before giving up.
-    async fn cursor_usage(&self, slot: &Slot) -> Option<Vec<AgentUsageWindow>> {
+    async fn cursor_usage(&self, slot: &Slot, is_active: bool) -> Option<Vec<AgentUsageWindow>> {
         // Primary: token stored in the slot credentials by detect_cursor.
         let slot_token = str_field(&slot.credentials, "sessionToken")
             .or_else(|| str_field(&slot.credentials, "accessToken"));
@@ -2279,6 +2279,12 @@ impl AgentAccounts {
 
         // Fallback: try a fresh read from the local SQLite store (Cursor may
         // have silently refreshed its session since the slot was last saved).
+        // Active slot only: the store holds the LIVE session (whichever
+        // account is signed in), so using it for an inactive slot would
+        // attribute another account's usage to this one.
+        if !is_active {
+            return None;
+        }
         for db in cursor_state_db_paths() {
             if let Some(token) = read_cursor_sqlite_token(&db) {
                 if slot_token.as_deref() == Some(token.as_str()) {
