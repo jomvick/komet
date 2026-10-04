@@ -31,10 +31,12 @@
 //!
 //! Usage probes: both providers expose the rate-limit view their own CLIs render
 //! (`/usage` in Claude Code, `/status` in Codex). Unlike komet (fetch on every
-//! list, 60s cache), native only hits the network when `force_usage` is set —
-//! the default list stays offline-fast and deterministic; the UI passes
-//! `forceUsage` on page mount/refresh. Cached results (60s TTL) are served to
-//! non-forced lists in between; misses are never cached.
+//! list, 60s cache), native never probes on a plain list — an offline list stays
+//! fast and deterministic. The caller picks the aggressiveness via [`UsageMode`]:
+//! `Offline` serves the cache only, `Cached` probes on a cache miss (page mount),
+//! and `Fresh` ignores the cache outright (explicit Refresh, post-login). The
+//! legacy `forceUsage` boolean is still accepted and maps `true → Fresh`. Cached
+//! results carry a 60s TTL; misses are never cached.
 //!
 //! Antigravity's windows come from Cloud Code's
 //! `v1internal:retrieveUserQuotaSummary` (body `{"project":"aicode-consumers"}`,
@@ -320,6 +322,172 @@ enum UsageProbeOutcome {
 /// Historic alias kept for the Antigravity call sites.
 type PaProbe = UsageProbeOutcome;
 
+/// How aggressively a `list` should resolve usage windows.
+///
+/// The boolean this replaces could not express the one distinction that
+/// matters: `force = true` kept serving the 60 s cache, so a Refresh clicked
+/// inside the TTL returned the previous numbers without one network call
+/// (the cache-retention pass and the cache read tested the same predicate, so
+/// the "invalidation" deleted only entries that would have been refused
+/// anyway). A three-way mode makes the intent explicit and testable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UsageMode {
+    /// Serve the cache only; never touch the network. Fast, deterministic —
+    /// the default for internal lists (Switch/Forget bookkeeping).
+    #[default]
+    Offline,
+    /// Serve the 60 s cache when warm, probe on miss. This is what the visit's
+    /// first list wants: a warm entry is still good, and a cold cache — the
+    /// normal case on a freshly opened page — probes.
+    Cached,
+    /// Ignore the cache entirely and probe. An explicit Refresh or a
+    /// just-completed login must never be answered from a stale entry.
+    Fresh,
+}
+
+impl UsageMode {
+    /// Parse the wire form: an explicit `usageMode` string wins; otherwise the
+    /// legacy `forceUsage` boolean maps `true → Fresh` (what the UI originally
+    /// meant by "force") and `false → Offline`.
+    pub fn from_params(mode: Option<&str>, force_usage: Option<bool>) -> Self {
+        match mode {
+            Some("cached") => UsageMode::Cached,
+            Some("fresh") => UsageMode::Fresh,
+            Some("none") | Some("offline") => UsageMode::Offline,
+            _ => match force_usage {
+                Some(true) => UsageMode::Fresh,
+                _ => UsageMode::Offline,
+            },
+        }
+    }
+
+    /// The wire string the UI sends as `usageMode`.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            UsageMode::Offline => "none",
+            UsageMode::Cached => "cached",
+            UsageMode::Fresh => "fresh",
+        }
+    }
+
+    /// Whether a probe may hit the network at all.
+    fn probes(self) -> bool {
+        matches!(self, UsageMode::Cached | UsageMode::Fresh)
+    }
+
+    /// Whether the 60 s cache may answer without a probe.
+    fn may_serve_cache(self) -> bool {
+        matches!(self, UsageMode::Cached | UsageMode::Offline)
+    }
+}
+
+#[cfg(test)]
+mod usage_mode_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_mode_wins_over_the_legacy_flag() {
+        assert_eq!(
+            UsageMode::from_params(Some("cached"), Some(true)),
+            UsageMode::Cached
+        );
+        assert_eq!(
+            UsageMode::from_params(Some("fresh"), Some(false)),
+            UsageMode::Fresh
+        );
+    }
+
+    #[test]
+    fn legacy_flag_maps_true_to_fresh_false_to_offline() {
+        assert_eq!(UsageMode::from_params(None, Some(true)), UsageMode::Fresh);
+        assert_eq!(UsageMode::from_params(None, Some(false)), UsageMode::Offline);
+        // Absent entirely = the historical "not forced" default.
+        assert_eq!(UsageMode::from_params(None, None), UsageMode::Offline);
+    }
+
+    #[test]
+    fn only_fresh_ignores_the_cache() {
+        assert!(UsageMode::Cached.may_serve_cache());
+        assert!(UsageMode::Offline.may_serve_cache());
+        assert!(!UsageMode::Fresh.may_serve_cache());
+    }
+
+    #[test]
+    fn fresh_and_cached_probe_but_offline_never_does() {
+        assert!(UsageMode::Fresh.probes());
+        assert!(UsageMode::Cached.probes());
+        assert!(!UsageMode::Offline.probes());
+    }
+
+    /// The regression the UI reported: a Refresh (now `Fresh`) must not be
+    /// answered out of a warm cache. `Cached` and `Offline` still serve it.
+    #[tokio::test]
+    async fn fresh_skips_a_warm_cache_entry() {
+        let dir = std::env::temp_dir().join(format!(
+            "komet-usage-mode-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let config = AgentAccountsConfig {
+            data_dir: dir.join("data"),
+            claude_config_dir: dir.join("claude"),
+            claude_config_file: dir.join("claude.json"),
+            codex_home: dir.join("codex"),
+            antigravity_home: dir.join("antigravity"),
+            cursor_auth_file: dir.join("sdk").join("auth.json"),
+        };
+        let accounts = AgentAccounts::new(config);
+        let slot = Slot {
+            id: "0123456789abcdef".into(),
+            harness: HarnessId::ClaudeCode,
+            account_key: "acct-key".into(),
+            profile: SlotProfile {
+                email: "a@example.com".into(),
+                display_name: None,
+                organization: None,
+                plan: None,
+                auth_kind: AgentAuthKind::Oauth,
+            },
+            credentials: serde_json::json!({}),
+            claude_config: None,
+            saved_at: 0,
+            created_at: None,
+        };
+        // Seed a fresh, warm cache entry for this slot.
+        let windows = vec![AgentUsageWindow {
+            label: "Session".into(),
+            used_fraction: 0.42,
+            resets_at: None,
+        }];
+        let key = format!("{}:{}", harness_slug(slot.harness), slot.account_key);
+        lock(&accounts.inner.usage_cache).insert(key, (Some(windows.clone()), Instant::now()));
+
+        // Cached + Offline serve the warm entry without a probe. (`Offline`
+        // reaching into the cache is the documented behaviour: it is "no
+        // network", not "no data".)
+        for mode in [UsageMode::Cached, UsageMode::Offline] {
+            let got = accounts
+                .usage_for(HarnessId::ClaudeCode, &slot, true, mode)
+                .await;
+            assert_eq!(got, Some(windows.clone()), "{mode:?} should serve the cache");
+        }
+
+        // `Fresh` ignores the warm entry and takes the network path. These
+        // credentials are empty, so the probe fails and returns `None` — the
+        // POINT is that it did NOT return the cached windows.
+        let fresh = accounts
+            .usage_for(HarnessId::ClaudeCode, &slot, true, UsageMode::Fresh)
+            .await;
+        assert_ne!(
+            fresh,
+            Some(windows),
+            "Fresh must not be answered from a warm cache"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// Classify an HTTP status for any usage probe (Claude, Codex, Antigravity).
 fn classify_probe_status(status: reqwest::StatusCode) -> Option<UsageProbeOutcome> {
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
@@ -488,15 +656,13 @@ impl AgentAccounts {
     // ── list ────────────────────────────────────────────────────────────────
 
     /// Detect both CLIs, auto-snapshot the live logins, and assemble the view.
-    pub async fn list(&self, force_usage: bool) -> Result<AgentAccountsSnapshot, EngineError> {
-        if force_usage {
-            // Per-harness invalidation happens in `usage_for` callers via fresh
-            // probes; a full clear forced every Refresh to re-probe all 6
-            // accounts at once (partial timeouts => some cards with gauges,
-            // others "Usage unavailable"). Keep warm successes, drop only
-            // entries older than the TTL so forced lists still refresh.
-            lock(&self.inner.usage_cache).retain(|_, (_, at)| at.elapsed() < USAGE_TTL);
-        }
+    pub async fn list(&self, mode: UsageMode) -> Result<AgentAccountsSnapshot, EngineError> {
+        // No cache eviction here: whether an entry may be served is decided by
+        // `usage_for` from `mode` alone (`Fresh` ignores the cache outright).
+        // The old eviction pass tested the same `elapsed() < USAGE_TTL`
+        // predicate as the read, so it removed exactly the entries that would
+        // have been refused anyway — leaving stale numbers served to a
+        // Refresh that arrived inside the TTL.
         let mut warnings: Vec<AgentAccountWarning> = Vec::new();
         let mut active_keys: HashMap<HarnessId, String> = HashMap::new();
         let mut unreadable: HashMap<HarnessId, Detected> = HashMap::new();
@@ -592,7 +758,7 @@ impl AgentAccounts {
             let slots = self.read_slots(harness);
             for slot in &slots {
                 let active = active_key.as_deref() == Some(slot.account_key.as_str());
-                let usage = self.usage_for(harness, slot, active, force_usage).await;
+                let usage = self.usage_for(harness, slot, active, mode).await;
                 accounts.push(AgentAccount {
                     id: slot.id.clone(),
                     harness,
@@ -655,7 +821,7 @@ impl AgentAccounts {
                     && is_opaque_antigravity_email(&s.profile.email))
             })
             .map(|s| s.profile.email.to_lowercase());
-        self.list(false).await?;
+        self.list(UsageMode::Offline).await?;
         let slot = self
             .read_slots(harness)
             .into_iter()
@@ -685,7 +851,7 @@ impl AgentAccounts {
                 )));
             }
         }
-        self.list(false).await
+        self.list(UsageMode::Offline).await
     }
 
     async fn activate_claude(&self, slot: &Slot) -> Result<(), EngineError> {
@@ -795,7 +961,7 @@ impl AgentAccounts {
         {
             return Err(EngineError::Other("Unknown account.".into()));
         }
-        let snapshot = self.list(false).await?;
+        let snapshot = self.list(UsageMode::Offline).await?;
         let active = snapshot
             .accounts
             .iter()
@@ -811,7 +977,7 @@ impl AgentAccounts {
         if file.exists() {
             std::fs::remove_file(&file)?;
         }
-        self.list(false).await
+        self.list(UsageMode::Offline).await
     }
 
     // ── add-account OAuth flows ─────────────────────────────────────────────
@@ -1360,7 +1526,7 @@ impl AgentAccounts {
             created_at: None,
         })?;
         lock(&self.inner.flows).remove(login_id);
-        self.list(false).await
+        self.list(UsageMode::Offline).await
     }
 
     /// Feed the pasted authorization code into the `agy` PTY, then wait for the
@@ -1427,7 +1593,7 @@ impl AgentAccounts {
                         .adopt_antigravity_secret(login_id, initial.as_deref(), value)
                         .await?
                 {
-                    return self.list(false).await;
+                    return self.list(UsageMode::Offline).await;
                 }
                 // `agy` exited without rewriting the keyring: the pasted code
                 // was rejected (or the flow died). Report its own last line
@@ -1444,7 +1610,7 @@ impl AgentAccounts {
                             .adopt_antigravity_secret(login_id, initial.as_deref(), value)
                             .await?
                     {
-                        return self.list(false).await;
+                        return self.list(UsageMode::Offline).await;
                     }
                     let tail = last_output_line(&lock(&output));
                     self.cancel_login(login_id);
@@ -2113,16 +2279,19 @@ impl AgentAccounts {
         harness: HarnessId,
         slot: &Slot,
         is_active: bool,
-        force: bool,
+        mode: UsageMode,
     ) -> Option<Vec<AgentUsageWindow>> {
         let key = format!("{}:{}", harness_slug(harness), slot.account_key);
-        if let Some((usage, at)) = lock(&self.inner.usage_cache).get(&key)
+        // `Fresh` never reads the cache: a Refresh must produce a real probe
+        // even when the previous one succeeded less than USAGE_TTL ago.
+        if mode.may_serve_cache()
+            && let Some((usage, at)) = lock(&self.inner.usage_cache).get(&key)
             && at.elapsed() < USAGE_TTL
         {
             return usage.clone();
         }
-        if !force {
-            // Non-forced lists never hit the network (see module docs).
+        if !mode.probes() {
+            // Offline lists never hit the network (see module docs).
             return None;
         }
         let usage = match harness {
@@ -4218,7 +4387,7 @@ mod tests {
         )
         .unwrap();
         let accounts = AgentAccounts::new(config);
-        let snapshot = accounts.list(false).await.expect("list");
+        let snapshot = accounts.list(UsageMode::Offline).await.expect("list");
         let cursor: Vec<_> = snapshot
             .accounts
             .iter()
@@ -4496,7 +4665,7 @@ mod tests {
         };
         let accounts = AgentAccounts::new(config);
 
-        let snapshot = accounts.list(false).await.expect("list");
+        let snapshot = accounts.list(UsageMode::Offline).await.expect("list");
         let agy: Vec<_> = snapshot
             .accounts
             .iter()

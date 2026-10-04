@@ -1360,6 +1360,10 @@ async fn cline_workspace_write_blocks_on_the_permission_bridge() {
     let _ = steer_tx;
     let mut req = request("cline permission bridge");
     req.sandbox = SandboxLevel::WorkspaceWrite;
+    // No model: the fixture's advertised list has no `grok-4.5`, and Cline
+    // strict-send rejects unannounced models by design (silent agent-default
+    // runs used to hide exactly this class of mismatch).
+    req.model = None;
     let events = run_to_end(&harness, req, controls).await;
     assert!(
         events.iter().any(|e| matches!(
@@ -1369,6 +1373,54 @@ async fn cline_workspace_write_blocks_on_the_permission_bridge() {
         "bridge AllowAlways must reach the fixture: {events:?}"
     );
     assert_eq!(dones(&events).len(), 1, "{events:?}");
+}
+
+#[tokio::test]
+async fn cline_empty_turn_errored_done_on_insufficient_balance() {
+    let harness = cline_harness("empty-turn-error");
+    let (controls, _steer, _token) = controls();
+    let root = tempfile::tempdir().expect("tempdir");
+    let dir = root.path().join("sessions").join("s-cline");
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    std::fs::write(
+        dir.join("s-cline.messages.json"),
+        serde_json::json!({
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+                {"role": "assistant",
+                 "content": [{"type": "text", "text": "Insufficient balance. Your Cline Credits balance is $-0.00"}],
+                 "metadata": {"displayOnly": true, "displayRole": "error"}},
+            ],
+        })
+        .to_string(),
+    )
+    .expect("write");
+    let old = std::env::var("KOMET_CLINE_DATA_DIR").ok();
+    unsafe {
+        std::env::set_var("KOMET_CLINE_DATA_DIR", root.path());
+    }
+    let mut req = request("cline empty turn");
+    req.model = None;
+    let events = run_to_end(&harness, req, controls).await;
+    unsafe {
+        match old {
+            Some(v) => std::env::set_var("KOMET_CLINE_DATA_DIR", v),
+            None => std::env::remove_var("KOMET_CLINE_DATA_DIR"),
+        }
+    }
+    let done_events = dones(&events);
+    assert_eq!(done_events.len(), 1, "expected 1 Done event: {events:?}");
+    let (status, err) = &done_events[0];
+    assert_eq!(*status, DoneStatus::Errored, "must map empty turn to Errored");
+    let err_msg = err.as_ref().expect("error message must be present");
+    assert!(
+        err_msg.contains("Cline credits exhausted"),
+        "error message must mention exhausted credits: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("Insufficient balance"),
+        "error message must include file text: {err_msg}"
+    );
 }
 
 /// Native-first access mapping declaration (ARCHITECTURE.md §6): every
