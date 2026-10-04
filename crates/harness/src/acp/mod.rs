@@ -3287,10 +3287,13 @@ async fn run_session(session: Session) {
         // "model not found". An explicit request model wins; the CLI
         // config is the fallback so the bottom bar's "Cline default" is
         // what actually runs when nothing is selected — Paseo parity.
+        // The static "Cline default" entry (`id: "default"`) is not a real
+        // model id — treat it as no explicit selection.
         let requested_model = if harness == HarnessId::Cline {
             request
                 .model
                 .as_deref()
+                .filter(|m| *m != "default")
                 .or_else(|| cli_config.as_ref().and_then(|(_, m)| m.as_deref()))
         } else {
             request.model.as_deref().or_else(|| {
@@ -3304,11 +3307,18 @@ async fn run_session(session: Session) {
         // when the CLI last used another provider. Inject that last-used
         // value so set_config_option runs before the prompt (prefix
         // inference still covers `cline-pass/...` model ids without this
-        // file).
-        if !model_options.contains_key("provider")
-            && let Some((provider, _)) = &cli_config
-        {
-            model_options.insert("provider".into(), json!(provider));
+        // file). When the run selected a model configured under a specific
+        // provider, that provider owns the run — not the last-used one.
+        if !model_options.contains_key("provider") {
+            let owning = requested_model.and_then(|model| {
+                cline_cli_models_in(cline_data_dir.as_ref())
+                    .into_iter()
+                    .find(|(_, m)| m.as_deref() == Some(model))
+                    .map(|(provider, _)| provider)
+            });
+            if let Some(provider) = owning.or_else(|| cli_config.as_ref().map(|(p, _)| p.clone())) {
+                model_options.insert("provider".into(), json!(provider));
+            }
         }
         // Cline's `auto_approve` boolean defaults false; without it the hub
         // parks tool calls on an approval that komet never surfaces. Full
