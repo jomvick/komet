@@ -38,7 +38,7 @@ pub mod uploads;
 pub mod workspace_files;
 pub mod workspace_host;
 
-pub use agent_accounts::{AgentAccounts, AgentAccountsConfig};
+pub use agent_accounts::{AgentAccounts, AgentAccountsConfig, UsageMode};
 pub use auth::{Auth, AuthConfig, AuthState, AuthUser, OrgMembership};
 pub use diff_sync::{
     CheckoutDiffSync, DiffFileTextPair, DiffSidecar, DiffSnapshot, TurnSnapshot,

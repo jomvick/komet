@@ -731,11 +731,12 @@ impl Pickers {
     pub fn resolved(&self, cx: &App) -> ResolvedRunConfig {
         ResolvedRunConfig {
             harness: self.effective_harness(cx),
-            model: self
-                .selected_model(cx)
-                .map(|m| m.id.clone())
-                // Catalog not loaded (offline): still send the id we know.
-                .or_else(|| self.effective_model_id(cx).map(str::to_string)),
+            // Paseo parity: only send a model id the harness catalog
+            // actually offers. While the catalog isn't loaded (offline /
+            // slow discovery like Cline's 300+ model fetch), send None so
+            // the harness runs its agent default instead of a stale id
+            // remembered from another harness ("model not found").
+            model: self.selected_model(cx).map(|m| m.id.clone()),
             reasoning: self.effective_reasoning(cx),
             model_options: self.explicit_options(cx),
             mcp_server_ids: Vec::new(),
