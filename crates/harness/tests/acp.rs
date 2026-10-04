@@ -1377,8 +1377,6 @@ async fn cline_workspace_write_blocks_on_the_permission_bridge() {
 
 #[tokio::test]
 async fn cline_empty_turn_errored_done_on_insufficient_balance() {
-    let harness = cline_harness("empty-turn-error");
-    let (controls, _steer, _token) = controls();
     let root = tempfile::tempdir().expect("tempdir");
     let dir = root.path().join("sessions").join("s-cline");
     std::fs::create_dir_all(&dir).expect("mkdir");
@@ -1395,19 +1393,11 @@ async fn cline_empty_turn_errored_done_on_insufficient_balance() {
         .to_string(),
     )
     .expect("write");
-    let old = std::env::var("KOMET_CLINE_DATA_DIR").ok();
-    unsafe {
-        std::env::set_var("KOMET_CLINE_DATA_DIR", root.path());
-    }
+    let harness = cline_harness("empty-turn-error").with_cline_data_dir(root.path());
+    let (controls, _steer, _token) = controls();
     let mut req = request("cline empty turn");
     req.model = None;
     let events = run_to_end(&harness, req, controls).await;
-    unsafe {
-        match old {
-            Some(v) => std::env::set_var("KOMET_CLINE_DATA_DIR", v),
-            None => std::env::remove_var("KOMET_CLINE_DATA_DIR"),
-        }
-    }
     let done_events = dones(&events);
     assert_eq!(done_events.len(), 1, "expected 1 Done event: {events:?}");
     let (status, err) = &done_events[0];
