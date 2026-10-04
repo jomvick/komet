@@ -750,6 +750,8 @@ pub struct AcpHarness {
     /// [`AcpHarness::with_executable`] this is off: fixtures must stay
     /// deterministic no matter what lives in `~`.
     cli_sync: bool,
+    /// Override of Cline's on-disk data dir (`~/.cline/data`) for tests.
+    cline_data_dir: Option<PathBuf>,
 }
 
 impl AcpHarness {
@@ -769,6 +771,7 @@ impl AcpHarness {
             models_cache: tokio::sync::Mutex::new(None),
             models_probe: tokio::sync::Mutex::new(()),
             cli_sync: true,
+            cline_data_dir: None,
         }
     }
 
@@ -822,6 +825,14 @@ impl AcpHarness {
     #[doc(hidden)]
     pub fn with_sessions_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.sessions_root = Some(root.into());
+        self
+    }
+
+    /// Test seam: read Cline's on-disk data dir from here instead of
+    /// `KOMET_CLINE_DATA_DIR` / `~/.cline/data`.
+    #[doc(hidden)]
+    pub fn with_cline_data_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.cline_data_dir = Some(dir.into());
         self
     }
 
@@ -1117,7 +1128,7 @@ impl AcpHarness {
                 }
 
                 // Inject any other configured CLI models (e.g. from cline-pass):
-                for (provider, model) in cline_cli_models() {
+                for (provider, model) in cline_cli_models_in(self.cline_data_dir.as_ref()) {
                     let Some(model) = model else {
                         continue;
                     };
@@ -1658,7 +1669,7 @@ impl Harness for AcpHarness {
     /// "Authentication required" until `cline` has a login).
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         self.resolve_launch()?;
-        let buster = acp_model_cache_buster(self.spec.id);
+        let buster = acp_model_cache_buster_in(self.spec.id, self.cline_data_dir.as_ref());
         {
             let guard = self.models_cache.lock().await;
             if let Some(entry) = guard.as_ref()
@@ -1813,6 +1824,7 @@ impl Harness for AcpHarness {
             handshake_timeout: self.handshake_timeout,
             stderr_tail,
             cli_sync: self.cli_sync,
+            cline_data_dir: self.cline_data_dir.clone(),
         }));
 
         Ok(futures::stream::unfold(event_rx, |mut rx| async move {
@@ -1852,6 +1864,8 @@ struct Session {
     /// Sync with the agent CLI's on-disk config (Cline provider + model).
     /// Off when pointed at a fake (see `cli_sync`).
     cli_sync: bool,
+    /// Override of Cline's on-disk data dir (tests).
+    cline_data_dir: Option<PathBuf>,
 }
 
 fn initialize_params(_harness: HarnessId) -> Value {
@@ -2101,12 +2115,16 @@ fn first_class_model_change(
 }
 
 /// Cline's on-disk data dir (`~/.cline/data`): sessions, settings, logs.
-/// `KOMET_CLINE_DATA_DIR` overrides it (tests point it at a fixture tree).
-fn cline_data_dir() -> Option<PathBuf> {
-    if let Ok(dir) = std::env::var("KOMET_CLINE_DATA_DIR") {
-        if !dir.is_empty() {
-            return Some(PathBuf::from(dir));
-        }
+/// `KOMET_CLINE_DATA_DIR` overrides it (tests point it at a fixture tree);
+/// an explicit harness override wins over both.
+fn resolve_cline_data_dir(override_dir: Option<&PathBuf>) -> Option<PathBuf> {
+    if let Some(dir) = override_dir {
+        return Some(dir.clone());
+    }
+    if let Ok(dir) = std::env::var("KOMET_CLINE_DATA_DIR")
+        && !dir.is_empty()
+    {
+        return Some(PathBuf::from(dir));
     }
     if cfg!(test) {
         return None;
@@ -2126,13 +2144,17 @@ fn cline_data_dir() -> Option<PathBuf> {
 /// discovery fixtures stay deterministic; `KOMET_CLINE_PROVIDER` overrides
 /// the provider (model override: `KOMET_CLINE_MODEL`).
 fn cline_cli_config() -> Option<(String, Option<String>)> {
-    cline_cli_models().into_iter().next()
+    cline_cli_config_in(None)
+}
+
+fn cline_cli_config_in(data_dir: Option<&PathBuf>) -> Option<(String, Option<String>)> {
+    cline_cli_models_in(data_dir).into_iter().next()
 }
 
 /// Every configured CLI model as `(provider, model)`, last-used first:
 /// the wire list omits the CLI's own ids, so discovery injects all of them
 /// (not just the last-used provider's) with the provider in the label.
-fn cline_cli_models() -> Vec<(String, Option<String>)> {
+fn cline_cli_models_in(data_dir: Option<&PathBuf>) -> Vec<(String, Option<String>)> {
     if let Ok(value) = std::env::var("KOMET_CLINE_PROVIDER") {
         if value.is_empty() {
             return Vec::new();
@@ -2140,10 +2162,10 @@ fn cline_cli_models() -> Vec<(String, Option<String>)> {
         let model = std::env::var("KOMET_CLINE_MODEL").ok().filter(|m| !m.is_empty());
         return vec![(value, model)];
     }
-    if cfg!(test) && std::env::var("KOMET_CLINE_DATA_DIR").is_err() {
+    if data_dir.is_none() && cfg!(test) && std::env::var("KOMET_CLINE_DATA_DIR").is_err() {
         return Vec::new();
     }
-    let Some(data) = cline_data_dir() else {
+    let Some(data) = resolve_cline_data_dir(data_dir) else {
         return Vec::new();
     };
     let text = std::fs::read_to_string(data.join("settings").join("providers.json"))
@@ -2186,10 +2208,10 @@ fn cline_cli_models() -> Vec<(String, Option<String>)> {
 /// Provider, model AND account all live in that file, so any CLI-side change
 /// (model switch, account switch) invalidates the list — including callers
 /// holding a disk-cached copy keyed on this buster.
-fn cline_cache_buster() -> String {
+fn cline_cache_buster_in(data_dir: Option<&PathBuf>) -> String {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
-    let Some(data) = cline_data_dir() else {
+    let Some(data) = resolve_cline_data_dir(data_dir) else {
         return String::new();
     };
     let bytes = std::fs::read(data.join("settings").join("providers.json")).unwrap_or_default();
@@ -2202,9 +2224,9 @@ fn cline_cache_buster() -> String {
 /// config (provider + model + account all live in `providers.json`);
 /// every other agent's world is static per process, so the TTL alone
 /// governs. Disk-cached copies must key on this same string.
-fn acp_model_cache_buster(id: HarnessId) -> String {
+fn acp_model_cache_buster_in(id: HarnessId, data_dir: Option<&PathBuf>) -> String {
     if id == HarnessId::Cline {
-        cline_cache_buster()
+        cline_cache_buster_in(data_dir)
     } else {
         String::new()
     }
@@ -2258,18 +2280,33 @@ fn cline_is_free_model(id: &str) -> bool {
 /// unknown model) surface ONLY here, never on the ACP wire: a prompt can
 /// return `stopReason: end_turn` with zero content while this file holds
 /// the real cause. Best-effort: missing/unparseable files yield `None`.
-fn cline_session_error(session_id: &str) -> Option<String> {
+/// Only errors from the current prompt are returned: anything at or before
+/// the last user message belongs to an earlier (possibly resumed) turn, so
+/// a successful empty prompt is never marked errored by a historical error.
+fn cline_session_error_in(session_id: &str, data_dir: Option<&PathBuf>) -> Option<String> {
     if session_id.is_empty() || session_id.contains(['/', '\\', '.']) {
         return None;
     }
-    let data = cline_data_dir()?;
-    let text =
-        std::fs::read_to_string(data.join("sessions").join(session_id).join(format!("{session_id}.messages.json")))
-            .ok()?;
+    let data = resolve_cline_data_dir(data_dir)?;
+    let path = data
+        .join("sessions")
+        .join(session_id)
+        .join(format!("{session_id}.messages.json"));
+    let text = std::fs::read_to_string(path).ok()?;
     let doc: Value = serde_json::from_str(&text).ok()?;
     let messages = doc.get("messages")?.as_array()?;
+    // Index of the last user message; errors at or before it are history.
+    let mut last_user = None;
+    for (i, message) in messages.iter().enumerate() {
+        if message.get("role").and_then(Value::as_str) == Some("user") {
+            last_user = Some(i);
+        }
+    }
     let mut last: Option<String> = None;
-    for message in messages {
+    for (i, message) in messages.iter().enumerate() {
+        if last_user.is_some_and(|u| i <= u) {
+            continue;
+        }
         let metadata = message.get("metadata");
         let is_error = metadata
             .and_then(|m| m.get("displayRole"))
@@ -2302,7 +2339,11 @@ fn cline_session_error(session_id: &str) -> Option<String> {
     last.map(|text| {
         const MAX: usize = 500;
         if text.len() > MAX {
-            format!("{}…", text[..MAX].trim_end())
+            let mut end = MAX;
+            while end > 0 && !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("{}…", text[..end].trim_end())
         } else {
             text
         }
@@ -2314,12 +2355,23 @@ fn cline_session_error(session_id: &str) -> Option<String> {
 /// [`cline_session_error`] wearing a `completed` status. Returns the `Done`
 /// error text, or `None` when the turn genuinely produced nothing observable
 /// (in which case the caller keeps the historical `completed`).
-fn cline_empty_turn_error(session_id: &str, content_seen: bool, open_tool_calls: usize) -> Option<String> {
+async fn cline_empty_turn_error(
+    session_id: &str,
+    content_seen: bool,
+    open_tool_calls: usize,
+    data_dir: Option<PathBuf>,
+) -> Option<String> {
     if content_seen || open_tool_calls > 0 {
         return None;
     }
     for _ in 0..5 {
-        if let Some(raw) = cline_session_error(session_id) {
+        let sid = session_id.to_owned();
+        let dir = data_dir.clone();
+        let found = tokio::task::spawn_blocking(move || cline_session_error_in(&sid, dir.as_ref()))
+            .await
+            .ok()
+            .flatten();
+        if let Some(raw) = found {
             if raw.contains("Insufficient balance") {
                 return Some(format!(
                     "Cline credits exhausted ({raw}): pick a free model or top up, then retry."
@@ -2327,7 +2379,7 @@ fn cline_empty_turn_error(session_id: &str, content_seen: bool, open_tool_calls:
             }
             return Some(raw);
         }
-        std::thread::sleep(Duration::from_millis(40));
+        tokio::time::sleep(Duration::from_millis(40)).await;
     }
     None
 }
@@ -3133,6 +3185,7 @@ async fn run_session(session: Session) {
         handshake_timeout,
         stderr_tail,
         cli_sync,
+        cline_data_dir,
         _opencode_overlay_dir: _overlay_dir,
     } = session;
     let RunControls {
@@ -3227,17 +3280,18 @@ async fn run_session(session: Session) {
         // traits: a rejected auxiliary set is logged and the agent default
         // runs.
         let cli_config =
-            (harness == HarnessId::Cline && cli_sync).then(cline_cli_config).flatten();
+            (harness == HarnessId::Cline && cli_sync).then(|| cline_cli_config_in(cline_data_dir.as_ref())).flatten();
         // Cline owns its model natively (`cline` CLI config); the Komet
         // global picker id (e.g. `Muse Spark ...`) is never a valid Cline
         // wire id and previously killed session/prompt with
-        // "model not found". CLI config wins so the bottom bar's
-        // "Cline default" is what actually runs — Paseo parity.
+        // "model not found". An explicit request model wins; the CLI
+        // config is the fallback so the bottom bar's "Cline default" is
+        // what actually runs when nothing is selected — Paseo parity.
         let requested_model = if harness == HarnessId::Cline {
-            cli_config
-                .as_ref()
-                .and_then(|(_, m)| m.as_deref())
-                .or(request.model.as_deref())
+            request
+                .model
+                .as_deref()
+                .or_else(|| cli_config.as_ref().and_then(|(_, m)| m.as_deref()))
         } else {
             request.model.as_deref().or_else(|| {
                 cli_config.as_ref().and_then(|(_, m)| m.as_deref())
@@ -3318,7 +3372,7 @@ async fn run_session(session: Session) {
                 })
                 .unwrap_or_default();
             // Any provider's configured CLI model passes through verbatim.
-            let cli_models: Vec<String> = cline_cli_models()
+            let cli_models: Vec<String> = cline_cli_models_in(cline_data_dir.as_ref())
                 .into_iter()
                 .filter_map(|(_, model)| model)
                 .collect();
@@ -3722,7 +3776,9 @@ async fn run_session(session: Session) {
                                 &session_id,
                                 turn_content_seen,
                                 open_tools.len(),
+                                cline_data_dir.clone(),
                             )
+                            .await
                         {
                             status = DoneStatus::Errored;
                             error = Some(empty);
@@ -3912,7 +3968,9 @@ async fn run_session(session: Session) {
                                 &session_id,
                                 turn_content_seen,
                                 open_tools.len(),
+                                cline_data_dir.clone(),
                             )
+                            .await
                         {
                             status = DoneStatus::Errored;
                             error = Some(empty);
@@ -4805,8 +4863,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn cline_empty_turn_reads_session_file_error() {
+    #[tokio::test]
+    async fn cline_empty_turn_reads_session_file_error() {
         // Fixture tree mimicking ~/.cline/data for one failed session.
         let root = tempfile::tempdir().expect("tempdir");
         let dir = root.path().join("sessions").join("s-1");
@@ -4824,29 +4882,47 @@ mod tests {
             .to_string(),
         )
         .expect("write");
-        // SAFETY: scoped to this test binary; no other test reads this var
-        // concurrently with a different value (unit tests only set it here).
-        let old = std::env::var("KOMET_CLINE_DATA_DIR").ok();
-        unsafe {
-            std::env::set_var("KOMET_CLINE_DATA_DIR", root.path());
-        }
-        let raw = cline_session_error("s-1");
-        let empty = cline_empty_turn_error("s-1", false, 0);
-        unsafe {
-            match old {
-                Some(v) => std::env::set_var("KOMET_CLINE_DATA_DIR", v),
-                None => std::env::remove_var("KOMET_CLINE_DATA_DIR"),
-            }
-        }
+        let data_dir = root.path().to_path_buf();
+        let raw = cline_session_error_in("s-1", Some(&data_dir));
+        let empty = cline_empty_turn_error("s-1", false, 0, Some(data_dir.clone())).await;
         assert!(raw.is_some_and(|t| t.contains("Insufficient balance")));
         let message = empty.expect("empty turn with session error must error");
         assert!(message.contains("Cline credits exhausted"), "{message}");
         assert!(message.contains("free model"), "{message}");
         // Content or tool calls: not an empty turn, no error.
-        assert_eq!(cline_empty_turn_error("s-1", true, 0), None);
-        assert_eq!(cline_empty_turn_error("s-1", false, 1), None);
+        assert_eq!(
+            cline_empty_turn_error("s-1", true, 0, Some(data_dir.clone())).await,
+            None
+        );
+        assert_eq!(
+            cline_empty_turn_error("s-1", false, 1, Some(data_dir.clone())).await,
+            None
+        );
         // Unknown session: silent (historical completed), never a crash.
-        assert_eq!(cline_empty_turn_error("nope", false, 0), None);
+        assert_eq!(
+            cline_empty_turn_error("nope", false, 0, Some(data_dir.clone())).await,
+            None
+        );
+        // Historical error (before the latest user message) belongs to an
+        // earlier turn: a successful empty prompt must not be marked errored.
+        std::fs::write(
+            dir.join("s-1.messages.json"),
+            serde_json::json!({
+                "messages": [
+                    {"role": "assistant",
+                     "content": [{"type": "text", "text": "Insufficient balance. Old turn."}],
+                     "metadata": {"displayOnly": true, "displayRole": "error"}},
+                    {"role": "user", "content": [{"type": "text", "text": "new prompt"}]},
+                ],
+            })
+            .to_string(),
+        )
+        .expect("write");
+        assert_eq!(cline_session_error_in("s-1", Some(&data_dir)), None);
+        assert_eq!(
+            cline_empty_turn_error("s-1", false, 0, Some(data_dir)).await,
+            None
+        );
     }
 
     #[test]
