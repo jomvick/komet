@@ -53,6 +53,23 @@ else
 fi
 
 # Discovery-only scenarios end here (models() never sends a prompt).
+if [ "${SCENARIO:-two-tier}" = "empty-turn-error" ]; then
+  while read -r line; do
+    case "$line" in
+      *'"method":"session/set_config_option"'*)
+        emit "{\"id\":$(rid "$line"),\"result\":{}}"
+        ;;
+      *'"method":"session/prompt"'*)
+        pid=$(rid "$line")
+        emit "{\"id\":$pid,\"result\":{\"stopReason\":\"end_turn\"}}"
+        while read -r _l; do :; done
+        exit 0
+        ;;
+    esac
+  done
+  exit 0
+fi
+
 if [ "${SCENARIO:-two-tier}" != "permission-bridge" ]; then
   exit 0
 fi

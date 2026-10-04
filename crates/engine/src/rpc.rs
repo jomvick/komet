@@ -27,7 +27,7 @@
 //!   (replay then live tail), `WriteTerminal {terminalId, data}`, `ResizeTerminal`,
 //!   `CloseTerminal`. M5 is single-user local: per-user owner checks land with
 //!   real multi-account auth in M6.
-//! - Agent accounts (§3.7): `ListAgentAccounts {forceUsage?}` →
+//! - Agent accounts (§3.7): `ListAgentAccounts {usageMode?, forceUsage?}` →
 //!   `AgentAccountsSnapshot`, `ActivateAgentAccount`/`ForgetAgentAccount`
 //!   `{harness, accountId}` → snapshot, `StartAgentLogin {harness}` →
 //!   `{loginId, url, mode}`, `CompleteAgentLogin {loginId, code}` → snapshot,
@@ -324,8 +324,14 @@ struct ResizeTerminalParams {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ListAgentAccountsParams {
+    /// Legacy boolean (`true` meant "force"). Still honoured when `usage_mode`
+    /// is absent so an older UI keeps working.
     #[serde(default)]
     force_usage: Option<bool>,
+    /// Explicit usage mode: `"none"` | `"cached"` | `"fresh"`. Wins over
+    /// `force_usage` when present.
+    #[serde(default)]
+    usage_mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2006,9 +2012,13 @@ impl RpcService for EngineRpc {
             }
             methods::LIST_AGENT_ACCOUNTS => {
                 let p: ListAgentAccountsParams = parse_params(params)?;
+                let mode = crate::agent_accounts::UsageMode::from_params(
+                    p.usage_mode.as_deref(),
+                    p.force_usage,
+                );
                 let snapshot = self
                     .agent_accounts
-                    .list(p.force_usage.unwrap_or(false))
+                    .list(mode)
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&snapshot)

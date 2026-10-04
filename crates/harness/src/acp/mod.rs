@@ -527,7 +527,8 @@ fn cline_spec() -> AcpAgentSpec {
         // that select is a trait, and send-time set_config_option uses the
         // CLI's lastUsedProvider so chats don't stick on empty Cline Credits.
         models: || {
-            vec![Model {
+            let mut list = cline_builtin_free_models();
+            list.push(Model {
                 id: "default".into(),
                 label: "Cline default".into(),
                 description: Some(
@@ -535,7 +536,8 @@ fn cline_spec() -> AcpAgentSpec {
                 ),
                 reasoning_levels: vec![],
                 options: Vec::new(),
-            }]
+            });
+            list
         },
         // Cline's ACP advertises no `_session/steering` extension — steers
         // deliver at turn boundaries. Modes (plan/act) ride Cline's own
@@ -701,6 +703,18 @@ enum Launch {
     },
 }
 
+/// One cached model probe: the list, when it was taken, and the buster it
+/// was taken under. A CLI-side change must invalidate — never serve a list
+/// taken under a different world.
+struct ModelCacheEntry {
+    buster: String,
+    at: std::time::Instant,
+    models: Vec<Model>,
+}
+
+/// How long a model probe stays fresh without a buster change.
+const MODEL_CACHE_TTL: Duration = Duration::from_secs(300);
+
 /// The ACP harness. Construct with [`AcpHarness::grok`]; tests point it at a
 /// fake agent with [`AcpHarness::with_executable`].
 pub struct AcpHarness {
@@ -722,12 +736,22 @@ pub struct AcpHarness {
     model_discovery_timeout: Duration,
     /// Discovery result cache: the advertised commands survive across calls.
     commands: tokio::sync::OnceCell<Vec<SlashCommand>>,
-    /// Model discovery cache: only a successful, non-empty probe is cached,
-    /// so a mis-authed agent retries on the next picker open.
-    models_cache: tokio::sync::OnceCell<Vec<Model>>,
+    /// Model discovery cache: a successful, non-empty probe is reused while
+    /// fresh AND the buster still matches, so a CLI-side change (Cline
+    /// model/account switch) invalidates the list instead of serving it for
+    /// the process lifetime. Disk-cached copies should key on the same
+    /// buster (see [`cline_cache_buster`]).
+    models_cache: tokio::sync::Mutex<Option<ModelCacheEntry>>,
     /// Coalesce concurrent picker/title probes. Starting several OpenCode
     /// processes at once makes cold plugin loading slower and wastes memory.
     models_probe: tokio::sync::Mutex<()>,
+    /// Read the agent CLI's on-disk config during discovery/setup (Cline
+    /// `providers.json`: real provider + model). Pointed at a fake via
+    /// [`AcpHarness::with_executable`] this is off: fixtures must stay
+    /// deterministic no matter what lives in `~`.
+    cli_sync: bool,
+    /// Override of Cline's on-disk data dir (`~/.cline/data`) for tests.
+    cline_data_dir: Option<PathBuf>,
 }
 
 impl AcpHarness {
@@ -744,8 +768,10 @@ impl AcpHarness {
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             model_discovery_timeout: DEFAULT_MODEL_DISCOVERY_TIMEOUT,
             commands: tokio::sync::OnceCell::new(),
-            models_cache: tokio::sync::OnceCell::new(),
+            models_cache: tokio::sync::Mutex::new(None),
             models_probe: tokio::sync::Mutex::new(()),
+            cli_sync: true,
+            cline_data_dir: None,
         }
     }
 
@@ -788,6 +814,9 @@ impl AcpHarness {
     /// Use a fixed agent binary instead of PATH/known-location resolution.
     pub fn with_executable(mut self, path: impl Into<PathBuf>) -> Self {
         self.executable = Some(path.into());
+        // A fake stands in for the CLI: its on-disk config (another
+        // installed CLI's, or nothing) must not leak into discovery.
+        self.cli_sync = false;
         self
     }
 
@@ -796,6 +825,14 @@ impl AcpHarness {
     #[doc(hidden)]
     pub fn with_sessions_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.sessions_root = Some(root.into());
+        self
+    }
+
+    /// Test seam: read Cline's on-disk data dir from here instead of
+    /// `KOMET_CLINE_DATA_DIR` / `~/.cline/data`.
+    #[doc(hidden)]
+    pub fn with_cline_data_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.cline_data_dir = Some(dir.into());
         self
     }
 
@@ -1072,6 +1109,68 @@ impl AcpHarness {
                 .request("session/new", build_acp_session_params(&cwd, None, vec![]))
                 .await?;
             let mut models = models_from_session(&session, &(self.spec.models)());
+            // Sync with the real CLI: the wire list omits the CLI's own
+            // model ids (`cline-free/*`) and defaults to its own choice,
+            // so the picker would never show the CLI's actual setup — and
+            // a saved CLI model id would match nothing at send time.
+            // Every configured provider's model is injected when missing
+            // (last-used first), labelled with its provider; free-tier
+            // models float to the top, labelled as such.
+            if self.spec.id == HarnessId::Cline && self.cli_sync {
+                // Drop the paid version of deepseek-v4.1-flash to prevent zero-balance billing failures.
+                models.retain(|m| m.id != "deepseek/deepseek-v4.1-flash");
+
+                // Inject official Cline free-tier models first.
+                for builtin in cline_builtin_free_models().into_iter().rev() {
+                    if !models.iter().any(|m| m.id == builtin.id) {
+                        models.insert(0, builtin);
+                    }
+                }
+
+                // Inject any other configured CLI models (e.g. from cline-pass):
+                for (provider, model) in cline_cli_models_in(self.cline_data_dir.as_ref()) {
+                    let Some(model) = model else {
+                        continue;
+                    };
+                    if models.iter().any(|m| m.id == model) {
+                        continue;
+                    }
+                    let short = model.rsplit('/').next().unwrap_or(&model).to_owned();
+                    let label = if cline_is_free_model(&model) {
+                        format!("{short} (free)")
+                    } else {
+                        format!("{short} ({provider})")
+                    };
+                    models.insert(
+                        0,
+                        komet_proto::Model {
+                            id: model,
+                            label,
+                            description: Some(
+                                format!("Model configured in Cline CLI for {provider}"),
+                            ),
+                            reasoning_levels: Vec::new(),
+                            options: Vec::new(),
+                        },
+                    );
+                }
+                for model in &mut models {
+                    if cline_is_free_model(&model.id) && !model.label.contains("(free)") {
+                        model.label = format!("{} (free)", model.label);
+                    }
+                }
+                // Stable: free-tier first, wire order preserved within tiers.
+                let mut free: Vec<komet_proto::Model> = Vec::new();
+                let mut rest: Vec<komet_proto::Model> = Vec::new();
+                for model in models.drain(..) {
+                    if cline_is_free_model(&model.id) {
+                        free.push(model);
+                    } else {
+                        rest.push(model);
+                    }
+                }
+                models = free.into_iter().chain(rest).collect();
+            }
             // Prompt-convention modes (Claude Ultrathink) extend any real
             // ladder — never an effort-less model's empty one.
             for model in &mut models {
@@ -1342,7 +1441,7 @@ fn trait_from_config_option(option: &Value) -> Option<ModelOption> {
                 .map(str::to_owned)
                 .or_else(|| choices.first().map(|c| c.id.clone()))?;
             if id == "provider"
-                && let Some(last) = cline_last_used_provider()
+                && let Some((last, _)) = cline_cli_config()
                 && choices.iter().any(|c| c.id == last)
             {
                 default_choice = last;
@@ -1570,17 +1669,34 @@ impl Harness for AcpHarness {
     /// "Authentication required" until `cline` has a login).
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         self.resolve_launch()?;
-        if let Some(models) = self.models_cache.get() {
-            return Ok(models.clone());
+        let buster = acp_model_cache_buster_in(self.spec.id, self.cline_data_dir.as_ref());
+        {
+            let guard = self.models_cache.lock().await;
+            if let Some(entry) = guard.as_ref()
+                && entry.buster == buster
+                && entry.at.elapsed() < MODEL_CACHE_TTL
+            {
+                return Ok(entry.models.clone());
+            }
         }
         let _probe = self.models_probe.lock().await;
-        if let Some(models) = self.models_cache.get() {
-            return Ok(models.clone());
+        {
+            let guard = self.models_cache.lock().await;
+            if let Some(entry) = guard.as_ref()
+                && entry.buster == buster
+                && entry.at.elapsed() < MODEL_CACHE_TTL
+            {
+                return Ok(entry.models.clone());
+            }
         }
         match self.discover_models().await {
             Ok(models) if !models.is_empty() => {
-                let _ = self.models_cache.set(models.clone());
-                Ok(self.models_cache.get().cloned().unwrap_or(models))
+                *self.models_cache.lock().await = Some(ModelCacheEntry {
+                    buster,
+                    at: std::time::Instant::now(),
+                    models: models.clone(),
+                });
+                Ok(models)
             }
             Ok(_) => Ok((self.spec.models)()),
             // Never let a stale static catalog masquerade as a successful
@@ -1707,6 +1823,8 @@ impl Harness for AcpHarness {
             kill_grace: self.kill_grace,
             handshake_timeout: self.handshake_timeout,
             stderr_tail,
+            cli_sync: self.cli_sync,
+            cline_data_dir: self.cline_data_dir.clone(),
         }));
 
         Ok(futures::stream::unfold(event_rx, |mut rx| async move {
@@ -1743,6 +1861,11 @@ struct Session {
     kill_grace: Duration,
     handshake_timeout: Duration,
     stderr_tail: crate::StderrTail,
+    /// Sync with the agent CLI's on-disk config (Cline provider + model).
+    /// Off when pointed at a fake (see `cli_sync`).
+    cli_sync: bool,
+    /// Override of Cline's on-disk data dir (tests).
+    cline_data_dir: Option<PathBuf>,
 }
 
 fn initialize_params(_harness: HarnessId) -> Value {
@@ -1991,35 +2114,333 @@ fn first_class_model_change(
     Ok(Some(requested.to_owned()))
 }
 
-/// Cline's last-used auth provider (`cline` / `cline-pass` / `openai-codex`)
-/// from `~/.cline/data/settings/providers.json`. ACP `session/new` ignores
-/// this and defaults `provider` to Cline Credits (`cline`), which then
-/// hangs or errors ("Insufficient balance") instead of using ClinePass.
-/// Tests skip the on-disk file so discovery fixtures stay deterministic;
-/// `KOMET_CLINE_PROVIDER` overrides both.
-fn cline_last_used_provider() -> Option<String> {
-    if let Ok(value) = std::env::var("KOMET_CLINE_PROVIDER") {
-        return (!value.is_empty()).then_some(value);
+/// Cline's on-disk data dir (`~/.cline/data`): sessions, settings, logs.
+/// `KOMET_CLINE_DATA_DIR` overrides it (tests point it at a fixture tree);
+/// an explicit harness override wins over both.
+fn resolve_cline_data_dir(override_dir: Option<&PathBuf>) -> Option<PathBuf> {
+    if let Some(dir) = override_dir {
+        return Some(dir.clone());
+    }
+    if let Ok(dir) = std::env::var("KOMET_CLINE_DATA_DIR")
+        && !dir.is_empty()
+    {
+        return Some(PathBuf::from(dir));
     }
     if cfg!(test) {
         return None;
     }
-    let home = std::env::var_os("HOME").map(PathBuf::from)?;
-    let text = std::fs::read_to_string(
-        home.join(".cline")
-            .join("data")
-            .join("settings")
-            .join("providers.json"),
-    )
-    .ok()?;
-    serde_json::from_str::<Value>(&text)
-        .ok()?
-        .get("lastUsedProvider")?
-        .as_str()
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cline").join("data"))
 }
 
+/// Cline's CLI config (`settings/providers.json` under [`cline_data_dir`]): the
+/// last-used auth provider (`cline` / `cline-pass` / `openai-codex`) plus
+/// that provider's configured model id. ACP `session/new` ignores both and
+/// defaults `provider` to Cline Credits (`cline`) with its own model
+/// default — which then hangs or errors ("Insufficient balance") instead
+/// of using the CLI's real setup. Worse, the wire model list omits the
+/// CLI's own ids (`cline-free/*`): without this sync the picker can't show
+/// the CLI's real model and the send path fabricates `{provider}/{name}`
+/// ids the agent rejects at prompt time. Tests skip the on-disk file so
+/// discovery fixtures stay deterministic; `KOMET_CLINE_PROVIDER` overrides
+/// the provider (model override: `KOMET_CLINE_MODEL`).
+fn cline_cli_config() -> Option<(String, Option<String>)> {
+    cline_cli_config_in(None)
+}
+
+fn cline_cli_config_in(data_dir: Option<&PathBuf>) -> Option<(String, Option<String>)> {
+    cline_cli_models_in(data_dir).into_iter().next()
+}
+
+/// Every configured CLI model as `(provider, model)`, last-used first:
+/// the wire list omits the CLI's own ids, so discovery injects all of them
+/// (not just the last-used provider's) with the provider in the label.
+fn cline_cli_models_in(data_dir: Option<&PathBuf>) -> Vec<(String, Option<String>)> {
+    if let Ok(value) = std::env::var("KOMET_CLINE_PROVIDER") {
+        if value.is_empty() {
+            return Vec::new();
+        }
+        let model = std::env::var("KOMET_CLINE_MODEL").ok().filter(|m| !m.is_empty());
+        return vec![(value, model)];
+    }
+    if data_dir.is_none() && cfg!(test) && std::env::var("KOMET_CLINE_DATA_DIR").is_err() {
+        return Vec::new();
+    }
+    let Some(data) = resolve_cline_data_dir(data_dir) else {
+        return Vec::new();
+    };
+    let text = std::fs::read_to_string(data.join("settings").join("providers.json"))
+        .ok()
+        .unwrap_or_default();
+    let doc: Value = serde_json::from_str(&text).ok().unwrap_or(Value::Null);
+    let last = doc
+        .get("lastUsedProvider")
+        .and_then(Value::as_str)
+        .filter(|v| !v.is_empty());
+    let providers = doc.get("providers").and_then(Value::as_object);
+    let mut out: Vec<(String, Option<String>)> = providers
+        .map(|providers| {
+            providers
+                .iter()
+                .map(|(name, entry)| {
+                    let model = entry
+                        .get("settings")
+                        .and_then(|s| s.get("model"))
+                        .and_then(Value::as_str)
+                        .filter(|m| !m.is_empty())
+                        .map(str::to_owned);
+                    (name.clone(), model)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    out.sort_by_key(|(name, _)| {
+        if last.is_some_and(|l| l == name) {
+            0
+        } else {
+            1
+        }
+    });
+    out.retain(|(_, model)| model.is_some());
+    out
+}
+
+/// Cache buster for Cline's model list: a hash of `providers.json` content.
+/// Provider, model AND account all live in that file, so any CLI-side change
+/// (model switch, account switch) invalidates the list — including callers
+/// holding a disk-cached copy keyed on this buster.
+fn cline_cache_buster_in(data_dir: Option<&PathBuf>) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let Some(data) = resolve_cline_data_dir(data_dir) else {
+        return String::new();
+    };
+    let bytes = std::fs::read(data.join("settings").join("providers.json")).unwrap_or_default();
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// Buster for an ACP harness's model cache: Cline hashes its live CLI
+/// config (provider + model + account all live in `providers.json`);
+/// every other agent's world is static per process, so the TTL alone
+/// governs. Disk-cached copies must key on this same string.
+fn acp_model_cache_buster_in(id: HarnessId, data_dir: Option<&PathBuf>) -> String {
+    if id == HarnessId::Cline {
+        cline_cache_buster_in(data_dir)
+    } else {
+        String::new()
+    }
+}
+
+/// Official built-in free-tier models embedded in the Cline CLI package:
+/// these are always free ($0.00) under the `cline` (Usage-Billing) provider,
+/// even when the account has no credits.
+fn cline_builtin_free_models() -> Vec<Model> {
+    vec![
+        Model {
+            id: "cline-free/deepseek-v4.1-flash".into(),
+            label: "DeepSeek V4.1 Flash (free)".into(),
+            description: Some("Fast and efficient with 1M context window (free)".into()),
+            reasoning_levels: Vec::new(),
+            options: Vec::new(),
+        },
+        Model {
+            id: "stealth/space-bunny-alpha".into(),
+            label: "Space Bunny Alpha (free)".into(),
+            description: Some("Blazing-fast inference with 1M context (free)".into()),
+            reasoning_levels: Vec::new(),
+            options: Vec::new(),
+        },
+        Model {
+            id: "cline-free/mimo-v2.6-flash".into(),
+            label: "MiMo-V2.6-Flash (free)".into(),
+            description: Some("Mixture-of-Experts architecture with 309B total parameters (free)".into()),
+            reasoning_levels: Vec::new(),
+            options: Vec::new(),
+        },
+        Model {
+            id: "cline-free/muse-spark-1.3-contributor".into(),
+            label: "Muse Spark 1.3 Contributor (free)".into(),
+            description: Some("Meta's multimodal reasoning model (free)".into()),
+            reasoning_levels: Vec::new(),
+            options: Vec::new(),
+        },
+    ]
+}
+
+/// Whether a model id is a free-tier one (`cline-free/*` and `stealth/*`
+/// hardcodes from the CLI package, `:free` suffix on the wire catalog).
+fn cline_is_free_model(id: &str) -> bool {
+    id.starts_with("cline-free/") || id.ends_with(":free") || id == "stealth/space-bunny-alpha"
+}
+
+/// The last `displayRole: "error"` message in a Cline session file
+/// (`sessions/<sessionId>/<sessionId>.messages.json` — the ACP `sessionId`
+/// is the directory name). Billing/model failures (`Insufficient balance`,
+/// unknown model) surface ONLY here, never on the ACP wire: a prompt can
+/// return `stopReason: end_turn` with zero content while this file holds
+/// the real cause. Best-effort: missing/unparseable files yield `None`.
+/// Only errors from the current prompt are returned: anything at or before
+/// the last user message belongs to an earlier (possibly resumed) turn, so
+/// a successful empty prompt is never marked errored by a historical error.
+fn cline_session_error_in(session_id: &str, data_dir: Option<&PathBuf>) -> Option<String> {
+    if session_id.is_empty() || session_id.contains(['/', '\\', '.']) {
+        return None;
+    }
+    let data = resolve_cline_data_dir(data_dir)?;
+    let path = data
+        .join("sessions")
+        .join(session_id)
+        .join(format!("{session_id}.messages.json"));
+    let text = std::fs::read_to_string(path).ok()?;
+    let doc: Value = serde_json::from_str(&text).ok()?;
+    let messages = doc.get("messages")?.as_array()?;
+    // Index of the last user message; errors at or before it are history.
+    let mut last_user = None;
+    for (i, message) in messages.iter().enumerate() {
+        if message.get("role").and_then(Value::as_str) == Some("user") {
+            last_user = Some(i);
+        }
+    }
+    let mut last: Option<String> = None;
+    for (i, message) in messages.iter().enumerate() {
+        if last_user.is_some_and(|u| i <= u) {
+            continue;
+        }
+        let metadata = message.get("metadata");
+        let is_error = metadata
+            .and_then(|m| m.get("displayRole"))
+            .and_then(Value::as_str)
+            .is_some_and(|role| role == "error");
+        if !is_error {
+            continue;
+        }
+        let Some(text) = message
+            .get("content")
+            .and_then(Value::as_array)
+            .map(|parts| {
+                parts
+                    .iter()
+                    .filter_map(|part| {
+                        (part.get("type").and_then(Value::as_str) == Some("text"))
+                            .then(|| part.get("text").and_then(Value::as_str))
+                            .flatten()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .map(|t| t.trim().to_owned())
+            .filter(|t| !t.is_empty())
+        else {
+            continue;
+        };
+        last = Some(text);
+    }
+    last.map(|text| {
+        const MAX: usize = 500;
+        if text.len() > MAX {
+            let mut end = MAX;
+            while end > 0 && !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("{}…", text[..end].trim_end())
+        } else {
+            text
+        }
+    })
+}
+
+/// Empty-turn guard (Cline only): `end_turn` with no assistant text and no
+/// tool calls is never a real answer — it is the billing/model failure from
+/// [`cline_session_error`] wearing a `completed` status. Returns the `Done`
+/// error text, or `None` when the turn genuinely produced nothing observable
+/// (in which case the caller keeps the historical `completed`).
+async fn cline_empty_turn_error(
+    session_id: &str,
+    content_seen: bool,
+    open_tool_calls: usize,
+    data_dir: Option<PathBuf>,
+) -> Option<String> {
+    if content_seen || open_tool_calls > 0 {
+        return None;
+    }
+    for _ in 0..5 {
+        let sid = session_id.to_owned();
+        let dir = data_dir.clone();
+        let found = tokio::task::spawn_blocking(move || cline_session_error_in(&sid, dir.as_ref()))
+            .await
+            .ok()
+            .flatten();
+        if let Some(raw) = found {
+            if raw.contains("Insufficient balance") {
+                return Some(format!(
+                    "Cline credits exhausted ({raw}): pick a free model or top up, then retry."
+                ));
+            }
+            return Some(raw);
+        }
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+    None
+}
+
+/// Decide the `model` value for Cline's `session/set_config_option`.
+///
+/// - Any CLI-configured model id that the wire never advertises is skipped
+///   (`Ok(None)` — the agent default, i.e. the CLI's own model, runs).
+///   Sending it verbatim kills the later `session/prompt` with
+///   "model not found" while the CLI itself works.
+///   Exception: `cline-free/*` — accepted, verified live.
+/// - After a provider switch the same model may live under the provider
+///   prefix — but only when that prefixed id is actually advertised.
+/// - Anything else is a strict error: silently running the agent default
+///   (possibly billed) is worse than failing loudly.
+///
+/// Returns `Ok(None)` when no `set_config_option` is warranted (no model
+/// requested, or the normal `config_option_sets` path owns it).
+fn cline_model_set(
+    requested: Option<&str>,
+    advertised: &[&str],
+    provider: Option<&str>,
+    cli_models: &[String],
+) -> Result<Option<String>, String> {
+    let Some(model) = requested else {
+        return Ok(None);
+    };
+    // Under Cline Usage-Billing ("cline"), map DeepSeek V4.1 Flash to the free tier id.
+    if provider.unwrap_or("cline") == "cline"
+        && (model == "deepseek/deepseek-v4.1-flash" || model == "cline/deepseek-v4.1-flash")
+    {
+        return Ok(Some("cline-free/deepseek-v4.1-flash".into()));
+    }
+    if model.starts_with("cline-free/") || model == "stealth/space-bunny-alpha" {
+        return Ok(Some(model.to_owned()));
+    }
+    if advertised.contains(&model) {
+        return Ok(None);
+    }
+    // The CLI's own model id may use a display format the ACP wire doesn't
+    // advertise (e.g. `Muse Spark 1.3 Contributor`). Sending it verbatim via
+    // set_config_option is accepted but kills the later session/prompt with
+    // "model not found", while the CLI itself works. Skip the set so the
+    // agent default (the CLI's own model) runs — Paseo parity: never send
+    // an unadvertised id.
+    if cli_models.iter().any(|id| id == model) {
+        return Ok(None);
+    }
+    if let Some(provider) = provider
+        && !model.starts_with(&format!("{provider}/"))
+        && let Some((_, name)) = model.rsplit_once('/')
+    {
+        let prefixed = format!("{provider}/{name}");
+        if advertised.contains(&prefixed.as_str()) {
+            return Ok(Some(prefixed));
+        }
+    }
+    Err(format!(
+        "cline does not advertise model {model}; pick one from the announced list (the CLI's own model is synced automatically)"
+    ))
+}
 /// Value for a sibling `category=model` select that is NOT the model list
 /// itself (Cline's `provider`). Traits first, then a model-id prefix match
 /// (`cline-pass/glm-5.3` → `cline-pass`).
@@ -2037,6 +2458,11 @@ fn auth_provider_value(
         return Some(choice.to_owned());
     }
     let model = model?;
+    if (model.starts_with("cline-free/") || model == "stealth/space-bunny-alpha")
+        && available.contains(&"cline")
+    {
+        return Some("cline".into());
+    }
     available
         .iter()
         .copied()
@@ -2758,6 +3184,8 @@ async fn run_session(session: Session) {
         kill_grace,
         handshake_timeout,
         stderr_tail,
+        cli_sync,
+        cline_data_dir,
         _opencode_overlay_dir: _overlay_dir,
     } = session;
     let RunControls {
@@ -2851,19 +3279,46 @@ async fn run_session(session: Session) {
         // session's advertised config options. Best-effort for effort and
         // traits: a rejected auxiliary set is logged and the agent default
         // runs.
-        let efforts = effort_values(request.reasoning, request.model.as_deref());
-        let requested_model = request.model.as_deref();
+        let cli_config =
+            (harness == HarnessId::Cline && cli_sync).then(|| cline_cli_config_in(cline_data_dir.as_ref())).flatten();
+        // Cline owns its model natively (`cline` CLI config); the Komet
+        // global picker id (e.g. `Muse Spark ...`) is never a valid Cline
+        // wire id and previously killed session/prompt with
+        // "model not found". An explicit request model wins; the CLI
+        // config is the fallback so the bottom bar's "Cline default" is
+        // what actually runs when nothing is selected — Paseo parity.
+        // The static "Cline default" entry (`id: "default"`) is not a real
+        // model id — treat it as no explicit selection.
+        let requested_model = if harness == HarnessId::Cline {
+            request
+                .model
+                .as_deref()
+                .filter(|m| *m != "default")
+                .or_else(|| cli_config.as_ref().and_then(|(_, m)| m.as_deref()))
+        } else {
+            request.model.as_deref().or_else(|| {
+                cli_config.as_ref().and_then(|(_, m)| m.as_deref())
+            })
+        };
+        let efforts = effort_values(request.reasoning, requested_model);
         let options_snapshot = session_response;
         let mut model_options = request.model_options.clone();
         // Cline's ACP session/new defaults `provider` to Cline Credits even
-        // when the CLI last used ClinePass. Inject that last-used value so
-        // set_config_option runs before the prompt (prefix inference still
-        // covers `cline-pass/...` model ids without this file).
-        if harness == HarnessId::Cline
-            && !model_options.contains_key("provider")
-            && let Some(provider) = cline_last_used_provider()
-        {
-            model_options.insert("provider".into(), json!(provider));
+        // when the CLI last used another provider. Inject that last-used
+        // value so set_config_option runs before the prompt (prefix
+        // inference still covers `cline-pass/...` model ids without this
+        // file). When the run selected a model configured under a specific
+        // provider, that provider owns the run — not the last-used one.
+        if !model_options.contains_key("provider") {
+            let owning = requested_model.and_then(|model| {
+                cline_cli_models_in(cline_data_dir.as_ref())
+                    .into_iter()
+                    .find(|(_, m)| m.as_deref() == Some(model))
+                    .map(|(provider, _)| provider)
+            });
+            if let Some(provider) = owning.or_else(|| cli_config.as_ref().map(|(p, _)| p.clone())) {
+                model_options.insert("provider".into(), json!(provider));
+            }
         }
         // Cline's `auto_approve` boolean defaults false; without it the hub
         // parks tool calls on an approval that komet never surfaces. Full
@@ -2896,34 +3351,66 @@ async fn run_session(session: Session) {
                 );
             }
         }
-        // After a Cline provider switch the advertised model ids change
-        // (`zai/glm-5.3` on Credits → `cline-pass/glm-5.3` on ClinePass).
-        // The initial session/new catalog can't see those ids, so retry the
-        // same model under the provider prefix; a rejection falls through
-        // to the provider's own default.
+        // The wire model list omits the CLI's own ids (`cline-free/*`):
+        // pass the CLI's configured model through verbatim — the agent
+        // accepts it (verified live) even though it never advertises it.
+        // Otherwise, after a provider switch the advertised ids change
+        // (`zai/glm-5.3` on Credits → `cline-pass/glm-5.3` on ClinePass):
+        // retry under the provider prefix, but ONLY when that prefixed id
+        // is actually advertised — a fabricated `{provider}/{name}` (e.g.
+        // `cline/deepseek-v4.1-flash` for the real `cline-free/...` id)
+        // is accepted by set_config_option yet kills the prompt.
         if harness == HarnessId::Cline
-            && let Some(provider) = model_options.get("provider").and_then(Value::as_str)
-            && let Some(model) = requested_model
-            && !model.starts_with(&format!("{provider}/"))
-            && let Some((_, name)) = model.rsplit_once('/')
+            && cli_sync
+            && requested_model.is_some()
         {
-            let prefixed = format!("{provider}/{name}");
-            let mut params = serde_json::Map::new();
-            params.insert("sessionId".into(), session_id.clone().into());
-            params.insert("configId".into(), "model".into());
-            params.insert("value".into(), json!(prefixed));
-            if let Err(e) = request_draining(
-                &client,
-                &mut incoming,
-                "session/set_config_option",
-                Value::Object(params),
+            let advertised: Vec<&str> = options_snapshot
+                .get("configOptions")
+                .and_then(Value::as_array)
+                .map(|a| a.as_slice())
+                .unwrap_or_default()
+                .iter()
+                .find(|o| {
+                    o.get("id").and_then(Value::as_str) == Some("model")
+                        && o.get("category").and_then(Value::as_str) == Some("model")
+                })
+                .and_then(|o| o.get("options").and_then(Value::as_array))
+                .map(|opts| {
+                    opts.iter()
+                        .filter_map(|o| o.get("value").and_then(Value::as_str))
+                        .collect()
+                })
+                .unwrap_or_default();
+            // Any provider's configured CLI model passes through verbatim.
+            let cli_models: Vec<String> = cline_cli_models_in(cline_data_dir.as_ref())
+                .into_iter()
+                .filter_map(|(_, model)| model)
+                .collect();
+            let direct = cline_model_set(
+                requested_model,
+                &advertised,
+                model_options.get("provider").and_then(Value::as_str),
+                &cli_models,
             )
-            .await
-            {
-                tracing::debug!(
-                    target: "komet_harness::acp",
-                    "session/set_config_option model={prefixed} rejected (agent default runs): {e}"
-                );
+            .map_err(HarnessError::Protocol)?;
+            if let Some(value) = direct {
+                let mut params = serde_json::Map::new();
+                params.insert("sessionId".into(), session_id.clone().into());
+                params.insert("configId".into(), "model".into());
+                params.insert("value".into(), json!(value));
+                if let Err(e) = request_draining(
+                    &client,
+                    &mut incoming,
+                    "session/set_config_option",
+                    Value::Object(params),
+                )
+                .await
+                {
+                    tracing::debug!(
+                        target: "komet_harness::acp",
+                        "session/set_config_option model={value} rejected (agent default runs): {e}"
+                    );
+                }
             }
         }
         Ok::<(String, bool, Vec<SlashCommand>), HarnessError>((
@@ -3001,6 +3488,20 @@ async fn run_session(session: Session) {
         };
 
     let mut assistant_message_id = new_message_id();
+    // Startup line: one info per run (harness, provider, model, session) so a
+    // later failure can be traced without crossing three log sources.
+    tracing::info!(
+        target: "komet_harness::acp",
+        harness = ?harness,
+        provider = request
+            .model_options
+            .get("provider")
+            .and_then(|v| v.as_str())
+            .unwrap_or("-"),
+        model = request.model.as_deref().unwrap_or("-"),
+        session_id = session_id.as_str(),
+        "agent session started",
+    );
     if !send(
         &event_tx,
         AgentEvent::SessionStarted {
@@ -3273,7 +3774,25 @@ async fn run_session(session: Session) {
                         if !emit_grok_session_info(&event_tx, &client, &session_id, harness).await {
                             break 'main;
                         }
-                        let (status, error) = stop_outcome(&res, interrupted);
+                        let (mut status, mut error) = stop_outcome(&res, interrupted);
+                        // Cline's empty turn (billing/model failure with a
+                        // `completed` status) must not journal as success —
+                        // the real cause lives in its session file, never on
+                        // the wire.
+                        if harness == HarnessId::Cline
+                            && status == DoneStatus::Completed
+                            && res.is_ok()
+                            && let Some(empty) = cline_empty_turn_error(
+                                &session_id,
+                                turn_content_seen,
+                                open_tools.len(),
+                                cline_data_dir.clone(),
+                            )
+                            .await
+                        {
+                            status = DoneStatus::Errored;
+                            error = Some(empty);
+                        }
                         done_current = true;
                         if interrupted {
                             done_after_interrupt = true;
@@ -3292,7 +3811,7 @@ async fn run_session(session: Session) {
                         {
                             break 'main;
                         }
-                        if interrupted || res.is_err() {
+                        if interrupted || res.is_err() || status == DoneStatus::Errored {
                             break 'main;
                         }
                         // Persistent session: a queued steer becomes the next turn;
@@ -3447,7 +3966,25 @@ async fn run_session(session: Session) {
                                 let _ =
                                     emit_grok_session_info(&event_tx, &client, &session_id, harness)
                                         .await;
-                                let (status, error) = stop_outcome(&res, interrupted);
+                        let (mut status, mut error) = stop_outcome(&res, interrupted);
+                        // Cline's empty turn (billing/model failure with a
+                        // `completed` status) must not journal as success —
+                        // the real cause lives in its session file, never on
+                        // the wire.
+                        if harness == HarnessId::Cline
+                            && status == DoneStatus::Completed
+                            && res.is_ok()
+                            && let Some(empty) = cline_empty_turn_error(
+                                &session_id,
+                                turn_content_seen,
+                                open_tools.len(),
+                                cline_data_dir.clone(),
+                            )
+                            .await
+                        {
+                            status = DoneStatus::Errored;
+                            error = Some(empty);
+                        }
                                 done_current = true;
                                 if interrupted {
                                     done_after_interrupt = true;
@@ -4252,6 +4789,149 @@ mod tests {
                 .map(|c| c.id.as_str())
                 .collect::<Vec<_>>(),
             vec!["cline", "cline-pass", "openai-codex"]
+        );
+    }
+
+    #[test]
+    fn cline_cli_config_env_override() {
+        // SAFETY: unit tests in this binary never rely on these vars
+        // elsewhere; the integration binary is a separate process.
+        unsafe {
+            std::env::set_var("KOMET_CLINE_PROVIDER", "cline-pass");
+            std::env::set_var("KOMET_CLINE_MODEL", "cline-pass/glm-5.3");
+        }
+        assert_eq!(
+            cline_cli_config(),
+            Some(("cline-pass".into(), Some("cline-pass/glm-5.3".into())))
+        );
+        unsafe {
+            std::env::remove_var("KOMET_CLINE_MODEL");
+        }
+        assert_eq!(cline_cli_config(), Some(("cline-pass".into(), None)));
+        unsafe {
+            std::env::remove_var("KOMET_CLINE_PROVIDER");
+        }
+    }
+
+    #[test]
+    fn cline_model_set_strictness() {
+        let advertised = ["zai/glm-5.3", "cline-pass/glm-5.3"];
+        // No model requested: nothing to set.
+        assert_eq!(cline_model_set(None, &advertised, Some("cline"), &[]), Ok(None));
+        // Advertised: the normal config_option_sets path owns it.
+        assert_eq!(
+            cline_model_set(Some("zai/glm-5.3"), &advertised, Some("cline"), &[]),
+            Ok(None)
+        );
+        // The CLI's own id that the wire never advertises: skip the set so
+        // the agent default (the CLI's own model) runs.
+        let cli_models = vec!["cline-free/deepseek-v4.1-flash".to_string()];
+        assert_eq!(
+            cline_model_set(
+                Some("cline-free/deepseek-v4.1-flash"),
+                &advertised,
+                Some("cline"),
+                &cli_models,
+            ),
+            Ok(Some("cline-free/deepseek-v4.1-flash".into()))
+        );
+        assert_eq!(
+            cline_model_set(
+                Some("Muse Spark 1.3 Contributor (free)"),
+                &advertised,
+                Some("cline"),
+                &["Muse Spark 1.3 Contributor (free)".to_string()],
+            ),
+            Ok(None)
+        );
+        // Provider prefix, but only when actually advertised.
+        assert_eq!(
+            cline_model_set(Some("zai/glm-5.3"), &["cline-pass/glm-5.3"], Some("cline-pass"), &[]),
+            Ok(Some("cline-pass/glm-5.3".into()))
+        );
+        // Fabricated `{provider}/{name}` that is NOT advertised: loud error,
+        // never a silent agent-default run.
+        let other = vec!["other/model".to_string()];
+        let err = cline_model_set(
+            Some("fabricated/non-existent-model"),
+            &advertised,
+            Some("cline"),
+            &other,
+        )
+        .expect_err("unadvertised non-CLI model must fail");
+        assert!(err.contains("does not advertise model"), "{err}");
+
+        // deepseek/deepseek-v4.1-flash automatically mapped to cline-free when provider is cline
+        assert_eq!(
+            cline_model_set(
+                Some("deepseek/deepseek-v4.1-flash"),
+                &advertised,
+                Some("cline"),
+                &cli_models,
+            ),
+            Ok(Some("cline-free/deepseek-v4.1-flash".into()))
+        );
+    }
+
+    #[tokio::test]
+    async fn cline_empty_turn_reads_session_file_error() {
+        // Fixture tree mimicking ~/.cline/data for one failed session.
+        let root = tempfile::tempdir().expect("tempdir");
+        let dir = root.path().join("sessions").join("s-1");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::fs::write(
+            dir.join("s-1.messages.json"),
+            serde_json::json!({
+                "messages": [
+                    {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+                    {"role": "assistant",
+                     "content": [{"type": "text", "text": "Insufficient balance. Your Cline Credits balance is $-0.00"}],
+                     "metadata": {"displayOnly": true, "displayRole": "error"}},
+                ],
+            })
+            .to_string(),
+        )
+        .expect("write");
+        let data_dir = root.path().to_path_buf();
+        let raw = cline_session_error_in("s-1", Some(&data_dir));
+        let empty = cline_empty_turn_error("s-1", false, 0, Some(data_dir.clone())).await;
+        assert!(raw.is_some_and(|t| t.contains("Insufficient balance")));
+        let message = empty.expect("empty turn with session error must error");
+        assert!(message.contains("Cline credits exhausted"), "{message}");
+        assert!(message.contains("free model"), "{message}");
+        // Content or tool calls: not an empty turn, no error.
+        assert_eq!(
+            cline_empty_turn_error("s-1", true, 0, Some(data_dir.clone())).await,
+            None
+        );
+        assert_eq!(
+            cline_empty_turn_error("s-1", false, 1, Some(data_dir.clone())).await,
+            None
+        );
+        // Unknown session: silent (historical completed), never a crash.
+        assert_eq!(
+            cline_empty_turn_error("nope", false, 0, Some(data_dir.clone())).await,
+            None
+        );
+        // Historical error (before the latest user message) belongs to an
+        // earlier turn: a successful empty prompt must not be marked errored.
+        std::fs::write(
+            dir.join("s-1.messages.json"),
+            serde_json::json!({
+                "messages": [
+                    {"role": "assistant",
+                     "content": [{"type": "text", "text": "Insufficient balance. Old turn."}],
+                     "metadata": {"displayOnly": true, "displayRole": "error"}},
+                    {"role": "user", "content": [{"type": "text", "text": "new prompt"}]},
+                ],
+            })
+            .to_string(),
+        )
+        .expect("write");
+        assert_eq!(cline_session_error_in("s-1", Some(&data_dir)), None);
+        assert_eq!(
+            cline_empty_turn_error("s-1", false, 0, Some(data_dir)).await,
+            None
         );
     }
 
