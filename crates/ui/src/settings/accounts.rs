@@ -16,6 +16,7 @@ use gpui::{
 };
 use std::time::Duration;
 
+use komet_engine::UsageMode;
 use komet_proto::{
     AgentAccount, AgentAccountsSnapshot, AgentLoginMode, AgentLoginPoll, AgentLoginStart,
     AgentLoginStatus, HarnessId,
@@ -64,7 +65,7 @@ pub fn usage_color(level: UsageLevel, theme: &Theme) -> Hsla {
 }
 
 /// Why a `ListAgentAccounts` load is happening. Pure input to
-/// [`force_usage_for`].
+/// [`usage_mode_for`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoadTrigger {
     /// Page construction — the visit's first list.
@@ -80,24 +81,27 @@ pub enum LoadTrigger {
     PostAction,
 }
 
-/// Whether a load should ask the engine to probe usage (`forceUsage`). The
-/// engine only hits the provider when forced; non-forced lists serve the 60s
-/// usage cache or nothing (engine/src/agent_accounts.rs module docs — the
-/// design expects the UI to force "on page mount/refresh"). The visit's first
-/// list (mount, or retry after a failure) must force, or every first open
-/// renders "Usage unavailable" until a manual Refresh — the old app fetched
-/// usage on every list. Post-Switch/Forget lists force too: a switch changes
-/// which account is ACTIVE, and the active account is probed through a
-/// different path (live keyring / local language_server) than the saved-slot
-/// copy, so riding the warm cache showed the previous account's numbers — or a
-/// stale miss — right after switching.
-pub fn force_usage_for(trigger: LoadTrigger) -> bool {
+/// How aggressively a load should resolve usage, sent to the engine as
+/// `usageMode`. Replaces the old `forceUsage` boolean, which could not express
+/// the distinction that mattered: a forced list still served the 60s cache, so
+/// a Refresh inside the TTL returned the previous numbers without a probe.
+///
+/// - `Cached` — the visit's first list (mount, or retry after a failure), and
+///   post-Switch/Forget lists. A cold cache probes, so a first open never
+///   renders "Usage unavailable"; a warm entry is still trustworthy, so we do
+///   not stampede the provider on every nav. Post-Switch/Forget uses it because
+///   the switch moved the LIVE login — the active account is probed through a
+///   different path (live keyring / local language_server) than the saved-slot
+///   copy, and that live entry was just invalidated by the switch itself.
+/// - `Fresh` — the explicit Refresh button and a just-completed login. Both are
+///   an explicit user request for current numbers, so the cache is bypassed
+///   outright.
+pub fn usage_mode_for(trigger: LoadTrigger) -> UsageMode {
     match trigger {
         LoadTrigger::Mount
         | LoadTrigger::Retry
-        | LoadTrigger::Refresh
-        | LoadTrigger::PostLogin
-        | LoadTrigger::PostAction => true,
+        | LoadTrigger::PostAction => UsageMode::Cached,
+        LoadTrigger::Refresh | LoadTrigger::PostLogin => UsageMode::Fresh,
     }
 }
 
@@ -218,6 +222,10 @@ pub struct AccountsPage {
     target_device: Option<String>,
     device_menu: popover::Popup<()>,
     snapshot: Loadable<AgentAccountsSnapshot>,
+    /// A `ListAgentAccounts` is in flight. Kept separate from the `Loadable`
+    /// state so a refresh dims the button and leaves the cards (and their last
+    /// known gauges) on screen instead of collapsing them to skeletons.
+    refreshing: bool,
     /// Account id with an in-flight Switch/Forget.
     busy_account: Option<String>,
     login: Option<LoginFlow>,
@@ -244,6 +252,7 @@ impl AccountsPage {
             target_device: None,
             device_menu: popover::Popup::default(),
             snapshot: Loadable::Idle,
+            refreshing: false,
             busy_account: None,
             login: None,
             error: None,
@@ -259,7 +268,7 @@ impl AccountsPage {
         // every account as "Usage unavailable" until a manual Refresh. The
         // Loading skeleton (meter ghosts) covers the probe latency, so
         // "Usage unavailable" is reserved for a probe that genuinely failed.
-        page.load(force_usage_for(LoadTrigger::Mount), cx);
+        page.load(usage_mode_for(LoadTrigger::Mount), cx);
         page
     }
 
@@ -286,7 +295,7 @@ impl AccountsPage {
         self.login = None;
         self.busy_account = None;
         self.error = None;
-        self.load(force_usage_for(LoadTrigger::Mount), cx);
+        self.load(usage_mode_for(LoadTrigger::Mount), cx);
     }
 
     /// Params with the `targetDeviceId` passthrough merged in.
@@ -461,28 +470,39 @@ impl AccountsPage {
         trigger.into_any_element()
     }
 
-    fn load(&mut self, force_usage: bool, cx: &mut Context<Self>) {
+    fn load(&mut self, mode: UsageMode, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.snapshot = Loadable::Error("Engine not connected".into());
             return;
         };
-        self.snapshot = Loadable::Loading;
-        let params = self.params(serde_json::json!({ "forceUsage": force_usage }));
+        // Only the first load has nothing to show yet; afterwards the previous
+        // snapshot stays rendered while the new one is in flight (the Refresh
+        // button dims via `refreshing`). Collapsing to `Loading` here was what
+        // blanked every card to a skeleton and made the merge below dead code —
+        // `snapshot.ready()` is always `None` mid-load.
+        if matches!(self.snapshot, Loadable::Idle) {
+            self.snapshot = Loadable::Loading;
+        }
+        self.refreshing = true;
+        let params = self.params(serde_json::json!({ "usageMode": mode.as_wire() }));
         self.load_task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
                 .call(methods::LIST_AGENT_ACCOUNTS, params)
                 .await;
             this.update(cx, |page, cx| {
+                page.refreshing = false;
                 page.snapshot = match result {
                     Ok(value) => match serde_json::from_value::<AgentAccountsSnapshot>(value) {
                         Ok(mut snapshot) => {
-                            // Merge: a non-forced re-list returns empty
-                            // `usage_windows` (engine never hits the network
-                            // unless forced). Overwriting wholesale made gauges
-                            // flicker to "Usage unavailable" after every
-                            // Switch/Forget/watch frame — keep the previous
-                            // windows when the fresh ones are empty.
+                            // Merge: a cached/offline re-list can return empty
+                            // `usage_windows` for an account whose cache entry
+                            // expired or was never warmed. Overwriting wholesale
+                            // made gauges flicker to "Usage unavailable" after
+                            // every Switch/Forget/watch frame — keep the
+                            // previous windows when the fresh ones are empty.
+                            // `page.snapshot` still holds the rendered snapshot
+                            // here, so this now actually fires.
                             if let Some(prev) = page.snapshot.ready() {
                                 let prev = prev.clone();
                                 for account in &mut snapshot.accounts {
@@ -546,7 +566,7 @@ impl AccountsPage {
             this.update(cx, |page, cx| {
                 page.busy_account = None;
                 match result {
-                    Ok(_) => page.load(force_usage_for(LoadTrigger::PostAction), cx),
+                    Ok(_) => page.load(usage_mode_for(LoadTrigger::PostAction), cx),
                     Err(err) => page.error = Some(format!("{err}").into()),
                 }
                 cx.notify();
@@ -658,7 +678,7 @@ impl AccountsPage {
                 match result {
                     Ok(_) => {
                         page.login = None;
-                        page.load(force_usage_for(LoadTrigger::PostLogin), cx);
+                        page.load(usage_mode_for(LoadTrigger::PostLogin), cx);
                     }
                     Err(err) => {
                         if let Some(LoginFlow::PasteCode {
@@ -706,7 +726,7 @@ impl AccountsPage {
                         Some(poll) => match poll.status {
                             AgentLoginStatus::Done => {
                                 page.login = None;
-                                page.load(force_usage_for(LoadTrigger::PostLogin), cx);
+                                page.load(usage_mode_for(LoadTrigger::PostLogin), cx);
                                 cx.notify();
                                 true
                             }
@@ -1010,18 +1030,17 @@ impl AccountsPage {
                                     .truncate()
                                     .text_size(px(11.5))
                                     .text_color(theme.text_muted.opacity(0.6))
-                                    .child(SharedString::from(
-                                        if account.harness == HarnessId::Cursor {
-                                            // The engine never probes Cursor quotas
-                                            // (`usage_for` returns None) — don't
-                                            // imply a failure, state the support gap.
-                                            "Quota not tracked for this provider"
-                                        } else if account.switchable {
-                                            "Usage unavailable"
-                                        } else {
-                                            "Credentials unavailable"
-                                        },
-                                    )),
+                                    .child(SharedString::from(if account.switchable {
+                                        // Cursor is probed too (its usage DB is
+                                        // read for the ACTIVE login only), so an
+                                        // empty reading here is a real miss, not
+                                        // a coverage gap. "Credentials
+                                        // unavailable" stays reserved for a
+                                        // live login we could not read.
+                                        "Usage unavailable"
+                                    } else {
+                                        "Credentials unavailable"
+                                    })),
                             )
                         } else {
                             el.child(
@@ -1336,7 +1355,9 @@ impl Render for AccountsPage {
         let theme = Theme::of(cx).clone();
         let now = Utc::now();
         let dialog = self.render_login_dialog(window.viewport_size(), cx);
-        let refreshing = matches!(self.snapshot, Loadable::Loading);
+        // Driven by the load flag, not the `Loadable` state: a reload keeps the
+        // previous snapshot on screen, so `Loading` no longer marks "in flight".
+        let refreshing = self.refreshing;
         let account_count = self
             .snapshot
             .ready()
@@ -1433,7 +1454,7 @@ impl Render for AccountsPage {
                         .cursor_pointer()
                         .on_click(cx.listener(|this, _, _, cx| {
                             // Retry IS the visit's first successful list — force usage.
-                            this.load(force_usage_for(LoadTrigger::Retry), cx)
+                            this.load(usage_mode_for(LoadTrigger::Retry), cx)
                         }))
                         .child(
                             div()
@@ -1554,7 +1575,7 @@ impl Render for AccountsPage {
                                     .hover(|s| widgets::ghost_hover(&theme, s))
                                     .when(refreshing, |el| el.opacity(0.5))
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        this.load(force_usage_for(LoadTrigger::Refresh), cx)
+                                        this.load(usage_mode_for(LoadTrigger::Refresh), cx)
                                     }))
                                     .child(
                                         crate::icons::icon(crate::icons::REFRESH)
@@ -1567,9 +1588,9 @@ impl Render for AccountsPage {
                     )
                     .child(widgets::page_subtitle(
                         &theme,
-                        "The Claude Code and Codex logins on this device. Komet detects the \
-                         live session, keeps each account backed up, and can swap between \
-                         them.",
+                        "The Claude Code, Codex, Antigravity and Cursor logins on this \
+                         device. Komet detects the live session, keeps each account backed \
+                         up, and can swap between them.",
                     ))
                     .when_some(self.error.clone(), |el, message| {
                         el.child(
@@ -1609,20 +1630,49 @@ mod tests {
     use chrono::TimeDelta;
 
     #[test]
-    fn first_load_of_a_visit_forces_the_usage_probe() {
-        // The engine only probes usage when forced (M5c); without forcing on
-        // mount, the first Accounts open always rendered "Usage unavailable".
-        assert!(force_usage_for(LoadTrigger::Mount));
-        // A retry after a failed load is still the visit's first successful
-        // list — same requirement.
-        assert!(force_usage_for(LoadTrigger::Retry));
-        // Explicit refresh and a just-completed login always re-probe.
-        assert!(force_usage_for(LoadTrigger::Refresh));
-        assert!(force_usage_for(LoadTrigger::PostLogin));
-        // Switch/Forget re-probe too: the switch moved the LIVE login, so the
-        // cache entry the previous list filled describes the account that is
-        // no longer active.
-        assert!(force_usage_for(LoadTrigger::PostAction));
+    fn first_load_of_a_visit_probes_on_a_cold_cache() {
+        // The visit's first list must be able to hit the provider, or the open
+        // renders "Usage unavailable" until a manual Refresh. `Cached` still
+        // probes whenever the entry is missing or stale — which is the normal
+        // case for a freshly opened page — without re-fetching a warm entry.
+        assert_eq!(usage_mode_for(LoadTrigger::Mount), UsageMode::Cached);
+        // A retry after a failed load is still the visit's first list.
+        assert_eq!(usage_mode_for(LoadTrigger::Retry), UsageMode::Cached);
+    }
+
+    #[test]
+    fn explicit_refresh_bypasses_the_cache() {
+        // THE regression this guards: a Refresh clicked inside the 60s TTL used
+        // to be served the previous numbers without a probe. `Fresh` ignores
+        // the cache outright, so the click always reaches the engine network
+        // path.
+        assert_eq!(usage_mode_for(LoadTrigger::Refresh), UsageMode::Fresh);
+        // A just-completed login must show the new account's real numbers, not
+        // whatever the previous list cached for that slot id.
+        assert_eq!(usage_mode_for(LoadTrigger::PostLogin), UsageMode::Fresh);
+    }
+
+    #[test]
+    fn switch_and_forget_re_probe() {
+        // The switch moved the LIVE login, so the cached entry describes the
+        // account that is no longer active. `Cached` re-probes because the
+        // engine invalidates the live entry on a switch.
+        assert_eq!(usage_mode_for(LoadTrigger::PostAction), UsageMode::Cached);
+    }
+
+    #[test]
+    fn no_trigger_stays_offline() {
+        // Every visit-shaped load must be able to hit the network; only the
+        // engine's internal bookkeeping lists are offline.
+        for trigger in [
+            LoadTrigger::Mount,
+            LoadTrigger::Retry,
+            LoadTrigger::Refresh,
+            LoadTrigger::PostLogin,
+            LoadTrigger::PostAction,
+        ] {
+            assert_ne!(usage_mode_for(trigger), UsageMode::Offline, "{trigger:?}");
+        }
     }
 
     #[test]
