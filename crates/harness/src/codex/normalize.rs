@@ -5,7 +5,7 @@
 //! (`delta`/`textDelta`, `exitCode`/`exit_code`, camelCase/snake_case item
 //! types) are accepted, and unknown item types map to nothing.
 
-use komet_proto::{AgentEvent, TodoItem, ToolCall};
+use komet_proto::{AgentEvent, ErrorKind, TodoItem, ToolCall};
 use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -304,6 +304,9 @@ pub(crate) fn map_item(phase: Phase, item: &Value) -> Vec<AgentEvent> {
         }
         "error" => vec![AgentEvent::Error {
             message: str_field(item, &["message"]),
+            kind: ErrorKind::Unknown,
+            detail: None,
+            retryable: false,
         }],
         // A subagent spawn/lifecycle marker on the PARENT thread (multi-agent
         // v2, codex 0.146.x): the parent-feed chip for the child thread. The

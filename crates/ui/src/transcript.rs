@@ -890,6 +890,7 @@ pub fn rows_for_entry(
                     MessagePart::Error {
                         id: part_id,
                         message,
+                        ..
                     } => {
                         rows.push(Row {
                             id: format!("{}#{}", entry.id, part_id).into(),

@@ -1530,6 +1530,44 @@ pub enum DoneReason {
     EngineRestart,
 }
 
+/// Machine-readable class of a CLI-side failure, carried on
+/// [`AgentEvent::Error`] and on the doc's `MessagePart::Error` alongside the
+/// raw CLI text. Decided by the harness `classify_error` helper; `Unknown`
+/// is the default for anything unrecognized and for old persisted errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum ErrorKind {
+    Auth,
+    Billing,
+    RateLimit,
+    Overloaded,
+    ModelUnavailable,
+    Network,
+    Config,
+    CliCrash,
+    Timeout,
+    Refusal,
+    Truncated,
+    #[default]
+    Unknown,
+}
+
+impl ErrorKind {
+    /// `true` when the part is rendered without its kind suffix.
+    /// Takes `&self` so it fits `skip_serializing_if`.
+    pub fn is_unknown(&self) -> bool {
+        matches!(self, Self::Unknown)
+    }
+
+    /// Whether retrying the same request is expected to help.
+    pub fn retryable_default(self) -> bool {
+        matches!(
+            self,
+            Self::RateLimit | Self::Overloaded | Self::Network | Self::Timeout
+        )
+    }
+}
+
 /// The normalized streaming event every harness emits.
 ///
 /// Mirrors komet's `AgentEvent` tagged enum.
@@ -1603,6 +1641,15 @@ pub enum AgentEvent {
     },
     Error {
         message: String,
+        /// Typed class of the failure (spec §1); `Unknown` on old events.
+        #[serde(default, skip_serializing_if = "ErrorKind::is_unknown")]
+        kind: ErrorKind,
+        /// Raw CLI text / stderr tail backing the Details view.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+        /// Whether the UI offers a retry action.
+        #[serde(default)]
+        retryable: bool,
     },
     #[serde(rename_all = "camelCase")]
     PermissionRequested {

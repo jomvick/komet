@@ -55,7 +55,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
 use komet_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SlashCommand,
+    AgentEvent, DoneStatus, ErrorKind, HarnessId, Model, ReasoningLevel, RunRequest, SlashCommand,
     SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
@@ -982,6 +982,9 @@ async fn run_session(session: Session) {
                                                     })
                                                     .unwrap_or("Codex subagent error")
                                                     .to_owned(),
+                                                kind: ErrorKind::Unknown,
+                                                detail: None,
+                                                retryable: false,
                                             }],
                                             "thread/closed" => vec![AgentEvent::Done {
                                                 status: DoneStatus::Completed,
@@ -1255,7 +1258,7 @@ async fn run_session(session: Session) {
                                     .or_else(|| params.get("message").and_then(Value::as_str))
                                     .unwrap_or("Codex error")
                                     .to_owned();
-                                if !send(&event_tx, AgentEvent::Error { message }).await {
+                                if !send(&event_tx, AgentEvent::Error { message, kind: ErrorKind::Unknown, detail: None, retryable: false }).await {
                                     break 'main;
                                 }
                             }
@@ -1467,6 +1470,9 @@ async fn steer_as_new_turn(
                 event_tx,
                 AgentEvent::Error {
                     message: format!("Steering failed: {e}"),
+                    kind: ErrorKind::Unknown,
+                    detail: None,
+                    retryable: false,
                 },
             )
             .await;

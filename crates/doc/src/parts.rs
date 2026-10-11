@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use komet_proto::{AgentEvent, SUBAGENT_MODEL_KEYS, ToolCall, ToolDiff, UserInputQuestion};
+use komet_proto::{AgentEvent, ErrorKind, SUBAGENT_MODEL_KEYS, ToolCall, ToolDiff, UserInputQuestion};
 
 use crate::constants::MSG_INLINE_MAX;
 
@@ -192,6 +192,20 @@ pub enum MessagePart {
     Error {
         id: String,
         message: String,
+        /// Typed class of the failure; `Unknown` on old rows. Renamed on the
+        /// wire: the enum's internal serde tag already occupies `kind`.
+        #[serde(
+            default,
+            skip_serializing_if = "ErrorKind::is_unknown",
+            rename = "errorKind"
+        )]
+        kind: ErrorKind,
+        /// Raw CLI text / stderr tail backing the Details view.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+        /// Whether the UI offers a retry action.
+        #[serde(default)]
+        retryable: bool,
     },
     #[serde(rename_all = "camelCase")]
     Permission {
@@ -378,11 +392,19 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                 }
             }
         }
-        AgentEvent::Error { message } => {
+        AgentEvent::Error {
+            message,
+            kind,
+            detail,
+            retryable,
+        } => {
             let id = format!("e{}", out.len());
             out.push(MessagePart::Error {
                 id,
                 message: message.clone(),
+                kind: *kind,
+                detail: detail.clone(),
+                retryable: *retryable,
             });
         }
         AgentEvent::Done { error, .. } => {
@@ -391,6 +413,9 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                 out.push(MessagePart::Error {
                     id,
                     message: message.clone(),
+                    kind: ErrorKind::Unknown,
+                    detail: None,
+                    retryable: false,
                 });
             }
         }

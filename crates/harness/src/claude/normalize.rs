@@ -1,7 +1,7 @@
 //! Frame → [`AgentEvent`] normalization (init dedupe, subagent tagging, tool
 //! decoding, error-code mapping).
 
-use komet_proto::{AgentEvent, DoneStatus, HarnessId, TodoItem, ToolCall};
+use komet_proto::{AgentEvent, DoneStatus, ErrorKind, HarnessId, TodoItem, ToolCall};
 use serde_json::Value;
 
 use super::wire::{ContentBlock, Frame};
@@ -398,6 +398,9 @@ impl Normalizer {
                             parent,
                             AgentEvent::Error {
                                 message: assistant_error_text(code),
+                                kind: ErrorKind::Unknown,
+                                detail: None,
+                                retryable: false,
                             },
                         ));
                     }
@@ -469,6 +472,9 @@ impl Normalizer {
                 if let Some(code) = &f.error {
                     out.push(AgentEvent::Error {
                         message: assistant_error_text(code),
+                        kind: ErrorKind::Unknown,
+                        detail: None,
+                        retryable: false,
                     });
                 }
                 // The enclosing assistant frame closes the streamed message
@@ -541,6 +547,9 @@ impl Normalizer {
                     message: format!(
                         "Claude {window} limit reached — the turn was blocked. Try again after it resets."
                     ),
+                    kind: ErrorKind::Unknown,
+                    detail: None,
+                    retryable: false,
                 }]
             }
 
