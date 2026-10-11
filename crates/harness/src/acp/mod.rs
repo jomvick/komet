@@ -181,6 +181,56 @@ fn free_localhost_port() -> Option<u16> {
         .ok()
 }
 
+/// Whether the installed opencode binary still accepts the v1 `acp --port`
+/// sidecar flag. OpenCode v2 dropped the flag (the removed server never
+/// binds), so passing it fails the whole spawn with "Unrecognized flag".
+/// Detection is by `opencode acp --help` (cached 60s): v1 keeps the sidecar,
+/// v2+ launches bare-stdio and the transcript tail degrades to final output.
+/// Cache lives in-process only, keyed by the resolved executable + mtime.
+fn opencode_sidecar_capable(exe: &std::path::Path) -> bool {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
+
+    struct Entry {
+        at: Instant,
+        mtime: Option<std::time::SystemTime>,
+        capable: bool,
+    }
+    static CACHE: OnceLock<Mutex<HashMap<std::path::PathBuf, Entry>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+
+    let mtime = std::fs::metadata(exe).and_then(|m| m.modified()).ok();
+    if let Ok(guard) = cache.lock()
+        && let Some(entry) = guard.get(exe)
+        && entry.at.elapsed() < std::time::Duration::from_secs(60)
+        && entry.mtime == mtime
+    {
+        return entry.capable;
+    }
+    // No cache lock held across the probe (a hung binary must not wedge the
+    // harness): default capable=true on v1 (unchanged legacy behaviour).
+    let capable = std::process::Command::new(exe)
+        .args(["acp", "--help"])
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout).contains("--port")
+                || String::from_utf8_lossy(&o.stderr).contains("--port")
+        })
+        .unwrap_or(true);
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(
+            exe.to_path_buf(),
+            Entry {
+                at: Instant::now(),
+                mtime,
+                capable,
+            },
+        );
+    }
+    capable
+}
+
 /// PATH + login-shell + extra dirs + node-version-manager scan for a binary.
 pub(crate) fn find_on_paths(exe: &str, extra: Vec<PathBuf>) -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = std::env::var_os("PATH")
@@ -1739,10 +1789,23 @@ impl Harness for AcpHarness {
         // (4096) is shared, and a losing concurrent bind silently drops the
         // server the subagent viz tails. The pick-then-release race is
         // acceptable — a lost port only degrades transcripts to final output.
-        let sidecar_port = self.spec.http_sidecar.then(free_localhost_port).flatten();
-        let extra_args = match sidecar_port {
-            Some(port) => vec!["--port".to_owned(), port.to_string()],
-            None => Vec::new(),
+        //
+        // OpenCode v2 dropped `acp --port` entirely (its per-process server
+        // was removed in favour of the central service), so passing the flag
+        // fails the whole spawn with "Unrecognized flag". Only ask for a port
+        // when the installed binary still accepts it (v1); on v2+ the run is
+        // bare-stdio and the subagent transcript tail degrades to final text.
+        let (sidecar_port, extra_args) = if self.spec.id == HarnessId::Opencode
+            && !opencode_sidecar_capable(&self.resolve_program(true).await.map(|(p, _)| p).unwrap_or_default())
+        {
+            (None, Vec::new())
+        } else {
+            let sidecar_port = self.spec.http_sidecar.then(free_localhost_port).flatten();
+            let extra_args = match sidecar_port {
+                Some(port) => vec!["--port".to_owned(), port.to_string()],
+                None => Vec::new(),
+            };
+            (sidecar_port, extra_args)
         };
         // OpenCode permission overlay: write temp opencode.json and point OPENCODE_CONFIG at it.
         // The file must outlive the child, so we leak its TempPath into a owned PathBuf kept alive
