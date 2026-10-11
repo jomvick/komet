@@ -143,6 +143,11 @@ pub(crate) struct ContentBlock {
     pub tool_use_id: String,
     #[serde(default)]
     pub is_error: Option<bool>,
+    /// Raw `content` of `tool_result` blocks (the tool's output text; arrays
+    /// for rich content). Ignored except by the normalizer's error path —
+    /// success outputs never leave the CLI transcript.
+    #[serde(default)]
+    pub content: Value,
 }
 
 #[derive(Debug, Default, Deserialize)]

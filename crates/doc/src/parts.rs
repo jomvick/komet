@@ -359,8 +359,17 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                     // host's run journal. Inline diffs die the same way:
                     // stats only, never text. `is_error` still folds so
                     // failed chips read as failed.
+                    //
+                    // Exception: a FAILED tool keeps a 160-char summary of
+                    // its output ([`summarize_tool_output`]) so the failure
+                    // is diagnosable from the transcript; success outputs
+                    // stay journal-only even when the event carries them.
                     let _ = output; // journal-only
-                    *out_slot = None;
+                    *out_slot = if *is_error {
+                        output.as_deref().and_then(summarize_tool_output)
+                    } else {
+                        None
+                    };
                     *output_bytes = None;
                     *diff_slot = None;
                     *diff_stats = diff.as_ref().map(|d| vec![diff_stat(d)]);
@@ -1059,6 +1068,61 @@ mod tests {
             new_text: "one\ntwo\n".into(),
         });
         assert_eq!((stat.additions, stat.deletions), (2, 0));
+    }
+
+    #[test]
+    fn error_tool_result_keeps_160_summary_only() {
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ToolCall {
+                id: "t".into(),
+                call: ToolCall::Exec {
+                    command: "ls".into(),
+                },
+            },
+        );
+        let long = "y".repeat(200);
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ToolResult {
+                id: "t".into(),
+                is_error: true,
+                output: Some(long),
+                diff: None,
+            },
+        );
+        let summary = parts.iter().find_map(|p| match p {
+            MessagePart::Tool { output, .. } => output.clone(),
+            _ => None,
+        });
+        assert_eq!(summary, Some(format!("{}…", "y".repeat(160))));
+
+        // ... while a successful result with output persists no summary.
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ToolCall {
+                id: "u".into(),
+                call: ToolCall::Exec {
+                    command: "ls".into(),
+                },
+            },
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ToolResult {
+                id: "u".into(),
+                is_error: false,
+                output: Some("y".repeat(200)),
+                diff: None,
+            },
+        );
+        let summary = parts.iter().find_map(|p| match p {
+            MessagePart::Tool { output, .. } => output.clone(),
+            _ => None,
+        });
+        assert_eq!(summary, None);
     }
 
     #[test]
