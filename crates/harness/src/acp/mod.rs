@@ -55,8 +55,9 @@ use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
 use komet_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ModelOption, ModelOptionChoice, ReasoningLevel,
-    RunRequest, SandboxLevel, SlashCommand, SteeringMode, UserInputAnswer, UserInputQuestion,
+    AgentEvent, DoneStatus, ErrorKind, HarnessId, Model, ModelOption, ModelOptionChoice,
+    ReasoningLevel, RunRequest, SandboxLevel, SlashCommand, SteeringMode, UserInputAnswer,
+    UserInputQuestion,
 };
 
 use crate::jsonrpc::{Incoming, RpcClient};
@@ -2728,26 +2729,65 @@ async fn emit_grok_session_info(
 }
 
 /// Map a finished `session/prompt` result to the run's terminal status.
+///
+/// The third element is a NON-BLOCKING error chip: `max_tokens` /
+/// `max_turn_requests` end the turn with partial output already in the doc,
+/// so the status stays Completed while a Truncated chip makes the cut
+/// visible instead of silent.
 fn stop_outcome(
     res: &Result<Value, HarnessError>,
     interrupted: bool,
-) -> (DoneStatus, Option<String>) {
+) -> (DoneStatus, Option<String>, Option<AgentEvent>) {
     if interrupted {
-        return (DoneStatus::Interrupted, None);
+        return (DoneStatus::Interrupted, None, None);
     }
     match res {
         Ok(resp) => match resp.get("stopReason").and_then(Value::as_str) {
-            Some("cancelled") => (DoneStatus::Interrupted, None),
+            Some("cancelled") => (DoneStatus::Interrupted, None, None),
             Some("refusal") => (
                 DoneStatus::Errored,
                 Some("The agent refused to continue.".to_owned()),
+                None,
             ),
-            // end_turn / max_tokens / max_turn_requests: the turn ended;
-            // partial output is already in the doc.
-            _ => (DoneStatus::Completed, None),
+            Some("max_tokens") => (
+                DoneStatus::Completed,
+                None,
+                Some(AgentEvent::Error {
+                    message: "The turn hit the model's output limit — output may be cut off."
+                        .to_owned(),
+                    kind: komet_proto::ErrorKind::Truncated,
+                    detail: None,
+                    retryable: false,
+                }),
+            ),
+            Some("max_turn_requests") => (
+                DoneStatus::Completed,
+                None,
+                Some(AgentEvent::Error {
+                    message: "The turn hit the maximum number of requests — output may be cut off."
+                        .to_owned(),
+                    kind: komet_proto::ErrorKind::Truncated,
+                    detail: None,
+                    retryable: false,
+                }),
+            ),
+            // end_turn: the turn ended; partial output is already in the doc.
+            _ => (DoneStatus::Completed, None, None),
         },
-        Err(e) => (DoneStatus::Errored, Some(e.to_string())),
+        Err(e) => (DoneStatus::Errored, Some(e.to_string()), None),
     }
+}
+
+/// Generic empty-turn text for harnesses with no session-file cause source
+/// (everything but Cline): a turn that ended Completed with no text, tool
+/// calls or errors is never a real answer. The caller emits the identical
+/// typed pair (fold dedupes to one chip); retryable — empty turns are
+/// usually transient.
+fn empty_turn_message(agent_name: &str) -> String {
+    format!(
+        "{agent_name} returned an empty turn — no text, tool calls or errors. \
+         Retry the prompt; if it persists, switch models."
+    )
 }
 
 /// One turn: `session/prompt` whose response (the `stopReason`) ends it.
@@ -3740,6 +3780,11 @@ async fn run_session(session: Session) {
                                     let events =
                                         session_update_events(&method, &params, &session_id, &mut subagents);
                                     for ev in events {
+                                        track_turn_signals(
+                                            &ev,
+                                            &mut turn_content_seen,
+                                            &mut open_tools,
+                                        );
                                         if !send(&event_tx, ev).await {
                                             consumer_gone = true;
                                             break;
@@ -3789,30 +3834,71 @@ async fn run_session(session: Session) {
                         if !emit_grok_session_info(&event_tx, &client, &session_id, harness).await {
                             break 'main;
                         }
-                        let (mut status, mut error) = stop_outcome(&res, interrupted);
-                        // Cline's empty turn (billing/model failure with a
-                        // `completed` status) must not journal as success —
-                        // the real cause lives in its session file, never on
-                        // the wire.
-                        if harness == HarnessId::Cline
-                            && status == DoneStatus::Completed
+                        let (mut status, mut error, truncated) =
+                            stop_outcome(&res, interrupted);
+                        if let Some(chip) = truncated {
+                            let _ = send(&event_tx, chip).await;
+                        }
+                        // An empty turn must not journal as success. Cline's
+                        // real cause lives in its session file, never on the
+                        // wire; a clean session file keeps Completed (nothing
+                        // failed). Every other harness has no cause source —
+                        // an empty turn there is never a real answer, so the
+                        // generic guard errors it instead of staying silent.
+                        if status == DoneStatus::Completed
                             && res.is_ok()
-                            && let Some(empty) = cline_empty_turn_error(
-                                &session_id,
-                                turn_content_seen,
-                                open_tools.len(),
-                                cline_data_dir.clone(),
-                            )
-                            .await
+                            && !turn_content_seen
+                            && open_tools.is_empty()
                         {
-                            status = DoneStatus::Errored;
-                            error = Some(empty);
+                            let empty = if harness == HarnessId::Cline {
+                                cline_empty_turn_error(
+                                    &session_id,
+                                    turn_content_seen,
+                                    open_tools.len(),
+                                    cline_data_dir.clone(),
+                                )
+                                .await
+                            } else {
+                                None
+                            };
+                            match empty {
+                                Some(cause) => {
+                                    let _ = send(
+                                        &event_tx,
+                                        typed_error(cause.clone(), None, None),
+                                    )
+                                    .await;
+                                    status = DoneStatus::Errored;
+                                    error = Some(cause);
+                                }
+                                None if harness != HarnessId::Cline => {
+                                    let message = empty_turn_message(agent_name);
+                                    let _ = send(
+                                        &event_tx,
+                                        AgentEvent::Error {
+                                            message: message.clone(),
+                                            kind: ErrorKind::Unknown,
+                                            detail: None,
+                                            retryable: true,
+                                        },
+                                    )
+                                    .await;
+                                    status = DoneStatus::Errored;
+                                    error = Some(message);
+                                }
+                                None => {}
+                            }
                         }
                         done_current = true;
                         if interrupted {
                             done_after_interrupt = true;
                         }
-                        if status == DoneStatus::Errored
+                        // RPC/wire failures carry no guard pair (the guard only
+                        // fires on Completed+ok): join the stderr tail here so
+                        // every errored Done still lands one detailed chip
+                        // (fold dedupes the identical pair).
+                        if res.is_err()
+                            && status == DoneStatus::Errored
                             && let Some(msg) = &error
                         {
                             let _ = send(
@@ -3994,30 +4080,71 @@ async fn run_session(session: Session) {
                                 let _ =
                                     emit_grok_session_info(&event_tx, &client, &session_id, harness)
                                         .await;
-                        let (mut status, mut error) = stop_outcome(&res, interrupted);
-                        // Cline's empty turn (billing/model failure with a
-                        // `completed` status) must not journal as success —
-                        // the real cause lives in its session file, never on
-                        // the wire.
-                        if harness == HarnessId::Cline
-                            && status == DoneStatus::Completed
+                        let (mut status, mut error, truncated) =
+                            stop_outcome(&res, interrupted);
+                        if let Some(chip) = truncated {
+                            let _ = send(&event_tx, chip).await;
+                        }
+                        // An empty turn must not journal as success. Cline's
+                        // real cause lives in its session file, never on the
+                        // wire; a clean session file keeps Completed (nothing
+                        // failed). Every other harness has no cause source —
+                        // an empty turn there is never a real answer, so the
+                        // generic guard errors it instead of staying silent.
+                        if status == DoneStatus::Completed
                             && res.is_ok()
-                            && let Some(empty) = cline_empty_turn_error(
-                                &session_id,
-                                turn_content_seen,
-                                open_tools.len(),
-                                cline_data_dir.clone(),
-                            )
-                            .await
+                            && !turn_content_seen
+                            && open_tools.is_empty()
                         {
-                            status = DoneStatus::Errored;
-                            error = Some(empty);
+                            let empty = if harness == HarnessId::Cline {
+                                cline_empty_turn_error(
+                                    &session_id,
+                                    turn_content_seen,
+                                    open_tools.len(),
+                                    cline_data_dir.clone(),
+                                )
+                                .await
+                            } else {
+                                None
+                            };
+                            match empty {
+                                Some(cause) => {
+                                    let _ = send(
+                                        &event_tx,
+                                        typed_error(cause.clone(), None, None),
+                                    )
+                                    .await;
+                                    status = DoneStatus::Errored;
+                                    error = Some(cause);
+                                }
+                                None if harness != HarnessId::Cline => {
+                                    let message = empty_turn_message(agent_name);
+                                    let _ = send(
+                                        &event_tx,
+                                        AgentEvent::Error {
+                                            message: message.clone(),
+                                            kind: ErrorKind::Unknown,
+                                            detail: None,
+                                            retryable: true,
+                                        },
+                                    )
+                                    .await;
+                                    status = DoneStatus::Errored;
+                                    error = Some(message);
+                                }
+                                None => {}
+                            }
                         }
                                 done_current = true;
                                 if interrupted {
                                     done_after_interrupt = true;
                                 }
-                                if status == DoneStatus::Errored
+                                // RPC/wire failures carry no guard pair (the guard only
+                                // fires on Completed+ok): join the stderr tail here so
+                                // every errored Done still lands one detailed chip
+                                // (fold dedupes the identical pair).
+                                if res.is_err()
+                                    && status == DoneStatus::Errored
                                     && let Some(msg) = &error
                                 {
                                     let _ = send(
@@ -4094,6 +4221,11 @@ async fn run_session(session: Session) {
                                             let events =
                                                 session_update_events(&method, &params, &session_id, &mut subagents);
                                             for ev in events {
+                                                track_turn_signals(
+                                                    &ev,
+                                                    &mut turn_content_seen,
+                                                    &mut open_tools,
+                                                );
                                                 if !send(&event_tx, ev).await {
                                                     consumer_gone = true;
                                                     break;
@@ -4938,6 +5070,54 @@ mod tests {
             ),
             Ok(Some("cline-free/deepseek-v4.1-flash".into()))
         );
+    }
+
+    #[test]
+    fn stop_outcome_max_tokens_is_completed_with_truncated_chip() {
+        for reason in ["max_tokens", "max_turn_requests"] {
+            let (status, error, chip) = stop_outcome(&Ok(json!({ "stopReason": reason })), false);
+            assert_eq!(status, DoneStatus::Completed, "{reason}");
+            assert!(error.is_none(), "{reason}");
+            let ev = chip.expect("a non-blocking Truncated chip");
+            assert!(
+                matches!(
+                    ev,
+                    AgentEvent::Error {
+                        kind: komet_proto::ErrorKind::Truncated,
+                        retryable: false,
+                        ..
+                    }
+                ),
+                "{reason}: {ev:?}"
+            );
+        }
+        // Every other reason is unchanged: no chip.
+        let (status, error, chip) = stop_outcome(&Ok(json!({ "stopReason": "end_turn" })), false);
+        assert_eq!(status, DoneStatus::Completed);
+        assert!(error.is_none());
+        assert!(chip.is_none());
+    }
+
+    #[test]
+    fn empty_turn_guard_fires_beyond_cline() {
+        // The generic fallback names the harness and offers a retry; the
+        // Cline-specific session-file cause keeps flowing through
+        // `cline_empty_turn_error` (tested below), classified at emit time.
+        let msg = empty_turn_message("Opencode");
+        assert!(msg.contains("empty turn"), "{msg}");
+        let ev = AgentEvent::Error {
+            message: msg,
+            kind: komet_proto::ErrorKind::Unknown,
+            detail: None,
+            retryable: true,
+        };
+        assert!(matches!(
+            ev,
+            AgentEvent::Error {
+                retryable: true,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
