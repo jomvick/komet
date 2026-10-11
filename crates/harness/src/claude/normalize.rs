@@ -1,10 +1,11 @@
 //! Frame → [`AgentEvent`] normalization (init dedupe, subagent tagging, tool
 //! decoding, error-code mapping).
 
-use komet_proto::{AgentEvent, DoneStatus, ErrorKind, HarnessId, TodoItem, ToolCall};
+use komet_proto::{AgentEvent, DoneStatus, HarnessId, TodoItem, ToolCall};
 use serde_json::Value;
 
 use super::wire::{ContentBlock, Frame};
+use crate::errors::classify_error;
 
 /// Human-readable text for the CLI's assistant-level error codes. These arrive
 /// as a terse `error` field on an `assistant` frame — usually with NO text
@@ -394,13 +395,14 @@ impl Normalizer {
                         })
                         .collect();
                     if let Some(code) = &f.error {
+                        let (kind, retryable) = classify_error(code, None);
                         out.push(tag(
                             parent,
                             AgentEvent::Error {
                                 message: assistant_error_text(code),
-                                kind: ErrorKind::Unknown,
-                                detail: None,
-                                retryable: false,
+                                kind,
+                                detail: Some(code.clone()),
+                                retryable,
                             },
                         ));
                     }
@@ -470,11 +472,12 @@ impl Normalizer {
                 // carries a terse `error` code here — often with empty content
                 // and no `result` error — so surface it visibly.
                 if let Some(code) = &f.error {
+                    let (kind, retryable) = classify_error(code, None);
                     out.push(AgentEvent::Error {
                         message: assistant_error_text(code),
-                        kind: ErrorKind::Unknown,
-                        detail: None,
-                        retryable: false,
+                        kind,
+                        detail: Some(code.clone()),
+                        retryable,
                     });
                 }
                 // The enclosing assistant frame closes the streamed message
@@ -543,13 +546,14 @@ impl Normalizer {
                 }
                 let window =
                     rate_window_label(f.rate_limit_info.rate_limit_type.as_deref().unwrap_or(""));
+                let (kind, retryable) = classify_error("rate_limit", None);
                 vec![AgentEvent::Error {
                     message: format!(
                         "Claude {window} limit reached — the turn was blocked. Try again after it resets."
                     ),
-                    kind: ErrorKind::Unknown,
-                    detail: None,
-                    retryable: false,
+                    kind,
+                    detail: f.rate_limit_info.rate_limit_type.clone(),
+                    retryable,
                 }]
             }
 

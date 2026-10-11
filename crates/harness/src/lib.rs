@@ -144,6 +144,7 @@ pub mod capabilities;
 pub mod claude;
 pub mod codex;
 pub mod cursor;
+pub mod errors;
 pub(crate) mod jsonrpc;
 pub mod mock;
 pub mod shell_env;

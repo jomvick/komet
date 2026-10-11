@@ -260,7 +260,13 @@ fn from_doc_part(p: DocPartJson) -> MessagePart {
                     .questions
                     .as_ref()
                     .and_then(|q| {
-                        serde_json::from_value::<(serde_json::Value, serde_json::Value, String, serde_json::Value)>(q.clone()).ok()
+                        serde_json::from_value::<(
+                            serde_json::Value,
+                            serde_json::Value,
+                            String,
+                            serde_json::Value,
+                        )>(q.clone())
+                        .ok()
                     })
                     .map(|(_, _, rid, _)| {
                         // Strip the perm- prefix in legacy fallback
@@ -1181,10 +1187,8 @@ mod tests {
     #[test]
     fn old_error_parts_reread_with_unknown_kind() {
         // 1. App-layer serde: old JSON without the new fields.
-        let part: MessagePart = serde_json::from_str(
-            r#"{"kind":"error","id":"e0","message":"boom"}"#,
-        )
-        .unwrap();
+        let part: MessagePart =
+            serde_json::from_str(r#"{"kind":"error","id":"e0","message":"boom"}"#).unwrap();
         assert!(
             matches!(
                 &part,

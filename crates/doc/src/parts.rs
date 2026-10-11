@@ -5,7 +5,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use komet_proto::{AgentEvent, ErrorKind, SUBAGENT_MODEL_KEYS, ToolCall, ToolDiff, UserInputQuestion};
+use komet_proto::{
+    AgentEvent, ErrorKind, SUBAGENT_MODEL_KEYS, ToolCall, ToolDiff, UserInputQuestion,
+};
 
 use crate::constants::MSG_INLINE_MAX;
 
@@ -409,14 +411,21 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
         }
         AgentEvent::Done { error, .. } => {
             if let Some(message) = error {
-                let id = format!("e{}", out.len());
-                out.push(MessagePart::Error {
-                    id,
-                    message: message.clone(),
-                    kind: ErrorKind::Unknown,
-                    detail: None,
-                    retryable: false,
-                });
+                // Terminal failures are announced by a typed Error event just
+                // before the Done (same message, kind + stderr detail); the
+                // Done then adds nothing — skip it so the transcript shows a
+                // single detailed part instead of two chips.
+                let dup = matches!(out.last(), Some(MessagePart::Error { message: m, .. }) if m == message);
+                if !dup {
+                    let id = format!("e{}", out.len());
+                    out.push(MessagePart::Error {
+                        id,
+                        message: message.clone(),
+                        kind: ErrorKind::Unknown,
+                        detail: None,
+                        retryable: false,
+                    });
+                }
             }
         }
         // Subagent-attributed CONTENT belongs to the subagent's own doc (the
@@ -694,6 +703,40 @@ pub fn join_continuations(entries: Vec<Vec<MessagePart>>) -> Vec<MessagePart> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn done_errored_after_identical_error_keeps_single_detailed_part() {
+        let mut out = Vec::new();
+        fold_event_into_parts(
+            &mut out,
+            &AgentEvent::Error {
+                message: "boom".into(),
+                kind: ErrorKind::Timeout,
+                detail: Some("tail".into()),
+                retryable: true,
+            },
+        );
+        fold_event_into_parts(
+            &mut out,
+            &AgentEvent::Done {
+                status: komet_proto::DoneStatus::Errored,
+                result: None,
+                error: Some("boom".into()),
+                session_id: None,
+                reason: None,
+            },
+        );
+        assert_eq!(
+            out.len(),
+            1,
+            "identical Done error must not duplicate the part: {out:?}"
+        );
+        assert!(
+            matches!(&out[0], MessagePart::Error { detail: Some(d), .. } if d == "tail"),
+            "the surviving part keeps the stderr detail: {:?}",
+            out[0]
+        );
+    }
 
     fn text_delta(s: &str) -> AgentEvent {
         AgentEvent::TextDelta { text: s.into() }
