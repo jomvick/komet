@@ -55,8 +55,9 @@ use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
 use komet_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ModelOption, ModelOptionChoice, ReasoningLevel,
-    RunRequest, SandboxLevel, SlashCommand, SteeringMode, UserInputAnswer, UserInputQuestion,
+    AgentEvent, DoneStatus, ErrorKind, HarnessId, Model, ModelOption, ModelOptionChoice,
+    ReasoningLevel, RunRequest, SandboxLevel, SlashCommand, SteeringMode, UserInputAnswer,
+    UserInputQuestion,
 };
 
 use crate::jsonrpc::{Incoming, RpcClient};
@@ -4448,6 +4449,9 @@ async fn run_session(session: Session) {
                             &event_tx,
                             AgentEvent::Error {
                                 message: stall_message,
+                                kind: ErrorKind::Unknown,
+                                detail: None,
+                                retryable: false,
                             },
                         )
                         .await;
