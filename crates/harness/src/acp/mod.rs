@@ -55,13 +55,15 @@ use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
 use komet_proto::{
-    AgentEvent, DoneStatus, ErrorKind, HarnessId, Model, ModelOption, ModelOptionChoice,
-    ReasoningLevel, RunRequest, SandboxLevel, SlashCommand, SteeringMode, UserInputAnswer,
-    UserInputQuestion,
+    AgentEvent, DoneStatus, HarnessId, Model, ModelOption, ModelOptionChoice, ReasoningLevel,
+    RunRequest, SandboxLevel, SlashCommand, SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
 use crate::jsonrpc::{Incoming, RpcClient};
-use crate::{Harness, HarnessError, RunControls, Signal, send_signal, shutdown_child};
+use crate::{
+    Harness, HarnessError, RunControls, Signal, errors::tail_detail, errors::typed_error,
+    send_signal, shutdown_child,
+};
 use normalize::{
     billed_usage_event, map_update, native_context_event, parse_commands, preferred_allow_option,
     session_info_window,
@@ -1147,9 +1149,9 @@ impl AcpHarness {
                         komet_proto::Model {
                             id: model,
                             label,
-                            description: Some(
-                                format!("Model configured in Cline CLI for {provider}"),
-                            ),
+                            description: Some(format!(
+                                "Model configured in Cline CLI for {provider}"
+                            )),
                             reasoning_levels: Vec::new(),
                             options: Vec::new(),
                         },
@@ -2160,7 +2162,9 @@ fn cline_cli_models_in(data_dir: Option<&PathBuf>) -> Vec<(String, Option<String
         if value.is_empty() {
             return Vec::new();
         }
-        let model = std::env::var("KOMET_CLINE_MODEL").ok().filter(|m| !m.is_empty());
+        let model = std::env::var("KOMET_CLINE_MODEL")
+            .ok()
+            .filter(|m| !m.is_empty());
         return vec![(value, model)];
     }
     if data_dir.is_none() && cfg!(test) && std::env::var("KOMET_CLINE_DATA_DIR").is_err() {
@@ -2255,7 +2259,9 @@ fn cline_builtin_free_models() -> Vec<Model> {
         Model {
             id: "cline-free/mimo-v2.6-flash".into(),
             label: "MiMo-V2.6-Flash (free)".into(),
-            description: Some("Mixture-of-Experts architecture with 309B total parameters (free)".into()),
+            description: Some(
+                "Mixture-of-Experts architecture with 309B total parameters (free)".into(),
+            ),
             reasoning_levels: Vec::new(),
             options: Vec::new(),
         },
@@ -3280,8 +3286,9 @@ async fn run_session(session: Session) {
         // session's advertised config options. Best-effort for effort and
         // traits: a rejected auxiliary set is logged and the agent default
         // runs.
-        let cli_config =
-            (harness == HarnessId::Cline && cli_sync).then(|| cline_cli_config_in(cline_data_dir.as_ref())).flatten();
+        let cli_config = (harness == HarnessId::Cline && cli_sync)
+            .then(|| cline_cli_config_in(cline_data_dir.as_ref()))
+            .flatten();
         // Cline owns its model natively (`cline` CLI config); the Komet
         // global picker id (e.g. `Muse Spark ...`) is never a valid Cline
         // wire id and previously killed session/prompt with
@@ -3297,9 +3304,10 @@ async fn run_session(session: Session) {
                 .filter(|m| *m != "default")
                 .or_else(|| cli_config.as_ref().and_then(|(_, m)| m.as_deref()))
         } else {
-            request.model.as_deref().or_else(|| {
-                cli_config.as_ref().and_then(|(_, m)| m.as_deref())
-            })
+            request
+                .model
+                .as_deref()
+                .or_else(|| cli_config.as_ref().and_then(|(_, m)| m.as_deref()))
         };
         let efforts = effort_values(request.reasoning, requested_model);
         let options_snapshot = session_response;
@@ -3361,10 +3369,7 @@ async fn run_session(session: Session) {
         // is actually advertised — a fabricated `{provider}/{name}` (e.g.
         // `cline/deepseek-v4.1-flash` for the real `cline-free/...` id)
         // is accepted by set_config_option yet kills the prompt.
-        if harness == HarnessId::Cline
-            && cli_sync
-            && requested_model.is_some()
-        {
+        if harness == HarnessId::Cline && cli_sync && requested_model.is_some() {
             let advertised: Vec<&str> = options_snapshot
                 .get("configOptions")
                 .and_then(Value::as_array)
@@ -3459,6 +3464,15 @@ async fn run_session(session: Session) {
                             },
                         };
                         tracing::warn!(target: "komet_harness::acp", %error, "agent setup failed");
+                        let _ = send(
+                            &event_tx,
+                            typed_error(
+                                error.clone(),
+                                None,
+                                tail_detail(stderr_tail.snapshot()),
+                            ),
+                        )
+                        .await;
                         let _ = event_tx
                             .send(Ok(AgentEvent::Done {
                                 status: DoneStatus::Errored,
@@ -3798,6 +3812,19 @@ async fn run_session(session: Session) {
                         if interrupted {
                             done_after_interrupt = true;
                         }
+                        if status == DoneStatus::Errored
+                            && let Some(msg) = &error
+                        {
+                            let _ = send(
+                                &event_tx,
+                                typed_error(
+                                    msg.clone(),
+                                    None,
+                                    tail_detail(stderr_tail.snapshot()),
+                                ),
+                            )
+                            .await;
+                        }
                         if !send(
                             &event_tx,
                             AgentEvent::Done {
@@ -3989,6 +4016,19 @@ async fn run_session(session: Session) {
                                 done_current = true;
                                 if interrupted {
                                     done_after_interrupt = true;
+                                }
+                                if status == DoneStatus::Errored
+                                    && let Some(msg) = &error
+                                {
+                                    let _ = send(
+                                        &event_tx,
+                                        typed_error(
+                                            msg.clone(),
+                                            None,
+                                            tail_detail(stderr_tail.snapshot()),
+                                        ),
+                                    )
+                                    .await;
                                 }
                                 let _ = send(
                                     &event_tx,
@@ -4447,23 +4487,32 @@ async fn run_session(session: Session) {
                         }
                         let _ = send(
                             &event_tx,
-                            AgentEvent::Error {
-                                message: stall_message,
-                                kind: ErrorKind::Unknown,
-                                detail: None,
-                                retryable: false,
-                            },
+                            typed_error(
+                                stall_message,
+                                None,
+                                tail_detail(stderr_tail.snapshot()),
+                            ),
                         )
                         .await;
                         done_current = true;
+                        let done_message = format!(
+                            "{agent_name} is unresponsive — the run was closed."
+                        );
+                        let _ = send(
+                            &event_tx,
+                            typed_error(
+                                done_message.clone(),
+                                None,
+                                tail_detail(stderr_tail.snapshot()),
+                            ),
+                        )
+                        .await;
                         let _ = send(
                             &event_tx,
                             AgentEvent::Done {
                                 status: DoneStatus::Errored,
                                 result: None,
-                                error: Some(format!(
-                                    "{agent_name} is unresponsive — the run was closed."
-                                )),
+                                error: Some(done_message),
                                 session_id: Some(session_id.clone()),
         reason: None,
                             },
@@ -4492,11 +4541,17 @@ async fn run_session(session: Session) {
         } else if !interrupted && !done_current {
             // A child killed mid-turn must not read as a silent success.
             let status = child.try_wait().ok().flatten();
+            let crash = crate::crash_message(agent_name, status, &stderr_tail);
+            let _ = send(
+                &event_tx,
+                typed_error(crash.clone(), None, tail_detail(stderr_tail.snapshot())),
+            )
+            .await;
             let _ = event_tx
                 .send(Ok(AgentEvent::Done {
                     status: DoneStatus::Errored,
                     result: None,
-                    error: Some(crate::crash_message(agent_name, status, &stderr_tail)),
+                    error: Some(crash),
                     session_id: Some(session_id.clone()),
                     reason: None,
                 }))
@@ -4821,7 +4876,10 @@ mod tests {
     fn cline_model_set_strictness() {
         let advertised = ["zai/glm-5.3", "cline-pass/glm-5.3"];
         // No model requested: nothing to set.
-        assert_eq!(cline_model_set(None, &advertised, Some("cline"), &[]), Ok(None));
+        assert_eq!(
+            cline_model_set(None, &advertised, Some("cline"), &[]),
+            Ok(None)
+        );
         // Advertised: the normal config_option_sets path owns it.
         assert_eq!(
             cline_model_set(Some("zai/glm-5.3"), &advertised, Some("cline"), &[]),
@@ -4850,7 +4908,12 @@ mod tests {
         );
         // Provider prefix, but only when actually advertised.
         assert_eq!(
-            cline_model_set(Some("zai/glm-5.3"), &["cline-pass/glm-5.3"], Some("cline-pass"), &[]),
+            cline_model_set(
+                Some("zai/glm-5.3"),
+                &["cline-pass/glm-5.3"],
+                Some("cline-pass"),
+                &[]
+            ),
             Ok(Some("cline-pass/glm-5.3".into()))
         );
         // Fabricated `{provider}/{name}` that is NOT advertised: loud error,

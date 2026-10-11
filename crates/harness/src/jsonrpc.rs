@@ -172,11 +172,20 @@ async fn read_loop(stdout: ChildStdout, pending: Pending, tx: mpsc::Sender<Incom
                     continue;
                 };
                 let outcome = match msg.get("error") {
-                    Some(err) => Err(err
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                        .unwrap_or_else(|| err.to_string())),
+                    Some(err) => Err({
+                        let message = err
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| err.to_string());
+                        // Keep the numeric code in the string: `classify_error`
+                        // maps embedded `[rpc <code>]` markers (notably
+                        // -32000 server timeouts) when the text is silent.
+                        match err.get("code").and_then(Value::as_i64) {
+                            Some(code) => format!("[rpc {code}] {message}"),
+                            None => message,
+                        }
+                    }),
                     None => Ok(msg.get("result").cloned().unwrap_or(Value::Null)),
                 };
                 let _ = sender.send(outcome);
