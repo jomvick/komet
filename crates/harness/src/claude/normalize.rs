@@ -68,6 +68,21 @@ fn opt_str_field(input: &Value, key: &str) -> Option<String> {
     input.get(key).and_then(Value::as_str).map(str::to_owned)
 }
 
+/// Failing tools keep their output text for the transcript's error chip;
+/// success outputs never leave the CLI transcript (the fold caps error
+/// summaries at 160 chars and drops the rest).
+fn tool_result_output(block: &ContentBlock, is_error: bool) -> Option<String> {
+    if !is_error {
+        return None;
+    }
+    block
+        .content
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
 /// Decode a Claude `tool_use` block (name + input) into a typed [`ToolCall`].
 pub(crate) fn decode_tool_use(name: &str, input: &Value) -> ToolCall {
     match name {
@@ -498,12 +513,13 @@ impl Normalizer {
                         .blocks()
                         .filter(|b: &ContentBlock| b.kind == "tool_result")
                         .map(|b| {
+                            let is_error = b.is_error.unwrap_or(false);
                             tag(
                                 parent,
                                 AgentEvent::ToolResult {
                                     id: b.tool_use_id.clone(),
-                                    is_error: b.is_error.unwrap_or(false),
-                                    output: None,
+                                    is_error,
+                                    output: tool_result_output(&b, is_error),
                                     diff: None,
                                 },
                             )
@@ -529,11 +545,14 @@ impl Normalizer {
                 f.message
                     .blocks()
                     .filter(|b: &ContentBlock| b.kind == "tool_result")
-                    .map(|b| AgentEvent::ToolResult {
-                        id: b.tool_use_id.clone(),
-                        is_error: b.is_error.unwrap_or(false),
-                        output: None,
-                        diff: None,
+                    .map(|b| {
+                        let is_error = b.is_error.unwrap_or(false);
+                        AgentEvent::ToolResult {
+                            id: b.tool_use_id.clone(),
+                            is_error,
+                            output: tool_result_output(&b, is_error),
+                            diff: None,
+                        }
                     })
                     .collect()
             }
@@ -720,6 +739,33 @@ mod tests {
     fn normalize_one(raw: &str) -> Vec<AgentEvent> {
         let frame = crate::claude::wire::parse_frame(raw).expect("frame parses");
         Normalizer::new().normalize(frame, false)
+    }
+
+    #[test]
+    fn failing_tool_result_carries_output_text() {
+        let events = normalize_one(
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t1","content":"boom: no such file","is_error":true}]}}"#,
+        );
+        assert!(
+            events.iter().any(
+                |e| matches!(e, AgentEvent::ToolResult { id, output: Some(o), is_error: true, .. } if id == "t1" && o == "boom: no such file")
+            ),
+            "{events:?}"
+        );
+        // Success results stay lean: no output transmitted.
+        let events = normalize_one(
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"t2","content":"ok","is_error":false}]}}"#,
+        );
+        assert!(
+            events.iter().all(|e| !matches!(
+                e,
+                AgentEvent::ToolResult {
+                    output: Some(_),
+                    ..
+                }
+            )),
+            "{events:?}"
+        );
     }
 
     #[allow(dead_code)]
