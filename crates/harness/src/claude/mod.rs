@@ -128,7 +128,7 @@ pub struct ClaudeHarness {
     /// broken CLI retries on the next picker open (ACP-harness parity).
     commands: tokio::sync::OnceCell<Vec<SlashCommand>>,
     /// Model discovery cache: live probe cached on success.
-    models: tokio::sync::OnceCell<Vec<Model>>,
+    models: tokio::sync::Mutex<Option<(std::time::Instant, Vec<Model>)>>,
 }
 
 impl Default for ClaudeHarness {
@@ -138,7 +138,7 @@ impl Default for ClaudeHarness {
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
             commands: tokio::sync::OnceCell::new(),
-            models: tokio::sync::OnceCell::new(),
+            models: tokio::sync::Mutex::new(None),
         }
     }
 }
@@ -766,41 +766,32 @@ impl Harness for ClaudeHarness {
         true
     }
 
-    /// Dynamic model discovery via control-channel probe first, falling back
-    /// to curated static catalog on error or empty response.
+    /// Live model discovery via control-channel probe. Errors propagate —
+    /// no static fallback, so the picker only shows models the CLI offers.
+    /// A failed probe is UNCACHED so the next picker open retries.
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         self.resolve_executable()?;
-        self.models
-            .get_or_try_init(|| async {
-                match self.discover_live_models().await {
-                    Ok(models) if !models.is_empty() => {
-                        tracing::info!(
-                            target: "komet_harness::claude",
-                            count = models.len(),
-                            "discovered live Claude models from control channel"
-                        );
-                        Ok(models)
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "komet_harness::claude",
-                            source = "static-fallback",
-                            "Claude live model discovery failed; falling back to static catalog: {e}"
-                        );
-                        Ok(catalog::static_models())
-                    }
-                    Ok(_) => {
-                        tracing::warn!(
-                            target: "komet_harness::claude",
-                            source = "static-fallback",
-                            "Claude live model discovery returned 0 models; falling back to static catalog"
-                        );
-                        Ok(catalog::static_models())
-                    }
+        {
+            let guard = self.models.lock().await;
+            if let Some((at, models)) = guard.as_ref() {
+                if at.elapsed() < std::time::Duration::from_secs(10) {
+                    return Ok(models.clone());
                 }
-            })
-            .await
-            .cloned()
+            }
+        }
+        let models = self.discover_live_models().await.inspect_err(|e| {
+            tracing::warn!(
+                target: "komet_harness::claude",
+                "Claude live model discovery failed: {e}"
+            );
+        })?;
+        tracing::info!(
+            target: "komet_harness::claude",
+            count = models.len(),
+            "discovered live Claude models from control channel"
+        );
+        *self.models.lock().await = Some((std::time::Instant::now(), models.clone()));
+        Ok(models)
     }
 
     /// Slash commands from the CLI's `initialize` control-request handshake —

@@ -388,39 +388,30 @@ impl Harness for CodexHarness {
         true
     }
 
-    /// Model discovery: live `codex app-server` `model/list` first,
-    /// local `~/.codex/models_cache.json` as second tier, curated snapshot as fallback.
+    /// Model discovery: live `codex app-server` `model/list` only — no
+    /// static fallback, so the picker only shows models the CLI offers.
     /// Requires an installed CLI so an absent binary surfaces as [`HarnessError::NotInstalled`].
+    /// A failed probe is UNCACHED (`OnceCell` stores successes only) so the
+    /// next picker open retries.
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         self.resolve_executable()?;
         self.models
             .get_or_try_init(|| async {
-                match self.discover_live_models().await {
-                    Ok(models) if !models.is_empty() => {
+                self.discover_live_models()
+                    .await
+                    .inspect(|models| {
                         tracing::info!(
                             target: "komet_harness::codex",
                             count = models.len(),
                             "discovered live Codex models from app-server"
                         );
-                        Ok(models)
-                    }
-                    Err(e) => {
+                    })
+                    .inspect_err(|e| {
                         tracing::warn!(
                             target: "komet_harness::codex",
-                            source = "static-fallback",
-                            "Codex live model discovery failed; falling back to local cache: {e}"
+                            "Codex live model discovery failed: {e}"
                         );
-                        Ok(catalog::load_catalog())
-                    }
-                    Ok(_) => {
-                        tracing::warn!(
-                            target: "komet_harness::codex",
-                            source = "static-fallback",
-                            "Codex live model discovery returned 0 models; falling back to local cache"
-                        );
-                        Ok(catalog::load_catalog())
-                    }
-                }
+                    })
             })
             .await
             .cloned()

@@ -1757,18 +1757,15 @@ impl Harness for AcpHarness {
                 });
                 Ok(models)
             }
-            Ok(_) => Ok((self.spec.models)()),
-            // Never let a stale static catalog masquerade as a successful
-            // load: opencode's plugin-backed catalog and Cline's signed-in
-            // catalog (session/new rejects -32000 until `cline` has a login)
-            // would otherwise hide a slow or failed handshake from the picker.
-            // The error (and the agent's own wording) stays visible.
-            Err(error)
-                if self.spec.id == HarnessId::Opencode || self.spec.id == HarnessId::Cline =>
-            {
-                Err(error)
-            }
-            Err(_) => Ok((self.spec.models)()),
+            Ok(_) => Err(HarnessError::Protocol(format!(
+                "{} model discovery returned no usable models — {}",
+                self.spec.display_name, self.spec.install_hint
+            ))),
+            // Live-only: a failed handshake errors — never let a stale static
+            // catalog masquerade as a successful load. The error (and the
+            // agent's own wording) stays visible, and a failed probe is
+            // UNCACHED so the next picker open retries.
+            Err(error) => Err(error),
         }
     }
 
