@@ -24,7 +24,7 @@ use komet_proto::{AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, Stee
 const MODELS_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 /// A fresh cache entry is re-probed in the background at most this often, so
 /// the file stays warm for the next launch without a probe per picker open.
-const MODELS_CACHE_REFRESH_AFTER: Duration = Duration::from_secs(60);
+const MODELS_CACHE_REFRESH_AFTER: Duration = Duration::from_secs(60 * 60);
 
 /// One harness's persisted model discovery (`{data_dir}/model-cache.json`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
