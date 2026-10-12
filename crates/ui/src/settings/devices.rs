@@ -58,6 +58,24 @@ pub fn update_check_summary(checked_at_ms: Option<i64>, update_available: Option
         }
     }
 }
+
+/// A stream frame answers THIS manual click only when its `checked_at` is
+/// newer than the click timestamp. The CheckUpdate RPC acks the wake, not
+/// the fetch — settling on the ack would report a predated frame as fresh.
+pub fn check_is_fresh(checked_at_ms: Option<i64>, click_ms: i64) -> bool {
+    checked_at_ms.is_some_and(|ms| ms > click_ms)
+}
+
+/// Manual-check watchdog: a wake with no fresh frame within this long still
+/// settles (hung transport must not spin forever).
+const CHECK_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
 /// Scope-aware copy: a local registry describes only the active local
 /// workspace and must not imply that account device metadata is already live.
 pub fn devices_subtitle(scope: Option<WorkspaceScope>) -> &'static str {
@@ -84,11 +102,14 @@ pub struct DevicesPage {
     copy_task: Option<Task<()>>,
     /// Manual update check in flight (CheckUpdate RPC called, stream pending).
     checking: bool,
+    /// Wall-clock ms of the in-flight click; a stream frame settles it only
+    /// when `checked_at` is newer (the RPC acks the wake, not the fetch).
+    check_started_ms: Option<i64>,
     /// Last manual-check transport error (engine unreachable, unknown method).
     check_error: Option<SharedString>,
     check_task: Option<Task<()>>,
-    /// Set once a manual check round-trips so "You're up to date" reads as a
-    /// fresh answer even when the stream frame predates the click.
+    /// Set once a FRESH stream frame answers the click, so "You're up to
+    /// date" never reports a predated frame as the answer.
     just_checked: bool,
     _observe: Subscription,
 }
@@ -104,10 +125,24 @@ impl DevicesPage {
             task: None,
             copy_task: None,
             checking: false,
+            check_started_ms: None,
             check_error: None,
             check_task: None,
             just_checked: false,
             _observe: observe,
+        }
+    }
+
+    fn settle_if_fresh(&mut self, checked_at: Option<i64>, cx: &mut Context<Self>) {
+        let Some(started) = self.check_started_ms else {
+            return;
+        };
+        if check_is_fresh(checked_at, started) {
+            self.checking = false;
+            self.check_started_ms = None;
+            self.check_task = None;
+            self.just_checked = true;
+            cx.notify();
         }
     }
 
@@ -120,21 +155,39 @@ impl DevicesPage {
             cx.notify();
             return;
         };
+        let started = now_ms();
         self.checking = true;
+        self.check_started_ms = Some(started);
         self.check_error = None;
+        self.just_checked = false;
         cx.notify();
         self.check_task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
                 .call(methods::CHECK_UPDATE, serde_json::json!({}))
                 .await;
+            if let Err(err) = result {
+                this.update(cx, |page, cx| {
+                    page.checking = false;
+                    page.check_started_ms = None;
+                    page.check_task = None;
+                    page.check_error = Some(format!("Check failed: {err}").into());
+                    cx.notify();
+                })
+                .ok();
+                return;
+            }
+            // Wake acked; the fetch lands later via the UpdateStatus stream.
+            // Watchdog: never spin past the timeout on a hung fetch.
+            cx.background_executor().timer(CHECK_TIMEOUT).await;
             this.update(cx, |page, cx| {
-                page.checking = false;
-                match result {
-                    Ok(_) => page.just_checked = true,
-                    Err(err) => page.check_error = Some(format!("Check failed: {err}").into()),
+                if page.check_started_ms == Some(started) && page.checking {
+                    page.checking = false;
+                    page.check_started_ms = None;
+                    page.check_task = None;
+                    page.check_error = Some("Check timed out — try again.".into());
+                    cx.notify();
                 }
-                cx.notify();
             })
             .ok();
         }));
@@ -291,6 +344,16 @@ impl Render for DevicesPage {
                 self.just_checked,
             )
         };
+        // Fresh stream frame answers the in-flight click: settle here (render
+        // runs on every AppState observation) so the spinner tracks the fetch,
+        // not the wake ack. Stale frames leave `checking` on until the fresh
+        // one or the watchdog timeout.
+        if checking {
+            self.settle_if_fresh(update_status.as_ref().and_then(|s| s.checked_at), cx);
+        }
+        let (checking, check_error, just_checked) =
+            (self.checking, self.check_error.clone(), self.just_checked);
+        let update_status = self.state.read(cx).update.clone();
 
         let rows: Vec<AnyElement> = devices
             .into_iter()
@@ -683,5 +746,13 @@ mod tests {
             "Never checked for updates"
         );
         assert!(update_check_summary(Some(42), Some(false)).contains("up to date"));
+    }
+
+    #[test]
+    fn manual_check_counts_only_fresh_stream_frames() {
+        assert!(check_is_fresh(Some(200), 100));
+        assert!(!check_is_fresh(Some(100), 100));
+        assert!(!check_is_fresh(Some(50), 100));
+        assert!(!check_is_fresh(None, 100));
     }
 }
