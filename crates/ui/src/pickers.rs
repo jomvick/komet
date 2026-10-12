@@ -361,6 +361,9 @@ struct ModelRowData {
     harness: HarnessId,
     harness_name: SharedString,
     model: Model,
+    /// Provider group label (e.g. `"Google Gemini"`, `"Anthropic"`) used for
+    /// section-header rendering in `ModelRail::Harness` view.
+    provider: &'static str,
 }
 
 /// Which picker popover is open.
@@ -873,6 +876,12 @@ impl Pickers {
                 // possibly from another viewer) — every open revalidates,
                 // keeping current rows visible until the fresh catalog lands.
                 self.ensure_harnesses(true, cx);
+                // Force the effective harness to re-probe its CLI so the model
+                // list is always live when the picker opens. Prefetch all other
+                // offered harnesses in the background (non-forced).
+                if let Some(effective) = self.effective_harness(cx) {
+                    self.ensure_models(effective, true, cx);
+                }
                 self.prefetch_models(cx);
             }
             // Projects, devices, and context usage are already synced state — nothing to load.
@@ -952,11 +961,16 @@ impl Pickers {
             targets.push(effective);
         }
         for harness in targets {
-            self.ensure_models(harness, cx);
+            self.ensure_models(harness, false, cx);
         }
     }
 
-    fn ensure_models(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
+    fn ensure_models(&mut self, harness: HarnessId, force: bool, cx: &mut Context<Self>) {
+        // When force is true, we reset the slot to Idle so the guard below
+        // always triggers a fresh probe — used on picker open / harness switch.
+        if force {
+            self.models.insert(harness, Loadable::Idle);
+        }
         // Absent or Idle only — same render-loop hazard as `ensure_harnesses`;
         // the retry row clears the map to re-arm.
         if self
@@ -972,7 +986,7 @@ impl Pickers {
         let target = self.space_target(cx);
         self.models.insert(harness, Loadable::Loading);
         cx.spawn(async move |this, cx| {
-            let mut params = serde_json::json!({ "harness": harness });
+            let mut params = serde_json::json!({ "harness": harness, "force": force });
             if let (Some(target), Some(object)) = (&target, params.as_object_mut()) {
                 object.insert(
                     "targetDeviceId".into(),
@@ -1200,7 +1214,7 @@ impl Pickers {
         self.defaults.harness = Some(harness);
         self.save_defaults();
         self.model_scroll.set_offset(gpui::Point::default());
-        self.ensure_models(harness, cx);
+        self.ensure_models(harness, true, cx);
         // Re-anchor the keyboard highlight onto the new harness's selected row.
         self.active = self.selected_model_index(cx);
         cx.notify();
@@ -1394,6 +1408,7 @@ impl Pickers {
         let row = |descriptor: &HarnessDescriptor, model: &Model| ModelRowData {
             harness: descriptor.id,
             harness_name: SharedString::from(descriptor.name.clone()),
+            provider: model_provider(descriptor.id, &model.id),
             model: model.clone(),
         };
         let query = self.search.read(cx).text().trim().to_string();
@@ -1455,10 +1470,27 @@ impl Pickers {
                 let (starred, rest): (Vec<&Model>, Vec<&Model>) = models
                     .iter()
                     .partition(|m| self.defaults.is_favorite(descriptor.id, &m.id));
+                // Starred rows float to the top (no provider grouping for
+                // favorites); the rest is sorted by (provider, label) so the
+                // section headers in the render step are contiguous.
+                let mut rest_rows: Vec<ModelRowData> =
+                    rest.into_iter().map(|m| row(descriptor, m)).collect();
+                rest_rows.sort_by(|a, b| {
+                    a.provider
+                        .cmp(b.provider)
+                        .then_with(|| a.model.label.cmp(&b.model.label))
+                });
                 starred
                     .into_iter()
-                    .chain(rest)
-                    .map(|model| row(descriptor, model))
+                    .map(|model| {
+                        // Favorites float above the grouped block and are not
+                        // provider-sorted — no heading of their own (empty
+                        // provider) so the first grouped row still gets one.
+                        let mut r = row(descriptor, model);
+                        r.provider = "";
+                        r
+                    })
+                    .chain(rest_rows)
                     .collect()
             }
         }
@@ -2588,6 +2620,12 @@ impl Pickers {
                             this.harnesses = Loadable::Idle;
                             this.models.clear();
                             this.ensure_harnesses(false, cx);
+                            // Rescan: force the effective harness to re-probe
+                            // its CLI at once (the render loop's non-forced
+                            // prefetch would also reload, but only later).
+                            if let Some(effective) = this.effective_harness(cx) {
+                                this.ensure_models(effective, true, cx);
+                            }
                         }
                         // Projects/devices/context load nothing; no retry surface exists.
                         PickerKind::Space | PickerKind::Device | PickerKind::ContextUsage => {}
@@ -3074,6 +3112,16 @@ impl Pickers {
                     if ix < 9 {
                         el = el.child(popover::kbd_hint(&theme, &format!("⌘{}", ix + 1)));
                     }
+                    // Provider section heading on the first row of each group
+                    // (rails where rows are provider-sorted). Kept INSIDE this
+                    // row's wrapper so the list stays one child per row and
+                    // `scroll_to_item(active)` keeps its 1:1 index mapping.
+                    let group_start = !searching
+                        && !favorites_view
+                        && !row.provider.is_empty()
+                        && rows
+                            .get(ix.wrapping_sub(1))
+                            .map_or(true, |prev| prev.provider != row.provider);
                     el = el.child(
                         div()
                             .id(("model-star", ix))
@@ -3104,7 +3152,16 @@ impl Pickers {
                                 }),
                             ),
                     );
-                    el.into_any_element()
+                    if group_start {
+                        div()
+                            .flex()
+                            .flex_col()
+                            .child(popover::menu_heading(&theme, row.provider))
+                            .child(el)
+                            .into_any_element()
+                    } else {
+                        el.into_any_element()
+                    }
                 })
                 .collect()
         } else if searching {
@@ -3345,6 +3402,113 @@ fn empty_list_note(theme: &Theme, copy: &str) -> AnyElement {
         .text_center()
         .child(SharedString::from(copy.to_string()))
         .into_any_element()
+}
+
+/// Classify a model into a display provider group used for section headers in
+/// the model picker.  Returns a short human-readable provider name, e.g.
+/// `"Google Gemini"`, `"Anthropic"`, `"OpenAI"`.
+///
+/// Display labels ONLY — never served as a model list (Global Constraint:
+/// no hardcoded list as success). First match wins:
+/// - For Antigravity: substring on model id — `gemini` → Google Gemini,
+///   `claude` → Anthropic, `gpt*`/`o1*`/`o3*` → OpenAI, else Other.
+/// - For ClaudeCode / Cline / Hermes / ACP harnesses with slash ids
+///   (`anthropic/claude-…`, `meta-llama/…`): the vendor slug table below.
+/// - Known prefix aliases: `nous:` → Nous Research,
+///   `cline-free/` or `:free` suffix → Free Models.
+/// - Aggregator alias: `openrouter/…` derives the REAL vendor behind the
+///   prefix (`openrouter/deepseek-v3` → DeepSeek,
+///   `openrouter/anthropic/claude` → Anthropic, unknown → OpenRouter).
+/// - Bare (slash-less) ids fall back to family prefixes (`gpt*` → OpenAI,
+///   `gemini` → Google Gemini, `claude` → Anthropic).
+/// - Codex → OpenAI, Cursor → Cursor Curated.
+/// - Fallback → "Other".
+pub(crate) fn model_provider(harness: HarnessId, model_id: &str) -> &'static str {
+    /// Vendor slug → display label. `None` = unknown slug (caller decides
+    /// between the aggregator label and "Other"). `&'static str` only.
+    fn vendor_label(slug: &str) -> Option<&'static str> {
+        match slug {
+            "anthropic" => Some("Anthropic"),
+            "openai" => Some("OpenAI"),
+            "meta-llama" | "meta" => Some("Meta"),
+            "google" | "gemini" => Some("Google Gemini"),
+            "mistralai" | "mistral" => Some("Mistral"),
+            "qwen" => Some("Qwen / Alibaba"),
+            "deepseek" => Some("DeepSeek"),
+            "nousresearch" | "nous" => Some("Nous Research"),
+            "x-ai" | "xai" => Some("xAI"),
+            "cohere" => Some("Cohere"),
+            "microsoft" => Some("Microsoft"),
+            "nvidia" => Some("NVIDIA"),
+            "perplexity" => Some("Perplexity"),
+            _ => None,
+        }
+    }
+    let id = model_id;
+    match harness {
+        HarnessId::Antigravity => {
+            if id.contains("gemini") {
+                "Google Gemini"
+            } else if id.contains("claude") {
+                "Anthropic"
+            } else if id.starts_with("gpt") || id.starts_with("o1") || id.starts_with("o3") {
+                "OpenAI"
+            } else {
+                "Other"
+            }
+        }
+        HarnessId::ClaudeCode => "Anthropic",
+        HarnessId::Codex => "OpenAI",
+        HarnessId::Cursor => "Cursor Curated",
+        // ACP harnesses (Cline / Hermes / OpenCode): provider prefix before `/`
+        _ => {
+            // Free-tier shortcut
+            if id.starts_with("cline-free/") || id.ends_with(":free") {
+                return "Free Models";
+            }
+            if id.starts_with("nous:") {
+                return "Nous Research";
+            }
+            let mut parts = id.split('/');
+            let vendor = parts.next().unwrap_or("");
+            // Aggregator alias — derive the real vendor behind the prefix.
+            // The segment after `openrouter/` is the real vendor, but it is
+            // often fused with the model name (`openrouter/deepseek-v3`):
+            // try the whole slug, then its leading `-`-delimited token
+            // (`deepseek-v3` → `deepseek` → DeepSeek), else stay OpenRouter.
+            if vendor == "openrouter" {
+                let slug = parts.next().unwrap_or("");
+                if let Some(label) =
+                    vendor_label(slug).or_else(|| slug.split('-').next().and_then(vendor_label))
+                {
+                    return label;
+                }
+                return "OpenRouter";
+            }
+            // Slash-separated `vendor/model` ids.
+            if vendor != id {
+                if let Some(label) = vendor_label(vendor) {
+                    return label;
+                }
+                return "Other";
+            }
+            // Bare ids (no vendor prefix): well-known model-family prefixes.
+            if id.starts_with("gpt")
+                || id.starts_with("o1")
+                || id.starts_with("o3")
+                || id.starts_with("openai")
+            {
+                return "OpenAI";
+            }
+            if id.contains("gemini") {
+                return "Google Gemini";
+            }
+            if id.contains("claude") {
+                return "Anthropic";
+            }
+            "Other"
+        }
+    }
 }
 
 /// Display-side model-list hygiene, mirroring the engine's discovery-side
@@ -4182,5 +4346,77 @@ mod tests {
         let offered =
             offered_harnesses_impl(&catalog(Some(false), Some(false), Some(false)), false);
         assert_eq!(offered.len(), 3);
+    }
+
+    #[test]
+    fn model_provider_groups_antigravity_hermes_cline_opencode() {
+        assert_eq!(
+            model_provider(HarnessId::Antigravity, "gemini-3.8-flash-high"),
+            "Google Gemini"
+        );
+        assert_eq!(
+            model_provider(HarnessId::Antigravity, "claude-sonnet-4-6"),
+            "Anthropic"
+        );
+        assert_eq!(
+            model_provider(HarnessId::Antigravity, "gpt-oss-120b-medium"),
+            "OpenAI"
+        );
+        assert_eq!(
+            model_provider(HarnessId::Hermes, "nous:hermes-4-405b"),
+            "Nous Research"
+        );
+        assert_eq!(
+            model_provider(HarnessId::Opencode, "openrouter/deepseek-v3"),
+            "DeepSeek"
+        );
+        assert_eq!(
+            model_provider(HarnessId::Cline, "cline-free/deepseek-v3:free"),
+            "Free Models"
+        );
+    }
+
+    #[test]
+    fn model_provider_derives_vendor_behind_openrouter_and_acp_aliases() {
+        // Aggregator alias derives the real vendor; unknown stays OpenRouter.
+        assert_eq!(
+            model_provider(HarnessId::Opencode, "openrouter/anthropic/claude"),
+            "Anthropic"
+        );
+        assert_eq!(
+            model_provider(HarnessId::Opencode, "openrouter/unknown-vendor-x"),
+            "OpenRouter"
+        );
+        // ACP vendor aliases.
+        assert_eq!(
+            model_provider(HarnessId::Hermes, "nousresearch/hermes-4"),
+            "Nous Research"
+        );
+        assert_eq!(model_provider(HarnessId::Cline, "xai/grok-4"), "xAI");
+        assert_eq!(model_provider(HarnessId::Cline, "x-ai/grok-4"), "xAI");
+        assert_eq!(
+            model_provider(HarnessId::Opencode, "google/gemini-3-flash"),
+            "Google Gemini"
+        );
+        assert_eq!(
+            model_provider(HarnessId::Opencode, "gemini/gemini-3-flash"),
+            "Google Gemini"
+        );
+        // Bare (slash-less) family prefixes.
+        assert_eq!(model_provider(HarnessId::Opencode, "gpt-4o"), "OpenAI");
+        assert_eq!(model_provider(HarnessId::Opencode, "o3-mini"), "OpenAI");
+        assert_eq!(
+            model_provider(HarnessId::Opencode, "gemini-2.5-flash"),
+            "Google Gemini"
+        );
+        assert_eq!(
+            model_provider(HarnessId::Opencode, "claude-sonnet-4"),
+            "Anthropic"
+        );
+        // Unknown stays Other — never a fabricated vendor label.
+        assert_eq!(
+            model_provider(HarnessId::Opencode, "some-vendor/model-x"),
+            "Other"
+        );
     }
 }
