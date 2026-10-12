@@ -155,7 +155,7 @@ impl TitleGenerator {
                 return None;
             }
         };
-        let cheap = match self.inner.registry.models(harness_id).await {
+        let cheap = match self.inner.registry.models(harness_id, false).await {
             Ok(models) => cheapest_model(&models),
             Err(err) => {
                 tracing::debug!(error = %err, "titling harness unavailable");
