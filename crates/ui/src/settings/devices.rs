@@ -44,6 +44,20 @@ pub fn format_last_seen(last_seen: Option<DateTime<Utc>>, now: DateTime<Utc>) ->
     }
 }
 
+/// Pure summary line for the Updates check card.
+pub fn update_check_summary(checked_at_ms: Option<i64>, update_available: Option<bool>) -> String {
+    match update_available {
+        Some(true) => "Update available".to_string(),
+        Some(false) => "You're up to date".to_string(),
+        None => {
+            if checked_at_ms.is_some() {
+                "Last check complete".to_string()
+            } else {
+                "Never checked for updates".to_string()
+            }
+        }
+    }
+}
 /// Scope-aware copy: a local registry describes only the active local
 /// workspace and must not imply that account device metadata is already live.
 pub fn devices_subtitle(scope: Option<WorkspaceScope>) -> &'static str {
@@ -68,6 +82,14 @@ pub struct DevicesPage {
     error: Option<SharedString>,
     task: Option<Task<()>>,
     copy_task: Option<Task<()>>,
+    /// Manual update check in flight (CheckUpdate RPC called, stream pending).
+    checking: bool,
+    /// Last manual-check transport error (engine unreachable, unknown method).
+    check_error: Option<SharedString>,
+    check_task: Option<Task<()>>,
+    /// Set once a manual check round-trips so "You're up to date" reads as a
+    /// fresh answer even when the stream frame predates the click.
+    just_checked: bool,
     _observe: Subscription,
 }
 
@@ -81,8 +103,41 @@ impl DevicesPage {
             error: None,
             task: None,
             copy_task: None,
+            checking: false,
+            check_error: None,
+            check_task: None,
+            just_checked: false,
             _observe: observe,
         }
+    }
+
+    fn check_updates(&mut self, cx: &mut Context<Self>) {
+        if self.checking {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.check_error = Some("Engine unavailable".into());
+            cx.notify();
+            return;
+        };
+        self.checking = true;
+        self.check_error = None;
+        cx.notify();
+        self.check_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine
+                .client()
+                .call(methods::CHECK_UPDATE, serde_json::json!({}))
+                .await;
+            this.update(cx, |page, cx| {
+                page.checking = false;
+                match result {
+                    Ok(_) => page.just_checked = true,
+                    Err(err) => page.check_error = Some(format!("Check failed: {err}").into()),
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 
     fn open_rename(&mut self, device_id: String, current: String, cx: &mut Context<Self>) {
@@ -227,6 +282,15 @@ impl Render for DevicesPage {
         let dialog = self.render_rename_dialog(window.viewport_size(), cx);
         let emerald = theme.success; // emerald-400
         let count = devices.len();
+        let (update_status, checking, check_error, just_checked) = {
+            let state = self.state.read(cx);
+            (
+                state.update.clone(),
+                self.checking,
+                self.check_error.clone(),
+                self.just_checked,
+            )
+        };
 
         let rows: Vec<AnyElement> = devices
             .into_iter()
@@ -394,6 +458,146 @@ impl Render for DevicesPage {
             card.children(rows)
         };
 
+        // Manual update check: explicit copy + spinner so the action reads
+        // without icon literacy. The result comes from the UpdateStatus
+        // stream (Shell auto-opens the existing update modal on new
+        // versions); this card only reports + the inline fallback row.
+        let current = komet_update::current_version();
+        let (summary, latest, checked_at, available, stream_error) = match &update_status {
+            Some(s) => (
+                update_check_summary(s.checked_at, Some(s.update_available)),
+                s.latest_version.clone(),
+                s.checked_at,
+                Some(s.update_available),
+                s.error.clone(),
+            ),
+            None => (update_check_summary(None, None), None, None, None, None),
+        };
+        let checked_ago = checked_at.map(|ms| {
+            let age_secs = (Utc::now().timestamp_millis() - ms).max(0) / 1000;
+            if age_secs < 60 {
+                "checked just now".to_string()
+            } else if age_secs < 3600 {
+                format!("checked {}m ago", age_secs / 60)
+            } else {
+                format!("checked {}h ago", age_secs / 3600)
+            }
+        });
+        let mut meta: Vec<AnyElement> = vec![
+            div()
+                .child(SharedString::from(format!("Running v{current}")))
+                .into_any_element(),
+            div()
+                .child(SharedString::from(summary.clone()))
+                .into_any_element(),
+        ];
+        if let Some(ago) = checked_ago {
+            meta.push(div().child(SharedString::from(ago)).into_any_element());
+        }
+        if available == Some(true)
+            && let Some(ver) = latest.clone()
+        {
+            meta.push(
+                div()
+                    .child(SharedString::from(format!("Latest v{ver}")))
+                    .into_any_element(),
+            );
+        }
+        let check_label = if checking {
+            "Checking…"
+        } else {
+            "Check for updates"
+        };
+        let view_id = cx.entity_id();
+        let updates_card = widgets::section_card(&theme).child(
+            widgets::card_row(&theme, true)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .child(widgets::field_label(&theme, "Updates"))
+                        .child(widgets::meta_line(&theme, meta))
+                        .when(available == Some(true) && latest.is_some(), |el| {
+                            el.child(
+                                div()
+                                    .mt(px(6.0))
+                                    .text_size(px(12.0))
+                                    .text_color(theme.accent)
+                                    .child(SharedString::from(format!(
+                                        "Update available — v{}. The update dialog opens automatically for new versions.",
+                                        latest.clone().unwrap_or_default()
+                                    ))),
+                            )
+                        })
+                        .when(just_checked && available == Some(false), |el| {
+                            el.child(
+                                div().mt(px(6.0)).child(widgets::badge_active(
+                                    &theme,
+                                    format!("You're up to date — v{current}"),
+                                )),
+                            )
+                        })
+                        .when_some(
+                            stream_error.filter(|_| check_error.is_none()),
+                            |el, msg| {
+                                el.child(
+                                    div()
+                                        .mt(px(6.0))
+                                        .text_size(px(11.5))
+                                        .text_color(theme.text_muted.opacity(0.7))
+                                        .child(SharedString::from(format!("Last check note: {msg}"))),
+                                )
+                            },
+                        ),
+                )
+                .child(
+                    widgets::ghost_action(&theme)
+                        .id("updates-check")
+                        .opacity(if checking { 0.5 } else { 0.9 })
+                        .hover(|s| crate::settings::widgets::ghost_hover(&theme, s))
+                        .on_click(cx.listener(|this, _, _, cx| this.check_updates(cx)))
+                        .when(checking, |el| {
+                            el.child(
+                                crate::loaders::mini_gradient_spinner(
+                                    "updates-checking",
+                                    3.0,
+                                    view_id,
+                                    cx,
+                                )
+                                .into_any_element(),
+                            )
+                        })
+                        .when(!checking, |el| {
+                            el.child(
+                                crate::icons::icon(crate::icons::REFRESH)
+                                    .size(px(14.0))
+                                    .text_color(theme.text_muted),
+                            )
+                        })
+                        .child(SharedString::from(check_label)),
+                ),
+        );
+        let updates_card = match check_error.clone() {
+            Some(msg) => div()
+                .flex()
+                .flex_col()
+                .child(updates_card.into_any_element())
+                .child(
+                    widgets::error_strip(&theme, msg)
+                        .id("updates-check-error")
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.check_error = None;
+                            cx.notify();
+                        }))
+                        .into_any_element(),
+                )
+                .into_any_element(),
+            None => updates_card.into_any_element(),
+        };
+
         div()
             .id("devices-page")
             .size_full()
@@ -420,7 +624,8 @@ impl Render for DevicesPage {
                                 })),
                         )
                     })
-                    .child(card),
+                    .child(card)
+                    .child(updates_card),
             )
             .when_some(dialog, |el, dialog| el.child(dialog))
     }
@@ -469,5 +674,14 @@ mod tests {
         let copy = devices_subtitle(Some(WorkspaceScope::Local));
         assert!(copy.contains("local workspace"));
         assert!(!copy.contains("synced"));
+    }
+
+    #[test]
+    fn update_section_copy_states_current_version() {
+        assert_eq!(
+            update_check_summary(None, None),
+            "Never checked for updates"
+        );
+        assert!(update_check_summary(Some(42), Some(false)).contains("up to date"));
     }
 }
