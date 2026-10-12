@@ -215,6 +215,42 @@ impl EngineCore {
         // boot instead of re-probing every agent (opencode's cold Node boot
         // measured ~13s under the app's 4-way boot prefetch).
         registry.load_models_cache(data_dir);
+        // Boot prefetch: warm the model cache for every offered harness with
+        // an installed CLI (except Mock) in the background, two at a time, so
+        // the first picker open renders instantly. Never blocks boot and never
+        // fails it — probe errors stay uncached for the live retry.
+        {
+            let reg = registry.clone();
+            let ids: Vec<HarnessId> = reg
+                .descriptors()
+                .into_iter()
+                .filter(|d| {
+                    d.installed
+                        && d.id != HarnessId::Mock
+                        && crate::registry::descriptor_enabled(d)
+                })
+                .map(|d| d.id)
+                .collect();
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => {
+                    let _ = handle.spawn(async move { reg.warm_models_cache(ids).await });
+                }
+                Err(_) => {
+                    // No ambient runtime (tests, one-shot tools): an isolated
+                    // thread with its own current-thread runtime instead.
+                    let _ = std::thread::Builder::new()
+                        .name("models-warm".into())
+                        .spawn(move || {
+                            if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                                .enable_all()
+                                .build()
+                            {
+                                rt.block_on(reg.warm_models_cache(ids));
+                            }
+                        });
+                }
+            }
+        }
         let store = Arc::new(DocsStore::open(profile.store_root())?);
         let store_for_import = store.clone();
         let journal = Arc::new(RunJournal::open(profile.store_root().join("journals"))?);
