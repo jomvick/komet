@@ -1401,7 +1401,11 @@ async fn cline_empty_turn_errored_done_on_insufficient_balance() {
     let done_events = dones(&events);
     assert_eq!(done_events.len(), 1, "expected 1 Done event: {events:?}");
     let (status, err) = &done_events[0];
-    assert_eq!(*status, DoneStatus::Errored, "must map empty turn to Errored");
+    assert_eq!(
+        *status,
+        DoneStatus::Errored,
+        "must map empty turn to Errored"
+    );
     let err_msg = err.as_ref().expect("error message must be present");
     assert!(
         err_msg.contains("Cline credits exhausted"),
@@ -1424,15 +1428,27 @@ fn sandbox_surface_declares_a_native_first_branch_per_harness() {
         ("codex", "native-config: CodexSandbox tables"),
         ("claude", "native-config: ClaudeSandbox filesystem settings"),
         ("opencode", "native-config: OPENCODE_CONFIG_CONTENT overlay"),
-        ("grok", "native-flags: --sandbox/--permission-mode/--always-approve"),
+        (
+            "grok",
+            "native-flags: --sandbox/--permission-mode/--always-approve",
+        ),
         ("antigravity", "native-flags: --sandbox + --mode plan"),
         ("cline-full", "native-acp-option: auto_approve=true"),
-        ("cline-readonly", "bridge-fallback: acp_auto_permission deny"),
+        (
+            "cline-readonly",
+            "bridge-fallback: acp_auto_permission deny",
+        ),
         ("cline-workspace", "bridge-fallback: permission bridge"),
-        ("cursor", "native-passthrough: sandbox via shim into SDK params"),
+        (
+            "cursor",
+            "native-passthrough: sandbox via shim into SDK params",
+        ),
         ("hermes", "bridge-fallback: ACP permission policy"),
         ("pi", "bridge-fallback: ACP permission policy"),
-        ("unsupported-sandbox-options", "rejected: ProviderOptionsRejected"),
+        (
+            "unsupported-sandbox-options",
+            "rejected: ProviderOptionsRejected",
+        ),
     ];
     for harness in [
         HarnessId::Codex,

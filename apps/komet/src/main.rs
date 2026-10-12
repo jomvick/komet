@@ -81,8 +81,6 @@ fn edge_url_from_env() -> String {
     url
 }
 
-
-
 /// mimalloc: system malloc (macOS libmalloc especially) never returns the
 /// streaming churn's high-water pages, so transient allocation became
 /// permanent RSS (docs/memory-plan.md §1).
@@ -152,17 +150,25 @@ fn main() -> anyhow::Result<()> {
         Some(Command::SyncInit) => {
             use std::fmt::Write;
             let mut token = String::new();
-            for b in uuid::Uuid::new_v4().as_bytes() { let _ = write!(token, "{b:02x}"); }
+            for b in uuid::Uuid::new_v4().as_bytes() {
+                let _ = write!(token, "{b:02x}");
+            }
             println!("KOMET_SYNC_TOKEN={token}");
             println!("KOMET_EDGE_URL=https://YOUR_VPS_HOST:8787");
-            println!("\nSur chaque device: export KOMET_SYNC_TOKEN={token} KOMET_EDGE_URL=https://YOUR_VPS_HOST:8787");
-            println!("Exposez le serveur via un reverse proxy TLS (voir docs/self-hosted-sync.md).");
+            println!(
+                "\nSur chaque device: export KOMET_SYNC_TOKEN={token} KOMET_EDGE_URL=https://YOUR_VPS_HOST:8787"
+            );
+            println!(
+                "Exposez le serveur via un reverse proxy TLS (voir docs/self-hosted-sync.md)."
+            );
             Ok(())
         }
         Some(Command::SyncServer { port }) => {
             let runtime = tokio::runtime::Runtime::new()?;
             let token = komet_sync_server::require_token(std::env::var("KOMET_SYNC_TOKEN").ok())?;
-            let data_dir = std::env::var_os("KOMET_DATA_DIR").map(std::path::PathBuf::from).unwrap_or_else(dirs_data_dir);
+            let data_dir = std::env::var_os("KOMET_DATA_DIR")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(dirs_data_dir);
             runtime.block_on(komet_sync_server::serve(data_dir, token, port))
         }
         Some(Command::Headless) => {
@@ -270,8 +276,9 @@ fn dirs_data_dir() -> std::path::PathBuf {
 /// The introspection surface every 2026-08 incident was missing — "is this
 /// device's workspace room actually receiving?" as a one-liner.
 async fn sync_cli(ipc_port: u16) -> anyhow::Result<()> {
-    let token = komet_rpc::ipc_token::read_default(ipc_port)
-        .map_err(|e| anyhow::anyhow!("no engine token for port {ipc_port} ({e}); is komet running?"))?;
+    let token = komet_rpc::ipc_token::read_default(ipc_port).map_err(|e| {
+        anyhow::anyhow!("no engine token for port {ipc_port} ({e}); is komet running?")
+    })?;
     let client = komet_rpc::connect_ws(&format!("ws://127.0.0.1:{ipc_port}"), &token)
         .await
         .map_err(|e| {

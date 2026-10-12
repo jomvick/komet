@@ -6,6 +6,8 @@
 //! types) are accepted, and unknown item types map to nothing.
 
 use komet_proto::{AgentEvent, TodoItem, ToolCall};
+
+use crate::errors::typed_error;
 use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,6 +25,22 @@ fn str_field(v: &Value, keys: &[&str]) -> String {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_owned()
+}
+
+/// Failing tools keep their output text for the transcript's error chip;
+/// success outputs never enter the event stream (the fold caps error
+/// summaries at 160 chars and drops the rest). Reads the aggregated-output
+/// spellings the app server has used; `None` when the item carries none.
+fn item_output_text(item: &Value, is_error: bool) -> Option<String> {
+    if !is_error {
+        return None;
+    }
+    ["aggregatedOutput", "aggregated_output", "output"]
+        .into_iter()
+        .filter_map(|k| item.get(k).and_then(Value::as_str))
+        .map(str::trim)
+        .find(|s| !s.is_empty())
+        .map(str::to_owned)
 }
 
 /// Delta text under either spelling the app server has used
@@ -229,10 +247,11 @@ pub(crate) fn map_item(phase: Phase, item: &Value) -> Vec<AgentEvent> {
                 let exit_code = field(item, &["exitCode", "exit_code"])
                     .and_then(Value::as_i64)
                     .unwrap_or(0);
+                let is_error = status == "failed" || exit_code != 0;
                 vec![AgentEvent::ToolResult {
                     id,
-                    is_error: status == "failed" || exit_code != 0,
-                    output: None,
+                    is_error,
+                    output: item_output_text(item, is_error),
                     diff: None,
                 }]
             }
@@ -273,12 +292,15 @@ pub(crate) fn map_item(phase: Phase, item: &Value) -> Vec<AgentEvent> {
                     },
                 }]
             }
-            Phase::Completed => vec![AgentEvent::ToolResult {
-                id,
-                is_error: status == "failed",
-                output: None,
-                diff: None,
-            }],
+            Phase::Completed => {
+                let is_error = status == "failed";
+                vec![AgentEvent::ToolResult {
+                    id,
+                    is_error,
+                    output: item_output_text(item, is_error),
+                    diff: None,
+                }]
+            }
         },
         "webSearch" | "web_search" => tool_lifecycle(
             phase,
@@ -302,9 +324,7 @@ pub(crate) fn map_item(phase: Phase, item: &Value) -> Vec<AgentEvent> {
                 .collect();
             tool_lifecycle(phase, id, ToolCall::Todo { items }, false)
         }
-        "error" => vec![AgentEvent::Error {
-            message: str_field(item, &["message"]),
-        }],
+        "error" => vec![typed_error(str_field(item, &["message"]), None, None)],
         // A subagent spawn/lifecycle marker on the PARENT thread (multi-agent
         // v2, codex 0.146.x): the parent-feed chip for the child thread. The
         // child's own traffic routes separately (see `route_child_notification`
@@ -459,6 +479,35 @@ mod tests {
         );
         assert_eq!(user_message_text(&json!({"text": "  "})), None);
         assert_eq!(user_message_text(&json!({})), None);
+    }
+
+    #[test]
+    fn failing_command_execution_carries_output_text() {
+        let completed = map_item(
+            Phase::Completed,
+            &json!({"type": "command_execution", "id": "c1", "status": "failed", "exit_code": 1, "aggregatedOutput": "boom: no such file"}),
+        );
+        assert!(
+            completed.iter().any(
+                |e| matches!(e, AgentEvent::ToolResult { id, output: Some(o), is_error: true, .. } if id == "c1" && o == "boom: no such file")
+            ),
+            "{completed:?}"
+        );
+        // Success results stay lean: no output transmitted.
+        let completed = map_item(
+            Phase::Completed,
+            &json!({"type": "command_execution", "id": "c2", "status": "completed", "exit_code": 0, "aggregatedOutput": "ok"}),
+        );
+        assert!(
+            completed.iter().all(|e| !matches!(
+                e,
+                AgentEvent::ToolResult {
+                    output: Some(_),
+                    ..
+                }
+            )),
+            "{completed:?}"
+        );
     }
 
     #[test]

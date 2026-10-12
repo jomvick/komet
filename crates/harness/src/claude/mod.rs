@@ -56,7 +56,9 @@ use komet_proto::{
     SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
-use crate::{Harness, HarnessError, RunControls, Signal, send_signal, shutdown_child};
+use crate::{
+    Harness, HarnessError, RunControls, Signal, errors::typed_error, send_signal, shutdown_child,
+};
 use catalog::{apply_ultrathink, to_effort};
 use normalize::Normalizer;
 use wire::{ControlRequestFrame, Frame, allow_response, control_response_line};
@@ -623,7 +625,9 @@ impl ClaudeHarness {
         shutdown_child(&mut child, self.kill_grace).await;
         match result {
             Ok(inner) => inner,
-            Err(_) => Err(HarnessError::Protocol("claude model discovery timed out".into())),
+            Err(_) => Err(HarnessError::Protocol(
+                "claude model discovery timed out".into(),
+            )),
         }
     }
 
@@ -1198,11 +1202,19 @@ async fn run_session(session: Session) {
                 .await;
         } else if !interrupted && !any_done {
             let status = child.try_wait().ok().flatten();
+            let crash = crate::crash_message("claude", status, &stderr_tail);
+            let _ = event_tx
+                .send(Ok(typed_error(
+                    crash.clone(),
+                    None,
+                    crate::errors::tail_detail(stderr_tail.snapshot()),
+                )))
+                .await;
             let _ = event_tx
                 .send(Ok(AgentEvent::Done {
                     status: DoneStatus::Errored,
                     result: None,
-                    error: Some(crate::crash_message("claude", status, &stderr_tail)),
+                    error: Some(crash),
                     session_id: norm.session_id.clone(),
                     reason: None,
                 }))

@@ -100,6 +100,15 @@ struct DocPartJson {
     /// Dedicated request_id for permission parts (additive).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     request_id: Option<String>,
+    /// Typed error class for error parts (additive; absent on old rows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error_kind: Option<komet_proto::ErrorKind>,
+    /// Raw CLI text for error parts (additive; absent on old rows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error_detail: Option<String>,
+    /// Retry flag for error parts (additive; absent on old rows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    error_retryable: Option<bool>,
 }
 
 /// App parts → doc part json (mirror of `toDocParts`).
@@ -158,10 +167,19 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             resolved: Some(*resolved),
             ..Default::default()
         },
-        MessagePart::Error { id, message } => DocPartJson {
+        MessagePart::Error {
+            id,
+            message,
+            kind,
+            detail,
+            retryable,
+        } => DocPartJson {
             id: id.clone(),
             kind: "error".into(),
             message: Some(message.clone()),
+            error_kind: (!kind.is_unknown()).then_some(*kind),
+            error_detail: detail.clone(),
+            error_retryable: (*retryable).then_some(true),
             ..Default::default()
         },
         MessagePart::Permission {
@@ -228,6 +246,9 @@ fn from_doc_part(p: DocPartJson) -> MessagePart {
         "error" => MessagePart::Error {
             id: p.id,
             message: p.message.unwrap_or_default(),
+            kind: p.error_kind.unwrap_or_default(),
+            detail: p.error_detail,
+            retryable: p.error_retryable.unwrap_or(false),
         },
         "permission" => {
             // Read request_id directly from the dedicated column first
@@ -239,7 +260,13 @@ fn from_doc_part(p: DocPartJson) -> MessagePart {
                     .questions
                     .as_ref()
                     .and_then(|q| {
-                        serde_json::from_value::<(serde_json::Value, serde_json::Value, String, serde_json::Value)>(q.clone()).ok()
+                        serde_json::from_value::<(
+                            serde_json::Value,
+                            serde_json::Value,
+                            String,
+                            serde_json::Value,
+                        )>(q.clone())
+                        .ok()
                     })
                     .map(|(_, _, rid, _)| {
                         // Strip the perm- prefix in legacy fallback
@@ -326,6 +353,19 @@ impl SessionDoc {
         self.doc.commit();
         Ok(())
     }
+
+    /// Truncate all entries from `from_index` (inclusive) to end of messages list.
+    /// Used when editing a prompt to erase the prompt and all its subsequent responses.
+    pub fn truncate_messages_from(&self, from_index: usize) -> Result<(), DocError> {
+        let messages = self.doc.get_list("messages");
+        let len = messages.len();
+        if from_index < len {
+            messages.delete(from_index, len - from_index)?;
+            self.doc.commit();
+        }
+        Ok(())
+    }
+
 
     /// Read all entries (continuations NOT joined — see `join_continuation_entries`).
     ///
@@ -527,6 +567,9 @@ impl SessionDoc {
                 &MessagePart::Error {
                     id: part_id.to_string(),
                     message: message.to_string(),
+                    kind: komet_proto::ErrorKind::Unknown,
+                    detail: None,
+                    retryable: false,
                 },
             )?;
             self.doc.commit();
@@ -854,6 +897,9 @@ fn salvage_part(part: &serde_json::Value, entry_id: &str, ix: usize) -> Option<M
         return Some(MessagePart::Error {
             id,
             message: message.to_owned(),
+            kind: komet_proto::ErrorKind::Unknown,
+            detail: None,
+            retryable: false,
         });
     }
     None
@@ -1149,6 +1195,47 @@ mod tests {
             }]
         );
         assert_eq!(doc.chat_id().as_deref(), Some("chat-1"));
+    }
+
+    #[test]
+    fn old_error_parts_reread_with_unknown_kind() {
+        // 1. App-layer serde: old JSON without the new fields.
+        let part: MessagePart =
+            serde_json::from_str(r#"{"kind":"error","id":"e0","message":"boom"}"#).unwrap();
+        assert!(
+            matches!(
+                &part,
+                MessagePart::Error { kind, detail, retryable, .. }
+                if *kind == komet_proto::ErrorKind::Unknown
+                    && detail.is_none()
+                    && !retryable
+            ),
+            "old error JSON must default to Unknown: {part:?}"
+        );
+        // 2. Doc-layer: old persisted part map without the new columns.
+        let old = DocPartJson {
+            id: "e0".into(),
+            kind: "error".into(),
+            message: Some("boom".into()),
+            ..Default::default()
+        };
+        let part = from_doc_part(old);
+        assert!(
+            matches!(
+                &part,
+                MessagePart::Error { kind, detail, retryable, .. }
+                if *kind == komet_proto::ErrorKind::Unknown
+                    && detail.is_none()
+                    && !retryable
+            ),
+            "old doc rows must default to Unknown: {part:?}"
+        );
+        // 3. Defaulted new fields stay off the wire so old readers see old bytes
+        // (the enum tag itself occupies `kind`; the typed class rides `errorKind`).
+        let v = serde_json::to_value(&part).unwrap();
+        assert_eq!(v.get("message").unwrap(), "boom");
+        assert!(v.get("errorKind").is_none());
+        assert!(v.get("detail").is_none());
     }
 
     #[test]
@@ -1504,5 +1591,26 @@ mod tests {
         });
         let entry = entry_from_json(v).expect("strict");
         assert_eq!(entry.id, "m1");
+    }
+
+    #[test]
+    fn test_truncate_messages_from() {
+        let doc = SessionDoc::init("chat-truncate").unwrap();
+        doc.push_message(&user_entry("m1", "first")).unwrap();
+        doc.push_message(&user_entry("m2", "second")).unwrap();
+        doc.push_message(&user_entry("m3", "third")).unwrap();
+        assert_eq!(doc.read_entries().unwrap().len(), 3);
+
+        // Truncate from index 1 (removes m2 and m3)
+        doc.truncate_messages_from(1).unwrap();
+        let entries = doc.read_entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, "m1");
+
+        // Push new message
+        doc.push_message(&user_entry("m4", "new fourth")).unwrap();
+        let entries = doc.read_entries().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].id, "m4");
     }
 }

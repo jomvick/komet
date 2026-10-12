@@ -98,9 +98,7 @@ pub enum LoadTrigger {
 ///   outright.
 pub fn usage_mode_for(trigger: LoadTrigger) -> UsageMode {
     match trigger {
-        LoadTrigger::Mount
-        | LoadTrigger::Retry
-        | LoadTrigger::PostAction => UsageMode::Cached,
+        LoadTrigger::Mount | LoadTrigger::Retry | LoadTrigger::PostAction => UsageMode::Cached,
         LoadTrigger::Refresh | LoadTrigger::PostLogin => UsageMode::Fresh,
     }
 }

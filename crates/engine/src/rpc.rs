@@ -1072,6 +1072,7 @@ fn forwardable(method: &str) -> bool {
             | methods::READ_ATTACHMENT_CHUNK
             // Updates report/apply on the device whose binary they concern.
             | methods::UPDATE_STATUS
+            | methods::CHECK_UPDATE
             | methods::APPLY_UPDATE
             | methods::GET_CONTEXT_USAGE
             // External MCP registries are device-local: each device manages its
@@ -1505,6 +1506,10 @@ impl RpcService for EngineRpc {
                 ))))
             }
             methods::UPDATE_STATUS => Ok(RpcReply::Stream(watch_stream(self.updater()?.watch()))),
+            methods::CHECK_UPDATE => {
+                self.updater()?.check_now();
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
             methods::APPLY_UPDATE => {
                 let version = self
                     .updater()?
@@ -2151,6 +2156,12 @@ mod tests {
         assert!(forwardable(methods::GET_TOOL_DETAIL));
         assert!(is_stream_method(methods::WATCH_REASONING));
         assert!(!is_stream_method(methods::GET_TOOL_DETAIL));
+    }
+
+    #[test]
+    fn check_update_method_is_forwardable() {
+        assert!(forwardable(methods::CHECK_UPDATE));
+        assert!(!is_stream_method(methods::CHECK_UPDATE));
     }
 
     use crate::sessions::JournaledEvent;

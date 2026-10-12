@@ -226,6 +226,35 @@ pub async fn fetch_latest() -> anyhow::Result<Manifest> {
     verify_manifest(&manifest, &signature, &public_key, &version)
 }
 
+/// Like [`fetch_latest`] but skips signature verification — used for dev / CI
+/// builds that have no `KOMET_RELEASE_PUBLIC_KEY` compiled in.  We can still
+/// compare version numbers to tell the user whether a newer release exists,
+/// we just cannot safely *install* it without a verified manifest.
+async fn fetch_latest_unverified() -> anyhow::Result<Manifest> {
+    let repo = release_repo();
+    let client = http_client()?;
+    let api_url = format!("https://api.github.com/repos/{repo}/releases/latest");
+    let release: GhRelease = client
+        .get(&api_url)
+        .send()
+        .await
+        .with_context(|| format!("fetching {api_url}"))?
+        .error_for_status()
+        .with_context(|| format!("fetching {api_url}"))?
+        .json()
+        .await
+        .context("parsing the GitHub release")?;
+    let version = release.tag_name.trim().trim_start_matches('v').to_string();
+    if version.is_empty() {
+        bail!("GitHub release has an empty tag_name");
+    }
+    let manifest_bytes =
+        fetch_release_asset(&client, &repo, &version, "manifest.json").await?;
+    let manifest: Manifest =
+        serde_json::from_slice(&manifest_bytes).context("parsing manifest.json")?;
+    Ok(manifest)
+}
+
 async fn fetch_release_asset(
     client: &reqwest::Client,
     repo: &str,
@@ -371,10 +400,7 @@ fn run(program: &str, args: &[&str]) -> anyhow::Result<()> {
 
 /// Download + unpack the headless tarball into `app_root/<ver>` (idempotent —
 /// an already-staged version is reused). Returns the versioned dir.
-pub async fn stage_headless(
-    manifest: &Manifest,
-    app_root: &Path,
-) -> anyhow::Result<PathBuf> {
+pub async fn stage_headless(manifest: &Manifest, app_root: &Path) -> anyhow::Result<PathBuf> {
     let version = &manifest.version;
     let dest = app_root.join(version);
     if dest.join("komet").exists() {
@@ -475,10 +501,7 @@ pub fn restart_service() -> anyhow::Result<()> {
 
 /// Download + unpack the app tarball into `{data_dir}/updates/<ver>/Komet.app`
 /// (idempotent). Returns the staged bundle path.
-pub async fn stage_mac_app(
-    manifest: &Manifest,
-    data_dir: &Path,
-) -> anyhow::Result<PathBuf> {
+pub async fn stage_mac_app(manifest: &Manifest, data_dir: &Path) -> anyhow::Result<PathBuf> {
     let version = &manifest.version;
     let dir = data_dir.join("updates").join(version);
     let staged = dir.join("Komet.app");
@@ -756,8 +779,25 @@ impl Updater {
     }
 
     /// One check; returns false on fetch failure (retry sooner).
+    ///
+    /// When this build has no `KOMET_RELEASE_PUBLIC_KEY` (dev/CI builds) we
+    /// skip signature verification and just compare version numbers — the user
+    /// still gets "up to date" or the update-available popup without seeing an
+    /// internal build-config error.
     async fn check_once(&self) -> bool {
-        match fetch_latest().await {
+        // First try the verified path; if the only problem is a missing signing
+        // key, fall back silently to the unverified version-number check.
+        let result = match release_public_key() {
+            Ok(_) => fetch_latest().await,
+            Err(_) => {
+                tracing::debug!(
+                    "no release signing key — checking versions without signature verification"
+                );
+                fetch_latest_unverified().await
+            }
+        };
+
+        match result {
             Ok(manifest) => {
                 let status = UpdateStatus {
                     current_version: current_version().to_string(),

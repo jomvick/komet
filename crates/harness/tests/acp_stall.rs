@@ -73,7 +73,7 @@ async fn silent_agent_errors_via_the_prompt_stall_watchdog() {
     let error = events
         .iter()
         .find_map(|e| match e {
-            AgentEvent::Error { message } => Some(message.clone()),
+            AgentEvent::Error { message, .. } => Some(message.clone()),
             _ => None,
         })
         .expect("visible error chip");
@@ -142,7 +142,7 @@ async fn opencode_stall_hint_names_the_provider() {
     let error = events
         .iter()
         .find_map(|e| match e {
-            AgentEvent::Error { message } => Some(message.clone()),
+            AgentEvent::Error { message, .. } => Some(message.clone()),
             _ => None,
         })
         .expect("visible error chip");

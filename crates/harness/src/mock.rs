@@ -5,7 +5,7 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 
 use komet_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SteeringMode,
+    AgentEvent, DoneStatus, ErrorKind, HarnessId, Model, ReasoningLevel, RunRequest, SteeringMode,
     UserInputQuestion,
 };
 
@@ -191,6 +191,9 @@ impl Harness for MockHarness {
         let (body, tail) = self.script.split_at(done_ix);
         let error_event = mock_error.then(|| AgentEvent::Error {
             message: "Claude usage limit reached — try again after the limit resets.".into(),
+            kind: ErrorKind::Unknown,
+            detail: None,
+            retryable: false,
         });
         // Dev/testing knob: `KOMET_MOCK_CODE=1` (fallback `ZERON_MOCK_CODE`) appends rust + ts code blocks
         // (keywords, strings, numbers, comments) plus inline code — for
