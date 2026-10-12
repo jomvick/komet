@@ -392,26 +392,29 @@ impl Harness for CodexHarness {
     /// static fallback, so the picker only shows models the CLI offers.
     /// Requires an installed CLI so an absent binary surfaces as [`HarnessError::NotInstalled`].
     /// A failed probe is UNCACHED (`OnceCell` stores successes only) so the
-    /// next picker open retries.
+    /// next picker open retries. Concurrent calls share one probe:
+    /// `OnceCell` single-flights the initializer.
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         self.resolve_executable()?;
         self.models
             .get_or_try_init(|| async {
-                self.discover_live_models()
-                    .await
-                    .inspect(|models| {
-                        tracing::info!(
-                            target: "komet_harness::codex",
-                            count = models.len(),
-                            "discovered live Codex models from app-server"
-                        );
-                    })
-                    .inspect_err(|e| {
-                        tracing::warn!(
-                            target: "komet_harness::codex",
-                            "Codex live model discovery failed: {e}"
-                        );
-                    })
+                let models = self.discover_live_models().await.inspect_err(|e| {
+                    tracing::warn!(
+                        target: "komet_harness::codex",
+                        "Codex live model discovery failed: {e}"
+                    );
+                })?;
+                if models.is_empty() {
+                    return Err(HarnessError::Protocol(
+                        "codex model/list returned no usable models".into(),
+                    ));
+                }
+                tracing::info!(
+                    target: "komet_harness::codex",
+                    count = models.len(),
+                    "discovered live Codex models from app-server"
+                );
+                Ok(models)
             })
             .await
             .cloned()

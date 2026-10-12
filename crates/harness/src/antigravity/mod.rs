@@ -28,6 +28,10 @@ use crate::{Harness, HarnessError, RunControls};
 pub struct AntigravityHarness {
     executable: Option<PathBuf>,
     models: tokio::sync::Mutex<Option<(std::time::Instant, Vec<Model>)>>,
+    /// Single-flight for model probes: held across cache-check + probe +
+    /// store, so concurrent `models()` calls share one `agy models` spawn —
+    /// waiters then read the fresh cache instead of spawning their own.
+    models_probe: tokio::sync::Mutex<()>,
 }
 
 impl AntigravityHarness {
@@ -35,6 +39,7 @@ impl AntigravityHarness {
         Self {
             executable: None,
             models: tokio::sync::Mutex::new(None),
+            models_probe: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -143,9 +148,11 @@ impl Harness for AntigravityHarness {
 
     /// Live model discovery via `agy models`. Errors propagate — no static
     /// fallback, so the picker only shows models the CLI offers. A failed
-    /// probe is UNCACHED so the next picker open retries.
+    /// probe is UNCACHED so the next picker open retries. Concurrent calls
+    /// share one probe (single-flight via `models_probe`).
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         let executable = self.resolve_executable()?;
+        let _probe = self.models_probe.lock().await;
         {
             let guard = self.models.lock().await;
             if let Some((at, models)) = guard.as_ref() {

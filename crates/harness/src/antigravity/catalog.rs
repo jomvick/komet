@@ -337,6 +337,15 @@ mod tests {
     }
 
     #[test]
+    fn parse_models_empty_output_yields_no_models() {
+        // Live-only: an empty/blank `agy models` parse must come back empty
+        // (the caller maps it to a Protocol error) — never the static list.
+        assert!(parse_models("").is_empty());
+        assert!(parse_models("   \n  \n").is_empty());
+        assert!(parse_models("Fetching available models...\n").is_empty());
+    }
+
+    #[test]
     fn static_models_contain_defaults_and_flash() {
         let models = static_models();
         assert!(models.iter().any(|m| m.id == "gemini-3.8-flash-high"));
