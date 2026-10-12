@@ -3551,6 +3551,9 @@ pub struct Composer {
     pickers: Entity<Pickers>,
     /// Draft text per chat key ("" = new-chat canvas), surviving navigation.
     drafts: HashMap<String, String>,
+    /// Last user prompt sent as a full turn (steers excluded): the error
+    /// chip's Réessayer action resubmits it verbatim.
+    last_sent: Option<String>,
     /// Staged-but-unsent attachments per chat key (use-attachments.ts `stash`):
     /// navigating away and back restores them; memory-only, like the original.
     attachments: HashMap<String, Vec<StagedAttachment>>,
@@ -3669,6 +3672,15 @@ impl Composer {
         self.send(text, false, cx);
     }
 
+    /// Resubmit the last full-turn prompt verbatim (the error chip's
+    /// Réessayer action). No-op when nothing was sent yet; `submit_text`
+    /// re-applies the sending/blocked guards.
+    pub fn resubmit_last(&mut self, cx: &mut Context<Self>) {
+        if let Some(text) = self.last_sent.clone() {
+            self.submit_text(text, cx);
+        }
+    }
+
     /// In-place Edit → Send on an already-sent prompt (transcript bubble).
     /// When a run is live this steers the current run instead of killing it
     /// and opening a brand-new turn (which read as "le prompt est renvoyé"
@@ -3745,6 +3757,7 @@ impl Composer {
             input,
             pickers,
             drafts: HashMap::new(),
+            last_sent: None,
             attachments: HashMap::new(),
             preview: None,
             preview_focus: cx.focus_handle(),
@@ -4830,6 +4843,9 @@ impl Composer {
     /// is on), `Mutate createChat` with the `ChatConfig` + cwd, and the model /
     /// reasoning / options on the Run request itself (§1.7).
     fn send(&mut self, text: String, steer: bool, cx: &mut Context<Self>) {
+        if !steer && !text.trim().is_empty() {
+            self.last_sent = Some(text.clone());
+        }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.failure = Some("Engine not connected".into());
             cx.notify();
