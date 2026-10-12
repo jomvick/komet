@@ -249,9 +249,10 @@ impl Harness for CursorHarness {
     }
 
     /// Cursor-native families (Auto / Composer / Grok) from
-    /// `cursor-agent --list-models`, then the SDK list, then the snapshot.
-    /// New Composer/Grok versions appear when the CLI lists them. A failed
-    /// live probe is UNCACHED so the next picker open retries.
+    /// `cursor-agent --list-models`, then the SDK list. Both probes are live;
+    /// a failed probe errors (no static fallback) so the picker only shows
+    /// models the account actually offers. A failed probe is UNCACHED so the
+    /// next picker open retries.
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         if let Some(models) = self.models_cache.get() {
             return Ok(models.clone());
@@ -267,7 +268,10 @@ impl Harness for CursorHarness {
                 let _ = self.models_cache.set(models.clone());
                 Ok(models)
             }
-            Ok(_) | Err(_) => Ok(catalog::static_models()),
+            Ok(_) => Err(HarnessError::Protocol(
+                "cursor models probe returned no usable models".into(),
+            )),
+            Err(e) => Err(e),
         }
     }
 

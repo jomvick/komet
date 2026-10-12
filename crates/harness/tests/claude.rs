@@ -730,18 +730,29 @@ async fn models_live_discovery_via_control_channel() {
 }
 
 #[tokio::test]
-async fn models_falls_back_to_static_on_failure() {
+async fn catalog_harness_failed_probe_returns_err_not_static() {
+    let harness = ClaudeHarness::new().with_executable("/nonexistent/never-a-claude");
+    let err = harness.models().await.expect_err("probe must fail");
+    assert!(err.to_string().contains("claude") || matches!(err, HarnessError::NotInstalled(_)));
+}
+
+#[tokio::test]
+async fn models_errors_on_failed_discovery() {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("fixtures")
         .join("fake-claude-fail-models.sh");
     let failing_harness = ClaudeHarness::new().with_executable(path);
-    let models = failing_harness.models().await.expect("models fallback");
-    assert!(!models.is_empty());
-    // Static fallback has 6 models
-    assert_eq!(models.len(), 6);
-    assert_eq!(models[0].id, "claude-fable-5");
-    assert_eq!(models[0].label, "Fable 5");
+    // Live-only: a failed probe errors instead of serving the static catalog.
+    let err = failing_harness
+        .models()
+        .await
+        .expect_err("failed probe errors");
+    assert!(
+        matches!(err, HarnessError::Protocol(_)),
+        "readable protocol error, got: {err:?}"
+    );
+    assert!(!err.to_string().is_empty());
 }
 
 /// Live smoke against the real CLI: `cargo test -p komet-harness --test

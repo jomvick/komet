@@ -27,14 +27,14 @@ use crate::{Harness, HarnessError, RunControls};
 
 pub struct AntigravityHarness {
     executable: Option<PathBuf>,
-    models: tokio::sync::OnceCell<Vec<Model>>,
+    models: tokio::sync::Mutex<Option<(std::time::Instant, Vec<Model>)>>,
 }
 
 impl AntigravityHarness {
     pub fn new() -> Self {
         Self {
             executable: None,
-            models: tokio::sync::OnceCell::new(),
+            models: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -141,28 +141,56 @@ impl Harness for AntigravityHarness {
         self.resolve_executable().is_ok()
     }
 
+    /// Live model discovery via `agy models`. Errors propagate — no static
+    /// fallback, so the picker only shows models the CLI offers. A failed
+    /// probe is UNCACHED so the next picker open retries.
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         let executable = self.resolve_executable()?;
-        self.models
-            .get_or_try_init(|| async {
-                let mut cmd = Command::new(&executable);
-                crate::compose_child_path(&mut cmd, &executable);
-                cmd.arg("models");
-                cmd.stdout(Stdio::piped()).stderr(Stdio::null());
-                if let Ok(Ok(output)) =
-                    tokio::time::timeout(std::time::Duration::from_secs(15), cmd.output()).await
-                    && output.status.success()
-                    && let Ok(text) = String::from_utf8(output.stdout)
-                {
-                    let parsed = catalog::parse_models(&text);
-                    if !parsed.is_empty() {
-                        return Ok(parsed);
-                    }
+        {
+            let guard = self.models.lock().await;
+            if let Some((at, models)) = guard.as_ref() {
+                if at.elapsed() < std::time::Duration::from_secs(10) {
+                    return Ok(models.clone());
                 }
-                Ok(catalog::static_models())
-            })
+            }
+        }
+        let mut cmd = Command::new(&executable);
+        crate::compose_child_path(&mut cmd, &executable);
+        cmd.arg("models");
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let output = tokio::time::timeout(std::time::Duration::from_secs(15), cmd.output())
             .await
-            .cloned()
+            .map_err(|_| {
+                HarnessError::Protocol("timeout 15s `agy models` — `agy` login requis?".into())
+            })?
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    HarnessError::NotInstalled(executable.display().to_string())
+                } else {
+                    HarnessError::Protocol(format!("`agy models` probe failed: {e}"))
+                }
+            })?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = stderr.trim();
+            let mut message = String::from("`agy models` failed");
+            if !stderr.is_empty() {
+                message.push_str("; stderr: ");
+                message.push_str(&stderr.chars().take(500).collect::<String>());
+            }
+            message.push_str(" — `agy` login requis?");
+            return Err(HarnessError::Protocol(message));
+        }
+        let text = String::from_utf8(output.stdout)
+            .map_err(|e| HarnessError::Protocol(format!("`agy models` output not UTF-8: {e}")))?;
+        let parsed = catalog::parse_models(&text);
+        if parsed.is_empty() {
+            return Err(HarnessError::Protocol(
+                "`agy models` returned no usable models — `agy` login requis?".into(),
+            ));
+        }
+        *self.models.lock().await = Some((std::time::Instant::now(), parsed.clone()));
+        Ok(parsed)
     }
 
     async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {

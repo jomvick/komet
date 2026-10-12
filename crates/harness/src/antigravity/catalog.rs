@@ -180,9 +180,9 @@ pub fn parse_models(output: &str) -> Vec<Model> {
             .unwrap_or("");
         models.push(model(id, &label, description, options));
     }
-    if models.is_empty() {
-        return static_list;
-    }
+    // No static fallback: an empty parse means the probe found nothing, and
+    // the caller surfaces that as a Protocol error. `static_list` above only
+    // enriches labels/descriptions of LIVE-discovered ids.
     models
 }
 
