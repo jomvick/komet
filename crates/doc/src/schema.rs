@@ -354,6 +354,19 @@ impl SessionDoc {
         Ok(())
     }
 
+    /// Truncate all entries from `from_index` (inclusive) to end of messages list.
+    /// Used when editing a prompt to erase the prompt and all its subsequent responses.
+    pub fn truncate_messages_from(&self, from_index: usize) -> Result<(), DocError> {
+        let messages = self.doc.get_list("messages");
+        let len = messages.len();
+        if from_index < len {
+            messages.delete(from_index, len - from_index)?;
+            self.doc.commit();
+        }
+        Ok(())
+    }
+
+
     /// Read all entries (continuations NOT joined — see `join_continuation_entries`).
     ///
     /// Malformed entries are SKIPPED, not fatal: a torn intermediate state
@@ -1578,5 +1591,26 @@ mod tests {
         });
         let entry = entry_from_json(v).expect("strict");
         assert_eq!(entry.id, "m1");
+    }
+
+    #[test]
+    fn test_truncate_messages_from() {
+        let doc = SessionDoc::init("chat-truncate").unwrap();
+        doc.push_message(&user_entry("m1", "first")).unwrap();
+        doc.push_message(&user_entry("m2", "second")).unwrap();
+        doc.push_message(&user_entry("m3", "third")).unwrap();
+        assert_eq!(doc.read_entries().unwrap().len(), 3);
+
+        // Truncate from index 1 (removes m2 and m3)
+        doc.truncate_messages_from(1).unwrap();
+        let entries = doc.read_entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, "m1");
+
+        // Push new message
+        doc.push_message(&user_entry("m4", "new fourth")).unwrap();
+        let entries = doc.read_entries().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].id, "m4");
     }
 }

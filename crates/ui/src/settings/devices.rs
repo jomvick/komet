@@ -335,21 +335,13 @@ impl Render for DevicesPage {
         let dialog = self.render_rename_dialog(window.viewport_size(), cx);
         let emerald = theme.success; // emerald-400
         let count = devices.len();
-        let (update_status, checking, check_error, just_checked) = {
-            let state = self.state.read(cx);
-            (
-                state.update.clone(),
-                self.checking,
-                self.check_error.clone(),
-                self.just_checked,
-            )
-        };
         // Fresh stream frame answers the in-flight click: settle here (render
         // runs on every AppState observation) so the spinner tracks the fetch,
         // not the wake ack. Stale frames leave `checking` on until the fresh
         // one or the watchdog timeout.
-        if checking {
-            self.settle_if_fresh(update_status.as_ref().and_then(|s| s.checked_at), cx);
+        if self.checking {
+            let checked_at = self.state.read(cx).update.as_ref().and_then(|s| s.checked_at);
+            self.settle_if_fresh(checked_at, cx);
         }
         let (checking, check_error, just_checked) =
             (self.checking, self.check_error.clone(), self.just_checked);

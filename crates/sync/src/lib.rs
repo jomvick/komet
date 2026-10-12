@@ -11,9 +11,9 @@
 
 pub mod chat_client;
 pub mod chat_frames;
-pub mod registry;
 pub mod dial;
 pub mod net_path;
+pub mod registry;
 mod room;
 mod store;
 pub mod wake;
@@ -22,5 +22,7 @@ pub use chat_client::{
     ChatClient, ChatDocSink, ChatEvent, ChatStatsSnapshot, ChatTuning, CheckpointFetcher,
 };
 pub use registry::{RegistryClient, RegistryEvent, RegistryTuning};
-pub use room::{RoomClient, RoomEvent, RoomStatsSnapshot, RoomTuning, StaticUrl, SyncError, UrlProvider};
+pub use room::{
+    RoomClient, RoomEvent, RoomStatsSnapshot, RoomTuning, StaticUrl, SyncError, UrlProvider,
+};
 pub use store::{DocsStore, StoreError};

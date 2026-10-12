@@ -276,6 +276,11 @@ impl SessionsEngine {
         lock(&self.inner.last_requests).get(chat_id).cloned()
     }
 
+    /// Explicitly tombstone the harness session for a chat (e.g. on prompt edit).
+    pub fn tombstone_harness_session(&self, chat_id: &str) {
+        self.inner.remember_harness_session(chat_id, "", "");
+    }
+
     /// IDs assigned to the chat for MCP servers (`ChatConfig.mcp_server_ids`).
     fn mcp_ids_for_chat(&self, chat_id: &str) -> Vec<String> {
         if let Some(host) = self.inner.doc_host()

@@ -156,10 +156,7 @@ mod export_tests {
 
     #[test]
     fn user_text_exports_verbatim_as_blockquote() {
-        let e = entry(
-            MessageRole::User,
-            vec![text("p1", "do # stuff *now*")],
-        );
+        let e = entry(MessageRole::User, vec![text("p1", "do # stuff *now*")]);
         assert_eq!(
             entry_to_markdown(&e, false),
             "**User:**\n\n> do # stuff *now*"
@@ -168,10 +165,7 @@ mod export_tests {
 
     #[test]
     fn assistant_text_passes_through_raw() {
-        let e = entry(
-            MessageRole::Assistant,
-            vec![text("p1", "# Done\n\n* hi")],
-        );
+        let e = entry(MessageRole::Assistant, vec![text("p1", "# Done\n\n* hi")]);
         assert_eq!(entry_to_markdown(&e, false), "# Done\n\n* hi");
     }
 
