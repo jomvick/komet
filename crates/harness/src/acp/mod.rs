@@ -968,7 +968,7 @@ impl AcpHarness {
         &self,
         cwd: Option<&str>,
         block_on_install: bool,
-        extra_args: &[String],
+        sidecar_port: Option<u16>,
         opencode_config_overlay: Option<&std::path::Path>,
         sandbox: Option<SandboxLevel>,
     ) -> Result<(Child, crate::StderrTail), HarnessError> {
@@ -980,7 +980,10 @@ impl AcpHarness {
         }
         let mut cmd = Command::new(&exe);
         cmd.args(args);
-        cmd.args(extra_args);
+        if let Some(port) = sidecar_port {
+            cmd.env("PORT", port.to_string());
+            cmd.env("OPENCODE_PORT", port.to_string());
+        }
         crate::compose_child_path(&mut cmd, &exe);
         if let Some(cwd) = cwd.filter(|c| !c.is_empty()) {
             cmd.current_dir(cwd);
@@ -1026,7 +1029,7 @@ impl AcpHarness {
     /// refuses sessions before login still surfaces whatever the handshake
     /// advertised.
     async fn discover_commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
-        let (mut child, _stderr) = self.spawn_agent(None, false, &[], None, None).await?;
+        let (mut child, _stderr) = self.spawn_agent(None, false, None, None, None).await?;
         let (client, mut incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
             _ => {
@@ -1096,7 +1099,7 @@ impl AcpHarness {
     /// wire is the source of truth — the spec's static catalog only enriches
     /// matching entries and names the pick when the agent advertises nothing.
     async fn discover_models(&self) -> Result<Vec<Model>, HarnessError> {
-        let (mut child, stderr_tail) = self.spawn_agent(None, false, &[], None, None).await?;
+        let (mut child, stderr_tail) = self.spawn_agent(None, false, None, None, None).await?;
         let (client, _incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
             _ => {
@@ -1743,11 +1746,10 @@ impl Harness for AcpHarness {
         // (4096) is shared, and a losing concurrent bind silently drops the
         // server the subagent viz tails. The pick-then-release race is
         // acceptable — a lost port only degrades transcripts to final output.
+        // We set the port via environment variables (PORT / OPENCODE_PORT) in
+        // spawn_agent, rather than command-line flags, because `opencode acp`
+        // runs in stdio mode and rejects `--port` as an unrecognized flag.
         let sidecar_port = self.spec.http_sidecar.then(free_localhost_port).flatten();
-        let extra_args = match sidecar_port {
-            Some(port) => vec!["--port".to_owned(), port.to_string()],
-            None => Vec::new(),
-        };
         // OpenCode permission overlay: write temp opencode.json and point OPENCODE_CONFIG at it.
         // The file must outlive the child, so we leak its TempPath into a owned PathBuf kept alive
         // until the child exits (the Session owns the TempDir via _opencode_overlay_dir).
@@ -1791,7 +1793,7 @@ impl Harness for AcpHarness {
             .spawn_agent(
                 Some(&request.cwd),
                 true,
-                &extra_args,
+                sidecar_port,
                 opencode_overlay_path.as_deref(),
                 Some(request.sandbox),
             )

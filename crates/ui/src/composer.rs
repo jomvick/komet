@@ -3682,18 +3682,18 @@ impl Composer {
     }
 
     /// In-place Edit → Send on an already-sent prompt (transcript bubble).
-    /// When a run is live this steers the current run instead of killing it
-    /// and opening a brand-new turn (which read as "le prompt est renvoyé"
-    /// next to the original). When idle it falls back to a plain new turn —
-    /// true rewind-and-rerun needs backend truncation support (doc entries
-    /// are append-only), so the edited text goes out as a follow-up.
-    pub fn submit_edit(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
+    /// Truncates the transcript from the target prompt onwards and dispatches a fresh run.
+    pub fn submit_edit(
+        &mut self,
+        target_message_id: String,
+        text: impl Into<String>,
+        cx: &mut Context<Self>,
+    ) {
         let text = text.into().trim().to_string();
         if text.is_empty() || self.sending || self.send_blocked(cx) || self.wizard.is_some() {
             return;
         }
-        let steer = self.run_live(cx);
-        self.send(text, steer, cx);
+        self.send_edit(target_message_id, text, cx);
     }
 
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
@@ -5291,6 +5291,131 @@ impl Composer {
                         }
                         composer.attachments.insert(restore_key, merged);
                     }
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    fn send_edit(
+        &mut self,
+        target_message_id: String,
+        text: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            self.failure = Some("Engine not connected".into());
+            cx.notify();
+            return;
+        };
+        let Some(chat_id) = self.state.read(cx).selected_chat.clone() else {
+            return;
+        };
+
+        let resolved = self.pickers.read(cx).resolved(cx);
+        let existing_cwd = self
+            .state
+            .read(cx)
+            .selected_chat_row()
+            .and_then(|c| c.cwd.clone())
+            .unwrap_or_else(|| ".".to_string());
+        let sandbox = self.state.read(cx).access_mode;
+        let harness_supports_sandbox = resolved.harness.as_ref().is_none_or(|h| {
+            !matches!(
+                h,
+                komet_proto::HarnessId::Cursor
+                    | komet_proto::HarnessId::Grok
+                    | komet_proto::HarnessId::Hermes
+                    | komet_proto::HarnessId::Pi
+                    | komet_proto::HarnessId::Antigravity
+                    | komet_proto::HarnessId::Cline
+            )
+        });
+        let sandbox_options = if harness_supports_sandbox {
+            Some(komet_proto::SandboxOptions::from_level(sandbox))
+        } else {
+            None
+        };
+
+        let new_message_id = uuid::Uuid::new_v4().to_string();
+        let created_at = chrono::Utc::now().timestamp_millis();
+
+        let echo = SessionMessageEntry {
+            id: new_message_id.clone(),
+            role: komet_doc::MessageRole::User,
+            parts: vec![MessagePart::Text {
+                id: "t0".into(),
+                text: text.clone(),
+            }],
+            created_at,
+            device_id: "local".into(),
+            status: None,
+            continuation_of: None,
+        };
+
+        let err_chat_id = chat_id.clone();
+        let err_message_id = new_message_id.clone();
+
+        self.state.update(cx, |s, cx| {
+            s.truncate_transcript_from(&chat_id, &target_message_id);
+            s.push_echo(&chat_id, echo);
+            s.begin_pending_send(&chat_id, &new_message_id, chrono::Utc::now());
+            cx.notify();
+        });
+
+        self.failure = None;
+        self.sending = true;
+        cx.emit(ComposerEvent::Sent {
+            chat_id: chat_id.clone(),
+            message_id: new_message_id.clone(),
+        });
+        cx.notify();
+
+        self.send_task = Some(cx.spawn(async move |this, cx| {
+            let result: Result<(), String> = async {
+                let command = SessionCommandPayload::Edit {
+                    message_id: target_message_id,
+                    new_message_id: new_message_id.clone(),
+                    request: RunRequest {
+                        prompt: text,
+                        harness: resolved.harness,
+                        model: resolved.model.clone(),
+                        reasoning: resolved.reasoning,
+                        model_options: resolved.model_options.clone(),
+                        cwd: existing_cwd,
+                        sandbox,
+                        sandbox_options,
+                        auto_approve: false,
+                        resume: None,
+                        attachments: Vec::new(),
+                        worktree: None,
+                        permission_timeout_ms: None,
+                        mcp: None,
+                        mcp_external: Vec::new(),
+                    },
+                };
+                let command = serde_json::to_value(&command)
+                    .map_err(|e| format!("Edit failed: {e}"))?;
+                let params = serde_json::json!({ "chatId": chat_id, "command": command });
+                engine
+                    .client()
+                    .call(methods::QUEUE_COMMAND, params)
+                    .await
+                    .map_err(|e| format!("Edit failed: {e}"))?;
+                Ok(())
+            }
+            .await;
+
+            this.update(cx, |composer, cx| {
+                composer.sending = false;
+                if let Err(message) = result {
+                    composer.failure = Some(message.into());
+                    composer.state.update(cx, |s, cx| {
+                        s.remove_echo(&err_chat_id, &err_message_id);
+                        s.end_pending_send(&err_chat_id, &err_message_id);
+                        cx.notify();
+                    });
                 }
                 cx.notify();
             })

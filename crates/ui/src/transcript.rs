@@ -1806,8 +1806,9 @@ impl Transcript {
             return;
         }
         if let Some(composer) = self.composer.as_ref() {
+            let row_id = edit.row_id.to_string();
             composer
-                .update(cx, |composer, cx| composer.submit_edit(text, cx))
+                .update(cx, |composer, cx| composer.submit_edit(row_id, text, cx))
                 .ok();
         }
         cx.notify();

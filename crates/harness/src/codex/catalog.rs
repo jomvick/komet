@@ -192,7 +192,8 @@ pub(crate) fn parse_models_cache(value: &serde_json::Value) -> Option<Vec<Model>
 pub(crate) fn parse_model_list_items(items: &[serde_json::Value]) -> Vec<Model> {
     let mut out = Vec::new();
     for m in items {
-        let id = m.get("id")
+        let id = m
+            .get("id")
             .or_else(|| m.get("slug"))
             .or_else(|| m.get("model"))
             .and_then(serde_json::Value::as_str)
@@ -220,7 +221,8 @@ pub(crate) fn parse_model_list_items(items: &[serde_json::Value]) -> Vec<Model> 
             .unwrap_or("");
 
         let mut efforts = Vec::new();
-        let levels_val = m.get("supportedReasoningEfforts")
+        let levels_val = m
+            .get("supportedReasoningEfforts")
             .or_else(|| m.get("supported_reasoning_levels"))
             .or_else(|| m.get("supportedReasoningLevels"))
             .and_then(serde_json::Value::as_array);

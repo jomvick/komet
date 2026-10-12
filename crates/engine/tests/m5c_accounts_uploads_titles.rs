@@ -310,7 +310,10 @@ async fn codex_slot_swap_and_api_key_detection() {
         serde_json::json!({ "OPENAI_API_KEY": "sk-test-12345678abcd" }).to_string(),
     )
     .expect("api key auth");
-    let snapshot = accounts.list(UsageMode::Offline).await.expect("list api key");
+    let snapshot = accounts
+        .list(UsageMode::Offline)
+        .await
+        .expect("list api key");
     let key_account = snapshot
         .accounts
         .iter()

@@ -400,7 +400,10 @@ mod usage_mode_tests {
     #[test]
     fn legacy_flag_maps_true_to_fresh_false_to_offline() {
         assert_eq!(UsageMode::from_params(None, Some(true)), UsageMode::Fresh);
-        assert_eq!(UsageMode::from_params(None, Some(false)), UsageMode::Offline);
+        assert_eq!(
+            UsageMode::from_params(None, Some(false)),
+            UsageMode::Offline
+        );
         // Absent entirely = the historical "not forced" default.
         assert_eq!(UsageMode::from_params(None, None), UsageMode::Offline);
     }
@@ -469,7 +472,11 @@ mod usage_mode_tests {
             let got = accounts
                 .usage_for(HarnessId::ClaudeCode, &slot, true, mode)
                 .await;
-            assert_eq!(got, Some(windows.clone()), "{mode:?} should serve the cache");
+            assert_eq!(
+                got,
+                Some(windows.clone()),
+                "{mode:?} should serve the cache"
+            );
         }
 
         // `Fresh` ignores the warm entry and takes the network path. These
@@ -2632,9 +2639,7 @@ impl AgentAccounts {
         for body in &bodies {
             last = self.query_antigravity_pa_once(endpoint, token, body).await;
             match &last {
-                PaProbe::Windows(_)
-                | PaProbe::Unauthorized
-                | PaProbe::RateLimited => return last,
+                PaProbe::Windows(_) | PaProbe::Unauthorized | PaProbe::RateLimited => return last,
                 PaProbe::Failed | PaProbe::QuotaExhausted => {}
             }
         }
@@ -3262,9 +3267,7 @@ fn cursor_state_db_paths() -> Vec<PathBuf> {
     paths.push(home.join("Library/Application Support/Cursor/User/globalStorage/state.vscdb"));
     #[cfg(target_os = "windows")]
     if let Ok(appdata) = std::env::var("APPDATA") {
-        paths.push(
-            PathBuf::from(appdata).join("Cursor/User/globalStorage/state.vscdb"),
-        );
+        paths.push(PathBuf::from(appdata).join("Cursor/User/globalStorage/state.vscdb"));
     }
     paths
 }
@@ -3292,12 +3295,10 @@ fn read_cursor_sqlite_token(db: &Path) -> Option<String> {
     }
 }
 
-fn read_cursor_sqlite_token_once(
-    db: &Path,
-    flags: rusqlite::OpenFlags,
-) -> Option<String> {
+fn read_cursor_sqlite_token_once(db: &Path, flags: rusqlite::OpenFlags) -> Option<String> {
     let conn = rusqlite::Connection::open_with_flags(db, flags).ok()?;
-    conn.busy_timeout(std::time::Duration::from_millis(0)).ok()?;
+    conn.busy_timeout(std::time::Duration::from_millis(0))
+        .ok()?;
     // Exact keys first (cheap, index-friendly), then a LIKE sweep for
     // build-variant spellings (`WorkosCursorSessionToken`, …).
     for key in [
@@ -3317,9 +3318,7 @@ fn read_cursor_sqlite_token_once(
     let mut stmt = conn
         .prepare("SELECT value FROM ItemTable WHERE key LIKE '%SessionToken%' LIMIT 5")
         .ok()?;
-    let rows = stmt
-        .query_map([], |row| row.get::<_, String>(0))
-        .ok()?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0)).ok()?;
     for value in rows.flatten() {
         if !value.trim().is_empty() {
             return Some(value);
@@ -3427,7 +3426,10 @@ fn listening_ports_lsof(pid: u32) -> Vec<u16> {
             "-n",
         ])
         .output();
-    parse_lsof_listening(&out.map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default())
+    parse_lsof_listening(
+        &out.map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default(),
+    )
 }
 
 /// Pure parser over `lsof -P -n` output: trailing `:port` on loopback lines.
@@ -3677,9 +3679,8 @@ fn parse_cursor_usage_response(body: &serde_json::Value) -> Vec<AgentUsageWindow
             windows.push(AgentUsageWindow {
                 label: format!("{label} Requests"),
                 used_fraction: (count / limit).clamp(0.0, 1.0) as f32,
-                resets_at: parse_when(body.get("resetsAt")).or_else(|| {
-                    parse_when(body.get("resetAt"))
-                }),
+                resets_at: parse_when(body.get("resetsAt"))
+                    .or_else(|| parse_when(body.get("resetAt"))),
             });
         }
     }
@@ -4839,8 +4840,7 @@ mod tests {
             "   2: 00000000:9A61 00000000:0000 0A 00000000:00000000 00:00000000 00000000 0 0 1111 0\n",
             "   3: 0100007F:9A62 00000000:0000 0A 00000000:00000000 00:00000000 00000000 0 0 2222 0\n",
         );
-        let inodes: std::collections::HashSet<String> =
-            ["1111".to_string()].into_iter().collect();
+        let inodes: std::collections::HashSet<String> = ["1111".to_string()].into_iter().collect();
         // 0x9A5F = 39519; established/remote/other-inode lines are dropped.
         assert_eq!(parse_proc_net_tcp_listening(content, &inodes), vec![39519]);
         assert!(parse_proc_net_tcp_listening("garbage", &inodes).is_empty());
@@ -4877,28 +4877,30 @@ mod tests {
 
     #[test]
     fn cursor_sqlite_fixture_and_missing_key() {
-        let dir =
-            std::env::temp_dir().join(format!("komet-cursor-vscdb-{}-{}", std::process::id(), now_ms()));
+        let dir = std::env::temp_dir().join(format!(
+            "komet-cursor-vscdb-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let db = dir.join("state.vscdb");
         {
             let conn = rusqlite::Connection::open(&db).unwrap();
-            conn.execute_batch("CREATE TABLE ItemTable(key TEXT PRIMARY KEY, value TEXT);").unwrap();
+            conn.execute_batch("CREATE TABLE ItemTable(key TEXT PRIMARY KEY, value TEXT);")
+                .unwrap();
             conn.execute(
                 "INSERT INTO ItemTable(key, value) VALUES(?1, ?2)",
                 rusqlite::params!["WorkosCursorSessionToken", "tok-abc"],
             )
             .unwrap();
         }
-        assert_eq!(
-            read_cursor_sqlite_token(&db).as_deref(),
-            Some("tok-abc")
-        );
+        assert_eq!(read_cursor_sqlite_token(&db).as_deref(), Some("tok-abc"));
         // Missing key → unavailable, no panic.
         let empty = dir.join("empty.vscdb");
         {
             let conn = rusqlite::Connection::open(&empty).unwrap();
-            conn.execute_batch("CREATE TABLE ItemTable(key TEXT PRIMARY KEY, value TEXT);").unwrap();
+            conn.execute_batch("CREATE TABLE ItemTable(key TEXT PRIMARY KEY, value TEXT);")
+                .unwrap();
         }
         assert_eq!(read_cursor_sqlite_token(&empty), None);
         // Missing file → unavailable, no panic.
@@ -5117,7 +5119,10 @@ mod tests {
             let _guard = lock(&mutex);
             panic!("intentional poison for lock() test");
         }));
-        assert!(mutex.is_poisoned(), "the mutex must be poisoned for this test");
+        assert!(
+            mutex.is_poisoned(),
+            "the mutex must be poisoned for this test"
+        );
         // L'appel suivant ne doit pas re-paniquer : il logue et récupère.
         *lock(&mutex) = 42;
         assert_eq!(*lock(&mutex), 42);
@@ -5154,9 +5159,12 @@ mod tests {
             .await
             .expect("activate should follow the deduped slot to its survivor");
         assert!(
-            snapshot.accounts.iter().any(|a| a.harness == HarnessId::Cursor
-                && a.email.as_deref() == Some("dup@example.com")
-                && a.active),
+            snapshot
+                .accounts
+                .iter()
+                .any(|a| a.harness == HarnessId::Cursor
+                    && a.email.as_deref() == Some("dup@example.com")
+                    && a.active),
             "survivor identity must remain listed as active: {snapshot:?}"
         );
         let _ = std::fs::remove_dir_all(&root);

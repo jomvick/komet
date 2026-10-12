@@ -1,16 +1,16 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use axum::{
+    Json, Router,
     extract::{
-        ws::{Message, WebSocket},
         Path, State, WebSocketUpgrade,
+        ws::{Message, WebSocket},
     },
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::get,
-    Json, Router,
 };
 use futures_util::{SinkExt, StreamExt};
-use tokio::sync::{broadcast, RwLock};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use tokio::sync::{RwLock, broadcast};
 use tracing::info;
 
 #[derive(Clone)]
@@ -27,7 +27,16 @@ pub struct Room {
 }
 
 fn room_db_path(data_dir: &std::path::Path, room: &str) -> PathBuf {
-    let safe: String = room.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' }).collect();
+    let safe: String = room
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
     data_dir.join("rooms").join(format!("{safe}.db"))
 }
 
@@ -66,12 +75,13 @@ pub fn sync_url_is_insecure(url: &str) -> bool {
         .map(|(h, _)| h)
         .unwrap_or(rest);
     let host = host.rsplit('@').next().unwrap_or(host);
-    let host = host.strip_prefix('[').and_then(|h| h.split_once(']')).map(|(h, _)| h).unwrap_or_else(|| host.split_once(':').map(|(h, _)| h).unwrap_or(host));
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.split_once(']'))
+        .map(|(h, _)| h)
+        .unwrap_or_else(|| host.split_once(':').map(|(h, _)| h).unwrap_or(host));
     let host = host.trim().to_lowercase();
-    !(host.is_empty()
-        || host == "localhost"
-        || host == "127.0.0.1"
-        || host == "::1")
+    !(host.is_empty() || host == "localhost" || host == "127.0.0.1" || host == "::1")
 }
 
 /// Warn when a token would be sent over insecure HTTP. LAN setups can opt
@@ -149,7 +159,6 @@ async fn handle_socket(state: AppState, room: String, socket: WebSocket) {
     };
     let mut rx = tx.subscribe();
     let (mut sender, mut receiver) = socket.split();
-
 
     // replay history
     for frame in history {
