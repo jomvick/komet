@@ -1879,7 +1879,9 @@ impl DocHost {
         });
         let is_message = matches!(
             payload,
-            SessionCommandPayload::Run { .. } | SessionCommandPayload::Steer { .. }
+            SessionCommandPayload::Run { .. }
+                | SessionCommandPayload::Steer { .. }
+                | SessionCommandPayload::Edit { .. }
         );
         handle.doc.queue_command(&SessionCommandEntry {
             id: id.clone(),
@@ -2368,6 +2370,24 @@ impl DocHost {
                 if !resolved {
                     tracing::warn!(chat=%chat_id, request=%request_id, ?decision, "permit received but no pending permission part found");
                 }
+                Ok((SessionCommandStatus::Applied, None))
+            }
+            SessionCommandPayload::Edit {
+                message_id,
+                new_message_id,
+                request,
+            } => {
+                sessions.interrupt(chat_id).await?;
+                sessions.tombstone_harness_session(chat_id);
+                let entries = handle.doc.read_entries()?;
+                if let Some(idx) = entries.iter().position(|e| &e.id == message_id) {
+                    handle.doc.truncate_messages_from(idx)?;
+                }
+                let harness = self.harness_for_request(chat_id, request);
+                sessions
+                    .dispatch(chat_id, harness, request.clone(), Some(new_message_id.clone()))
+                    .await?;
+                handle.publish_messages_if_watched();
                 Ok((SessionCommandStatus::Applied, None))
             }
         }

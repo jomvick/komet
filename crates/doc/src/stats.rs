@@ -57,7 +57,10 @@ mod stats_tests {
 
     #[test]
     fn close_messages_count_the_gap() {
-        let entries = vec![entry_at(MessageRole::User, 0), entry_at(MessageRole::User, 60_000)];
+        let entries = vec![
+            entry_at(MessageRole::User, 0),
+            entry_at(MessageRole::User, 60_000),
+        ];
         assert_eq!(session_active_duration_ms(&entries), 60_000);
     }
 

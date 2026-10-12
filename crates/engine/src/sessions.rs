@@ -30,7 +30,7 @@ use komet_doc::{
 };
 use komet_harness::{CancellationToken, Harness, RunControls, SteerMessage};
 use komet_proto::{
-    AgentEvent, DoneReason, DoneStatus, HarnessId, RunRequest, Session, SessionStatus,
+    AgentEvent, DoneReason, DoneStatus, ErrorKind, HarnessId, RunRequest, Session, SessionStatus,
     UserInputAnswer, UserInputQuestion,
 };
 
@@ -276,6 +276,11 @@ impl SessionsEngine {
         lock(&self.inner.last_requests).get(chat_id).cloned()
     }
 
+    /// Explicitly tombstone the harness session for a chat (e.g. on prompt edit).
+    pub fn tombstone_harness_session(&self, chat_id: &str) {
+        self.inner.remember_harness_session(chat_id, "", "");
+    }
+
     /// IDs assigned to the chat for MCP servers (`ChatConfig.mcp_server_ids`).
     fn mcp_ids_for_chat(&self, chat_id: &str) -> Vec<String> {
         if let Some(host) = self.inner.doc_host()
@@ -334,7 +339,15 @@ impl SessionsEngine {
             Err(err) => {
                 let message = format!("Komet MCP unavailable: {err}");
                 tracing::warn!(chat = %chat_id, error = %err, "internal MCP endpoint failed");
-                self.inner.publish(chat_id, &AgentEvent::Error { message });
+                self.inner.publish(
+                    chat_id,
+                    &AgentEvent::Error {
+                        message,
+                        kind: ErrorKind::Unknown,
+                        detail: None,
+                        retryable: false,
+                    },
+                );
                 None
             }
         }
@@ -438,6 +451,9 @@ impl SessionsEngine {
                 chat_id,
                 &AgentEvent::Error {
                     message: message.clone(),
+                    kind: ErrorKind::Unknown,
+                    detail: None,
+                    retryable: false,
                 },
             );
             self.inner.publish(
@@ -481,6 +497,9 @@ impl SessionsEngine {
                 chat_id,
                 &komet_proto::AgentEvent::Error {
                     message: message.clone(),
+                    kind: komet_proto::ErrorKind::Unknown,
+                    detail: None,
+                    retryable: false,
                 },
             );
             self.inner.publish(
@@ -510,6 +529,9 @@ impl SessionsEngine {
                     chat_id,
                     &AgentEvent::Error {
                         message: message.clone(),
+                        kind: ErrorKind::Unknown,
+                        detail: None,
+                        retryable: false,
                     },
                 );
                 self.inner.publish(
@@ -1544,6 +1566,9 @@ async fn drive_run(
                 &chat_id,
                 &AgentEvent::Error {
                     message: message.clone(),
+                    kind: ErrorKind::Unknown,
+                    detail: None,
+                    retryable: false,
                 },
             );
             inner.publish(

@@ -744,28 +744,26 @@ impl Engine {
             )?,
         };
         core.set_auth(auth.clone());
-        if edge_enabled {
-            // Release checker: polls the GitHub releases on a 6h cadence;
-            // headless installs with KOMET_AUTO_UPDATE=1 apply + restart
-            // themselves — gated on quiescence so a restart never lands under
-            // a live run or open PTY.
-            let quiescent: komet_update::QuiescentCheck = {
-                let sessions = core.sessions.clone();
-                let terminals = core.terminals.clone();
-                Arc::new(move || !sessions.any_active() && !terminals.any_open())
-            };
-            let updater = komet_update::Updater::spawn(Some(quiescent));
-            if let Some(mut token_changes) = edge.as_ref().and_then(EdgeConfig::token_changes) {
-                let updater_for_tokens = updater.clone();
-                let wake = tokio::spawn(async move {
-                    while token_changes.changed().await.is_ok() {
-                        updater_for_tokens.check_now();
-                    }
-                });
-                core.set_updater_wake(wake);
-            }
-            core.set_updater(updater);
+        // Release checker: polls the GitHub releases on a 6h cadence;
+        // headless installs with KOMET_AUTO_UPDATE=1 apply + restart
+        // themselves — gated on quiescence so a restart never lands under
+        // a live run or open PTY.
+        let quiescent: komet_update::QuiescentCheck = {
+            let sessions = core.sessions.clone();
+            let terminals = core.terminals.clone();
+            Arc::new(move || !sessions.any_active() && !terminals.any_open())
+        };
+        let updater = komet_update::Updater::spawn(Some(quiescent));
+        if let Some(mut token_changes) = edge.as_ref().and_then(EdgeConfig::token_changes) {
+            let updater_for_tokens = updater.clone();
+            let wake = tokio::spawn(async move {
+                while token_changes.changed().await.is_ok() {
+                    updater_for_tokens.check_now();
+                }
+            });
+            core.set_updater_wake(wake);
         }
+        core.set_updater(updater);
         tracing::info!(device_id = %core.device_id, "engine core assembled");
         // Managed ACP adapters are NOT pre-installed at boot: installing them
         // fetches from the npm registry, which would break the app's

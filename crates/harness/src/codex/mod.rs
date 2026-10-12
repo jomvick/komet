@@ -60,7 +60,7 @@ use komet_proto::{
 };
 
 use crate::jsonrpc::{Incoming, RpcClient};
-use crate::{Harness, HarnessError, RunControls};
+use crate::{Harness, HarnessError, RunControls, errors::typed_error};
 use catalog::REASONING_LEVELS;
 use normalize::{
     ChildRoute, Phase, compacted_event, delta_text, item_id, item_type, map_item,
@@ -740,11 +740,19 @@ async fn run_session(session: Session) {
             res = setup => match res {
                 Ok(thread_id) => thread_id,
                 Err(e) => {
+                    let message = e.to_string();
+                    let _ = event_tx
+                        .send(Ok(typed_error(
+                            message.clone(),
+                            None,
+                            crate::errors::tail_detail(stderr_tail.snapshot()),
+                        )))
+                        .await;
                     let _ = event_tx
                         .send(Ok(AgentEvent::Done {
                             status: DoneStatus::Errored,
                             result: None,
-                            error: Some(e.to_string()),
+                            error: Some(message),
                             session_id: None,
     reason: None,
                         }))
@@ -818,11 +826,19 @@ async fn run_session(session: Session) {
     match start_turn(&client, turn_params(&request.prompt)).await {
         Ok(id) => router.adopt_started(id),
         Err(e) => {
+            let message = e.to_string();
+            let _ = event_tx
+                .send(Ok(typed_error(
+                    message.clone(),
+                    None,
+                    crate::errors::tail_detail(stderr_tail.snapshot()),
+                )))
+                .await;
             let _ = event_tx
                 .send(Ok(AgentEvent::Done {
                     status: DoneStatus::Errored,
                     result: None,
-                    error: Some(e.to_string()),
+                    error: Some(message),
                     session_id: Some(thread_id.clone()),
                     reason: None,
                 }))
@@ -907,13 +923,21 @@ async fn run_session(session: Session) {
                                                 session_id: Some(nthread.clone()),
         reason: None,
                                             }],
-                                            "turn/failed" => vec![AgentEvent::Done {
-                                                status: DoneStatus::Errored,
-                                                result: None,
-                                                error: turn_error_message(&params),
-                                                session_id: Some(nthread.clone()),
-        reason: None,
-                                            }],
+                                            "turn/failed" => {
+                                                let message = turn_error_message(&params);
+                                                let mut evs = Vec::new();
+                                                if let Some(msg) = &message {
+                                                    evs.push(typed_error(msg.clone(), None, None));
+                                                }
+                                                evs.push(AgentEvent::Done {
+                                                    status: DoneStatus::Errored,
+                                                    result: None,
+                                                    error: message,
+                                                    session_id: Some(nthread.clone()),
+            reason: None,
+                                                });
+                                                evs
+                                            }
                                             "turn/aborted" => vec![AgentEvent::Done {
                                                 status: DoneStatus::Interrupted,
                                                 result: None,
@@ -973,16 +997,17 @@ async fn run_session(session: Session) {
                                                     map_item(phase, &item)
                                                 }
                                             }
-                                            "error" => vec![AgentEvent::Error {
-                                                message: params
+                                            "error" => {
+                                                let message = params
                                                     .pointer("/error/message")
                                                     .and_then(Value::as_str)
                                                     .or_else(|| {
                                                         params.get("message").and_then(Value::as_str)
                                                     })
                                                     .unwrap_or("Codex subagent error")
-                                                    .to_owned(),
-                                            }],
+                                                    .to_owned();
+                                                vec![typed_error(message, None, None)]
+                                            }
                                             "thread/closed" => vec![AgentEvent::Done {
                                                 status: DoneStatus::Completed,
                                                 result: None,
@@ -1155,6 +1180,19 @@ async fn run_session(session: Session) {
                                     DoneStatus::Completed
                                 };
                                 done_current = true;
+                                if status == DoneStatus::Errored
+                                    && let Some(msg) = &error
+                                {
+                                    let _ = send(
+                                        &event_tx,
+                                        typed_error(
+                                            msg.clone(),
+                                            None,
+                                            crate::errors::tail_detail(stderr_tail.snapshot()),
+                                        ),
+                                    )
+                                    .await;
+                                }
                                 if !send(
                                     &event_tx,
                                     AgentEvent::Done {
@@ -1205,6 +1243,17 @@ async fn run_session(session: Session) {
                                 if interrupted {
                                     done_after_interrupt = true;
                                 }
+                                let failed_message = turn_error_message(&params)
+                                    .unwrap_or_else(|| "Codex turn failed".into());
+                                let _ = send(
+                                    &event_tx,
+                                    typed_error(
+                                        failed_message.clone(),
+                                        None,
+                                        crate::errors::tail_detail(stderr_tail.snapshot()),
+                                    ),
+                                )
+                                .await;
                                 let _ = send(
                                     &event_tx,
                                     AgentEvent::Done {
@@ -1214,10 +1263,7 @@ async fn run_session(session: Session) {
                                             DoneStatus::Errored
                                         },
                                         result: None,
-                                        error: Some(
-                                            turn_error_message(&params)
-                                                .unwrap_or_else(|| "Codex turn failed".into()),
-                                        ),
+                                        error: Some(failed_message),
                                         session_id: Some(thread_id.clone()),
         reason: None,
                                     },
@@ -1255,7 +1301,7 @@ async fn run_session(session: Session) {
                                     .or_else(|| params.get("message").and_then(Value::as_str))
                                     .unwrap_or("Codex error")
                                     .to_owned();
-                                if !send(&event_tx, AgentEvent::Error { message }).await {
+                                if !send(&event_tx, typed_error(message, None, None)).await {
                                     break 'main;
                                 }
                             }
@@ -1415,15 +1461,21 @@ async fn run_session(session: Session) {
             // must not read as a silent success — codex.ts's signal-death
             // handling, reduced to the turn-in-flight case.
             let status = child.try_wait().ok().flatten();
+            let crash = crate::crash_message("codex app-server", status, &stderr_tail);
+            let _ = send(
+                &event_tx,
+                typed_error(
+                    crash.clone(),
+                    None,
+                    crate::errors::tail_detail(stderr_tail.snapshot()),
+                ),
+            )
+            .await;
             let _ = event_tx
                 .send(Ok(AgentEvent::Done {
                     status: DoneStatus::Errored,
                     result: None,
-                    error: Some(crate::crash_message(
-                        "codex app-server",
-                        status,
-                        &stderr_tail,
-                    )),
+                    error: Some(crash),
                     session_id: Some(thread_id.clone()),
                     reason: None,
                 }))
@@ -1465,9 +1517,7 @@ async fn steer_as_new_turn(
         Err(e) => {
             let _ = send(
                 event_tx,
-                AgentEvent::Error {
-                    message: format!("Steering failed: {e}"),
-                },
+                typed_error(format!("Steering failed: {e}"), None, None),
             )
             .await;
             false

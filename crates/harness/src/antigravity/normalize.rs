@@ -1,4 +1,4 @@
-use komet_proto::{AgentEvent, ToolCall, TodoItem, UserInputQuestion};
+use komet_proto::{AgentEvent, TodoItem, ToolCall, UserInputQuestion};
 use serde_json::Value;
 
 pub fn normalize_line(line: &str) -> Option<AgentEvent> {

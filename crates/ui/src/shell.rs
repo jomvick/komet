@@ -54,7 +54,9 @@ use crate::state::{
 };
 use crate::terminal::panel::{TerminalPanel, ToggleTerminal, clamp_terminal_height};
 use crate::theme::Theme;
-use crate::transcript::{self, Transcript};
+use crate::transcript::{
+    self, ErrorOpenAccounts, ErrorOpenModelPicker, ErrorRetryTurn, Transcript,
+};
 
 /// Wider floor for the right pane while it shows the Files+FileEditor split
 /// (tree column + content column side by side) — below this the content
@@ -7186,6 +7188,27 @@ impl Render for Shell {
                 } else {
                     this.open_add_space(cx);
                 }
+            }))
+            // Error-chip actions (transcript rows): Auth opens the Accounts
+            // settings section, Billing/ModelUnavailable opens the model
+            // picker, and Réessayer resubmits the last prompt verbatim.
+            .on_action(cx.listener(|this, _: &ErrorOpenAccounts, _, cx| {
+                this.open_settings(SettingsSection::Agents, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ErrorOpenModelPicker, window, cx| {
+                let composer = this.composer.clone();
+                composer.update(cx, |composer, cx| {
+                    let pickers = composer.pickers().clone();
+                    pickers.update(cx, |pickers, cx| {
+                        pickers.open_model_menu(window, cx);
+                    });
+                });
+            }))
+            .on_action(cx.listener(|this, _: &ErrorRetryTurn, _, cx| {
+                let composer = this.composer.clone();
+                composer.update(cx, |composer, cx| {
+                    composer.resubmit_last(cx);
+                });
             }));
 
         let render_gate = if restart_required {

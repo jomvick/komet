@@ -15,12 +15,20 @@ pub fn render_sync_settings(cx: &mut gpui::Context<crate::shell::Shell>) -> AnyE
     };
     let insecure = std::env::var("KOMET_EDGE_URL").ok().is_some_and(|u| {
         let u = u.trim();
-        let Some(rest) = u.split_once("://").filter(|(s, _)| s.eq_ignore_ascii_case("http")).map(|(_, r)| r) else {
+        let Some(rest) = u
+            .split_once("://")
+            .filter(|(s, _)| s.eq_ignore_ascii_case("http"))
+            .map(|(_, r)| r)
+        else {
             return false;
         };
         let host = rest.split(['/', '?', '#']).next().unwrap_or(rest);
         let host = host.rsplit('@').next().unwrap_or(host);
-        let host = host.strip_prefix('[').and_then(|h| h.split_once(']')).map(|(h, _)| h).unwrap_or_else(|| host.split_once(':').map(|(h, _)| h).unwrap_or(host));
+        let host = host
+            .strip_prefix('[')
+            .and_then(|h| h.split_once(']'))
+            .map(|(h, _)| h)
+            .unwrap_or_else(|| host.split_once(':').map(|(h, _)| h).unwrap_or(host));
         let host = host.trim().to_lowercase();
         !(host.is_empty() || host == "localhost" || host == "127.0.0.1" || host == "::1")
     });

@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 use gpui::{
     AnyElement, App, BorderStyle, ClipboardItem, Context, Entity, Focusable as _, ListAlignment,
     ListOffset, ListScrollEvent, ListState, MouseButton, ObjectFit, SharedString, StyledImage as _,
-    StyledText, Subscription, Task, TextRun, WeakEntity, Window, canvas, div, img, list,
+    StyledText, Subscription, Task, TextRun, WeakEntity, Window, actions, canvas, div, img, list,
     prelude::*, px, quad,
 };
 
@@ -540,8 +540,18 @@ pub enum RowKind {
     },
     ErrorChip {
         message: SharedString,
+        kind: komet_proto::ErrorKind,
+        detail: Option<String>,
+        retryable: bool,
     },
 }
+
+// Window actions dispatched by an error chip's action button; handled by
+// the shell (it owns the settings outlet, the composer, and the pickers).
+actions!(
+    transcript,
+    [ErrorOpenAccounts, ErrorOpenModelPicker, ErrorRetryTurn]
+);
 
 /// A transcript row: stable id + content version (diff key) + block payload.
 #[derive(Clone)]
@@ -890,14 +900,27 @@ pub fn rows_for_entry(
                     MessagePart::Error {
                         id: part_id,
                         message,
+                        kind,
+                        detail,
+                        retryable,
                     } => {
+                        // Version covers the typed fields: a kind/detail
+                        // arriving late (re-fold) re-renders the chip.
+                        let mut version = message.len() as u64;
+                        version = version.wrapping_mul(31).wrapping_add(*retryable as u64);
+                        if let Some(detail) = detail {
+                            version = version.wrapping_mul(31).wrapping_add(detail.len() as u64);
+                        }
                         rows.push(Row {
                             id: format!("{}#{}", entry.id, part_id).into(),
-                            version: message.len() as u64,
+                            version,
                             turn_start: false,
                             kind: RowKind::ErrorChip {
                                 // Harness-generated; the chip is one line.
                                 message: single_line(message).into(),
+                                kind: *kind,
+                                detail: detail.clone(),
+                                retryable: *retryable,
                             },
                             entry_id: entry_id.clone(),
                             timestamp: None,
@@ -1505,6 +1528,9 @@ pub struct Transcript {
     /// group fold. Render-local like `folds` — never part of the row
     /// fingerprint.
     tool_details: HashMap<SharedString, FoldState>,
+    /// Expanded « Détails » bodies on error chips, keyed by row id.
+    /// Render-local like `tool_details` — never part of the row fingerprint.
+    error_details: std::collections::HashSet<SharedString>,
     /// Streaming fade veils, one per live markdown row (dropped on completion).
     veils: HashMap<SharedString, Rc<RefCell<RowVeil>>>,
     /// Live rows present in the transcript's REPLAY after (re)attaching to a
@@ -1683,6 +1709,7 @@ impl Transcript {
             tree_cache: HashMap::new(),
             folds: HashMap::new(),
             tool_details: HashMap::new(),
+            error_details: std::collections::HashSet::new(),
             veils: HashMap::new(),
             veil_baseline: std::collections::HashSet::new(),
             veil_attach_pending: true,
@@ -1779,8 +1806,9 @@ impl Transcript {
             return;
         }
         if let Some(composer) = self.composer.as_ref() {
+            let row_id = edit.row_id.to_string();
             composer
-                .update(cx, |composer, cx| composer.submit_edit(text, cx))
+                .update(cx, |composer, cx| composer.submit_edit(row_id, text, cx))
                 .ok();
         }
         cx.notify();
@@ -3471,7 +3499,12 @@ impl Transcript {
             RowKind::InputChip { header, resolved } => {
                 input_chip(header.clone(), *resolved, &theme)
             }
-            RowKind::ErrorChip { message } => error_chip(message.clone(), &theme),
+            RowKind::ErrorChip {
+                message,
+                kind,
+                detail,
+                retryable,
+            } => self.render_error_chip(&row.id, message, kind, detail, *retryable, &theme, cx),
         };
 
         // Hover-revealed timestamp strip (komet chat-view.tsx `Timestamp`):
@@ -4436,6 +4469,136 @@ fn user_bubble_text(
         .child(underlay)
         .child(styled)
         .into_any_element()
+}
+
+/// One action an error chip offers, decided by [`error_action`].
+#[derive(Clone, Copy)]
+enum ErrorUiAction {
+    Accounts,
+    ModelPicker,
+    Retry,
+    CopyLogs,
+}
+
+/// Exactly one action per error kind (spec): Auth → Comptes,
+/// Billing/ModelUnavailable → model picker, CliCrash → copy the logs, and
+/// Réessayer whenever the error is retryable (RateLimit/Overloaded/Network
+/// by construction, plus Timeout and the generic empty-turn guard).
+/// Anything else renders no button — Details alone.
+fn error_action(
+    kind: &komet_proto::ErrorKind,
+    retryable: bool,
+) -> Option<(&'static str, ErrorUiAction)> {
+    use komet_proto::ErrorKind as K;
+    match kind {
+        K::Auth => Some(("Comptes", ErrorUiAction::Accounts)),
+        K::Billing | K::ModelUnavailable => Some(("Changer de modèle", ErrorUiAction::ModelPicker)),
+        K::CliCrash => Some(("Copier les logs", ErrorUiAction::CopyLogs)),
+        _ if retryable => Some(("Réessayer", ErrorUiAction::Retry)),
+        _ => None,
+    }
+}
+
+impl Transcript {
+    /// Error chip with a « Détails » toggle (raw CLI text) and the kind's
+    /// action button. Navigation/retry actions dispatch window actions the
+    /// shell handles (it owns settings, composer, and pickers); copy runs
+    /// inline. Unknown kinds without detail render today's plain chip.
+    #[allow(clippy::too_many_arguments)]
+    fn render_error_chip(
+        &mut self,
+        row_id: &SharedString,
+        message: &SharedString,
+        kind: &komet_proto::ErrorKind,
+        detail: &Option<String>,
+        retryable: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let detail_text = detail.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let expanded = self.error_details.contains(row_id);
+        let action = error_action(kind, retryable);
+
+        let mut card = div()
+            .py(px(4.0))
+            .w_full()
+            .child(error_chip(message.clone(), theme));
+
+        if detail_text.is_some() || action.is_some() {
+            let mut bar = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(12.0))
+                .px(px(10.0))
+                .pt(px(4.0));
+            if detail_text.is_some() {
+                let key = row_id.clone();
+                let label: SharedString = (if expanded { "Masquer" } else { "Détails" }).into();
+                bar = bar.child(
+                    div()
+                        .id(SharedString::from(format!("error-details-{key}")))
+                        .cursor_pointer()
+                        .text_size(px(12.0))
+                        .text_color(theme.text_muted)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if !this.error_details.remove(&key) {
+                                this.error_details.insert(key.clone());
+                            }
+                            cx.notify();
+                        }))
+                        .child(label),
+                );
+            }
+            if let Some((label, act)) = action {
+                let copy_text = format!("{message}\n{}", detail_text.unwrap_or(""));
+                bar = bar.child(
+                    div()
+                        .id(SharedString::from(format!("error-action-{row_id}")))
+                        .cursor_pointer()
+                        .text_size(px(12.0))
+                        .text_color(theme.text_muted)
+                        .on_click(move |_, window: &mut Window, cx: &mut App| {
+                            cx.stop_propagation();
+                            match act {
+                                ErrorUiAction::CopyLogs => {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        copy_text.clone(),
+                                    ));
+                                }
+                                ErrorUiAction::Accounts => {
+                                    window.dispatch_action(Box::new(ErrorOpenAccounts), cx);
+                                }
+                                ErrorUiAction::ModelPicker => {
+                                    window.dispatch_action(Box::new(ErrorOpenModelPicker), cx);
+                                }
+                                ErrorUiAction::Retry => {
+                                    window.dispatch_action(Box::new(ErrorRetryTurn), cx);
+                                }
+                            }
+                        })
+                        .child(SharedString::from(label)),
+                );
+            }
+            card = card.child(bar);
+        }
+
+        if expanded && let Some(raw) = detail_text {
+            card = card.child(
+                div()
+                    .mx(px(10.0))
+                    .mt(px(4.0))
+                    .rounded(px(6.0))
+                    .bg(crate::theme::ink(0.04))
+                    .px(px(8.0))
+                    .py(px(6.0))
+                    .text_size(px(12.0))
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from(raw.to_owned())),
+            );
+        }
+        card.into_any_element()
+    }
 }
 
 /// The transcript ErrorChip — a port of komet chat-view.tsx `ErrorChip`

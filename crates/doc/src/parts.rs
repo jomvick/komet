@@ -5,7 +5,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use komet_proto::{AgentEvent, SUBAGENT_MODEL_KEYS, ToolCall, ToolDiff, UserInputQuestion};
+use komet_proto::{
+    AgentEvent, ErrorKind, SUBAGENT_MODEL_KEYS, ToolCall, ToolDiff, UserInputQuestion,
+};
 
 use crate::constants::MSG_INLINE_MAX;
 
@@ -192,6 +194,20 @@ pub enum MessagePart {
     Error {
         id: String,
         message: String,
+        /// Typed class of the failure; `Unknown` on old rows. Renamed on the
+        /// wire: the enum's internal serde tag already occupies `kind`.
+        #[serde(
+            default,
+            skip_serializing_if = "ErrorKind::is_unknown",
+            rename = "errorKind"
+        )]
+        kind: ErrorKind,
+        /// Raw CLI text / stderr tail backing the Details view.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+        /// Whether the UI offers a retry action.
+        #[serde(default)]
+        retryable: bool,
     },
     #[serde(rename_all = "camelCase")]
     Permission {
@@ -343,8 +359,17 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                     // host's run journal. Inline diffs die the same way:
                     // stats only, never text. `is_error` still folds so
                     // failed chips read as failed.
+                    //
+                    // Exception: a FAILED tool keeps a 160-char summary of
+                    // its output ([`summarize_tool_output`]) so the failure
+                    // is diagnosable from the transcript; success outputs
+                    // stay journal-only even when the event carries them.
                     let _ = output; // journal-only
-                    *out_slot = None;
+                    *out_slot = if *is_error {
+                        output.as_deref().and_then(summarize_tool_output)
+                    } else {
+                        None
+                    };
                     *output_bytes = None;
                     *diff_slot = None;
                     *diff_stats = diff.as_ref().map(|d| vec![diff_stat(d)]);
@@ -378,20 +403,38 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
                 }
             }
         }
-        AgentEvent::Error { message } => {
+        AgentEvent::Error {
+            message,
+            kind,
+            detail,
+            retryable,
+        } => {
             let id = format!("e{}", out.len());
             out.push(MessagePart::Error {
                 id,
                 message: message.clone(),
+                kind: *kind,
+                detail: detail.clone(),
+                retryable: *retryable,
             });
         }
         AgentEvent::Done { error, .. } => {
             if let Some(message) = error {
-                let id = format!("e{}", out.len());
-                out.push(MessagePart::Error {
-                    id,
-                    message: message.clone(),
-                });
+                // Terminal failures are announced by a typed Error event just
+                // before the Done (same message, kind + stderr detail); the
+                // Done then adds nothing — skip it so the transcript shows a
+                // single detailed part instead of two chips.
+                let dup = matches!(out.last(), Some(MessagePart::Error { message: m, .. }) if m == message);
+                if !dup {
+                    let id = format!("e{}", out.len());
+                    out.push(MessagePart::Error {
+                        id,
+                        message: message.clone(),
+                        kind: ErrorKind::Unknown,
+                        detail: None,
+                        retryable: false,
+                    });
+                }
             }
         }
         // Subagent-attributed CONTENT belongs to the subagent's own doc (the
@@ -669,6 +712,40 @@ pub fn join_continuations(entries: Vec<Vec<MessagePart>>) -> Vec<MessagePart> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn done_errored_after_identical_error_keeps_single_detailed_part() {
+        let mut out = Vec::new();
+        fold_event_into_parts(
+            &mut out,
+            &AgentEvent::Error {
+                message: "boom".into(),
+                kind: ErrorKind::Timeout,
+                detail: Some("tail".into()),
+                retryable: true,
+            },
+        );
+        fold_event_into_parts(
+            &mut out,
+            &AgentEvent::Done {
+                status: komet_proto::DoneStatus::Errored,
+                result: None,
+                error: Some("boom".into()),
+                session_id: None,
+                reason: None,
+            },
+        );
+        assert_eq!(
+            out.len(),
+            1,
+            "identical Done error must not duplicate the part: {out:?}"
+        );
+        assert!(
+            matches!(&out[0], MessagePart::Error { detail: Some(d), .. } if d == "tail"),
+            "the surviving part keeps the stderr detail: {:?}",
+            out[0]
+        );
+    }
 
     fn text_delta(s: &str) -> AgentEvent {
         AgentEvent::TextDelta { text: s.into() }
@@ -991,6 +1068,61 @@ mod tests {
             new_text: "one\ntwo\n".into(),
         });
         assert_eq!((stat.additions, stat.deletions), (2, 0));
+    }
+
+    #[test]
+    fn error_tool_result_keeps_160_summary_only() {
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ToolCall {
+                id: "t".into(),
+                call: ToolCall::Exec {
+                    command: "ls".into(),
+                },
+            },
+        );
+        let long = "y".repeat(200);
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ToolResult {
+                id: "t".into(),
+                is_error: true,
+                output: Some(long),
+                diff: None,
+            },
+        );
+        let summary = parts.iter().find_map(|p| match p {
+            MessagePart::Tool { output, .. } => output.clone(),
+            _ => None,
+        });
+        assert_eq!(summary, Some(format!("{}…", "y".repeat(160))));
+
+        // ... while a successful result with output persists no summary.
+        let mut parts = Vec::new();
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ToolCall {
+                id: "u".into(),
+                call: ToolCall::Exec {
+                    command: "ls".into(),
+                },
+            },
+        );
+        fold_event_into_parts(
+            &mut parts,
+            &AgentEvent::ToolResult {
+                id: "u".into(),
+                is_error: false,
+                output: Some("y".repeat(200)),
+                diff: None,
+            },
+        );
+        let summary = parts.iter().find_map(|p| match p {
+            MessagePart::Tool { output, .. } => output.clone(),
+            _ => None,
+        });
+        assert_eq!(summary, None);
     }
 
     #[test]

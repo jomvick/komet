@@ -980,9 +980,10 @@ impl Actor {
             }
             frame_type::PROBE_OK => {
                 if let Ok(probe) = serde_json::from_value::<wire::ProbeOkHeader>(frame.header)
-                    && let Some(server) = &mut lock(&self.shared).server {
-                        server.head_seq = server.head_seq.max(probe.head_seq);
-                    }
+                    && let Some(server) = &mut lock(&self.shared).server
+                {
+                    server.head_seq = server.head_seq.max(probe.head_seq);
+                }
             }
             frame_type::STATE => {
                 // Late duplicate of a hello answer — refresh the server view.
