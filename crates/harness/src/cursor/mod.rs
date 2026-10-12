@@ -252,26 +252,33 @@ impl Harness for CursorHarness {
     /// `cursor-agent --list-models`, then the SDK list. Both probes are live;
     /// a failed probe errors (no static fallback) so the picker only shows
     /// models the account actually offers. A failed probe is UNCACHED so the
-    /// next picker open retries.
+    /// next picker open retries. When both probes fail, the error names both
+    /// wire reasons.
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         if let Some(models) = self.models_cache.get() {
             return Ok(models.clone());
         }
-        if let Ok(models) = self.discover_cli_models().await
-            && !models.is_empty()
-        {
-            let _ = self.models_cache.set(models.clone());
-            return Ok(models);
-        }
+        let cli_err = match self.discover_cli_models().await {
+            Ok(models) if !models.is_empty() => {
+                let _ = self.models_cache.set(models.clone());
+                return Ok(models);
+            }
+            Ok(_) => HarnessError::Protocol(
+                "cursor-agent --list-models returned no usable models".into(),
+            ),
+            Err(e) => e,
+        };
         match self.discover_sdk_models().await {
             Ok(models) if !models.is_empty() => {
                 let _ = self.models_cache.set(models.clone());
                 Ok(models)
             }
-            Ok(_) => Err(HarnessError::Protocol(
-                "cursor models probe returned no usable models".into(),
-            )),
-            Err(e) => Err(e),
+            Ok(_) => Err(HarnessError::Protocol(format!(
+                "cursor probe failed — cli: {cli_err}; sdk: cursor models probe returned no usable models"
+            ))),
+            Err(sdk_err) => Err(HarnessError::Protocol(format!(
+                "cursor probe failed — cli: {cli_err}; sdk: {sdk_err}"
+            ))),
         }
     }
 

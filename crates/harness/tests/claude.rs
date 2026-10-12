@@ -755,6 +755,45 @@ async fn models_errors_on_failed_discovery() {
     assert!(!err.to_string().is_empty());
 }
 
+#[tokio::test]
+async fn models_concurrent_probes_share_one_spawn() {
+    // Single-flight regression: N concurrent models() calls must spawn the
+    // CLI exactly once — waiters read the fresh cache. The counting wrapper
+    // logs every spawn to a temp file, then delegates to the happy-path fake.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let count_file = dir.path().join("probes.log");
+    let wrapper = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("fake-claude-counting.sh");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755));
+    }
+    unsafe {
+        std::env::set_var("KOMET_CLAUDE_PROBE_COUNT", &count_file);
+    }
+    let harness = Arc::new(ClaudeHarness::new().with_executable(wrapper));
+    let results = futures::future::join_all((0..8).map(|_| {
+        let harness = Arc::clone(&harness);
+        tokio::spawn(async move { harness.models().await })
+    }))
+    .await;
+    unsafe {
+        std::env::remove_var("KOMET_CLAUDE_PROBE_COUNT");
+    }
+    for task in &results {
+        let models = task.as_ref().expect("task").as_ref().expect("models");
+        assert_eq!(models.len(), 3, "live discovery result: {models:?}");
+    }
+    let spawns = std::fs::read_to_string(&count_file)
+        .expect("count file")
+        .lines()
+        .count();
+    assert_eq!(spawns, 1, "concurrent models() must share one probe spawn");
+}
+
 /// Live smoke against the real CLI: `cargo test -p komet-harness --test
 /// claude -- --ignored live_commands`. No model turn, no API cost.
 #[tokio::test]

@@ -129,6 +129,10 @@ pub struct ClaudeHarness {
     commands: tokio::sync::OnceCell<Vec<SlashCommand>>,
     /// Model discovery cache: live probe cached on success.
     models: tokio::sync::Mutex<Option<(std::time::Instant, Vec<Model>)>>,
+    /// Single-flight for model probes: held across cache-check + probe +
+    /// store, so concurrent `models()` calls share one CLI spawn — waiters
+    /// then read the fresh cache instead of spawning their own.
+    models_probe: tokio::sync::Mutex<()>,
 }
 
 impl Default for ClaudeHarness {
@@ -139,6 +143,7 @@ impl Default for ClaudeHarness {
             kill_grace: Duration::from_secs(3),
             commands: tokio::sync::OnceCell::new(),
             models: tokio::sync::Mutex::new(None),
+            models_probe: tokio::sync::Mutex::new(()),
         }
     }
 }
@@ -769,8 +774,10 @@ impl Harness for ClaudeHarness {
     /// Live model discovery via control-channel probe. Errors propagate —
     /// no static fallback, so the picker only shows models the CLI offers.
     /// A failed probe is UNCACHED so the next picker open retries.
+    /// Concurrent calls share one probe (single-flight via `models_probe`).
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         self.resolve_executable()?;
+        let _probe = self.models_probe.lock().await;
         {
             let guard = self.models.lock().await;
             if let Some((at, models)) = guard.as_ref() {
@@ -785,6 +792,11 @@ impl Harness for ClaudeHarness {
                 "Claude live model discovery failed: {e}"
             );
         })?;
+        if models.is_empty() {
+            return Err(HarnessError::Protocol(
+                "claude supported_models returned no usable models".into(),
+            ));
+        }
         tracing::info!(
             target: "komet_harness::claude",
             count = models.len(),
