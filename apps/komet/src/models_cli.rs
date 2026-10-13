@@ -447,11 +447,12 @@ fn print_row(cols: &[&str], widths: &[usize], is_tty: bool, is_header: bool) {
             line.push_str("  ");
         }
         let width = widths[i];
-        let truncated = if col.len() > width {
+        let truncated = if col.chars().count() > width {
             if width > 3 {
-                format!("{}...", &col[..width - 3])
+                let head: String = col.chars().take(width - 3).collect();
+                format!("{head}...")
             } else {
-                col[..width].to_string()
+                col.chars().take(width).collect()
             }
         } else {
             col.to_string()
