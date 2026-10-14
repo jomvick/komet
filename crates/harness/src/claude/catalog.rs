@@ -194,7 +194,7 @@ pub(crate) fn supports_xhigh(model: &str) -> bool {
         model,
         &[
             "fable-5", "opus-4-7", "opus-4-8", "opus-4-9", "opus-5", "opus-6", "opus-7", "opus-8",
-            "opus-9", "sonnet-5", "sonnet-6", "sonnet-7", "sonnet-8", "sonnet-9",
+            "opus-9", "sonnet-5", "sonnet-6", "sonnet-7", "sonnet-8", "sonnet-9", "3-7-sonnet",
         ],
     )
 }
@@ -313,24 +313,79 @@ fn model(
     }
 }
 
-/// The curated model list, mirroring claude.ts's `claudeEffortsFor` /
-/// `claudeOptionsFor` ladders: full ladder (through ultracode/ultrathink) on
-/// Fable 5, `max`-topped ladders on Opus/Sonnet, no efforts but a thinking
-/// toggle on Haiku; context-window select on the long-context families and
-/// fast mode on Opus 4.5+.
-///
-/// `pub`: besides the discovery-side enrichment here, the UI's display-side
-/// normalization borrows these labels so alias rows served by older engines
-/// still read with their version numbers ("Opus 5", not "Opus").
+/// Read models configured in Claude CLI settings files (~/.claude/settings.json, ~/.claude/settings.local.json)
+/// and environment variables (ANTHROPIC_MODEL, etc.), mirroring Paseo's `getClaudeModelsWithSettings`.
+pub fn read_claude_settings_models() -> Vec<Model> {
+    let mut custom = Vec::new();
+
+    // Check ANTHROPIC_MODEL env var
+    if let Ok(env_model) = std::env::var("ANTHROPIC_MODEL") {
+        let trimmed = env_model.trim();
+        if !trimmed.is_empty() {
+            custom.push(model(
+                trimmed,
+                trimmed,
+                "From environment ANTHROPIC_MODEL",
+                FULL_LADDER,
+                vec![context_window()],
+            ));
+        }
+    }
+
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from);
+
+    if let Some(home) = home {
+        let claude_dir = home.join(".claude");
+        for settings_name in ["settings.json", "settings.local.json"] {
+            let path = claude_dir.join(settings_name);
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+                    if let Some(model_str) = val.get("model").and_then(|v| v.as_str()) {
+                        let m = model_str.trim();
+                        if !m.is_empty() && !custom.iter().any(|c| c.id == m) {
+                            custom.push(model(
+                                m,
+                                m,
+                                &format!("Configured in ~/.claude/{settings_name}"),
+                                FULL_LADDER,
+                                vec![context_window()],
+                            ));
+                        }
+                    }
+                    if let Some(env_obj) = val.get("env").and_then(|v| v.as_object()) {
+                        for (k, v) in env_obj {
+                            if (k.contains("MODEL") || k == "model")
+                                && let Some(m) = v.as_str()
+                            {
+                                let m = m.trim();
+                                if !m.is_empty() && !custom.iter().any(|c| c.id == m) {
+                                    custom.push(model(
+                                        m,
+                                        m,
+                                        &format!("From ~/.claude/{settings_name} env.{k}"),
+                                        FULL_LADDER,
+                                        vec![context_window()],
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    custom
+}
+
+/// The curated model list, prioritizing real official Claude models and user settings models.
 pub fn static_models() -> Vec<Model> {
-    vec![
-        model(
-            "claude-fable-5",
-            "Fable 5",
-            "Most intelligent model for building agents",
-            FULL_LADDER,
-            vec![context_window()],
-        ),
+    let mut list = Vec::new();
+
+    // 1. Primary flagship models (with alias compatibility labels for ACP)
+    let primary = [
         model(
             "claude-opus-5",
             "Opus 5",
@@ -339,18 +394,11 @@ pub fn static_models() -> Vec<Model> {
             vec![context_window(), toggle("fastMode", "Fast Mode")],
         ),
         model(
-            "claude-opus-4-8",
-            "Opus 4.8",
-            "Previous generation Opus",
+            "claude-fable-5",
+            "Fable 5",
+            "Most intelligent model for building agents",
             FULL_LADDER,
-            vec![toggle("fastMode", "Fast Mode")],
-        ),
-        model(
-            "claude-opus-4-7",
-            "Opus 4.7",
-            "Older generation Opus",
-            XHIGH_LADDER,
-            vec![toggle("fastMode", "Fast Mode")],
+            vec![context_window()],
         ),
         model(
             "claude-sonnet-5",
@@ -366,7 +414,85 @@ pub fn static_models() -> Vec<Model> {
             &[],
             vec![toggle("thinking", "Thinking")],
         ),
-    ]
+        // Real-world Claude 3.7 / 3.5 / 3 models
+        model(
+            "claude-3-7-sonnet",
+            "Claude 3.7 Sonnet",
+            "Most intelligent hybrid reasoning model",
+            FULL_LADDER,
+            vec![context_window()],
+        ),
+        model(
+            "claude-3-5-sonnet",
+            "Claude 3.5 Sonnet",
+            "Industry-leading intelligence and coding performance",
+            XHIGH_LADDER,
+            vec![context_window()],
+        ),
+        model(
+            "claude-3-5-haiku",
+            "Claude 3.5 Haiku",
+            "Fastest and most responsive model",
+            &[],
+            vec![toggle("thinking", "Thinking")],
+        ),
+        model(
+            "claude-3-opus",
+            "Claude 3 Opus",
+            "Powerful model for complex analysis",
+            XHIGH_LADDER,
+            vec![toggle("fastMode", "Fast Mode")],
+        ),
+        // Versioned snapshots
+        model(
+            "claude-3-7-sonnet-20250219",
+            "Claude 3.7 Sonnet (2025-02-19)",
+            "Snapshot of Claude 3.7 Sonnet",
+            FULL_LADDER,
+            vec![context_window()],
+        ),
+        model(
+            "claude-3-5-sonnet-20241022",
+            "Claude 3.5 Sonnet (2024-10-22)",
+            "Snapshot of Claude 3.5 Sonnet v2",
+            XHIGH_LADDER,
+            vec![context_window()],
+        ),
+        model(
+            "claude-3-5-haiku-20241022",
+            "Claude 3.5 Haiku (2024-10-22)",
+            "Snapshot of Claude 3.5 Haiku",
+            &[],
+            vec![toggle("thinking", "Thinking")],
+        ),
+        model(
+            "claude-opus-4-8",
+            "Opus 4.8",
+            "Previous generation Opus",
+            FULL_LADDER,
+            vec![toggle("fastMode", "Fast Mode")],
+        ),
+        model(
+            "claude-opus-4-7",
+            "Opus 4.7",
+            "Older generation Opus",
+            XHIGH_LADDER,
+            vec![toggle("fastMode", "Fast Mode")],
+        ),
+    ];
+
+    for m in primary {
+        list.push(m);
+    }
+
+    // 2. User-configured custom models from settings and env
+    for custom in read_claude_settings_models() {
+        if !list.iter().any(|m: &Model| m.id == custom.id) {
+            list.insert(0, custom);
+        }
+    }
+
+    list
 }
 
 /// Parse dynamically discovered models from Claude control response (`supported_models`).
