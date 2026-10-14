@@ -3619,6 +3619,7 @@ dependencies = [
  "anyhow",
  "clap",
  "komet-engine",
+ "komet-proto",
  "komet-rpc",
  "komet-sync-server",
  "komet-ui",
