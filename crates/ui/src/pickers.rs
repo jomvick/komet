@@ -176,6 +176,34 @@ pub fn clamp_reasoning(
 }
 
 // ---------------------------------------------------------------------------
+// Pure: send-path sync (models-refresh T5 — zero friction, zero stale ids)
+// ---------------------------------------------------------------------------
+
+/// The model id a run may actually carry for a remembered pick against the
+/// harness's LIVE catalog: the pick verbatim when still offered, `None` when
+/// it vanished (the harness then runs its own agent default). A vanished pick
+/// must NEVER fall back to the catalog default — that would silently switch
+/// the run to a sibling model. No pick at all keeps the catalog default (the
+/// new-chat canvas resolves concrete values from the first frame).
+pub fn sync_send_model_id(live: &[Model], remembered: Option<&str>) -> Option<String> {
+    match remembered {
+        Some(id) if live.iter().any(|m| m.id == id) => Some(id.to_string()),
+        Some(_) => None,
+        None => default_model(live).map(|m| m.id.clone()),
+    }
+}
+
+/// Whether the remembered pick vanished from the live catalog: the chip then
+/// reads "<remembered label> (unavailable)" — the label survives through the
+/// sticky `remember_labels` store — and the send path carries `None` (see
+/// [`sync_send_model_id`]). `false` while the catalog isn't loaded or is
+/// empty (nothing to judge staleness against).
+pub fn sync_model_is_stale(live: &[Model], remembered: Option<&str>) -> bool {
+    !live.is_empty()
+        && matches!(remembered, Some(id) if !live.iter().any(|m| m.id == id))
+}
+
+// ---------------------------------------------------------------------------
 // Pure: labels + traits summary
 // ---------------------------------------------------------------------------
 
@@ -690,7 +718,9 @@ impl Pickers {
 
     /// The selected model — concrete from the moment the list loads: the
     /// effective id when the list still offers it, else the harness default
-    /// (first row). Never `None` with a non-empty catalog.
+    /// (first row). Never `None` with a non-empty catalog. Display-only: the
+    /// SEND path goes through [`Self::send_model`], which never substitutes
+    /// the default for a vanished pick (see [`sync_send_model_id`]).
     fn selected_model<'a>(&'a self, cx: &'a App) -> Option<&'a Model> {
         let harness = self.effective_harness(cx)?;
         let models = self.models.get(&harness)?.ready()?;
@@ -701,6 +731,31 @@ impl Pickers {
                 .or_else(|| default_model(models)),
             None => default_model(models),
         }
+    }
+
+    /// Send-path staleness: the effective pick is set but the live catalog no
+    /// longer offers it. The chip then reads "<remembered> (unavailable)" and
+    /// [`Self::resolved`] carries `None` (harness default) — never a silent
+    /// substitution.
+    fn model_is_stale(&self, cx: &App) -> bool {
+        let (Some(id), Some(harness)) = (self.effective_model_id(cx), self.effective_harness(cx))
+        else {
+            return false;
+        };
+        self.models
+            .get(&harness)
+            .and_then(|slot| slot.ready())
+            .is_some_and(|models| sync_model_is_stale(models, Some(id)))
+    }
+
+    /// The model id the run may carry: the effective pick when the live
+    /// catalog still offers it, the catalog default when nothing was ever
+    /// picked, `None` when the pick vanished (harness default) or the catalog
+    /// isn't loaded yet (same harness-default passthrough as before).
+    fn send_model(&self, cx: &App) -> Option<String> {
+        let harness = self.effective_harness(cx)?;
+        let models = self.models.get(&harness)?.ready()?;
+        sync_send_model_id(models, self.effective_model_id(cx))
     }
 
     /// The explicit (non-default) option picks: the chat's persisted
@@ -738,8 +793,12 @@ impl Pickers {
             // actually offers. While the catalog isn't loaded (offline /
             // slow discovery like Cline's 300+ model fetch), send None so
             // the harness runs its agent default instead of a stale id
-            // remembered from another harness ("model not found").
-            model: self.selected_model(cx).map(|m| m.id.clone()),
+            // remembered from another harness ("model not found"). A pick
+            // the live catalog no longer offers sends None too — never a
+            // silent substitution of the catalog default (see
+            // `send_model`); the chip reads "(unavailable)" and the engine
+            // rejects any such id it still receives with a Rescan message.
+            model: self.send_model(cx),
             reasoning: self.effective_reasoning(cx),
             model_options: self.explicit_options(cx),
             mcp_server_ids: Vec::new(),
@@ -3790,7 +3849,16 @@ impl Render for Pickers {
                     None => remembered.map(|m| m.label.clone()),
                 }
             });
-            label.map(SharedString::from).unwrap_or_default()
+            let label = label.map(SharedString::from).unwrap_or_default();
+            // Send-path sync: the pick vanished from the live catalog — the
+            // chip names it "(unavailable)" (the label survives via the
+            // remembered-labels store) instead of wearing the substituted
+            // default's name; the run itself carries None (harness default).
+            if self.model_is_stale(cx) && !label.is_empty() {
+                SharedString::from(format!("{label} (unavailable)"))
+            } else {
+                label
+            }
         };
         let harness_icon: (&'static str, Option<gpui::Hsla>) = self
             .effective_harness(cx)
@@ -4132,6 +4200,31 @@ mod tests {
             &ladder,
             &serde_json::Map::new()
         ));
+    }
+
+    #[test]
+    fn resolved_never_sends_stale_model_id() {
+        // Live catalog offers one model; the remembered pick vanished.
+        let live = vec![bare_model("gemini-3.8-flash-high", "Gemini 3.8 Flash High")];
+        // A vanished pick must NEVER ride the send path (not even as the
+        // catalog default — that would silently switch the run to a sibling
+        // model): the harness runs its own agent default instead.
+        assert_eq!(sync_send_model_id(&live, Some("gemini-2.5-flash")), None);
+        assert!(sync_model_is_stale(&live, Some("gemini-2.5-flash")));
+        // An offered pick still sends verbatim; no pick → catalog default.
+        assert_eq!(
+            sync_send_model_id(&live, Some("gemini-3.8-flash-high")),
+            Some("gemini-3.8-flash-high".to_string())
+        );
+        assert!(!sync_model_is_stale(&live, Some("gemini-3.8-flash-high")));
+        assert_eq!(
+            sync_send_model_id(&live, None),
+            Some("gemini-3.8-flash-high".to_string())
+        );
+        assert!(!sync_model_is_stale(&live, None));
+        // Empty catalog: nothing to send, nothing to call stale.
+        assert_eq!(sync_send_model_id(&[], Some("gemini-2.5-flash")), None);
+        assert!(!sync_model_is_stale(&[], Some("gemini-2.5-flash")));
     }
 
     #[test]

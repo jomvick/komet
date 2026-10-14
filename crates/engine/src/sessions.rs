@@ -608,6 +608,45 @@ impl SessionsEngine {
         }
 
         let harness = self.inner.registry.resolve(harness_id)?;
+        // Send-path sync (models-refresh T5): a non-empty `request.model`
+        // must be offered by the harness's LIVE catalog. A remembered id the
+        // CLI no longer offers never dispatches — the UI sends None (harness
+        // default) instead, but a stale id can still arrive from an older
+        // client or a raced Rescan. Mock is exempt (tests / scripted runs).
+        if harness_id != komet_proto::HarnessId::Mock
+            && let Some(model) = request.model.as_deref().filter(|m| !m.is_empty())
+        {
+            let live = harness.models().await.map_err(|e| {
+                EngineError::Other(format!(
+                    "model catalog unavailable for {harness_id:?} CLI: {e}"
+                ))
+            })?;
+            if !live.iter().any(|m| m.id == model) {
+                let message = format!("model {model} not offered by {harness_id:?} CLI — Rescan");
+                tracing::warn!(chat = %chat_id, model = %model, "run rejected: model not in live catalog");
+                self.inner.publish(
+                    chat_id,
+                    &AgentEvent::Error {
+                        message: message.clone(),
+                        kind: ErrorKind::Unknown,
+                        detail: None,
+                        retryable: false,
+                    },
+                );
+                self.inner.publish(
+                    chat_id,
+                    &AgentEvent::Done {
+                        status: DoneStatus::Errored,
+                        result: None,
+                        error: Some(message.clone()),
+                        session_id: None,
+                        reason: None,
+                    },
+                );
+                self.set_status(chat_id, SessionStatus::Idle, false);
+                return Err(EngineError::Other(message));
+            }
+        }
         // External MCP stays with the agent (Claude Desktop, Codex config,
         // Cursor mcp.json, …). Komet only injects the per-run internal server
         // via `request.mcp` after `run_id` is minted.
@@ -2460,5 +2499,132 @@ mod tests {
         assert_eq!(native.used(), 500_000);
         assert_eq!(native.input_tokens, 3_000_000);
         assert_eq!(native.source, ContextUsageSource::Native);
+    }
+
+    /// Send-path sync (models-refresh T5): a catalog with a single offered
+    /// model; dispatches name whatever they want.
+    struct StaticCatalogHarness;
+
+    #[async_trait::async_trait]
+    impl Harness for StaticCatalogHarness {
+        fn id(&self) -> HarnessId {
+            HarnessId::Codex
+        }
+        fn display_name(&self) -> &str {
+            "Static"
+        }
+        fn supports_steering(&self) -> bool {
+            false
+        }
+        fn steering_mode(&self) -> komet_proto::SteeringMode {
+            komet_proto::SteeringMode::StepBoundary
+        }
+        fn reasoning_levels(&self) -> &[komet_proto::ReasoningLevel] {
+            &[]
+        }
+        async fn models(&self) -> Result<Vec<komet_proto::Model>, komet_harness::HarnessError> {
+            Ok(vec![komet_proto::Model {
+                id: "offered-1".into(),
+                label: "Offered 1".into(),
+                description: None,
+                reasoning_levels: vec![],
+                options: vec![],
+            }])
+        }
+        async fn run(
+            &self,
+            _request: RunRequest,
+            _controls: RunControls,
+        ) -> Result<
+            futures::stream::BoxStream<'static, Result<AgentEvent, komet_harness::HarnessError>>,
+            komet_harness::HarnessError,
+        > {
+            Ok(futures::stream::empty().boxed())
+        }
+    }
+
+    fn catalog_engine() -> (tempfile::TempDir, SessionsEngine) {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Arc::new(RunJournal::open(dir.path()).unwrap());
+        let registry = Arc::new(HarnessRegistry::new());
+        registry.register(Arc::new(StaticCatalogHarness));
+        (
+            dir,
+            SessionsEngine::new_for_tests("dev".into(), journal, registry),
+        )
+    }
+
+    fn catalog_probe_request(model: Option<&str>) -> RunRequest {
+        RunRequest {
+            prompt: "hi".into(),
+            harness: None,
+            model: model.map(str::to_string),
+            reasoning: None,
+            model_options: Default::default(),
+            cwd: "/tmp".into(),
+            sandbox: komet_proto::SandboxLevel::WorkspaceWrite,
+            sandbox_options: None,
+            auto_approve: false,
+            resume: None,
+            attachments: Vec::new(),
+            worktree: None,
+            permission_timeout_ms: None,
+            mcp: None,
+            mcp_external: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn dispatch_rejects_model_id_missing_from_live_catalog() {
+        let (_dir, engine) = catalog_engine();
+        // A model the live CLI no longer offers never dispatches: the
+        // rejection names the id and points at Rescan.
+        let err = engine
+            .dispatch(
+                "chat-stale-model",
+                HarnessId::Codex,
+                catalog_probe_request(Some("gone-1")),
+                None,
+            )
+            .await
+            .expect_err("model outside the live catalog must not dispatch");
+        let message = err.to_string();
+        assert!(
+            message.contains("gone-1")
+                && message.contains("not offered")
+                && message.contains("Rescan"),
+            "readable rescan rejection, got: {message}"
+        );
+        // The offered id passes the gate (it then fails on the unwired doc
+        // host — proof the gate, not the plumbing, rejected the stale id).
+        let err = engine
+            .dispatch(
+                "chat-offered-model",
+                HarnessId::Codex,
+                catalog_probe_request(Some("offered-1")),
+                None,
+            )
+            .await
+            .expect_err("no doc host wired in unit tests");
+        assert!(
+            !err.to_string().contains("not offered"),
+            "offered id must pass the model gate, got: {err}"
+        );
+        // No model (or an empty one) always passes the gate.
+        for model in [None, Some("")] {
+            let err = engine
+                .dispatch(
+                    "chat-no-model",
+                    HarnessId::Codex,
+                    catalog_probe_request(model),
+                    None,
+                )
+                .await
+                .expect_err("no doc host wired in unit tests");
+            assert!(
+                !err.to_string().contains("not offered"),
+                "model-less run must pass the model gate, got: {err}"
+            );
+        }
     }
 }
