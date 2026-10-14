@@ -203,6 +203,19 @@ pub fn sync_model_is_stale(live: &[Model], remembered: Option<&str>) -> bool {
         && matches!(remembered, Some(id) if !live.iter().any(|m| m.id == id))
 }
 
+/// Pure core of the send-path wiring: the model id a run may carry given the
+/// LOADED live catalog (`None` = not loaded yet — nothing may ride the send
+/// path) and the remembered pick. [`Pickers::send_model`] — and through it
+/// [`Pickers::resolved`] — is a thin lookup delegating here with no
+/// branching of its own, so the `resolved_wiring_*` test below executes the
+/// exact decision the send path runs, including the not-loaded branch that
+/// previously lived only behind `&App`. (A gpui `App` fixture calling
+/// `resolved()` itself would be stronger, but needs gpui's `test-support`
+/// feature — not enabled, a Cargo-level change out of scope.)
+pub fn resolve_send_model(loaded: Option<&[Model]>, remembered: Option<&str>) -> Option<String> {
+    sync_send_model_id(loaded?, remembered)
+}
+
 // ---------------------------------------------------------------------------
 // Pure: labels + traits summary
 // ---------------------------------------------------------------------------
@@ -700,6 +713,12 @@ impl Pickers {
     /// Effective reasoning — always concrete once the model is known: the
     /// draft pick / chat config / remembered default, clamped to the selected
     /// model's ladder, falling back to the model's default level.
+    /// Display-derivation note (stale case): the ladder comes from
+    /// [`Self::selected_model`], which substitutes the catalog default for a
+    /// vanished pick — so the reasoning [`Self::resolved`] sends is clamped
+    /// to the DEFAULT model's ladder while the sent model id is `None`. The
+    /// harness runs its own default with a level valid for the catalog head;
+    /// never the stale id's ladder (the vanished row is gone).
     fn effective_reasoning(&self, cx: &App) -> Option<ReasoningLevel> {
         let explicit = self.config.reasoning.or_else(|| {
             match self.state.read(cx).selected_chat_row() {
@@ -721,6 +740,11 @@ impl Pickers {
     /// (first row). Never `None` with a non-empty catalog. Display-only: the
     /// SEND path goes through [`Self::send_model`], which never substitutes
     /// the default for a vanished pick (see [`sync_send_model_id`]).
+    /// Stale-case divergence (documented, not a bug): the substituted default
+    /// also lends its ladder/options to [`Self::trait_ladder`] and
+    /// [`Self::effective_reasoning`] — the chip summary and the sent
+    /// reasoning clamp derive from the DEFAULT model while the sent model id
+    /// stays `None` (harness default runs). See those consumers.
     fn selected_model<'a>(&'a self, cx: &'a App) -> Option<&'a Model> {
         let harness = self.effective_harness(cx)?;
         let models = self.models.get(&harness)?.ready()?;
@@ -752,10 +776,11 @@ impl Pickers {
     /// catalog still offers it, the catalog default when nothing was ever
     /// picked, `None` when the pick vanished (harness default) or the catalog
     /// isn't loaded yet (same harness-default passthrough as before).
+    /// Thin lookup over [`resolve_send_model`] — all branching lives there.
     fn send_model(&self, cx: &App) -> Option<String> {
         let harness = self.effective_harness(cx)?;
-        let models = self.models.get(&harness)?.ready()?;
-        sync_send_model_id(models, self.effective_model_id(cx))
+        let models = self.models.get(&harness)?.ready();
+        resolve_send_model(models.map(Vec::as_slice), self.effective_model_id(cx))
     }
 
     /// The explicit (non-default) option picks: the chat's persisted
@@ -1426,6 +1451,10 @@ impl Pickers {
     /// The traits popover's reasoning ladder. A catalog model's levels are
     /// authoritative even when empty — falling back to the harness ladder is
     /// what sent `--effort` to Haiku / Antigravity Claude.
+    /// Display-derivation note (stale case): sourced from
+    /// [`Self::selected_model`], so a vanished pick yields the catalog
+    /// DEFAULT's ladder here (and in [`Self::effective_reasoning`]) while
+    /// the sent model id is `None` — see [`Self::selected_model`].
     fn trait_ladder(&self, cx: &App) -> Vec<ReasoningLevel> {
         self.selected_model(cx)
             .map(|m| m.reasoning_levels.clone())
@@ -4225,6 +4254,39 @@ mod tests {
         // Empty catalog: nothing to send, nothing to call stale.
         assert_eq!(sync_send_model_id(&[], Some("gemini-2.5-flash")), None);
         assert!(!sync_model_is_stale(&[], Some("gemini-2.5-flash")));
+    }
+
+    #[test]
+    fn resolved_wiring_never_sends_stale_model_id() {
+        // Executes the exact decision `Pickers::resolved` runs for its
+        // `model` field: `resolved` → `send_model` → `resolve_send_model`,
+        // where both App-land steps are branch-free delegations (lookup +
+        // forward). A vanished pick must NEVER ride the send path — not as
+        // the stale id, not even as the catalog default (that would silently
+        // switch the run to a sibling model): the harness runs its own
+        // agent default instead.
+        let live = vec![bare_model("gemini-3.8-flash-high", "Gemini 3.8 Flash High")];
+        let loaded = Some(live.as_slice());
+        assert_eq!(resolve_send_model(loaded, Some("gemini-2.5-flash")), None);
+        // An offered pick still sends verbatim; no pick → catalog default.
+        assert_eq!(
+            resolve_send_model(loaded, Some("gemini-3.8-flash-high")),
+            Some("gemini-3.8-flash-high".to_string())
+        );
+        assert_eq!(
+            resolve_send_model(loaded, None),
+            Some("gemini-3.8-flash-high".to_string())
+        );
+        // Catalog not loaded yet → None (harness default), never stale.
+        assert_eq!(resolve_send_model(None, Some("gemini-2.5-flash")), None);
+        assert_eq!(resolve_send_model(None, None), None);
+        // Empty catalog → None, not stale.
+        let empty: &[Model] = &[];
+        assert_eq!(
+            resolve_send_model(Some(empty), Some("gemini-2.5-flash")),
+            None
+        );
+        assert_eq!(resolve_send_model(Some(empty), None), None);
     }
 
     #[test]
