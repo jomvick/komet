@@ -176,6 +176,47 @@ pub fn clamp_reasoning(
 }
 
 // ---------------------------------------------------------------------------
+// Pure: send-path sync (models-refresh T5 — zero friction, zero stale ids)
+// ---------------------------------------------------------------------------
+
+/// The model id a run may actually carry for a remembered pick against the
+/// harness's LIVE catalog: the pick verbatim when still offered, `None` when
+/// it vanished (the harness then runs its own agent default). A vanished pick
+/// must NEVER fall back to the catalog default — that would silently switch
+/// the run to a sibling model. No pick at all keeps the catalog default (the
+/// new-chat canvas resolves concrete values from the first frame).
+pub fn sync_send_model_id(live: &[Model], remembered: Option<&str>) -> Option<String> {
+    match remembered {
+        Some(id) if live.iter().any(|m| m.id == id) => Some(id.to_string()),
+        Some(_) => None,
+        None => default_model(live).map(|m| m.id.clone()),
+    }
+}
+
+/// Whether the remembered pick vanished from the live catalog: the chip then
+/// reads "<remembered label> (unavailable)" — the label survives through the
+/// sticky `remember_labels` store — and the send path carries `None` (see
+/// [`sync_send_model_id`]). `false` while the catalog isn't loaded or is
+/// empty (nothing to judge staleness against).
+pub fn sync_model_is_stale(live: &[Model], remembered: Option<&str>) -> bool {
+    !live.is_empty()
+        && matches!(remembered, Some(id) if !live.iter().any(|m| m.id == id))
+}
+
+/// Pure core of the send-path wiring: the model id a run may carry given the
+/// LOADED live catalog (`None` = not loaded yet — nothing may ride the send
+/// path) and the remembered pick. [`Pickers::send_model`] — and through it
+/// [`Pickers::resolved`] — is a thin lookup delegating here with no
+/// branching of its own, so the `resolved_wiring_*` test below executes the
+/// exact decision the send path runs, including the not-loaded branch that
+/// previously lived only behind `&App`. (A gpui `App` fixture calling
+/// `resolved()` itself would be stronger, but needs gpui's `test-support`
+/// feature — not enabled, a Cargo-level change out of scope.)
+pub fn resolve_send_model(loaded: Option<&[Model]>, remembered: Option<&str>) -> Option<String> {
+    sync_send_model_id(loaded?, remembered)
+}
+
+// ---------------------------------------------------------------------------
 // Pure: labels + traits summary
 // ---------------------------------------------------------------------------
 
@@ -361,6 +402,9 @@ struct ModelRowData {
     harness: HarnessId,
     harness_name: SharedString,
     model: Model,
+    /// Provider group label (e.g. `"Google Gemini"`, `"Anthropic"`) used for
+    /// section-header rendering in `ModelRail::Harness` view.
+    provider: &'static str,
 }
 
 /// Which picker popover is open.
@@ -383,6 +427,23 @@ pub enum PickerKind {
     Device,
 }
 
+/// Minimum age of an already-loaded model list before a picker open / agent
+/// switch may revalidate it. A back-and-forth between two agents inside this
+/// window reuses what is already on screen — no spinner, no probe.
+const MODELS_REVALIDATE_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How a model load is allowed to start (see [`Pickers::ensure_models`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ModelsLoad {
+    /// Render-loop prefetch: fill an absent / Idle slot only.
+    Fill,
+    /// Picker open / agent switch: fill a missing slot, or revalidate one whose
+    /// list is older than [`MODELS_REVALIDATE_AFTER`] — rows stay on screen.
+    Revalidate,
+    /// Rescan / Retry: drop the slot and probe the CLI live.
+    Force,
+}
+
 pub struct Pickers {
     state: Entity<AppState>,
     config: DraftConfig,
@@ -403,6 +464,10 @@ pub struct Pickers {
     model_rail: ModelRail,
     harnesses: Loadable<Vec<HarnessDescriptor>>,
     models: HashMap<HarnessId, Loadable<Vec<Model>>>,
+    /// When each list in [`Self::models`] was last (re)loaded. Drives the
+    /// bounded revalidation on picker open / agent switch so a flip-flop
+    /// between two agents backs off instead of re-probing on every visit.
+    models_loaded_at: HashMap<HarnessId, std::time::Instant>,
     refs: Loadable<Vec<RepoRef>>,
     /// Space id the `refs` slot belongs to (invalidated on space change).
     refs_space: Option<String>,
@@ -566,6 +631,7 @@ impl Pickers {
             model_rail: ModelRail::default(),
             harnesses: Loadable::Idle,
             models: HashMap::new(),
+            models_loaded_at: HashMap::new(),
             refs: Loadable::Idle,
             refs_space: None,
             active: 0,
@@ -669,6 +735,12 @@ impl Pickers {
     /// Effective reasoning — always concrete once the model is known: the
     /// draft pick / chat config / remembered default, clamped to the selected
     /// model's ladder, falling back to the model's default level.
+    /// Display-derivation note (stale case): the ladder comes from
+    /// [`Self::selected_model`], which substitutes the catalog default for a
+    /// vanished pick — so the reasoning [`Self::resolved`] sends is clamped
+    /// to the DEFAULT model's ladder while the sent model id is `None`. The
+    /// harness runs its own default with a level valid for the catalog head;
+    /// never the stale id's ladder (the vanished row is gone).
     fn effective_reasoning(&self, cx: &App) -> Option<ReasoningLevel> {
         let explicit = self.config.reasoning.or_else(|| {
             match self.state.read(cx).selected_chat_row() {
@@ -687,7 +759,14 @@ impl Pickers {
 
     /// The selected model — concrete from the moment the list loads: the
     /// effective id when the list still offers it, else the harness default
-    /// (first row). Never `None` with a non-empty catalog.
+    /// (first row). Never `None` with a non-empty catalog. Display-only: the
+    /// SEND path goes through [`Self::send_model`], which never substitutes
+    /// the default for a vanished pick (see [`sync_send_model_id`]).
+    /// Stale-case divergence (documented, not a bug): the substituted default
+    /// also lends its ladder/options to [`Self::trait_ladder`] and
+    /// [`Self::effective_reasoning`] — the chip summary and the sent
+    /// reasoning clamp derive from the DEFAULT model while the sent model id
+    /// stays `None` (harness default runs). See those consumers.
     fn selected_model<'a>(&'a self, cx: &'a App) -> Option<&'a Model> {
         let harness = self.effective_harness(cx)?;
         let models = self.models.get(&harness)?.ready()?;
@@ -698,6 +777,32 @@ impl Pickers {
                 .or_else(|| default_model(models)),
             None => default_model(models),
         }
+    }
+
+    /// Send-path staleness: the effective pick is set but the live catalog no
+    /// longer offers it. The chip then reads "<remembered> (unavailable)" and
+    /// [`Self::resolved`] carries `None` (harness default) — never a silent
+    /// substitution.
+    fn model_is_stale(&self, cx: &App) -> bool {
+        let (Some(id), Some(harness)) = (self.effective_model_id(cx), self.effective_harness(cx))
+        else {
+            return false;
+        };
+        self.models
+            .get(&harness)
+            .and_then(|slot| slot.ready())
+            .is_some_and(|models| sync_model_is_stale(models, Some(id)))
+    }
+
+    /// The model id the run may carry: the effective pick when the live
+    /// catalog still offers it, the catalog default when nothing was ever
+    /// picked, `None` when the pick vanished (harness default) or the catalog
+    /// isn't loaded yet (same harness-default passthrough as before).
+    /// Thin lookup over [`resolve_send_model`] — all branching lives there.
+    fn send_model(&self, cx: &App) -> Option<String> {
+        let harness = self.effective_harness(cx)?;
+        let models = self.models.get(&harness)?.ready();
+        resolve_send_model(models.map(Vec::as_slice), self.effective_model_id(cx))
     }
 
     /// The explicit (non-default) option picks: the chat's persisted
@@ -735,8 +840,12 @@ impl Pickers {
             // actually offers. While the catalog isn't loaded (offline /
             // slow discovery like Cline's 300+ model fetch), send None so
             // the harness runs its agent default instead of a stale id
-            // remembered from another harness ("model not found").
-            model: self.selected_model(cx).map(|m| m.id.clone()),
+            // remembered from another harness ("model not found"). A pick
+            // the live catalog no longer offers sends None too — never a
+            // silent substitution of the catalog default (see
+            // `send_model`); the chip reads "(unavailable)" and the engine
+            // rejects any such id it still receives with a Rescan message.
+            model: self.send_model(cx),
             reasoning: self.effective_reasoning(cx),
             model_options: self.explicit_options(cx),
             mcp_server_ids: Vec::new(),
@@ -873,6 +982,12 @@ impl Pickers {
                 // possibly from another viewer) — every open revalidates,
                 // keeping current rows visible until the fresh catalog lands.
                 self.ensure_harnesses(true, cx);
+                // Revalidate the effective harness (bounded: a list already on
+                // screen and younger than MODELS_REVALIDATE_AFTER is reused as
+                // is). Prefetch all other offered harnesses in the background.
+                if let Some(effective) = self.effective_harness(cx) {
+                    self.ensure_models(effective, ModelsLoad::Revalidate, cx);
+                }
                 self.prefetch_models(cx);
             }
             // Projects, devices, and context usage are already synced state — nothing to load.
@@ -952,27 +1067,57 @@ impl Pickers {
             targets.push(effective);
         }
         for harness in targets {
-            self.ensure_models(harness, cx);
+            self.ensure_models(harness, ModelsLoad::Fill, cx);
         }
     }
 
-    fn ensure_models(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
-        // Absent or Idle only — same render-loop hazard as `ensure_harnesses`;
-        // the retry row clears the map to re-arm.
-        if self
-            .models
-            .get(&harness)
-            .is_some_and(|slot| !matches!(slot, Loadable::Idle))
-        {
-            return;
+    /// Whether `harness`'s in-memory list is old enough to revalidate.
+    fn models_slot_stale(&self, harness: HarnessId) -> bool {
+        match self.models_loaded_at.get(&harness) {
+            Some(at) => at.elapsed() >= MODELS_REVALIDATE_AFTER,
+            None => true,
+        }
+    }
+
+    /// Loads `harness`'s model list according to `load` (see [`ModelsLoad`]).
+    /// The RPC goes out with `force: false` unless this is an explicit
+    /// Rescan/Retry: the engine answers from its persistent cache and
+    /// revalidates in the background, so a normal open never blocks on a cold
+    /// CLI and never drops a list it already knows.
+    fn ensure_models(&mut self, harness: HarnessId, load: ModelsLoad, cx: &mut Context<Self>) {
+        if load == ModelsLoad::Force {
+            // Reset to Idle so the guard below always triggers a fresh probe —
+            // Rescan / Retry.
+            self.models.insert(harness, Loadable::Idle);
+        } else if let Some(slot) = self.models.get(&harness) {
+            let reload = match load {
+                // Render-loop prefetch: absent/Idle only — an Error must wait
+                // for an explicit reopen (same render-loop hazard as
+                // `ensure_harnesses`).
+                ModelsLoad::Fill => false,
+                ModelsLoad::Revalidate => match slot {
+                    Loadable::Loading => false,
+                    Loadable::Ready(_) => self.models_slot_stale(harness),
+                    Loadable::Idle | Loadable::Error(_) => true,
+                },
+                ModelsLoad::Force => false,
+            };
+            if !reload {
+                return;
+            }
         }
         let Some(engine) = self.engine(cx) else {
             return;
         };
         let target = self.space_target(cx);
-        self.models.insert(harness, Loadable::Loading);
+        let force = load == ModelsLoad::Force;
+        // Stale-while-revalidate: an already-loaded list stays on screen while
+        // the reload runs, so a revalidate never flashes a skeleton.
+        if !matches!(self.models.get(&harness), Some(Loadable::Ready(_))) {
+            self.models.insert(harness, Loadable::Loading);
+        }
         cx.spawn(async move |this, cx| {
-            let mut params = serde_json::json!({ "harness": harness });
+            let mut params = serde_json::json!({ "harness": harness, "force": force });
             if let (Some(target), Some(object)) = (&target, params.as_object_mut()) {
                 object.insert(
                     "targetDeviceId".into(),
@@ -999,7 +1144,29 @@ impl Pickers {
                         pickers.save_defaults();
                     }
                 }
-                pickers.models.insert(harness, loaded);
+                // Stale-while-revalidate: a failed RELOAD never blanks a list
+                // that is already on screen — the known rows stay, and the
+                // timestamp is left alone so the next open retries. A Rescan /
+                // Retry resets the slot to Idle first, so nothing is kept and
+                // the error still surfaces for the reader who asked for it.
+                let keep_previous = matches!(loaded, Loadable::Error(_))
+                    && pickers.models.get(&harness).is_some_and(
+                        |slot| matches!(slot, Loadable::Ready(rows) if !rows.is_empty()),
+                    );
+                if keep_previous {
+                    if let Loadable::Error(err) = &loaded {
+                        tracing::warn!(
+                            ?harness,
+                            error = %err,
+                            "model reload failed, keeping the list on screen"
+                        );
+                    }
+                } else {
+                    pickers.models.insert(harness, loaded);
+                    pickers
+                        .models_loaded_at
+                        .insert(harness, std::time::Instant::now());
+                }
                 // A list that landed while its popover is open re-anchors the
                 // keyboard highlight onto the selected row (it sat at 0 while
                 // loading).
@@ -1200,7 +1367,9 @@ impl Pickers {
         self.defaults.harness = Some(harness);
         self.save_defaults();
         self.model_scroll.set_offset(gpui::Point::default());
-        self.ensure_models(harness, cx);
+        // Switching back to an agent whose list is already on screen reuses it
+        // instead of re-probing — only a stale/burst-missing slot reloads.
+        self.ensure_models(harness, ModelsLoad::Revalidate, cx);
         // Re-anchor the keyboard highlight onto the new harness's selected row.
         self.active = self.selected_model_index(cx);
         cx.notify();
@@ -1353,6 +1522,10 @@ impl Pickers {
     /// The traits popover's reasoning ladder. A catalog model's levels are
     /// authoritative even when empty — falling back to the harness ladder is
     /// what sent `--effort` to Haiku / Antigravity Claude.
+    /// Display-derivation note (stale case): sourced from
+    /// [`Self::selected_model`], so a vanished pick yields the catalog
+    /// DEFAULT's ladder here (and in [`Self::effective_reasoning`]) while
+    /// the sent model id is `None` — see [`Self::selected_model`].
     fn trait_ladder(&self, cx: &App) -> Vec<ReasoningLevel> {
         self.selected_model(cx)
             .map(|m| m.reasoning_levels.clone())
@@ -1394,6 +1567,7 @@ impl Pickers {
         let row = |descriptor: &HarnessDescriptor, model: &Model| ModelRowData {
             harness: descriptor.id,
             harness_name: SharedString::from(descriptor.name.clone()),
+            provider: model_provider(descriptor.id, &model.id),
             model: model.clone(),
         };
         let query = self.search.read(cx).text().trim().to_string();
@@ -1455,10 +1629,27 @@ impl Pickers {
                 let (starred, rest): (Vec<&Model>, Vec<&Model>) = models
                     .iter()
                     .partition(|m| self.defaults.is_favorite(descriptor.id, &m.id));
+                // Starred rows float to the top (no provider grouping for
+                // favorites); the rest is sorted by (provider, label) so the
+                // section headers in the render step are contiguous.
+                let mut rest_rows: Vec<ModelRowData> =
+                    rest.into_iter().map(|m| row(descriptor, m)).collect();
+                rest_rows.sort_by(|a, b| {
+                    a.provider
+                        .cmp(b.provider)
+                        .then_with(|| a.model.label.cmp(&b.model.label))
+                });
                 starred
                     .into_iter()
-                    .chain(rest)
-                    .map(|model| row(descriptor, model))
+                    .map(|model| {
+                        // Favorites float above the grouped block and are not
+                        // provider-sorted — no heading of their own (empty
+                        // provider) so the first grouped row still gets one.
+                        let mut r = row(descriptor, model);
+                        r.provider = "";
+                        r
+                    })
+                    .chain(rest_rows)
                     .collect()
             }
         }
@@ -2588,6 +2779,12 @@ impl Pickers {
                             this.harnesses = Loadable::Idle;
                             this.models.clear();
                             this.ensure_harnesses(false, cx);
+                            // Rescan: force the effective harness to re-probe
+                            // its CLI at once (the render loop's prefetch would
+                            // also reload, but only later).
+                            if let Some(effective) = this.effective_harness(cx) {
+                                this.ensure_models(effective, ModelsLoad::Force, cx);
+                            }
                         }
                         // Projects/devices/context load nothing; no retry surface exists.
                         PickerKind::Space | PickerKind::Device | PickerKind::ContextUsage => {}
@@ -3074,6 +3271,16 @@ impl Pickers {
                     if ix < 9 {
                         el = el.child(popover::kbd_hint(&theme, &format!("⌘{}", ix + 1)));
                     }
+                    // Provider section heading on the first row of each group
+                    // (rails where rows are provider-sorted). Kept INSIDE this
+                    // row's wrapper so the list stays one child per row and
+                    // `scroll_to_item(active)` keeps its 1:1 index mapping.
+                    let group_start = !searching
+                        && !favorites_view
+                        && !row.provider.is_empty()
+                        && rows
+                            .get(ix.wrapping_sub(1))
+                            .map_or(true, |prev| prev.provider != row.provider);
                     el = el.child(
                         div()
                             .id(("model-star", ix))
@@ -3104,7 +3311,16 @@ impl Pickers {
                                 }),
                             ),
                     );
-                    el.into_any_element()
+                    if group_start {
+                        div()
+                            .flex()
+                            .flex_col()
+                            .child(popover::menu_heading(&theme, row.provider))
+                            .child(el)
+                            .into_any_element()
+                    } else {
+                        el.into_any_element()
+                    }
                 })
                 .collect()
         } else if searching {
@@ -3345,6 +3561,113 @@ fn empty_list_note(theme: &Theme, copy: &str) -> AnyElement {
         .text_center()
         .child(SharedString::from(copy.to_string()))
         .into_any_element()
+}
+
+/// Classify a model into a display provider group used for section headers in
+/// the model picker.  Returns a short human-readable provider name, e.g.
+/// `"Google Gemini"`, `"Anthropic"`, `"OpenAI"`.
+///
+/// Display labels ONLY — never served as a model list (Global Constraint:
+/// no hardcoded list as success). First match wins:
+/// - For Antigravity: substring on model id — `gemini` → Google Gemini,
+///   `claude` → Anthropic, `gpt*`/`o1*`/`o3*` → OpenAI, else Other.
+/// - For ClaudeCode / Cline / Hermes / ACP harnesses with slash ids
+///   (`anthropic/claude-…`, `meta-llama/…`): the vendor slug table below.
+/// - Known prefix aliases: `nous:` → Nous Research,
+///   `cline-free/` or `:free` suffix → Free Models.
+/// - Aggregator alias: `openrouter/…` derives the REAL vendor behind the
+///   prefix (`openrouter/deepseek-v3` → DeepSeek,
+///   `openrouter/anthropic/claude` → Anthropic, unknown → OpenRouter).
+/// - Bare (slash-less) ids fall back to family prefixes (`gpt*` → OpenAI,
+///   `gemini` → Google Gemini, `claude` → Anthropic).
+/// - Codex → OpenAI, Cursor → Cursor Curated.
+/// - Fallback → "Other".
+pub(crate) fn model_provider(harness: HarnessId, model_id: &str) -> &'static str {
+    /// Vendor slug → display label. `None` = unknown slug (caller decides
+    /// between the aggregator label and "Other"). `&'static str` only.
+    fn vendor_label(slug: &str) -> Option<&'static str> {
+        match slug {
+            "anthropic" => Some("Anthropic"),
+            "openai" => Some("OpenAI"),
+            "meta-llama" | "meta" => Some("Meta"),
+            "google" | "gemini" => Some("Google Gemini"),
+            "mistralai" | "mistral" => Some("Mistral"),
+            "qwen" => Some("Qwen / Alibaba"),
+            "deepseek" => Some("DeepSeek"),
+            "nousresearch" | "nous" => Some("Nous Research"),
+            "x-ai" | "xai" => Some("xAI"),
+            "cohere" => Some("Cohere"),
+            "microsoft" => Some("Microsoft"),
+            "nvidia" => Some("NVIDIA"),
+            "perplexity" => Some("Perplexity"),
+            _ => None,
+        }
+    }
+    let id = model_id;
+    match harness {
+        HarnessId::Antigravity => {
+            if id.contains("gemini") {
+                "Google Gemini"
+            } else if id.contains("claude") {
+                "Anthropic"
+            } else if id.starts_with("gpt") || id.starts_with("o1") || id.starts_with("o3") {
+                "OpenAI"
+            } else {
+                "Other"
+            }
+        }
+        HarnessId::ClaudeCode => "Anthropic",
+        HarnessId::Codex => "OpenAI",
+        HarnessId::Cursor => "Cursor Curated",
+        // ACP harnesses (Cline / Hermes / OpenCode): provider prefix before `/`
+        _ => {
+            // Free-tier shortcut
+            if id.starts_with("cline-free/") || id.ends_with(":free") {
+                return "Free Models";
+            }
+            if id.starts_with("nous:") {
+                return "Nous Research";
+            }
+            let mut parts = id.split('/');
+            let vendor = parts.next().unwrap_or("");
+            // Aggregator alias — derive the real vendor behind the prefix.
+            // The segment after `openrouter/` is the real vendor, but it is
+            // often fused with the model name (`openrouter/deepseek-v3`):
+            // try the whole slug, then its leading `-`-delimited token
+            // (`deepseek-v3` → `deepseek` → DeepSeek), else stay OpenRouter.
+            if vendor == "openrouter" {
+                let slug = parts.next().unwrap_or("");
+                if let Some(label) =
+                    vendor_label(slug).or_else(|| slug.split('-').next().and_then(vendor_label))
+                {
+                    return label;
+                }
+                return "OpenRouter";
+            }
+            // Slash-separated `vendor/model` ids.
+            if vendor != id {
+                if let Some(label) = vendor_label(vendor) {
+                    return label;
+                }
+                return "Other";
+            }
+            // Bare ids (no vendor prefix): well-known model-family prefixes.
+            if id.starts_with("gpt")
+                || id.starts_with("o1")
+                || id.starts_with("o3")
+                || id.starts_with("openai")
+            {
+                return "OpenAI";
+            }
+            if id.contains("gemini") {
+                return "Google Gemini";
+            }
+            if id.contains("claude") {
+                return "Anthropic";
+            }
+            "Other"
+        }
+    }
 }
 
 /// Display-side model-list hygiene, mirroring the engine's discovery-side
@@ -3626,7 +3949,16 @@ impl Render for Pickers {
                     None => remembered.map(|m| m.label.clone()),
                 }
             });
-            label.map(SharedString::from).unwrap_or_default()
+            let label = label.map(SharedString::from).unwrap_or_default();
+            // Send-path sync: the pick vanished from the live catalog — the
+            // chip names it "(unavailable)" (the label survives via the
+            // remembered-labels store) instead of wearing the substituted
+            // default's name; the run itself carries None (harness default).
+            if self.model_is_stale(cx) && !label.is_empty() {
+                SharedString::from(format!("{label} (unavailable)"))
+            } else {
+                label
+            }
         };
         let harness_icon: (&'static str, Option<gpui::Hsla>) = self
             .effective_harness(cx)
@@ -3971,6 +4303,64 @@ mod tests {
     }
 
     #[test]
+    fn resolved_never_sends_stale_model_id() {
+        // Live catalog offers one model; the remembered pick vanished.
+        let live = vec![bare_model("gemini-3.8-flash-high", "Gemini 3.8 Flash High")];
+        // A vanished pick must NEVER ride the send path (not even as the
+        // catalog default — that would silently switch the run to a sibling
+        // model): the harness runs its own agent default instead.
+        assert_eq!(sync_send_model_id(&live, Some("gemini-2.5-flash")), None);
+        assert!(sync_model_is_stale(&live, Some("gemini-2.5-flash")));
+        // An offered pick still sends verbatim; no pick → catalog default.
+        assert_eq!(
+            sync_send_model_id(&live, Some("gemini-3.8-flash-high")),
+            Some("gemini-3.8-flash-high".to_string())
+        );
+        assert!(!sync_model_is_stale(&live, Some("gemini-3.8-flash-high")));
+        assert_eq!(
+            sync_send_model_id(&live, None),
+            Some("gemini-3.8-flash-high".to_string())
+        );
+        assert!(!sync_model_is_stale(&live, None));
+        // Empty catalog: nothing to send, nothing to call stale.
+        assert_eq!(sync_send_model_id(&[], Some("gemini-2.5-flash")), None);
+        assert!(!sync_model_is_stale(&[], Some("gemini-2.5-flash")));
+    }
+
+    #[test]
+    fn resolved_wiring_never_sends_stale_model_id() {
+        // Executes the exact decision `Pickers::resolved` runs for its
+        // `model` field: `resolved` → `send_model` → `resolve_send_model`,
+        // where both App-land steps are branch-free delegations (lookup +
+        // forward). A vanished pick must NEVER ride the send path — not as
+        // the stale id, not even as the catalog default (that would silently
+        // switch the run to a sibling model): the harness runs its own
+        // agent default instead.
+        let live = vec![bare_model("gemini-3.8-flash-high", "Gemini 3.8 Flash High")];
+        let loaded = Some(live.as_slice());
+        assert_eq!(resolve_send_model(loaded, Some("gemini-2.5-flash")), None);
+        // An offered pick still sends verbatim; no pick → catalog default.
+        assert_eq!(
+            resolve_send_model(loaded, Some("gemini-3.8-flash-high")),
+            Some("gemini-3.8-flash-high".to_string())
+        );
+        assert_eq!(
+            resolve_send_model(loaded, None),
+            Some("gemini-3.8-flash-high".to_string())
+        );
+        // Catalog not loaded yet → None (harness default), never stale.
+        assert_eq!(resolve_send_model(None, Some("gemini-2.5-flash")), None);
+        assert_eq!(resolve_send_model(None, None), None);
+        // Empty catalog → None, not stale.
+        let empty: &[Model] = &[];
+        assert_eq!(
+            resolve_send_model(Some(empty), Some("gemini-2.5-flash")),
+            None
+        );
+        assert_eq!(resolve_send_model(Some(empty), None), None);
+    }
+
+    #[test]
     fn folder_paths_and_breadcrumbs() {
         assert_eq!(parent_path("/home/w/dev"), Some("/home/w".to_string()));
         assert_eq!(parent_path("/home"), Some("/".to_string()));
@@ -4182,5 +4572,77 @@ mod tests {
         let offered =
             offered_harnesses_impl(&catalog(Some(false), Some(false), Some(false)), false);
         assert_eq!(offered.len(), 3);
+    }
+
+    #[test]
+    fn model_provider_groups_antigravity_hermes_cline_opencode() {
+        assert_eq!(
+            model_provider(HarnessId::Antigravity, "gemini-3.8-flash-high"),
+            "Google Gemini"
+        );
+        assert_eq!(
+            model_provider(HarnessId::Antigravity, "claude-sonnet-4-6"),
+            "Anthropic"
+        );
+        assert_eq!(
+            model_provider(HarnessId::Antigravity, "gpt-oss-120b-medium"),
+            "OpenAI"
+        );
+        assert_eq!(
+            model_provider(HarnessId::Hermes, "nous:hermes-4-405b"),
+            "Nous Research"
+        );
+        assert_eq!(
+            model_provider(HarnessId::Opencode, "openrouter/deepseek-v3"),
+            "DeepSeek"
+        );
+        assert_eq!(
+            model_provider(HarnessId::Cline, "cline-free/deepseek-v3:free"),
+            "Free Models"
+        );
+    }
+
+    #[test]
+    fn model_provider_derives_vendor_behind_openrouter_and_acp_aliases() {
+        // Aggregator alias derives the real vendor; unknown stays OpenRouter.
+        assert_eq!(
+            model_provider(HarnessId::Opencode, "openrouter/anthropic/claude"),
+            "Anthropic"
+        );
+        assert_eq!(
+            model_provider(HarnessId::Opencode, "openrouter/unknown-vendor-x"),
+            "OpenRouter"
+        );
+        // ACP vendor aliases.
+        assert_eq!(
+            model_provider(HarnessId::Hermes, "nousresearch/hermes-4"),
+            "Nous Research"
+        );
+        assert_eq!(model_provider(HarnessId::Cline, "xai/grok-4"), "xAI");
+        assert_eq!(model_provider(HarnessId::Cline, "x-ai/grok-4"), "xAI");
+        assert_eq!(
+            model_provider(HarnessId::Opencode, "google/gemini-3-flash"),
+            "Google Gemini"
+        );
+        assert_eq!(
+            model_provider(HarnessId::Opencode, "gemini/gemini-3-flash"),
+            "Google Gemini"
+        );
+        // Bare (slash-less) family prefixes.
+        assert_eq!(model_provider(HarnessId::Opencode, "gpt-4o"), "OpenAI");
+        assert_eq!(model_provider(HarnessId::Opencode, "o3-mini"), "OpenAI");
+        assert_eq!(
+            model_provider(HarnessId::Opencode, "gemini-2.5-flash"),
+            "Google Gemini"
+        );
+        assert_eq!(
+            model_provider(HarnessId::Opencode, "claude-sonnet-4"),
+            "Anthropic"
+        );
+        // Unknown stays Other — never a fabricated vendor label.
+        assert_eq!(
+            model_provider(HarnessId::Opencode, "some-vendor/model-x"),
+            "Other"
+        );
     }
 }

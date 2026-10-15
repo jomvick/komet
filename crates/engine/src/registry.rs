@@ -7,7 +7,7 @@
 //! Per-device because CLI installs are — a viewer retargets the settings page at
 //! another device and edits THAT device's set over the forwarded RPCs.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
@@ -17,13 +17,11 @@ use serde::{Deserialize, Serialize};
 use komet_harness::{Harness, HarnessError, mock::MockHarness};
 use komet_proto::{AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, SteeringMode};
 
-/// How long a previously-discovered model list is served without re-probing.
-/// Long enough that every app launch (the common case) skips the cold agent
-/// boot entirely — opencode's Node startup measured ~13s under the app's
-/// 4-way boot prefetch — while still re-discovering within a day.
-const MODELS_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
-/// A fresh cache entry is re-probed in the background at most this often, so
-/// the file stays warm for the next launch without a probe per picker open.
+/// A served cache entry is re-probed in the background at most this often, so
+/// the file stays warm without a probe per picker open. There is no upper
+/// bound on serving age: a known list is always better than a spinner, and a
+/// failing agent still shows its last known models until a probe replaces
+/// them.
 const MODELS_CACHE_REFRESH_AFTER: Duration = Duration::from_secs(60 * 60);
 
 /// One harness's persisted model discovery (`{data_dir}/model-cache.json`).
@@ -39,6 +37,26 @@ struct CachedModels {
 #[serde(default)]
 struct ModelsCacheFile {
     entries: HashMap<HarnessId, CachedModels>,
+}
+
+/// Best-effort atomic write (temp + rename): persist `entries` only — callers
+/// hold a successfully probed, non-empty list. Shared by the inline persist
+/// and the background refresh so both paths are atomic.
+fn persist_models_cache_to(path: &Path, entries: &HashMap<HarnessId, CachedModels>) {
+    let file = ModelsCacheFile {
+        entries: entries.clone(),
+    };
+    let json = match serde_json::to_string_pretty(&file) {
+        Ok(json) => json,
+        Err(err) => {
+            tracing::warn!(error = %err, "model-cache serialize failed");
+            return;
+        }
+    };
+    let tmp = path.with_extension("json.tmp");
+    if let Err(err) = std::fs::write(&tmp, json).and_then(|()| std::fs::rename(&tmp, &path)) {
+        tracing::warn!(error = %err, "model-cache save failed");
+    }
 }
 
 /// What `ListHarnesses` reports per harness.
@@ -127,6 +145,9 @@ pub struct HarnessRegistry {
     /// Where the model cache persists; `None` (tests, bare registries) skips
     /// disk reads/writes and `models()` always probes.
     models_cache_path: Mutex<Option<PathBuf>>,
+    /// Harnesses currently being warmed — `warm_models_cache` claims an id
+    /// here so concurrent warms never probe the same harness twice.
+    warm_inflight: Mutex<HashSet<HarnessId>>,
 }
 
 impl Default for HarnessRegistry {
@@ -144,6 +165,7 @@ impl HarnessRegistry {
             prefs_path: Mutex::new(None),
             models_cache: Arc::new(Mutex::new(HashMap::new())),
             models_cache_path: Mutex::new(None),
+            warm_inflight: Mutex::new(HashSet::new()),
         }
     }
 
@@ -210,109 +232,196 @@ impl HarnessRegistry {
         else {
             return;
         };
-        let file = ModelsCacheFile {
-            entries: self.models_cache_entries().clone(),
-        };
-        let json = match serde_json::to_string_pretty(&file) {
-            Ok(json) => json,
-            Err(err) => {
-                tracing::warn!(error = %err, "model-cache serialize failed");
-                return;
-            }
-        };
-        let tmp = path.with_extension("json.tmp");
-        if let Err(err) = std::fs::write(&tmp, json).and_then(|()| std::fs::rename(&tmp, &path)) {
-            tracing::warn!(error = %err, "model-cache save failed");
-        }
+        persist_models_cache_to(&path, &self.models_cache_entries());
     }
 
-    /// The model list for `id` — the resolved harness's discovery, served
-    /// stale-while-revalidate from the persistent cache. A fresh-enough
-    /// entry renders instantly (no cold agent boot on picker open; the app's
-    /// boot prefetch probes every offered harness in parallel, and opencode's
-    /// Node startup alone measured ~13s), then re-probes in the background so
-    /// the file stays warm for the next launch. A miss — or a probe failure
-    /// with no usable fallback — probes now and propagates, exactly like the
-    /// harness's own `models()`.
-    pub async fn models(&self, id: HarnessId) -> Result<Vec<Model>, HarnessError> {
+    /// The model list for `id`.
+    ///
+    /// `force == false` is the picker's normal path and is CACHE-FIRST: any
+    /// known list is served instantly however old it is, and a stale one is
+    /// re-probed in the background — so opening the picker, or switching back
+    /// to an agent, never re-runs a cold CLI probe. With nothing cached yet,
+    /// one live probe runs; if the CLI is installed but failing (crash,
+    /// timeout, signed out), the harness's curated
+    /// [`Harness::fallback_models`] stands in for the display while the probe
+    /// is retried in the background. The send path still refuses ids the CLI
+    /// does not advertise, so a fallback row can never start a dead run.
+    ///
+    /// `force == true` (Rescan / Retry) bypasses the cache entirely and probes
+    /// live: a failure propagates and is never masked.
+    pub async fn models(&self, id: HarnessId, force: bool) -> Result<Vec<Model>, HarnessError> {
+        if force {
+            return self.probe_live(id).await;
+        }
         let now = crate::now_ms();
-        let ttl_ms = MODELS_CACHE_TTL.as_millis() as i64;
         let refresh_after_ms = MODELS_CACHE_REFRESH_AFTER.as_millis() as i64;
 
-        // Stale-while-revalidate off the boot-loaded cache: a fresh-enough
-        // entry serves instantly WITHOUT resolving the harness — the picker
-        // renders before any agent boots (opencode's cold Node start measured
-        // ~13s under the app's 4-way boot prefetch; user report: "model
-        // loading is too slow"). Refresh in the background at most every
-        // REFRESH_AFTER so the file stays warm without a probe per open.
+        // Cache-first off the boot-loaded cache: the entry serves WITHOUT
+        // resolving the harness, so the picker renders before any agent boots
+        // (opencode's cold Node start measured ~13s under the app's 4-way boot
+        // prefetch; user report: "model loading is too slow"). A stale entry is
+        // revalidated off the hot path.
         if let Some(cached) = self.models_cache_entries().get(&id).cloned() {
-            let age = now - cached.discovered_at_ms;
-            let has_obsolete = id == HarnessId::Antigravity
-                && cached
-                    .models
-                    .iter()
-                    .any(|m| m.id == "gemini-3.7-flash" || m.id == "gemini-2.5-flash");
-            if age < ttl_ms && !has_obsolete {
-                if age >= refresh_after_ms
-                    && let Ok(harness) = self.resolve(id)
-                {
-                    let cache = Arc::clone(&self.models_cache);
-                    let path = self
-                        .models_cache_path
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .clone();
-                    tokio::spawn(async move {
-                        if let Ok(fresh) = harness.models().await
-                            && !fresh.is_empty()
-                        {
-                            cache.lock().unwrap_or_else(PoisonError::into_inner).insert(
-                                id,
-                                CachedModels {
-                                    discovered_at_ms: crate::now_ms(),
-                                    models: fresh.clone(),
-                                },
-                            );
-                            if let Some(path) = path {
-                                let file = ModelsCacheFile {
-                                    entries: cache
-                                        .lock()
-                                        .unwrap_or_else(PoisonError::into_inner)
-                                        .clone(),
-                                };
-                                let _ = serde_json::to_string_pretty(&file)
-                                    .ok()
-                                    .and_then(|json| std::fs::write(path, json).ok());
-                            }
-                        }
-                    });
+            if !cached.models.is_empty() {
+                if now - cached.discovered_at_ms >= refresh_after_ms {
+                    self.spawn_background_refresh(id);
                 }
                 return Ok(cached.models);
             }
         }
 
+        // Nothing known yet: one blocking probe, then the curated fallback.
         let harness = self.resolve(id)?;
         match harness.models().await {
             Ok(models) if !models.is_empty() => {
-                self.models_cache_entries().insert(
-                    id,
-                    CachedModels {
-                        discovered_at_ms: now,
-                        models: models.clone(),
-                    },
-                );
-                self.persist_models_cache();
+                self.store_models(id, now, models.clone());
                 Ok(models)
             }
-            // The wire advertised nothing (or the probe failed): fall back to
-            // a stale cached list when one exists, then to the harness's own
-            // answer (static catalog, or the propagated error for
-            // wire-first harnesses).
-            other => match self.models_cache_entries().get(&id).cloned() {
-                Some(cached) if !cached.models.is_empty() => Ok(cached.models),
-                _ => other,
-            },
+            Ok(_) => {
+                // An empty wire answer is never a successful load (every
+                // harness errors instead; this arm is the belt).
+                let error = HarnessError::Protocol(format!(
+                    "{id:?} model discovery returned no usable models"
+                ));
+                self.fallback_or_error(id, &harness, error)
+            }
+            Err(error) => self.fallback_or_error(id, &harness, error),
         }
+    }
+
+    /// Persist a successfully probed list (success-only, atomically).
+    fn store_models(&self, id: HarnessId, now: i64, models: Vec<Model>) {
+        self.models_cache_entries().insert(
+            id,
+            CachedModels {
+                discovered_at_ms: now,
+                models,
+            },
+        );
+        self.persist_models_cache();
+    }
+
+    /// No cache AND a failed probe: show the harness's curated catalog when it
+    /// has one, and keep retrying in the background. A harness without a
+    /// catalog has nothing honest to show, so its error propagates.
+    fn fallback_or_error(
+        &self,
+        id: HarnessId,
+        harness: &Arc<dyn Harness>,
+        error: HarnessError,
+    ) -> Result<Vec<Model>, HarnessError> {
+        let fallback = harness.fallback_models();
+        if fallback.is_empty() {
+            return Err(error);
+        }
+        tracing::warn!(
+            harness = ?id,
+            error = %error,
+            "model probe failed with nothing cached; showing the curated fallback and retrying in the background"
+        );
+        self.spawn_background_refresh(id);
+        Ok(fallback)
+    }
+
+    /// Re-probe `id` in the background and persist a successful answer
+    /// atomically. Failures are silent — the served entry stays until the next
+    /// refresh window or an explicit `force` probe.
+    fn spawn_background_refresh(&self, id: HarnessId) {
+        let Ok(harness) = self.resolve(id) else {
+            return;
+        };
+        let cache = Arc::clone(&self.models_cache);
+        let path = self
+            .models_cache_path
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        tokio::spawn(async move {
+            if let Ok(fresh) = harness.models().await
+                && !fresh.is_empty()
+            {
+                cache.lock().unwrap_or_else(PoisonError::into_inner).insert(
+                    id,
+                    CachedModels {
+                        discovered_at_ms: crate::now_ms(),
+                        models: fresh,
+                    },
+                );
+                if let Some(path) = path {
+                    persist_models_cache_to(
+                        &path,
+                        &cache.lock().unwrap_or_else(PoisonError::into_inner),
+                    );
+                }
+            }
+        });
+    }
+
+    /// Pure live probe for `id`: no cache read, no stale fallback — the
+    /// harness error propagates. A non-empty answer persists (success-only).
+    pub async fn probe_live(&self, id: HarnessId) -> Result<Vec<Model>, HarnessError> {
+        let harness = self.resolve(id)?;
+        let models = harness.models().await?;
+        if models.is_empty() {
+            return Err(HarnessError::Protocol(format!(
+                "{id:?} model discovery returned no usable models"
+            )));
+        }
+        self.models_cache_entries().insert(
+            id,
+            CachedModels {
+                discovered_at_ms: crate::now_ms(),
+                models: models.clone(),
+            },
+        );
+        self.persist_models_cache();
+        Ok(models)
+    }
+
+    /// Drop one harness's cached models; the next `models()` probes live.
+    pub fn invalidate_models(&self, id: HarnessId) {
+        self.models_cache_entries().remove(&id);
+        self.persist_models_cache();
+    }
+
+    /// Harness ids holding a non-empty cached model list.
+    pub fn cached_model_ids(&self) -> Vec<HarnessId> {
+        self.models_cache_entries()
+            .iter()
+            .filter_map(|(id, cached)| (!cached.models.is_empty()).then_some(*id))
+            .collect()
+    }
+
+    /// Prefetch `ids` through the normal [`Self::models`] discipline
+    /// (cached path: instant when fresh, live probe on miss), two harnesses
+    /// at a time. Single-flight per harness: an id already being warmed is
+    /// skipped. Probe failures are ignored — boot prefetch must never fail;
+    /// the picker retries live.
+    pub async fn warm_models_cache(&self, ids: Vec<HarnessId>) {
+        for chunk in ids.chunks(2) {
+            if chunk.len() == 2 {
+                tokio::join!(self.warm_one(chunk[0]), self.warm_one(chunk[1]));
+            } else if let [only] = chunk {
+                self.warm_one(*only).await;
+            }
+        }
+    }
+
+    async fn warm_one(&self, id: HarnessId) {
+        {
+            let mut inflight = self
+                .warm_inflight
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if !inflight.insert(id) {
+                return;
+            }
+        }
+        let _ = self.models(id, false).await;
+        self.warm_inflight
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&id);
     }
 
     /// The enabled set in effect (the default set until the user edits it).
@@ -938,7 +1047,7 @@ mod tests {
         registry.register(Arc::new(MockHarness { script: Vec::new() }));
 
         // A cache miss probes the harness and writes through.
-        let models = registry.models(HarnessId::Mock).await.unwrap();
+        let models = registry.models(HarnessId::Mock, false).await.unwrap();
         assert!(!models.is_empty(), "{models:?}");
         assert!(
             dir.path().join("model-cache.json").exists(),
@@ -950,7 +1059,7 @@ mod tests {
         let reloaded = HarnessRegistry::new();
         reloaded.load_prefs(dir.path());
         reloaded.load_models_cache(dir.path());
-        let cached = reloaded.models(HarnessId::Mock).await;
+        let cached = reloaded.models(HarnessId::Mock, false).await;
         let ids: Vec<String> = cached.unwrap().into_iter().map(|m| m.id).collect();
         assert_eq!(ids, vec!["mock-1", "mock-fable-5"]);
     }
@@ -966,12 +1075,12 @@ mod tests {
         let registry = HarnessRegistry::new();
         registry.load_models_cache(dir.path());
         registry.register(Arc::new(MockHarness { script: Vec::new() }));
-        let models = registry.models(HarnessId::Mock).await.unwrap();
+        let models = registry.models(HarnessId::Mock, false).await.unwrap();
         assert_eq!(models.len(), 2);
 
         // Fresh path: second call returns from the in-memory cache (no
         // re-probe observable, but the entry's age stays under the window).
-        let again = registry.models(HarnessId::Mock).await.unwrap();
+        let again = registry.models(HarnessId::Mock, false).await.unwrap();
         assert_eq!(again.len(), 2);
         let entry = registry
             .models_cache_entries()
@@ -1005,13 +1114,50 @@ mod tests {
             reg.register(Arc::new(harness) as Arc<dyn Harness>);
             // Seed the same cache entry the parent holds.
             *reg.models_cache_entries() = registry.models_cache_entries().clone();
-            reg.models(HarnessId::Opencode).await
+            reg.models(HarnessId::Opencode, false).await
         };
         assert_eq!(
             fallback.unwrap()[0].id,
             "opencode/smol",
             "a stale cached list must outlive an empty wire probe"
         );
+    }
+
+    #[tokio::test]
+    async fn models_force_bypasses_cache_and_propagates_error() {
+        let registry = HarnessRegistry::new();
+        registry.load_models_cache(std::path::Path::new("/nonexistent-dir-xyz"));
+        let err = registry.models(HarnessId::ClaudeCode, true).await.expect_err("sans CLI ProbeError attendu");
+        assert!(!err.to_string().is_empty());
+    }
+
+    /// `force=true` must never mask a probe failure with a stale cached
+    /// list: the error propagates so the picker shows it, not old models.
+    #[tokio::test]
+    async fn models_force_never_serves_stale_on_probe_error() {
+        let registry = HarnessRegistry::new();
+        registry.load_models_cache(std::path::Path::new("/nonexistent-dir-xyz"));
+        let harness = komet_harness::AcpHarness::opencode()
+            .with_executable("/nonexistent/never-an-opencode-acp");
+        registry.register(Arc::new(harness) as Arc<dyn Harness>);
+        registry.models_cache_entries().insert(
+            HarnessId::Opencode,
+            CachedModels {
+                discovered_at_ms: crate::now_ms(),
+                models: vec![Model {
+                    id: "opencode/smol".into(),
+                    label: "Smol".into(),
+                    description: None,
+                    reasoning_levels: vec![],
+                    options: vec![],
+                }],
+            },
+        );
+        let err = registry
+            .models(HarnessId::Opencode, true)
+            .await
+            .expect_err("force=true must propagate the probe error, not stale cache");
+        assert!(!err.to_string().is_empty());
     }
 
     /// The Codex lazy descriptor must be indistinguishable from `describe()`
@@ -1038,5 +1184,102 @@ mod tests {
         assert_eq!(before.supports_steering, after.supports_steering);
         assert_eq!(before.steering_mode, after.steering_mode);
         assert_eq!(before.reasoning_levels, after.reasoning_levels);
+    }
+
+    /// Cache-first: once a list is known, `models(force=false)` must serve it
+    /// WITHOUT resolving the harness again — that is what stops a picker open
+    /// or an agent switch from re-running a cold CLI probe. `force=true`
+    /// (Rescan) still resolves and probes.
+    #[tokio::test]
+    async fn cached_models_are_served_without_resolving_the_harness() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let registry = HarnessRegistry::new();
+        let resolves = Arc::new(AtomicUsize::new(0));
+        let counted = resolves.clone();
+        registry.register_lazy(
+            HarnessDescriptor {
+                id: HarnessId::Mock,
+                name: "Mock".into(),
+                supports_steering: true,
+                steering_mode: SteeringMode::StepBoundary,
+                reasoning_levels: vec![],
+                installed: true,
+                enabled: None,
+            },
+            Box::new(|| true),
+            Box::new(move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Ok(Arc::new(MockHarness { script: vec![] }) as Arc<dyn Harness>)
+            }),
+        );
+
+        // Cold picker: one probe, which resolves the harness and caches.
+        let first = registry
+            .models(HarnessId::Mock, false)
+            .await
+            .expect("first load probes");
+        assert!(!first.is_empty());
+        assert_eq!(resolves.load(Ordering::SeqCst), 1);
+
+        // Overwrite the cache with a marker list so the next answer's origin
+        // is unambiguous: the marker means "cache", anything else "probe".
+        registry.models_cache_entries().insert(
+            HarnessId::Mock,
+            CachedModels {
+                discovered_at_ms: crate::now_ms(),
+                models: vec![Model {
+                    id: "from-cache".into(),
+                    label: "From cache".into(),
+                    description: None,
+                    reasoning_levels: vec![],
+                    options: vec![],
+                }],
+            },
+        );
+
+        let cached = registry
+            .models(HarnessId::Mock, false)
+            .await
+            .expect("cached load");
+        assert_eq!(
+            cached[0].id, "from-cache",
+            "a known list must be served from the cache, not re-probed"
+        );
+        assert_eq!(
+            resolves.load(Ordering::SeqCst),
+            1,
+            "a cache hit must not resolve (and therefore not probe) the harness"
+        );
+
+        // Rescan / Retry: bypasses the cache and probes the CLI.
+        let forced = registry
+            .models(HarnessId::Mock, true)
+            .await
+            .expect("forced probe");
+        assert_ne!(
+            forced[0].id, "from-cache",
+            "force=true must probe the harness instead of serving the cache"
+        );
+    }
+
+    /// A crashing CLI with nothing cached shows the harness's curated catalog
+    /// instead of a dead-end error, while the background retry keeps running.
+    #[tokio::test]
+    async fn failed_probe_without_cache_serves_the_curated_fallback() {
+        let registry = HarnessRegistry::new();
+        let harness = komet_harness::claude::ClaudeHarness::new()
+            .with_executable("/nonexistent/never-a-claude");
+        registry.register(Arc::new(harness) as Arc<dyn Harness>);
+
+        let models = registry
+            .models(HarnessId::ClaudeCode, false)
+            .await
+            .expect("a curated fallback must outlive a failed first probe");
+        assert_eq!(
+            models.len(),
+            komet_harness::claude::catalog::static_models().len(),
+            "the fallback is the harness's curated catalog"
+        );
+        assert!(!models.is_empty());
     }
 }

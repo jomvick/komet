@@ -7,7 +7,9 @@ use std::time::Duration;
 use futures::StreamExt;
 use tokio::sync::{mpsc, oneshot};
 
-use komet_harness::{AntigravityHarness, CancellationToken, Harness, RunControls, SteerMessage};
+use komet_harness::{
+    AntigravityHarness, CancellationToken, Harness, HarnessError, RunControls, SteerMessage,
+};
 use komet_proto::{
     AgentEvent, DoneStatus, HarnessId, ReasoningLevel, RunRequest, SandboxLevel, ToolCall,
 };
@@ -322,6 +324,38 @@ async fn dynamic_model_discovery() {
     let models = h.models().await.expect("models query succeeds");
     assert!(models.iter().any(|m| m.id == "gemini-3.8-flash-high"));
     assert!(models.iter().any(|m| m.id == "claude-sonnet-4-6"));
+}
+
+#[tokio::test]
+async fn antigravity_failed_probe_returns_err() {
+    // Live-only: a missing binary surfaces NotInstalled, never a list.
+    let missing = AntigravityHarness::new().with_executable("/nonexistent/never-an-agy");
+    let err = missing.models().await.expect_err("missing binary errors");
+    assert!(
+        matches!(err, HarnessError::NotInstalled(_)),
+        "readable install error, got: {err:?}"
+    );
+    // A failing `agy models` (non-zero exit, login hint on stderr) surfaces
+    // a Protocol error naming agy — never the static catalog.
+    let failing_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("fake-agy-fail-models.sh");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&failing_path, std::fs::Permissions::from_mode(0o755));
+    }
+    let failing = AntigravityHarness::new().with_executable(failing_path);
+    let err = failing.models().await.expect_err("failing probe errors");
+    assert!(
+        matches!(err, HarnessError::Protocol(_)),
+        "readable protocol error, got: {err:?}"
+    );
+    assert!(
+        err.to_string().contains("agy"),
+        "error names the CLI, got: {err}"
+    );
 }
 
 #[tokio::test]

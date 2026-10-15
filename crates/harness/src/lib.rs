@@ -116,6 +116,16 @@ pub trait Harness: Send + Sync {
         false
     }
     async fn models(&self) -> Result<Vec<Model>, HarnessError>;
+    /// Last-resort DISPLAY list used when live discovery fails and nothing has
+    /// ever been cached: the harness's curated catalog, for the CLIs that
+    /// still ship one. Display only — the engine keeps re-probing in the
+    /// background and swaps this out the moment the CLI answers, and the send
+    /// path still refuses any id the CLI does not advertise, so a fallback row
+    /// can never smuggle a dead model into a run. Empty for adapter agents
+    /// with no catalog (ACP: grok, hermes, opencode, cline).
+    fn fallback_models(&self) -> Vec<Model> {
+        Vec::new()
+    }
     /// Slash commands the agent advertises. Native harnesses merge a curated
     /// CLI catalog with a live probe when one exists (ACP
     /// `availableCommands`, Claude `initialize` / skills, Codex

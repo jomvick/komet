@@ -302,7 +302,11 @@ impl CodexHarness {
             }
             Ok::<Vec<Model>, HarnessError>(models)
         };
-        let result = tokio::time::timeout(Duration::from_secs(15), discovery).await;
+        // A cold `codex app-server` boot can exceed 15s on a busy machine; a
+        // too-tight bound turned a healthy CLI into a protocol error. 45s
+        // absorbs it, and the engine's cache/fallback keeps the picker
+        // populated meanwhile.
+        let result = tokio::time::timeout(Duration::from_secs(45), discovery).await;
         shutdown_child(&mut child, self.kill_grace).await;
         match result {
             Ok(inner) => inner,
@@ -388,42 +392,42 @@ impl Harness for CodexHarness {
         true
     }
 
-    /// Model discovery: live `codex app-server` `model/list` first,
-    /// local `~/.codex/models_cache.json` as second tier, curated snapshot as fallback.
+    /// Model discovery: live `codex app-server` `model/list` only — no
+    /// static fallback, so the picker only shows models the CLI offers.
     /// Requires an installed CLI so an absent binary surfaces as [`HarnessError::NotInstalled`].
+    /// A failed probe is UNCACHED (`OnceCell` stores successes only) so the
+    /// next picker open retries. Concurrent calls share one probe:
+    /// `OnceCell` single-flights the initializer.
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         self.resolve_executable()?;
         self.models
             .get_or_try_init(|| async {
-                match self.discover_live_models().await {
-                    Ok(models) if !models.is_empty() => {
-                        tracing::info!(
-                            target: "komet_harness::codex",
-                            count = models.len(),
-                            "discovered live Codex models from app-server"
-                        );
-                        Ok(models)
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "komet_harness::codex",
-                            source = "static-fallback",
-                            "Codex live model discovery failed; falling back to local cache: {e}"
-                        );
-                        Ok(catalog::load_catalog())
-                    }
-                    Ok(_) => {
-                        tracing::warn!(
-                            target: "komet_harness::codex",
-                            source = "static-fallback",
-                            "Codex live model discovery returned 0 models; falling back to local cache"
-                        );
-                        Ok(catalog::load_catalog())
-                    }
+                let models = self.discover_live_models().await.inspect_err(|e| {
+                    tracing::warn!(
+                        target: "komet_harness::codex",
+                        "Codex live model discovery failed: {e}"
+                    );
+                })?;
+                if models.is_empty() {
+                    return Err(HarnessError::Protocol(
+                        "codex model/list returned no usable models".into(),
+                    ));
                 }
+                tracing::info!(
+                    target: "komet_harness::codex",
+                    count = models.len(),
+                    "discovered live Codex models from app-server"
+                );
+                Ok(models)
             })
             .await
             .cloned()
+    }
+
+    /// Curated catalog, shown only until the first live probe succeeds (see
+    /// [`Harness::fallback_models`]). `models()` itself stays live-only.
+    fn fallback_models(&self) -> Vec<Model> {
+        catalog::static_models()
     }
 
     /// Skills from a short-lived `skills/list` probe (see

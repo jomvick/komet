@@ -73,7 +73,16 @@ use subagent::SubagentTracker;
 use subagent_opencode::OpencodeTracker;
 
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(120);
-const DEFAULT_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
+/// Default model-probe bound for ACP agents that do NOT override their own
+/// startup budget (grok, hermes, pi — opencode/cline set their own). Measured
+/// against the installed Hermes on a WARM machine: `initialize` answers at
+/// 8.2s and the `session/new` that carries the model list at 22.7s (plugin
+/// discovery alone registers 57 plugins), so the old 10s bound failed a
+/// perfectly healthy CLI with "model discovery did not complete within 10s".
+/// The probe therefore shares the handshake's wedged-agent bound: a genuinely
+/// stuck agent is still caught, a slow-but-healthy one is not — and the
+/// engine's cache/fallback keeps the picker populated while it runs.
+const DEFAULT_MODEL_DISCOVERY_TIMEOUT: Duration = DEFAULT_HANDSHAKE_TIMEOUT;
 /// OpenCode loads its plugins and MCP configuration before it answers ACP.
 /// Plugin-heavy cold starts can take minutes, so model discovery and a real
 /// chat must share one generous startup budget instead of racing 10s vs 120s.
@@ -1176,17 +1185,10 @@ impl AcpHarness {
             // (last-used first), labelled with its provider; free-tier
             // models float to the top, labelled as such.
             if self.spec.id == HarnessId::Cline && self.cli_sync {
-                // Drop the paid version of deepseek-v4.1-flash to prevent zero-balance billing failures.
-                models.retain(|m| m.id != "deepseek/deepseek-v4.1-flash");
+                // Drop obsolete fake test models
+                models.retain(|m| m.id != "deepseek/deepseek-v4.1-flash" && m.id != "stealth/space-bunny-alpha");
 
-                // Inject official Cline free-tier models first.
-                for builtin in cline_builtin_free_models().into_iter().rev() {
-                    if !models.iter().any(|m| m.id == builtin.id) {
-                        models.insert(0, builtin);
-                    }
-                }
-
-                // Inject any other configured CLI models (e.g. from cline-pass):
+                // Inject configured CLI models first (last-used first) from providers.json:
                 for (provider, model) in cline_cli_models_in(self.cline_data_dir.as_ref()) {
                     let Some(model) = model else {
                         continue;
@@ -1212,6 +1214,13 @@ impl AcpHarness {
                             options: Vec::new(),
                         },
                     );
+                }
+
+                // Inject official Cline free-tier models next if missing.
+                for builtin in cline_builtin_free_models().into_iter().rev() {
+                    if !models.iter().any(|m| m.id == builtin.id) {
+                        models.insert(0, builtin);
+                    }
                 }
                 for model in &mut models {
                     if cline_is_free_model(&model.id) && !model.label.contains("(free)") {
@@ -1757,18 +1766,15 @@ impl Harness for AcpHarness {
                 });
                 Ok(models)
             }
-            Ok(_) => Ok((self.spec.models)()),
-            // Never let a stale static catalog masquerade as a successful
-            // load: opencode's plugin-backed catalog and Cline's signed-in
-            // catalog (session/new rejects -32000 until `cline` has a login)
-            // would otherwise hide a slow or failed handshake from the picker.
-            // The error (and the agent's own wording) stays visible.
-            Err(error)
-                if self.spec.id == HarnessId::Opencode || self.spec.id == HarnessId::Cline =>
-            {
-                Err(error)
-            }
-            Err(_) => Ok((self.spec.models)()),
+            Ok(_) => Err(HarnessError::Protocol(format!(
+                "{} model discovery returned no usable models — {}",
+                self.spec.display_name, self.spec.install_hint
+            ))),
+            // Live-only: a failed handshake errors — never let a stale static
+            // catalog masquerade as a successful load. The error (and the
+            // agent's own wording) stays visible, and a failed probe is
+            // UNCACHED so the next picker open retries.
+            Err(error) => Err(error),
         }
     }
 
@@ -2184,16 +2190,35 @@ fn first_class_model_change(
     if available.is_empty() {
         return Ok(None);
     }
-    if !available.contains(&requested) {
+
+    let resolved = if available.contains(&requested) {
+        Some(requested.to_owned())
+    } else if let Some(fuzzy) = pick_model_value(requested, &available, false) {
+        Some(fuzzy)
+    } else if let Some(stripped_match) = available.iter().find(|m| {
+        let m_unprefixed = m.split_once(':').map(|(_, s)| s).unwrap_or(m);
+        m_unprefixed == requested
+            || m_unprefixed.rsplit('/').next() == Some(requested)
+            || requested.rsplit('/').next() == Some(m_unprefixed)
+            || m.contains(requested)
+            || requested.contains(*m)
+    }) {
+        Some((*stripped_match).to_owned())
+    } else {
+        None
+    };
+
+    let Some(target) = resolved else {
         return Err(HarnessError::Protocol(format!(
             "agent does not advertise requested model {requested}; available models: {}",
             available.join(", ")
         )));
-    }
-    if models.get("currentModelId").and_then(Value::as_str) == Some(requested) {
+    };
+
+    if models.get("currentModelId").and_then(Value::as_str) == Some(&target) {
         return Ok(None);
     }
-    Ok(Some(requested.to_owned()))
+    Ok(Some(target))
 }
 
 /// Cline's on-disk data dir (`~/.cline/data`): sessions, settings, logs.
@@ -2322,20 +2347,6 @@ fn acp_model_cache_buster_in(id: HarnessId, data_dir: Option<&PathBuf>) -> Strin
 fn cline_builtin_free_models() -> Vec<Model> {
     vec![
         Model {
-            id: "cline-free/deepseek-v4.1-flash".into(),
-            label: "DeepSeek V4.1 Flash (free)".into(),
-            description: Some("Fast and efficient with 1M context window (free)".into()),
-            reasoning_levels: Vec::new(),
-            options: Vec::new(),
-        },
-        Model {
-            id: "stealth/space-bunny-alpha".into(),
-            label: "Space Bunny Alpha (free)".into(),
-            description: Some("Blazing-fast inference with 1M context (free)".into()),
-            reasoning_levels: Vec::new(),
-            options: Vec::new(),
-        },
-        Model {
             id: "cline-free/mimo-v2.6-flash".into(),
             label: "MiMo-V2.6-Flash (free)".into(),
             description: Some(
@@ -2344,20 +2355,13 @@ fn cline_builtin_free_models() -> Vec<Model> {
             reasoning_levels: Vec::new(),
             options: Vec::new(),
         },
-        Model {
-            id: "cline-free/muse-spark-1.3-contributor".into(),
-            label: "Muse Spark 1.3 Contributor (free)".into(),
-            description: Some("Meta's multimodal reasoning model (free)".into()),
-            reasoning_levels: Vec::new(),
-            options: Vec::new(),
-        },
     ]
 }
 
-/// Whether a model id is a free-tier one (`cline-free/*` and `stealth/*`
-/// hardcodes from the CLI package, `:free` suffix on the wire catalog).
+/// Whether a model id is a free-tier one (`cline-free/*`
+/// prefix on the wire catalog or `:free` suffix).
 fn cline_is_free_model(id: &str) -> bool {
-    id.starts_with("cline-free/") || id.ends_with(":free") || id == "stealth/space-bunny-alpha"
+    id.starts_with("cline-free/") || id.ends_with(":free")
 }
 
 /// The last `displayRole: "error"` message in a Cline session file
@@ -4887,6 +4891,20 @@ mod tests {
         ));
         assert!(acp_auto_permission(SandboxLevel::ReadOnly, &tool).is_none());
         assert!(acp_auto_permission(SandboxLevel::WorkspaceWrite, &write).is_none());
+    }
+
+    /// ACP agents with no startup budget of their own (hermes, grok, pi) must
+    /// not fail their model probe earlier than the point where the same
+    /// process would be considered wedged — Hermes answers `session/new` at
+    /// ~23s warm, well past the old 10s probe bound.
+    #[test]
+    fn default_model_probe_matches_the_handshake_bound() {
+        let harness = AcpHarness::hermes();
+        assert_eq!(
+            harness.model_discovery_timeout, DEFAULT_HANDSHAKE_TIMEOUT,
+            "a healthy cold ACP boot must not read as a model-discovery failure"
+        );
+        assert_eq!(harness.model_discovery_timeout.as_secs(), 120);
     }
 
     #[test]

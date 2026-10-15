@@ -180,9 +180,9 @@ pub fn parse_models(output: &str) -> Vec<Model> {
             .unwrap_or("");
         models.push(model(id, &label, description, options));
     }
-    if models.is_empty() {
-        return static_list;
-    }
+    // No static fallback: an empty parse means the probe found nothing, and
+    // the caller surfaces that as a Protocol error. `static_list` above only
+    // enriches labels/descriptions of LIVE-discovered ids.
     models
 }
 
@@ -334,6 +334,15 @@ mod tests {
         );
         // Default model is gemini-3.8-flash-high — omit --effort when unspecified.
         assert_eq!(to_effort(Some(ReasoningLevel::Medium), None), None);
+    }
+
+    #[test]
+    fn parse_models_empty_output_yields_no_models() {
+        // Live-only: an empty/blank `agy models` parse must come back empty
+        // (the caller maps it to a Protocol error) — never the static list.
+        assert!(parse_models("").is_empty());
+        assert!(parse_models("   \n  \n").is_empty());
+        assert!(parse_models("Fetching available models...\n").is_empty());
     }
 
     #[test]

@@ -870,11 +870,11 @@ async fn models_enrich_from_the_static_catalog_on_id_match() {
 }
 
 #[tokio::test]
-async fn models_fall_back_to_the_static_catalog_when_the_probe_fails() {
+async fn models_errors_when_the_probe_fails() {
     let harness = AcpHarness::pi().with_executable("/nonexistent/never-a-pi-acp");
-    let models = harness.models().await.expect("static fallback");
-    let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
-    assert_eq!(ids, vec!["default"], "{models:?}");
+    // Live-only: a failed probe errors instead of serving the static catalog.
+    let err = harness.models().await.expect_err("failed probe errors");
+    assert!(matches!(err, HarnessError::NotInstalled(_)), "{err:?}");
 }
 
 #[cfg(unix)]
@@ -1128,12 +1128,12 @@ async fn opencode_probe_failure_surfaces_as_an_error() {
 }
 
 #[tokio::test]
-async fn catalog_harness_failed_probe_still_falls_back_to_static_models() {
-    // The error-propagation rule is wire-only: a catalog-backed harness
-    // (cursor here) keeps the static fallback on a failed probe.
+async fn catalog_harness_failed_probe_returns_err_not_static() {
+    // Live-only for every harness: a failed probe errors instead of serving
+    // the static catalog (grok here — same rule as opencode/cline).
     let harness = AcpHarness::grok().with_executable("/nonexistent/never-a-cursor-agent");
-    let models = harness.models().await.expect("static fallback");
-    assert!(!models.is_empty(), "{models:?}");
+    let err = harness.models().await.expect_err("failed probe errors");
+    assert!(matches!(err, HarnessError::NotInstalled(_)), "{err:?}");
 }
 
 #[tokio::test]
