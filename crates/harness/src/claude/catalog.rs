@@ -189,14 +189,34 @@ fn contains_any(hay: &str, needles: &[&str]) -> bool {
 /// Models whose CLI accepts `xhigh` natively; elsewhere it clamps to `max`
 /// (mirroring Claude Code's own normalization). Substring port of claude.ts's
 /// `/fable-5|opus-4-[7-9]|opus-[5-9]|sonnet-[5-9]/`.
+///
+/// The CLI's own `list_models` entries use FAMILY ALIASES as ids (`default`,
+/// `opus[1m]`, `sonnet`, `haiku`) and advertise `supportedEffortLevels`
+/// including `xhigh` for them, so those alias shapes are recognized too —
+/// exactly, not by substring, which would drag `opus-4-5` back in.
 pub(crate) fn supports_xhigh(model: &str) -> bool {
-    contains_any(
-        model,
-        &[
-            "fable-5", "opus-4-7", "opus-4-8", "opus-4-9", "opus-5", "opus-6", "opus-7", "opus-8",
-            "opus-9", "sonnet-5", "sonnet-6", "sonnet-7", "sonnet-8", "sonnet-9", "3-7-sonnet",
-        ],
-    )
+    let alias = model.split('[').next().unwrap_or(model);
+    matches!(alias, "default" | "opus" | "sonnet")
+        || contains_any(
+            model,
+            &[
+                "fable-5",
+                "opus-4-7",
+                "opus-4-8",
+                "opus-4-9",
+                "opus-5",
+                "opus-6",
+                "opus-7",
+                "opus-8",
+                "opus-9",
+                "sonnet-5",
+                "sonnet-6",
+                "sonnet-7",
+                "sonnet-8",
+                "sonnet-9",
+                "3-7-sonnet",
+            ],
+        )
 }
 
 /// Map the unified level to the `--effort` flag value the CLI accepts for this
@@ -495,8 +515,53 @@ pub fn static_models() -> Vec<Model> {
     list
 }
 
-/// Parse dynamically discovered models from Claude control response (`supported_models`).
-/// Overlays curated effort ladders and model options.
+/// The CLI's own effort ladder for a live entry (`supportedEffortLevels`),
+/// mapped onto the picker's levels. `None` when the wire says nothing, so the
+/// curated family heuristics below still decide.
+fn wire_ladder(item: &serde_json::Value) -> Option<Vec<ReasoningLevel>> {
+    let names: Vec<String> = item
+        .get("supportedEffortLevels")?
+        .as_array()?
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::to_ascii_lowercase)
+        .collect();
+    if names.is_empty() {
+        return None;
+    }
+    let has = |name: &str| names.iter().any(|n| n == name);
+    let mut ladder = Vec::new();
+    if has("minimal") {
+        ladder.push(ReasoningLevel::Minimal);
+    }
+    if has("low") {
+        ladder.push(ReasoningLevel::Low);
+    }
+    if has("medium") {
+        ladder.push(ReasoningLevel::Medium);
+    }
+    if has("high") {
+        ladder.push(ReasoningLevel::High);
+    }
+    if has("xhigh") {
+        ladder.push(ReasoningLevel::XHigh);
+    }
+    if has("max") {
+        ladder.push(ReasoningLevel::Max);
+    }
+    // komet-only modes ride the advertised levels instead of a new flag:
+    // Ultracode is the CLI's `xhigh`, Ultrathink a prompt prefix.
+    if has("xhigh") {
+        ladder.push(ReasoningLevel::Ultracode);
+    }
+    ladder.push(ReasoningLevel::Ultrathink);
+    Some(ladder)
+}
+
+/// Parse dynamically discovered models from a Claude control-channel response
+/// (`list_models` on 2.1.x, `supported_models` on older builds; the shapes
+/// differ only in which keys are present). Overlays curated effort ladders and
+/// model options where the wire is silent.
 pub(crate) fn parse_discovered_models(value: &serde_json::Value) -> Vec<Model> {
     let raw_list = if let Some(arr) = value.as_array() {
         arr.as_slice()
@@ -563,23 +628,41 @@ pub(crate) fn parse_discovered_models(value: &serde_json::Value) -> Vec<Model> {
                 options: matched.options.clone(),
             });
         } else {
-            // New/unrecognized model: derive ladder & options
-            let ladder = if id.contains("haiku") {
-                Vec::new()
-            } else if id.contains("opus-4-7") || id.contains("sonnet-5") {
-                XHIGH_LADDER.to_vec()
-            } else {
-                FULL_LADDER.to_vec()
-            };
+            // Live/unrecognized model: prefer what the CLI itself advertises
+            // (`supportedEffortLevels`, `supportsFastMode`) and keep the
+            // curated family heuristics only for what the wire omits.
+            let ladder = wire_ladder(item).unwrap_or_else(|| {
+                if id.contains("haiku") {
+                    Vec::new()
+                } else if id.contains("opus-4-7") || id.contains("sonnet-5") {
+                    XHIGH_LADDER.to_vec()
+                } else {
+                    FULL_LADDER.to_vec()
+                }
+            });
 
+            // `[1m]` in the advertised id or its resolved model means this row
+            // IS the long-context variant: a 200K/1M select on top of it would
+            // be a lie (and would double the suffix on the wire).
+            let already_one_m = ["value", "id", "resolvedModel", "model"]
+                .iter()
+                .filter_map(|key| item.get(key).and_then(serde_json::Value::as_str))
+                .any(|v| v.contains("[1m]"));
             let mut options = Vec::new();
             if id.contains("haiku") {
                 options.push(toggle("thinking", "Thinking"));
-            } else {
+            } else if !already_one_m {
                 options.push(context_window());
-                if id.contains("opus") {
-                    options.push(toggle("fastMode", "Fast Mode"));
-                }
+            }
+            let fast_mode = match item
+                .get("supportsFastMode")
+                .and_then(serde_json::Value::as_bool)
+            {
+                Some(advertised) => advertised,
+                None => id.contains("opus"),
+            };
+            if fast_mode {
+                options.push(toggle("fastMode", "Fast Mode"));
             }
 
             out.push(model(id, label, description, &ladder, options));
@@ -610,6 +693,132 @@ mod tests {
         assert!(models[1].reasoning_levels.is_empty());
         assert_eq!(models[2].id, "claude-custom-new");
         assert_eq!(models[2].reasoning_levels, FULL_LADDER);
+    }
+
+    /// The live shape of CLI 2.1.x `list_models` (captured verbatim from
+    /// `claude --print … | list_models`): alias ids, `displayName`, and the
+    /// CLI's own `supportedEffortLevels` / `supportsFastMode`.
+    fn live_list_models_payload() -> serde_json::Value {
+        serde_json::json!({
+            "models": [
+                {
+                    "value": "default",
+                    "resolvedModel": "claude-opus-4-8[1m]",
+                    "displayName": "Default (recommended)",
+                    "description": "Use the default model (currently Opus 4.8 (1M context)) · $5/$25 per Mtok",
+                    "supportsEffort": true,
+                    "supportedEffortLevels": ["low", "medium", "high", "xhigh", "max"],
+                    "supportsAdaptiveThinking": true,
+                    "supportsFastMode": true,
+                    "supportsAutoMode": true
+                },
+                {
+                    "value": "opus[1m]",
+                    "resolvedModel": "claude-opus-4-8[1m]",
+                    "displayName": "Opus",
+                    "description": "Opus 4.8 with 1M context · Best for everyday, complex tasks · $5/$25 per Mtok",
+                    "supportsEffort": true,
+                    "supportedEffortLevels": ["low", "medium", "high", "xhigh", "max"],
+                    "supportsFastMode": true
+                },
+                {
+                    "value": "sonnet",
+                    "resolvedModel": "claude-sonnet-5",
+                    "displayName": "Sonnet",
+                    "description": "Sonnet 5 · Efficient for routine tasks · $3/$15 per Mtok",
+                    "supportsEffort": true,
+                    "supportedEffortLevels": ["low", "medium", "high", "xhigh", "max"]
+                },
+                {
+                    "value": "haiku",
+                    "resolvedModel": "claude-haiku-4-5-20251001",
+                    "displayName": "Haiku",
+                    "description": "Haiku 4.5 · Fastest for quick answers · $1/$5 per Mtok"
+                }
+            ]
+        })
+    }
+
+    /// The live list drives the picker: alias ids the CLI accepts, its own
+    /// labels/descriptions, and its own effort ladder (never a guessed one).
+    #[test]
+    fn parse_live_list_models_shape() {
+        let models = parse_discovered_models(&live_list_models_payload());
+        let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["default", "opus[1m]", "sonnet", "haiku"]);
+        assert_eq!(models[0].label, "Default (recommended)");
+        assert_eq!(models[2].label, "Sonnet");
+        assert!(
+            models[2]
+                .description
+                .as_deref()
+                .unwrap()
+                .starts_with("Sonnet 5")
+        );
+
+        // `low high xhigh max` + the komet-only modes riding them.
+        assert_eq!(
+            models[1].reasoning_levels,
+            vec![
+                ReasoningLevel::Low,
+                ReasoningLevel::Medium,
+                ReasoningLevel::High,
+                ReasoningLevel::XHigh,
+                ReasoningLevel::Max,
+                ReasoningLevel::Ultracode,
+                ReasoningLevel::Ultrathink,
+            ]
+        );
+        // Haiku advertises no effort levels: thinking toggle only.
+        assert!(models[3].reasoning_levels.is_empty());
+        assert_eq!(models[3].options.len(), 1);
+        assert_eq!(models[3].options[0].id, "thinking");
+
+        // `[1m]` rows are already long-context — no 200K/1M select to double
+        // the suffix on the wire — while the plain `sonnet` alias gets one.
+        assert!(models[1].options.iter().all(|o| o.id != "contextWindow"));
+        assert!(models[2].options.iter().any(|o| o.id == "contextWindow"));
+        // Fast mode comes from the wire, not from the id spelling.
+        assert!(models[0].options.iter().any(|o| o.id == "fastMode"));
+        assert!(models[2].options.iter().all(|o| o.id != "fastMode"));
+    }
+
+    /// `to_effort` must not clamp away the `xhigh` the CLI advertises for its
+    /// alias ids, and must keep clamping it for older families.
+    #[test]
+    fn alias_ids_keep_their_advertised_xhigh() {
+        for alias in ["default", "opus", "opus[1m]", "sonnet"] {
+            assert!(supports_xhigh(alias), "{alias}");
+            assert_eq!(
+                to_effort(Some(ReasoningLevel::XHigh), Some(alias)),
+                Some("xhigh"),
+                "{alias}"
+            );
+        }
+        assert!(!supports_xhigh("claude-opus-4-5"));
+        assert!(!supports_xhigh("claude-sonnet-4-5"));
+        assert_eq!(
+            to_effort(Some(ReasoningLevel::XHigh), Some("claude-opus-4-5")),
+            Some("max")
+        );
+        // Haiku stays effort-less (top-level thinking is its own toggle).
+        assert_eq!(to_effort(Some(ReasoningLevel::High), Some("haiku")), None);
+    }
+
+    /// Older builds answer `supported_models` with `{id, name}` rows and no
+    /// capability fields: the curated ladders still cover them.
+    #[test]
+    fn legacy_supported_models_shape_keeps_curated_ladders() {
+        let payload = serde_json::json!({
+            "models": [
+                { "id": "claude-opus-5", "name": "Opus 5 (Live)" },
+                { "id": "claude-sonnet-5", "name": "Sonnet 5 (Live)" }
+            ]
+        });
+        let models = parse_discovered_models(&payload);
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].reasoning_levels, FULL_LADDER);
+        assert_eq!(models[1].reasoning_levels, XHIGH_LADDER);
     }
 
     #[test]

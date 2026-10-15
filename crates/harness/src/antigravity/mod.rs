@@ -156,7 +156,10 @@ impl Harness for AntigravityHarness {
         {
             let guard = self.models.lock().await;
             if let Some((at, models)) = guard.as_ref() {
-                if at.elapsed() < std::time::Duration::from_secs(10) {
+                // In-session memo only: long enough that switching back to this
+                // harness never re-spawns `agy models`, short enough that a
+                // `Rescan` past it still sees a fresh CLI.
+                if at.elapsed() < std::time::Duration::from_secs(60) {
                     return Ok(models.clone());
                 }
             }
@@ -165,10 +168,14 @@ impl Harness for AntigravityHarness {
         crate::compose_child_path(&mut cmd, &executable);
         cmd.arg("models");
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let output = tokio::time::timeout(std::time::Duration::from_secs(15), cmd.output())
+        // `agy` cold start (auth, catalog fetch) can exceed 15s on a busy
+        // machine; a too-tight bound turned a healthy CLI into a protocol
+        // error. 45s absorbs it, and the engine's cache/fallback keeps the
+        // picker populated meanwhile.
+        let output = tokio::time::timeout(std::time::Duration::from_secs(45), cmd.output())
             .await
             .map_err(|_| {
-                HarnessError::Protocol("timeout 15s `agy models` — `agy` login requis?".into())
+                HarnessError::Protocol("timeout 45s `agy models` — `agy` login requis?".into())
             })?
             .map_err(|e| {
                 if e.kind() == std::io::ErrorKind::NotFound {
@@ -198,6 +205,12 @@ impl Harness for AntigravityHarness {
         }
         *self.models.lock().await = Some((std::time::Instant::now(), parsed.clone()));
         Ok(parsed)
+    }
+
+    /// Curated `agy` catalog, shown only until the first live probe succeeds
+    /// (see [`Harness::fallback_models`]). `models()` itself stays live-only.
+    fn fallback_models(&self) -> Vec<Model> {
+        catalog::static_models()
     }
 
     async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {

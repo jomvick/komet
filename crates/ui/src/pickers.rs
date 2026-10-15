@@ -427,6 +427,23 @@ pub enum PickerKind {
     Device,
 }
 
+/// Minimum age of an already-loaded model list before a picker open / agent
+/// switch may revalidate it. A back-and-forth between two agents inside this
+/// window reuses what is already on screen — no spinner, no probe.
+const MODELS_REVALIDATE_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How a model load is allowed to start (see [`Pickers::ensure_models`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ModelsLoad {
+    /// Render-loop prefetch: fill an absent / Idle slot only.
+    Fill,
+    /// Picker open / agent switch: fill a missing slot, or revalidate one whose
+    /// list is older than [`MODELS_REVALIDATE_AFTER`] — rows stay on screen.
+    Revalidate,
+    /// Rescan / Retry: drop the slot and probe the CLI live.
+    Force,
+}
+
 pub struct Pickers {
     state: Entity<AppState>,
     config: DraftConfig,
@@ -447,6 +464,10 @@ pub struct Pickers {
     model_rail: ModelRail,
     harnesses: Loadable<Vec<HarnessDescriptor>>,
     models: HashMap<HarnessId, Loadable<Vec<Model>>>,
+    /// When each list in [`Self::models`] was last (re)loaded. Drives the
+    /// bounded revalidation on picker open / agent switch so a flip-flop
+    /// between two agents backs off instead of re-probing on every visit.
+    models_loaded_at: HashMap<HarnessId, std::time::Instant>,
     refs: Loadable<Vec<RepoRef>>,
     /// Space id the `refs` slot belongs to (invalidated on space change).
     refs_space: Option<String>,
@@ -610,6 +631,7 @@ impl Pickers {
             model_rail: ModelRail::default(),
             harnesses: Loadable::Idle,
             models: HashMap::new(),
+            models_loaded_at: HashMap::new(),
             refs: Loadable::Idle,
             refs_space: None,
             active: 0,
@@ -960,11 +982,11 @@ impl Pickers {
                 // possibly from another viewer) — every open revalidates,
                 // keeping current rows visible until the fresh catalog lands.
                 self.ensure_harnesses(true, cx);
-                // Force the effective harness to re-probe its CLI so the model
-                // list is always live when the picker opens. Prefetch all other
-                // offered harnesses in the background (non-forced).
+                // Revalidate the effective harness (bounded: a list already on
+                // screen and younger than MODELS_REVALIDATE_AFTER is reused as
+                // is). Prefetch all other offered harnesses in the background.
                 if let Some(effective) = self.effective_harness(cx) {
-                    self.ensure_models(effective, true, cx);
+                    self.ensure_models(effective, ModelsLoad::Revalidate, cx);
                 }
                 self.prefetch_models(cx);
             }
@@ -1045,30 +1067,55 @@ impl Pickers {
             targets.push(effective);
         }
         for harness in targets {
-            self.ensure_models(harness, false, cx);
+            self.ensure_models(harness, ModelsLoad::Fill, cx);
         }
     }
 
-    fn ensure_models(&mut self, harness: HarnessId, force: bool, cx: &mut Context<Self>) {
-        // When force is true, we reset the slot to Idle so the guard below
-        // always triggers a fresh probe — used on picker open / harness switch.
-        if force {
-            self.models.insert(harness, Loadable::Idle);
+    /// Whether `harness`'s in-memory list is old enough to revalidate.
+    fn models_slot_stale(&self, harness: HarnessId) -> bool {
+        match self.models_loaded_at.get(&harness) {
+            Some(at) => at.elapsed() >= MODELS_REVALIDATE_AFTER,
+            None => true,
         }
-        // Absent or Idle only — same render-loop hazard as `ensure_harnesses`;
-        // the retry row clears the map to re-arm.
-        if self
-            .models
-            .get(&harness)
-            .is_some_and(|slot| !matches!(slot, Loadable::Idle))
-        {
-            return;
+    }
+
+    /// Loads `harness`'s model list according to `load` (see [`ModelsLoad`]).
+    /// The RPC goes out with `force: false` unless this is an explicit
+    /// Rescan/Retry: the engine answers from its persistent cache and
+    /// revalidates in the background, so a normal open never blocks on a cold
+    /// CLI and never drops a list it already knows.
+    fn ensure_models(&mut self, harness: HarnessId, load: ModelsLoad, cx: &mut Context<Self>) {
+        if load == ModelsLoad::Force {
+            // Reset to Idle so the guard below always triggers a fresh probe —
+            // Rescan / Retry.
+            self.models.insert(harness, Loadable::Idle);
+        } else if let Some(slot) = self.models.get(&harness) {
+            let reload = match load {
+                // Render-loop prefetch: absent/Idle only — an Error must wait
+                // for an explicit reopen (same render-loop hazard as
+                // `ensure_harnesses`).
+                ModelsLoad::Fill => false,
+                ModelsLoad::Revalidate => match slot {
+                    Loadable::Loading => false,
+                    Loadable::Ready(_) => self.models_slot_stale(harness),
+                    Loadable::Idle | Loadable::Error(_) => true,
+                },
+                ModelsLoad::Force => false,
+            };
+            if !reload {
+                return;
+            }
         }
         let Some(engine) = self.engine(cx) else {
             return;
         };
         let target = self.space_target(cx);
-        self.models.insert(harness, Loadable::Loading);
+        let force = load == ModelsLoad::Force;
+        // Stale-while-revalidate: an already-loaded list stays on screen while
+        // the reload runs, so a revalidate never flashes a skeleton.
+        if !matches!(self.models.get(&harness), Some(Loadable::Ready(_))) {
+            self.models.insert(harness, Loadable::Loading);
+        }
         cx.spawn(async move |this, cx| {
             let mut params = serde_json::json!({ "harness": harness, "force": force });
             if let (Some(target), Some(object)) = (&target, params.as_object_mut()) {
@@ -1097,7 +1144,29 @@ impl Pickers {
                         pickers.save_defaults();
                     }
                 }
-                pickers.models.insert(harness, loaded);
+                // Stale-while-revalidate: a failed RELOAD never blanks a list
+                // that is already on screen — the known rows stay, and the
+                // timestamp is left alone so the next open retries. A Rescan /
+                // Retry resets the slot to Idle first, so nothing is kept and
+                // the error still surfaces for the reader who asked for it.
+                let keep_previous = matches!(loaded, Loadable::Error(_))
+                    && pickers.models.get(&harness).is_some_and(
+                        |slot| matches!(slot, Loadable::Ready(rows) if !rows.is_empty()),
+                    );
+                if keep_previous {
+                    if let Loadable::Error(err) = &loaded {
+                        tracing::warn!(
+                            ?harness,
+                            error = %err,
+                            "model reload failed, keeping the list on screen"
+                        );
+                    }
+                } else {
+                    pickers.models.insert(harness, loaded);
+                    pickers
+                        .models_loaded_at
+                        .insert(harness, std::time::Instant::now());
+                }
                 // A list that landed while its popover is open re-anchors the
                 // keyboard highlight onto the selected row (it sat at 0 while
                 // loading).
@@ -1298,7 +1367,9 @@ impl Pickers {
         self.defaults.harness = Some(harness);
         self.save_defaults();
         self.model_scroll.set_offset(gpui::Point::default());
-        self.ensure_models(harness, true, cx);
+        // Switching back to an agent whose list is already on screen reuses it
+        // instead of re-probing — only a stale/burst-missing slot reloads.
+        self.ensure_models(harness, ModelsLoad::Revalidate, cx);
         // Re-anchor the keyboard highlight onto the new harness's selected row.
         self.active = self.selected_model_index(cx);
         cx.notify();
@@ -2709,10 +2780,10 @@ impl Pickers {
                             this.models.clear();
                             this.ensure_harnesses(false, cx);
                             // Rescan: force the effective harness to re-probe
-                            // its CLI at once (the render loop's non-forced
-                            // prefetch would also reload, but only later).
+                            // its CLI at once (the render loop's prefetch would
+                            // also reload, but only later).
                             if let Some(effective) = this.effective_harness(cx) {
-                                this.ensure_models(effective, true, cx);
+                                this.ensure_models(effective, ModelsLoad::Force, cx);
                             }
                         }
                         // Projects/devices/context load nothing; no retry surface exists.

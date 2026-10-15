@@ -142,7 +142,10 @@ impl CursorHarness {
             }
             Ok(models)
         };
-        tokio::time::timeout(Duration::from_secs(20), run)
+        // Cold `cursor-agent` startup can exceed 20s on a busy machine; 45s
+        // absorbs it, and the engine's cache/fallback keeps the picker
+        // populated meanwhile.
+        tokio::time::timeout(Duration::from_secs(45), run)
             .await
             .map_err(|_| HarnessError::Protocol("cursor-agent --list-models timed out".into()))?
     }
@@ -174,7 +177,9 @@ impl CursorHarness {
                 })?;
             Ok::<_, HarnessError>(catalog::map_model_items(&items))
         };
-        tokio::time::timeout(Duration::from_secs(15), run)
+        // Node shim boot plus the SDK catalog fetch: 45s, same rationale as
+        // the CLI probe above.
+        tokio::time::timeout(Duration::from_secs(45), run)
             .await
             .map_err(|_| HarnessError::Protocol("cursor models probe timed out".into()))?
     }
@@ -281,6 +286,10 @@ impl Harness for CursorHarness {
             ))),
         }
     }
+
+    // No `fallback_models` override: cursor's catalog rows are test fixtures
+    // (`#[cfg(test)]`), not a curated production list. With nothing cached, a
+    // failed probe still surfaces its own error.
 
     /// cursor-agent TUI built-ins (Bucket A). `@cursor/sdk` 1.0.28 still has
     /// no listing API, so the static catalog is the source — same prompt-line

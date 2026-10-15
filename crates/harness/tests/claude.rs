@@ -719,14 +719,63 @@ async fn live_session_probes_context_usage_after_result() {
 
 #[tokio::test]
 async fn models_live_discovery_via_control_channel() {
+    // CLI 2.1.x answers `list_models` (alias ids + wire capability fields);
+    // the SDK-style `supported_models` subtype is no longer supported by it.
     let models = harness().models().await.expect("models discovery");
+    let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(ids, vec!["default", "opus[1m]", "sonnet", "haiku"]);
+    assert_eq!(models[0].label, "Default (recommended)");
+    assert_eq!(models[1].label, "Opus");
+    // The CLI's own effort levels, not a guessed ladder.
+    assert_eq!(
+        models[1].reasoning_levels,
+        vec![
+            ReasoningLevel::Low,
+            ReasoningLevel::Medium,
+            ReasoningLevel::High,
+            ReasoningLevel::XHigh,
+            ReasoningLevel::Max,
+            ReasoningLevel::Ultracode,
+            ReasoningLevel::Ultrathink,
+        ]
+    );
+    assert_eq!(models[3].id, "haiku");
+    assert!(models[3].reasoning_levels.is_empty());
+}
+
+/// Older CLIs reject `list_models`; discovery must fall back to the legacy
+/// `supported_models` subtype instead of surfacing "no usable models".
+#[tokio::test]
+async fn models_fall_back_to_legacy_supported_models_subtype() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("fake-claude-legacy-models.sh");
+    let legacy = ClaudeHarness::new().with_executable(path);
+    let models = legacy.models().await.expect("legacy subtype discovery");
     assert_eq!(models.len(), 3);
     assert_eq!(models[0].id, "claude-fable-5");
     assert_eq!(models[0].label, "Fable 5 (Live)");
     assert_eq!(models[1].id, "claude-opus-5");
-    assert_eq!(models[1].label, "Opus 5 (Live)");
     assert_eq!(models[2].id, "claude-haiku-4-5");
-    assert!(models[2].reasoning_levels.is_empty());
+}
+
+/// Both subtypes rejected → the CLI's own message reaches the picker, not a
+/// bare "returned no usable models".
+#[tokio::test]
+async fn models_probe_error_surfaces_the_cli_message() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("fake-claude-fail-models.sh");
+    let failing = ClaudeHarness::new().with_executable(path);
+    let err = failing.models().await.expect_err("both subtypes fail");
+    let text = err.to_string();
+    assert!(text.contains("list_models"), "{text}");
+    assert!(
+        text.contains("Unsupported control request subtype"),
+        "{text}"
+    );
 }
 
 #[tokio::test]
@@ -785,13 +834,32 @@ async fn models_concurrent_probes_share_one_spawn() {
     }
     for task in &results {
         let models = task.as_ref().expect("task").as_ref().expect("models");
-        assert_eq!(models.len(), 3, "live discovery result: {models:?}");
+        assert_eq!(models.len(), 4, "live discovery result: {models:?}");
     }
     let spawns = std::fs::read_to_string(&count_file)
         .expect("count file")
         .lines()
         .count();
     assert_eq!(spawns, 1, "concurrent models() must share one probe spawn");
+}
+
+/// Live smoke against the real CLI: `cargo test -p komet-harness --test
+/// claude -- --ignored live_models_discovery`. Spawns one `claude --print`
+/// probe — no model turn, no API cost — and is how the sibling
+/// "supported_models returned no usable models" regression was found and
+/// closed (the CLI answers `list_models`).
+#[tokio::test]
+#[ignore]
+async fn live_models_discovery() {
+    let h = ClaudeHarness::new();
+    let models = h.models().await.expect("live model discovery");
+    let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
+    eprintln!("live claude models: {ids:?}");
+    assert!(!models.is_empty());
+    assert!(
+        models.iter().any(|m| !m.reasoning_levels.is_empty()),
+        "at least one model must advertise the CLI's effort ladder"
+    );
 }
 
 /// Live smoke against the real CLI: `cargo test -p komet-harness --test
