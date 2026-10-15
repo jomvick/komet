@@ -840,6 +840,11 @@ pub struct Shell {
     /// Unarchive affordance and restores the dimmed harness mark (t3code's
     /// settled-row hover).
     pub(super) archived_hover: Option<String>,
+    /// "All projects" grouped view: set of space IDs whose folder is
+    /// collapsed (folded). Absent = expanded by default. In-memory only —
+    /// resets to all-open on restart (a future ShellSettings field can
+    /// persist it if needed).
+    pub(super) collapsed_spaces: std::collections::HashSet<String>,
     /// Lazy panes: no entity (and no RPC) until first opened.
     terminal: Option<Entity<TerminalPanel>>,
     /// Embedded terminal host for right-pane Terminal surfaces — a SEPARATE
@@ -1120,6 +1125,7 @@ impl Shell {
             archived_open: true,
             archived_shown: 0,
             archived_hover: None,
+            collapsed_spaces: std::collections::HashSet::new(),
             terminal: None,
             right_terminal: None,
             right_plus: popover::Popup::default(),
@@ -4014,60 +4020,68 @@ impl Shell {
             (state.auth_user().cloned(), state.workspace_scope)
         };
 
-        // Keyed rows: (stable key, estimated height, element) — the key + height
-        // list drives the §1.6 resort FLIP diff below (attention-bucket
-        // promotions glide; cleared rows just go).
-        let keyed: Vec<(String, f32, AnyElement)> = self.render_active_rows(theme, cx);
+        // When "All projects" (filter = None) → grouped by project folder.
+        // When a specific project is selected → flat list with FLIP resort.
+        let list_items: Vec<AnyElement> = if self.settings.space_filter.is_none() {
+            self.render_grouped_rows(theme, cx)
+        } else {
+            // Keyed rows: (stable key, estimated height, element) — the key + height
+            // list drives the §1.6 resort FLIP diff below (attention-bucket
+            // promotions glide; cleared rows just go).
+            let keyed: Vec<(String, f32, AnyElement)> = self.render_active_rows(theme, cx);
 
-        // Resort glide (§1.6 View Transitions parity): when the ORDER of a live
-        // list changes (new activity resort, grouping flip), surviving rows
-        // glide from their old y to the new one — layout is already at the new
-        // position; the offset is a paint-only relative inset animated to 0
-        // over 260ms cubic-bezier(0.22,1,0.36,1). New rows fade in; removals
-        // just go (matching the original). First fill and chat switches (which
-        // don't reorder) never animate.
-        let order: Vec<(String, f32)> = keyed.iter().map(|(k, h, _)| (k.clone(), *h)).collect();
-        if self.sidebar_prev_order != order {
-            if !self.sidebar_prev_order.is_empty() {
-                let offsets = resort_offsets(&self.sidebar_prev_order, &order, SIDEBAR_LIST_GAP);
-                let prev_keys: std::collections::HashSet<&str> = self
-                    .sidebar_prev_order
-                    .iter()
-                    .map(|(k, _)| k.as_str())
-                    .collect();
-                let new_keys: std::collections::HashSet<String> = order
-                    .iter()
-                    .filter(|(k, _)| !prev_keys.contains(k.as_str()))
-                    .map(|(k, _)| k.clone())
-                    .collect();
-                if !offsets.is_empty() || !new_keys.is_empty() {
-                    self.resort_epoch += 1;
-                    self.sidebar_resort = offsets;
-                    self.sidebar_new_keys = new_keys;
+            // Resort glide (§1.6 View Transitions parity): when the ORDER of a live
+            // list changes (new activity resort, grouping flip), surviving rows
+            // glide from their old y to the new one — layout is already at the new
+            // position; the offset is a paint-only relative inset animated to 0
+            // over 260ms cubic-bezier(0.22,1,0.36,1). New rows fade in; removals
+            // just go (matching the original). First fill and chat switches (which
+            // don't reorder) never animate.
+            let order: Vec<(String, f32)> =
+                keyed.iter().map(|(k, h, _)| (k.clone(), *h)).collect();
+            if self.sidebar_prev_order != order {
+                if !self.sidebar_prev_order.is_empty() {
+                    let offsets =
+                        resort_offsets(&self.sidebar_prev_order, &order, SIDEBAR_LIST_GAP);
+                    let prev_keys: std::collections::HashSet<&str> = self
+                        .sidebar_prev_order
+                        .iter()
+                        .map(|(k, _)| k.as_str())
+                        .collect();
+                    let new_keys: std::collections::HashSet<String> = order
+                        .iter()
+                        .filter(|(k, _)| !prev_keys.contains(k.as_str()))
+                        .map(|(k, _)| k.clone())
+                        .collect();
+                    if !offsets.is_empty() || !new_keys.is_empty() {
+                        self.resort_epoch += 1;
+                        self.sidebar_resort = offsets;
+                        self.sidebar_new_keys = new_keys;
+                    }
                 }
+                self.sidebar_prev_order = order;
             }
-            self.sidebar_prev_order = order;
-        }
-        let epoch = self.resort_epoch;
-        let list_items: Vec<AnyElement> = keyed
-            .into_iter()
-            .map(|(key, _, element)| {
-                if let Some(dy) = self.sidebar_resort.get(&key).copied() {
-                    let id = SharedString::from(format!("resort-{epoch}-{key}"));
-                    div()
-                        .child(element)
-                        .with_animation(id, RESORT.animation(), move |el, t| {
-                            el.relative().top(px(dy * (1.0 - t)))
-                        })
-                        .into_any_element()
-                } else if self.sidebar_new_keys.contains(&key) {
-                    let id = SharedString::from(format!("row-in-{epoch}-{key}"));
-                    motion::fade_quick(id, div().child(element)).into_any_element()
-                } else {
-                    element
-                }
-            })
-            .collect();
+            let epoch = self.resort_epoch;
+            keyed
+                .into_iter()
+                .map(|(key, _, element)| {
+                    if let Some(dy) = self.sidebar_resort.get(&key).copied() {
+                        let id = SharedString::from(format!("resort-{epoch}-{key}"));
+                        div()
+                            .child(element)
+                            .with_animation(id, RESORT.animation(), move |el, t| {
+                                el.relative().top(px(dy * (1.0 - t)))
+                            })
+                            .into_any_element()
+                    } else if self.sidebar_new_keys.contains(&key) {
+                        let id = SharedString::from(format!("row-in-{epoch}-{key}"));
+                        motion::fade_quick(id, div().child(element)).into_any_element()
+                    } else {
+                        element
+                    }
+                })
+                .collect()
+        };
 
         // t3code's archived accordion, below the active list.
         let archived_section = self.render_archived_section(theme, cx);
