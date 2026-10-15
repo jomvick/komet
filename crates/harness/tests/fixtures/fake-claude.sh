@@ -130,11 +130,22 @@ case "$first" in
   exec sleep 30
   ;;
 
-*'"subtype":"initialize"'*|*'"subtype":"get_context_usage"'*|*'"subtype":"supported_models"'*|*'"subtype":"supportedModels"'*)
+*'"subtype":"initialize"'*|*'"subtype":"get_context_usage"'*|*'"subtype":"list_models"'*|*'"subtype":"supported_models"'*|*'"subtype":"supportedModels"'*)
   # Command discovery, context usage, and model discovery probes.
   line="$first"
   while [ -n "$line" ]; do
     case "$line" in
+    *'"subtype":"list_models"'*)
+      # CLI 2.1.x model discovery: alias ids + the CLI's own capability
+      # fields (mirrors the live `list_models` capture). CLAUDE_LEGACY_MODELS
+      # mimics a build that does not know the subtype yet.
+      rid=$(printf '%s\n' "$line" | sed 's/.*"request_id":"\([^"]*\)".*/\1/')
+      if [ "$CLAUDE_FAIL_MODELS" = "1" ] || [ "$CLAUDE_LEGACY_MODELS" = "1" ]; then
+        emit "{\"type\":\"control_response\",\"response\":{\"subtype\":\"error\",\"request_id\":\"$rid\",\"error\":\"Unsupported control request subtype: list_models\"}}"
+      else
+        emit "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"$rid\",\"response\":{\"models\":[{\"value\":\"default\",\"resolvedModel\":\"claude-opus-4-8[1m]\",\"displayName\":\"Default (recommended)\",\"description\":\"Use the default model (currently Opus 4.8 (1M context))\",\"supportsEffort\":true,\"supportedEffortLevels\":[\"low\",\"medium\",\"high\",\"xhigh\",\"max\"],\"supportsFastMode\":true},{\"value\":\"opus[1m]\",\"resolvedModel\":\"claude-opus-4-8[1m]\",\"displayName\":\"Opus\",\"description\":\"Opus 4.8 with 1M context\",\"supportsEffort\":true,\"supportedEffortLevels\":[\"low\",\"medium\",\"high\",\"xhigh\",\"max\"],\"supportsFastMode\":true},{\"value\":\"sonnet\",\"resolvedModel\":\"claude-sonnet-5\",\"displayName\":\"Sonnet\",\"description\":\"Sonnet 5\",\"supportsEffort\":true,\"supportedEffortLevels\":[\"low\",\"medium\",\"high\",\"xhigh\",\"max\"]},{\"value\":\"haiku\",\"resolvedModel\":\"claude-haiku-4-5-20251001\",\"displayName\":\"Haiku\",\"description\":\"Haiku 4.5\"}]}}}"
+      fi
+      ;;
     *'"subtype":"initialize"'*)
       rid=$(printf '%s\n' "$line" | sed 's/.*"request_id":"\([^"]*\)".*/\1/')
       emit "{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\",\"request_id\":\"$rid\",\"response\":{\"commands\":[{\"name\":\"review\",\"description\":\"Review a pull request\",\"argumentHint\":\"[pr number]\"},{\"name\":\"compact\",\"description\":\"Compact the conversation\",\"argumentHint\":\"\"},{\"name\":\"\",\"description\":\"nameless: dropped\"}],\"output_style\":\"default\"}}}"

@@ -93,6 +93,36 @@ fn claude_mcp_config_merges_without_duplicate() {
     assert_eq!(cfg["mcpServers"].as_object().unwrap().len(), 3); // komet + gh + notion
 }
 
+/// The 1M context window rides the model id as a `[1m]` suffix. Ids discovered
+/// from the CLI's own `list_models` can already carry it (`opus[1m]`), so the
+/// suffix must never be doubled on the wire.
+#[test]
+fn claude_model_suffix_is_not_doubled_for_live_alias_ids() {
+    let model_arg = |model: &str, one_m: bool| -> String {
+        let mut req = base_request_with_mcp(vec![]);
+        req.model = Some(model.to_owned());
+        if one_m {
+            req.model_options
+                .insert("contextWindow".into(), Value::String("1m".into()));
+        }
+        let cmd = ClaudeHarness::new().build_command(&PathBuf::from("claude"), &req);
+        let args: Vec<String> = cmd
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().to_string())
+            .collect();
+        let idx = args
+            .iter()
+            .position(|a| a == "--model")
+            .expect("--model present");
+        args[idx + 1].clone()
+    };
+
+    assert_eq!(model_arg("sonnet", true), "sonnet[1m]");
+    assert_eq!(model_arg("sonnet", false), "sonnet");
+    assert_eq!(model_arg("opus[1m]", true), "opus[1m]");
+}
+
 #[test]
 fn capability_matrix_reports_codex_status() {
     assert_eq!(supports_dynamic_mcp(HarnessId::ClaudeCode), (true, ""));

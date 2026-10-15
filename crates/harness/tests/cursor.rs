@@ -376,3 +376,21 @@ async fn commands_come_from_the_cursor_agent_catalog() {
         commands
     );
 }
+
+#[tokio::test]
+async fn cursor_failed_probe_returns_err_not_static() {
+    // Live-only: with no runnable shim the CLI probe is skipped and the SDK
+    // probe fails, so models() errors (naming both wire reasons) instead of
+    // serving the static catalog.
+    let harness = CursorHarness::new().with_executable("/nonexistent/never-a-cursor-shim");
+    let err = harness.models().await.expect_err("failed probe errors");
+    let message = err.to_string();
+    assert!(
+        message.contains("cursor"),
+        "readable error naming the probe, got: {message}"
+    );
+    assert!(
+        message.contains("cli:") && message.contains("sdk:"),
+        "error names both wire reasons, got: {message}"
+    );
+}

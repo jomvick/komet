@@ -142,7 +142,10 @@ impl CursorHarness {
             }
             Ok(models)
         };
-        tokio::time::timeout(Duration::from_secs(20), run)
+        // Cold `cursor-agent` startup can exceed 20s on a busy machine; 45s
+        // absorbs it, and the engine's cache/fallback keeps the picker
+        // populated meanwhile.
+        tokio::time::timeout(Duration::from_secs(45), run)
             .await
             .map_err(|_| HarnessError::Protocol("cursor-agent --list-models timed out".into()))?
     }
@@ -174,7 +177,9 @@ impl CursorHarness {
                 })?;
             Ok::<_, HarnessError>(catalog::map_model_items(&items))
         };
-        tokio::time::timeout(Duration::from_secs(15), run)
+        // Node shim boot plus the SDK catalog fetch: 45s, same rationale as
+        // the CLI probe above.
+        tokio::time::timeout(Duration::from_secs(45), run)
             .await
             .map_err(|_| HarnessError::Protocol("cursor models probe timed out".into()))?
     }
@@ -249,27 +254,42 @@ impl Harness for CursorHarness {
     }
 
     /// Cursor-native families (Auto / Composer / Grok) from
-    /// `cursor-agent --list-models`, then the SDK list, then the snapshot.
-    /// New Composer/Grok versions appear when the CLI lists them. A failed
-    /// live probe is UNCACHED so the next picker open retries.
+    /// `cursor-agent --list-models`, then the SDK list. Both probes are live;
+    /// a failed probe errors (no static fallback) so the picker only shows
+    /// models the account actually offers. A failed probe is UNCACHED so the
+    /// next picker open retries. When both probes fail, the error names both
+    /// wire reasons.
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         if let Some(models) = self.models_cache.get() {
             return Ok(models.clone());
         }
-        if let Ok(models) = self.discover_cli_models().await
-            && !models.is_empty()
-        {
-            let _ = self.models_cache.set(models.clone());
-            return Ok(models);
-        }
+        let cli_err = match self.discover_cli_models().await {
+            Ok(models) if !models.is_empty() => {
+                let _ = self.models_cache.set(models.clone());
+                return Ok(models);
+            }
+            Ok(_) => HarnessError::Protocol(
+                "cursor-agent --list-models returned no usable models".into(),
+            ),
+            Err(e) => e,
+        };
         match self.discover_sdk_models().await {
             Ok(models) if !models.is_empty() => {
                 let _ = self.models_cache.set(models.clone());
                 Ok(models)
             }
-            Ok(_) | Err(_) => Ok(catalog::static_models()),
+            Ok(_) => Err(HarnessError::Protocol(format!(
+                "cursor probe failed — cli: {cli_err}; sdk: cursor models probe returned no usable models"
+            ))),
+            Err(sdk_err) => Err(HarnessError::Protocol(format!(
+                "cursor probe failed — cli: {cli_err}; sdk: {sdk_err}"
+            ))),
         }
     }
+
+    // No `fallback_models` override: cursor's catalog rows are test fixtures
+    // (`#[cfg(test)]`), not a curated production list. With nothing cached, a
+    // failed probe still surfaces its own error.
 
     /// cursor-agent TUI built-ins (Bucket A). `@cursor/sdk` 1.0.28 still has
     /// no listing API, so the static catalog is the source — same prompt-line

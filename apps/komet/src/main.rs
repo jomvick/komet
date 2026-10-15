@@ -4,6 +4,7 @@
 
 mod auth_cli;
 mod daemon;
+mod models_cli;
 mod update_cli;
 
 use clap::{Parser, Subcommand};
@@ -39,6 +40,29 @@ enum Command {
     /// Live sync introspection from the running engine: per-room connection
     /// state, last pushed-frame/ack ages, rejoin/probe/resync counters.
     Sync,
+    /// List available models for an agent harness.
+    Models {
+        /// Target agent harness (claude-code, cline, codex, opencode, cursor, grok, hermes, pi, antigravity, mock).
+        /// Optional when `--check` is passed.
+        harness: Option<models_cli::HarnessIdArg>,
+
+        /// Output as formatted JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Print only model IDs (ideal for scripting and pipes)
+        #[arg(short, long)]
+        quiet: bool,
+
+        /// Include reasoning levels and model options
+        #[arg(long)]
+        reasoning: bool,
+
+        /// Live-vs-cache drift check over every installed harness (Mock
+        /// excluded). Exits non-zero on drift or on any failed probe.
+        #[arg(long)]
+        check: bool,
+    },
     /// Manage `komet headless` as a background service (launchd / systemd --user).
     Daemon {
         #[command(subcommand)]
@@ -193,6 +217,33 @@ fn main() -> anyhow::Result<()> {
         Some(Command::Sync) => {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(sync_cli(engine_config_from_env().ipc_port))
+        }
+        Some(Command::Models {
+            harness,
+            json,
+            quiet,
+            reasoning,
+            check,
+        }) => {
+            let runtime = tokio::runtime::Runtime::new()?;
+            let config = engine_config_from_env();
+            if check {
+                runtime.block_on(models_cli::run_check(config.data_dir))
+            } else {
+                let Some(harness) = harness else {
+                    return Err(anyhow::anyhow!(
+                        "specify a harness (e.g. `komet models antigravity`) or pass `--check`"
+                    ));
+                };
+                runtime.block_on(models_cli::run(
+                    config.ipc_port,
+                    harness,
+                    json,
+                    quiet,
+                    reasoning,
+                    config.data_dir,
+                ))
+            }
         }
         Some(Command::Update { check }) => {
             let runtime = tokio::runtime::Runtime::new()?;

@@ -128,7 +128,11 @@ pub struct ClaudeHarness {
     /// broken CLI retries on the next picker open (ACP-harness parity).
     commands: tokio::sync::OnceCell<Vec<SlashCommand>>,
     /// Model discovery cache: live probe cached on success.
-    models: tokio::sync::OnceCell<Vec<Model>>,
+    models: tokio::sync::Mutex<Option<(std::time::Instant, Vec<Model>)>>,
+    /// Single-flight for model probes: held across cache-check + probe +
+    /// store, so concurrent `models()` calls share one CLI spawn — waiters
+    /// then read the fresh cache instead of spawning their own.
+    models_probe: tokio::sync::Mutex<()>,
 }
 
 impl Default for ClaudeHarness {
@@ -138,7 +142,8 @@ impl Default for ClaudeHarness {
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
             commands: tokio::sync::OnceCell::new(),
-            models: tokio::sync::OnceCell::new(),
+            models: tokio::sync::Mutex::new(None),
+            models_probe: tokio::sync::Mutex::new(()),
         }
     }
 }
@@ -208,7 +213,9 @@ impl ClaudeHarness {
                 .and_then(Value::as_str)
                 == Some("1m");
             cmd.arg("--model");
-            cmd.arg(if one_m {
+            // Ids discovered from the CLI's own `list_models` can already carry
+            // the suffix (`opus[1m]`); appending again would send a doubled one.
+            cmd.arg(if one_m && !model.contains("[1m]") {
                 format!("{model}[1m]")
             } else {
                 model.clone()
@@ -551,7 +558,15 @@ impl ClaudeHarness {
         }
     }
 
-    /// Live model discovery via Claude control channel (`supported_models`).
+    /// Live model discovery via the Claude control channel.
+    ///
+    /// The subtype has moved across CLI generations: 2.1.x answers
+    /// `list_models` (each entry carries `value`/`resolvedModel`/`displayName`
+    /// and the CLI's own `supportedEffortLevels`) and rejects the SDK-style
+    /// `supported_models` the TS harness used, while older builds answer the
+    /// latter. Both are probed, newest first, so either generation works.
+    /// A CLI that answers neither produces that CLI's own error message
+    /// instead of a bare "no usable models", which is what a user can act on.
     pub(crate) async fn discover_live_models(&self) -> Result<Vec<Model>, HarnessError> {
         let exe = self.resolve_executable()?;
         let mut cmd = Command::new(&exe);
@@ -581,47 +596,85 @@ impl ClaudeHarness {
         };
 
         const MODELS_PROBE_ID: &str = "komet-models-probe";
+        // Probed in order; the next one is only tried when the CLI explicitly
+        // rejects the previous as an unsupported subtype.
+        const MODEL_PROBE_SUBTYPES: [&str; 2] = ["list_models", "supported_models"];
         let discovery = async {
-            let req = serde_json::json!({
-                "type": "control_request",
-                "request_id": MODELS_PROBE_ID,
-                "request": { "subtype": "supported_models" },
-            });
-            stdin
-                .write_all(format!("{req}\n").as_bytes())
-                .await
-                .map_err(HarnessError::Io)?;
-            stdin.flush().await.map_err(HarnessError::Io)?;
-
-            let mut discovered_models: Vec<Model> = Vec::new();
             let mut lines = BufReader::new(stdout).lines();
-            while let Some(line) = lines.next_line().await.map_err(HarnessError::Io)? {
-                let Ok(frame) = serde_json::from_str::<Value>(&line) else {
-                    continue;
-                };
-                if frame.get("type").and_then(Value::as_str) != Some("control_response") {
-                    continue;
-                }
-                let response = frame.get("response").cloned().unwrap_or(Value::Null);
-                let req_id = response.get("request_id").and_then(Value::as_str);
-                if req_id == Some(MODELS_PROBE_ID) {
-                    if response.get("subtype").and_then(Value::as_str) != Some("error") {
+            let mut rejected: Vec<String> = Vec::new();
+            for (attempt, subtype) in MODEL_PROBE_SUBTYPES.iter().enumerate() {
+                let request_id = format!("{MODELS_PROBE_ID}-{attempt}");
+                let req = serde_json::json!({
+                    "type": "control_request",
+                    "request_id": request_id,
+                    "request": { "subtype": subtype },
+                });
+                stdin
+                    .write_all(format!("{req}\n").as_bytes())
+                    .await
+                    .map_err(HarnessError::Io)?;
+                stdin.flush().await.map_err(HarnessError::Io)?;
+
+                let mut discovered_models: Vec<Model> = Vec::new();
+                let mut cli_error: Option<String> = None;
+                let mut answered = false;
+                while let Some(line) = lines.next_line().await.map_err(HarnessError::Io)? {
+                    let Ok(frame) = serde_json::from_str::<Value>(&line) else {
+                        continue;
+                    };
+                    if frame.get("type").and_then(Value::as_str) != Some("control_response") {
+                        continue;
+                    }
+                    let response = frame.get("response").cloned().unwrap_or(Value::Null);
+                    if response.get("request_id").and_then(Value::as_str)
+                        != Some(request_id.as_str())
+                    {
+                        continue;
+                    }
+                    answered = true;
+                    if response.get("subtype").and_then(Value::as_str) == Some("error") {
+                        cli_error = Some(
+                            response
+                                .get("error")
+                                .and_then(Value::as_str)
+                                .unwrap_or("unknown control error")
+                                .to_owned(),
+                        );
+                    } else {
                         let resp_body = response.get("response").unwrap_or(&response);
                         discovered_models = catalog::parse_discovered_models(resp_body);
                     }
                     break;
                 }
+
+                if !discovered_models.is_empty() {
+                    return Ok::<Vec<Model>, HarnessError>(discovered_models);
+                }
+                let Some(cli_error) = cli_error else {
+                    if answered {
+                        rejected.push(format!("{subtype}: answered without a model list"));
+                    }
+                    break;
+                };
+                let unsupported = cli_error.to_ascii_lowercase().contains("unsupported");
+                rejected.push(format!("{subtype}: {cli_error}"));
+                if !unsupported {
+                    break;
+                }
             }
 
-            if discovered_models.is_empty() {
-                return Err(HarnessError::Protocol(
-                    "claude supported_models returned no usable models".into(),
-                ));
-            }
-            Ok::<Vec<Model>, HarnessError>(discovered_models)
+            Err(HarnessError::Protocol(format!(
+                "claude model discovery failed ({})",
+                rejected.join("; ")
+            )))
         };
 
-        let result = tokio::time::timeout(Duration::from_secs(10), discovery).await;
+        // A cold `claude --print` boot (auth check, MCP/config load) routinely
+        // runs past 10s on a busy machine — too tight a bound turned a healthy
+        // CLI into "harness protocol error: claude model discovery timed out".
+        // 45s absorbs a cold start; the engine's cache/fallback layer keeps the
+        // picker populated while it runs.
+        let result = tokio::time::timeout(Duration::from_secs(45), discovery).await;
         shutdown_child(&mut child, self.kill_grace).await;
         match result {
             Ok(inner) => inner,
@@ -766,41 +819,49 @@ impl Harness for ClaudeHarness {
         true
     }
 
-    /// Dynamic model discovery via control-channel probe first, falling back
-    /// to curated static catalog on error or empty response.
+    /// Live model discovery via control-channel probe. Errors propagate —
+    /// no static fallback, so the picker only shows models the CLI offers.
+    /// A failed probe is UNCACHED so the next picker open retries.
+    /// Concurrent calls share one probe (single-flight via `models_probe`).
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         self.resolve_executable()?;
-        self.models
-            .get_or_try_init(|| async {
-                match self.discover_live_models().await {
-                    Ok(models) if !models.is_empty() => {
-                        tracing::info!(
-                            target: "komet_harness::claude",
-                            count = models.len(),
-                            "discovered live Claude models from control channel"
-                        );
-                        Ok(models)
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "komet_harness::claude",
-                            source = "static-fallback",
-                            "Claude live model discovery failed; falling back to static catalog: {e}"
-                        );
-                        Ok(catalog::static_models())
-                    }
-                    Ok(_) => {
-                        tracing::warn!(
-                            target: "komet_harness::claude",
-                            source = "static-fallback",
-                            "Claude live model discovery returned 0 models; falling back to static catalog"
-                        );
-                        Ok(catalog::static_models())
-                    }
+        let _probe = self.models_probe.lock().await;
+        {
+            let guard = self.models.lock().await;
+            if let Some((at, models)) = guard.as_ref() {
+                // In-session memo only: long enough that a switch back to this
+                // harness never re-spawns the probe, short enough that a
+                // `Rescan` past it still sees a fresh CLI.
+                if at.elapsed() < std::time::Duration::from_secs(60) {
+                    return Ok(models.clone());
                 }
-            })
-            .await
-            .cloned()
+            }
+        }
+        let models = self.discover_live_models().await.inspect_err(|e| {
+            tracing::warn!(
+                target: "komet_harness::claude",
+                "Claude live model discovery failed: {e}"
+            );
+        })?;
+        if models.is_empty() {
+            return Err(HarnessError::Protocol(
+                "claude supported_models returned no usable models".into(),
+            ));
+        }
+        tracing::info!(
+            target: "komet_harness::claude",
+            count = models.len(),
+            "discovered live Claude models from control channel"
+        );
+        *self.models.lock().await = Some((std::time::Instant::now(), models.clone()));
+        Ok(models)
+    }
+
+    /// Curated catalog, shown only until the first live probe succeeds (see
+    /// [`Harness::fallback_models`]). Not served by `models()` — that stays
+    /// live-only and error-honest.
+    fn fallback_models(&self) -> Vec<Model> {
+        catalog::static_models()
     }
 
     /// Slash commands from the CLI's `initialize` control-request handshake —

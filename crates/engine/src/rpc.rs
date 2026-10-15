@@ -85,6 +85,8 @@ struct ChatParams {
 #[serde(rename_all = "camelCase")]
 struct ListModelsParams {
     harness: HarnessId,
+    #[serde(default)]
+    force: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1352,12 +1354,15 @@ impl RpcService for EngineRpc {
             }
             methods::LIST_MODELS => {
                 let p: ListModelsParams = parse_params(params)?;
-                // Stale-while-revalidate off the persistent cache: a fresh
-                // entry serves instantly (no cold agent boot per picker
-                // open), refreshing in the background.
+                // Cache-first off the persistent cache: any known entry serves
+                // instantly (no cold agent boot per picker open) and is
+                // revalidated in the background, so a probe never blocks the
+                // picker and a failing CLI keeps showing its last known list.
+                // `force: true` bypasses the cache and probes live — sent on
+                // Rescan / Retry, where a failure must surface.
                 let models = self
                     .registry
-                    .models(p.harness)
+                    .models(p.harness, p.force)
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&models)

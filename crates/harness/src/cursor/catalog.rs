@@ -261,8 +261,9 @@ pub(crate) fn map_model_items(items: &Value) -> Vec<Model> {
         .collect()
 }
 
-/// Fallback when both `cursor-agent --list-models` and the SDK probe fail:
-/// native Cursor Agent families only (Auto / Composer / Grok).
+/// Test-only reference rows mirroring the native Cursor Agent families
+/// (Auto / Composer / Grok) the live probes report.
+#[cfg(test)]
 pub(crate) fn static_models() -> Vec<Model> {
     vec![
         model(
@@ -289,6 +290,7 @@ pub(crate) fn static_models() -> Vec<Model> {
     ]
 }
 
+#[cfg(test)]
 fn model(id: &str, label: &str, description: &str, options: Vec<ModelOption>) -> Model {
     Model {
         id: id.into(),

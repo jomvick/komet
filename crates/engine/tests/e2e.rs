@@ -2192,3 +2192,107 @@ async fn parked_steer_restamps_started_at_and_idle_clears_it() {
     .await;
     assert_eq!(core.sessions.session_status(CHAT).unwrap().started_at, None);
 }
+
+/// Send-path sync (models-refresh T5): a non-Mock harness with a one-model
+/// live catalog. A Run naming a model the CLI no longer offers is rejected
+/// with a readable Rescan message instead of reaching the harness; the
+/// offered id dispatches normally.
+struct SingleModelHarness;
+
+#[async_trait]
+impl Harness for SingleModelHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Codex
+    }
+    fn display_name(&self) -> &str {
+        "Single"
+    }
+    fn supports_steering(&self) -> bool {
+        true
+    }
+    fn steering_mode(&self) -> SteeringMode {
+        SteeringMode::StepBoundary
+    }
+    fn reasoning_levels(&self) -> &[ReasoningLevel] {
+        &[ReasoningLevel::Medium]
+    }
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        Ok(vec![Model {
+            id: "offered-1".into(),
+            label: "Offered 1".into(),
+            description: None,
+            reasoning_levels: vec![],
+            options: vec![],
+        }])
+    }
+    async fn run(
+        &self,
+        request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        MockHarness {
+            script: mock_script(),
+        }
+        .run(request, controls)
+        .await
+    }
+}
+
+#[tokio::test]
+async fn run_with_model_missing_from_live_catalog_is_rejected_with_rescan() {
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), Arc::new(SingleModelHarness));
+    let handle = core.doc_host.open(CHAT).unwrap();
+
+    // Stale id the live CLI no longer offers: rejected, never dispatched.
+    let mut stale = run_request("stale model send");
+    stale.harness = Some(HarnessId::Codex);
+    stale.model = Some("gone-1".into());
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-run-stale-model",
+        SessionCommandPayload::Run {
+            request: stale,
+            message_id: "m-stale-1".into(),
+        },
+    );
+    wait_for(
+        || {
+            command_status(&core, "cmd-run-stale-model")
+                .is_some_and(|(s, _)| s != SessionCommandStatus::Pending)
+        },
+        "stale-model run to settle",
+    )
+    .await;
+    let (status, resolution) = command_status(&core, "cmd-run-stale-model").expect("settled");
+    assert_eq!(status, SessionCommandStatus::Rejected);
+    let message = resolution.expect("rejection names the stale id");
+    assert!(
+        message.contains("gone-1")
+            && message.contains("not offered")
+            && message.contains("Rescan"),
+        "readable rescan rejection, got: {message}"
+    );
+
+    // The offered id dispatches normally (Applied, then the scripted run
+    // completes in the doc).
+    let mut offered = run_request("offered model send");
+    offered.harness = Some(HarnessId::Codex);
+    offered.model = Some("offered-1".into());
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-run-offered-model",
+        SessionCommandPayload::Run {
+            request: offered,
+            message_id: "m-offered-1".into(),
+        },
+    );
+    wait_for(
+        || {
+            command_status(&core, "cmd-run-offered-model")
+                .is_some_and(|(s, _)| s == SessionCommandStatus::Applied)
+        },
+        "offered-model run to dispatch",
+    )
+    .await;
+}
