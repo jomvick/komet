@@ -643,6 +643,290 @@ impl Shell {
             .collect()
     }
 
+    /// Builds one collapsible folder header for the "All projects" grouped
+    /// view: `[📁 icon] [Project name] ── [N] [▶/▼]`.
+    /// Clicking toggles `collapsed_spaces` for the given space ID.
+    fn render_space_folder_header(
+        &mut self,
+        space_id: String,
+        name: SharedString,
+        session_count: usize,
+        is_collapsed: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let toggle_id = space_id.clone();
+        div()
+            .id(SharedString::from(format!("folder-header-{space_id}")))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .mt(px(4.0))
+            .mb(px(2.0))
+            .px(px(10.0))
+            .h(px(28.0))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if this.collapsed_spaces.contains(&toggle_id) {
+                    this.collapsed_spaces.remove(&toggle_id);
+                } else {
+                    this.collapsed_spaces.insert(toggle_id.clone());
+                }
+                cx.notify();
+            }))
+            // Folder icon
+            .child(
+                crate::icons::icon(crate::icons::FOLDER)
+                    .size(px(14.0))
+                    .flex_none()
+                    .text_color(theme.text_muted.opacity(0.7)),
+            )
+            // Project name (truncated)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(13.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.text.opacity(0.85))
+                    .child(name),
+            )
+            // Hairline filler
+            .child(div().h(px(1.0)).flex_1().bg(theme.border.opacity(0.4)))
+            // Session count badge (shown when collapsed and has sessions)
+            .when(is_collapsed && session_count > 0, |el| {
+                el.child(
+                    div()
+                        .flex_none()
+                        .text_size(px(11.0))
+                        .text_color(theme.text_muted.opacity(0.5))
+                        .child(SharedString::from(format!("{session_count}"))),
+                )
+            })
+            // Chevron
+            .child(
+                crate::icons::icon(if is_collapsed {
+                    crate::icons::ALT_ARROW_RIGHT
+                } else {
+                    crate::icons::ALT_ARROW_DOWN
+                })
+                .size(px(12.0))
+                .flex_none()
+                .text_color(theme.text_muted.opacity(0.5)),
+            )
+            .into_any_element()
+    }
+
+    /// "All projects" sidebar view: sessions grouped by project folder.
+    /// Each `Space` becomes a collapsible folder header; clicking toggles it.
+    /// Projects with no sessions show a "No conversations yet" placeholder.
+    /// Project-less sessions (space_id = None) are listed flat at the bottom
+    /// under a "~" group, or omitted if none exist.
+    pub(super) fn render_grouped_rows(
+        &mut self,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let now = Utc::now();
+
+        // Collect all needed data from state while holding read lock.
+        struct SpaceGroup {
+            id: String,
+            name: String,
+            sessions: Vec<(komet_proto::ChatIndicator, komet_proto::Chat, String, Option<String>)>,
+        }
+        let (groups, projectless): (Vec<SpaceGroup>, Vec<(komet_proto::ChatIndicator, komet_proto::Chat, String, Option<String>)>) = {
+            let state = self.state.read(cx);
+            let spaces = state.spaces_sorted();
+
+            // Build groups: one per space in alphabetical order.
+            let space_groups: Vec<SpaceGroup> = spaces
+                .iter()
+                .map(|space| {
+                    let mut chats: Vec<komet_proto::Chat> = state
+                        .chats
+                        .iter()
+                        .filter(|c| !c.archived && c.space_id.as_deref() == Some(space.id.as_str()))
+                        .cloned()
+                        .collect();
+                    // Sort by recency (most recent first).
+                    chats.sort_by(|a, b| {
+                        let ta = a.last_message_at.unwrap_or(a.created_at);
+                        let tb = b.last_message_at.unwrap_or(b.created_at);
+                        tb.cmp(&ta)
+                    });
+                    let sessions = chats
+                        .into_iter()
+                        .map(|chat| {
+                            let status = state.display_status_for(&chat, now);
+                            let mut folder = space.display_name().to_string();
+                            if let Some(device) = state.device_name(&chat.device_id) {
+                                folder = format!("{folder} @ {device}");
+                            }
+                            let branch = chat
+                                .branch
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|b| !b.is_empty())
+                                .map(str::to_string);
+                            (status, chat, folder, branch)
+                        })
+                        .collect();
+                    SpaceGroup {
+                        id: space.id.clone(),
+                        name: space.display_name().to_string(),
+                        sessions,
+                    }
+                })
+                .collect();
+
+            // Project-less sessions (space_id = None, or dangling space).
+            let mut orphan_chats: Vec<komet_proto::Chat> = state
+                .chats
+                .iter()
+                .filter(|c| !c.archived && c.space_id.is_none())
+                .cloned()
+                .collect();
+            orphan_chats.sort_by(|a, b| {
+                let ta = a.last_message_at.unwrap_or(a.created_at);
+                let tb = b.last_message_at.unwrap_or(b.created_at);
+                tb.cmp(&ta)
+            });
+            let projectless_rows: Vec<(komet_proto::ChatIndicator, komet_proto::Chat, String, Option<String>)> = orphan_chats
+                .into_iter()
+                .map(|chat| {
+                    let status = state.display_status_for(&chat, now);
+                    let mut folder = "~".to_string();
+                    if let Some(device) = state.device_name(&chat.device_id) {
+                        folder = format!("~ @ {device}");
+                    }
+                    let branch = chat
+                        .branch
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|b| !b.is_empty())
+                        .map(str::to_string);
+                    (status, chat, folder, branch)
+                })
+                .collect();
+
+            (space_groups, projectless_rows)
+        };
+
+        let selected = self.state.read(cx).selected_chat.clone();
+        let mut elements: Vec<AnyElement> = Vec::new();
+
+        for group in groups {
+            let is_collapsed = self.collapsed_spaces.contains(&group.id);
+            let count = group.sessions.len();
+            let header = self.render_space_folder_header(
+                group.id.clone(),
+                SharedString::from(group.name),
+                count,
+                is_collapsed,
+                theme,
+                cx,
+            );
+            elements.push(header);
+
+            if !is_collapsed {
+                if group.sessions.is_empty() {
+                    // Placeholder: "No conversations yet"
+                    elements.push(
+                        div()
+                            .px(px(Theme::SPACE_SM + 6.0))
+                            .pb(px(4.0))
+                            .text_size(px(12.0))
+                            .text_color(theme.text_faint)
+                            .child(SharedString::from("No conversations yet"))
+                            .into_any_element(),
+                    );
+                } else {
+                    let mut rows_div = div().flex().flex_col().gap(px(2.0)).pb(px(4.0));
+                    for (status, chat, folder, branch) in group.sessions {
+                        let is_selected = selected.as_deref() == Some(chat.id.as_str());
+                        let time_ago: SharedString = format_time_ago(
+                            chat.last_message_at.unwrap_or(chat.created_at),
+                            now,
+                        )
+                        .into();
+                        let harness = chat.config.as_ref().map(|c| c.harness);
+                        let element = self.render_chat_row(
+                            chat.id.clone(),
+                            transcript::single_line(
+                                &chat.title.clone().unwrap_or_else(|| "New session".into()),
+                            )
+                            .into(),
+                            time_ago,
+                            folder.into(),
+                            branch.map(SharedString::from),
+                            harness,
+                            status,
+                            is_selected,
+                            false,
+                            chat.pinned,
+                            theme,
+                            cx,
+                        );
+                        rows_div = rows_div.child(element);
+                    }
+                    elements.push(rows_div.into_any_element());
+                }
+            }
+        }
+
+        // Project-less sessions at the bottom (if any).
+        if !projectless.is_empty() {
+            let orphan_id = "__projectless__".to_string();
+            let is_collapsed = self.collapsed_spaces.contains(&orphan_id);
+            let count = projectless.len();
+            let header = self.render_space_folder_header(
+                orphan_id,
+                SharedString::from("~"),
+                count,
+                is_collapsed,
+                theme,
+                cx,
+            );
+            elements.push(header);
+            if !is_collapsed {
+                let mut rows_div = div().flex().flex_col().gap(px(2.0)).pb(px(4.0));
+                for (status, chat, folder, branch) in projectless {
+                    let is_selected = selected.as_deref() == Some(chat.id.as_str());
+                    let time_ago: SharedString = format_time_ago(
+                        chat.last_message_at.unwrap_or(chat.created_at),
+                        now,
+                    )
+                    .into();
+                    let harness = chat.config.as_ref().map(|c| c.harness);
+                    let element = self.render_chat_row(
+                        chat.id.clone(),
+                        transcript::single_line(
+                            &chat.title.clone().unwrap_or_else(|| "New session".into()),
+                        )
+                        .into(),
+                        time_ago,
+                        folder.into(),
+                        branch.map(SharedString::from),
+                        harness,
+                        status,
+                        is_selected,
+                        false,
+                        chat.pinned,
+                        theme,
+                        cx,
+                    );
+                    rows_div = rows_div.child(element);
+                }
+                elements.push(rows_div.into_any_element());
+            }
+        }
+
+        elements
+    }
+
     /// The sidebar's archived shelf — a direct port of t3code's settled
     /// shelf: header is label + hairline + chevron ("Archived (N)" closed,
     /// "Archived" open), rows are 36px SLIM one-liners (dimmed harness mark,
