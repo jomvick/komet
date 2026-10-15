@@ -17,13 +17,11 @@ use serde::{Deserialize, Serialize};
 use komet_harness::{Harness, HarnessError, mock::MockHarness};
 use komet_proto::{AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, SteeringMode};
 
-/// How long a previously-discovered model list is served without re-probing.
-/// Long enough that every app launch (the common case) skips the cold agent
-/// boot entirely — opencode's Node startup measured ~13s under the app's
-/// 4-way boot prefetch — while still re-discovering within a day.
-const MODELS_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
-/// A fresh cache entry is re-probed in the background at most this often, so
-/// the file stays warm for the next launch without a probe per picker open.
+/// A served cache entry is re-probed in the background at most this often, so
+/// the file stays warm without a probe per picker open. There is no upper
+/// bound on serving age: a known list is always better than a spinner, and a
+/// failing agent still shows its last known models until a probe replaces
+/// them.
 const MODELS_CACHE_REFRESH_AFTER: Duration = Duration::from_secs(60 * 60);
 
 /// One harness's persisted model discovery (`{data_dir}/model-cache.json`).
@@ -237,79 +235,92 @@ impl HarnessRegistry {
         persist_models_cache_to(&path, &self.models_cache_entries());
     }
 
-    /// The model list for `id` — stale-while-revalidate from the persistent
-    /// cache. When `force` is true the cache is bypassed totally and the
-    /// harness is probed immediately (used when the picker is opened or the
-    /// harness is switched, so the displayed list is always in sync with the
-    /// CLI): a probe failure propagates, never masked by stale entries.
+    /// The model list for `id`.
+    ///
+    /// `force == false` is the picker's normal path and is CACHE-FIRST: any
+    /// known list is served instantly however old it is, and a stale one is
+    /// re-probed in the background — so opening the picker, or switching back
+    /// to an agent, never re-runs a cold CLI probe. With nothing cached yet,
+    /// one live probe runs; if the CLI is installed but failing (crash,
+    /// timeout, signed out), the harness's curated
+    /// [`Harness::fallback_models`] stands in for the display while the probe
+    /// is retried in the background. The send path still refuses ids the CLI
+    /// does not advertise, so a fallback row can never start a dead run.
+    ///
+    /// `force == true` (Rescan / Retry) bypasses the cache entirely and probes
+    /// live: a failure propagates and is never masked.
     pub async fn models(&self, id: HarnessId, force: bool) -> Result<Vec<Model>, HarnessError> {
+        if force {
+            return self.probe_live(id).await;
+        }
         let now = crate::now_ms();
-        let ttl_ms = MODELS_CACHE_TTL.as_millis() as i64;
         let refresh_after_ms = MODELS_CACHE_REFRESH_AFTER.as_millis() as i64;
 
-        if !force {
-            // Stale-while-revalidate off the boot-loaded cache: a fresh-enough
-            // entry serves instantly WITHOUT resolving the harness — the picker
-            // renders before any agent boots (opencode's cold Node start measured
-            // ~13s under the app's 4-way boot prefetch; user report: "model
-            // loading is too slow"). Refresh in the background at most every
-            // REFRESH_AFTER so the file stays warm without a probe per open.
-            if let Some(cached) = self.models_cache_entries().get(&id).cloned() {
-                let age = now - cached.discovered_at_ms;
-                if age < ttl_ms && !cached.models.is_empty() {
-                    if age >= refresh_after_ms {
-                        self.spawn_background_refresh(id);
-                    }
-                    return Ok(cached.models);
+        // Cache-first off the boot-loaded cache: the entry serves WITHOUT
+        // resolving the harness, so the picker renders before any agent boots
+        // (opencode's cold Node start measured ~13s under the app's 4-way boot
+        // prefetch; user report: "model loading is too slow"). A stale entry is
+        // revalidated off the hot path.
+        if let Some(cached) = self.models_cache_entries().get(&id).cloned() {
+            if !cached.models.is_empty() {
+                if now - cached.discovered_at_ms >= refresh_after_ms {
+                    self.spawn_background_refresh(id);
                 }
+                return Ok(cached.models);
             }
         }
 
+        // Nothing known yet: one blocking probe, then the curated fallback.
         let harness = self.resolve(id)?;
         match harness.models().await {
             Ok(models) if !models.is_empty() => {
-                self.models_cache_entries().insert(
-                    id,
-                    CachedModels {
-                        discovered_at_ms: now,
-                        models: models.clone(),
-                    },
-                );
-                self.persist_models_cache();
+                self.store_models(id, now, models.clone());
                 Ok(models)
             }
             Ok(_) => {
-                // An empty wire answer is never a successful load (Task 1
-                // makes every harness error instead; this arm is the belt).
-                // Stale may cover it on the cached path, exactly like a
-                // probe failure — but `force` always surfaces the error.
+                // An empty wire answer is never a successful load (every
+                // harness errors instead; this arm is the belt).
                 let error = HarnessError::Protocol(format!(
                     "{id:?} model discovery returned no usable models"
                 ));
-                self.stale_or_error(id, force, error)
+                self.fallback_or_error(id, &harness, error)
             }
-            Err(error) => self.stale_or_error(id, force, error),
+            Err(error) => self.fallback_or_error(id, &harness, error),
         }
     }
 
-    /// Shared tail of [`Self::models`]: on the cached path (`force=false`) a
-    /// failed/empty probe falls back to a non-empty stale list (logged); any
-    /// other case propagates the error — `force=true` never serves stale.
-    fn stale_or_error(
+    /// Persist a successfully probed list (success-only, atomically).
+    fn store_models(&self, id: HarnessId, now: i64, models: Vec<Model>) {
+        self.models_cache_entries().insert(
+            id,
+            CachedModels {
+                discovered_at_ms: now,
+                models,
+            },
+        );
+        self.persist_models_cache();
+    }
+
+    /// No cache AND a failed probe: show the harness's curated catalog when it
+    /// has one, and keep retrying in the background. A harness without a
+    /// catalog has nothing honest to show, so its error propagates.
+    fn fallback_or_error(
         &self,
         id: HarnessId,
-        force: bool,
+        harness: &Arc<dyn Harness>,
         error: HarnessError,
     ) -> Result<Vec<Model>, HarnessError> {
-        if !force {
-            if let Some(cached) = self.models_cache_entries().get(&id).cloned() {
-                if !cached.models.is_empty() {
-                    tracing::warn!(harness = ?id, error = %error, "model probe failed, serving stale cache");
-                    return Ok(cached.models);
-                }
-            }
+        let fallback = harness.fallback_models();
+        if fallback.is_empty() {
+            return Err(error);
         }
-        Err(error)
+        tracing::warn!(
+            harness = ?id,
+            error = %error,
+            "model probe failed with nothing cached; showing the curated fallback and retrying in the background"
+        );
+        self.spawn_background_refresh(id);
+        Ok(fallback)
     }
 
     /// Re-probe `id` in the background and persist a successful answer
@@ -1173,5 +1184,102 @@ mod tests {
         assert_eq!(before.supports_steering, after.supports_steering);
         assert_eq!(before.steering_mode, after.steering_mode);
         assert_eq!(before.reasoning_levels, after.reasoning_levels);
+    }
+
+    /// Cache-first: once a list is known, `models(force=false)` must serve it
+    /// WITHOUT resolving the harness again — that is what stops a picker open
+    /// or an agent switch from re-running a cold CLI probe. `force=true`
+    /// (Rescan) still resolves and probes.
+    #[tokio::test]
+    async fn cached_models_are_served_without_resolving_the_harness() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let registry = HarnessRegistry::new();
+        let resolves = Arc::new(AtomicUsize::new(0));
+        let counted = resolves.clone();
+        registry.register_lazy(
+            HarnessDescriptor {
+                id: HarnessId::Mock,
+                name: "Mock".into(),
+                supports_steering: true,
+                steering_mode: SteeringMode::StepBoundary,
+                reasoning_levels: vec![],
+                installed: true,
+                enabled: None,
+            },
+            Box::new(|| true),
+            Box::new(move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Ok(Arc::new(MockHarness { script: vec![] }) as Arc<dyn Harness>)
+            }),
+        );
+
+        // Cold picker: one probe, which resolves the harness and caches.
+        let first = registry
+            .models(HarnessId::Mock, false)
+            .await
+            .expect("first load probes");
+        assert!(!first.is_empty());
+        assert_eq!(resolves.load(Ordering::SeqCst), 1);
+
+        // Overwrite the cache with a marker list so the next answer's origin
+        // is unambiguous: the marker means "cache", anything else "probe".
+        registry.models_cache_entries().insert(
+            HarnessId::Mock,
+            CachedModels {
+                discovered_at_ms: crate::now_ms(),
+                models: vec![Model {
+                    id: "from-cache".into(),
+                    label: "From cache".into(),
+                    description: None,
+                    reasoning_levels: vec![],
+                    options: vec![],
+                }],
+            },
+        );
+
+        let cached = registry
+            .models(HarnessId::Mock, false)
+            .await
+            .expect("cached load");
+        assert_eq!(
+            cached[0].id, "from-cache",
+            "a known list must be served from the cache, not re-probed"
+        );
+        assert_eq!(
+            resolves.load(Ordering::SeqCst),
+            1,
+            "a cache hit must not resolve (and therefore not probe) the harness"
+        );
+
+        // Rescan / Retry: bypasses the cache and probes the CLI.
+        let forced = registry
+            .models(HarnessId::Mock, true)
+            .await
+            .expect("forced probe");
+        assert_ne!(
+            forced[0].id, "from-cache",
+            "force=true must probe the harness instead of serving the cache"
+        );
+    }
+
+    /// A crashing CLI with nothing cached shows the harness's curated catalog
+    /// instead of a dead-end error, while the background retry keeps running.
+    #[tokio::test]
+    async fn failed_probe_without_cache_serves_the_curated_fallback() {
+        let registry = HarnessRegistry::new();
+        let harness = komet_harness::claude::ClaudeHarness::new()
+            .with_executable("/nonexistent/never-a-claude");
+        registry.register(Arc::new(harness) as Arc<dyn Harness>);
+
+        let models = registry
+            .models(HarnessId::ClaudeCode, false)
+            .await
+            .expect("a curated fallback must outlive a failed first probe");
+        assert_eq!(
+            models.len(),
+            komet_harness::claude::catalog::static_models().len(),
+            "the fallback is the harness's curated catalog"
+        );
+        assert!(!models.is_empty());
     }
 }

@@ -1354,11 +1354,12 @@ impl RpcService for EngineRpc {
             }
             methods::LIST_MODELS => {
                 let p: ListModelsParams = parse_params(params)?;
-                // Stale-while-revalidate off the persistent cache: a fresh
-                // entry serves instantly (no cold agent boot per picker
-                // open), refreshing in the background. `force: true` bypasses
-                // the cache and probes the harness immediately — sent on every
-                // picker open and harness switch so the list is always live.
+                // Cache-first off the persistent cache: any known entry serves
+                // instantly (no cold agent boot per picker open) and is
+                // revalidated in the background, so a probe never blocks the
+                // picker and a failing CLI keeps showing its last known list.
+                // `force: true` bypasses the cache and probes live — sent on
+                // Rescan / Retry, where a failure must surface.
                 let models = self
                     .registry
                     .models(p.harness, p.force)

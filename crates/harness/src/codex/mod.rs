@@ -302,7 +302,11 @@ impl CodexHarness {
             }
             Ok::<Vec<Model>, HarnessError>(models)
         };
-        let result = tokio::time::timeout(Duration::from_secs(15), discovery).await;
+        // A cold `codex app-server` boot can exceed 15s on a busy machine; a
+        // too-tight bound turned a healthy CLI into a protocol error. 45s
+        // absorbs it, and the engine's cache/fallback keeps the picker
+        // populated meanwhile.
+        let result = tokio::time::timeout(Duration::from_secs(45), discovery).await;
         shutdown_child(&mut child, self.kill_grace).await;
         match result {
             Ok(inner) => inner,
@@ -418,6 +422,12 @@ impl Harness for CodexHarness {
             })
             .await
             .cloned()
+    }
+
+    /// Curated catalog, shown only until the first live probe succeeds (see
+    /// [`Harness::fallback_models`]). `models()` itself stays live-only.
+    fn fallback_models(&self) -> Vec<Model> {
+        catalog::static_models()
     }
 
     /// Skills from a short-lived `skills/list` probe (see

@@ -73,7 +73,16 @@ use subagent::SubagentTracker;
 use subagent_opencode::OpencodeTracker;
 
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(120);
-const DEFAULT_MODEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
+/// Default model-probe bound for ACP agents that do NOT override their own
+/// startup budget (grok, hermes, pi — opencode/cline set their own). Measured
+/// against the installed Hermes on a WARM machine: `initialize` answers at
+/// 8.2s and the `session/new` that carries the model list at 22.7s (plugin
+/// discovery alone registers 57 plugins), so the old 10s bound failed a
+/// perfectly healthy CLI with "model discovery did not complete within 10s".
+/// The probe therefore shares the handshake's wedged-agent bound: a genuinely
+/// stuck agent is still caught, a slow-but-healthy one is not — and the
+/// engine's cache/fallback keeps the picker populated while it runs.
+const DEFAULT_MODEL_DISCOVERY_TIMEOUT: Duration = DEFAULT_HANDSHAKE_TIMEOUT;
 /// OpenCode loads its plugins and MCP configuration before it answers ACP.
 /// Plugin-heavy cold starts can take minutes, so model discovery and a real
 /// chat must share one generous startup budget instead of racing 10s vs 120s.
@@ -4882,6 +4891,20 @@ mod tests {
         ));
         assert!(acp_auto_permission(SandboxLevel::ReadOnly, &tool).is_none());
         assert!(acp_auto_permission(SandboxLevel::WorkspaceWrite, &write).is_none());
+    }
+
+    /// ACP agents with no startup budget of their own (hermes, grok, pi) must
+    /// not fail their model probe earlier than the point where the same
+    /// process would be considered wedged — Hermes answers `session/new` at
+    /// ~23s warm, well past the old 10s probe bound.
+    #[test]
+    fn default_model_probe_matches_the_handshake_bound() {
+        let harness = AcpHarness::hermes();
+        assert_eq!(
+            harness.model_discovery_timeout, DEFAULT_HANDSHAKE_TIMEOUT,
+            "a healthy cold ACP boot must not read as a model-discovery failure"
+        );
+        assert_eq!(harness.model_discovery_timeout.as_secs(), 120);
     }
 
     #[test]
