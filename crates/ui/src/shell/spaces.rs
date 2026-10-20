@@ -644,20 +644,36 @@ impl Shell {
     }
 
     /// Builds one collapsible folder header for the "All projects" grouped
-    /// view: `[📁 icon] [Project name] ── [N] [▶/▼]`.
-    /// Clicking toggles `collapsed_spaces` for the given space ID.
+    /// view: `[📁 icon] [Project name] ── [N] [+] [▶/▼]`.
+    /// Clicking toggles `expanded_spaces` for the given space ID; the `+`
+    /// re-homes the new-session canvas on that folder without leaving the
+    /// grouped view (the project-less `~` group passes `None`, so it has no `+`).
     fn render_space_folder_header(
         &mut self,
-        space_id: String,
+        folder_id: Option<String>,
         name: SharedString,
         session_count: usize,
         is_collapsed: bool,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let toggle_id = space_id.clone();
+        // The project-less "~" group has no folder (`None`): it collapses like
+        // a folder but cannot host a new session or toggle in settings.
+        let key = folder_id
+            .clone()
+            .unwrap_or_else(|| "__projectless__".to_string());
+        let toggle_id = key.clone();
+        let hover_key = format!("folder-header-{key}");
+        let click_hover = hover_key.clone();
+        let hover_text = hover_key.clone();
+        // The + fades in with the header's own hover, so it is discoverable
+        // without hunting for an invisible target; its wash follows its own
+        // hover for the click affordance.
+        let plus_key = format!("{hover_key}-plus");
+        let plus_hover = plus_key.clone();
+        let plus_space = folder_id.clone();
         div()
-            .id(SharedString::from(format!("folder-header-{space_id}")))
+            .id(SharedString::from(format!("folder-header-{key}")))
             .flex()
             .flex_row()
             .items_center()
@@ -666,13 +682,22 @@ impl Shell {
             .mb(px(2.0))
             .px(px(10.0))
             .h(px(28.0))
+            .rounded(px(6.0))
             .cursor_pointer()
+            .bg(motion::hover_blend(
+                &click_hover,
+                crate::theme::wash(0.0),
+                crate::theme::wash(0.14),
+            ))
+            .on_hover(motion::hover_listener(hover_key))
             .on_click(cx.listener(move |this, _, _, cx| {
-                if this.collapsed_spaces.contains(&toggle_id) {
-                    this.collapsed_spaces.remove(&toggle_id);
+                if this.expanded_spaces.contains(&toggle_id) {
+                    this.expanded_spaces.remove(&toggle_id);
                 } else {
-                    this.collapsed_spaces.insert(toggle_id.clone());
+                    this.expanded_spaces.insert(toggle_id.clone());
                 }
+                this.settings.expanded_spaces = this.expanded_spaces.clone();
+                this.schedule_save(cx);
                 cx.notify();
             }))
             // Folder icon
@@ -690,11 +715,13 @@ impl Shell {
                     .truncate()
                     .text_size(px(13.0))
                     .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(theme.text.opacity(0.85))
+                    .text_color(motion::hover_blend(
+                        &hover_text,
+                        theme.text.opacity(0.85),
+                        theme.text,
+                    ))
                     .child(name),
             )
-            // Hairline filler
-            .child(div().h(px(1.0)).flex_1().bg(theme.border.opacity(0.4)))
             // Session count badge (shown when collapsed and has sessions)
             .when(is_collapsed && session_count > 0, |el| {
                 el.child(
@@ -703,6 +730,44 @@ impl Shell {
                         .text_size(px(11.0))
                         .text_color(theme.text_muted.opacity(0.5))
                         .child(SharedString::from(format!("{session_count}"))),
+                )
+            })
+            // New session in this folder (real folders only; the `~` group has
+            // no folder to start in). Always laid out so hovering never shifts
+            // the rows; it fades in with the header hover.
+            .when(folder_id.is_some(), |el| {
+                el.child(
+                    div()
+                        .id(SharedString::from(format!("folder-new-{key}")))
+                        .size(px(24.0))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(6.0))
+                        .cursor_pointer()
+                        .bg(motion::hover_blend(
+                            &plus_hover,
+                            crate::theme::wash(0.0),
+                            crate::theme::wash(0.14),
+                        ))
+                        .on_hover(motion::hover_listener(plus_hover.clone()))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            if let Some(space) = &plus_space {
+                                this.open_new_session_in(Some(space.clone()), cx);
+                            }
+                        }))
+                        .child(
+                            crate::icons::icon(crate::icons::PLUS)
+                                .size(px(14.0))
+                                .flex_none()
+                                .text_color(motion::hover_blend(
+                                    &hover_text,
+                                    theme.text_muted.opacity(0.0),
+                                    theme.text_muted.opacity(0.8),
+                                )),
+                        ),
                 )
             })
             // Chevron
@@ -714,7 +779,11 @@ impl Shell {
                 })
                 .size(px(12.0))
                 .flex_none()
-                .text_color(theme.text_muted.opacity(0.5)),
+                .text_color(motion::hover_blend(
+                    &hover_text,
+                    theme.text_muted.opacity(0.5),
+                    theme.text_muted.opacity(0.85),
+                )),
             )
             .into_any_element()
     }
@@ -830,10 +899,10 @@ impl Shell {
         let mut elements: Vec<AnyElement> = Vec::new();
 
         for group in groups {
-            let is_collapsed = self.collapsed_spaces.contains(&group.id);
+            let is_collapsed = !self.expanded_spaces.contains(&group.id);
             let count = group.sessions.len();
             let header = self.render_space_folder_header(
-                group.id.clone(),
+                Some(group.id.clone()),
                 SharedString::from(group.name),
                 count,
                 is_collapsed,
@@ -889,10 +958,10 @@ impl Shell {
         // Project-less sessions at the bottom (if any).
         if !projectless.is_empty() {
             let orphan_id = "__projectless__".to_string();
-            let is_collapsed = self.collapsed_spaces.contains(&orphan_id);
+            let is_collapsed = !self.expanded_spaces.contains(&orphan_id);
             let count = projectless.len();
             let header = self.render_space_folder_header(
-                orphan_id,
+                None,
                 SharedString::from("~"),
                 count,
                 is_collapsed,
