@@ -199,8 +199,7 @@ pub fn sync_send_model_id(live: &[Model], remembered: Option<&str>) -> Option<St
 /// [`sync_send_model_id`]). `false` while the catalog isn't loaded or is
 /// empty (nothing to judge staleness against).
 pub fn sync_model_is_stale(live: &[Model], remembered: Option<&str>) -> bool {
-    !live.is_empty()
-        && matches!(remembered, Some(id) if !live.iter().any(|m| m.id == id))
+    !live.is_empty() && matches!(remembered, Some(id) if !live.iter().any(|m| m.id == id))
 }
 
 /// Pure core of the send-path wiring: the model id a run may carry given the
@@ -1397,6 +1396,36 @@ impl Pickers {
             }
         }
         cx.notify();
+    }
+
+    /// Select a model from a Komet command without opening the popover.  The
+    /// lookup is deliberately limited to the live catalog; an arbitrary model
+    /// id must never be injected into a run.
+    pub fn select_model_query(&mut self, query: &str, cx: &mut Context<Self>) -> bool {
+        let query = query.trim();
+        let Some(harness) = self.effective_harness(cx) else {
+            return false;
+        };
+        let Some(models) = self.models.get(&harness).and_then(|models| models.ready()) else {
+            return false;
+        };
+        let Some(model) = models.iter().find(|model| {
+            model.id.eq_ignore_ascii_case(query) || model.label.eq_ignore_ascii_case(query)
+        }) else {
+            return false;
+        };
+        self.pick_model(model.id.clone(), cx);
+        true
+    }
+
+    /// `/worktree` chooses the isolated checkout mode on the new-chat canvas.
+    /// The branch picker remains the source of the base ref when one is
+    /// available, so this command never invents a branch name.
+    pub fn select_new_worktree(&mut self, cx: &mut Context<Self>) {
+        if self.state.read(cx).selected_chat.is_none() {
+            self.config.checkout = CheckoutKind::NewWorktree;
+            cx.notify();
+        }
     }
 
     fn pick_reasoning(&mut self, level: ReasoningLevel, cx: &mut Context<Self>) {
@@ -3280,7 +3309,7 @@ impl Pickers {
                         && !row.provider.is_empty()
                         && rows
                             .get(ix.wrapping_sub(1))
-                            .map_or(true, |prev| prev.provider != row.provider);
+                            .is_none_or(|prev| prev.provider != row.provider);
                     el = el.child(
                         div()
                             .id(("model-star", ix))

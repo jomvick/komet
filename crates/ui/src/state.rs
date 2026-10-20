@@ -1065,14 +1065,17 @@ impl AppState {
     /// Truncate transcript from a target message ID and clear pending echoes.
     /// Used when editing a prompt to erase the prompt and all its subsequent responses.
     pub fn truncate_transcript_from(&mut self, chat_id: &str, target_message_id: &str) {
-        if let Some(idx) = self.transcript.iter().position(|e| e.id == target_message_id) {
+        if let Some(idx) = self
+            .transcript
+            .iter()
+            .position(|e| e.id == target_message_id)
+        {
             self.transcript.truncate(idx);
         }
         if let Some(echoes) = self.echoes.get_mut(chat_id) {
             echoes.clear();
         }
     }
-
 
     /// Composer send fired: overlay the chat as Working until the host writes
     /// the user message back into the transcript (or the TTL lapses). A remote

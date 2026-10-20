@@ -7,7 +7,7 @@
 //! pending-input detection) lives in free functions/structs with unit tests;
 //! the gpui element only feeds them measurements.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -368,13 +368,16 @@ pub enum SendButtonMode {
     Steer,
     /// Live run, nothing typed: red stop square.
     Stop,
+    /// Live non-steerable run with text typed: prompt goes into the local queue.
+    Queue,
 }
 
-pub fn send_button_mode(run_live: bool, has_text: bool) -> SendButtonMode {
-    match (run_live, has_text) {
-        (false, _) => SendButtonMode::Send,
-        (true, true) => SendButtonMode::Steer,
-        (true, false) => SendButtonMode::Stop,
+pub fn send_button_mode(run_live: bool, has_text: bool, can_steer: bool) -> SendButtonMode {
+    match (run_live, has_text, can_steer) {
+        (false, _, _) => SendButtonMode::Send,
+        (true, true, true) => SendButtonMode::Steer,
+        (true, true, false) => SendButtonMode::Queue,
+        (true, false, _) => SendButtonMode::Stop,
     }
 }
 
@@ -3476,6 +3479,70 @@ fn slash_token(text: &str, cursor: usize) -> Option<MentionToken> {
     })
 }
 
+/// Parse a Komet-owned command.  Native agent commands are intentionally not
+/// parsed here: if Komet does not recognize the complete command, the text is
+/// sent unchanged to the agent (the issue #42 fallback rule).
+fn parse_komet_command(text: &str) -> Option<(&str, Option<&str>)> {
+    let mut words = text.trim().splitn(2, char::is_whitespace);
+    let command = words.next()?.strip_prefix('/')?;
+    let argument = words
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    matches!(
+        command,
+        "new" | "worktree" | "prompt" | "attach" | "model" | "sandbox"
+    )
+    .then_some((command, argument))
+}
+
+fn parse_sandbox_level(argument: Option<&str>) -> Option<komet_proto::SandboxLevel> {
+    let value = argument?.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "ro" | "read-only" | "readonly" | "read" => Some(komet_proto::SandboxLevel::ReadOnly),
+        "workspace" | "workspace-write" | "write" => {
+            Some(komet_proto::SandboxLevel::WorkspaceWrite)
+        }
+        "danger" | "full" | "danger-full-access" | "yolo" => {
+            Some(komet_proto::SandboxLevel::DangerFullAccess)
+        }
+        _ => None,
+    }
+}
+
+fn with_komet_commands(
+    mut commands: Vec<SlashCommand>,
+    prompt_names: impl IntoIterator<Item = String>,
+) -> Vec<SlashCommand> {
+    for (name, description, input_hint) in [
+        ("new", "Open a new chat", None),
+        ("worktree", "Choose a checkout or worktree", None),
+        ("prompt", "Insert a saved prompt", Some("[name]")),
+        ("attach", "Attach files", None),
+        ("model", "Choose the chat model", Some("[name]")),
+        ("sandbox", "Change access mode", Some("[level]")),
+    ] {
+        if !commands.iter().any(|command| command.name == name) {
+            commands.push(SlashCommand {
+                name: name.into(),
+                description: format!("Komet · {description}"),
+                input_hint: input_hint.map(str::to_owned),
+            });
+        }
+    }
+    for prompt_name in prompt_names {
+        let name = format!("prompt {prompt_name}");
+        if !commands.iter().any(|command| command.name == name) {
+            commands.push(SlashCommand {
+                name,
+                description: "Komet · Insert saved prompt".into(),
+                input_hint: None,
+            });
+        }
+    }
+    commands
+}
+
 /// Slash-command completion state: like [`FileMentionState`] but the
 /// candidate list is fetched once per harness (`ListCommands`) and filtered
 /// locally per keystroke — no RPC, debounce, or skeleton churn while typing.
@@ -3540,6 +3607,15 @@ fn slash_error_message(err: &RpcError) -> SharedString {
             "Couldn't load this agent's commands".into()
         }
     }
+}
+
+/// A prompt held in the local UI queue while an agent turn is live.
+/// Drained automatically when the session transitions to Completed/Aborted.
+#[derive(Clone)]
+struct QueuedPrompt {
+    text: String,
+    steer: bool,
+    staged: Vec<StagedAttachment>,
 }
 
 pub struct Composer {
@@ -3620,6 +3696,10 @@ pub struct Composer {
     /// Clears a stale arming hint once its 3-second stop window lapses
     /// (while the run stays live the hint must not linger forever).
     escape_hint_task: Option<Task<()>>,
+    /// Local UI prompt queue: prompts captured while a session turn is live.
+    /// Drained in FIFO order as soon as the session becomes idle again.
+    /// Cleared when navigating to a different chat.
+    prompt_queue: VecDeque<QueuedPrompt>,
     _observe: Subscription,
     _pickers_observe: Subscription,
     _input_events: Subscription,
@@ -3792,6 +3872,7 @@ impl Composer {
             route_snap_until: None,
             escape_stop_armed_at: None,
             escape_hint_task: None,
+            prompt_queue: VecDeque::new(),
             _observe: observe,
             _pickers_observe: pickers_observe,
             _input_events: input_events,
@@ -4385,6 +4466,20 @@ impl Composer {
                 .map(|chat| chat.device_id.clone())
                 .or_else(|| state.selected_space_row().map(|s| s.device_id.clone()))
         };
+        let prompt_names = self
+            .state
+            .read(cx)
+            .data_dir
+            .as_deref()
+            .map(crate::settings::prompts::PromptLibrary::load)
+            .map(|library| {
+                library
+                    .prompts
+                    .into_iter()
+                    .map(|prompt| prompt.name)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
         let request = self.slash.request;
         self.slash_task = Some(cx.spawn(async move |this, cx| {
             let mut params = serde_json::json!({ "harness": harness });
@@ -4401,7 +4496,9 @@ impl Composer {
                 match result {
                     Ok(value) => match serde_json::from_value::<Vec<SlashCommand>>(value) {
                         Ok(commands) => {
-                            composer.slash_cache.insert(harness, commands);
+                            composer
+                                .slash_cache
+                                .insert(harness, with_komet_commands(commands, prompt_names));
                         }
                         Err(err) => {
                             tracing::warn!(%err, "slash command decode failed");
@@ -4696,10 +4793,14 @@ impl Composer {
             self.current_key = key;
             self.failure = None;
             self.wizard = None;
+            // Discard any queued prompts for the old chat — they were meant for
+            // that session's context and would be confusing on a different chat.
+            self.prompt_queue.clear();
             // Attachments stay stashed under their chat key (the map swap IS
             // the navigation); only the transient chrome resets.
             self.preview = None;
             self.reset_mention(None, cx);
+
             // Route changes snap (round 5/6): a mode difference between the
             // old and new session's composer must not glide across
             // navigation. Killing the in-flight morph here isn't enough —
@@ -4788,6 +4889,12 @@ impl Composer {
                 }
             }
         }
+        // Prompt-queue drain: when the session becomes idle and there are
+        // queued prompts, pop and send the next one automatically.
+        if !self.run_live(cx) && !self.prompt_queue.is_empty() {
+            self.drain_prompt_queue(cx);
+            return; // drain_prompt_queue → send() → cx.notify() already called
+        }
         cx.notify();
     }
 
@@ -4815,7 +4922,15 @@ impl Composer {
         // A staged image counts as content: image-only sends are legal
         // (the prompt body becomes "See the attached image(s).").
         let has_text = !self.input.read(cx).text().trim().is_empty() || !self.staged().is_empty();
-        send_button_mode(self.run_live(cx), has_text)
+        // `can_steer` = agent supports mid-turn injection (StepBoundary). When
+        // the agent only supports TurnBoundary steering (or no steering at all),
+        // we use the Queue mode so the prompt waits locally for the turn to finish.
+        let can_steer = self.run_live(cx)
+            && matches!(
+                self.pickers.read(cx).resolved_steering_mode(cx),
+                Some(komet_proto::SteeringMode::StepBoundary)
+            );
+        send_button_mode(self.run_live(cx), has_text, can_steer)
     }
 
     fn on_submit(&mut self, cx: &mut Context<Self>) {
@@ -4829,12 +4944,125 @@ impl Composer {
             return;
         }
         let text = self.input.read(cx).text().trim().to_string();
+        if self.handle_komet_command(&text, cx) {
+            return;
+        }
         match self.button_mode(cx) {
             SendButtonMode::Stop => self.interrupt(cx),
             _ if text.is_empty() && self.staged().is_empty() => {}
             _ if self.send_blocked(cx) => {}
+            SendButtonMode::Queue => self.enqueue_prompt(text, false, cx),
             SendButtonMode::Send => self.send(text, false, cx),
             SendButtonMode::Steer => self.send(text, true, cx),
+        }
+    }
+
+    /// Execute the Komet-owned commands that have a safe local equivalent.
+    /// Commands needing a picker remain ordinary text until their picker is
+    /// wired to the surrounding shell; they never block sending.
+    fn handle_komet_command(&mut self, text: &str, cx: &mut Context<Self>) -> bool {
+        let Some((command, argument)) = parse_komet_command(text) else {
+            return false;
+        };
+        match command {
+            "new" => {
+                self.state
+                    .update(cx, |state, cx| state.select_chat(None, cx));
+                self.input.update(cx, |input, cx| input.set_text("", cx));
+                true
+            }
+            "worktree" => {
+                self.pickers
+                    .update(cx, |pickers, cx| pickers.select_new_worktree(cx));
+                self.input.update(cx, |input, cx| input.set_text("", cx));
+                true
+            }
+            "attach" => {
+                self.input.update(cx, |input, cx| input.set_text("", cx));
+                self.open_file_picker(cx);
+                true
+            }
+            "sandbox" => {
+                if let Some(argument) = argument {
+                    let Some(level) = parse_sandbox_level(Some(argument)) else {
+                        return false;
+                    };
+                    self.state.update(cx, |state, cx| {
+                        state.set_access_mode(level);
+                        cx.notify();
+                    });
+                } else {
+                    self.cycle_access_mode(cx);
+                }
+                self.input.update(cx, |input, cx| input.set_text("", cx));
+                true
+            }
+            "prompt" => {
+                let Some(name) = argument else {
+                    return false;
+                };
+                let Some(data_dir) = self.state.read(cx).data_dir.clone() else {
+                    return false;
+                };
+                let library = crate::settings::prompts::PromptLibrary::load(&data_dir);
+                let Some(prompt) = library.find(name) else {
+                    return false;
+                };
+                self.input
+                    .update(cx, |input, cx| input.set_text(&prompt.body, cx));
+                true
+            }
+            "model" => {
+                let Some(query) = argument else {
+                    return false;
+                };
+                let selected = self
+                    .pickers
+                    .update(cx, |pickers, cx| pickers.select_model_query(query, cx));
+                if selected {
+                    self.input.update(cx, |input, cx| input.set_text("", cx));
+                }
+                selected
+            }
+            _ => false,
+        }
+    }
+
+    /// Push a prompt onto the local queue while a turn is live. The input and
+    /// staged attachments are cleared immediately (same as a real send), and the
+    /// bandeau « N queued » appears. The queue drains automatically when the
+    /// session becomes idle.
+    fn enqueue_prompt(&mut self, text: String, steer: bool, cx: &mut Context<Self>) {
+        // Snapshot staged attachments for this queued item.
+        let staged = self
+            .attachments
+            .remove(&self.current_key)
+            .unwrap_or_default();
+        self.preview = None;
+        self.prompt_queue.push_back(QueuedPrompt {
+            text,
+            steer,
+            staged,
+        });
+        // Clear the input right away, exactly like a real send.
+        self.input.update(cx, |input, cx| input.set_text("", cx));
+        self.drafts.remove(&self.current_key);
+        self.failure = None;
+        cx.notify();
+    }
+
+    /// Pop the front queued prompt and send it. Called from `on_state_changed`
+    /// when the session transitions to idle (no live run).
+    fn drain_prompt_queue(&mut self, cx: &mut Context<Self>) {
+        if let Some(item) = self.prompt_queue.pop_front() {
+            // Restore staged attachments for this item so `send()` picks them up.
+            if !item.staged.is_empty() {
+                self.attachments
+                    .entry(self.current_key.clone())
+                    .or_default()
+                    .extend(item.staged);
+            }
+            self.send(item.text, item.steer, cx);
         }
     }
 
@@ -5298,12 +5526,7 @@ impl Composer {
         }));
     }
 
-    fn send_edit(
-        &mut self,
-        target_message_id: String,
-        text: String,
-        cx: &mut Context<Self>,
-    ) {
+    fn send_edit(&mut self, target_message_id: String, text: String, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.failure = Some("Engine not connected".into());
             cx.notify();
@@ -5395,8 +5618,8 @@ impl Composer {
                         mcp_external: Vec::new(),
                     },
                 };
-                let command = serde_json::to_value(&command)
-                    .map_err(|e| format!("Edit failed: {e}"))?;
+                let command =
+                    serde_json::to_value(&command).map_err(|e| format!("Edit failed: {e}"))?;
                 let params = serde_json::json!({ "chatId": chat_id, "command": command });
                 engine
                     .client()
@@ -6358,7 +6581,7 @@ impl Composer {
                 .on_click(cx.listener(|this, _, _, cx| this.interrupt(cx)))
                 .child(div().size(px(11.0)).rounded(px(3.0)).bg(theme.bg))
                 .into_any_element(),
-            SendButtonMode::Send | SendButtonMode::Steer => {
+            SendButtonMode::Send | SendButtonMode::Steer | SendButtonMode::Queue => {
                 // Dimmed and inert while no project is picked (`send_blocked`
                 // also gates `on_submit`, so Enter is a no-op too).
                 let blocked = self.send_blocked(cx);
@@ -6599,6 +6822,7 @@ impl Render for Composer {
                     .child("This agent can't be steered mid-turn — your message will be queued and sent when the current turn finishes."),
             )
         });
+
         // First Escape while a run is live only arms a 3s stop window; say so
         // explicitly so the second press (which actually stops) isn't a
         // surprise — without this the first press read as a dead key.
@@ -6864,11 +7088,11 @@ impl Render for Composer {
         // via `add_paths`.
         // Frosted: the pill backdrop-blurs the transcript scrolling under it
         // (the popover glass treatment; radius matches the pill's rounding).
-        let container = container.child(crate::frost::frosted(
-            26.0,
-            16.0,
-            motion::fade_quick("composer-input", body),
-        ));
+        let input_surface =
+            crate::frost::frosted(26.0, 16.0, motion::fade_quick("composer-input", body));
+        // Queueing remains an internal delivery detail. The composer itself
+        // stays focused on the current draft, without a queue panel.
+        let container = container.child(input_surface);
         // Branch/worktree toolbar under the pill (t3code BranchToolbar): the
         // checkout-kind selector + ref picker for new sessions, read-only
         // labels once the session exists. Git spaces only.
@@ -7043,6 +7267,66 @@ mod tests {
         // Bare "/" with cursor at 0 → closed; cursor after it → open-all.
         assert!(slash_token("/", 0).is_none());
         assert_eq!(slash_token("/", 1).map(|t| t.query), Some(String::new()));
+    }
+
+    #[test]
+    fn komet_commands_are_strict_and_unknown_text_falls_through() {
+        assert_eq!(
+            parse_komet_command("/prompt review"),
+            Some(("prompt", Some("review")))
+        );
+        assert_eq!(parse_komet_command("/sandbox"), Some(("sandbox", None)));
+        assert!(parse_komet_command("/prompt review extra").is_some());
+        assert!(parse_komet_command("please /prompt review").is_none());
+        assert!(parse_komet_command("/unknown thing").is_none());
+    }
+
+    #[test]
+    fn sandbox_command_accepts_explicit_levels_only() {
+        assert_eq!(
+            parse_sandbox_level(Some("read-only")),
+            Some(komet_proto::SandboxLevel::ReadOnly)
+        );
+        assert_eq!(
+            parse_sandbox_level(Some("workspace-write")),
+            Some(komet_proto::SandboxLevel::WorkspaceWrite)
+        );
+        assert_eq!(
+            parse_sandbox_level(Some("yolo")),
+            Some(komet_proto::SandboxLevel::DangerFullAccess)
+        );
+        assert_eq!(parse_sandbox_level(Some("unknown")), None);
+        assert_eq!(parse_sandbox_level(None), None);
+    }
+
+    #[test]
+    fn komet_command_entries_are_executable_and_do_not_shadow_native() {
+        let native = vec![SlashCommand {
+            name: "model".into(),
+            description: "native".into(),
+            input_hint: None,
+        }];
+        let commands = with_komet_commands(native, ["review".to_string()]);
+        assert_eq!(
+            commands
+                .iter()
+                .filter(|command| command.name == "model")
+                .count(),
+            1
+        );
+        for name in [
+            "new",
+            "worktree",
+            "prompt",
+            "attach",
+            "sandbox",
+            "prompt review",
+        ] {
+            assert!(
+                commands.iter().any(|command| command.name == name),
+                "missing {name}"
+            );
+        }
     }
 
     #[test]
@@ -7500,10 +7784,18 @@ mod tests {
 
     #[test]
     fn send_button_morph() {
-        assert_eq!(send_button_mode(false, false), SendButtonMode::Send);
-        assert_eq!(send_button_mode(false, true), SendButtonMode::Send);
-        assert_eq!(send_button_mode(true, true), SendButtonMode::Steer);
-        assert_eq!(send_button_mode(true, false), SendButtonMode::Stop);
+        // Not live → always Send regardless of text or steer capability
+        assert_eq!(send_button_mode(false, false, false), SendButtonMode::Send);
+        assert_eq!(send_button_mode(false, false, true), SendButtonMode::Send);
+        assert_eq!(send_button_mode(false, true, false), SendButtonMode::Send);
+        assert_eq!(send_button_mode(false, true, true), SendButtonMode::Send);
+        // Live + steerable + text → Steer
+        assert_eq!(send_button_mode(true, true, true), SendButtonMode::Steer);
+        // Live + NOT steerable + text → Queue (local prompt queue)
+        assert_eq!(send_button_mode(true, true, false), SendButtonMode::Queue);
+        // Live + no text → Stop (regardless of steer capability)
+        assert_eq!(send_button_mode(true, false, true), SendButtonMode::Stop);
+        assert_eq!(send_button_mode(true, false, false), SendButtonMode::Stop);
     }
 
     #[test]

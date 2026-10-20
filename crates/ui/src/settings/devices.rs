@@ -340,7 +340,12 @@ impl Render for DevicesPage {
         // not the wake ack. Stale frames leave `checking` on until the fresh
         // one or the watchdog timeout.
         if self.checking {
-            let checked_at = self.state.read(cx).update.as_ref().and_then(|s| s.checked_at);
+            let checked_at = self
+                .state
+                .read(cx)
+                .update
+                .as_ref()
+                .and_then(|s| s.checked_at);
             self.settle_if_fresh(checked_at, cx);
         }
         let (checking, check_error, just_checked) =
