@@ -225,15 +225,13 @@ impl EngineCore {
                 .descriptors()
                 .into_iter()
                 .filter(|d| {
-                    d.installed
-                        && d.id != HarnessId::Mock
-                        && crate::registry::descriptor_enabled(d)
+                    d.installed && d.id != HarnessId::Mock && crate::registry::descriptor_enabled(d)
                 })
                 .map(|d| d.id)
                 .collect();
             match tokio::runtime::Handle::try_current() {
                 Ok(handle) => {
-                    let _ = handle.spawn(async move { reg.warm_models_cache(ids).await });
+                    std::mem::drop(handle.spawn(async move { reg.warm_models_cache(ids).await }));
                 }
                 Err(_) => {
                     // No ambient runtime (tests, one-shot tools): an isolated

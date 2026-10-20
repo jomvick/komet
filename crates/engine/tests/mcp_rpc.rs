@@ -258,7 +258,7 @@ async fn test_mcp_server_probes_unsaved_config_without_persisting() {
     .expect("test reply carries status, not an RPC error");
     assert_eq!(probe["id"], "dead");
     assert_eq!(probe["status"], "error");
-    assert!(probe["error"].as_str().unwrap_or_default().len() > 0);
+    assert!(!probe["error"].as_str().unwrap_or_default().is_empty());
     assert_eq!(probe["toolsCount"], 0);
     // Nothing persisted by the probe.
     let list = call(&rpc, methods::LIST_MCP_SERVERS, serde_json::json!({}))

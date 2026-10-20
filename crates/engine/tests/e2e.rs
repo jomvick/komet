@@ -2268,9 +2268,7 @@ async fn run_with_model_missing_from_live_catalog_is_rejected_with_rescan() {
     assert_eq!(status, SessionCommandStatus::Rejected);
     let message = resolution.expect("rejection names the stale id");
     assert!(
-        message.contains("gone-1")
-            && message.contains("not offered")
-            && message.contains("Rescan"),
+        message.contains("gone-1") && message.contains("not offered") && message.contains("Rescan"),
         "readable rescan rejection, got: {message}"
     );
 
