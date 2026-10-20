@@ -38,7 +38,7 @@ pub mod permissions;
 mod tests_mcp;
 mod wire;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -52,8 +52,8 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
 
 use komet_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SlashCommand,
-    SteeringMode, UserInputAnswer, UserInputQuestion,
+    AgentEvent, CommandScope, CommandSource, DoneStatus, HarnessId, Model, ReasoningLevel,
+    RunRequest, SlashCommand, SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
 use crate::{
@@ -124,9 +124,9 @@ pub struct ClaudeHarness {
     interrupt_grace: Duration,
     /// Grace between SIGTERM and SIGKILL.
     kill_grace: Duration,
-    /// Command discovery cache: only a successful probe is cached, so a
-    /// broken CLI retries on the next picker open (ACP-harness parity).
-    commands: tokio::sync::OnceCell<Vec<SlashCommand>>,
+    /// Command discovery cache keyed by probe cwd; the stored buster
+    /// invalidates it when the CLI's command/skill dirs change.
+    commands: tokio::sync::Mutex<std::collections::HashMap<String, (u128, Vec<SlashCommand>)>>,
     /// Model discovery cache: live probe cached on success.
     models: tokio::sync::Mutex<Option<(std::time::Instant, Vec<Model>)>>,
     /// Single-flight for model probes: held across cache-check + probe +
@@ -141,7 +141,7 @@ impl Default for ClaudeHarness {
             executable: None,
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
-            commands: tokio::sync::OnceCell::new(),
+            commands: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             models: tokio::sync::Mutex::new(None),
             models_probe: tokio::sync::Mutex::new(()),
         }
@@ -454,10 +454,11 @@ impl ClaudeHarness {
     /// Short-lived discovery probe: spawn the CLI in stream-json mode, send
     /// the `initialize` and `get_context_usage` control requests, and combine
     /// static built-in commands with dynamically discovered skills.
-    async fn discover_commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
+    async fn discover_commands(&self, cwd: &Path) -> Result<Vec<SlashCommand>, HarnessError> {
         let exe = self.resolve_executable()?;
         let mut cmd = Command::new(&exe);
         crate::compose_child_path(&mut cmd, &exe);
+        cmd.current_dir(cwd);
         cmd.args([
             "--print",
             "--input-format",
@@ -541,6 +542,7 @@ impl ClaudeHarness {
                     commands.push(command);
                 }
             }
+            mark_project_commands(&mut commands, cwd);
 
             Ok(commands)
         };
@@ -751,6 +753,26 @@ impl ClaudeHarness {
     }
 }
 
+/// Mark commands backed by a project-local `.claude/commands/<name>.md` or
+/// `.claude/skills/<name>` as project-scoped skill entries. The initialize
+/// wire does not say where a command came from; the file's presence does.
+fn mark_project_commands(commands: &mut [SlashCommand], cwd: &Path) {
+    for command in commands {
+        let from_project = [
+            cwd.join(".claude/commands")
+                .join(format!("{}.md", command.name)),
+            cwd.join(".claude/commands").join(&command.name),
+            cwd.join(".claude/skills").join(&command.name),
+        ]
+        .iter()
+        .any(|path| path.exists());
+        if from_project {
+            command.source = CommandSource::Skill;
+            command.scope = CommandScope::Project;
+        }
+    }
+}
+
 /// `commands` out of an `initialize` control_response payload
 /// (`response.response.commands`: name / description / argumentHint).
 fn parse_initialize_commands(response: &Value) -> Vec<SlashCommand> {
@@ -779,6 +801,7 @@ fn parse_initialize_commands(response: &Value) -> Vec<SlashCommand> {
                     .map(str::trim)
                     .filter(|h| !h.is_empty())
                     .map(str::to_owned),
+                ..SlashCommand::default()
             })
         })
         .collect()
@@ -865,19 +888,21 @@ impl Harness for ClaudeHarness {
     /// carries every command with description + argument hint and involves no
     /// model turn (verified live, 2.1.228: the control_response is the first
     /// stdout line, well before any API traffic). Cached on success.
-    async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
+    async fn commands(&self, cwd: Option<&Path>) -> Result<Vec<SlashCommand>, HarnessError> {
+        let cwd = crate::discovery_cwd(cwd);
+        let key = cwd.to_string_lossy().into_owned();
+        let buster = crate::commands_buster(&cwd, HarnessId::ClaudeCode);
+        if let Some((stored, commands)) = self.commands.lock().await.get(&key)
+            && *stored == buster
+        {
+            return Ok(commands.clone());
+        }
+        let commands = self.discover_commands(&cwd).await?;
         self.commands
-            .get_or_try_init(|| async {
-                match self.discover_commands().await {
-                    Ok(commands) => Ok(commands),
-                    Err(error) => {
-                        tracing::debug!(%error, "live Claude command discovery failed");
-                        Ok(Vec::new())
-                    }
-                }
-            })
+            .lock()
             .await
-            .cloned()
+            .insert(key, (buster, commands.clone()));
+        Ok(commands)
     }
 
     async fn context_usage(&self) -> Result<komet_proto::ContextUsage, HarnessError> {

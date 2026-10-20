@@ -362,7 +362,7 @@ async fn model_discovery_maps_the_live_catalog() {
 
 #[tokio::test]
 async fn commands_come_from_the_cursor_agent_catalog() {
-    let commands = harness().commands().await.expect("catalog");
+    let commands = harness().commands(None).await.expect("catalog");
     assert!(
         commands.len() >= 8,
         "cursor-agent builtins present: {commands:?}"
@@ -372,7 +372,7 @@ async fn commands_come_from_the_cursor_agent_catalog() {
     assert!(commands.iter().any(|c| c.name == "goal"));
     assert!(commands.iter().any(|c| c.name == "clear"));
     assert_eq!(
-        harness().commands().await.expect("no spawn on catalog"),
+        harness().commands(None).await.expect("no spawn on catalog"),
         commands
     );
 }

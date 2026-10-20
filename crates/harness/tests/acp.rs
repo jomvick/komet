@@ -759,13 +759,13 @@ async fn failed_load_falls_back_to_a_fresh_session() {
 #[tokio::test]
 async fn commands_discovery_scans_the_initialize_response() {
     let harness = harness();
-    let commands = harness.commands().await.expect("discovery");
+    let commands = harness.commands(None).await.expect("discovery");
     assert!(commands.len() >= 2, "initialize ads: {commands:?}");
     assert!(commands.iter().any(|c| c.name == "compact"));
     let goal = commands.iter().find(|c| c.name == "goal").expect("goal");
     assert_eq!(goal.input_hint.as_deref(), Some("the goal"));
     // Cached: a second call must not respawn (same result, instant).
-    let again = harness.commands().await.expect("cached");
+    let again = harness.commands(None).await.expect("cached");
     assert_eq!(again, commands);
 }
 
@@ -778,7 +778,7 @@ async fn grok_hermes_pi_commands_are_live_only() {
         AcpHarness::hermes().with_executable(fixture_path()),
         AcpHarness::pi().with_executable(fixture_path()),
     ] {
-        let commands = harness.commands().await.expect("discovery");
+        let commands = harness.commands(None).await.expect("discovery");
         let names: Vec<_> = commands.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, ["compact", "goal"]);
     }
@@ -787,7 +787,7 @@ async fn grok_hermes_pi_commands_are_live_only() {
 #[tokio::test]
 async fn opencode_commands_are_live_only() {
     let harness = opencode_harness();
-    let commands = harness.commands().await.expect("discovery");
+    let commands = harness.commands(None).await.expect("discovery");
     let names: Vec<_> = commands.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(names, ["compact"]);
 }

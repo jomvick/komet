@@ -8,7 +8,7 @@
 pub mod catalog;
 pub mod normalize;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use async_trait::async_trait;
@@ -19,8 +19,8 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 
 use komet_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SlashCommand,
-    SteeringMode,
+    AgentEvent, CommandSource, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest,
+    SlashCommand, SteeringMode,
 };
 
 use crate::{Harness, HarnessError, RunControls};
@@ -213,33 +213,43 @@ impl Harness for AntigravityHarness {
         catalog::static_models()
     }
 
-    async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
+    async fn commands(&self, _cwd: Option<&Path>) -> Result<Vec<SlashCommand>, HarnessError> {
         Ok(vec![
             SlashCommand {
                 name: "goal".into(),
                 description: "Run a long-running autonomous task with extra thoroughness".into(),
                 input_hint: Some("<goal instruction>".into()),
+                source: CommandSource::Fallback,
+                ..SlashCommand::default()
             },
             SlashCommand {
                 name: "schedule".into(),
                 description: "Schedule a one-shot timer or recurring cron job".into(),
                 input_hint: Some("<schedule instruction>".into()),
+                source: CommandSource::Fallback,
+                ..SlashCommand::default()
             },
             SlashCommand {
                 name: "browser".into(),
                 description: "Web browsing, search, and web application testing".into(),
                 input_hint: Some("<url or search task>".into()),
+                source: CommandSource::Fallback,
+                ..SlashCommand::default()
             },
             SlashCommand {
                 name: "grill-me".into(),
                 description: "Interactive architectural interview to clarify design decisions"
                     .into(),
                 input_hint: None,
+                source: CommandSource::Fallback,
+                ..SlashCommand::default()
             },
             SlashCommand {
                 name: "learn".into(),
                 description: "Persist lessons, behavioral rules, or setup for future tasks".into(),
                 input_hint: Some("<learning note>".into()),
+                source: CommandSource::Fallback,
+                ..SlashCommand::default()
             },
         ])
     }

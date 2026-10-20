@@ -1269,9 +1269,33 @@ pub struct TodoItem {
     pub done: bool,
 }
 
+/// Where a slash command comes from. `Native` is the running CLI's own
+/// command surface; `Skill` is a skill/command file the CLI discovered;
+/// `Custom` is a Komet-owned entry; `Fallback` is the curated catalog shown
+/// only when live discovery failed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CommandSource {
+    #[default]
+    Native,
+    Skill,
+    Custom,
+    Fallback,
+}
+
+/// Whether a slash command applies to the current project or the whole user
+/// profile.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum CommandScope {
+    #[default]
+    Global,
+    Project,
+}
+
 /// A slash command advertised by the agent (ACP `availableCommands`): typed as
 /// `/name` at the start of the composer, sent to the agent as prompt text.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SlashCommand {
     pub name: String,
@@ -1280,6 +1304,10 @@ pub struct SlashCommand {
     /// Placeholder hint for the command's argument, when it takes one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_hint: Option<String>,
+    #[serde(default)]
+    pub source: CommandSource,
+    #[serde(default)]
+    pub scope: CommandScope,
 }
 
 /// A category entry in context breakdown (e.g. "Skills", "Free space", "System prompt").
@@ -2970,5 +2998,30 @@ mod tests {
         };
         assert!(fs.allow_read.contains(&"/repo/.env".to_string()));
         assert!(fs.deny_write.contains(&"/repo/.env".to_string()));
+    }
+
+    #[test]
+    fn slash_command_source_and_scope_default_when_missing() {
+        let command: SlashCommand =
+            serde_json::from_str(r#"{"name":"compact"}"#).expect("old wire decodes");
+        assert_eq!(command.source, CommandSource::Native);
+        assert_eq!(command.scope, CommandScope::Global);
+    }
+
+    #[test]
+    fn slash_command_source_and_scope_round_trip() {
+        let command = SlashCommand {
+            name: "review".into(),
+            source: CommandSource::Skill,
+            scope: CommandScope::Project,
+            ..SlashCommand::default()
+        };
+        let json = serde_json::to_string(&command).unwrap();
+        assert!(json.contains(r#""source":"skill""#), "{json}");
+        assert!(json.contains(r#""scope":"project""#), "{json}");
+        assert_eq!(
+            serde_json::from_str::<SlashCommand>(&json).unwrap(),
+            command
+        );
     }
 }

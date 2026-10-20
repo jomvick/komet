@@ -498,10 +498,28 @@ pub(crate) fn parse_skills_frontmatter(response: &Value) -> Vec<komet_proto::Sla
                 (None, other) if !other.is_empty() => format!("Skill ({other})"),
                 (None, _) => format!("Skill ({name})"),
             };
+            let (source_kind, scope) = if source == "built-in" {
+                (
+                    komet_proto::CommandSource::Native,
+                    komet_proto::CommandScope::Global,
+                )
+            } else if source.contains("project") || source.contains("local") {
+                (
+                    komet_proto::CommandSource::Skill,
+                    komet_proto::CommandScope::Project,
+                )
+            } else {
+                (
+                    komet_proto::CommandSource::Skill,
+                    komet_proto::CommandScope::Global,
+                )
+            };
             Some(komet_proto::SlashCommand {
                 name: name.to_owned(),
                 description,
                 input_hint: None,
+                source: source_kind,
+                scope,
             })
         })
         .collect()

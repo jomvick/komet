@@ -87,6 +87,9 @@ struct ListModelsParams {
     harness: HarnessId,
     #[serde(default)]
     force: bool,
+    /// Chat project cwd for command discovery; absent = the engine's HOME.
+    #[serde(default)]
+    cwd: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1370,7 +1373,10 @@ impl RpcService for EngineRpc {
             methods::LIST_COMMANDS => {
                 let p: ListModelsParams = parse_params(params)?;
                 let commands = match self.registry.resolve(p.harness) {
-                    Ok(harness) => harness.commands().await.unwrap_or_default(),
+                    Ok(harness) => harness
+                        .commands(p.cwd.as_deref().map(std::path::Path::new))
+                        .await
+                        .unwrap_or_default(),
                     Err(_) => Vec::new(),
                 };
                 RpcReply::value(&commands)
