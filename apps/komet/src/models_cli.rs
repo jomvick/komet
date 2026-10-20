@@ -303,7 +303,7 @@ fn model_provider(harness: HarnessId, model_id: &str) -> &'static str {
 }
 
 /// Models sorted by `(provider, label)` so each provider group is contiguous.
-fn sorted_by_provider<'a>(harness: HarnessId, models: &'a [Model]) -> Vec<(String, &'a Model)> {
+fn sorted_by_provider(harness: HarnessId, models: &[Model]) -> Vec<(String, &Model)> {
     let mut ordered: Vec<(String, &Model)> = models
         .iter()
         .map(|m| (model_provider(harness, &m.id).to_string(), m))
@@ -357,8 +357,8 @@ fn render_models_table(harness: HarnessId, models: &[Model], show_reasoning: boo
             headers[3].len(),
         ];
         for row in &rows {
-            for i in 0..4 {
-                widths[i] = widths[i].max(row.1[i].len());
+            for (i, width) in widths.iter_mut().enumerate() {
+                *width = (*width).max(row.1[i].len());
             }
         }
 

@@ -331,7 +331,8 @@ mod tests {
             permission_timeout_ms: None,
             resume: None,
             worktree: None,
-            mcp: None, mcp_external: Vec::new(),
+            mcp: None,
+            mcp_external: Vec::new(),
         }
     }
 }

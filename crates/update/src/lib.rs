@@ -248,8 +248,7 @@ async fn fetch_latest_unverified() -> anyhow::Result<Manifest> {
     if version.is_empty() {
         bail!("GitHub release has an empty tag_name");
     }
-    let manifest_bytes =
-        fetch_release_asset(&client, &repo, &version, "manifest.json").await?;
+    let manifest_bytes = fetch_release_asset(&client, &repo, &version, "manifest.json").await?;
     let manifest: Manifest =
         serde_json::from_slice(&manifest_bytes).context("parsing manifest.json")?;
     Ok(manifest)
