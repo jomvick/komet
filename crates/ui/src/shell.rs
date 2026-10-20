@@ -4037,8 +4037,7 @@ impl Shell {
             // over 260ms cubic-bezier(0.22,1,0.36,1). New rows fade in; removals
             // just go (matching the original). First fill and chat switches (which
             // don't reorder) never animate.
-            let order: Vec<(String, f32)> =
-                keyed.iter().map(|(k, h, _)| (k.clone(), *h)).collect();
+            let order: Vec<(String, f32)> = keyed.iter().map(|(k, h, _)| (k.clone(), *h)).collect();
             if self.sidebar_prev_order != order {
                 if !self.sidebar_prev_order.is_empty() {
                     let offsets =
@@ -5040,15 +5039,16 @@ impl Shell {
             let archive_id = chat_id.clone();
             let pin_id = chat_id.clone();
             let delete_id = chat_id.clone();
-            let pin_label = self
-                .state
-                .read(cx)
-                .chats
-                .iter()
-                .find(|c| c.id == chat_id)
-                .is_some_and(|c| c.pinned)
-                .then_some("Unpin")
-                .unwrap_or("Pin");
+            let pin_label = {
+                let pinned = self
+                    .state
+                    .read(cx)
+                    .chats
+                    .iter()
+                    .find(|c| c.id == chat_id)
+                    .is_some_and(|c| c.pinned);
+                if pinned { "Unpin" } else { "Pin" }
+            };
             let menu = popover::popover_card(&theme)
                 .w(px(170.0))
                 .on_mouse_down_out(cx.listener(|this, _, _, cx| {

@@ -732,12 +732,18 @@ impl Shell {
         let now = Utc::now();
 
         // Collect all needed data from state while holding read lock.
+        type SessionEntry = (
+            komet_proto::ChatIndicator,
+            komet_proto::Chat,
+            String,
+            Option<String>,
+        );
         struct SpaceGroup {
             id: String,
             name: String,
-            sessions: Vec<(komet_proto::ChatIndicator, komet_proto::Chat, String, Option<String>)>,
+            sessions: Vec<SessionEntry>,
         }
-        let (groups, projectless): (Vec<SpaceGroup>, Vec<(komet_proto::ChatIndicator, komet_proto::Chat, String, Option<String>)>) = {
+        let (groups, projectless): (Vec<SpaceGroup>, Vec<SessionEntry>) = {
             let state = self.state.read(cx);
             let spaces = state.spaces_sorted();
 
@@ -794,7 +800,12 @@ impl Shell {
                 let tb = b.last_message_at.unwrap_or(b.created_at);
                 tb.cmp(&ta)
             });
-            let projectless_rows: Vec<(komet_proto::ChatIndicator, komet_proto::Chat, String, Option<String>)> = orphan_chats
+            let projectless_rows: Vec<(
+                komet_proto::ChatIndicator,
+                komet_proto::Chat,
+                String,
+                Option<String>,
+            )> = orphan_chats
                 .into_iter()
                 .map(|chat| {
                     let status = state.display_status_for(&chat, now);
@@ -847,11 +858,9 @@ impl Shell {
                     let mut rows_div = div().flex().flex_col().gap(px(2.0)).pb(px(4.0));
                     for (status, chat, folder, branch) in group.sessions {
                         let is_selected = selected.as_deref() == Some(chat.id.as_str());
-                        let time_ago: SharedString = format_time_ago(
-                            chat.last_message_at.unwrap_or(chat.created_at),
-                            now,
-                        )
-                        .into();
+                        let time_ago: SharedString =
+                            format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now)
+                                .into();
                         let harness = chat.config.as_ref().map(|c| c.harness);
                         let element = self.render_chat_row(
                             chat.id.clone(),
@@ -895,11 +904,9 @@ impl Shell {
                 let mut rows_div = div().flex().flex_col().gap(px(2.0)).pb(px(4.0));
                 for (status, chat, folder, branch) in projectless {
                     let is_selected = selected.as_deref() == Some(chat.id.as_str());
-                    let time_ago: SharedString = format_time_ago(
-                        chat.last_message_at.unwrap_or(chat.created_at),
-                        now,
-                    )
-                    .into();
+                    let time_ago: SharedString =
+                        format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now)
+                            .into();
                     let harness = chat.config.as_ref().map(|c| c.harness);
                     let element = self.render_chat_row(
                         chat.id.clone(),

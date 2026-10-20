@@ -2662,7 +2662,7 @@ impl Transcript {
     /// repeated dump). Todo items ship complete in the doc, so no fetch is
     /// needed — pure derivation over row order. An empty diff clears the
     /// invocation, collapsing the chip back to its one-line summary.
-    fn apply_todo_diffs(&mut self, rows: &mut Vec<Row>) {
+    fn apply_todo_diffs(&mut self, rows: &mut [Row]) {
         for row in rows.iter_mut() {
             let RowKind::ToolGroup { tools, .. } = &mut row.kind else {
                 continue;
@@ -4218,10 +4218,10 @@ impl Transcript {
                                 group.toggled_at = Some(Instant::now());
                                 if let (Some(chat_id), part_id) =
                                     (journal_chat.clone(), journal_part.clone())
+                                    && journal_resolved
+                                    && !part_id.is_empty()
                                 {
-                                    if journal_resolved && !part_id.is_empty() {
-                                        this.spawn_journal_fetch(chat_id, part_id, cx);
-                                    }
+                                    this.spawn_journal_fetch(chat_id, part_id, cx);
                                 }
                                 cx.notify();
                             }))
