@@ -366,7 +366,6 @@ impl SessionDoc {
         Ok(())
     }
 
-
     /// Read all entries (continuations NOT joined — see `join_continuation_entries`).
     ///
     /// Malformed entries are SKIPPED, not fatal: a torn intermediate state
