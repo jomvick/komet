@@ -104,7 +104,6 @@ impl Shell {
     /// onto that project; under "All" the current pick (the last selected
     /// project, restored from composer defaults) stands.
     pub(super) fn open_new_session(&mut self, cx: &mut Context<Self>) {
-        self.route = Route::Chat;
         let target = {
             let state = self.state.read(cx);
             self.settings
@@ -112,9 +111,17 @@ impl Shell {
                 .clone()
                 .filter(|id| state.space_row(id).is_some())
         };
+        self.open_new_session_in(target, cx);
+    }
+
+    /// Open the new-session canvas hosted in `space` (or keep the current pick
+    /// when `None`). A folder `+` in the grouped view passes the folder id and
+    /// leaves `space_filter` alone, so the sidebar stays on "All projects".
+    pub(super) fn open_new_session_in(&mut self, space: Option<String>, cx: &mut Context<Self>) {
+        self.route = Route::Chat;
         self.state.update(cx, |s, cx| {
-            if target.is_some() {
-                s.select_space(target, cx);
+            if space.is_some() {
+                s.select_space(space, cx);
             }
             s.select_chat(None, cx);
         });

@@ -840,11 +840,10 @@ pub struct Shell {
     /// Unarchive affordance and restores the dimmed harness mark (t3code's
     /// settled-row hover).
     pub(super) archived_hover: Option<String>,
-    /// "All projects" grouped view: set of space IDs whose folder is
-    /// collapsed (folded). Absent = expanded by default. In-memory only —
-    /// resets to all-open on restart (a future ShellSettings field can
-    /// persist it if needed).
-    pub(super) collapsed_spaces: std::collections::HashSet<String>,
+    /// "All projects" grouped view: space IDs whose folder is expanded.
+    /// Absent = collapsed (the default on first launch); persisted in
+    /// `UiSettings::expanded_spaces` and pruned with the spaces.
+    pub(super) expanded_spaces: std::collections::HashSet<String>,
     /// Lazy panes: no entity (and no RPC) until first opened.
     terminal: Option<Entity<TerminalPanel>>,
     /// Embedded terminal host for right-pane Terminal surfaces — a SEPARATE
@@ -1125,7 +1124,6 @@ impl Shell {
             archived_open: true,
             archived_shown: 0,
             archived_hover: None,
-            collapsed_spaces: std::collections::HashSet::new(),
             terminal: None,
             right_terminal: None,
             right_plus: popover::Popup::default(),
@@ -1195,6 +1193,7 @@ impl Shell {
             import_current: None,
             boot,
             data_dir,
+            expanded_spaces: settings.expanded_spaces.clone(),
             settings,
             panels: SessionPanels::default(),
             active_chat: String::new(),
@@ -2355,7 +2354,14 @@ impl Shell {
         for id in to_remove {
             self.settings.last_session_by_device.remove(&id);
         }
-        pruned
+        // Drop folder expansion state for deleted spaces (same rule as the
+        // remembered destinations above).
+        let before = self.settings.expanded_spaces.len();
+        let state = self.state.read(cx);
+        self.settings
+            .expanded_spaces
+            .retain(|id| state.space_row(id).is_some());
+        pruned || self.settings.expanded_spaces.len() != before
     }
 
     fn retry_engine(&mut self, cx: &mut Context<Self>) {

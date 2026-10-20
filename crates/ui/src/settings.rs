@@ -104,6 +104,11 @@ pub struct UiSettings {
     /// list. Kept for file compatibility; no longer read.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub space_order: Vec<String>,
+    /// "All projects" folders the user expanded, by space id. Absent =
+    /// collapsed (the default on first launch); pruned against existing
+    /// spaces like the remembered-navigation map.
+    #[serde(default, skip_serializing_if = "std::collections::HashSet::is_empty")]
+    pub expanded_spaces: std::collections::HashSet<String>,
     /// Session notification chimes (done / awaiting-input). `KOMET_DISABLE_SOUND`
     /// overrides.
     pub sound_enabled: bool,
@@ -147,6 +152,7 @@ impl Default for UiSettings {
             space_filter: None,
             tab_order: std::collections::HashMap::new(),
             space_order: Vec::new(),
+            expanded_spaces: std::collections::HashSet::new(),
             sound_enabled: true,
             notifications_enabled: true,
             notifications_background_only: true,
@@ -442,6 +448,7 @@ mod tests {
                 vec!["b".to_string(), "a".to_string()],
             )]),
             space_order: vec!["space-2".to_string(), "space-1".to_string()],
+            expanded_spaces: std::collections::HashSet::from(["space-1".to_string()]),
             sound_enabled: false,
             notifications_enabled: false,
             notifications_background_only: false,
@@ -460,6 +467,12 @@ mod tests {
             files_show_all: false,
         };
         settings.save(dir.path()).unwrap();
+        let json = std::fs::read_to_string(UiSettings::path(dir.path())).unwrap();
+        let saved: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            saved["expandedSpaces"][0], "space-1",
+            "expanded folder state is written under the camelCase key"
+        );
         assert_eq!(UiSettings::load(dir.path()), settings);
     }
 
@@ -614,6 +627,8 @@ mod tests {
         let loaded = UiSettings::load(dir.path());
         assert_eq!(loaded.keymap, KeymapConfig::default());
         assert!(!loaded.sidebar_grouped);
+        // A file without the key means "every folder collapsed".
+        assert!(loaded.expanded_spaces.is_empty());
     }
 
     #[test]
