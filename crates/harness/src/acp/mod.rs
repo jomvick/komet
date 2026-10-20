@@ -41,7 +41,7 @@ mod subagent;
 mod subagent_opencode;
 
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -55,9 +55,9 @@ use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
 use komet_proto::{
-    AgentEvent, DoneStatus, ErrorKind, HarnessId, Model, ModelOption, ModelOptionChoice,
-    ReasoningLevel, RunRequest, SandboxLevel, SlashCommand, SteeringMode, UserInputAnswer,
-    UserInputQuestion,
+    AgentEvent, CommandSource, DoneStatus, ErrorKind, HarnessId, Model, ModelOption,
+    ModelOptionChoice, ReasoningLevel, RunRequest, SandboxLevel, SlashCommand, SteeringMode,
+    UserInputAnswer, UserInputQuestion,
 };
 
 use crate::jsonrpc::{Incoming, RpcClient};
@@ -797,8 +797,10 @@ pub struct AcpHarness {
     /// picker. OpenCode shares this with its real startup budget because both
     /// paths wait for the same plugin-heavy boot.
     model_discovery_timeout: Duration,
-    /// Discovery result cache: the advertised commands survive across calls.
-    commands: tokio::sync::OnceCell<Vec<SlashCommand>>,
+    /// Discovery result cache, keyed by the probe cwd. Each entry carries the
+    /// buster (newest mtime of the command/skill dirs) it was discovered
+    /// under, so a CLI-side change re-probes instead of serving the old list.
+    commands: tokio::sync::Mutex<std::collections::HashMap<String, (u128, Vec<SlashCommand>)>>,
     /// Model discovery cache: a successful, non-empty probe is reused while
     /// fresh AND the buster still matches, so a CLI-side change (Cline
     /// model/account switch) invalidates the list instead of serving it for
@@ -830,7 +832,7 @@ impl AcpHarness {
             // wedged agent, not a slow one.
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             model_discovery_timeout: DEFAULT_MODEL_DISCOVERY_TIMEOUT,
-            commands: tokio::sync::OnceCell::new(),
+            commands: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             models_cache: tokio::sync::Mutex::new(None),
             models_probe: tokio::sync::Mutex::new(()),
             cli_sync: true,
@@ -1089,7 +1091,7 @@ impl AcpHarness {
     /// briefly for `available_commands_update`. Best-effort — an agent that
     /// refuses sessions before login still surfaces whatever the handshake
     /// advertised.
-    async fn discover_commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
+    async fn discover_commands(&self, cwd: &Path) -> Result<Vec<SlashCommand>, HarnessError> {
         let (mut child, _stderr) = self.spawn_agent(None, false, None, &[], None, None).await?;
         let (client, mut incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
@@ -1104,7 +1106,7 @@ impl AcpHarness {
                 .await?;
             let mut commands = scan_available_commands(&init);
             if commands.is_empty() {
-                let cwd = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+                let cwd = cwd.to_string_lossy();
                 let session = client
                     .request("session/new", build_acp_session_params(&cwd, None, vec![]))
                     .await;
@@ -1550,6 +1552,8 @@ fn cmd(name: &str, description: &str, hint: Option<&str>) -> SlashCommand {
         name: name.into(),
         description: description.into(),
         input_hint: hint.map(str::to_owned),
+        source: CommandSource::Fallback,
+        ..SlashCommand::default()
     }
 }
 
@@ -1779,19 +1783,28 @@ impl Harness for AcpHarness {
         }
     }
 
-    async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
+    async fn commands(&self, cwd: Option<&Path>) -> Result<Vec<SlashCommand>, HarnessError> {
+        let cwd = crate::discovery_cwd(cwd);
+        let key = cwd.to_string_lossy().into_owned();
+        let buster = crate::commands_buster(&cwd, self.spec.id);
+        if let Some((stored, commands)) = self.commands.lock().await.get(&key)
+            && *stored == buster
+        {
+            return Ok(commands.clone());
+        }
+        let commands = match self.discover_commands(&cwd).await {
+            // A failure is NOT cached: the next open retries the live probe.
+            Err(error) => {
+                tracing::debug!(harness = ?self.spec.id, %error, "live command discovery failed; using fallback catalog");
+                return Ok(static_commands(self.spec.id));
+            }
+            Ok(commands) => commands,
+        };
         self.commands
-            .get_or_try_init(|| async {
-                match self.discover_commands().await {
-                    Ok(commands) => Ok(commands),
-                    Err(error) => {
-                        tracing::debug!(harness = ?self.spec.id, %error, "live command discovery failed; using fallback catalog");
-                        Ok(static_commands(self.spec.id))
-                    }
-                }
-            })
+            .lock()
             .await
-            .cloned()
+            .insert(key, (buster, commands.clone()));
+        Ok(commands)
     }
 
     async fn context_usage(&self) -> Result<komet_proto::ContextUsage, HarnessError> {

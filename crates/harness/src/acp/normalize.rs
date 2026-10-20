@@ -569,6 +569,7 @@ pub(crate) fn parse_commands(value: Option<&Value>) -> Vec<SlashCommand> {
                     .and_then(|i| i.get("hint"))
                     .and_then(Value::as_str)
                     .map(str::to_owned),
+                ..SlashCommand::default()
             })
         })
         .collect()
@@ -830,11 +831,13 @@ mod tests {
                         name: "compact".into(),
                         description: "Compact the session".into(),
                         input_hint: None,
+                        ..SlashCommand::default()
                     },
                     SlashCommand {
                         name: "goal".into(),
                         description: "Set a goal".into(),
                         input_hint: Some("the goal".into()),
+                        ..SlashCommand::default()
                     },
                 ]
             }]

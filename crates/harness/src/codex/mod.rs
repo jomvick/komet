@@ -41,7 +41,7 @@ mod normalize;
 pub(crate) mod permissions;
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -55,8 +55,8 @@ use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
 use komet_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SlashCommand,
-    SteeringMode, UserInputAnswer, UserInputQuestion,
+    AgentEvent, CommandSource, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest,
+    SlashCommand, SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
 use crate::jsonrpc::{Incoming, RpcClient};
@@ -118,9 +118,9 @@ pub struct CodexHarness {
     interrupt_grace: Duration,
     /// Grace between SIGTERM and SIGKILL.
     kill_grace: Duration,
-    /// Command discovery cache: only a successful probe is cached, so a
-    /// broken CLI retries on the next picker open (ACP-harness parity).
-    commands: tokio::sync::OnceCell<Vec<SlashCommand>>,
+    /// Command discovery cache keyed by probe cwd; the stored buster
+    /// invalidates it when the CLI's skill dirs change.
+    commands: tokio::sync::Mutex<HashMap<String, (u128, Vec<SlashCommand>)>>,
     /// Model discovery cache: live app-server model/list cached on success.
     models: tokio::sync::OnceCell<Vec<Model>>,
 }
@@ -131,7 +131,7 @@ impl Default for CodexHarness {
             executable: None,
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
-            commands: tokio::sync::OnceCell::new(),
+            commands: tokio::sync::Mutex::new(HashMap::new()),
             models: tokio::sync::OnceCell::new(),
         }
     }
@@ -175,7 +175,7 @@ impl CodexHarness {
     /// (custom `~/.codex/prompts` are NOT exposed; the TUI-only built-ins
     /// aren't either). Skills are what the codex TUI itself surfaces as
     /// slash-invocables, listed per-cwd and deduped by name here.
-    async fn discover_commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
+    async fn discover_commands(&self, cwd: &Path) -> Result<Vec<SlashCommand>, HarnessError> {
         let exe = self.resolve_executable()?;
         let mut cmd = Command::new(&exe);
         cmd.arg("app-server");
@@ -214,7 +214,7 @@ impl CodexHarness {
                 .await?;
             client.notify("initialized", None);
             let skills = client
-                .request("skills/list", json!({}))
+                .request("skills/list", json!({ "cwds": [cwd.to_string_lossy()] }))
                 .await
                 .unwrap_or(Value::Null);
             // `skills/list` is the live source for this CLI.  Do not add the
@@ -353,6 +353,8 @@ fn parse_skill_commands(result: &Value) -> Vec<SlashCommand> {
                 name: name.to_owned(),
                 description: description.to_owned(),
                 input_hint: None,
+                source: CommandSource::Skill,
+                ..SlashCommand::default()
             });
         }
     }
@@ -428,20 +430,22 @@ impl Harness for CodexHarness {
     }
 
     /// Skills from a short-lived `skills/list` probe (see
-    /// [`Self::discover_commands`]); cached on success.
-    async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
+    /// [`Self::discover_commands`]); cached on success per cwd + buster.
+    async fn commands(&self, cwd: Option<&Path>) -> Result<Vec<SlashCommand>, HarnessError> {
+        let cwd = crate::discovery_cwd(cwd);
+        let key = cwd.to_string_lossy().into_owned();
+        let buster = crate::commands_buster(&cwd, HarnessId::Codex);
+        if let Some((stored, commands)) = self.commands.lock().await.get(&key)
+            && *stored == buster
+        {
+            return Ok(commands.clone());
+        }
+        let commands = self.discover_commands(&cwd).await?;
         self.commands
-            .get_or_try_init(|| async {
-                match self.discover_commands().await {
-                    Ok(commands) => Ok(commands),
-                    Err(error) => {
-                        tracing::debug!(%error, "live Codex command discovery failed");
-                        Ok(Vec::new())
-                    }
-                }
-            })
+            .lock()
             .await
-            .cloned()
+            .insert(key, (buster, commands.clone()));
+        Ok(commands)
     }
 
     async fn context_usage(&self) -> Result<komet_proto::ContextUsage, HarnessError> {

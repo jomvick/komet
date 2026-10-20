@@ -126,11 +126,15 @@ pub trait Harness: Send + Sync {
     fn fallback_models(&self) -> Vec<Model> {
         Vec::new()
     }
-    /// Slash commands the agent advertises. Native harnesses merge a curated
-    /// CLI catalog with a live probe when one exists (ACP
-    /// `availableCommands`, Claude `initialize` / skills, Codex
-    /// `skills/list`). Empty only for harnesses without a command surface.
-    async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
+    /// Slash commands the agent advertises for `cwd` (the chat's project, or
+    /// HOME when none is selected). Native harnesses read the running CLI's
+    /// live surface (ACP `availableCommands`, Claude `initialize` / skills,
+    /// Codex `skills/list`). Empty only for harnesses without a command
+    /// surface.
+    async fn commands(
+        &self,
+        _cwd: Option<&std::path::Path>,
+    ) -> Result<Vec<SlashCommand>, HarnessError> {
         Ok(Vec::new())
     }
     /// Out-of-session probe (Claude skill discovery via Bucket C
@@ -145,6 +149,43 @@ pub trait Harness: Send + Sync {
         request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError>;
+}
+
+/// The cwd a command probe should run in — the chat's project, else HOME.
+pub(crate) fn discovery_cwd(cwd: Option<&std::path::Path>) -> std::path::PathBuf {
+    cwd.map(std::path::Path::to_path_buf).unwrap_or_else(|| {
+        std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("/"))
+    })
+}
+
+/// Cache buster for a harness's command surface: the newest mtime over the
+/// command/skill dirs that harness reads, under `cwd` and `$HOME`. A CLI-side
+/// add/remove bumps a directory's mtime and invalidates the cache; 0 when no
+/// candidate dir exists.
+pub fn commands_buster(cwd: &std::path::Path, harness: HarnessId) -> u128 {
+    let dirs: &[&str] = match harness {
+        HarnessId::Opencode => &[".opencode/command", ".opencode/skills"],
+        HarnessId::ClaudeCode => &[".claude/commands", ".claude/skills"],
+        HarnessId::Codex => &[".codex"],
+        _ => &[],
+    };
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let mut newest: u128 = 0;
+    for base in std::iter::once(cwd.to_path_buf()).chain(home) {
+        for dir in dirs {
+            let Ok(modified) = std::fs::metadata(base.join(dir)).and_then(|m| m.modified()) else {
+                continue;
+            };
+            let stamp = modified
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            newest = newest.max(stamp);
+        }
+    }
+    newest
 }
 
 pub mod acp;
@@ -360,4 +401,37 @@ pub(crate) fn send_signal(pid: u32, signal: Signal) {
 #[cfg(not(unix))]
 pub(crate) fn send_signal(_pid: u32, _signal: Signal) {
     // No SIGTERM off unix; `start_kill`/`kill_on_drop` handle termination.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn commands_buster_tracks_directory_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let commands = dir.path().join(".claude/commands");
+        std::fs::create_dir_all(&commands).unwrap();
+
+        let before = commands_buster(dir.path(), HarnessId::ClaudeCode);
+        assert!(before > 0, "an existing command dir must produce a buster");
+
+        // Adding a command file bumps the directory mtime; set it explicitly
+        // so a coarse filesystem clock cannot hide the change.
+        std::fs::write(commands.join("review.md"), "# review").unwrap();
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(2);
+        touch(&commands, later);
+
+        let after = commands_buster(dir.path(), HarnessId::ClaudeCode);
+        assert!(after > before, "buster must change: {before} -> {after}");
+    }
+
+    /// `std::fs::File::set_times` keeps the test dependency-free; opening
+    /// read-only also works for a directory on the platforms komet builds for.
+    fn touch(path: &std::path::Path, time: std::time::SystemTime) {
+        std::fs::File::open(path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(time))
+            .unwrap();
+    }
 }

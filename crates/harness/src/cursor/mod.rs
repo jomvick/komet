@@ -34,7 +34,7 @@
 //! - Steering: turn-boundary — steers queue and become the next turn on the
 //!   parked session (parity with the previous ACP behavior).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -294,7 +294,7 @@ impl Harness for CursorHarness {
     /// cursor-agent TUI built-ins (Bucket A). `@cursor/sdk` 1.0.28 still has
     /// no listing API, so the static catalog is the source — same prompt-line
     /// shape as Claude/Codex (`/name` sent as the turn text).
-    async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
+    async fn commands(&self, _cwd: Option<&Path>) -> Result<Vec<SlashCommand>, HarnessError> {
         Ok(catalog::static_commands())
     }
 
