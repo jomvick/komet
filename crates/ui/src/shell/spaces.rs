@@ -644,7 +644,7 @@ impl Shell {
     }
 
     /// Builds one collapsible folder header for the "All projects" grouped
-    /// view: `[📁 icon] [Project name] ── [N] [+] [▶/▼]`.
+    /// view: `[📁 icon] [Project name] ── [N] [▶/▼] [+]`.
     /// Clicking toggles `expanded_spaces` for the given space ID; the `+`
     /// re-homes the new-session canvas on that folder without leaving the
     /// grouped view (the project-less `~` group passes `None`, so it has no `+`).
@@ -732,9 +732,24 @@ impl Shell {
                         .child(SharedString::from(format!("{session_count}"))),
                 )
             })
+            // Chevron
+            .child(
+                crate::icons::icon(if is_collapsed {
+                    crate::icons::ALT_ARROW_RIGHT
+                } else {
+                    crate::icons::ALT_ARROW_DOWN
+                })
+                .size(px(12.0))
+                .flex_none()
+                .text_color(motion::hover_blend(
+                    &hover_text,
+                    theme.text_muted.opacity(0.5),
+                    theme.text_muted.opacity(0.85),
+                )),
+            )
             // New session in this folder (real folders only; the `~` group has
-            // no folder to start in). Always laid out so hovering never shifts
-            // the rows; it fades in with the header hover.
+            // no folder to start in). Kept extreme-right, always laid out so
+            // hovering never shifts the rows; it fades in with header hover.
             .when(folder_id.is_some(), |el| {
                 el.child(
                     div()
@@ -770,21 +785,6 @@ impl Shell {
                         ),
                 )
             })
-            // Chevron
-            .child(
-                crate::icons::icon(if is_collapsed {
-                    crate::icons::ALT_ARROW_RIGHT
-                } else {
-                    crate::icons::ALT_ARROW_DOWN
-                })
-                .size(px(12.0))
-                .flex_none()
-                .text_color(motion::hover_blend(
-                    &hover_text,
-                    theme.text_muted.opacity(0.5),
-                    theme.text_muted.opacity(0.85),
-                )),
-            )
             .into_any_element()
     }
 
