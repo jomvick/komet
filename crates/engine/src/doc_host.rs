@@ -2385,7 +2385,12 @@ impl DocHost {
                 }
                 let harness = self.harness_for_request(chat_id, request);
                 sessions
-                    .dispatch(chat_id, harness, request.clone(), Some(new_message_id.clone()))
+                    .dispatch(
+                        chat_id,
+                        harness,
+                        request.clone(),
+                        Some(new_message_id.clone()),
+                    )
                     .await?;
                 handle.publish_messages_if_watched();
                 Ok((SessionCommandStatus::Applied, None))

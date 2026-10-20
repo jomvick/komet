@@ -54,7 +54,7 @@ fn persist_models_cache_to(path: &Path, entries: &HashMap<HarnessId, CachedModel
         }
     };
     let tmp = path.with_extension("json.tmp");
-    if let Err(err) = std::fs::write(&tmp, json).and_then(|()| std::fs::rename(&tmp, &path)) {
+    if let Err(err) = std::fs::write(&tmp, json).and_then(|()| std::fs::rename(&tmp, path)) {
         tracing::warn!(error = %err, "model-cache save failed");
     }
 }
@@ -261,13 +261,13 @@ impl HarnessRegistry {
         // (opencode's cold Node start measured ~13s under the app's 4-way boot
         // prefetch; user report: "model loading is too slow"). A stale entry is
         // revalidated off the hot path.
-        if let Some(cached) = self.models_cache_entries().get(&id).cloned() {
-            if !cached.models.is_empty() {
-                if now - cached.discovered_at_ms >= refresh_after_ms {
-                    self.spawn_background_refresh(id);
-                }
-                return Ok(cached.models);
+        if let Some(cached) = self.models_cache_entries().get(&id).cloned()
+            && !cached.models.is_empty()
+        {
+            if now - cached.discovered_at_ms >= refresh_after_ms {
+                self.spawn_background_refresh(id);
             }
+            return Ok(cached.models);
         }
 
         // Nothing known yet: one blocking probe, then the curated fallback.
@@ -1127,7 +1127,10 @@ mod tests {
     async fn models_force_bypasses_cache_and_propagates_error() {
         let registry = HarnessRegistry::new();
         registry.load_models_cache(std::path::Path::new("/nonexistent-dir-xyz"));
-        let err = registry.models(HarnessId::ClaudeCode, true).await.expect_err("sans CLI ProbeError attendu");
+        let err = registry
+            .models(HarnessId::ClaudeCode, true)
+            .await
+            .expect_err("sans CLI ProbeError attendu");
         assert!(!err.to_string().is_empty());
     }
 

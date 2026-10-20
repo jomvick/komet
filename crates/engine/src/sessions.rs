@@ -785,15 +785,6 @@ impl SessionsEngine {
         // lastMessageAt bump must never be observable ahead of the live run.
         self.inner.note_message(chat_id, &request.prompt);
 
-        // Name the chat NOW, off the first prompt — not after the first
-        // exchange completes ("called New session for a long time for no
-        // reason"; the titler only needs the prompt and skips titled chats;
-        // the Done-time call below stays as the retry for a failed
-        // generation).
-        if let Some(titles) = self.inner.titles.get() {
-            titles.maybe_generate(chat_id, harness_id, &request.prompt, &request.cwd);
-        }
-
         tokio::spawn(drive_run(
             self.inner.clone(),
             chat_id.to_string(),
@@ -1371,6 +1362,18 @@ impl Inner {
         );
         if let Some(ws) = self.workspace() {
             ws.set_chat_harness_session(chat_id, session_id, cwd);
+        }
+    }
+
+    /// Forget a harness session that proved unusable during a turn.  The
+    /// empty-turn guard is deliberately retryable, but resuming the same ACP
+    /// session would replay the failure forever.  Keep an explicit empty
+    /// tombstone in the workspace row so the journal fallback cannot revive
+    /// the poisoned id on the next dispatch.
+    fn invalidate_harness_session(&self, chat_id: &str) {
+        lock(&self.harness_sessions).remove(chat_id);
+        if let Some(ws) = self.workspace() {
+            ws.set_chat_harness_session(chat_id, "", "");
         }
     }
 
@@ -2136,9 +2139,23 @@ async fn drive_run(
             }
             AgentEvent::Done {
                 session_id: Some(session_id),
+                status,
+                error,
                 ..
             } => {
-                inner.remember_harness_session(&chat_id, session_id, &run_cwd);
+                // OpenCode can report a successful ACP stop with no wire
+                // output.  The harness converts that into the retryable
+                // "empty turn" error; do not persist the same poisoned
+                // session or every later command will fail identically.
+                let poisoned_empty_turn = *status == DoneStatus::Errored
+                    && error
+                        .as_deref()
+                        .is_some_and(|message| message.contains("returned an empty turn"));
+                if poisoned_empty_turn {
+                    inner.invalidate_harness_session(&chat_id);
+                } else {
+                    inner.remember_harness_session(&chat_id, session_id, &run_cwd);
+                }
             }
             AgentEvent::InputRequested { .. } => {
                 // Known-id guaranteed: the unknown-id twin was dropped above,

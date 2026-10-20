@@ -2459,10 +2459,10 @@ impl AgentAccounts {
         let slot_token = str_field(&slot.credentials, "sessionToken")
             .or_else(|| str_field(&slot.credentials, "accessToken"));
 
-        if let Some(token) = slot_token.as_deref() {
-            if let Some(windows) = self.query_cursor_usage(token).await {
-                return Some(windows);
-            }
+        if let Some(token) = slot_token.as_deref()
+            && let Some(windows) = self.query_cursor_usage(token).await
+        {
+            return Some(windows);
         }
 
         // Fallback: try a fresh read from the local SQLite store (Cursor may
@@ -3256,10 +3256,10 @@ mod wincred {
 fn cursor_state_db_paths() -> Vec<PathBuf> {
     let home = home_dir();
     let mut paths = Vec::new();
-    if let Ok(env) = std::env::var("CURSOR_STATE_DB") {
-        if !env.is_empty() {
-            paths.push(PathBuf::from(env));
-        }
+    if let Ok(env) = std::env::var("CURSOR_STATE_DB")
+        && !env.is_empty()
+    {
+        paths.push(PathBuf::from(env));
     }
     paths.push(home.join(".config/Cursor/User/globalStorage/state.vscdb"));
     paths.push(home.join(".cursor-server-data/User/globalStorage/state.vscdb"));
@@ -3319,12 +3319,7 @@ fn read_cursor_sqlite_token_once(db: &Path, flags: rusqlite::OpenFlags) -> Optio
         .prepare("SELECT value FROM ItemTable WHERE key LIKE '%SessionToken%' LIMIT 5")
         .ok()?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(0)).ok()?;
-    for value in rows.flatten() {
-        if !value.trim().is_empty() {
-            return Some(value);
-        }
-    }
-    None
+    rows.flatten().find(|value| !value.trim().is_empty())
 }
 
 /// Build a [`Detected`] from a raw Workos session JWT (identity mined from
@@ -3674,29 +3669,26 @@ fn parse_cursor_usage_response(body: &serde_json::Value) -> Vec<AgentUsageWindow
     if let (Some(count), Some(limit)) = (
         usage.get("requestCount").and_then(json_f64),
         usage.get("requestLimit").and_then(json_f64),
-    ) {
-        if limit > 0.0 {
-            windows.push(AgentUsageWindow {
-                label: format!("{label} Requests"),
-                used_fraction: (count / limit).clamp(0.0, 1.0) as f32,
-                resets_at: parse_when(body.get("resetsAt"))
-                    .or_else(|| parse_when(body.get("resetAt"))),
-            });
-        }
+    ) && limit > 0.0
+    {
+        windows.push(AgentUsageWindow {
+            label: format!("{label} Requests"),
+            used_fraction: (count / limit).clamp(0.0, 1.0) as f32,
+            resets_at: parse_when(body.get("resetsAt")).or_else(|| parse_when(body.get("resetAt"))),
+        });
     }
 
     // Token quota window (optional — not all Cursor plans expose it).
     if let (Some(count), Some(limit)) = (
         usage.get("tokenCount").and_then(json_f64),
         usage.get("tokenLimit").and_then(json_f64),
-    ) {
-        if limit > 0.0 {
-            windows.push(AgentUsageWindow {
-                label: format!("{label} Tokens"),
-                used_fraction: (count / limit).clamp(0.0, 1.0) as f32,
-                resets_at: None,
-            });
-        }
+    ) && limit > 0.0
+    {
+        windows.push(AgentUsageWindow {
+            label: format!("{label} Tokens"),
+            used_fraction: (count / limit).clamp(0.0, 1.0) as f32,
+            resets_at: None,
+        });
     }
 
     windows
