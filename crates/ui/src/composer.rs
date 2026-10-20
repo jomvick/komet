@@ -26,7 +26,8 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use komet_doc::{MessagePart, MessageRole, SessionCommandPayload, SessionMessageEntry};
 use komet_proto::{
-    FileSearchMatch, HarnessId, RunRequest, SlashCommand, UserInputAnswer, UserInputQuestion,
+    CommandSource, FileSearchMatch, HarnessId, RunRequest, SlashCommand, UserInputAnswer,
+    UserInputQuestion,
 };
 use komet_rpc::{RpcError, methods};
 
@@ -3510,9 +3511,45 @@ fn parse_sandbox_level(argument: Option<&str>) -> Option<komet_proto::SandboxLev
     }
 }
 
+/// What `/prompt …` asks for. `save`/`delete` manage the library; anything
+/// else is the name of a snippet to insert.
+enum PromptAction<'a> {
+    Insert(&'a str),
+    Save {
+        name: &'a str,
+        harness: Option<&'a str>,
+        body: &'a str,
+    },
+    Delete(&'a str),
+}
+
+fn parse_prompt_action(argument: &str) -> PromptAction<'_> {
+    let argument = argument.trim();
+    if let Some(rest) = argument.strip_prefix("save ")
+        && let Some((head, body)) = rest.split_once('=')
+    {
+        let mut words = head.split_whitespace();
+        if let (Some(name), Some(body)) =
+            (words.next(), Some(body.trim()).filter(|b| !b.is_empty()))
+        {
+            let harness = words.next().and_then(|word| word.strip_prefix('@'));
+            return PromptAction::Save {
+                name,
+                harness,
+                body,
+            };
+        }
+    }
+    if let Some(name) = argument.strip_prefix("delete ") {
+        return PromptAction::Delete(name.trim());
+    }
+    PromptAction::Insert(argument)
+}
+
 fn with_komet_commands(
     mut commands: Vec<SlashCommand>,
-    prompt_names: impl IntoIterator<Item = String>,
+    prompts: impl IntoIterator<Item = (String, Option<String>)>,
+    harness: HarnessId,
 ) -> Vec<SlashCommand> {
     for (name, description, input_hint) in [
         ("new", "Open a new chat", None),
@@ -3527,33 +3564,46 @@ fn with_komet_commands(
                 name: name.into(),
                 description: format!("Komet · {description}"),
                 input_hint: input_hint.map(str::to_owned),
+                source: CommandSource::Custom,
+                ..SlashCommand::default()
             });
         }
     }
-    for prompt_name in prompt_names {
+    for (prompt_name, prompt_harness) in prompts {
+        if let Some(tag) = prompt_harness
+            && !tag.eq_ignore_ascii_case(crate::settings::harnesses::cli_name(harness))
+        {
+            continue;
+        }
         let name = format!("prompt {prompt_name}");
         if !commands.iter().any(|command| command.name == name) {
             commands.push(SlashCommand {
                 name,
                 description: "Komet · Insert saved prompt".into(),
                 input_hint: None,
+                source: CommandSource::Custom,
+                ..SlashCommand::default()
             });
         }
     }
     commands
 }
 
+/// Cache key for advertised commands: harness + the chat project's cwd.
+type SlashCacheKey = (HarnessId, Option<String>);
+
 /// Slash-command completion state: like [`FileMentionState`] but the
-/// candidate list is fetched once per harness (`ListCommands`) and filtered
-/// locally per keystroke — no RPC, debounce, or skeleton churn while typing.
+/// candidate list is fetched once per harness + project (`ListCommands`) and
+/// filtered locally per keystroke — no RPC, debounce, or skeleton churn while
+/// typing.
 #[derive(Debug, Clone, Default)]
 struct SlashState {
     token: Option<MentionToken>,
     /// Indices into the cached command list, filter-ranked for the query.
     filtered: Vec<usize>,
     active: Option<usize>,
-    /// Harness the popup is showing commands for (cache key).
-    harness: Option<HarnessId>,
+    /// Harness + cwd the popup is showing commands for (cache key).
+    key: Option<SlashCacheKey>,
     request: u64,
     loading: bool,
     error: Option<SharedString>,
@@ -3649,9 +3699,9 @@ pub struct Composer {
     slash_task: Option<Task<()>>,
     slash_scroll: gpui::ScrollHandle,
     slash: SlashState,
-    /// Advertised commands per harness (one `ListCommands` per harness per
-    /// composer lifetime; the engine caches discovery on its side too).
-    slash_cache: HashMap<HarnessId, Vec<SlashCommand>>,
+    /// Advertised commands per harness + project cwd (one `ListCommands` per
+    /// key per composer lifetime; the engine caches discovery on its side).
+    slash_cache: HashMap<SlashCacheKey, Vec<SlashCommand>>,
     current_key: String,
     sending: bool,
     failure: Option<SharedString>,
@@ -4446,14 +4496,25 @@ impl Composer {
 
     // ---- slash commands ---------------------------------------------------
 
+    /// The cache key for the active project: resolved harness + selected
+    /// chat's configured cwd (None when no chat is selected).
+    fn slash_cache_key(&self, cx: &mut Context<Self>) -> Option<SlashCacheKey> {
+        let harness = self.pickers.read(cx).resolved(cx).harness?;
+        let cwd = self
+            .state
+            .read(cx)
+            .selected_chat_row()
+            .and_then(|chat| chat.cwd.clone());
+        Some((harness, cwd))
+    }
+
     /// Eagerly prefetch slash commands for the active harness so that typing `/`
     /// opens immediately without delay.
     fn prefetch_slash_commands(&mut self, cx: &mut Context<Self>) {
-        let harness = self.pickers.read(cx).resolved(cx).harness;
-        let Some(harness) = harness else {
+        let Some(key) = self.slash_cache_key(cx) else {
             return;
         };
-        if self.slash_cache.contains_key(&harness) || self.slash_task.is_some() {
+        if self.slash_cache.contains_key(&key) || self.slash_task.is_some() {
             return;
         }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
@@ -4466,7 +4527,7 @@ impl Composer {
                 .map(|chat| chat.device_id.clone())
                 .or_else(|| state.selected_space_row().map(|s| s.device_id.clone()))
         };
-        let prompt_names = self
+        let prompts = self
             .state
             .read(cx)
             .data_dir
@@ -4476,15 +4537,21 @@ impl Composer {
                 library
                     .prompts
                     .into_iter()
-                    .map(|prompt| prompt.name)
+                    .map(|prompt| (prompt.name, prompt.harness))
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        let (harness, cwd) = key.clone();
         let request = self.slash.request;
         self.slash_task = Some(cx.spawn(async move |this, cx| {
             let mut params = serde_json::json!({ "harness": harness });
-            if let (Some(target), Some(object)) = (&target, params.as_object_mut()) {
-                object.insert("targetDeviceId".into(), target.clone().into());
+            if let Some(object) = params.as_object_mut() {
+                if let Some(target) = &target {
+                    object.insert("targetDeviceId".into(), target.clone().into());
+                }
+                if let Some(cwd) = &cwd {
+                    object.insert("cwd".into(), cwd.clone().into());
+                }
             }
             let result = engine.client().call(methods::LIST_COMMANDS, params).await;
             this.update(cx, |composer, cx| {
@@ -4498,17 +4565,24 @@ impl Composer {
                         Ok(commands) => {
                             composer
                                 .slash_cache
-                                .insert(harness, with_komet_commands(commands, prompt_names));
+                                .insert(key, with_komet_commands(commands, prompts, harness));
                         }
                         Err(err) => {
                             tracing::warn!(%err, "slash command decode failed");
-                            composer.slash_cache.entry(harness).or_default();
+                            composer.slash_cache.entry(key).or_default();
                         }
                     },
                     Err(err) => {
                         tracing::debug!(%err, "slash command discovery failed");
-                        composer.slash_cache.entry(harness).or_default();
+                        composer.slash_cache.entry(key).or_default();
                     }
+                }
+                // The user may have switched projects while this probe ran;
+                // fetch the new key instead of leaving its popup empty.
+                if composer.slash.key.is_some()
+                    && composer.slash.key != composer.slash_cache_key(cx)
+                {
+                    composer.prefetch_slash_commands(cx);
                 }
                 if composer.slash.token.is_some() {
                     composer.refilter_slash(cx);
@@ -4533,14 +4607,14 @@ impl Composer {
             return;
         }
         self.slash.dismissed = None;
-        let harness = self.pickers.read(cx).resolved(cx).harness;
-        let harness_changed = self.slash.harness != harness;
-        if token == self.slash.token && !harness_changed {
+        let key = self.slash_cache_key(cx);
+        let key_changed = self.slash.key != key;
+        if token == self.slash.token && !key_changed {
             self.refilter_slash(cx);
             return;
         }
         self.slash.token = token.clone();
-        self.slash.harness = harness;
+        self.slash.key = key;
         self.slash.error = None;
         if token.is_none() {
             self.slash.active = None;
@@ -4548,12 +4622,12 @@ impl Composer {
             return;
         }
         // No resolved harness (catalog still loading): empty popup, no fetch.
-        let Some(harness) = harness else {
+        let Some(key) = self.slash.key.clone() else {
             self.slash.loading = false;
             self.refilter_slash(cx);
             return;
         };
-        if self.slash_cache.contains_key(&harness) {
+        if self.slash_cache.contains_key(&key) {
             self.slash.loading = false;
             self.refilter_slash(cx);
             return;
@@ -4576,8 +4650,9 @@ impl Composer {
             .unwrap_or_default();
         let commands = self
             .slash
-            .harness
-            .and_then(|h| self.slash_cache.get(&h))
+            .key
+            .as_ref()
+            .and_then(|key| self.slash_cache.get(key))
             .map(Vec::as_slice)
             .unwrap_or_default();
         let names: Vec<&str> = commands.iter().map(|c| c.name.as_str()).collect();
@@ -4619,8 +4694,9 @@ impl Composer {
             .and_then(|active| self.slash.filtered.get(active))
             .and_then(|&ix| {
                 self.slash
-                    .harness
-                    .and_then(|h| self.slash_cache.get(&h))
+                    .key
+                    .as_ref()
+                    .and_then(|key| self.slash_cache.get(key))
                     .and_then(|c| c.get(ix))
             })
             .cloned()
@@ -4641,7 +4717,7 @@ impl Composer {
         self.slash = SlashState {
             request,
             dismissed,
-            harness: self.slash.harness,
+            key: self.slash.key.clone(),
             ..SlashState::default()
         };
         self.sync_mention_controls(cx);
@@ -4655,8 +4731,9 @@ impl Composer {
         let token = self.slash.token.as_ref()?;
         let commands = self
             .slash
-            .harness
-            .and_then(|h| self.slash_cache.get(&h))
+            .key
+            .as_ref()
+            .and_then(|key| self.slash_cache.get(key))
             .map(Vec::as_slice)
             .unwrap_or_default();
         let mut card = crate::popover::popover_card(theme)
@@ -4695,6 +4772,21 @@ impl Composer {
                     }),
             );
         } else {
+            let offline = commands.iter().any(|c| c.source != CommandSource::Custom)
+                && commands
+                    .iter()
+                    .filter(|c| c.source != CommandSource::Custom)
+                    .all(|c| c.source == CommandSource::Fallback);
+            if offline {
+                card = card.child(
+                    div()
+                        .px(px(12.0))
+                        .py(px(6.0))
+                        .text_size(px(11.0))
+                        .text_color(theme.text_muted)
+                        .child("Offline list · live discovery unavailable"),
+                );
+            }
             let mut list = div()
                 .id("slash-popup-scroll")
                 .size_full()
@@ -4719,6 +4811,50 @@ impl Composer {
                     }
                 }
                 let description: SharedString = description.into();
+                let mut row = div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(
+                        crate::icons::icon(crate::icons::COMMAND)
+                            .size(px(14.0))
+                            .text_color(theme.text_muted),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(12.5))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text)
+                            .child(name),
+                    );
+                if command.source != CommandSource::Native {
+                    let label = match command.source {
+                        CommandSource::Skill => "skill",
+                        CommandSource::Custom => "custom",
+                        CommandSource::Fallback => "offline",
+                        CommandSource::Native => unreachable!(),
+                    };
+                    row = row.child(
+                        div()
+                            .flex_none()
+                            .text_size(px(10.0))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(theme.text_muted.opacity(0.6))
+                            .child(SharedString::from(label)),
+                    );
+                }
+                row = row.child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .overflow_hidden()
+                        .truncate()
+                        .text_size(px(12.0))
+                        .text_color(theme.text_muted)
+                        .child(description),
+                );
                 list = list.child(
                     crate::popover::menu_row(theme, selected, format!("slash-result-{row_ix}"))
                         .id(("slash-result", row_ix))
@@ -4726,36 +4862,7 @@ impl Composer {
                             this.slash.active = Some(row_ix);
                             this.accept_slash(cx);
                         }))
-                        .child(
-                            div()
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap(px(8.0))
-                                .child(
-                                    crate::icons::icon(crate::icons::COMMAND)
-                                        .size(px(14.0))
-                                        .text_color(theme.text_muted),
-                                )
-                                .child(
-                                    div()
-                                        .flex_none()
-                                        .text_size(px(12.5))
-                                        .font_weight(gpui::FontWeight::MEDIUM)
-                                        .text_color(theme.text)
-                                        .child(name),
-                                )
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .flex_1()
-                                        .overflow_hidden()
-                                        .truncate()
-                                        .text_size(px(12.0))
-                                        .text_color(theme.text_muted)
-                                        .child(description),
-                                ),
-                        ),
+                        .child(row),
                 );
             }
             card = card.child(list);
@@ -4998,18 +5105,45 @@ impl Composer {
                 true
             }
             "prompt" => {
-                let Some(name) = argument else {
+                let Some(argument) = argument else {
                     return false;
                 };
                 let Some(data_dir) = self.state.read(cx).data_dir.clone() else {
                     return false;
                 };
-                let library = crate::settings::prompts::PromptLibrary::load(&data_dir);
-                let Some(prompt) = library.find(name) else {
-                    return false;
-                };
-                self.input
-                    .update(cx, |input, cx| input.set_text(&prompt.body, cx));
+                let mut library = crate::settings::prompts::PromptLibrary::load(&data_dir);
+                match parse_prompt_action(argument) {
+                    PromptAction::Insert(name) => {
+                        let Some(prompt) = library.find(name) else {
+                            return false;
+                        };
+                        self.input
+                            .update(cx, |input, cx| input.set_text(&prompt.body, cx));
+                    }
+                    PromptAction::Save {
+                        name,
+                        harness,
+                        body,
+                    } => {
+                        library.upsert(crate::settings::prompts::PromptSnippet {
+                            name: name.into(),
+                            body: body.into(),
+                            harness: harness.map(str::to_owned),
+                        });
+                        if let Err(err) = library.save(&data_dir) {
+                            tracing::warn!(%err, "prompt library save failed");
+                        }
+                        self.input.update(cx, |input, cx| input.set_text("", cx));
+                    }
+                    PromptAction::Delete(name) => {
+                        if library.delete(name)
+                            && let Err(err) = library.save(&data_dir)
+                        {
+                            tracing::warn!(%err, "prompt library save failed");
+                        }
+                        self.input.update(cx, |input, cx| input.set_text("", cx));
+                    }
+                }
                 true
             }
             "model" => {
@@ -7305,8 +7439,13 @@ mod tests {
             name: "model".into(),
             description: "native".into(),
             input_hint: None,
+            ..SlashCommand::default()
         }];
-        let commands = with_komet_commands(native, ["review".to_string()]);
+        let commands = with_komet_commands(
+            native,
+            [("review".to_string(), None)],
+            HarnessId::ClaudeCode,
+        );
         assert_eq!(
             commands
                 .iter()
@@ -7327,6 +7466,57 @@ mod tests {
                 "missing {name}"
             );
         }
+    }
+
+    #[test]
+    fn prompt_actions_split_save_delete_and_insert() {
+        assert!(matches!(
+            parse_prompt_action("review"),
+            PromptAction::Insert("review")
+        ));
+        let PromptAction::Save {
+            name,
+            harness,
+            body,
+        } = parse_prompt_action("save review @claude = check the diff")
+        else {
+            panic!("save action expected");
+        };
+        assert_eq!(
+            (name, harness, body),
+            ("review", Some("claude"), "check the diff")
+        );
+        let PromptAction::Save { harness, .. } = parse_prompt_action("save review = body only")
+        else {
+            panic!("save action expected");
+        };
+        assert_eq!(harness, None);
+        // A malformed save falls back to insertion of the literal argument.
+        assert!(matches!(
+            parse_prompt_action("save review without equals"),
+            PromptAction::Insert(_)
+        ));
+        assert!(matches!(
+            parse_prompt_action("delete review"),
+            PromptAction::Delete("review")
+        ));
+    }
+
+    #[test]
+    fn prompt_entries_are_filtered_by_harness_tag() {
+        let commands = with_komet_commands(
+            Vec::new(),
+            [
+                ("everywhere".to_string(), None),
+                ("claude only".to_string(), Some("claude".to_string())),
+                ("codex only".to_string(), Some("codex".to_string())),
+            ],
+            HarnessId::ClaudeCode,
+        );
+        let names: Vec<&str> = commands.iter().map(|c| c.name.as_str()).collect();
+        assert!(names.contains(&"prompt everywhere"));
+        assert!(names.contains(&"prompt claude only"));
+        assert!(!names.contains(&"prompt codex only"));
     }
 
     #[test]
