@@ -1138,13 +1138,12 @@ impl AcpHarness {
                     }
                 }
             }
-            let mut all_commands = static_commands(self.spec.id);
-            for cmd in commands {
-                if !all_commands.iter().any(|c| c.name == cmd.name) {
-                    all_commands.push(cmd);
-                }
-            }
-            Ok::<Vec<SlashCommand>, HarnessError>(all_commands)
+            // An empty live response is meaningful: this CLI currently
+            // advertises no prompt commands.  Do not append the curated TUI
+            // catalog here; doing so made the composer show commands that the
+            // current agent could not execute (issue #27).  The caller keeps
+            // the static list only for a genuine probe failure below.
+            Ok::<Vec<SlashCommand>, HarnessError>(commands)
         };
         let result = tokio::time::timeout(Duration::from_secs(10), discovery).await;
         shutdown_child(&mut child, self.kill_grace).await;
@@ -1186,7 +1185,9 @@ impl AcpHarness {
             // models float to the top, labelled as such.
             if self.spec.id == HarnessId::Cline && self.cli_sync {
                 // Drop obsolete fake test models
-                models.retain(|m| m.id != "deepseek/deepseek-v4.1-flash" && m.id != "stealth/space-bunny-alpha");
+                models.retain(|m| {
+                    m.id != "deepseek/deepseek-v4.1-flash" && m.id != "stealth/space-bunny-alpha"
+                });
 
                 // Inject configured CLI models first (last-used first) from providers.json:
                 for (provider, model) in cline_cli_models_in(self.cline_data_dir.as_ref()) {
@@ -1782,8 +1783,11 @@ impl Harness for AcpHarness {
         self.commands
             .get_or_try_init(|| async {
                 match self.discover_commands().await {
-                    Ok(commands) if !commands.is_empty() => Ok(commands),
-                    _ => Ok(static_commands(self.spec.id)),
+                    Ok(commands) => Ok(commands),
+                    Err(error) => {
+                        tracing::debug!(harness = ?self.spec.id, %error, "live command discovery failed; using fallback catalog");
+                        Ok(static_commands(self.spec.id))
+                    }
                 }
             })
             .await
@@ -2195,17 +2199,18 @@ fn first_class_model_change(
         Some(requested.to_owned())
     } else if let Some(fuzzy) = pick_model_value(requested, &available, false) {
         Some(fuzzy)
-    } else if let Some(stripped_match) = available.iter().find(|m| {
-        let m_unprefixed = m.split_once(':').map(|(_, s)| s).unwrap_or(m);
-        m_unprefixed == requested
-            || m_unprefixed.rsplit('/').next() == Some(requested)
-            || requested.rsplit('/').next() == Some(m_unprefixed)
-            || m.contains(requested)
-            || requested.contains(*m)
-    }) {
-        Some((*stripped_match).to_owned())
     } else {
-        None
+        available
+            .iter()
+            .find(|m| {
+                let m_unprefixed = m.split_once(':').map(|(_, s)| s).unwrap_or(m);
+                m_unprefixed == requested
+                    || m_unprefixed.rsplit('/').next() == Some(requested)
+                    || requested.rsplit('/').next() == Some(m_unprefixed)
+                    || m.contains(requested)
+                    || requested.contains(*m)
+            })
+            .map(|stripped_match| (*stripped_match).to_owned())
     };
 
     let Some(target) = resolved else {
@@ -2345,17 +2350,15 @@ fn acp_model_cache_buster_in(id: HarnessId, data_dir: Option<&PathBuf>) -> Strin
 /// these are always free ($0.00) under the `cline` (Usage-Billing) provider,
 /// even when the account has no credits.
 fn cline_builtin_free_models() -> Vec<Model> {
-    vec![
-        Model {
-            id: "cline-free/mimo-v2.6-flash".into(),
-            label: "MiMo-V2.6-Flash (free)".into(),
-            description: Some(
-                "Mixture-of-Experts architecture with 309B total parameters (free)".into(),
-            ),
-            reasoning_levels: Vec::new(),
-            options: Vec::new(),
-        },
-    ]
+    vec![Model {
+        id: "cline-free/mimo-v2.6-flash".into(),
+        label: "MiMo-V2.6-Flash (free)".into(),
+        description: Some(
+            "Mixture-of-Experts architecture with 309B total parameters (free)".into(),
+        ),
+        reasoning_levels: Vec::new(),
+        options: Vec::new(),
+    }]
 }
 
 /// Whether a model id is a free-tier one (`cline-free/*`
@@ -3245,6 +3248,40 @@ async fn request_draining(
     res
 }
 
+/// opencode's cold start rejects `session/new` with -32603 while its model
+/// catalog warms up (`/api/model` still 503s); the same call succeeds a few
+/// seconds later. Retry only that signature — a real protocol error must not
+/// be replayed.
+const SESSION_NEW_RETRIES: usize = 2;
+const SESSION_NEW_RETRY_DELAY: Duration = Duration::from_secs(3);
+
+fn session_new_not_ready(error: &HarnessError) -> bool {
+    let text = error.to_string().to_lowercase();
+    text.contains("-32603")
+        && (text.contains("serviceunavailable") || text.contains("service unavailable"))
+}
+
+async fn session_new_with_retry(
+    client: &RpcClient,
+    incoming: &mut mpsc::Receiver<Incoming>,
+    params: Value,
+) -> Result<Value, HarnessError> {
+    let mut attempt = 0;
+    loop {
+        match request_draining(client, incoming, "session/new", params.clone()).await {
+            Err(e) if attempt < SESSION_NEW_RETRIES && session_new_not_ready(&e) => {
+                attempt += 1;
+                tracing::debug!(
+                    target: "komet_harness::acp",
+                    "session/new not ready yet (attempt {attempt}), retrying: {e}"
+                );
+                tokio::time::sleep(SESSION_NEW_RETRY_DELAY).await;
+            }
+            res => return res,
+        }
+    }
+}
+
 fn prompt_like_request(
     client: RpcClient,
     method: &'static str,
@@ -3350,13 +3387,9 @@ async fn run_session(session: Session) {
                         target: "komet_harness::acp",
                         "session/load failed (starting fresh): {e}"
                     );
-                    let new = request_draining(
-                        &client,
-                        &mut incoming,
-                        "session/new",
-                        session_params.clone(),
-                    )
-                    .await?;
+                    let new =
+                        session_new_with_retry(&client, &mut incoming, session_params.clone())
+                            .await?;
                     (
                         new.get("sessionId")
                             .and_then(Value::as_str)
@@ -3367,8 +3400,7 @@ async fn run_session(session: Session) {
                 }
             }
         } else {
-            let new =
-                request_draining(&client, &mut incoming, "session/new", session_params).await?;
+            let new = session_new_with_retry(&client, &mut incoming, session_params).await?;
             (
                 new.get("sessionId")
                     .and_then(Value::as_str)

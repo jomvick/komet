@@ -217,13 +217,10 @@ impl CodexHarness {
                 .request("skills/list", json!({}))
                 .await
                 .unwrap_or(Value::Null);
-            let mut commands = catalog::static_commands();
-            let discovered = parse_skill_commands(&skills);
-            for cmd in discovered {
-                if !commands.iter().any(|c| c.name == cmd.name) {
-                    commands.push(cmd);
-                }
-            }
+            // `skills/list` is the live source for this CLI.  Do not add the
+            // curated TUI catalog: a command absent from the current Codex
+            // process must not be presented as executable (issue #27).
+            let commands = parse_skill_commands(&skills);
             Ok::<Vec<SlashCommand>, HarnessError>(commands)
         };
         let result = tokio::time::timeout(Duration::from_secs(10), discovery).await;
@@ -437,7 +434,10 @@ impl Harness for CodexHarness {
             .get_or_try_init(|| async {
                 match self.discover_commands().await {
                     Ok(commands) => Ok(commands),
-                    Err(_) => Ok(catalog::static_commands()),
+                    Err(error) => {
+                        tracing::debug!(%error, "live Codex command discovery failed");
+                        Ok(Vec::new())
+                    }
                 }
             })
             .await

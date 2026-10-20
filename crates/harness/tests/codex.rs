@@ -830,13 +830,8 @@ async fn live_real_app_server_single_turn() {
 async fn commands_come_from_skills_list() {
     let h = harness();
     let commands = h.commands().await.expect("discovery succeeds");
-    assert!(
-        commands.len() >= 10,
-        "static commands and discovered skills present: len={}",
-        commands.len()
-    );
-    assert!(commands.iter().any(|c| c.name == "compact"));
-    assert!(commands.iter().any(|c| c.name == "diff"));
+    // `skills/list` is the live source: no curated TUI catalog is appended.
+    assert!(!commands.iter().any(|c| c.name == "diff"));
 
     let imagegen = commands
         .iter()

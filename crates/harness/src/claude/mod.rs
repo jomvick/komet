@@ -529,19 +529,16 @@ impl ClaudeHarness {
                 }
             }
 
-            let mut commands = catalog::static_commands();
-            let mut seen: std::collections::HashSet<String> =
-                commands.iter().map(|c| c.name.clone()).collect();
-
-            for skill in skill_commands {
-                if seen.insert(skill.name.clone()) {
-                    commands.push(skill);
-                }
-            }
-
-            for init_cmd in init_commands {
-                if seen.insert(init_cmd.name.clone()) {
-                    commands.push(init_cmd);
+            // The live wire is authoritative.  The old implementation
+            // prepended a curated TUI catalog, which made commands appear in
+            // Komet even when this CLI version did not offer them.  Merge
+            // only commands actually returned by the control channel and
+            // the project/user skill probe.
+            let mut commands = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            for command in skill_commands.into_iter().chain(init_commands) {
+                if seen.insert(command.name.clone()) {
+                    commands.push(command);
                 }
             }
 
@@ -551,10 +548,9 @@ impl ClaudeHarness {
         shutdown_child(&mut child, self.kill_grace).await;
         match result {
             Ok(inner) => inner,
-            Err(_) => {
-                // If live discovery timed out, fallback to static catalog
-                Ok(catalog::static_commands())
-            }
+            Err(_) => Err(HarnessError::Protocol(
+                "Claude command discovery timed out".into(),
+            )),
         }
     }
 
@@ -874,7 +870,10 @@ impl Harness for ClaudeHarness {
             .get_or_try_init(|| async {
                 match self.discover_commands().await {
                     Ok(commands) => Ok(commands),
-                    Err(_) => Ok(catalog::static_commands()),
+                    Err(error) => {
+                        tracing::debug!(%error, "live Claude command discovery failed");
+                        Ok(Vec::new())
+                    }
                 }
             })
             .await

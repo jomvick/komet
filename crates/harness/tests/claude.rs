@@ -659,18 +659,16 @@ async fn live_real_cli_single_turn() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn commands_discovery_merges_catalog_and_probes() {
+async fn commands_discovery_uses_live_wire_only() {
     let h = harness();
     let commands = h.commands().await.expect("discovery succeeds");
-    assert!(
-        commands.len() >= 20,
-        "static commands + discovered skills present: len={}",
-        commands.len()
-    );
 
-    // Static catalog entry
+    // Live control-channel commands and skill probe entries are returned.
     assert!(commands.iter().any(|c| c.name == "compact"));
-    assert!(commands.iter().any(|c| c.name == "diff"));
+    assert!(commands.iter().any(|c| c.name == "review"));
+
+    // The curated TUI catalog must not resurrect commands this CLI omitted.
+    assert!(!commands.iter().any(|c| c.name == "diff"));
 
     // Discovered custom skill from get_context_usage
     let custom = commands
