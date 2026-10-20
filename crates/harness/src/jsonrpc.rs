@@ -178,6 +178,12 @@ async fn read_loop(stdout: ChildStdout, pending: Pending, tx: mpsc::Sender<Incom
                             .and_then(Value::as_str)
                             .map(str::to_owned)
                             .unwrap_or_else(|| err.to_string());
+                        let message = match err.get("data") {
+                            Some(data) if !data.is_null() => {
+                                format!("{message}; details: {data}")
+                            }
+                            _ => message,
+                        };
                         // Keep the numeric code in the string: `classify_error`
                         // maps embedded `[rpc <code>]` markers (notably
                         // -32000 server timeouts) when the text is silent.
