@@ -1038,6 +1038,7 @@ fn forwardable(method: &str) -> bool {
             | methods::CREATE_REPO
             | methods::LIST_BRANCHES
             | methods::LIST_REFS
+            | methods::GET_GITHUB_REPO_URL
             | methods::LIST_GIT_HISTORY
             | methods::FETCH_ALL
             | methods::SWITCH_REF
@@ -1826,6 +1827,15 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&refs)
             }
+            methods::GET_GITHUB_REPO_URL => {
+                let p: RepoPathParams = parse_params(params)?;
+                let url = self
+                    .repos
+                    .github_repo_url(std::path::Path::new(&p.repo_path))
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&url)
+            }
             methods::LIST_GIT_HISTORY => {
                 #[derive(Deserialize)]
                 #[serde(rename_all = "camelCase")]
@@ -2162,6 +2172,7 @@ mod tests {
         assert!(forwardable(methods::QUEUE_COMMAND));
         assert!(forwardable(methods::SEARCH_FILES));
         assert!(forwardable(methods::FETCH_ALL));
+        assert!(forwardable(methods::GET_GITHUB_REPO_URL));
         // Issues #31 + #10 ride the same hub/philosophy as WatchDocMessages.
         assert!(forwardable(methods::WATCH_REASONING));
         assert!(forwardable(methods::GET_TOOL_DETAIL));

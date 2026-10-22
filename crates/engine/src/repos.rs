@@ -406,6 +406,26 @@ impl Repos {
         Ok(names)
     }
 
+    /// Resolve the first configured GitHub remote to a credential-free HTTPS
+    /// repository URL. `origin` wins when several remotes point to GitHub.
+    pub async fn github_repo_url(&self, repo_path: &Path) -> Result<Option<String>, EngineError> {
+        let remotes = self.git(&["remote"], Some(repo_path)).await?;
+        let mut names: Vec<&str> = remotes.lines().filter(|name| !name.is_empty()).collect();
+        names.sort_by_key(|name| (*name != "origin", *name));
+        for name in names {
+            let Ok(remote_url) = self
+                .git(&["remote", "get-url", name], Some(repo_path))
+                .await
+            else {
+                continue;
+            };
+            if let Some(url) = github_url_from_remote(&remote_url) {
+                return Ok(Some(url));
+            }
+        }
+        Ok(None)
+    }
+
     /// [`Self::branches`] enriched with checkout state: which branch the MAIN
     /// folder has checked out (`current`) and which branches are materialized
     /// as linked worktrees (`worktree_path`). Feeds the composer's ref picker
@@ -1112,6 +1132,48 @@ fn bounded_field(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect()
 }
 
+fn github_url_from_remote(remote: &str) -> Option<String> {
+    let remote = remote.trim();
+    if remote.is_empty() || remote.contains(['?', '#']) {
+        return None;
+    }
+
+    let (host, path) = if let Some((scheme, rest)) = remote.split_once("://") {
+        if !matches!(scheme.to_ascii_lowercase().as_str(), "https" | "ssh") {
+            return None;
+        }
+        let (authority, path) = rest.split_once('/')?;
+        let host = authority.rsplit('@').next()?;
+        (host, path)
+    } else {
+        let (authority, path) = remote.split_once(':')?;
+        let host = authority.rsplit('@').next()?;
+        (host, path)
+    };
+    if !host.eq_ignore_ascii_case("github.com") {
+        return None;
+    }
+
+    let path = path.trim_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let mut parts = path.split('/');
+    let owner = parts.next()?;
+    let repo = parts.next()?;
+    let valid_segment = |segment: &str| {
+        !segment.is_empty()
+            && segment != "."
+            && segment != ".."
+            && segment
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+    };
+    if parts.next().is_some() || !valid_segment(owner) || !valid_segment(repo) {
+        return None;
+    }
+
+    Some(format!("https://github.com/{owner}/{repo}"))
+}
+
 fn parse_history_log(
     output: &str,
     refs_by_sha: &HashMap<String, Vec<GitHistoryRef>>,
@@ -1222,6 +1284,78 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn github_remote_urls_normalize_https_and_ssh_forms() {
+        for remote in [
+            "https://github.com/owner/repo",
+            "https://github.com/owner/repo.git",
+            "ssh://git@github.com/owner/repo.git",
+            "git@github.com:owner/repo.git",
+        ] {
+            assert_eq!(
+                github_url_from_remote(remote).as_deref(),
+                Some("https://github.com/owner/repo"),
+                "{remote}"
+            );
+        }
+    }
+
+    #[test]
+    fn github_remote_urls_strip_credentials_and_reject_other_hosts() {
+        assert_eq!(
+            github_url_from_remote("https://local-user@github.com/owner/repo.git").as_deref(),
+            Some("https://github.com/owner/repo")
+        );
+        for remote in [
+            "https://gitlab.com/owner/repo.git",
+            "https://github.com.evil.test/owner/repo.git",
+            "https://github.com/owner",
+            "https://github.com/owner/repo/tree/main",
+            "https://github.com/owner/repo?token=secret",
+            "file:///owner/repo",
+        ] {
+            assert_eq!(github_url_from_remote(remote), None, "{remote}");
+        }
+    }
+
+    #[tokio::test]
+    async fn github_repo_url_prefers_origin_and_returns_none_without_a_github_remote() {
+        let data = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let repos =
+            Repos::with_worktrees_root(data.path(), "device", data.path().join("worktrees"));
+        repos
+            .git(&["init", "--quiet"], Some(root.path()))
+            .await
+            .unwrap();
+
+        assert_eq!(repos.github_repo_url(root.path()).await.unwrap(), None);
+
+        repos
+            .git(
+                &["remote", "add", "origin", "git@github.com:owner/origin.git"],
+                Some(root.path()),
+            )
+            .await
+            .unwrap();
+        repos
+            .git(
+                &[
+                    "remote",
+                    "add",
+                    "upstream",
+                    "https://github.com/owner/upstream.git",
+                ],
+                Some(root.path()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            repos.github_repo_url(root.path()).await.unwrap().as_deref(),
+            Some("https://github.com/owner/origin")
+        );
+    }
 
     #[test]
     fn fuzzy_score_matches_a_path_subsequence() {
