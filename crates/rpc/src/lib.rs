@@ -98,6 +98,8 @@ pub mod methods {
     pub const CREATE_REPO: &str = "CreateRepo";
     pub const LIST_BRANCHES: &str = "ListBranches";
     pub const LIST_REFS: &str = "ListRefs";
+    /// Canonical GitHub URL for the repository at a checkout path, if any.
+    pub const GET_GITHUB_REPO_URL: &str = "GetGitHubRepoUrl";
     pub const LIST_GIT_HISTORY: &str = "ListGitHistory";
     /// Update remote-tracking refs without changing HEAD, the index, or files.
     pub const FETCH_ALL: &str = "FetchAll";
