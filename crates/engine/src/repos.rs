@@ -1234,7 +1234,12 @@ fn github_url_from_remote(remote: &str) -> Option<String> {
             return None;
         }
         let (authority, path) = rest.split_once('/')?;
-        let host = authority.rsplit('@').next()?;
+        let host_port = authority.rsplit('@').next()?;
+        // `ssh://git@github.com:22/…` — only the hostname is compared.
+        let host = match host_port.rsplit_once(':') {
+            Some((host, port)) if port.bytes().all(|b| b.is_ascii_digit()) => host,
+            _ => host_port,
+        };
         (host, path)
     } else {
         let (authority, path) = remote.split_once(':')?;
@@ -1463,6 +1468,8 @@ mod tests {
             "https://github.com/owner/repo.git",
             "ssh://git@github.com/owner/repo.git",
             "git@github.com:owner/repo.git",
+            "ssh://git@github.com:22/owner/repo.git",
+            "https://github.com:443/owner/repo.git",
         ] {
             assert_eq!(
                 github_url_from_remote(remote).as_deref(),
@@ -1481,6 +1488,7 @@ mod tests {
         for remote in [
             "https://gitlab.com/owner/repo.git",
             "https://github.com.evil.test/owner/repo.git",
+            "ssh://git@github.com:abc/owner/repo.git",
             "https://github.com/owner",
             "https://github.com/owner/repo/tree/main",
             "https://github.com/owner/repo?token=secret",
