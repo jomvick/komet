@@ -765,7 +765,14 @@ impl AgentAccounts {
             let slots = self.read_slots(harness);
             for slot in &slots {
                 let active = active_key.as_deref() == Some(slot.account_key.as_str());
-                let usage = self.usage_for(harness, slot, active, mode).await;
+                // Quotas describe the live CLI session, not every saved login.
+                // Avoid probing inactive accounts and only attach usage to the
+                // account that is currently selected for this provider.
+                let usage = if active {
+                    self.usage_for(harness, slot, true, mode).await
+                } else {
+                    None
+                };
                 accounts.push(AgentAccount {
                     id: slot.id.clone(),
                     harness,
