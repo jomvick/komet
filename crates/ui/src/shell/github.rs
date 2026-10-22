@@ -21,8 +21,6 @@ pub(super) struct GitHubHeader {
     key: Option<GitHubKey>,
     status: Option<GitHubStatus>,
     task: Option<Task<()>>,
-    branch_open: bool,
-    commits_open: bool,
 }
 
 impl Shell {
@@ -57,8 +55,6 @@ impl Shell {
         };
         if self.github.key.as_ref() != Some(&key) {
             self.github.status = None;
-            self.github.branch_open = false;
-            self.github.commits_open = false;
         }
         self.github.key = Some(key.clone());
         self.github.task = Some(cx.spawn(async move |this, cx| {
@@ -142,11 +138,12 @@ impl Shell {
 
     /// The titlebar trigger plus its dropdown; `None` (no slot at all) when
     /// the checkout has no GitHub remote or the lookup hasn't resolved yet.
+    /// Returns the trigger with its exact width so the pane strip can budget it.
     pub(super) fn render_github_button(
         &mut self,
         theme: &Theme,
         cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
+    ) -> Option<(AnyElement, f32)> {
         let Some(key) = self.github_target(cx) else {
             self.github.key = None;
             self.github.status = None;
@@ -156,25 +153,34 @@ impl Shell {
         self.ensure_github_status(key, false, cx);
         let status = self.github.status.clone()?;
 
+        let pr_badge = status
+            .pull_request
+            .as_ref()
+            .map(|pr| (format!("#{}", pr.number), pr_state_color(pr, theme)));
+        let width = trigger_width(pr_badge.as_ref().map(|(label, _)| label.as_str()));
         let fade = "github-menu-trigger-fade";
         let open = self.github_menu.get().is_some();
         let mut trigger = div()
             .id("github-menu-trigger")
             .h(px(28.0))
-            .w(px(GITHUB_BUTTON_WIDTH))
+            .w(px(width))
             .flex_none()
             .flex()
             .items_center()
             .justify_center()
-            .gap(px(3.0))
-            .rounded(px(6.0))
+            .gap(px(5.0))
+            .rounded(px(8.0))
             .border_1()
-            .border_color(theme.border)
+            .border_color(if open {
+                crate::theme::hairline(0.18)
+            } else {
+                crate::theme::hairline(0.10)
+            })
             .cursor_pointer()
             .bg(if open {
-                crate::theme::wash(0.11)
+                crate::theme::wash(0.12)
             } else {
-                motion::hover_blend(fade, crate::theme::wash(0.0), crate::theme::wash(0.11))
+                motion::hover_blend(fade, crate::theme::wash(0.03), crate::theme::wash(0.11))
             })
             .on_hover(motion::hover_listener(fade))
             .tab_index(0)
@@ -202,24 +208,38 @@ impl Shell {
             .child(
                 icon(icons::GITHUB)
                     .size(px(15.0))
-                    .text_color(theme.text.opacity(0.85)),
+                    .text_color(theme.text.opacity(0.9)),
             )
-            .child(
-                icon(icons::ALT_ARROW_DOWN)
-                    .size(px(11.0))
-                    .text_color(theme.text_muted),
-            );
+            .when_some(pr_badge, |el, (label, color)| {
+                el.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(4.0))
+                        .child(div().size(px(6.0)).rounded_full().bg(color))
+                        .child(
+                            div()
+                                .text_size(px(11.5))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(theme.text.opacity(0.85))
+                                .child(SharedString::from(label)),
+                        ),
+                )
+            })
+            .child(chevron(open, theme));
         if open {
             let closing = self.github_menu.closing_since();
             let menu = self.render_github_menu(&status, theme, cx);
-            trigger = trigger.relative().child(popover::anchored_menu_below_gap(
+            // Right-aligned to the trigger: the card grows LEFT over the
+            // conversation instead of covering the right pane.
+            trigger = trigger.relative().child(popover::anchored_menu_below_end(
                 "github-menu",
                 menu,
                 closing,
-                10.0,
+                8.0,
             ));
         }
-        Some(trigger.into_any_element())
+        Some((trigger.into_any_element(), width))
     }
 
     fn render_github_menu(
@@ -229,243 +249,33 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let detached = status.branch == "HEAD";
-        let mut rows = div().flex().flex_col().gap(px(2.0));
+        let repo_name = status
+            .repo_url
+            .strip_prefix("https://github.com/")
+            .unwrap_or(&status.repo_url)
+            .to_string();
 
-        // Branch: the chevron reveals the GitHub destinations.
-        let branch_open = self.github.branch_open;
-        rows = rows.child(
-            popover::menu_row(theme, false, "github-branch")
-                .id("github-branch-row")
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.github.branch_open = !this.github.branch_open;
-                    cx.notify();
-                }))
-                .child(
-                    icon(icons::GIT_BRANCH)
-                        .size(px(14.0))
-                        .text_color(theme.text_muted),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .truncate()
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .child(SharedString::from(if detached {
-                            "Detached HEAD".to_string()
-                        } else {
-                            status.branch.clone()
-                        })),
-                )
-                .child(chevron(branch_open, theme)),
-        );
-        if branch_open {
-            let repo_url = status.repo_url.clone();
-            rows = rows.child(self.github_link_row(
-                "github-open-repo",
-                icons::GITHUB,
-                "Open repository",
-                repo_url,
-                theme,
-                cx,
-            ));
-            if !detached {
-                let url = format!("{}/tree/{}", status.repo_url, encode_ref(&status.branch));
-                rows = rows.child(self.github_link_row(
-                    "github-open-branch",
-                    icons::ARROW_UP_RIGHT,
-                    "Open branch on GitHub",
-                    url,
-                    theme,
-                    cx,
-                ));
-            }
-        }
-
-        // Pull request, or a compare link to open one.
-        match &status.pull_request {
-            Some(pr) => rows = rows.child(self.github_pr_row(pr, theme, cx)),
-            None if !detached => {
-                let url = format!(
-                    "{}/compare/{}?expand=1",
-                    status.repo_url,
-                    encode_ref(&status.branch)
-                );
-                rows = rows.child(self.github_link_row(
-                    "github-create-pr",
-                    icons::PULL_REQUEST,
-                    "Create pull request",
-                    url,
-                    theme,
-                    cx,
-                ));
-            }
-            None => {}
-        }
-
-        // Commits: the chevron lists HEAD's latest; a click pins its diff.
-        let commits_open = self.github.commits_open;
-        rows = rows.child(
-            popover::menu_row(theme, false, "github-commits")
-                .id("github-commits-row")
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.github.commits_open = !this.github.commits_open;
-                    cx.notify();
-                }))
-                .child(
-                    icon(icons::GIT_COMMIT)
-                        .size(px(14.0))
-                        .text_color(theme.text_muted),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .text_color(theme.text_muted)
-                        .child(SharedString::from("Commit")),
-                )
-                .child(chevron(commits_open, theme)),
-        );
-        if commits_open {
-            if status.recent_commits.is_empty() {
-                rows = rows.child(
-                    div()
-                        .px(px(32.0))
-                        .py(px(4.0))
-                        .text_size(px(12.0))
-                        .text_color(theme.text_muted)
-                        .child(SharedString::from("No commits yet")),
-                );
-            }
-            for (ix, commit) in status.recent_commits.iter().enumerate() {
-                let short: String = commit.sha.chars().take(7).collect();
-                let commit_for_click = commit.clone();
-                rows = rows.child(
-                    popover::menu_row(theme, false, format!("github-commit-{ix}"))
-                        .id(("github-commit-row", ix))
-                        .pl(px(32.0))
-                        .text_size(px(12.0))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.close_github_menu(cx);
-                            this.open_commit_from_github_menu(commit_for_click.clone(), cx);
-                        }))
-                        .child(
-                            div()
-                                .flex_none()
-                                .font_family(theme.font_mono.clone())
-                                .text_color(theme.text_muted)
-                                .child(SharedString::from(short)),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .child(SharedString::from(commit.subject.clone())),
-                        ),
-                );
-            }
-        }
-
-        // Changes: diff stats; a click focuses the working-tree Git tab.
-        rows = rows.child(
-            popover::menu_row(theme, false, "github-changes")
-                .id("github-changes-row")
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.close_github_menu(cx);
-                    this.open_working_tree_diff(cx);
-                }))
-                .child(
-                    icon(icons::FILE_DIFF)
-                        .size(px(14.0))
-                        .text_color(theme.text_muted),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .text_color(theme.text_muted)
-                        .child(SharedString::from("Changes")),
-                )
-                .child(
-                    div()
-                        .flex()
-                        .gap(px(6.0))
-                        .text_size(px(12.0))
-                        .font_family(theme.font_mono.clone())
-                        .child(
-                            div()
-                                .text_color(theme.success)
-                                .child(SharedString::from(format!("+{}", status.insertions))),
-                        )
-                        .child(
-                            div()
-                                .text_color(theme.danger)
-                                .child(SharedString::from(format!("-{}", status.deletions))),
-                        ),
-                ),
-        );
-
-        popover::popover_card(theme)
-            .w(px(272.0))
-            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_github_menu(cx)))
-            .child(rows)
-            .into_any_element()
-    }
-
-    fn github_link_row(
-        &self,
-        id: &'static str,
-        glyph: &'static str,
-        label: &'static str,
-        url: String,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        popover::menu_row(theme, false, id)
-            .id(id)
-            .pl(px(32.0))
-            .text_size(px(12.0))
-            .on_click(cx.listener(move |this, _, _, cx| {
-                cx.open_url(&url);
-                this.close_github_menu(cx);
-            }))
-            .child(icon(glyph).size(px(12.0)).text_color(theme.text_muted))
-            .child(SharedString::from(label))
-    }
-
-    fn github_pr_row(
-        &self,
-        pr: &GitHubPullRequest,
-        theme: &Theme,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let pr_color = match pr.state.as_str() {
-            "MERGED" => theme.accent,
-            "CLOSED" => theme.danger,
-            _ if pr.is_draft => theme.text_muted,
-            _ => theme.success,
-        };
-        let checks = pr.checks;
-        let checks_color = if checks.failed > 0 {
-            theme.danger
-        } else if checks.pending > 0 {
-            theme.warning
-        } else {
-            theme.success
-        };
-        let url = pr.url.clone();
-        popover::menu_row(theme, false, "github-pr")
-            .id("github-pr-row")
-            .items_start()
-            .on_click(cx.listener(move |this, _, _, cx| {
-                cx.open_url(&url);
-                this.close_github_menu(cx);
-            }))
+        // ── Header: repo + branch, external-link to GitHub ──
+        let repo_url = status.repo_url.clone();
+        let branch_url =
+            (!detached).then(|| format!("{}/tree/{}", status.repo_url, encode_ref(&status.branch)));
+        let header = div()
+            .flex()
+            .items_center()
+            .gap(px(10.0))
+            .px(px(10.0))
+            .pt(px(8.0))
+            .pb(px(10.0))
             .child(
-                div().pt(px(2.0)).child(
-                    icon(icons::PULL_REQUEST)
-                        .size(px(14.0))
-                        .text_color(pr_color),
-                ),
+                div()
+                    .size(px(30.0))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(8.0))
+                    .bg(crate::theme::wash(0.08))
+                    .child(icon(icons::GITHUB).size(px(17.0)).text_color(theme.text)),
             )
             .child(
                 div()
@@ -473,40 +283,490 @@ impl Shell {
                     .min_w_0()
                     .flex()
                     .flex_col()
-                    .gap(px(2.0))
-                    .child(div().truncate().child(SharedString::from(pr.title.clone())))
+                    .gap(px(3.0))
+                    .child(
+                        div()
+                            .truncate()
+                            .text_size(px(13.0))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child(SharedString::from(repo_name)),
+                    )
+                    .child(self.branch_chip(status, branch_url, theme, cx)),
+            )
+            .child(self.icon_link(
+                "github-open-repo",
+                icons::ARROW_UP_RIGHT,
+                repo_url,
+                theme,
+                cx,
+            ));
+
+        let mut body = div().flex().flex_col().child(header).child(divider());
+
+        // ── Pull request ──
+        body = body.child(section_label("Pull request", None, theme));
+        match &status.pull_request {
+            Some(pr) => body = body.child(self.github_pr_card(pr, &status.branch, theme, cx)),
+            None if !detached => {
+                let url = format!(
+                    "{}/compare/{}?expand=1",
+                    status.repo_url,
+                    encode_ref(&status.branch)
+                );
+                body = body.child(
+                    popover::menu_row(theme, false, "github-create-pr")
+                        .id("github-create-pr")
+                        .mx(px(4.0))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.open_url(&url);
+                            this.close_github_menu(cx);
+                        }))
+                        .child(
+                            div()
+                                .size(px(22.0))
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(6.0))
+                                .border_1()
+                                .border_color(crate::theme::hairline(0.14))
+                                .child(icon(icons::PLUS).size(px(11.0)).text_color(theme.text)),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .flex()
+                                .flex_col()
+                                .child(SharedString::from("Create pull request"))
+                                .child(
+                                    div()
+                                        .text_size(px(11.5))
+                                        .text_color(theme.text_muted)
+                                        .child(SharedString::from(
+                                            "No pull request for this branch",
+                                        )),
+                                ),
+                        ),
+                );
+            }
+            None => {
+                body = body.child(empty_note(
+                    "Detached HEAD — no branch to open a PR from",
+                    theme,
+                ));
+            }
+        }
+
+        // ── Recent commits: click pins the commit's diff in the right pane ──
+        body = body.child(divider()).child(section_label(
+            "Recent commits",
+            (!status.recent_commits.is_empty()).then(|| status.recent_commits.len().to_string()),
+            theme,
+        ));
+        if status.recent_commits.is_empty() {
+            body = body.child(empty_note("No commits yet", theme));
+        }
+        let now = chrono::Utc::now();
+        for (ix, commit) in status.recent_commits.iter().enumerate() {
+            let short: String = commit.sha.chars().take(7).collect();
+            let ago = chrono::DateTime::parse_from_rfc3339(&commit.authored_at)
+                .ok()
+                .map(|t| crate::state::format_time_ago(t.with_timezone(&chrono::Utc), now));
+            let commit_for_click = commit.clone();
+            body = body.child(
+                popover::menu_row(theme, false, format!("github-commit-{ix}"))
+                    .id(("github-commit-row", ix))
+                    .mx(px(4.0))
+                    .py(px(5.0))
+                    .gap(px(8.0))
+                    .text_size(px(12.5))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.close_github_menu(cx);
+                        this.open_commit_from_github_menu(commit_for_click.clone(), cx);
+                    }))
+                    .child(
+                        div()
+                            .flex_none()
+                            .px(px(5.0))
+                            .rounded(px(4.0))
+                            .bg(crate::theme::wash(0.07))
+                            .text_size(px(11.0))
+                            .font_family(theme.font_mono.clone())
+                            .text_color(theme.text_muted)
+                            .child(SharedString::from(short)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .child(SharedString::from(commit.subject.clone())),
+                    )
+                    .when_some(ago, |el, ago| {
+                        el.child(
+                            div()
+                                .flex_none()
+                                .text_size(px(11.0))
+                                .text_color(theme.text_faint)
+                                .child(SharedString::from(ago)),
+                        )
+                    }),
+            );
+        }
+
+        // ── Changes: stats + proportion bar; click focuses the Git diff tab ──
+        let (ins, del) = (status.insertions, status.deletions);
+        body = body.child(divider()).child(
+            popover::menu_row(theme, false, "github-changes")
+                .id("github-changes-row")
+                .mx(px(4.0))
+                .mb(px(2.0))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.close_github_menu(cx);
+                    this.open_working_tree_diff(cx);
+                }))
+                .child(
+                    icon(icons::FILE_DIFF)
+                        .size(px(15.0))
+                        .text_color(theme.text_muted),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap(px(5.0))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(8.0))
+                                .child(div().flex_1().child(SharedString::from("Changes")))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .gap(px(6.0))
+                                        .text_size(px(12.0))
+                                        .font_family(theme.font_mono.clone())
+                                        .child(
+                                            div()
+                                                .text_color(theme.success)
+                                                .child(SharedString::from(format!("+{ins}"))),
+                                        )
+                                        .child(
+                                            div()
+                                                .text_color(theme.danger)
+                                                .child(SharedString::from(format!("−{del}"))),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .h(px(4.0))
+                                .w_full()
+                                .flex()
+                                .gap(px(2.0))
+                                .rounded_full()
+                                .overflow_hidden()
+                                .bg(crate::theme::wash(0.08))
+                                .when(ins > 0, |el| {
+                                    el.child(
+                                        div()
+                                            .h_full()
+                                            .flex_grow(ins as f32)
+                                            .flex_basis(px(0.0))
+                                            .bg(theme.success),
+                                    )
+                                })
+                                .when(del > 0, |el| {
+                                    el.child(
+                                        div()
+                                            .h_full()
+                                            .flex_grow(del as f32)
+                                            .flex_basis(px(0.0))
+                                            .bg(theme.danger),
+                                    )
+                                }),
+                        ),
+                )
+                .child(
+                    icon(icons::ALT_ARROW_RIGHT)
+                        .size(px(12.0))
+                        .text_color(theme.text_faint),
+                ),
+        );
+
+        popover::popover_card(theme)
+            .w(px(MENU_WIDTH))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_github_menu(cx)))
+            .child(body)
+            .into_any_element()
+    }
+
+    /// Branch name chip; clickable (opens the branch on GitHub) when attached.
+    fn branch_chip(
+        &self,
+        status: &GitHubStatus,
+        url: Option<String>,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let label = if url.is_some() {
+            status.branch.clone()
+        } else {
+            "Detached HEAD".to_string()
+        };
+        let fade = "github-branch-chip";
+        let chip = div()
+            .id("github-branch-chip")
+            .max_w_full()
+            .flex()
+            .items_center()
+            .gap(px(4.0))
+            .text_size(px(11.5))
+            .text_color(motion::hover_blend(fade, theme.text_muted, theme.text))
+            .on_hover(motion::hover_listener(fade))
+            .child(
+                icon(icons::GIT_BRANCH)
+                    .size(px(11.0))
+                    .text_color(theme.text_muted),
+            )
+            .child(div().min_w_0().truncate().child(SharedString::from(label)));
+        match url {
+            Some(url) => chip
+                .cursor_pointer()
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    cx.open_url(&url);
+                    this.close_github_menu(cx);
+                }))
+                .into_any_element(),
+            None => chip.into_any_element(),
+        }
+    }
+
+    fn icon_link(
+        &self,
+        id: &'static str,
+        glyph: &'static str,
+        url: String,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .id(id)
+            .size(px(26.0))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(6.0))
+            .cursor_pointer()
+            .bg(motion::hover_blend(
+                id,
+                crate::theme::wash(0.0),
+                crate::theme::wash(0.10),
+            ))
+            .on_hover(motion::hover_listener(id))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.open_url(&url);
+                this.close_github_menu(cx);
+            }))
+            .child(icon(glyph).size(px(13.0)).text_color(theme.text_muted))
+    }
+
+    fn github_pr_card(
+        &self,
+        pr: &GitHubPullRequest,
+        branch: &str,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let color = pr_state_color(pr, theme);
+        let state = match pr.state.as_str() {
+            "MERGED" => "Merged",
+            "CLOSED" => "Closed",
+            _ if pr.is_draft => "Draft",
+            _ => "Open",
+        };
+        let checks = pr.checks;
+        let (checks_color, checks_label) = if checks.failed > 0 {
+            (theme.danger, format!("{} failing", checks.failed))
+        } else if checks.pending > 0 {
+            (theme.warning, format!("{} running", checks.pending))
+        } else {
+            (theme.success, "All checks passed".to_string())
+        };
+        let url = pr.url.clone();
+        let fade = "github-pr-card";
+        div()
+            .id("github-pr-card")
+            .mx(px(6.0))
+            .mb(px(4.0))
+            .p(px(10.0))
+            .flex()
+            .flex_col()
+            .gap(px(7.0))
+            .rounded(px(10.0))
+            .border_1()
+            .border_color(crate::theme::hairline(0.10))
+            .cursor_pointer()
+            .bg(motion::hover_blend(
+                fade,
+                crate::theme::wash(0.03),
+                crate::theme::wash(0.08),
+            ))
+            .on_hover(motion::hover_listener(fade))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.open_url(&url);
+                this.close_github_menu(cx);
+            }))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
                     .child(
                         div()
                             .flex()
                             .items_center()
-                            .gap(px(8.0))
-                            .text_size(px(12.0))
+                            .gap(px(4.0))
+                            .px(px(6.0))
+                            .py(px(1.0))
+                            .rounded_full()
+                            .bg(color.opacity(0.16))
+                            .text_size(px(11.0))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(color)
+                            .child(icon(icons::PULL_REQUEST).size(px(11.0)).text_color(color))
+                            .child(SharedString::from(state)),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.5))
                             .text_color(theme.text_muted)
-                            .child(SharedString::from(format!("#{}", pr.number)))
-                            .when(checks.total() > 0, |el| {
-                                el.child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(4.0))
-                                        .child(check_dot(checks_color))
-                                        .child(SharedString::from(format!(
-                                            "{}/{}",
-                                            checks.passed,
-                                            checks.total()
-                                        ))),
-                                )
-                            }),
+                            .child(SharedString::from(format!("#{}", pr.number))),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        icon(icons::ARROW_UP_RIGHT)
+                            .size(px(12.0))
+                            .text_color(theme.text_faint),
                     ),
+            )
+            .child(
+                div()
+                    .line_clamp(2)
+                    .text_size(px(13.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .child(SharedString::from(pr.title.clone())),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .text_size(px(11.5))
+                    .text_color(theme.text_muted)
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .font_family(theme.font_mono.clone())
+                            .child(SharedString::from(if pr.base_ref.is_empty() {
+                                branch.to_string()
+                            } else {
+                                format!("{} ← {branch}", pr.base_ref)
+                            })),
+                    )
+                    .when(checks.total() > 0, |el| {
+                        el.child(div().flex_1()).child(
+                            div()
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .gap(px(5.0))
+                                .child(check_dot(checks_color))
+                                .child(SharedString::from(checks_label))
+                                .child(div().text_color(theme.text_faint).child(
+                                    SharedString::from(format!(
+                                        "{}/{}",
+                                        checks.passed,
+                                        checks.total()
+                                    )),
+                                )),
+                        )
+                    }),
             )
     }
 }
 
-/// Down when collapsed (the reference), flipped up while expanded.
+const MENU_WIDTH: f32 = 340.0;
+
+/// Exact trigger width: icon + chevron, plus the `#N` badge when a PR exists.
+fn trigger_width(badge: Option<&str>) -> f32 {
+    match badge {
+        // dot 6 + gap 4 + ~7px per glyph at 11.5px + gap 5
+        Some(label) => GITHUB_BUTTON_WIDTH + 15.0 + 7.0 * label.chars().count() as f32,
+        None => GITHUB_BUTTON_WIDTH,
+    }
+}
+
+fn pr_state_color(pr: &GitHubPullRequest, theme: &Theme) -> gpui::Hsla {
+    match pr.state.as_str() {
+        // GitHub's merged purple.
+        "MERGED" => gpui::hsla(270.0 / 360.0, 0.6, 0.65, 1.0),
+        "CLOSED" => theme.danger,
+        _ if pr.is_draft => theme.text_muted,
+        _ => theme.success,
+    }
+}
+
+fn divider() -> impl IntoElement {
+    div()
+        .h(px(1.0))
+        .mx(px(8.0))
+        .my(px(4.0))
+        .bg(crate::theme::hairline(0.08))
+}
+
+fn section_label(label: &'static str, count: Option<String>, theme: &Theme) -> impl IntoElement {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(6.0))
+        .px(px(10.0))
+        .pt(px(6.0))
+        .pb(px(4.0))
+        .text_size(px(10.5))
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .text_color(theme.text_faint)
+        .child(SharedString::from(label.to_uppercase()))
+        .when_some(count, |el, count| {
+            el.child(
+                div()
+                    .px(px(5.0))
+                    .rounded_full()
+                    .bg(crate::theme::wash(0.08))
+                    .child(SharedString::from(count)),
+            )
+        })
+}
+
+fn empty_note(text: &'static str, theme: &Theme) -> impl IntoElement {
+    div()
+        .px(px(12.0))
+        .pb(px(6.0))
+        .text_size(px(12.0))
+        .text_color(theme.text_muted)
+        .child(SharedString::from(text))
+}
+
 fn chevron(open: bool, theme: &Theme) -> impl IntoElement {
     let angle = if open { std::f32::consts::PI } else { 0.0 };
     icon(icons::ALT_ARROW_DOWN)
-        .size(px(12.0))
+        .size(px(11.0))
         .text_color(theme.text_muted)
         .with_transformation(gpui::Transformation::rotate(gpui::radians(angle)))
 }

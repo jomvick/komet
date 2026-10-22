@@ -216,11 +216,9 @@ impl Shell {
             content_left
         };
         // GitHub control (issue #50): left of the pane strip / toggle.
-        let github = self.render_github_button(&theme, cx);
-        let github_slot = if github.is_some() {
-            github::GITHUB_BUTTON_WIDTH + 8.0
-        } else {
-            0.0
+        let (github, github_slot) = match self.render_github_button(&theme, cx) {
+            Some((button, width)) => (Some(button), width + 8.0),
+            None => (None, 0.0),
         };
         let trailing: Option<gpui::AnyElement> = if self.right_pane_open(cx) {
             let right_now = self.eval_tween(self.right_tween, self.right_target(cx));
