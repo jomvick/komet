@@ -1077,6 +1077,12 @@ impl Changes {
         gpui::SharedString::from(self.scope.label())
     }
 
+    /// A working-tree diff (not a pinned commit) — the GitHub menu's
+    /// Changes row reuses such a tab instead of stacking duplicates.
+    pub fn is_working_tree(&self) -> bool {
+        self.commit.is_none()
+    }
+
     /// The selected chat's host device when it differs from the connected
     /// engine's own — diffs are produced where the checkout lives, so a
     /// remote chat's watch must relay-forward (`targetDeviceId`) to its host.
