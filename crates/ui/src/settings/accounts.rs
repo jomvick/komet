@@ -19,7 +19,7 @@ use std::time::Duration;
 use komet_engine::UsageMode;
 use komet_proto::{
     AgentAccount, AgentAccountsSnapshot, AgentLoginMode, AgentLoginPoll, AgentLoginStart,
-    AgentLoginStatus, HarnessId,
+    AgentLoginStatus, AgentUsageWindow, HarnessId,
 };
 use komet_rpc::methods;
 
@@ -155,6 +155,43 @@ pub fn provider_accounts(
     accounts
 }
 
+/// Only the selected account's quota is meaningful for the live CLI session.
+fn displayed_usage(account: &AgentAccount) -> Option<&[AgentUsageWindow]> {
+    account.active.then_some(account.usage_windows.as_slice())
+}
+
+fn retain_previous_usage(
+    snapshot: &mut AgentAccountsSnapshot,
+    previous: Option<&AgentAccountsSnapshot>,
+) {
+    let Some(previous) = previous else { return };
+    for account in &mut snapshot.accounts {
+        if account.usage_windows.is_empty()
+            && let Some(old) = previous
+                .accounts
+                .iter()
+                .find(|old| old.id == account.id && !old.usage_windows.is_empty())
+        {
+            account.usage_windows = old.usage_windows.clone();
+        }
+    }
+}
+
+fn select_active_account(snapshot: &mut AgentAccountsSnapshot, harness: HarnessId, id: &str) {
+    if !snapshot
+        .accounts
+        .iter()
+        .any(|account| account.harness == harness && account.id == id)
+    {
+        return;
+    }
+    for account in &mut snapshot.accounts {
+        if account.harness == harness {
+            account.active = account.id == id;
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Entity
 // ---------------------------------------------------------------------------
@@ -230,6 +267,7 @@ pub struct AccountsPage {
     error: Option<SharedString>,
     code_input: Entity<ComposerInput>,
     load_task: Option<Task<()>>,
+    load_generation: u64,
     action_task: Option<Task<()>>,
     poll_task: Option<Task<()>>,
     _observe: Subscription,
@@ -256,6 +294,7 @@ impl AccountsPage {
             error: None,
             code_input,
             load_task: None,
+            load_generation: 0,
             action_task: None,
             poll_task: None,
             _observe: observe,
@@ -469,8 +508,16 @@ impl AccountsPage {
     }
 
     fn load(&mut self, mode: UsageMode, cx: &mut Context<Self>) {
+        self.load_generation = self.load_generation.wrapping_add(1);
+        let generation = self.load_generation;
         let Some(engine) = self.state.read(cx).engine().cloned() else {
-            self.snapshot = Loadable::Error("Engine not connected".into());
+            self.refreshing = false;
+            if matches!(self.snapshot, Loadable::Ready(_)) {
+                self.error = Some("Usage refresh failed: engine not connected".into());
+            } else {
+                self.snapshot = Loadable::Error("Engine not connected".into());
+            }
+            cx.notify();
             return;
         };
         // Only the first load has nothing to show yet; afterwards the previous
@@ -489,39 +536,28 @@ impl AccountsPage {
                 .call(methods::LIST_AGENT_ACCOUNTS, params)
                 .await;
             this.update(cx, |page, cx| {
+                if page.load_generation != generation {
+                    return;
+                }
                 page.refreshing = false;
-                page.snapshot = match result {
-                    Ok(value) => match serde_json::from_value::<AgentAccountsSnapshot>(value) {
-                        Ok(mut snapshot) => {
-                            // Merge: a cached/offline re-list can return empty
-                            // `usage_windows` for an account whose cache entry
-                            // expired or was never warmed. Overwriting wholesale
-                            // made gauges flicker to "Usage unavailable" after
-                            // every Switch/Forget/watch frame — keep the
-                            // previous windows when the fresh ones are empty.
-                            // `page.snapshot` still holds the rendered snapshot
-                            // here, so this now actually fires.
-                            if let Some(prev) = page.snapshot.ready() {
-                                let prev = prev.clone();
-                                for account in &mut snapshot.accounts {
-                                    if !account.usage_windows.is_empty() {
-                                        continue;
-                                    }
-                                    if let Some(old) = prev
-                                        .accounts
-                                        .iter()
-                                        .find(|a| a.id == account.id)
-                                        .filter(|a| !a.usage_windows.is_empty())
-                                    {
-                                        account.usage_windows = old.usage_windows.clone();
-                                    }
-                                }
-                            }
-                            Loadable::Ready(snapshot)
-                        }
-                        Err(err) => Loadable::Error(err.to_string()),
-                    },
-                    Err(err) => Loadable::Error(err.to_string()),
+                let previous = page.snapshot.ready().cloned();
+                let parsed = result.map_err(|err| err.to_string()).and_then(|value| {
+                    serde_json::from_value::<AgentAccountsSnapshot>(value)
+                        .map_err(|err| err.to_string())
+                });
+                page.snapshot = match parsed {
+                    Ok(mut snapshot) => {
+                        retain_previous_usage(&mut snapshot, previous.as_ref());
+                        page.error = None;
+                        Loadable::Ready(snapshot)
+                    }
+                    Err(message) if previous.is_some() => {
+                        // Keep the last successful account and quota snapshot
+                        // visible when a background refresh fails transiently.
+                        page.error = Some(format!("Usage refresh failed: {message}").into());
+                        Loadable::Ready(previous.expect("checked above"))
+                    }
+                    Err(message) => Loadable::Error(message),
                 };
                 cx.notify();
             })
@@ -553,6 +589,9 @@ impl AccountsPage {
             "accountId": account.id,
             "harness": account.harness,
         }));
+        let account_id = account.id.clone();
+        let account_harness = account.harness;
+        let is_switch = method == methods::ACTIVATE_AGENT_ACCOUNT;
         tracing::debug!(method, account = %account.id, "account_action dispatching");
         self.action_task = Some(cx.spawn(async move |this, cx| {
             let result = engine.client().call(method, params).await;
@@ -564,7 +603,12 @@ impl AccountsPage {
             this.update(cx, |page, cx| {
                 page.busy_account = None;
                 match result {
-                    Ok(_) => page.load(usage_mode_for(LoadTrigger::PostAction), cx),
+                    Ok(_) => {
+                        if is_switch && let Loadable::Ready(snapshot) = &mut page.snapshot {
+                            select_active_account(snapshot, account_harness, &account_id);
+                        }
+                        page.load(usage_mode_for(LoadTrigger::PostAction), cx);
+                    }
                     Err(err) => page.error = Some(format!("{err}").into()),
                 }
                 cx.notify();
@@ -1021,40 +1065,43 @@ impl AccountsPage {
                     .map(|el| {
                         // Meters XOR the quiet fallback line — never both
                         // (komet: `usage ? meters : "Usage unavailable"…`).
-                        if account.usage_windows.is_empty() {
-                            el.child(
-                                div()
-                                    .mt(px(6.0))
-                                    .truncate()
-                                    .text_size(px(11.5))
-                                    .text_color(theme.text_muted.opacity(0.6))
-                                    .child(SharedString::from(if account.switchable {
-                                        // Cursor is probed too (its usage DB is
-                                        // read for the ACTIVE login only), so an
-                                        // empty reading here is a real miss, not
-                                        // a coverage gap. "Credentials
-                                        // unavailable" stays reserved for a
-                                        // live login we could not read.
-                                        "Usage unavailable"
-                                    } else {
-                                        "Credentials unavailable"
-                                    })),
-                            )
+                        if let Some(usage_windows) = displayed_usage(account) {
+                            if usage_windows.is_empty() {
+                                el.child(
+                                    div()
+                                        .mt(px(6.0))
+                                        .truncate()
+                                        .text_size(px(11.5))
+                                        .text_color(theme.text_muted.opacity(0.6))
+                                        .child(SharedString::from(if account.switchable {
+                                            // Cursor is probed too (its usage DB is
+                                            // read for the ACTIVE login only), so an
+                                            // empty reading here is a real miss, not
+                                            // a coverage gap. "Credentials
+                                            // unavailable" stays reserved for a
+                                            // live login we could not read.
+                                            "Usage unavailable"
+                                        } else {
+                                            "Credentials unavailable"
+                                        })),
+                                )
+                            } else {
+                                el.child(
+                                    div()
+                                        .mt(px(6.0))
+                                        .w_full()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(4.0))
+                                        .children(
+                                            usage_windows
+                                                .iter()
+                                                .map(|w| self.render_usage_meter(w, theme, now)),
+                                        ),
+                                )
+                            }
                         } else {
-                            el.child(
-                                div()
-                                    .mt(px(6.0))
-                                    .w_full()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(4.0))
-                                    .children(
-                                        account
-                                            .usage_windows
-                                            .iter()
-                                            .map(|w| self.render_usage_meter(w, theme, now)),
-                                    ),
-                            )
+                            el
                         }
                     }),
             )
@@ -1745,5 +1792,92 @@ mod tests {
         assert_eq!(ids, ["c2", "c1"], "active account leads");
         assert_eq!(provider_accounts(&snapshot, HarnessId::Codex).len(), 1);
         assert!(provider_accounts(&snapshot, HarnessId::Cursor).is_empty());
+    }
+
+    #[test]
+    fn usage_is_only_displayed_for_the_active_account() {
+        let mut account = AgentAccount {
+            id: "codex-1".into(),
+            harness: HarnessId::Codex,
+            email: None,
+            plan_label: None,
+            active: false,
+            usage_windows: vec![AgentUsageWindow {
+                label: "Week".into(),
+                used_fraction: 0.42,
+                resets_at: None,
+            }],
+            display_name: None,
+            organization: None,
+            auth_kind: None,
+            switchable: true,
+            saved_at: None,
+        };
+
+        assert!(displayed_usage(&account).is_none());
+        account.active = true;
+        assert_eq!(displayed_usage(&account).unwrap()[0].label, "Week");
+    }
+
+    #[test]
+    fn switching_moves_the_active_usage_to_the_selected_account() {
+        let account = |id: &str, active: bool| AgentAccount {
+            id: id.into(),
+            harness: HarnessId::Codex,
+            email: None,
+            plan_label: None,
+            active,
+            usage_windows: vec![],
+            display_name: None,
+            organization: None,
+            auth_kind: None,
+            switchable: true,
+            saved_at: None,
+        };
+        let mut snapshot = AgentAccountsSnapshot {
+            accounts: vec![account("old", true), account("selected", false)],
+            warnings: vec![],
+        };
+
+        select_active_account(&mut snapshot, HarnessId::Codex, "selected");
+
+        assert!(!snapshot.accounts[0].active);
+        assert!(snapshot.accounts[1].active);
+    }
+
+    #[test]
+    fn empty_refresh_keeps_the_last_known_usage_for_each_account() {
+        let account = |usage_windows| AgentAccount {
+            id: "codex-1".into(),
+            harness: HarnessId::Codex,
+            email: None,
+            plan_label: None,
+            active: true,
+            usage_windows,
+            display_name: None,
+            organization: None,
+            auth_kind: None,
+            switchable: true,
+            saved_at: None,
+        };
+        let previous = AgentAccountsSnapshot {
+            accounts: vec![account(vec![AgentUsageWindow {
+                label: "Week".into(),
+                used_fraction: 0.42,
+                resets_at: None,
+            }])],
+            warnings: vec![],
+        };
+        let mut refreshed = AgentAccountsSnapshot {
+            accounts: vec![account(vec![])],
+            warnings: vec![],
+        };
+
+        retain_previous_usage(&mut refreshed, Some(&previous));
+
+        assert_eq!(
+            refreshed.accounts[0].usage_windows,
+            previous.accounts[0].usage_windows
+        );
     }
 }
