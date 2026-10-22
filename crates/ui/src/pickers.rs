@@ -470,8 +470,6 @@ pub struct Pickers {
     refs: Loadable<Vec<RepoRef>>,
     /// Space id the `refs` slot belongs to (invalidated on space change).
     refs_space: Option<String>,
-    github_repo_url: Option<String>,
-    github_repo_key: Option<(String, Option<String>)>,
     /// Highlighted row in the open list (keyboard nav).
     active: usize,
     /// Models-list scroll — keyboard nav keeps the highlighted row in view
@@ -491,7 +489,6 @@ pub struct Pickers {
     /// Own slot: the refs load runs concurrently with the eager
     /// harness/model loads — sharing `load_task` would abort one mid-flight.
     refs_task: Option<Task<()>>,
-    github_repo_task: Option<Task<()>>,
     /// In-flight mid-session `SwitchRef` (the ref being switched to).
     switching: Option<String>,
     switch_task: Option<Task<()>>,
@@ -501,22 +498,6 @@ pub struct Pickers {
     _search_events: Subscription,
     _state_observe: Subscription,
     _catalog_observe: Subscription,
-}
-
-struct GitHubRepoTooltip;
-
-impl gpui::Render for GitHubRepoTooltip {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::of(cx);
-        div()
-            .px(px(8.0))
-            .py(px(6.0))
-            .rounded_md()
-            .bg(theme.surface_overlay)
-            .text_color(theme.text)
-            .text_size(px(12.0))
-            .child("Open GitHub repository")
-    }
 }
 
 impl Pickers {
@@ -581,9 +562,6 @@ impl Pickers {
                 this.config.checkout = CheckoutKind::default();
                 this.refs = Loadable::Idle;
                 this.refs_space = None;
-                this.github_repo_url = None;
-                this.github_repo_key = None;
-                this.github_repo_task = None;
                 // Catalogs are per-DEVICE (fetched from the space's host):
                 // a space switch may land on another device, so refetch.
                 this.harnesses = Loadable::Idle;
@@ -655,8 +633,6 @@ impl Pickers {
             models_loaded_at: HashMap::new(),
             refs: Loadable::Idle,
             refs_space: None,
-            github_repo_url: None,
-            github_repo_key: None,
             active: 0,
             model_scroll: gpui::ScrollHandle::new(),
             search,
@@ -665,7 +641,6 @@ impl Pickers {
             boot_focus_pending: boot_open.is_some(),
             load_task: None,
             refs_task: None,
-            github_repo_task: None,
             switching: None,
             switch_task: None,
             switch_error: None,
@@ -1276,84 +1251,6 @@ impl Pickers {
             })
             .ok();
         }));
-    }
-
-    fn ensure_github_repo_url(
-        &mut self,
-        repo_path: String,
-        target_device_id: Option<String>,
-        cx: &mut Context<Self>,
-    ) {
-        let key = (repo_path.clone(), target_device_id.clone());
-        if self.github_repo_key.as_ref() == Some(&key) {
-            return;
-        }
-        let Some(engine) = self.engine(cx) else {
-            return;
-        };
-        self.github_repo_key = Some(key.clone());
-        self.github_repo_url = None;
-        self.github_repo_task = Some(cx.spawn(async move |this, cx| {
-            let mut params = serde_json::Map::new();
-            params.insert("repoPath".into(), repo_path.into());
-            if let Some(device_id) = target_device_id {
-                params.insert("targetDeviceId".into(), device_id.into());
-            }
-            let result = engine
-                .client()
-                .call(
-                    methods::GET_GITHUB_REPO_URL,
-                    serde_json::Value::Object(params),
-                )
-                .await;
-            this.update(cx, |pickers, cx| {
-                if pickers.github_repo_key.as_ref() != Some(&key) {
-                    return;
-                }
-                match result {
-                    Ok(value) => match serde_json::from_value::<Option<String>>(value) {
-                        Ok(url) => pickers.github_repo_url = url,
-                        Err(err) => {
-                            tracing::warn!(error = %err, "GitHub repository response was invalid");
-                        }
-                    },
-                    Err(err) => {
-                        tracing::warn!(error = %err, "GitHub repository lookup failed");
-                    }
-                }
-                cx.notify();
-            })
-            .ok();
-        }));
-    }
-
-    fn github_repo_link(&self, url: String, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let click_url = url.clone();
-        div()
-            .id("github-repository-link")
-            .flex()
-            .items_center()
-            .justify_center()
-            .size(px(24.0))
-            .rounded_lg()
-            .cursor_pointer()
-            .hover(|style| style.bg(theme.element_hover))
-            .text_color(theme.text_muted)
-            .tab_index(0)
-            .aria_label("Open GitHub repository")
-            .tooltip(|_, cx| cx.new(|_| GitHubRepoTooltip).into())
-            .on_click(cx.listener(move |_, _, _, cx| cx.open_url(&click_url)))
-            .on_key_down(cx.listener(move |_, event: &KeyDownEvent, _, cx| {
-                if matches!(event.keystroke.key.as_str(), "enter" | "space" | " ") {
-                    cx.open_url(&url);
-                }
-            }))
-            .child(
-                crate::icons::icon(crate::icons::GITHUB)
-                    .size(px(14.0))
-                    .text_color(theme.text_muted),
-            )
-            .into_any_element()
     }
 
     // ---- selections ----
@@ -2595,29 +2492,15 @@ impl Pickers {
         // right after send mints it) still renders the DRAFT footer — the
         // values are identical, so the toolbar never blinks through a
         // half-empty locked state.
-        let (space, session, local_device_id) = {
+        let (space, session) = {
             let state = self.state.read(cx);
             let space = state.selected_space_row().cloned();
             let session = state
                 .selected_chat
                 .as_ref()
                 .and_then(|_| state.selected_chat_row().cloned());
-            (space, session, state.local_device_id.clone())
+            (space, session)
         };
-        if let Some(space) = space.as_ref().filter(|space| space.git_detected) {
-            let repo_path = session
-                .as_ref()
-                .and_then(|chat| chat.cwd.clone())
-                .unwrap_or_else(|| space.path.clone());
-            let device_id = session
-                .as_ref()
-                .map(|chat| chat.device_id.as_str())
-                .unwrap_or(space.device_id.as_str());
-            let target_device_id =
-                (local_device_id.as_deref() != Some(device_id)).then(|| device_id.to_string());
-            self.ensure_github_repo_url(repo_path, target_device_id, cx);
-        }
-        let github_repo_url = self.github_repo_url.clone();
         let row = || {
             // Symmetric: the container's 8px gap sits above the toolbar;
             // bleeding 8 of the container's 16px bottom padding (mb -8)
@@ -2707,7 +2590,7 @@ impl Pickers {
                     None
                 };
 
-            let mut right = div()
+            let right = div()
                 .flex()
                 .flex_row()
                 .items_center()
@@ -2728,9 +2611,6 @@ impl Pickers {
                         .unwrap_or_else(|| SharedString::from("No ref")),
                     &theme,
                 ));
-            if let Some(url) = github_repo_url {
-                right = right.child(self.github_repo_link(url, &theme, cx));
-            }
             return Some(row().child(left).child(right).into_any_element());
         }
 
@@ -2834,7 +2714,7 @@ impl Pickers {
                 "checkout-popover",
                 closing,
             ));
-        let mut right = div()
+        let right = div()
             .flex()
             .flex_row()
             .items_center()
@@ -2854,9 +2734,6 @@ impl Pickers {
                 "branch-popover",
                 closing,
             ));
-        if let Some(url) = github_repo_url {
-            right = right.child(self.github_repo_link(url, &theme, cx));
-        }
         Some(row().child(left).child(right).into_any_element())
     }
 

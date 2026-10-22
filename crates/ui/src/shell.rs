@@ -64,6 +64,7 @@ use crate::transcript::{
 /// `Shell::right_target`/`files_split_active`.
 const SPLIT_RIGHT_PANE_MIN: f32 = 560.0;
 
+mod github;
 mod spaces;
 mod tabs;
 
@@ -852,6 +853,9 @@ pub struct Shell {
     right_terminal: Option<Entity<TerminalPanel>>,
     /// The surface-tab strip's `+` menu (Terminal / Git diff rows).
     right_plus: popover::Popup<()>,
+    /// Titlebar GitHub control: its dropdown + the checkout's status.
+    github_menu: popover::Popup<()>,
+    github: github::GitHubHeader,
     /// Diff surfaces by id — each tab its own [`Changes`] viewer with its own
     /// scope/base pick and diff watch (multiple diff panels, user request).
     diffs: std::collections::HashMap<u64, Entity<Changes>>,
@@ -1127,6 +1131,8 @@ impl Shell {
             terminal: None,
             right_terminal: None,
             right_plus: popover::Popup::default(),
+            github_menu: popover::Popup::default(),
+            github: github::GitHubHeader::default(),
             diffs: std::collections::HashMap::new(),
             diff_subs: std::collections::HashMap::new(),
             diff_seq: 0,
