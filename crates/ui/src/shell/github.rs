@@ -249,6 +249,9 @@ impl Shell {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let detached = status.branch == "HEAD";
+        // Diff surfaces resolve through the selected chat; on the new-session
+        // canvas they would sit on "Preparing" forever, so rows stay info-only.
+        let can_open_diffs = self.state.read(cx).selected_chat_row().is_some();
         let repo_name = status
             .repo_url
             .strip_prefix("https://github.com/")
@@ -381,10 +384,13 @@ impl Shell {
                     .py(px(5.0))
                     .gap(px(8.0))
                     .text_size(px(12.5))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.close_github_menu(cx);
-                        this.open_commit_from_github_menu(commit_for_click.clone(), cx);
-                    }))
+                    .when(can_open_diffs, |el| {
+                        el.on_click(cx.listener(move |this, _, _, cx| {
+                            this.close_github_menu(cx);
+                            this.open_commit_from_github_menu(commit_for_click.clone(), cx);
+                        }))
+                    })
+                    .when(!can_open_diffs, |el| el.cursor_default())
                     .child(
                         div()
                             .flex_none()
@@ -422,10 +428,13 @@ impl Shell {
                 .id("github-changes-row")
                 .mx(px(4.0))
                 .mb(px(2.0))
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.close_github_menu(cx);
-                    this.open_working_tree_diff(cx);
-                }))
+                .when(can_open_diffs, |el| {
+                    el.on_click(cx.listener(|this, _, _, cx| {
+                        this.close_github_menu(cx);
+                        this.open_working_tree_diff(cx);
+                    }))
+                })
+                .when(!can_open_diffs, |el| el.cursor_default())
                 .child(
                     icon(icons::FILE_DIFF)
                         .size(px(15.0))
@@ -491,11 +500,13 @@ impl Shell {
                                 }),
                         ),
                 )
-                .child(
-                    icon(icons::ALT_ARROW_RIGHT)
-                        .size(px(12.0))
-                        .text_color(theme.text_faint),
-                ),
+                .when(can_open_diffs, |el| {
+                    el.child(
+                        icon(icons::ALT_ARROW_RIGHT)
+                            .size(px(12.0))
+                            .text_color(theme.text_faint),
+                    )
+                }),
         );
 
         popover::popover_card(theme)
