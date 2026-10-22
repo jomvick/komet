@@ -215,6 +215,11 @@ impl Shell {
         } else {
             content_left
         };
+        // GitHub control (issue #50): left of the pane strip / toggle.
+        let (github, github_slot) = match self.render_github_button(&theme, cx) {
+            Some((button, width)) => (Some(button), width + 8.0),
+            None => (None, 0.0),
+        };
         let trailing: Option<gpui::AnyElement> = if self.right_pane_open(cx) {
             let right_now = self.eval_tween(self.right_tween, self.right_target(cx));
             let pr = titlebar_right_padding(cfg!(target_os = "windows"), Theme::SPACE_LG);
@@ -225,7 +230,7 @@ impl Shell {
             // the strip in takeover, two with the title row present): without
             // budgeting them the capped strip overflows by exactly one gap and
             // the buttons slide right on expand (user report).
-            let gap_budget = if takeover { 8.0 } else { 16.0 };
+            let gap_budget = if takeover { 8.0 } else { 16.0 } + github_slot;
             let avail = self.viewport_width - row_left - pr - gap_budget;
             // The right pane's SURFACE TABS (t3 RightPanelTabs) — the diff
             // options that used to live here moved into the pane's own
@@ -342,6 +347,7 @@ impl Shell {
                 )
             })
             .child(div().flex_1())
+            .children(github)
             .children(trailing);
 
         // The unified window titlebar: full-width on the glass shell, ABOVE
