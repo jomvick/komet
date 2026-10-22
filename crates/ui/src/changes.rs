@@ -1077,10 +1077,11 @@ impl Changes {
         gpui::SharedString::from(self.scope.label())
     }
 
-    /// A working-tree diff (not a pinned commit) — the GitHub menu's
-    /// Changes row reuses such a tab instead of stacking duplicates.
+    /// A pane currently showing the working tree (not a pinned commit or
+    /// another scope) — the GitHub menu's Changes row reuses such a tab
+    /// instead of stacking duplicates.
     pub fn is_working_tree(&self) -> bool {
-        self.commit.is_none()
+        self.commit.is_none() && self.scope == DiffScope::WorkingTree
     }
 
     /// The selected chat's host device when it differs from the connected
