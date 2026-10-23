@@ -26,7 +26,7 @@ use komet_engine::InstanceLock;
 use komet_proto::{AuthState, WorkspaceScope};
 use komet_rpc::methods;
 
-use crate::browser::BrowserPanel;
+use crate::browser::{BrowserEvent, BrowserPanel};
 use crate::changes::{Changes, ChangesEvent};
 use crate::composer::{Composer, ComposerEvent, ComposerInput, ComposerInputEvent};
 use crate::files::{FilesCloseDisposition, FilesEvent, FilesSurface, WorkspacePathDrag};
@@ -870,6 +870,7 @@ pub struct Shell {
     /// Event hookups for [`Self::diffs`] (History rows opening commit tabs).
     diff_subs: std::collections::HashMap<u64, Subscription>,
     browser: Option<Entity<BrowserPanel>>,
+    browser_sub: Option<Subscription>,
     diff_seq: u64,
     /// One workspace browser per chat/panel key. Dropping the entity closes
     /// its file watcher and every in-flight workspace request.
@@ -1147,6 +1148,7 @@ impl Shell {
             diffs: std::collections::HashMap::new(),
             diff_subs: std::collections::HashMap::new(),
             browser: None,
+            browser_sub: None,
             diff_seq: 0,
             files: std::collections::HashMap::new(),
             files_subs: std::collections::HashMap::new(),
@@ -2102,6 +2104,7 @@ impl Shell {
             RightSurface::Browser => {
                 // Dropped so the next open re-probes Chrome / npx.
                 self.browser = None;
+                self.browser_sub = None;
             }
         }
         self.panels.update(&key, |p| {
@@ -2183,7 +2186,16 @@ impl Shell {
     fn add_browser_surface(&mut self, cx: &mut Context<Self>) {
         if self.browser.is_none() {
             let state = self.state.clone();
-            self.browser = Some(cx.new(|cx| BrowserPanel::new(state, cx)));
+            let panel = cx.new(|cx| BrowserPanel::new(state, cx));
+            // The URL field hands the agent a browse task through the
+            // composer's normal send path (guards, steering, echo).
+            self.browser_sub = Some(cx.subscribe(&panel, |this: &mut Self, _, event, cx| {
+                let BrowserEvent::Browse { prompt, .. } = event;
+                let prompt = prompt.clone();
+                this.composer
+                    .update(cx, |composer, cx| composer.submit_text(prompt, cx));
+            }));
+            self.browser = Some(panel);
         }
         let key = self.panel_key(cx);
         push_unique_right_surface(
