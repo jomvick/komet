@@ -26,6 +26,7 @@ use komet_engine::InstanceLock;
 use komet_proto::{AuthState, WorkspaceScope};
 use komet_rpc::methods;
 
+use crate::browser::{BrowserEvent, BrowserPanel};
 use crate::changes::{Changes, ChangesEvent};
 use crate::composer::{Composer, ComposerEvent, ComposerInput, ComposerInputEvent};
 use crate::files::{FilesCloseDisposition, FilesEvent, FilesSurface, WorkspacePathDrag};
@@ -242,6 +243,9 @@ pub enum RightSurface {
     /// A subagent's transcript, read-only (per-subagent viz) — the handle
     /// keys [`Shell::subagent_tabs`].
     Subagent(u64),
+    /// Browser-use preset status / enable control (issue #45). One per
+    /// app, device-local like the MCP registry it fronts.
+    Browser,
 }
 
 fn push_unique_right_surface(tabs: &mut Vec<RightSurface>, surface: RightSurface) -> bool {
@@ -865,6 +869,8 @@ pub struct Shell {
     diffs: std::collections::HashMap<u64, Entity<Changes>>,
     /// Event hookups for [`Self::diffs`] (History rows opening commit tabs).
     diff_subs: std::collections::HashMap<u64, Subscription>,
+    browser: Option<Entity<BrowserPanel>>,
+    browser_sub: Option<Subscription>,
     diff_seq: u64,
     /// One workspace browser per chat/panel key. Dropping the entity closes
     /// its file watcher and every in-flight workspace request.
@@ -1141,6 +1147,8 @@ impl Shell {
             github: github::GitHubHeader::default(),
             diffs: std::collections::HashMap::new(),
             diff_subs: std::collections::HashMap::new(),
+            browser: None,
+            browser_sub: None,
             diff_seq: 0,
             files: std::collections::HashMap::new(),
             files_subs: std::collections::HashMap::new(),
@@ -1677,6 +1685,10 @@ impl Shell {
                     .map(|(_, title, _)| (*surface, title.clone(), false, None)),
                 RightSurface::Picker => None,
                 RightSurface::Subagent(_) => None,
+                RightSurface::Browser => self
+                    .browser
+                    .as_ref()
+                    .map(|panel| (*surface, panel.read(cx).tab_title(), false, None)),
             })
             .collect()
     }
@@ -1760,7 +1772,7 @@ impl Shell {
                     changes.update(cx, |changes, cx| changes.ensure_content(cx));
                 }
             }
-            RightSurface::Subagent(_) | RightSurface::Picker => {}
+            RightSurface::Subagent(_) | RightSurface::Picker | RightSurface::Browser => {}
         }
         cx.notify();
     }
@@ -1928,7 +1940,8 @@ impl Shell {
             RightSurface::Diff(_)
             | RightSurface::Picker
             | RightSurface::Terminal(_)
-            | RightSurface::Subagent(_) => {
+            | RightSurface::Subagent(_)
+            | RightSurface::Browser => {
                 return None;
             }
         };
@@ -2088,6 +2101,11 @@ impl Shell {
                 panel.update(cx, |panel, cx| panel.close_tab_by_key(tab, window, cx));
             }
             RightSurface::Subagent(_) | RightSurface::Picker => {}
+            RightSurface::Browser => {
+                // Dropped so the next open re-probes Chrome / npx.
+                self.browser = None;
+                self.browser_sub = None;
+            }
         }
         self.panels.update(&key, |p| {
             if p.right_active == surface {
@@ -2161,6 +2179,30 @@ impl Shell {
             .or_default()
             .push(RightSurface::Diff(id));
         self.set_right_active(RightSurface::Diff(id), cx);
+    }
+
+    /// The picker's Browser row: a single tab per chat hosting the
+    /// browser-use status / enable control (issue #45).
+    fn add_browser_surface(&mut self, cx: &mut Context<Self>) {
+        if self.browser.is_none() {
+            let state = self.state.clone();
+            let panel = cx.new(|cx| BrowserPanel::new(state, cx));
+            // The URL field hands the agent a browse task through the
+            // composer's normal send path (guards, steering, echo).
+            self.browser_sub = Some(cx.subscribe(&panel, |this: &mut Self, _, event, cx| {
+                let BrowserEvent::Browse { prompt, .. } = event;
+                let prompt = prompt.clone();
+                this.composer
+                    .update(cx, |composer, cx| composer.submit_text(prompt, cx));
+            }));
+            self.browser = Some(panel);
+        }
+        let key = self.panel_key(cx);
+        push_unique_right_surface(
+            self.right_tabs.entry(key).or_default(),
+            RightSurface::Browser,
+        );
+        self.set_right_active(RightSurface::Browser, cx);
     }
 
     /// The picker's Terminal card / the `+` menu's Terminal row: every click
@@ -5843,6 +5885,13 @@ impl Shell {
                     panel.update(cx, |panel, cx| panel.select_tab_by_key(tab, cx));
                     panel.into_any_element()
                 }
+                RightSurface::Browser => match self.browser.clone() {
+                    Some(panel) => {
+                        panel.update(cx, |panel, cx| panel.ensure_loaded(cx));
+                        panel.into_any_element()
+                    }
+                    None => self.render_surface_picker(cx),
+                },
                 _ => self.render_surface_picker(cx),
             };
             // Files browser companion: shown alongside File editor tabs
@@ -6041,6 +6090,13 @@ impl Shell {
                                         this.add_files_surface(window, cx);
                                     })),
                             )
+                            .child(
+                                row("surface-card-browser", icons::GLOBE, "Browser").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.add_browser_surface(cx);
+                                    }),
+                                ),
+                            )
                             // Git only where there IS git — the pane itself
                             // no longer gates on it (terminals work anywhere).
                             .when(self.space_git_detected(cx), |el| {
@@ -6226,6 +6282,7 @@ impl Shell {
                 RightSurface::File(_) => icons::DOCUMENT,
                 RightSurface::Diff(_) => icons::GIT_BRANCH,
                 RightSurface::Subagent(_) => icons::DOCUMENT,
+                RightSurface::Browser => icons::GLOBE,
                 _ => icons::TERMINAL,
             };
             // t3 tab hover: the surface icon swaps IN PLACE for the close ✕
