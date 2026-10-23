@@ -949,6 +949,7 @@ impl EngineRpc {
                 "status": browser_use::status(&registry),
                 "serverId": browser_use::SERVER_ID,
                 "systemPrompt": browser_use::SYSTEM_PROMPT,
+                "browser": crate::browser::host().info().await,
             })),
             // Registers the pinned chrome-devtools-mcp preset. Refused with a
             // readable reason when Chrome or npx is missing — a dead `npx`
