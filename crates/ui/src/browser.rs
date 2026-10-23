@@ -1,13 +1,22 @@
-//! Browser surface (issue #45): a browser-shaped frame in the right pane
-//! for the browser-use preset. Toolbar with a URL field, a "Start browsing"
-//! empty state, and a compact status line for the Chrome / npx probe from
-//! `BrowserUseStatus`. There is no embedded webview: entering a URL hands a
-//! browse task to the agent, which drives headless Chrome through
-//! `chrome-devtools-mcp`; its steps and screenshots land in the transcript.
+//! Browser surface (issue #45): a real view on Komet's own headless Chrome
+//! (`crates/engine/src/browser.rs`). Paste any link in the URL field and the
+//! page renders here as a stream of screenshots; clicks, wheel and typing
+//! are forwarded over CDP. Agents drive the SAME tab through
+//! `chrome-devtools-mcp --browserUrl`, so an agent's browsing is visible
+//! live — the integrated browser-use experience.
+//!
+//! No embedded webview (gpui): frames are JPEGs polled from the engine
+//! while the surface is open.
 
+use std::rc::Rc;
+use std::sync::Arc;
+use std::time::Duration;
+
+use base64::Engine as _;
 use gpui::{
-    AnyElement, Context, Entity, EventEmitter, Focusable as _, SharedString, Subscription, Task,
-    Window, div, prelude::*, px,
+    AnyElement, Context, Entity, FocusHandle, Focusable as _, Image, ImageFormat, KeyDownEvent,
+    MouseButton, MouseDownEvent, ScrollDelta, ScrollWheelEvent, SharedString, Subscription, Task,
+    Window, div, img, prelude::*, px,
 };
 use komet_rpc::methods;
 use serde::Deserialize;
@@ -17,6 +26,8 @@ use crate::icons::{self, icon};
 use crate::settings::widgets;
 use crate::state::AppState;
 use crate::theme::Theme;
+
+const FRAME_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -37,73 +48,146 @@ struct StatusReply {
     status: BrowserUseStatus,
 }
 
-/// Shell-facing events: the URL field submits a browse task.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum BrowserEvent {
-    /// Ask the current chat's agent to open `url` in headless Chrome.
-    Browse { url: String, prompt: String },
+/// `BrowserFrame` / `BrowserNavigate` reply.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct FrameReply {
+    running: Option<bool>,
+    url: String,
+    title: String,
+    image_base64: Option<String>,
+    width: u32,
+    height: u32,
+    can_go_back: bool,
+    can_go_forward: bool,
+}
+
+#[derive(Clone)]
+struct Frame {
+    url: SharedString,
+    title: SharedString,
+    image: Option<Arc<Image>>,
+    width: f32,
+    height: f32,
+    can_go_back: bool,
+    can_go_forward: bool,
+}
+
+/// Where the last frame was painted — maps pointer events back to page
+/// pixels.
+#[derive(Clone, Copy, Default)]
+struct Placement {
+    origin: gpui::Point<gpui::Pixels>,
+    size: gpui::Size<gpui::Pixels>,
 }
 
 pub struct BrowserPanel {
     state: Entity<AppState>,
     url_input: Entity<ComposerInput>,
     _url_events: Subscription,
+    page_focus: FocusHandle,
     status: Option<BrowserUseStatus>,
     error: Option<SharedString>,
     loaded: bool,
     busy: bool,
-    task: Option<Task<()>>,
-    /// Last URL handed to the agent — the tab title and the content hint.
-    current_url: Option<String>,
-    history: Vec<String>,
+    status_task: Option<Task<()>>,
+    poll_task: Option<Task<()>>,
+    nav_task: Option<Task<()>>,
+    frame: Option<Frame>,
+    /// Navigation in flight — the URL field shows it until the frame lands.
+    pending_url: Option<String>,
+    placement: Rc<std::cell::Cell<Placement>>,
+    /// Last frame bytes hash — skip re-decoding identical JPEGs.
+    frame_fingerprint: u64,
     focus_pending: bool,
+    /// The user has typed in the URL field since the last navigation.
+    url_editing: bool,
+    url_set_muted: bool,
 }
-
-impl EventEmitter<BrowserEvent> for BrowserPanel {}
 
 impl BrowserPanel {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
         let url_input =
             cx.new(|cx| ComposerInput::with_context("Search or enter URL", "PaletteSearch", cx));
-        let url_events = cx.subscribe(&url_input, |this: &mut Self, _, event, cx| {
-            if matches!(event, ComposerInputEvent::Submitted) {
-                this.submit_url(cx);
+        let url_events = cx.subscribe(&url_input, |this: &mut Self, _, event, cx| match event {
+            ComposerInputEvent::Submitted => this.submit_url(cx),
+            // `set_text` also emits Edited; the mute distinguishes the user's
+            // typing (which must not be clobbered by frame updates).
+            ComposerInputEvent::Edited => {
+                if !std::mem::take(&mut this.url_set_muted) {
+                    this.url_editing = true;
+                }
             }
+            _ => {}
         });
         Self {
             state,
             url_input,
             _url_events: url_events,
+            page_focus: cx.focus_handle(),
             status: None,
             error: None,
             loaded: false,
             busy: false,
-            task: None,
-            current_url: None,
-            history: Vec::new(),
+            status_task: None,
+            poll_task: None,
+            nav_task: None,
+            frame: None,
+            pending_url: None,
+            placement: Rc::new(std::cell::Cell::new(Placement::default())),
+            frame_fingerprint: 0,
             focus_pending: true,
+            url_editing: false,
+            url_set_muted: false,
         }
     }
 
     pub fn tab_title(&self) -> SharedString {
-        match self.current_url.as_deref() {
-            Some(url) => host_of(url).into(),
+        match self
+            .frame
+            .as_ref()
+            .filter(|f| f.url.as_ref() != "about:blank")
+        {
+            Some(f) if !f.title.is_empty() => f.title.clone(),
+            Some(f) => host_of(&f.url).into(),
             None => "about:blank".into(),
         }
     }
 
-    /// First render (and every re-open) refreshes the probe — Chrome or Node
-    /// may have been installed since.
+    /// First render (and every re-open): probe status and start polling
+    /// frames so an agent's browsing shows up even before the user types.
     pub fn ensure_loaded(&mut self, cx: &mut Context<Self>) {
         if self.loaded {
             return;
         }
         self.loaded = true;
-        self.call(methods::BROWSER_USE_STATUS, serde_json::json!({}), cx);
+        self.refresh_status(cx);
+        self.start_polling(cx);
     }
 
-    fn call(&mut self, method: &'static str, params: serde_json::Value, cx: &mut Context<Self>) {
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
+    fn engine(&self, cx: &gpui::App) -> Option<crate::state::EngineHandle> {
+        self.state.read(cx).engine().cloned()
+    }
+
+    fn refresh_status(&mut self, cx: &mut Context<Self>) {
+        self.status_call(methods::BROWSER_USE_STATUS, serde_json::json!({}), cx);
+    }
+
+    fn enable(&mut self, cx: &mut Context<Self>) {
+        self.status_call(methods::ENABLE_BROWSER_USE, serde_json::json!({}), cx);
+    }
+
+    fn disable(&mut self, cx: &mut Context<Self>) {
+        self.status_call(methods::DISABLE_BROWSER_USE, serde_json::json!({}), cx);
+    }
+
+    fn status_call(
+        &mut self,
+        method: &'static str,
+        params: serde_json::Value,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(engine) = self.engine(cx) else {
             self.error = Some("Engine not connected.".into());
             cx.notify();
             return;
@@ -111,7 +195,7 @@ impl BrowserPanel {
         self.busy = true;
         self.error = None;
         cx.notify();
-        self.task = Some(cx.spawn(async move |this, cx| {
+        self.status_task = Some(cx.spawn(async move |this, cx| {
             let result = engine.client().call(method, params).await;
             let _ = this.update(cx, |panel, cx| {
                 panel.busy = false;
@@ -127,45 +211,229 @@ impl BrowserPanel {
         }));
     }
 
-    fn refresh(&mut self, cx: &mut Context<Self>) {
-        self.call(methods::BROWSER_USE_STATUS, serde_json::json!({}), cx);
+    fn start_polling(&mut self, cx: &mut Context<Self>) {
+        if self.poll_task.is_some() {
+            return;
+        }
+        let Some(engine) = self.engine(cx) else {
+            return;
+        };
+        self.poll_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                let reply = engine
+                    .client()
+                    .call(methods::BROWSER_FRAME, serde_json::json!({}))
+                    .await;
+                let alive = this
+                    .update(cx, |panel, cx| {
+                        if let Ok(value) = reply {
+                            panel.apply_frame(value, cx);
+                        }
+                    })
+                    .is_ok();
+                if !alive {
+                    break;
+                }
+                cx.background_executor().timer(FRAME_INTERVAL).await;
+            }
+        }));
     }
 
-    fn enable(&mut self, cx: &mut Context<Self>) {
-        self.call(methods::ENABLE_BROWSER_USE, serde_json::json!({}), cx);
+    fn apply_frame(&mut self, value: serde_json::Value, cx: &mut Context<Self>) {
+        let Ok(reply) = serde_json::from_value::<FrameReply>(value) else {
+            return;
+        };
+        if reply.running == Some(false) {
+            return; // Chrome not started yet — keep the empty state.
+        }
+        let fingerprint = reply.image_base64.as_deref().map(fnv1a).unwrap_or(0);
+        let image = if fingerprint == self.frame_fingerprint {
+            self.frame.as_ref().and_then(|f| f.image.clone())
+        } else {
+            self.frame_fingerprint = fingerprint;
+            reply.image_base64.as_deref().and_then(|b64| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(b64)
+                    .ok()
+                    .map(|bytes| Arc::new(Image::from_bytes(ImageFormat::Jpeg, bytes)))
+            })
+        };
+        let url_changed = self
+            .frame
+            .as_ref()
+            .is_none_or(|f| f.url.as_ref() != reply.url);
+        self.frame = Some(Frame {
+            url: reply.url.clone().into(),
+            title: reply.title.into(),
+            image,
+            width: reply.width.max(1) as f32,
+            height: reply.height.max(1) as f32,
+            can_go_back: reply.can_go_back,
+            can_go_forward: reply.can_go_forward,
+        });
+        // Follow the page (agent navigations included) unless the user is
+        // mid-edit in the URL field.
+        if url_changed
+            && self.pending_url.is_none()
+            && reply.url != "about:blank"
+            && !self.url_editing
+        {
+            self.set_url_text(reply.url.clone(), cx);
+        }
+        if self.pending_url.as_deref() == Some(reply.url.as_str()) {
+            self.pending_url = None;
+        }
+        cx.notify();
     }
 
-    fn disable(&mut self, cx: &mut Context<Self>) {
-        self.call(methods::DISABLE_BROWSER_USE, serde_json::json!({}), cx);
+    fn browser_call(
+        &mut self,
+        method: &'static str,
+        params: serde_json::Value,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(engine) = self.engine(cx) else {
+            self.error = Some("Engine not connected.".into());
+            cx.notify();
+            return;
+        };
+        self.error = None;
+        self.nav_task = Some(cx.spawn(async move |this, cx| {
+            let result = engine.client().call(method, params).await;
+            let _ = this.update(cx, |panel, cx| match result {
+                Ok(value) => {
+                    if value.get("url").is_some() {
+                        panel.apply_frame(value, cx);
+                    }
+                }
+                Err(err) => {
+                    panel.pending_url = None;
+                    panel.error = Some(err.to_string().into());
+                    cx.notify();
+                }
+            });
+        }));
     }
 
-    /// Enter in the URL field: normalise, remember, and hand the agent a
-    /// browse task. Plain words become a search like a real omnibox.
+    fn set_url_text(&mut self, url: String, cx: &mut Context<Self>) {
+        self.url_set_muted = true;
+        self.url_input
+            .update(cx, |input, cx| input.set_text(url, cx));
+        self.url_set_muted = false;
+        self.url_editing = false;
+    }
+
+    /// Enter in the URL field: normalise and navigate Komet's Chrome.
     fn submit_url(&mut self, cx: &mut Context<Self>) {
         let raw = self.url_input.read(cx).text().trim().to_string();
         if raw.is_empty() {
             return;
         }
         let url = normalize_url(&raw);
-        self.url_input
-            .update(cx, |input, cx| input.set_text(url.clone(), cx));
-        if self.current_url.as_deref() != Some(url.as_str())
-            && let Some(prev) = self.current_url.replace(url.clone())
-        {
-            self.history.push(prev);
-        }
-        let prompt = browse_prompt(&url);
-        cx.emit(BrowserEvent::Browse { url, prompt });
+        self.set_url_text(url.clone(), cx);
+        self.pending_url = Some(url.clone());
+        self.browser_call(
+            methods::BROWSER_NAVIGATE,
+            serde_json::json!({ "url": url }),
+            cx,
+        );
+        self.start_polling(cx);
         cx.notify();
     }
 
-    fn go_back(&mut self, cx: &mut Context<Self>) {
-        if let Some(prev) = self.history.pop() {
-            self.current_url = Some(prev.clone());
-            self.url_input
-                .update(cx, |input, cx| input.set_text(prev, cx));
-            cx.notify();
+    fn history(&mut self, delta: i64, cx: &mut Context<Self>) {
+        self.browser_call(
+            methods::BROWSER_HISTORY,
+            serde_json::json!({ "delta": delta }),
+            cx,
+        );
+    }
+
+    fn reload(&mut self, cx: &mut Context<Self>) {
+        self.refresh_status(cx);
+        if self.frame.is_some() {
+            self.browser_call(methods::BROWSER_RELOAD, serde_json::json!({}), cx);
         }
+    }
+
+    fn send_input(&mut self, params: serde_json::Value, cx: &mut Context<Self>) {
+        let Some(engine) = self.engine(cx) else {
+            return;
+        };
+        cx.spawn(async move |_, _| {
+            let _ = engine.client().call(methods::BROWSER_INPUT, params).await;
+        })
+        .detach();
+    }
+
+    /// Window position → page pixels, if inside the painted frame.
+    fn page_point(&self, position: gpui::Point<gpui::Pixels>) -> Option<(f64, f64)> {
+        let frame = self.frame.as_ref()?;
+        let place = self.placement.get();
+        let w = f32::from(place.size.width);
+        let h = f32::from(place.size.height);
+        if w <= 0.0 || h <= 0.0 {
+            return None;
+        }
+        let rx = (f32::from(position.x) - f32::from(place.origin.x)) / w;
+        let ry = (f32::from(position.y) - f32::from(place.origin.y)) / h;
+        if !(0.0..=1.0).contains(&rx) || !(0.0..=1.0).contains(&ry) {
+            return None;
+        }
+        Some(((rx * frame.width) as f64, (ry * frame.height) as f64))
+    }
+
+    fn on_page_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&self.page_focus, cx);
+        if let Some((x, y)) = self.page_point(event.position) {
+            self.send_input(serde_json::json!({ "kind": "click", "x": x, "y": y }), cx);
+        }
+    }
+
+    fn on_page_scroll(
+        &mut self,
+        event: &ScrollWheelEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((x, y)) = self.page_point(event.position) else {
+            return;
+        };
+        let delta = match event.delta {
+            ScrollDelta::Pixels(p) => (f32::from(p.x), f32::from(p.y)),
+            ScrollDelta::Lines(l) => (l.x * 40.0, l.y * 40.0),
+        };
+        // gpui's wheel delta points the way content moves; CDP wants the
+        // opposite sign.
+        self.send_input(
+            serde_json::json!({
+                "kind": "scroll", "x": x, "y": y,
+                "dx": -(delta.0 as f64), "dy": -(delta.1 as f64)
+            }),
+            cx,
+        );
+    }
+
+    fn on_page_key(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let ks = &event.keystroke;
+        let params = match ks.key.as_str() {
+            "enter" | "backspace" | "tab" | "escape" => {
+                serde_json::json!({ "kind": "key", "key": ks.key })
+            }
+            _ => match ks.key_char.as_deref() {
+                Some(text) if !ks.modifiers.control && !ks.modifiers.platform => {
+                    serde_json::json!({ "kind": "text", "text": text })
+                }
+                _ => return,
+            },
+        };
+        self.send_input(params, cx);
+        cx.stop_propagation();
     }
 
     fn toolbar_button(
@@ -193,9 +461,17 @@ impl BrowserPanel {
     }
 
     fn render_toolbar(&mut self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
-        let can_back = !self.history.is_empty();
-        let busy = self.busy;
-        let current = self.current_url.clone();
+        let (back, forward) = self
+            .frame
+            .as_ref()
+            .map(|f| (f.can_go_back, f.can_go_forward))
+            .unwrap_or((false, false));
+        let current = self
+            .frame
+            .as_ref()
+            .filter(|f| f.url.as_ref() != "about:blank")
+            .map(|f| f.url.to_string());
+        let loading = self.pending_url.is_some();
         div()
             .flex_none()
             .h(px(44.0))
@@ -207,31 +483,22 @@ impl BrowserPanel {
             .items_center()
             .gap(px(4.0))
             .child(
-                Self::toolbar_button(theme, "browser-back", icons::ALT_ARROW_LEFT, can_back)
-                    .when(can_back, |el| {
-                        el.on_click(cx.listener(|this, _, _, cx| this.go_back(cx)))
+                Self::toolbar_button(theme, "browser-back", icons::ALT_ARROW_LEFT, back)
+                    .when(back, |el| {
+                        el.on_click(cx.listener(|this, _, _, cx| this.history(-1, cx)))
                     }),
             )
-            .child(Self::toolbar_button(
-                theme,
-                "browser-forward",
-                icons::ALT_ARROW_RIGHT,
-                false,
-            ))
             .child(
-                Self::toolbar_button(theme, "browser-reload", icons::REFRESH, !busy).when(
-                    !busy,
-                    |el| {
-                        el.on_click(cx.listener(|this, _, _, cx| {
-                            // Re-probe Chrome / npx and, with a page open,
-                            // re-send the browse task.
-                            this.refresh(cx);
-                            if this.current_url.is_some() {
-                                this.submit_url(cx);
-                            }
-                        }))
-                    },
-                ),
+                Self::toolbar_button(theme, "browser-forward", icons::ALT_ARROW_RIGHT, forward)
+                    .when(forward, |el| {
+                        el.on_click(cx.listener(|this, _, _, cx| this.history(1, cx)))
+                    }),
+            )
+            .child(
+                Self::toolbar_button(theme, "browser-reload", icons::REFRESH, !loading)
+                    .when(!loading, |el| {
+                        el.on_click(cx.listener(|this, _, _, cx| this.reload(cx)))
+                    }),
             )
             .child(
                 div()
@@ -242,7 +509,7 @@ impl BrowserPanel {
                     .px(px(12.0))
                     .rounded_full()
                     .border_1()
-                    .border_color(theme.border)
+                    .border_color(if loading { theme.accent } else { theme.border })
                     .bg(crate::theme::ink(0.04))
                     .flex()
                     .items_center()
@@ -262,7 +529,7 @@ impl BrowserPanel {
             )
     }
 
-    /// Status pill under the toolbar: probe results and the enable toggle.
+    /// Status pill under the toolbar: probe results and the agent toggle.
     fn render_status_line(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let Some(status) = self.status.clone() else {
             return div()
@@ -334,36 +601,84 @@ impl BrowserPanel {
                     .text_size(px(11.5))
                     .text_color(theme.text_muted)
                     .child(SharedString::from(if enabled {
-                        "Agent browsing on"
+                        "Agents can browse"
                     } else {
-                        "Agent browsing off"
+                        "Agents can't browse"
                     })),
             )
             .child(toggle)
             .into_any_element()
     }
 
-    fn render_content(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    fn render_page(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let Some(frame) = self.frame.clone().filter(|f| f.image.is_some()) else {
+            return self.render_empty(theme, cx);
+        };
+        let image = frame.image.clone().expect("filtered");
+        let placement = self.placement.clone();
+        let aspect = frame.width / frame.height;
+        div()
+            .id("browser-page")
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .bg(gpui::white())
+            .flex()
+            .items_start()
+            .justify_center()
+            .overflow_hidden()
+            .track_focus(&self.page_focus)
+            .key_context("BrowserPage")
+            .on_key_down(cx.listener(Self::on_page_key))
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_page_mouse_down))
+            .on_scroll_wheel(cx.listener(Self::on_page_scroll))
+            .cursor_pointer()
+            .child(
+                div()
+                    .w_full()
+                    .relative()
+                    .child(
+                        img(image)
+                            .w_full()
+                            .h_auto()
+                            .object_fit(gpui::ObjectFit::Contain),
+                    )
+                    .child(
+                        gpui::canvas(
+                            move |bounds, _, _| {
+                                // The image keeps the page aspect; its painted
+                                // height follows the width.
+                                let w = f32::from(bounds.size.width);
+                                let h = w / aspect;
+                                placement.set(Placement {
+                                    origin: bounds.origin,
+                                    size: gpui::size(px(w), px(h)),
+                                });
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .inset_0(),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn render_empty(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
         let status = self.status.clone().unwrap_or_default();
         let blocked = status.blocker.clone().filter(|_| !status.enabled);
-        let enabled = status.enabled;
+        let chrome_ok = status.chrome_installed;
         let can_enable = self.status.is_some() && !self.busy && blocked.is_none();
 
-        let (title, hint): (&str, SharedString) = match self.current_url.as_deref() {
-            Some(url) => (
-                "Browsing",
-                format!("{url}\nThe agent drives headless Chrome; its steps, console errors and screenshots land in the chat.")
-                    .into(),
-            ),
-            None if enabled => (
+        let (title, hint): (&str, &str) = match (self.pending_url.is_some(), chrome_ok) {
+            (true, _) => ("Loading…", "Starting Chrome and opening the page."),
+            (false, true) => (
                 "Start browsing",
-                "Enter a URL above — the agent opens it in headless Chrome and reports back."
-                    .into(),
+                "Paste a link above to open it in Komet's headless Chrome. Agents with browsing on drive this same tab, live.",
             ),
-            None => (
-                "Start browsing",
-                "Turn on agent browsing to let the agent open pages, click, fill forms and read console errors."
-                    .into(),
+            (false, false) => (
+                "Chrome required",
+                "Install Google Chrome or Chromium (or set CHROME_PATH) to browse here and let agents browse.",
             ),
         };
 
@@ -371,7 +686,7 @@ impl BrowserPanel {
             .flex()
             .flex_col()
             .items_center()
-            .max_w(px(360.0))
+            .max_w(px(380.0))
             .gap(px(12.0))
             .child(
                 icon(icons::GLOBE)
@@ -391,9 +706,9 @@ impl BrowserPanel {
                     .text_size(px(12.5))
                     .line_height(px(18.0))
                     .text_color(theme.text_muted)
-                    .child(hint),
+                    .child(SharedString::from(hint.to_string())),
             );
-        if !enabled {
+        if !status.enabled && chrome_ok {
             body = body.child(
                 div()
                     .id("browser-enable-cta")
@@ -415,7 +730,7 @@ impl BrowserPanel {
                             .on_click(cx.listener(|this, _, _, cx| this.enable(cx)))
                     })
                     .child(icon(icons::CHECK).size(px(14.0)))
-                    .child(SharedString::from("Enable agent browsing")),
+                    .child(SharedString::from("Let agents browse")),
             );
         }
         if let Some(blocker) = blocked {
@@ -445,23 +760,39 @@ impl Render for BrowserPanel {
         }
         let toolbar = self.render_toolbar(&theme, cx);
         let status = self.render_status_line(&theme, cx);
-        let content = self.render_content(&theme, cx);
-        div()
+        let page = self.render_page(&theme, cx);
+        let mut root = div()
             .id("browser-surface")
             .size_full()
             .flex()
             .flex_col()
             .child(toolbar)
-            .child(status)
-            .child(content)
+            .child(status);
+        if let Some(error) = self.error.clone().filter(|_| self.frame.is_some()) {
+            root = root.child(
+                div()
+                    .px(px(14.0))
+                    .child(widgets::error_strip(&theme, error)),
+            );
+        }
+        root.child(page)
     }
+}
+
+fn fnv1a(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in s.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0100_0000_01b3);
+    }
+    h
 }
 
 /// `example.com/x` → `https://example.com/x`; bare words → a search URL;
 /// `localhost:3000` keeps `http`.
 pub fn normalize_url(raw: &str) -> String {
     let raw = raw.trim();
-    if raw.contains("://") {
+    if raw.contains("://") || raw.starts_with("data:") || raw.starts_with("about:") {
         return raw.to_string();
     }
     let head = raw.split('/').next().unwrap_or(raw);
@@ -487,17 +818,6 @@ pub fn host_of(url: &str) -> String {
     rest.split('/').next().unwrap_or(rest).to_string()
 }
 
-/// The browse task handed to the agent (the chrome-devtools MCP tools do the
-/// rest). Kept short: the server's own descriptions carry the workflow.
-pub fn browse_prompt(url: &str) -> String {
-    format!(
-        "Open {url} in the headless browser (chrome-devtools MCP: navigate_page, then take_snapshot \
-         and take_screenshot). Describe what the page shows, list any console errors from \
-         list_console_messages, and finish with a short JSON report \
-         {{\"overallStatus\",\"summary\",\"finalUrl\",\"finalPageTitle\",\"results\",\"consoleErrors\",\"lessons\"}}."
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -507,11 +827,11 @@ mod tests {
         assert_eq!(normalize_url("example.com/a"), "https://example.com/a");
         assert_eq!(normalize_url("localhost:3000"), "http://localhost:3000");
         assert_eq!(normalize_url("https://x.io"), "https://x.io");
+        assert_eq!(normalize_url("about:blank"), "about:blank");
         assert_eq!(
             normalize_url("rust gpui docs"),
             "https://duckduckgo.com/?q=rust+gpui+docs"
         );
         assert_eq!(host_of("https://example.com/a/b"), "example.com");
-        assert!(browse_prompt("https://x.io").contains("navigate_page"));
     }
 }
