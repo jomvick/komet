@@ -352,6 +352,7 @@ pub(crate) fn crash_message(
 }
 
 pub use acp::AcpHarness;
+pub use acp::find_on_paths;
 pub use antigravity::AntigravityHarness;
 pub use claude::ClaudeHarness;
 pub use codex::CodexHarness;

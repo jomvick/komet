@@ -1,3 +1,4 @@
+pub mod browser_use;
 pub mod catalog;
 pub mod config;
 pub mod discovery;

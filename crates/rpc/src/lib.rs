@@ -161,6 +161,11 @@ pub mod methods {
     pub const TEST_MCP_SERVER: &str = "TestMcpServer";
     pub const LIST_MCP_TOOLS: &str = "ListMcpTools";
     pub const WATCH_MCP_STATUS: &str = "WatchMcpStatus";
+    // Browser-use preset (issue #45): pinned chrome-devtools-mcp registered in
+    // the local MCP registry, gated on a Chrome + npx file probe.
+    pub const BROWSER_USE_STATUS: &str = "BrowserUseStatus";
+    pub const ENABLE_BROWSER_USE: &str = "EnableBrowserUse";
+    pub const DISABLE_BROWSER_USE: &str = "DisableBrowserUse";
 }
 
 #[derive(Debug, thiserror::Error)]

@@ -71,3 +71,11 @@ Vérifié dans le code :
 - Screenshots (mon choix par défaut) : traités comme pixels de page non fiables, locaux uniquement (`protect_attachments`, jamais en doc sync), en attente de décision produit.
 
 Reste au produit (reporté dans l'issue) : prérequis Node/npx + règle sandbox pour Chrome ; pré-seedé/`always_load` vs ajout manuel ; politique privacy exacte des screenshots.
+
+## État d’implémentation (2026-10-22)
+
+- `crates/engine/src/mcp/browser_use.rs` : preset `chrome-devtools` (`npx -y chrome-devtools-mcp@1.12.0 --headless --isolated`), sonde Chrome/npx par fichiers uniquement (`CHROME_PATH` prioritaire, puis emplacements connus par OS, puis PATH + login shell), prompt système porté de freebuff, `task_prompt(task, url)`.
+- RPC (`crates/rpc`, relay-forwardable, local à l’appareil) : `BrowserUseStatus` → `{status, serverId, systemPrompt}` ; `EnableBrowserUse {alwaysLoad?, force?}` → refuse avec une raison lisible si Chrome ou npx manque ; `DisableBrowserUse`.
+- `crates/proto/src/browser_use.rs` : `BrowserUseReport::parse` (JSON nu, bloc ```json, ou objet au milieu de prose) + `to_markdown()` ; le transcript remplace le JSON brut par la carte une fois la réponse terminée (`crates/ui/src/transcript.rs`).
+- Décisions prises : Node/npx requis côté utilisateur (pas de vendoring) ; `always_load` laissé au choix de l’appelant (défaut : opt-in par chat) ; version épinglée.
+- Reste à faire : toggle dans les réglages, vignettes de captures → lightbox, test live contre le vrai MCP, règle sandbox Chrome (`ARCHITECTURE.md` §6).
