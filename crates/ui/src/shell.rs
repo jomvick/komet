@@ -41,6 +41,7 @@ use crate::settings::archived::ArchivedPage;
 use crate::settings::devices::DevicesPage;
 use crate::settings::files::FilesSettingsPage;
 use crate::settings::harnesses::HarnessesPage;
+use crate::settings::integrations::IntegrationsPage;
 use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
 use crate::settings::security::{SecurityDefaults, SecurityEvent, SecurityPage};
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
@@ -184,10 +185,11 @@ pub enum SettingsSection {
     Archived,
     Sync,
     Security,
+    Integrations,
 }
 
 impl SettingsSection {
-    pub const ALL: [SettingsSection; 10] = [
+    pub const ALL: [SettingsSection; 11] = [
         SettingsSection::Devices,
         SettingsSection::Harnesses,
         SettingsSection::Agents,
@@ -198,6 +200,7 @@ impl SettingsSection {
         SettingsSection::Archived,
         SettingsSection::Sync,
         SettingsSection::Security,
+        SettingsSection::Integrations,
     ];
 
     /// Sidebar + header label (komet settings-sidebar.tsx SECTIONS / __root.tsx
@@ -214,6 +217,7 @@ impl SettingsSection {
             SettingsSection::Archived => "Archived sessions",
             SettingsSection::Sync => "Sync",
             SettingsSection::Security => "Security",
+            SettingsSection::Integrations => "Integrations",
         }
     }
 }
@@ -901,6 +905,7 @@ pub struct Shell {
     accounts_page: Option<Entity<AccountsPage>>,
     harnesses_page: Option<Entity<HarnessesPage>>,
     security_page: Option<Entity<SecurityPage>>,
+    integrations_page: Option<Entity<IntegrationsPage>>,
     shortcuts_sub: Option<Subscription>,
     notifications_sub: Option<Subscription>,
     security_sub: Option<Subscription>,
@@ -1097,6 +1102,7 @@ impl Shell {
             Some("settings/shortcuts") => Route::Settings(SettingsSection::Shortcuts),
             Some("settings/archived") => Route::Settings(SettingsSection::Archived),
             Some("settings/security") => Route::Settings(SettingsSection::Security),
+            Some("settings/integrations") => Route::Settings(SettingsSection::Integrations),
             // `new` pins the new-chat canvas (suppresses boot auto-select).
             Some("new") => {
                 state.update(cx, |s, _| s.auto_selected = true);
@@ -1165,6 +1171,7 @@ impl Shell {
             accounts_page: None,
             harnesses_page: None,
             security_page: None,
+            integrations_page: None,
             shortcuts_sub: None,
             notifications_sub: None,
             security_sub: None,
@@ -2668,6 +2675,16 @@ impl Shell {
                     None => Empty.into_any_element(),
                 }
             }
+            SettingsSection::Integrations => {
+                if self.integrations_page.is_none() {
+                    let state = self.state.clone();
+                    self.integrations_page = Some(cx.new(|cx| IntegrationsPage::new(state, cx)));
+                }
+                match &self.integrations_page {
+                    Some(page) => page.clone().into_any_element(),
+                    None => Empty.into_any_element(),
+                }
+            }
         }
     }
 
@@ -3661,6 +3678,7 @@ impl Shell {
             SettingsSection::Archived => icons::ARCHIVE_MINIMALISTIC,
             SettingsSection::Sync => icons::GLOBAL,
             SettingsSection::Security => icons::SHIELD,
+            SettingsSection::Integrations => icons::WIDGET,
         };
         // Match the user's dragged sidebar width — the pane container clips to
         // it, so a hardcoded default here left hover washes stopping short of
@@ -8116,8 +8134,10 @@ mod tests {
 
     #[test]
     fn settings_sections_include_security() {
-        assert_eq!(SettingsSection::ALL.len(), 10);
+        assert_eq!(SettingsSection::ALL.len(), 11);
         assert!(SettingsSection::ALL.contains(&SettingsSection::Security));
         assert_eq!(SettingsSection::Security.label(), "Security");
+        assert!(SettingsSection::ALL.contains(&SettingsSection::Integrations));
+        assert_eq!(SettingsSection::Integrations.label(), "Integrations");
     }
 }

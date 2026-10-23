@@ -4,7 +4,9 @@ use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
-use crate::mcp::config::{McpServerConfig, PublicMcpServerConfig};
+use crate::mcp::config::{
+    COMPOSIO_API_KEY_HEADER, COMPOSIO_SERVER_ID, McpServerConfig, PublicMcpServerConfig,
+};
 use crate::mcp::secrets::McpSecretStore;
 
 /// Resolved server ready for provider launch: config + resolved secret values.
@@ -323,6 +325,14 @@ impl McpRegistry {
             // Resolve via store, filtered by config's declared keys
             let resolved_headers = store.get_resolved_headers_for(&cfg.id, &cfg.headers);
             let resolved_env = store.get_resolved_env_for(&cfg.id, &cfg.env);
+            if cfg.id == COMPOSIO_SERVER_ID
+                && resolved_headers
+                    .get(COMPOSIO_API_KEY_HEADER)
+                    .is_none_or(String::is_empty)
+            {
+                tracing::debug!(server_id = %cfg.id, "mcp resolve: Composio credential unavailable");
+                continue;
+            }
             tracing::debug!(
                 server_id = %cfg.id,
                 headers = resolved_headers.len(),

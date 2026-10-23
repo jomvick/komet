@@ -437,6 +437,15 @@ impl SessionsEngine {
         mut message_id: Option<String>,
         startup_retry: bool,
     ) -> Result<String, EngineError> {
+        // External server secrets are resolved on the host immediately before
+        // launch. The Composio key never enters chat state or sync documents.
+        let composio_allowed = composio_supported_by_harness(harness_id);
+        request.mcp_external = self
+            .prepare_mcp_for_run(chat_id)
+            .into_iter()
+            .filter(|server| server.config.id != "composio" || composio_allowed)
+            .map(resolved_mcp_to_proto)
+            .collect();
         // Project-less chats store cwd `~` (the creating device can't know the
         // host's home); expand it here, on the host, where the run spawns.
         request.cwd = expand_home(&request.cwd);
@@ -1158,6 +1167,35 @@ impl SessionsEngine {
 
     fn set_status(&self, chat_id: &str, status: SessionStatus, fresh_start: bool) {
         self.inner.set_status(chat_id, status, fresh_start);
+    }
+}
+
+fn composio_supported_by_harness(harness_id: HarnessId) -> bool {
+    harness_id != HarnessId::ClaudeCode
+        && komet_harness::capabilities::supports_dynamic_mcp(harness_id).0
+}
+
+fn resolved_mcp_to_proto(server: crate::mcp::ResolvedMcpServer) -> komet_proto::ResolvedMcpServer {
+    let config = server.config;
+    komet_proto::ResolvedMcpServer {
+        config: komet_proto::McpServerConfig {
+            id: config.id,
+            name: config.name,
+            enabled: config.enabled,
+            transport: match config.transport {
+                crate::mcp::McpTransport::Stdio => komet_proto::McpTransport::Stdio,
+                crate::mcp::McpTransport::Http => komet_proto::McpTransport::Http,
+                crate::mcp::McpTransport::Sse => komet_proto::McpTransport::Sse,
+            },
+            command: config.command,
+            args: config.args,
+            url: config.url,
+            headers: config.headers,
+            env: config.env,
+            always_load: config.always_load,
+        },
+        resolved_headers: server.resolved_headers,
+        resolved_env: server.resolved_env,
     }
 }
 
@@ -2589,6 +2627,14 @@ mod tests {
             mcp: None,
             mcp_external: Vec::new(),
         }
+    }
+
+    #[test]
+    fn composio_is_available_only_on_safe_dynamic_mcp_harnesses() {
+        assert!(composio_supported_by_harness(HarnessId::Opencode));
+        assert!(composio_supported_by_harness(HarnessId::Cline));
+        assert!(!composio_supported_by_harness(HarnessId::ClaudeCode));
+        assert!(!composio_supported_by_harness(HarnessId::Codex));
     }
 
     #[tokio::test]
