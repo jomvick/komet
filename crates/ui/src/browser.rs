@@ -9,6 +9,7 @@ use komet_rpc::methods;
 use serde::Deserialize;
 
 use crate::icons::{self, icon};
+use crate::settings::widgets;
 use crate::state::AppState;
 use crate::theme::Theme;
 
@@ -111,68 +112,47 @@ impl BrowserPanel {
         );
     }
 
-    fn probe_row(theme: &Theme, ok: bool, label: &str, detail: Option<&str>) -> AnyElement {
-        let dot = div().size(px(8.0)).flex_none().rounded_full().bg(if ok {
-            theme.success
-        } else {
-            theme.danger
-        });
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(8.0))
-            .child(dot)
+    /// One probe / state row in the settings-card idiom: tile + title +
+    /// wrapping meta line, trailing badge or control.
+    fn row(
+        theme: &Theme,
+        first: bool,
+        icon_path: &'static str,
+        title: &str,
+        meta: Vec<AnyElement>,
+        trailing: AnyElement,
+    ) -> gpui::Div {
+        widgets::card_row(theme, first)
+            .child(widgets::row_tile(theme, icon_path))
             .child(
                 div()
-                    .text_size(px(12.5))
-                    .text_color(theme.text)
-                    .child(SharedString::from(label.to_string())),
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child(widgets::row_title(theme, title.to_string()))
+                    .when(!meta.is_empty(), |el| {
+                        el.child(widgets::meta_line(theme, meta))
+                    }),
             )
-            .when_some(detail, |el, detail| {
-                el.child(
-                    div()
-                        .text_size(px(11.0))
-                        .text_color(theme.text_muted)
-                        .truncate()
-                        .child(SharedString::from(detail.to_string())),
-                )
-            })
+            .child(div().flex_none().child(trailing))
+    }
+
+    fn meta(theme: &Theme, text: impl Into<SharedString>) -> AnyElement {
+        div()
+            .min_w_0()
+            .text_color(theme.text_muted.opacity(0.65))
+            .child(text.into())
             .into_any_element()
     }
 
-    fn button(
-        id: &'static str,
-        theme: &Theme,
-        label: &str,
-        primary: bool,
-        disabled: bool,
-    ) -> gpui::Stateful<gpui::Div> {
-        let bg = if primary {
-            theme.accent
+    fn probe_badge(theme: &Theme, ok: bool, ok_label: &str, missing_label: &str) -> AnyElement {
+        if ok {
+            widgets::badge_active(theme, ok_label.to_string())
         } else {
-            crate::theme::ink(0.04)
-        };
-        let fg = if primary { theme.on_accent } else { theme.text };
-        div()
-            .id(id)
-            .h(px(30.0))
-            .px(px(12.0))
-            .rounded(px(8.0))
-            .border_1()
-            .border_color(if primary { theme.accent } else { theme.border })
-            .bg(bg)
-            .flex()
-            .items_center()
-            .justify_center()
-            .text_size(px(12.5))
-            .font_weight(gpui::FontWeight::MEDIUM)
-            .text_color(fg)
-            .when(disabled, |el| el.opacity(0.5))
-            .when(!disabled, |el| {
-                el.cursor_pointer().hover(move |s| s.opacity(0.9))
-            })
-            .child(SharedString::from(label.to_string()))
+            widgets::badge(theme, missing_label.to_string()).text_color(theme.danger_muted)
+        }
+        .into_any_element()
     }
 }
 
@@ -182,180 +162,154 @@ impl Render for BrowserPanel {
         let status = self.status.clone().unwrap_or_default();
         let have_status = self.status.is_some();
         let busy = self.busy;
-        let can_enable = have_status && status.blocker.is_none() && !busy;
+        let blocked = status.blocker.is_some() && !status.enabled;
+        let can_toggle = have_status && !busy && (status.enabled || !blocked);
 
-        let mut card = div()
-            .w_full()
-            .max_w(px(420.0))
-            .p(px(16.0))
-            .rounded(px(12.0))
-            .border_1()
-            .border_color(theme.border)
-            .bg(crate::theme::ink(0.02))
-            .flex()
-            .flex_col()
-            .gap(px(12.0))
+        let header = widgets::page_header(&theme, "Browser", None);
+        let subtitle = widgets::page_subtitle(
+            &theme,
+            "Headless Chrome for agents via chrome-devtools-mcp: navigate, snapshot, click, fill and read console errors.",
+        );
+
+        // Probes: Chrome and npx, each with a status pill; details wrap.
+        let mut probes = widgets::section_card(&theme);
+        if !have_status && self.error.is_none() {
+            probes = probes.child(
+                widgets::card_row(&theme, true).child(
+                    div()
+                        .text_size(px(12.5))
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from("Probing Chrome and npx…")),
+                ),
+            );
+        } else {
+            let chrome_meta = match status.chrome_path.as_deref() {
+                Some(path) => vec![Self::meta(&theme, path.to_string())],
+                None => vec![Self::meta(
+                    &theme,
+                    format!("not found — install Chrome or set {}", "CHROME_PATH"),
+                )],
+            };
+            probes = probes
+                .child(Self::row(
+                    &theme,
+                    true,
+                    icons::GLOBE,
+                    "Chrome / Chromium",
+                    chrome_meta,
+                    Self::probe_badge(&theme, status.chrome_installed, "Found", "Missing"),
+                ))
+                .child(Self::row(
+                    &theme,
+                    false,
+                    icons::TERMINAL,
+                    "npx (Node.js)",
+                    vec![Self::meta(
+                        &theme,
+                        if status.npx_installed {
+                            format!("runs {}", status.package)
+                        } else {
+                            "not found — install Node.js ≥ 20".to_string()
+                        },
+                    )],
+                    Self::probe_badge(&theme, status.npx_installed, "Found", "Missing"),
+                ));
+        }
+
+        // Controls: enable toggle, always-on toggle, re-check.
+        let enable_meta = if status.enabled {
+            "Registered as the chrome-devtools MCP server"
+        } else {
+            "Registers chrome-devtools-mcp for Claude Code, OpenCode, Grok, Hermes, Pi and Cline"
+        };
+        let enable_toggle = widgets::toggle_switch(&theme, status.enabled)
+            .id("browser-enable")
+            .when(!can_toggle, |el| el.opacity(0.5))
+            .when(can_toggle, |el| {
+                let enabled = status.enabled;
+                el.cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if enabled {
+                            this.disable(cx)
+                        } else {
+                            this.enable(cx)
+                        }
+                    }))
+            });
+        let always_on = status.enabled && !busy;
+        let always_toggle = widgets::toggle_switch(&theme, status.always_load)
+            .id("browser-always-load")
+            .when(!always_on, |el| el.opacity(0.5))
+            .when(always_on, |el| {
+                let next = !status.always_load;
+                el.cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| this.set_always_load(next, cx)))
+            });
+        let recheck = widgets::ghost_action(&theme)
+            .id("browser-refresh")
+            .hover(|s| widgets::ghost_hover(&theme, s))
+            .when(busy, |el| el.opacity(0.5))
+            .when(!busy, |el| {
+                el.on_click(cx.listener(|this, _, _, cx| this.refresh(cx)))
+            })
             .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(10.0))
-                    .child(
-                        icon(icons::GLOBE)
-                            .size(px(18.0))
-                            .flex_none()
-                            .text_color(theme.text),
-                    )
+                icon(icons::REFRESH)
+                    .size(px(14.0))
+                    .text_color(theme.text_muted),
+            )
+            .child(SharedString::from("Re-check"));
+
+        let controls = widgets::section_card(&theme)
+            .child(Self::row(
+                &theme,
+                true,
+                icons::CHECK,
+                "Enable browser use",
+                vec![Self::meta(&theme, enable_meta)],
+                enable_toggle.into_any_element(),
+            ))
+            .child(Self::row(
+                &theme,
+                false,
+                icons::INFO_CIRCLE,
+                "Always on",
+                vec![Self::meta(
+                    &theme,
+                    "Attach to every compatible run instead of per-chat assignment",
+                )],
+                always_toggle.into_any_element(),
+            ))
+            .child(
+                widgets::card_row(&theme, false)
+                    .justify_between()
                     .child(
                         div()
-                            .flex()
-                            .flex_col()
-                            .child(
-                                div()
-                                    .text_size(px(14.0))
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .text_color(theme.text)
-                                    .child(SharedString::from("Browser use")),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(11.5))
-                                    .text_color(theme.text_muted)
-                                    .child(SharedString::from(
-                                        "Headless Chrome via chrome-devtools-mcp: navigate, snapshot, click, fill, read console errors.",
-                                    )),
-                            ),
-                    ),
+                            .text_size(px(11.5))
+                            .text_color(theme.text_muted.opacity(0.65))
+                            .child(SharedString::from(
+                                "Probes are file checks only; Chrome is never launched here.",
+                            )),
+                    )
+                    .child(recheck),
             );
 
-        if !have_status && self.error.is_none() {
-            card = card.child(
-                div()
-                    .text_size(px(12.0))
-                    .text_color(theme.text_muted)
-                    .child(SharedString::from("Probing Chrome and npx…")),
-            );
-        } else {
-            card = card.child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(6.0))
-                    .child(Self::probe_row(
-                        &theme,
-                        status.chrome_installed,
-                        "Chrome / Chromium",
-                        status.chrome_path.as_deref(),
-                    ))
-                    .child(Self::probe_row(
-                        &theme,
-                        status.npx_installed,
-                        "npx (Node.js)",
-                        Some(status.package.as_str()).filter(|p| !p.is_empty()),
-                    ))
-                    .child(Self::probe_row(
-                        &theme,
-                        status.enabled,
-                        if status.enabled {
-                            "MCP server registered"
-                        } else {
-                            "MCP server not registered"
-                        },
-                        status.enabled.then_some(if status.always_load {
-                            "every compatible run"
-                        } else {
-                            "per-chat assignment"
-                        }),
-                    )),
-            );
-        }
-
-        if let Some(blocker) = status.blocker.as_deref().filter(|_| !status.enabled) {
-            card = card.child(
-                div()
-                    .p(px(10.0))
-                    .rounded(px(8.0))
-                    .bg(theme.warning_muted)
-                    .text_size(px(12.0))
-                    .text_color(theme.text)
-                    .child(SharedString::from(blocker.to_string())),
-            );
+        let mut page = widgets::page_column()
+            .child(header)
+            .child(subtitle)
+            .child(probes);
+        if let Some(blocker) = status.blocker.clone().filter(|_| blocked) {
+            page = page.child(widgets::warning_strip(&theme, blocker));
         }
         if let Some(error) = self.error.clone() {
-            card = card.child(
-                div()
-                    .p(px(10.0))
-                    .rounded(px(8.0))
-                    .bg(theme.danger_muted)
-                    .text_size(px(12.0))
-                    .text_color(theme.text)
-                    .child(error),
-            );
+            page = page.child(widgets::error_strip(&theme, error));
         }
+        page = page.child(controls);
 
-        let mut actions = div().flex().flex_row().items_center().gap(px(8.0));
-        if status.enabled {
-            actions = actions
-                .child(
-                    Self::button("browser-disable", &theme, "Disable", false, busy)
-                        .when(!busy, |el| {
-                            el.on_click(cx.listener(|this, _, _, cx| this.disable(cx)))
-                        }),
-                )
-                .child(
-                    Self::button(
-                        "browser-always-load",
-                        &theme,
-                        if status.always_load {
-                            "Always on: yes"
-                        } else {
-                            "Always on: no"
-                        },
-                        false,
-                        busy,
-                    )
-                    .when(!busy, |el| {
-                        let next = !status.always_load;
-                        el.on_click(
-                            cx.listener(move |this, _, _, cx| this.set_always_load(next, cx)),
-                        )
-                    }),
-                );
-        } else {
-            actions = actions.child(
-                Self::button(
-                    "browser-enable",
-                    &theme,
-                    "Enable browser",
-                    true,
-                    !can_enable,
-                )
-                .when(can_enable, |el| {
-                    el.on_click(cx.listener(|this, _, _, cx| this.enable(cx)))
-                }),
-            );
-        }
-        actions = actions.child(
-            Self::button("browser-refresh", &theme, "Re-check", false, busy).when(!busy, |el| {
-                el.on_click(cx.listener(|this, _, _, cx| this.refresh(cx)))
-            }),
-        );
-        card = card.child(actions).child(
-            div()
-                .text_size(px(11.0))
-                .text_color(theme.text_muted)
-                .child(SharedString::from(
-                    "Once enabled, agents on Claude Code, OpenCode, Grok, Hermes, Pi and Cline get the chrome-devtools tools. Set CHROME_PATH to point at a custom Chrome.",
-                )),
-        );
-
+        // Right pane is narrow: tighten the settings column's side padding.
         div()
+            .id("browser-page")
             .size_full()
-            .flex()
-            .items_start()
-            .justify_center()
-            .p(px(16.0))
-            .child(card)
+            .overflow_y_scroll()
+            .child(page.px(px(16.0)).pt(px(20.0)))
     }
 }
