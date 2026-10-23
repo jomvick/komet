@@ -52,6 +52,7 @@ macro_rules! icon_assets {
 
 icon_assets![
     // Solar Icons (Linear), CC BY 4.0 — 480 Design.
+    (GLOBE, "globe"),
     (MONITOR, "monitor"),
     (LAPTOP, "laptop"),
     (PEN_NEW_SQUARE, "pen-new-square"),
