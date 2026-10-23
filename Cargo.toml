@@ -65,7 +65,9 @@ gpui_platform = { git = "https://github.com/jomvick/zed", rev = "e2ddcc6805f8c50
     "runtime_shaders",
 ] }
 gpui_tokio = { git = "https://github.com/jomvick/zed", rev = "e2ddcc6805f8c5088e62a60dfe517abcccd61a9a" }
-gpui-base = { git = "https://github.com/jsgrrchg/gpui-component", rev = "edefc2fb645473f330488fbee2c421536a85c69a" }
+# gpui-component — jomvick/gpui-component (branch comet): jsgrrchg/gpui-component with its gpui deps
+# pointed straight at the jomvick/zed fork above, so no [patch] redirect is needed.
+gpui-base = { git = "https://github.com/jomvick/gpui-component", rev = "961d7360000000000000000000000000000000000" }
 
 # diffs
 similar = "2"
@@ -110,12 +112,6 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 ignore = "0.4"
 nucleo-matcher = "0.3"
 
-[patch."https://github.com/wingleeio/zed"]
-gpui = { git = "https://github.com/jomvick/zed", rev = "e2ddcc6805f8c5088e62a60dfe517abcccd61a9a" }
-gpui_platform = { git = "https://github.com/jomvick/zed", rev = "e2ddcc6805f8c5088e62a60dfe517abcccd61a9a" }
-gpui_tokio = { git = "https://github.com/jomvick/zed", rev = "e2ddcc6805f8c5088e62a60dfe517abcccd61a9a" }
-gpui_macros = { git = "https://github.com/jomvick/zed", rev = "e2ddcc6805f8c5088e62a60dfe517abcccd61a9a" }
-
 [profile.release]
 # Distribution profile (scripts/package-linux.sh): thin LTO buys most of fat
 # LTO's size/speed win at a fraction of the link time; strip debug symbols.
@@ -128,3 +124,6 @@ opt-level = 0
 
 [profile.dev.package."*"]
 opt-level = 2
+
+[patch."https://github.com/jomvick/gpui-component"]
+gpui-base = { path = "/tmp/gc/crates/base" }
