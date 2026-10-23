@@ -103,6 +103,7 @@ sha2 = "0.10"
 dirs = "6"
 notify = "7"
 portable-pty = "0.8"
+keyring = { version = "3.6", default-features = false, features = ["apple-native", "windows-native", "sync-secret-service"] }
 alacritty_terminal = "0.26"
 pulldown-cmark = "0.12"
 unicode-segmentation = "1"
