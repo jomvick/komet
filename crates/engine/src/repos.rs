@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 
 use komet_proto::{
     FileSearchMatch, FolderEntry, FolderListing, GitHistoryCommit, GitHistoryPage, GitHistoryRef,
-    GitHistoryRefKind, Repo, RepoRef, Worktree,
+    GitHistoryRefKind, GitHubChecks, GitHubPullRequest, GitHubStatus, Repo, RepoRef, Worktree,
 };
 
 use crate::EngineError;
@@ -404,6 +404,117 @@ impl Repos {
             names.insert(0, head);
         }
         Ok(names)
+    }
+
+    /// Resolve the first configured GitHub remote to a credential-free HTTPS
+    /// repository URL. `origin` wins when several remotes point to GitHub.
+    pub async fn github_repo_url(&self, repo_path: &Path) -> Result<Option<String>, EngineError> {
+        let remotes = self.git(&["remote"], Some(repo_path)).await?;
+        let mut names: Vec<&str> = remotes.lines().filter(|name| !name.is_empty()).collect();
+        names.sort_by_key(|name| (*name != "origin", *name));
+        for name in names {
+            let Ok(remote_url) = self
+                .git(&["remote", "get-url", name], Some(repo_path))
+                .await
+            else {
+                continue;
+            };
+            if let Some(url) = github_url_from_remote(&remote_url) {
+                return Ok(Some(url));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Everything the titlebar GitHub control shows for a checkout, or `None`
+    /// when no remote points at GitHub. The pull request comes from the
+    /// user's own `gh` CLI (its auth, never a Komet-held token) and is simply
+    /// absent when `gh` is missing, signed out, offline, or knows no PR.
+    pub async fn github_status(
+        &self,
+        repo_path: &Path,
+    ) -> Result<Option<GitHubStatus>, EngineError> {
+        let Some(repo_url) = self.github_repo_url(repo_path).await? else {
+            return Ok(None);
+        };
+        let branch = self.current_branch(repo_path).await?;
+        let detached = branch == "HEAD";
+        let (pull_request, recent_commits) = tokio::join!(
+            async {
+                if detached {
+                    None
+                } else {
+                    github_pull_request(repo_path).await
+                }
+            },
+            self.recent_commits(repo_path, GITHUB_RECENT_COMMITS),
+        );
+        let base = self
+            .changes_base(
+                repo_path,
+                pull_request.as_ref().map(|pr| pr.base_ref.as_str()),
+            )
+            .await;
+        let (insertions, deletions) = self
+            .git(&["diff", "--shortstat", &base], Some(repo_path))
+            .await
+            .map(|out| parse_shortstat(&out))
+            .unwrap_or_default();
+        Ok(Some(GitHubStatus {
+            repo_url,
+            branch,
+            pull_request,
+            recent_commits,
+            insertions,
+            deletions,
+        }))
+    }
+
+    /// Latest `limit` commits reachable from HEAD (empty for an unborn branch).
+    async fn recent_commits(&self, repo_path: &Path, limit: usize) -> Vec<GitHistoryCommit> {
+        let count = format!("-n{limit}");
+        self.git(
+            &[
+                "log",
+                "--no-color",
+                "--no-show-signature",
+                &count,
+                "--format=%H%x00%P%x00%s%x00%an%x00%ae%x00%aI%x00",
+                "HEAD",
+            ],
+            Some(repo_path),
+        )
+        .await
+        .map(|out| parse_history_log(&out, &HashMap::new()))
+        .unwrap_or_default()
+    }
+
+    /// The commit the branch's changes are measured from: the merge base with
+    /// the PR base, else with `origin/HEAD`, else HEAD itself (uncommitted only).
+    async fn changes_base(&self, repo_path: &Path, pr_base: Option<&str>) -> String {
+        let mut candidates = Vec::new();
+        if let Some(base) = pr_base.filter(|base| !base.is_empty()) {
+            candidates.push(format!("origin/{base}"));
+        }
+        if let Ok(default) = self
+            .git(
+                &["rev-parse", "--abbrev-ref", "origin/HEAD"],
+                Some(repo_path),
+            )
+            .await
+        {
+            candidates.push(default);
+        }
+        for candidate in candidates {
+            if let Ok(base) = self
+                .git(&["merge-base", "HEAD", &candidate], Some(repo_path))
+                .await
+                && !base.is_empty()
+            {
+                return base;
+            }
+        }
+        "HEAD".to_string()
     }
 
     /// [`Self::branches`] enriched with checkout state: which branch the MAIN
@@ -1112,6 +1223,133 @@ fn bounded_field(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect()
 }
 
+fn github_url_from_remote(remote: &str) -> Option<String> {
+    let remote = remote.trim();
+    if remote.is_empty() || remote.contains(['?', '#']) {
+        return None;
+    }
+
+    let (host, path) = if let Some((scheme, rest)) = remote.split_once("://") {
+        if !matches!(scheme.to_ascii_lowercase().as_str(), "https" | "ssh") {
+            return None;
+        }
+        let (authority, path) = rest.split_once('/')?;
+        let host_port = authority.rsplit('@').next()?;
+        // `ssh://git@github.com:22/…` — only the hostname is compared.
+        let host = match host_port.rsplit_once(':') {
+            Some((host, port)) if port.bytes().all(|b| b.is_ascii_digit()) => host,
+            _ => host_port,
+        };
+        (host, path)
+    } else {
+        let (authority, path) = remote.split_once(':')?;
+        let host = authority.rsplit('@').next()?;
+        (host, path)
+    };
+    if !host.eq_ignore_ascii_case("github.com") {
+        return None;
+    }
+
+    let path = path.trim_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let mut parts = path.split('/');
+    let owner = parts.next()?;
+    let repo = parts.next()?;
+    let valid_segment = |segment: &str| {
+        !segment.is_empty()
+            && segment != "."
+            && segment != ".."
+            && segment
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+    };
+    if parts.next().is_some() || !valid_segment(owner) || !valid_segment(repo) {
+        return None;
+    }
+
+    Some(format!("https://github.com/{owner}/{repo}"))
+}
+
+const GITHUB_RECENT_COMMITS: usize = 5;
+const GH_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// `gh pr view` for the checked-out branch. Every failure (no `gh`, signed
+/// out, offline, no PR, timeout) reads as "no pull request".
+async fn github_pull_request(repo_path: &Path) -> Option<GitHubPullRequest> {
+    let mut cmd = tokio::process::Command::new("gh");
+    cmd.args([
+        "pr",
+        "view",
+        "--json",
+        "number,title,url,state,isDraft,baseRefName,statusCheckRollup",
+    ])
+    .current_dir(repo_path)
+    .env("GH_PROMPT_DISABLED", "1")
+    .env("GH_NO_UPDATE_NOTIFIER", "1")
+    .stdin(std::process::Stdio::null())
+    .kill_on_drop(true);
+    let output = tokio::time::timeout(GH_TIMEOUT, cmd.output())
+        .await
+        .ok()?
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_gh_pull_request(&output.stdout)
+}
+
+fn parse_gh_pull_request(json: &[u8]) -> Option<GitHubPullRequest> {
+    let value: serde_json::Value = serde_json::from_slice(json).ok()?;
+    let mut checks = GitHubChecks::default();
+    for check in value["statusCheckRollup"].as_array().into_iter().flatten() {
+        // CheckRun carries `status` + `conclusion`; StatusContext only `state`.
+        let finished = check["status"]
+            .as_str()
+            .is_none_or(|status| status.eq_ignore_ascii_case("COMPLETED"));
+        let outcome = check["conclusion"]
+            .as_str()
+            .filter(|c| !c.is_empty())
+            .or_else(|| check["state"].as_str())
+            .unwrap_or("")
+            .to_ascii_uppercase();
+        match outcome.as_str() {
+            _ if !finished => checks.pending += 1,
+            "SUCCESS" | "NEUTRAL" | "SKIPPED" => checks.passed += 1,
+            "" | "PENDING" | "EXPECTED" => checks.pending += 1,
+            _ => checks.failed += 1,
+        }
+    }
+    Some(GitHubPullRequest {
+        number: value["number"].as_u64()?,
+        title: value["title"].as_str()?.to_string(),
+        url: value["url"].as_str()?.to_string(),
+        state: value["state"].as_str().unwrap_or("OPEN").to_string(),
+        is_draft: value["isDraft"].as_bool().unwrap_or(false),
+        base_ref: value["baseRefName"].as_str().unwrap_or("").to_string(),
+        checks,
+    })
+}
+
+/// `(insertions, deletions)` from `git diff --shortstat` output.
+fn parse_shortstat(out: &str) -> (u64, u64) {
+    let mut stats = (0, 0);
+    for part in out.split(',') {
+        let mut words = part.split_whitespace();
+        let (Some(count), Some(kind)) = (words.next(), words.next()) else {
+            continue;
+        };
+        let Ok(count) = count.parse::<u64>() else {
+            continue;
+        };
+        if kind.starts_with("insertion") {
+            stats.0 = count;
+        } else if kind.starts_with("deletion") {
+            stats.1 = count;
+        }
+    }
+    stats
+}
+
 fn parse_history_log(
     output: &str,
     refs_by_sha: &HashMap<String, Vec<GitHistoryRef>>,
@@ -1222,6 +1460,168 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn github_remote_urls_normalize_https_and_ssh_forms() {
+        for remote in [
+            "https://github.com/owner/repo",
+            "https://github.com/owner/repo.git",
+            "ssh://git@github.com/owner/repo.git",
+            "git@github.com:owner/repo.git",
+            "ssh://git@github.com:22/owner/repo.git",
+            "https://github.com:443/owner/repo.git",
+        ] {
+            assert_eq!(
+                github_url_from_remote(remote).as_deref(),
+                Some("https://github.com/owner/repo"),
+                "{remote}"
+            );
+        }
+    }
+
+    #[test]
+    fn github_remote_urls_strip_credentials_and_reject_other_hosts() {
+        assert_eq!(
+            github_url_from_remote("https://local-user@github.com/owner/repo.git").as_deref(),
+            Some("https://github.com/owner/repo")
+        );
+        for remote in [
+            "https://gitlab.com/owner/repo.git",
+            "https://github.com.evil.test/owner/repo.git",
+            "ssh://git@github.com:abc/owner/repo.git",
+            "https://github.com/owner",
+            "https://github.com/owner/repo/tree/main",
+            "https://github.com/owner/repo?token=secret",
+            "file:///owner/repo",
+        ] {
+            assert_eq!(github_url_from_remote(remote), None, "{remote}");
+        }
+    }
+
+    #[tokio::test]
+    async fn github_repo_url_prefers_origin_and_returns_none_without_a_github_remote() {
+        let data = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let repos =
+            Repos::with_worktrees_root(data.path(), "device", data.path().join("worktrees"));
+        repos
+            .git(&["init", "--quiet"], Some(root.path()))
+            .await
+            .unwrap();
+
+        assert_eq!(repos.github_repo_url(root.path()).await.unwrap(), None);
+
+        repos
+            .git(
+                &["remote", "add", "origin", "git@github.com:owner/origin.git"],
+                Some(root.path()),
+            )
+            .await
+            .unwrap();
+        repos
+            .git(
+                &[
+                    "remote",
+                    "add",
+                    "upstream",
+                    "https://github.com/owner/upstream.git",
+                ],
+                Some(root.path()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            repos.github_repo_url(root.path()).await.unwrap().as_deref(),
+            Some("https://github.com/owner/origin")
+        );
+    }
+
+    #[test]
+    fn gh_pull_request_json_counts_check_outcomes() {
+        let json = br#"{
+            "number": 52, "title": "feat(ui): add GitHub", "url": "https://github.com/o/r/pull/52",
+            "state": "OPEN", "isDraft": false, "baseRefName": "main",
+            "statusCheckRollup": [
+                {"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                {"__typename": "CheckRun", "status": "IN_PROGRESS", "conclusion": ""},
+                {"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "FAILURE"},
+                {"__typename": "StatusContext", "state": "PENDING"},
+                {"__typename": "StatusContext", "state": "SUCCESS"}
+            ]
+        }"#;
+        let pr = parse_gh_pull_request(json).unwrap();
+        assert_eq!(pr.number, 52);
+        assert_eq!(pr.base_ref, "main");
+        assert_eq!(
+            pr.checks,
+            GitHubChecks {
+                passed: 2,
+                failed: 1,
+                pending: 2
+            }
+        );
+        assert_eq!(parse_gh_pull_request(b"not json"), None);
+    }
+
+    #[test]
+    fn shortstat_parses_insertions_and_deletions() {
+        assert_eq!(
+            parse_shortstat(" 3 files changed, 280 insertions(+), 6 deletions(-)"),
+            (280, 6)
+        );
+        assert_eq!(parse_shortstat(" 1 file changed, 1 insertion(+)"), (1, 0));
+        assert_eq!(parse_shortstat(""), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn github_status_reports_branch_commits_and_uncommitted_changes() {
+        let data = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let repos =
+            Repos::with_worktrees_root(data.path(), "device", data.path().join("worktrees"));
+        repos
+            .git(&["init", "--quiet", "-b", "feature"], Some(root.path()))
+            .await
+            .unwrap();
+        assert_eq!(repos.github_status(root.path()).await.unwrap(), None);
+
+        repos
+            .git(
+                &["remote", "add", "origin", "git@github.com:owner/repo.git"],
+                Some(root.path()),
+            )
+            .await
+            .unwrap();
+        std::fs::write(root.path().join("a.txt"), "one\n").unwrap();
+        repos
+            .git(&["add", "a.txt"], Some(root.path()))
+            .await
+            .unwrap();
+        repos
+            .git(
+                &[
+                    "-c",
+                    "user.name=T",
+                    "-c",
+                    "user.email=t@example.com",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "first commit",
+                ],
+                Some(root.path()),
+            )
+            .await
+            .unwrap();
+        std::fs::write(root.path().join("a.txt"), "two\nthree\n").unwrap();
+
+        let status = repos.github_status(root.path()).await.unwrap().unwrap();
+        assert_eq!(status.repo_url, "https://github.com/owner/repo");
+        assert_eq!(status.branch, "feature");
+        assert_eq!(status.recent_commits.len(), 1);
+        assert_eq!(status.recent_commits[0].subject, "first commit");
+        assert_eq!((status.insertions, status.deletions), (2, 1));
+    }
 
     #[test]
     fn fuzzy_score_matches_a_path_subsequence() {
