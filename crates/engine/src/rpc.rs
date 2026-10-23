@@ -872,6 +872,63 @@ impl EngineRpc {
     }
 }
 
+/// Komet's shared headless Chrome: the Browser surface's navigate / frame /
+/// input calls. Errors are readable (Chrome missing, not running).
+async fn handle_browser(method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError> {
+    let host = crate::browser::host();
+    let failed = |e: crate::browser::BrowserError| RpcError::Failed(e.to_string());
+    let str_param = |key: &str| -> Result<String, RpcError> {
+        params
+            .get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| RpcError::BadParams(format!("{key} (string) required")))
+    };
+    let num = |key: &str| {
+        params
+            .get(key)
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0)
+    };
+    match method {
+        methods::BROWSER_NAVIGATE => {
+            let url = str_param("url")?;
+            RpcReply::value(&host.navigate(&url).await.map_err(failed)?)
+        }
+        methods::BROWSER_FRAME => match host.frame().await {
+            Ok(frame) => RpcReply::value(&frame),
+            Err(crate::browser::BrowserError::NotRunning) => {
+                RpcReply::value(&serde_json::json!({ "running": false }))
+            }
+            Err(e) => Err(failed(e)),
+        },
+        methods::BROWSER_HISTORY => {
+            let delta = params
+                .get("delta")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(-1);
+            RpcReply::value(&host.history(delta).await.map_err(failed)?)
+        }
+        methods::BROWSER_RELOAD => RpcReply::value(&host.reload().await.map_err(failed)?),
+        methods::BROWSER_INPUT => {
+            match str_param("kind")?.as_str() {
+                "click" => host.click(num("x"), num("y")).await,
+                "scroll" => host.scroll(num("x"), num("y"), num("dx"), num("dy")).await,
+                "text" => host.insert_text(&str_param("text")?).await,
+                "key" => host.press_key(&str_param("key")?).await,
+                other => return Err(RpcError::BadParams(format!("unknown input kind {other}"))),
+            }
+            .map_err(failed)?;
+            RpcReply::value(&serde_json::json!({ "ok": true }))
+        }
+        methods::BROWSER_CLOSE => {
+            host.shutdown().await;
+            RpcReply::value(&serde_json::json!({ "ok": true }))
+        }
+        _ => Err(RpcError::UnknownMethod(method.into())),
+    }
+}
+
 impl EngineRpc {
     /// Dispatch the external-MCP surface (Task 7). Replies carry the secret-free
     /// `PublicMcpServerConfig` only: secret values flow in via `SaveMcpServer`
@@ -1140,6 +1197,12 @@ fn forwardable(method: &str) -> bool {
             | methods::BROWSER_USE_STATUS
             | methods::ENABLE_BROWSER_USE
             | methods::DISABLE_BROWSER_USE
+            | methods::BROWSER_NAVIGATE
+            | methods::BROWSER_FRAME
+            | methods::BROWSER_HISTORY
+            | methods::BROWSER_RELOAD
+            | methods::BROWSER_INPUT
+            | methods::BROWSER_CLOSE
     )
 }
 
@@ -1396,6 +1459,17 @@ impl RpcService for EngineRpc {
             }
             let registry = self.mcp_registry()?;
             return self.handle_mcp(registry, method, params).await;
+        }
+        if matches!(
+            method,
+            methods::BROWSER_NAVIGATE
+                | methods::BROWSER_FRAME
+                | methods::BROWSER_HISTORY
+                | methods::BROWSER_RELOAD
+                | methods::BROWSER_INPUT
+                | methods::BROWSER_CLOSE
+        ) {
+            return handle_browser(method, params).await;
         }
         match method {
             methods::ENGINE_INFO => RpcReply::value(&self.engine_info),

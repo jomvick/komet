@@ -440,12 +440,32 @@ impl SessionsEngine {
         // External server secrets are resolved on the host immediately before
         // launch. The Composio key never enters chat state or sync documents.
         let composio_allowed = composio_supported_by_harness(harness_id);
-        request.mcp_external = self
+        let mut mcp_external: Vec<komet_proto::McpServerConfig> = self
             .prepare_mcp_for_run(chat_id)
             .into_iter()
             .filter(|server| server.config.id != "composio" || composio_allowed)
             .map(resolved_mcp_to_proto)
             .collect();
+        // Browser-use preset: start Komet's Chrome (if not already up) and
+        // point the MCP at it, so the agent drives the tab the Browser
+        // surface shows. If Chrome cannot start, fall back to the MCP's own
+        // headless instance — the run still works, just unseen.
+        if let Some(cfg) = mcp_external
+            .iter_mut()
+            .find(|c| c.id == crate::mcp::browser_use::SERVER_ID)
+        {
+            match crate::browser::host().ensure_started().await {
+                Ok(browser_url) => {
+                    let mut engine_cfg = crate::mcp::browser_use::server_config(cfg.always_load);
+                    crate::mcp::browser_use::attach_to_browser(&mut engine_cfg, &browser_url);
+                    cfg.args = engine_cfg.args;
+                }
+                Err(err) => {
+                    tracing::warn!(chat = %chat_id, error = %err, "browser-use: komet chrome unavailable, MCP will self-launch");
+                }
+            }
+        }
+        request.mcp_external = mcp_external;
         // Project-less chats store cwd `~` (the creating device can't know the
         // host's home); expand it here, on the host, where the run spawns.
         request.cwd = expand_home(&request.cwd);
