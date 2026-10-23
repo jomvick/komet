@@ -149,10 +149,10 @@ impl BrowserPanel {
         let url = normalize_url(&raw);
         self.url_input
             .update(cx, |input, cx| input.set_text(url.clone(), cx));
-        if self.current_url.as_deref() != Some(url.as_str()) {
-            if let Some(prev) = self.current_url.replace(url.clone()) {
-                self.history.push(prev);
-            }
+        if self.current_url.as_deref() != Some(url.as_str())
+            && let Some(prev) = self.current_url.replace(url.clone())
+        {
+            self.history.push(prev);
         }
         let prompt = browse_prompt(&url);
         cx.emit(BrowserEvent::Browse { url, prompt });
