@@ -64,7 +64,7 @@ use crate::agent_accounts::AgentAccounts;
 use crate::auth::Auth;
 use crate::diff_sync::CheckoutDiffSync;
 use crate::doc_host::DocHost;
-use crate::mcp::{McpRegistry, McpSecretStore, McpServerConfig, McpStatus};
+use crate::mcp::{McpRegistry, McpSecretStore, McpServerConfig, McpStatus, browser_use};
 use crate::registry::HarnessRegistry;
 use crate::repos::{Repos, home_dir};
 use crate::sessions::SessionsEngine;
@@ -106,6 +106,14 @@ struct SetHarnessEnabledParams {
 #[serde(rename_all = "camelCase")]
 struct McpIdParams {
     id: String,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct EnableBrowserUseParams {
+    /// `None` keeps the current assignment (default off on first enable).
+    always_load: Option<bool>,
+    force: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -880,6 +888,44 @@ impl EngineRpc {
                 let servers = registry.list_public();
                 RpcReply::value(&serde_json::json!({ "servers": servers }))
             }
+            methods::BROWSER_USE_STATUS => RpcReply::value(&serde_json::json!({
+                "status": browser_use::status(&registry),
+                "serverId": browser_use::SERVER_ID,
+                "systemPrompt": browser_use::SYSTEM_PROMPT,
+            })),
+            // Registers the pinned chrome-devtools-mcp preset. Refused with a
+            // readable reason when Chrome or npx is missing — a dead `npx`
+            // child at run time would be far harder to diagnose. `force`
+            // skips the probe (CI images with Chrome on an unusual path).
+            methods::ENABLE_BROWSER_USE => {
+                let p: EnableBrowserUseParams = parse_params(params)?;
+                if !p.force
+                    && let Some(reason) = browser_use::blocker()
+                {
+                    return Err(RpcError::Failed(reason));
+                }
+                let always_load = p.always_load.unwrap_or_else(|| {
+                    registry
+                        .get(browser_use::SERVER_ID)
+                        .is_some_and(|c| c.always_load)
+                });
+                let config = browser_use::server_config(always_load);
+                registry
+                    .save(&config)
+                    .map_err(|e| RpcError::Failed(format!("mcp registry: {e}")))?;
+                RpcReply::value(&serde_json::json!({
+                    "status": browser_use::status(&registry),
+                    "server": config.public_view(),
+                }))
+            }
+            methods::DISABLE_BROWSER_USE => {
+                registry
+                    .delete(browser_use::SERVER_ID)
+                    .map_err(|e| RpcError::Failed(format!("mcp registry: {e}")))?;
+                RpcReply::value(&serde_json::json!({
+                    "status": browser_use::status(&registry),
+                }))
+            }
             methods::GET_MCP_SERVER => {
                 let p: McpIdParams = parse_params(params)?;
                 let server = registry
@@ -1090,6 +1136,9 @@ fn forwardable(method: &str) -> bool {
             | methods::TEST_MCP_SERVER
             | methods::LIST_MCP_TOOLS
             | methods::WATCH_MCP_STATUS
+            | methods::BROWSER_USE_STATUS
+            | methods::ENABLE_BROWSER_USE
+            | methods::DISABLE_BROWSER_USE
     )
 }
 
@@ -1323,6 +1372,8 @@ impl RpcService for EngineRpc {
             methods::SAVE_MCP_SERVER,
             methods::DELETE_MCP_SERVER,
             methods::SET_MCP_SERVER_ENABLED,
+            methods::ENABLE_BROWSER_USE,
+            methods::DISABLE_BROWSER_USE,
         ];
         let is_mcp_method = matches!(
             method,
@@ -1334,6 +1385,9 @@ impl RpcService for EngineRpc {
                 | methods::TEST_MCP_SERVER
                 | methods::LIST_MCP_TOOLS
                 | methods::WATCH_MCP_STATUS
+                | methods::BROWSER_USE_STATUS
+                | methods::ENABLE_BROWSER_USE
+                | methods::DISABLE_BROWSER_USE
         );
         if is_mcp_method {
             if MCP_MUTATING.contains(&method) {

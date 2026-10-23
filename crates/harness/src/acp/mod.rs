@@ -245,7 +245,7 @@ fn opencode_sidecar_capable(exe: &std::path::Path) -> bool {
 }
 
 /// PATH + login-shell + extra dirs + node-version-manager scan for a binary.
-pub(crate) fn find_on_paths(exe: &str, extra: Vec<PathBuf>) -> Option<PathBuf> {
+pub fn find_on_paths(exe: &str, extra: Vec<PathBuf>) -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|path| {
             std::env::split_paths(&path)

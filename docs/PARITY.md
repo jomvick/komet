@@ -62,6 +62,7 @@ not built yet).
 | Hermes (ACP) | done | Shared `AcpHarness` spec; `hermes acp` (Nous Research's native ACP server), turn-boundary steering, no effort ladder yet. |
 | Pi (ACP) | done | Shared `AcpHarness` spec; community `pi-acp` adapter (pinned 0.0.33, npx fallback), turn-boundary steering, minimal→max thinking ladder. |
 | Mock harness | done | Scripted event replay; powers tests + the e2e smoke. |
+| Browser-use preset (issue #45, freebuff port) | partial | `engine/src/mcp/browser_use.rs`: pinned `chrome-devtools-mcp@1.12.0` stdio preset (`--headless --isolated`) registered via `EnableBrowserUse` / removed via `DisableBrowserUse`, `BrowserUseStatus` exposes the file-only Chrome + `npx` probe (`CHROME_PATH` override) and the ported system prompt; enable is refused with a readable reason when Chrome/npx is missing (`force` bypasses). Injected like any external MCP into `supports_dynamic_mcp` harnesses (always-load or per-chat). The agent's final `{overallStatus, summary, results, consoleErrors, lessons}` JSON (`proto::browser_use::BrowserUseReport`) renders as a status/steps/errors card in the transcript. Gaps: no settings toggle yet (RPC only), screenshots not yet surfaced as lightbox thumbnails, no live tool-surface test (`engine/tests/browser_use_rpc.rs` covers the RPC + registry path). |
 
 ## §5 Session doc schema
 

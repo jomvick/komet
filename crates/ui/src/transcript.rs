@@ -42,6 +42,7 @@ use gpui::{
 use komet_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
 use komet_proto::TodoItem;
 use komet_proto::ToolCall;
+use komet_proto::browser_use::BrowserUseReport;
 
 use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::markdown::parser::{Block, BlockTree, IncrementalParser, parse_full};
@@ -835,6 +836,19 @@ pub fn rows_for_entry(
                             continue;
                         }
                         let key = format!("{}#{}", entry.id, part_id);
+                        // A settled browser-use report renders as a readable
+                        // card (status / steps / console errors) instead of
+                        // the agent's raw JSON. Live parts keep the raw text
+                        // so the incremental parser sees stable bytes.
+                        let card;
+                        let text: &str = if streaming {
+                            text
+                        } else if let Some(report) = BrowserUseReport::parse(text) {
+                            card = report.to_markdown();
+                            &card
+                        } else {
+                            text
+                        };
                         let tree = parse(&key, text);
                         // Live and completed parts split identically — one row
                         // per top-level block, same ids, so the live→complete
@@ -5317,6 +5331,40 @@ mod tests {
     }
 
     const MD: &str = "# Title\n\npara one\n\n```rust\nlet x = 1;\n```";
+
+    #[test]
+    fn settled_browser_use_report_renders_as_card_not_raw_json() {
+        let report = r#"```json
+{"overallStatus":"success","summary":"Form works.","results":[{"name":"Open page","passed":true},{"name":"Submit","passed":false,"details":"500"}],"consoleErrors":[{"message":"boom"}]}
+```"#;
+        // Live: raw bytes untouched (incremental parser stability).
+        let live = assistant(
+            "m1",
+            MessageStatus::Streaming,
+            vec![text_part("t0", report)],
+        );
+        let live_rows = rows_for_entry(&live, false, &mut parse);
+        assert_eq!(live_rows.len(), 1);
+        assert!(matches!(
+            &live_rows[0].kind,
+            RowKind::LiveMarkdown { tree, .. } if matches!(tree.blocks[0].block, Block::CodeBlock { .. })
+        ));
+        // Settled: status line + steps + console errors as markdown blocks.
+        let done = assistant("m1", MessageStatus::Complete, vec![text_part("t0", report)]);
+        let done_rows = rows_for_entry(&done, false, &mut parse);
+        assert!(
+            done_rows.len() >= 4,
+            "status, summary, steps, console errors"
+        );
+        assert_eq!(done_rows[0].id.as_ref(), "m1#t0.0");
+        assert!(done_rows.iter().all(|r| matches!(
+            &r.kind,
+            RowKind::Markdown { tree, .. } if !matches!(tree.blocks[0].block, Block::CodeBlock { .. })
+        )));
+        // Non-report text is left alone.
+        let plain = assistant("m2", MessageStatus::Complete, vec![text_part("t0", MD)]);
+        assert_eq!(rows_for_entry(&plain, false, &mut parse).len(), 3);
+    }
 
     #[test]
     fn live_entry_splits_per_block_with_id_continuity() {

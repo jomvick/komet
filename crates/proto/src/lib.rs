@@ -5,6 +5,7 @@
 //! window snapshots ride `ContextWindow` / `ContextUsageStats` and the live `Session` row.
 
 pub mod agent;
+pub mod browser_use;
 pub mod entities;
 pub mod mcp;
 pub mod motion;
