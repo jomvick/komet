@@ -17,6 +17,7 @@ pub mod appearance;
 pub mod attachments;
 pub mod badges;
 pub mod blobatar;
+pub mod browser;
 pub mod changes;
 pub mod comments;
 pub mod composer;
