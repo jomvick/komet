@@ -25,11 +25,35 @@ the crate table in `ARCHITECTURE.md` §3 is authoritative.
 - gpui is pinned to a `jomvick/zed` git rev plus `[patch]` entries in the root `Cargo.toml`.
   Bumping the rev means updating every gpui* dep and patch together. Never use Zed's GPL crates
   (`markdown`, `ui`, `theme`, `editor`) — markdown/theme/components are Komet's own.
+- The `[patch."https://github.com/wingleeio/zed"]` block is not a leftover: `gpui-component`
+  (`jsgrrchg/gpui-component`) declares its gpui deps against `wingleeio/zed`, and the patch
+  redirects them to the `jomvick/zed` fork so the workspace has a single gpui. Removing it
+  yields two incompatible gpui crates. It only goes away if gpui-component is forked too.
 - Linux builds need gpui system libs (`libxkbcommon`, `libwayland`, `libx11-xcb`, `libfontconfig`,
   `libfreetype`, `libasound2`, `libvulkan`, `cmake`, `libfuse2`). The exact apt line is in
   `.github/workflows/release.yml`.
 - Workspace dependencies and `version` are declared once in the root `Cargo.toml`; crate manifests
   reference them with `.workspace = true`. Add deps there first.
+
+## When to patch the gpui fork (`jomvick/zed`)
+
+The fork is a maintenance cost (every upstream bump rebases its commits), so default to fixing
+things in `crates/ui`. Patch the fork only when **all** of these hold:
+
+1. Komet-side is impossible, not merely harder: the need is a renderer/platform primitive
+   (new draw primitive, GPU memory release path, platform window/blur API, text-shaping rule)
+   or a bug inside gpui itself. Element composition, caching, scheduling, layout tricks, and
+   state management belong in `crates/ui`.
+2. There is a measurement motivating it (`KOMET_GPU_STATS=1`, frame time, RSS per
+   `docs/memory-plan.md`, or a reproducible visual bug) and the PR records before/after.
+3. The change is minimal and self-contained: one commit per concern on the fork's `komet-gpui`
+   branch, written to rebase cleanly on upstream (no reformatting, no drive-by refactors).
+
+Procedure: land the commit on the fork first, then bump **every** `jomvick/zed` `rev` in the root
+`Cargo.toml` (deps and both `[patch]` blocks) in one commit, and append a one-line summary of
+the new fork commit to the comment above the `gpui =` line so the list stays authoritative.
+Before writing a fork patch, check whether upstream Zed already has the fix — prefer cherry-picking
+upstream over a bespoke change.
 
 ## Runtime / env
 
