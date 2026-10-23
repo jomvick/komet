@@ -1042,3 +1042,55 @@ mod tests {
         );
     }
 }
+
+/// What the titlebar GitHub control shows for a checkout: resolved only when
+/// a GitHub remote exists, so its absence hides the control outright.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitHubStatus {
+    /// Credential-free `https://github.com/{owner}/{repo}`.
+    pub repo_url: String,
+    /// Checked-out branch (`"HEAD"` when detached).
+    pub branch: String,
+    /// The branch's pull request, when the `gh` CLI is installed and knows one.
+    #[serde(default)]
+    pub pull_request: Option<GitHubPullRequest>,
+    /// Latest commits reachable from HEAD, newest first.
+    #[serde(default)]
+    pub recent_commits: Vec<GitHistoryCommit>,
+    /// Working tree vs. the merge base with the PR base (or `origin/HEAD`).
+    #[serde(default)]
+    pub insertions: u64,
+    #[serde(default)]
+    pub deletions: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitHubPullRequest {
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    /// GitHub state: `OPEN`, `CLOSED` or `MERGED`.
+    pub state: String,
+    #[serde(default)]
+    pub is_draft: bool,
+    #[serde(default)]
+    pub base_ref: String,
+    #[serde(default)]
+    pub checks: GitHubChecks,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitHubChecks {
+    pub passed: u32,
+    pub failed: u32,
+    pub pending: u32,
+}
+
+impl GitHubChecks {
+    pub fn total(&self) -> u32 {
+        self.passed + self.failed + self.pending
+    }
+}
