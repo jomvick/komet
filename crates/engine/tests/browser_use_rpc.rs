@@ -87,7 +87,8 @@ async fn enable_is_gated_unless_forced_then_registers_pinned_server() {
             "-y".to_string(),
             browser_use::package_spec(),
             "--headless".into(),
-            "--isolated".into()
+            "--isolated".into(),
+            "--no-usage-statistics".into()
         ]
     );
 

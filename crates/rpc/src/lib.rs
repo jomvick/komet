@@ -169,6 +169,14 @@ pub mod methods {
     pub const BROWSER_USE_STATUS: &str = "BrowserUseStatus";
     pub const ENABLE_BROWSER_USE: &str = "EnableBrowserUse";
     pub const DISABLE_BROWSER_USE: &str = "DisableBrowserUse";
+    // Komet's own headless Chrome (shared by the Browser surface and the
+    // agent's chrome-devtools-mcp via --browserUrl). Device-local.
+    pub const BROWSER_NAVIGATE: &str = "BrowserNavigate";
+    pub const BROWSER_FRAME: &str = "BrowserFrame";
+    pub const BROWSER_HISTORY: &str = "BrowserHistory";
+    pub const BROWSER_RELOAD: &str = "BrowserReload";
+    pub const BROWSER_INPUT: &str = "BrowserInput";
+    pub const BROWSER_CLOSE: &str = "BrowserClose";
 }
 
 #[derive(Debug, thiserror::Error)]
