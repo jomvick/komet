@@ -303,6 +303,10 @@ impl ClaudeHarness {
                 );
             }
             for ext in &request.mcp_external {
+                // Claude's CLI takes resolved MCP JSON as an argv value.
+                if ext.config.id == "composio" {
+                    continue;
+                }
                 let id = ext.config.id.clone();
                 if servers.contains_key(&id) {
                     let existing_url = servers
