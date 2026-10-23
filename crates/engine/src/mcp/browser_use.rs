@@ -43,6 +43,7 @@ pub fn server_config(always_load: bool) -> McpServerConfig {
             package_spec(),
             "--headless".into(),
             "--isolated".into(),
+            "--no-usage-statistics".into(),
         ],
         url: None,
         headers: Default::default(),
@@ -53,6 +54,20 @@ pub fn server_config(always_load: bool) -> McpServerConfig {
 
 pub fn is_browser_use(config: &McpServerConfig) -> bool {
     config.id == SERVER_ID
+}
+
+/// Point the preset at Komet's own Chrome instead of letting the MCP spawn a
+/// private headless instance: the agent then drives the tab the Browser
+/// surface displays. `--isolated`/`--headless` are dropped (they only apply
+/// to a self-launched browser).
+pub fn attach_to_browser(config: &mut McpServerConfig, browser_url: &str) {
+    config.args = vec![
+        "-y".into(),
+        package_spec(),
+        "--browserUrl".into(),
+        browser_url.to_string(),
+        "--no-usage-statistics".into(),
+    ];
 }
 
 /// Snapshot for `BrowserUseStatus` — no secrets, safe for RPC/UI.
@@ -214,7 +229,8 @@ pub const SYSTEM_PROMPT: &str = r#"You are an expert browser automation agent. Y
 ## Available Browser Tools
 
 ### Navigation
-- **navigate_page**: Load a URL in the browser
+- **list_pages**: Open tabs with their numeric `pageId` — most tools take a `pageId`; call this first and reuse the id of the selected page
+- **navigate_page**: Load a URL in the browser (`{ "pageId": 1, "url": "…" }`)
 - **select_page**: Switch between open tabs
 
 ### Inspection (USE THESE FIRST)
@@ -313,7 +329,8 @@ mod tests {
                 "-y",
                 &format!("chrome-devtools-mcp@{CHROME_DEVTOOLS_MCP_VERSION}"),
                 "--headless",
-                "--isolated"
+                "--isolated",
+                "--no-usage-statistics"
             ]
         );
         assert!(!cfg.args.iter().any(|a| a.contains("@latest")));
@@ -321,6 +338,26 @@ mod tests {
         cfg.validate().unwrap();
         assert!(server_config(true).always_load);
         assert!(is_browser_use(&cfg));
+    }
+
+    #[test]
+    fn attach_to_browser_swaps_launch_flags_for_browser_url() {
+        let mut cfg = server_config(false);
+        attach_to_browser(&mut cfg, "http://127.0.0.1:9222");
+        assert_eq!(
+            cfg.args,
+            vec![
+                "-y",
+                &package_spec(),
+                "--browserUrl",
+                "http://127.0.0.1:9222"
+            ]
+        );
+        assert!(
+            !cfg.args
+                .iter()
+                .any(|a| a == "--isolated" || a == "--headless")
+        );
     }
 
     #[test]
