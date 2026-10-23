@@ -55,6 +55,19 @@ pub fn is_browser_use(config: &McpServerConfig) -> bool {
     config.id == SERVER_ID
 }
 
+/// Point the preset at Komet's own Chrome instead of letting the MCP spawn a
+/// private headless instance: the agent then drives the tab the Browser
+/// surface displays. `--isolated`/`--headless` are dropped (they only apply
+/// to a self-launched browser).
+pub fn attach_to_browser(config: &mut McpServerConfig, browser_url: &str) {
+    config.args = vec![
+        "-y".into(),
+        package_spec(),
+        "--browserUrl".into(),
+        browser_url.to_string(),
+    ];
+}
+
 /// Snapshot for `BrowserUseStatus` — no secrets, safe for RPC/UI.
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -321,6 +334,26 @@ mod tests {
         cfg.validate().unwrap();
         assert!(server_config(true).always_load);
         assert!(is_browser_use(&cfg));
+    }
+
+    #[test]
+    fn attach_to_browser_swaps_launch_flags_for_browser_url() {
+        let mut cfg = server_config(false);
+        attach_to_browser(&mut cfg, "http://127.0.0.1:9222");
+        assert_eq!(
+            cfg.args,
+            vec![
+                "-y",
+                &package_spec(),
+                "--browserUrl",
+                "http://127.0.0.1:9222"
+            ]
+        );
+        assert!(
+            !cfg.args
+                .iter()
+                .any(|a| a == "--isolated" || a == "--headless")
+        );
     }
 
     #[test]
