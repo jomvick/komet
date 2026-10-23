@@ -15,6 +15,7 @@ use komet_rpc::{RpcError, RpcReply, RpcService, methods};
 
 use komet_sync::DocsStore;
 
+pub mod browser;
 pub mod agent_accounts;
 pub mod auth;
 pub mod chat2_host;
