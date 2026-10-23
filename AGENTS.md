@@ -22,8 +22,9 @@ the crate table in `ARCHITECTURE.md` §3 is authoritative.
 
 ## Toolchain gotchas
 
-- gpui is pinned to a `jomvick/zed` git rev plus `[patch]` entries in the root `Cargo.toml`.
-  Bumping the rev means updating every gpui* dep and patch together. Never use Zed's GPL crates
+- gpui-component comes from our fork jomvick/gpui-component (branch komet), whose gpui deps point
+  at jomvick/zed. When bumping gpui, bump the rev in the gpui-component fork first, then every
+  jomvick/zed rev and the gpui-base rev in the root Cargo.toml together. Never use Zed's GPL crates
   (`markdown`, `ui`, `theme`, `editor`) — markdown/theme/components are Komet's own.
 - Linux builds need gpui system libs (`libxkbcommon`, `libwayland`, `libx11-xcb`, `libfontconfig`,
   `libfreetype`, `libasound2`, `libvulkan`, `cmake`, `libfuse2`). The exact apt line is in
