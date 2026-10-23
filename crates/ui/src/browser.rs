@@ -1,13 +1,18 @@
-//! Browser surface (issue #45): the right-pane home of the browser-use
-//! preset. Shows the Chrome / npx probe from `BrowserUseStatus`, the
-//! readable blocker when enabling is impossible, and the enable / disable
-//! control for the pinned `chrome-devtools-mcp` server. Device-local, like
-//! the MCP registry it fronts.
+//! Browser surface (issue #45): a browser-shaped frame in the right pane
+//! for the browser-use preset. Toolbar with a URL field, a "Start browsing"
+//! empty state, and a compact status line for the Chrome / npx probe from
+//! `BrowserUseStatus`. There is no embedded webview: entering a URL hands a
+//! browse task to the agent, which drives headless Chrome through
+//! `chrome-devtools-mcp`; its steps and screenshots land in the transcript.
 
-use gpui::{AnyElement, Context, Entity, SharedString, Task, Window, div, prelude::*, px};
+use gpui::{
+    AnyElement, Context, Entity, EventEmitter, Focusable as _, SharedString, Subscription, Task,
+    Window, div, prelude::*, px,
+};
 use komet_rpc::methods;
 use serde::Deserialize;
 
+use crate::composer::{ComposerInput, ComposerInputEvent};
 use crate::icons::{self, icon};
 use crate::settings::widgets;
 use crate::state::AppState;
@@ -32,29 +37,59 @@ struct StatusReply {
     status: BrowserUseStatus,
 }
 
+/// Shell-facing events: the URL field submits a browse task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BrowserEvent {
+    /// Ask the current chat's agent to open `url` in headless Chrome.
+    Browse { url: String, prompt: String },
+}
+
 pub struct BrowserPanel {
     state: Entity<AppState>,
+    url_input: Entity<ComposerInput>,
+    _url_events: Subscription,
     status: Option<BrowserUseStatus>,
     error: Option<SharedString>,
     loaded: bool,
     busy: bool,
     task: Option<Task<()>>,
+    /// Last URL handed to the agent — the tab title and the content hint.
+    current_url: Option<String>,
+    history: Vec<String>,
+    focus_pending: bool,
 }
 
+impl EventEmitter<BrowserEvent> for BrowserPanel {}
+
 impl BrowserPanel {
-    pub fn new(state: Entity<AppState>, _cx: &mut Context<Self>) -> Self {
+    pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
+        let url_input =
+            cx.new(|cx| ComposerInput::with_context("Search or enter URL", "PaletteSearch", cx));
+        let url_events = cx.subscribe(&url_input, |this: &mut Self, _, event, cx| {
+            if matches!(event, ComposerInputEvent::Submitted) {
+                this.submit_url(cx);
+            }
+        });
         Self {
             state,
+            url_input,
+            _url_events: url_events,
             status: None,
             error: None,
             loaded: false,
             busy: false,
             task: None,
+            current_url: None,
+            history: Vec::new(),
+            focus_pending: true,
         }
     }
 
     pub fn tab_title(&self) -> SharedString {
-        "Browser".into()
+        match self.current_url.as_deref() {
+            Some(url) => host_of(url).into(),
+            None => "about:blank".into(),
+        }
     }
 
     /// First render (and every re-open) refreshes the probe — Chrome or Node
@@ -104,129 +139,160 @@ impl BrowserPanel {
         self.call(methods::DISABLE_BROWSER_USE, serde_json::json!({}), cx);
     }
 
-    fn set_always_load(&mut self, always_load: bool, cx: &mut Context<Self>) {
-        self.call(
-            methods::ENABLE_BROWSER_USE,
-            serde_json::json!({ "alwaysLoad": always_load }),
-            cx,
-        );
+    /// Enter in the URL field: normalise, remember, and hand the agent a
+    /// browse task. Plain words become a search like a real omnibox.
+    fn submit_url(&mut self, cx: &mut Context<Self>) {
+        let raw = self.url_input.read(cx).text().trim().to_string();
+        if raw.is_empty() {
+            return;
+        }
+        let url = normalize_url(&raw);
+        self.url_input
+            .update(cx, |input, cx| input.set_text(url.clone(), cx));
+        if self.current_url.as_deref() != Some(url.as_str()) {
+            if let Some(prev) = self.current_url.replace(url.clone()) {
+                self.history.push(prev);
+            }
+        }
+        let prompt = browse_prompt(&url);
+        cx.emit(BrowserEvent::Browse { url, prompt });
+        cx.notify();
     }
 
-    /// One probe / state row in the settings-card idiom: tile + title +
-    /// wrapping meta line, trailing badge or control.
-    fn row(
+    fn go_back(&mut self, cx: &mut Context<Self>) {
+        if let Some(prev) = self.history.pop() {
+            self.current_url = Some(prev.clone());
+            self.url_input
+                .update(cx, |input, cx| input.set_text(prev, cx));
+            cx.notify();
+        }
+    }
+
+    fn toolbar_button(
         theme: &Theme,
-        first: bool,
+        id: &'static str,
         icon_path: &'static str,
-        title: &str,
-        meta: Vec<AnyElement>,
-        trailing: AnyElement,
-    ) -> gpui::Div {
-        widgets::card_row(theme, first)
-            .child(widgets::row_tile(theme, icon_path))
+        enabled: bool,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id(id)
+            .size(px(28.0))
+            .rounded(px(8.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_color(if enabled {
+                theme.text_muted
+            } else {
+                theme.text_muted.opacity(0.35)
+            })
+            .when(enabled, |el| {
+                el.cursor_pointer().hover(|s| s.bg(crate::theme::ink(0.06)))
+            })
+            .child(icon(icon_path).size(px(15.0)))
+    }
+
+    fn render_toolbar(&mut self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
+        let can_back = !self.history.is_empty();
+        let busy = self.busy;
+        let current = self.current_url.clone();
+        div()
+            .flex_none()
+            .h(px(44.0))
+            .px(px(8.0))
+            .border_b_1()
+            .border_color(theme.border)
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(4.0))
+            .child(
+                Self::toolbar_button(theme, "browser-back", icons::ALT_ARROW_LEFT, can_back)
+                    .when(can_back, |el| {
+                        el.on_click(cx.listener(|this, _, _, cx| this.go_back(cx)))
+                    }),
+            )
+            .child(Self::toolbar_button(
+                theme,
+                "browser-forward",
+                icons::ALT_ARROW_RIGHT,
+                false,
+            ))
+            .child(
+                Self::toolbar_button(theme, "browser-reload", icons::REFRESH, !busy).when(
+                    !busy,
+                    |el| {
+                        el.on_click(cx.listener(|this, _, _, cx| {
+                            // Re-probe Chrome / npx and, with a page open,
+                            // re-send the browse task.
+                            this.refresh(cx);
+                            if this.current_url.is_some() {
+                                this.submit_url(cx);
+                            }
+                        }))
+                    },
+                ),
+            )
             .child(
                 div()
                     .flex_1()
                     .min_w_0()
+                    .mx(px(4.0))
+                    .h(px(32.0))
+                    .px(px(12.0))
+                    .rounded_full()
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(crate::theme::ink(0.04))
                     .flex()
-                    .flex_col()
-                    .child(widgets::row_title(theme, title.to_string()))
-                    .when(!meta.is_empty(), |el| {
-                        el.child(widgets::meta_line(theme, meta))
-                    }),
+                    .items_center()
+                    .text_size(px(12.5))
+                    .child(div().w_full().child(self.url_input.clone())),
             )
-            .child(div().flex_none().child(trailing))
+            .child(
+                Self::toolbar_button(
+                    theme,
+                    "browser-external",
+                    icons::ARROW_UP_RIGHT,
+                    current.is_some(),
+                )
+                .when_some(current, |el, url| {
+                    el.on_click(cx.listener(move |_, _, _, cx| cx.open_url(&url)))
+                }),
+            )
     }
 
-    fn meta(theme: &Theme, text: impl Into<SharedString>) -> AnyElement {
-        div()
-            .min_w_0()
-            .text_color(theme.text_muted.opacity(0.65))
-            .child(text.into())
-            .into_any_element()
-    }
-
-    fn probe_badge(theme: &Theme, ok: bool, ok_label: &str, missing_label: &str) -> AnyElement {
-        if ok {
-            widgets::badge_active(theme, ok_label.to_string())
-        } else {
-            widgets::badge(theme, missing_label.to_string()).text_color(theme.danger_muted)
-        }
-        .into_any_element()
-    }
-}
-
-impl Render for BrowserPanel {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::of(cx).clone();
-        let status = self.status.clone().unwrap_or_default();
-        let have_status = self.status.is_some();
-        let busy = self.busy;
-        let blocked = status.blocker.is_some() && !status.enabled;
-        let can_toggle = have_status && !busy && (status.enabled || !blocked);
-
-        let header = widgets::page_header(&theme, "Browser", None);
-        let subtitle = widgets::page_subtitle(
-            &theme,
-            "Headless Chrome for agents via chrome-devtools-mcp: navigate, snapshot, click, fill and read console errors.",
-        );
-
-        // Probes: Chrome and npx, each with a status pill; details wrap.
-        let mut probes = widgets::section_card(&theme);
-        if !have_status && self.error.is_none() {
-            probes = probes.child(
-                widgets::card_row(&theme, true).child(
-                    div()
-                        .text_size(px(12.5))
-                        .text_color(theme.text_muted)
-                        .child(SharedString::from("Probing Chrome and npx…")),
-                ),
-            );
-        } else {
-            let chrome_meta = match status.chrome_path.as_deref() {
-                Some(path) => vec![Self::meta(&theme, path.to_string())],
-                None => vec![Self::meta(
-                    &theme,
-                    format!("not found — install Chrome or set {}", "CHROME_PATH"),
-                )],
-            };
-            probes = probes
-                .child(Self::row(
-                    &theme,
-                    true,
-                    icons::GLOBE,
-                    "Chrome / Chromium",
-                    chrome_meta,
-                    Self::probe_badge(&theme, status.chrome_installed, "Found", "Missing"),
-                ))
-                .child(Self::row(
-                    &theme,
-                    false,
-                    icons::TERMINAL,
-                    "npx (Node.js)",
-                    vec![Self::meta(
-                        &theme,
-                        if status.npx_installed {
-                            format!("runs {}", status.package)
-                        } else {
-                            "not found — install Node.js ≥ 20".to_string()
-                        },
-                    )],
-                    Self::probe_badge(&theme, status.npx_installed, "Found", "Missing"),
-                ));
-        }
-
-        // Controls: enable toggle, always-on toggle, re-check.
-        let enable_meta = if status.enabled {
-            "Registered as the chrome-devtools MCP server"
-        } else {
-            "Registers chrome-devtools-mcp for Claude Code, OpenCode, Grok, Hermes, Pi and Cline"
+    /// Status pill under the toolbar: probe results and the enable toggle.
+    fn render_status_line(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let Some(status) = self.status.clone() else {
+            return div()
+                .px(px(14.0))
+                .py(px(6.0))
+                .text_size(px(11.5))
+                .text_color(theme.text_muted.opacity(0.65))
+                .child(SharedString::from(if self.error.is_some() {
+                    "Status unavailable."
+                } else {
+                    "Probing Chrome and npx…"
+                }))
+                .into_any_element();
         };
-        let enable_toggle = widgets::toggle_switch(&theme, status.enabled)
+        let pill = |ok: bool, label: String| -> AnyElement {
+            if ok {
+                widgets::badge_active(theme, label).into_any_element()
+            } else {
+                widgets::badge(theme, label)
+                    .text_color(theme.danger_muted)
+                    .into_any_element()
+            }
+        };
+        let blocked = status.blocker.is_some() && !status.enabled;
+        let busy = self.busy;
+        let enabled = status.enabled;
+        let toggle = widgets::toggle_switch(theme, enabled)
             .id("browser-enable")
-            .when(!can_toggle, |el| el.opacity(0.5))
-            .when(can_toggle, |el| {
-                let enabled = status.enabled;
+            .when(busy || blocked, |el| el.opacity(0.5))
+            .when(!busy && !blocked, |el| {
                 el.cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if enabled {
@@ -236,80 +302,216 @@ impl Render for BrowserPanel {
                         }
                     }))
             });
-        let always_on = status.enabled && !busy;
-        let always_toggle = widgets::toggle_switch(&theme, status.always_load)
-            .id("browser-always-load")
-            .when(!always_on, |el| el.opacity(0.5))
-            .when(always_on, |el| {
-                let next = !status.always_load;
-                el.cursor_pointer()
-                    .on_click(cx.listener(move |this, _, _, cx| this.set_always_load(next, cx)))
-            });
-        let recheck = widgets::ghost_action(&theme)
-            .id("browser-refresh")
-            .hover(|s| widgets::ghost_hover(&theme, s))
-            .when(busy, |el| el.opacity(0.5))
-            .when(!busy, |el| {
-                el.on_click(cx.listener(|this, _, _, cx| this.refresh(cx)))
-            })
+        div()
+            .px(px(14.0))
+            .py(px(6.0))
+            .border_b_1()
+            .border_color(theme.border)
+            .flex()
+            .flex_row()
+            .items_center()
+            .flex_wrap()
+            .gap(px(8.0))
+            .child(pill(
+                status.chrome_installed,
+                if status.chrome_installed {
+                    "Chrome".into()
+                } else {
+                    "Chrome missing".into()
+                },
+            ))
+            .child(pill(
+                status.npx_installed,
+                if status.npx_installed {
+                    status.package.clone()
+                } else {
+                    "npx missing".into()
+                },
+            ))
+            .child(div().flex_1())
             .child(
-                icon(icons::REFRESH)
-                    .size(px(14.0))
+                div()
+                    .text_size(px(11.5))
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from(if enabled {
+                        "Agent browsing on"
+                    } else {
+                        "Agent browsing off"
+                    })),
+            )
+            .child(toggle)
+            .into_any_element()
+    }
+
+    fn render_content(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let status = self.status.clone().unwrap_or_default();
+        let blocked = status.blocker.clone().filter(|_| !status.enabled);
+        let enabled = status.enabled;
+        let can_enable = self.status.is_some() && !self.busy && blocked.is_none();
+
+        let (title, hint): (&str, SharedString) = match self.current_url.as_deref() {
+            Some(url) => (
+                "Browsing",
+                format!("{url}\nThe agent drives headless Chrome; its steps, console errors and screenshots land in the chat.")
+                    .into(),
+            ),
+            None if enabled => (
+                "Start browsing",
+                "Enter a URL above — the agent opens it in headless Chrome and reports back."
+                    .into(),
+            ),
+            None => (
+                "Start browsing",
+                "Turn on agent browsing to let the agent open pages, click, fill forms and read console errors."
+                    .into(),
+            ),
+        };
+
+        let mut body = div()
+            .flex()
+            .flex_col()
+            .items_center()
+            .max_w(px(360.0))
+            .gap(px(12.0))
+            .child(
+                icon(icons::GLOBE)
+                    .size(px(32.0))
                     .text_color(theme.text_muted),
             )
-            .child(SharedString::from("Re-check"));
-
-        let controls = widgets::section_card(&theme)
-            .child(Self::row(
-                &theme,
-                true,
-                icons::CHECK,
-                "Enable browser use",
-                vec![Self::meta(&theme, enable_meta)],
-                enable_toggle.into_any_element(),
-            ))
-            .child(Self::row(
-                &theme,
-                false,
-                icons::INFO_CIRCLE,
-                "Always on",
-                vec![Self::meta(
-                    &theme,
-                    "Attach to every compatible run instead of per-chat assignment",
-                )],
-                always_toggle.into_any_element(),
-            ))
             .child(
-                widgets::card_row(&theme, false)
-                    .justify_between()
-                    .child(
-                        div()
-                            .text_size(px(11.5))
-                            .text_color(theme.text_muted.opacity(0.65))
-                            .child(SharedString::from(
-                                "Probes are file checks only; Chrome is never launched here.",
-                            )),
-                    )
-                    .child(recheck),
+                div()
+                    .text_size(px(16.0))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme.text)
+                    .child(SharedString::from(title.to_string())),
+            )
+            .child(
+                div()
+                    .text_center()
+                    .text_size(px(12.5))
+                    .line_height(px(18.0))
+                    .text_color(theme.text_muted)
+                    .child(hint),
             );
-
-        let mut page = widgets::page_column()
-            .child(header)
-            .child(subtitle)
-            .child(probes);
-        if let Some(blocker) = status.blocker.clone().filter(|_| blocked) {
-            page = page.child(widgets::warning_strip(&theme, blocker));
+        if !enabled {
+            body = body.child(
+                div()
+                    .id("browser-enable-cta")
+                    .mt(px(4.0))
+                    .px(px(14.0))
+                    .py(px(8.0))
+                    .rounded(px(8.0))
+                    .bg(theme.text)
+                    .text_size(px(13.0))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.on_solid)
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .when(!can_enable, |el| el.opacity(0.5))
+                    .when(can_enable, |el| {
+                        el.cursor_pointer()
+                            .hover(|s| s.opacity(0.9))
+                            .on_click(cx.listener(|this, _, _, cx| this.enable(cx)))
+                    })
+                    .child(icon(icons::CHECK).size(px(14.0)))
+                    .child(SharedString::from("Enable agent browsing")),
+            );
+        }
+        if let Some(blocker) = blocked {
+            body = body.child(widgets::warning_strip(theme, blocker));
         }
         if let Some(error) = self.error.clone() {
-            page = page.child(widgets::error_strip(&theme, error));
+            body = body.child(widgets::error_strip(theme, error));
         }
-        page = page.child(controls);
 
-        // Right pane is narrow: tighten the settings column's side padding.
         div()
-            .id("browser-page")
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .p(px(24.0))
+            .child(body)
+            .into_any_element()
+    }
+}
+
+impl Render for BrowserPanel {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::of(cx).clone();
+        if std::mem::take(&mut self.focus_pending) {
+            window.focus(&self.url_input.focus_handle(cx), cx);
+        }
+        let toolbar = self.render_toolbar(&theme, cx);
+        let status = self.render_status_line(&theme, cx);
+        let content = self.render_content(&theme, cx);
+        div()
+            .id("browser-surface")
             .size_full()
-            .overflow_y_scroll()
-            .child(page.px(px(16.0)).pt(px(20.0)))
+            .flex()
+            .flex_col()
+            .child(toolbar)
+            .child(status)
+            .child(content)
+    }
+}
+
+/// `example.com/x` → `https://example.com/x`; bare words → a search URL;
+/// `localhost:3000` keeps `http`.
+pub fn normalize_url(raw: &str) -> String {
+    let raw = raw.trim();
+    if raw.contains("://") {
+        return raw.to_string();
+    }
+    let head = raw.split('/').next().unwrap_or(raw);
+    let looks_like_host = head.starts_with("localhost")
+        || head.starts_with("127.")
+        || (head.contains('.') && !head.contains(' '));
+    if looks_like_host {
+        let scheme = if head.starts_with("localhost") || head.starts_with("127.") {
+            "http"
+        } else {
+            "https"
+        };
+        return format!("{scheme}://{raw}");
+    }
+    format!(
+        "https://duckduckgo.com/?q={}",
+        raw.split_whitespace().collect::<Vec<_>>().join("+")
+    )
+}
+
+pub fn host_of(url: &str) -> String {
+    let rest = url.split("://").nth(1).unwrap_or(url);
+    rest.split('/').next().unwrap_or(rest).to_string()
+}
+
+/// The browse task handed to the agent (the chrome-devtools MCP tools do the
+/// rest). Kept short: the server's own descriptions carry the workflow.
+pub fn browse_prompt(url: &str) -> String {
+    format!(
+        "Open {url} in the headless browser (chrome-devtools MCP: navigate_page, then take_snapshot \
+         and take_screenshot). Describe what the page shows, list any console errors from \
+         list_console_messages, and finish with a short JSON report \
+         {{\"overallStatus\",\"summary\",\"finalUrl\",\"finalPageTitle\",\"results\",\"consoleErrors\",\"lessons\"}}."
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_hosts_localhost_and_searches() {
+        assert_eq!(normalize_url("example.com/a"), "https://example.com/a");
+        assert_eq!(normalize_url("localhost:3000"), "http://localhost:3000");
+        assert_eq!(normalize_url("https://x.io"), "https://x.io");
+        assert_eq!(
+            normalize_url("rust gpui docs"),
+            "https://duckduckgo.com/?q=rust+gpui+docs"
+        );
+        assert_eq!(host_of("https://example.com/a/b"), "example.com");
+        assert!(browse_prompt("https://x.io").contains("navigate_page"));
     }
 }
