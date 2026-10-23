@@ -2,6 +2,10 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+pub const COMPOSIO_SERVER_ID: &str = "composio";
+pub const COMPOSIO_SERVER_URL: &str = "https://connect.composio.dev/mcp";
+pub const COMPOSIO_API_KEY_HEADER: &str = "x-consumer-api-key";
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum McpTransport {
@@ -12,7 +16,8 @@ pub enum McpTransport {
 
 /// Canonical external MCP server configuration.
 /// Secrets (header values, env values) are stored in this struct in-memory
-/// after resolve, but must never be serialized into RunRequest/docs/sync.
+/// after resolve; only the launch-only resolved type carries them to a run.
+/// They must never be written to docs or sync.
 /// Presentation layer should use `PublicMcpServerConfig`.
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct McpServerConfig {
@@ -102,6 +107,20 @@ impl McpServerConfig {
                 }
             }
         }
+        if self.id == COMPOSIO_SERVER_ID
+            && (self.transport != McpTransport::Http
+                || self.url.as_deref() != Some(COMPOSIO_SERVER_URL)
+                || !self.headers.contains_key(COMPOSIO_API_KEY_HEADER)
+                || self
+                    .headers
+                    .keys()
+                    .any(|key| key != COMPOSIO_API_KEY_HEADER)
+                || !self.env.is_empty()
+                || self.command.is_some()
+                || !self.args.is_empty())
+        {
+            anyhow::bail!("Composio must use its fixed HTTP endpoint and API-key header");
+        }
         Ok(())
     }
 
@@ -117,5 +136,30 @@ impl McpServerConfig {
             always_load: self.always_load,
             has_secrets: !self.headers.is_empty() || !self.env.is_empty(),
         }
+    }
+}
+
+#[cfg(test)]
+mod composio_tests {
+    use super::*;
+
+    #[test]
+    fn composio_must_use_fixed_http_endpoint() {
+        let mut config = McpServerConfig {
+            id: COMPOSIO_SERVER_ID.into(),
+            name: "Composio".into(),
+            enabled: true,
+            transport: McpTransport::Http,
+            command: None,
+            args: Vec::new(),
+            url: Some(COMPOSIO_SERVER_URL.into()),
+            headers: [(COMPOSIO_API_KEY_HEADER.into(), String::new())].into(),
+            env: Default::default(),
+            always_load: true,
+        };
+        assert!(config.validate().is_ok());
+
+        config.url = Some("https://attacker.invalid/mcp".into());
+        assert!(config.validate().is_err());
     }
 }
