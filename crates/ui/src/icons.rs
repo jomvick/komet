@@ -68,6 +68,9 @@ icon_assets![
     (FILE_DIFF, "file-diff"),
     // Compact history-ref glyphs, drawn in the same linear style.
     (CLOUD, "cloud"),
+    // Custom connector glyph: integrations need a distinct semantic from the
+    // generic agent/widget mark used by harness configuration.
+    (PLUG, "plug"),
     (TAG, "tag"),
     (SIDEBAR_MINIMALISTIC, "sidebar-minimalistic"),
     // Mirrored variant (komet window-controls.tsx `-scale-x-100`): the LEFT
@@ -94,6 +97,11 @@ icon_assets![
     // terminal/plus/return ports) — the set has no expand glyph.
     (EXPAND_ARROWS, "expand-arrows"),
     (COLLAPSE_ARROWS, "collapse-arrows"),
+    (WINDOW_MINIMIZE, "window-minimize"),
+    (WINDOW_MAXIMIZE, "window-maximize"),
+    (WINDOW_RESTORE, "window-restore"),
+    (WINDOW_CLOSE, "window-close"),
+    (THINKING, "thinking"),
     // Hand-drawn fold-all chevrons, drawn as a family with EXPAND_ARROWS
     // (same stroke, caps, 90° joints) — Solar has no unfold-less either.
     (FOLD_VERTICAL, "fold-vertical"),

@@ -11,7 +11,7 @@
 //! reasons this module handles explicitly:
 //!
 //! 1. **Surface order flips meaning.** In dark, the main content panel is the
-//!    *darkest* plane and raised surfaces get *lighter*. In light, the content
+//!    *base* plane and raised surfaces get *lighter*. In light, the content
 //!    panel is *white* and the shell/sidebar goes *grey* — chrome recedes by
 //!    getting darker, not lighter. Popovers stay white and earn separation from a
 //!    border and shadow rather than from lightness.
@@ -313,12 +313,12 @@ pub struct Theme {
     pub appearance: Appearance,
 
     // ---- paint: neutral surfaces ----
-    /// Main content panel. Dark: the deepest plane (#060606). Light: pure white —
+    /// Main content panel. Dark: #191919. Light: pure white —
     /// long-form content reads best on an unbroken white field.
     pub bg: Hsla,
-    /// Shell / sidebar surface. Dark: one step *up* from `bg`. Light: one step
-    /// *down* (grey) — chrome recedes from the content plane in both, which is
-    /// the direction a naive invert gets backwards.
+    /// Shell / sidebar surface. Dark: #1f1f1f. Light: one step *down* (grey) —
+    /// chrome recedes from the content plane in both, which is the direction a
+    /// naive invert gets backwards.
     pub surface: Hsla,
     /// Raised surface: opaque pills and chips that sit proud of the panel.
     /// Dark: lighter than `surface`. Light: white, separated by `border` +
@@ -327,9 +327,9 @@ pub struct Theme {
 
     // ---- paint: elevation ladder ----
     //
-    // Dark mode distinguishes floating planes by lightness, and the steps are
-    // *small* (#0e → #10 → #16 → #1e). They are not interchangeable: collapsing
-    // them onto one token visibly lifts popovers off their intended plane.
+    // Dark mode distinguishes floating planes by lightness. They are not
+    // interchangeable: collapsing them onto one token visibly lifts popovers
+    // off their intended plane.
     //
     // Light mode cannot use the same trick, because the content plane is already
     // white and there is nothing lighter to climb to. All three land on white and
@@ -615,15 +615,14 @@ impl Theme {
 
     /// How the platform should composite the window behind our paint.
     ///
-    /// Only dark macOS wants the blurred desktop — light chrome is opaque by
-    /// design ([`Self::GLASS_ALPHA_LIGHT`]), so it keeps opaque compositing
-    /// (subpixel-friendly, no vibrancy cost for a blur nothing shows). This is
-    /// a method rather than a constant because it has to be *re-applied* after
-    /// every theme swap: gpui's macOS backend tears the `NSVisualEffectView`
-    /// out of the hierarchy whenever the value is anything but `Blurred`, and
-    /// the re-apply in `appearance::apply` is what restores vibrancy when the
-    /// user switches back to dark. See zed's `crates/zed/src/main.rs`, which
-    /// runs the same loop on every settings change.
+    /// macOS uses the blurred desktop in both appearances; other platforms
+    /// keep opaque compositing because they do not guarantee window vibrancy.
+    /// This is a method rather than a constant because it has to be
+    /// *re-applied* after every theme swap: gpui's macOS backend tears the
+    /// `NSVisualEffectView` out of the hierarchy whenever the value is anything
+    /// but `Blurred`, and the re-apply in `appearance::apply` restores vibrancy.
+    /// See zed's `crates/zed/src/main.rs`, which runs the same loop on every
+    /// settings change.
     pub fn window_background_appearance(&self) -> gpui::WindowBackgroundAppearance {
         if self.is_glass() {
             gpui::WindowBackgroundAppearance::Blurred
@@ -632,25 +631,24 @@ impl Theme {
         }
     }
 
-    /// Build the dark theme. The surface tones are sampled straight from the
-    /// reference screenshots of the original app (docs/reference): main panel
-    /// `#060606`, shell/sidebar `#0d0d0d`.
+    /// Build the dark theme. The main panel and shared shell tones match the
+    /// user's reference images: main panel `#191919`, shell/sidebar `#1f1f1f`.
     pub fn dark() -> Self {
         Self {
             appearance: Appearance::Dark,
-            bg: grey(6),       // main panel — sampled #060606
-            surface: grey(13), // shell / sidebar — sampled #0d0d0d
-            surface_raised: neutral(0.235),
-            surface_card: grey(0x0e),
-            surface_dialog: grey(0x10),
-            surface_overlay: grey(0x16),
+            bg: grey(25),      // main panel — sampled #191919
+            surface: grey(31), // shell / sidebar — sampled #1f1f1f
+            surface_raised: neutral(0.27),
+            surface_card: grey(26),
+            surface_dialog: grey(29),
+            surface_overlay: grey(32),
             element_hover: hsla(0.0, 0.0, 0.92, 0.11),
             element_active: hsla(0.0, 0.0, 0.92, 0.16),
             border: hsla(0.0, 0.0, 1.0, 0.08),
             border_strong: hsla(0.0, 0.0, 1.0, 0.14),
-            text: neutral(0.922),       // ~neutral-200
-            text_muted: neutral(0.708), // ~neutral-400
-            text_faint: neutral(0.556), // ~neutral-500
+            text: neutral(0.968),      // ~16:1 on #191919
+            text_muted: neutral(0.75), // ~7.9:1 on #191919
+            text_faint: neutral(0.60), // ~4.3:1 on #191919
             text_dim: grey(0x98),
             solid: neutral(0.922),                       // near-white plate
             on_solid: grey(0x0e),                        // near-black label
@@ -664,7 +662,7 @@ impl Theme {
             success: oklch(0.765, 0.177, 163.223),     // emerald-400
             busy: oklch(0.718, 0.202, 349.761),        // pink-400
             success_muted: oklch(0.845, 0.143, 164.978), // emerald-300
-            surface_raised_hover: neutral(0.29),
+            surface_raised_hover: neutral(0.32),
             band: band_for(Appearance::Dark),
             input_bg: hsla(0.0, 0.0, 1.0, 0.03),
             selection: hsla(0.66, 0.6, 0.55, 0.35),
@@ -1262,11 +1260,9 @@ mod tests {
     /// they can land on, in both appearances.
     ///
     /// `text_faint` is held to a lower floor on purpose. It is placeholder and
-    /// disabled-control copy only, which WCAG 1.4.3 exempts, and the *existing
-    /// dark palette* already measures ~4.2:1 there (neutral-500 on #060606). The
-    /// light tone is matched to that inherited number rather than raised past it,
-    /// so the two appearances stay siblings; raising the floor is a palette
-    /// decision for both modes at once, not something light mode should do alone.
+    /// disabled-control copy only, which WCAG 1.4.3 exempts; it still clears 4.1:1
+    /// on both dark reference surfaces. The light tone is matched to that number
+    /// so the two appearances stay siblings.
     #[test]
     fn text_tones_clear_wcag_aa() {
         for t in [Theme::dark(), Theme::light()] {
@@ -1461,6 +1457,17 @@ mod tests {
         // Raised surfaces are white in light mode; separation comes from the
         // border, so the border must be strong enough to carry it alone.
         assert!(contrast_ratio(flatten(l.border, l.bg), l.bg) > 1.15);
+    }
+
+    #[test]
+    fn dark_shell_and_content_match_reference_colors() {
+        let dark = Theme::dark();
+        assert_eq!(
+            dark.surface,
+            grey(31),
+            "sidebar and titlebar should be #1f1f1f"
+        );
+        assert_eq!(dark.bg, grey(25), "content body should be #191919");
     }
 
     /// The dark elevation steps are small but deliberate, and each plane must
