@@ -9,7 +9,7 @@ use std::{
 use gpui::{
     AnyElement, App, Context, Entity, Focusable as _, HighlightStyle, ListAlignment,
     ListSizingBehavior, ListState, Point, Render, ScrollHandle, SharedString, Subscription, Window,
-    div, font, list, prelude::*, px,
+    div, font, list, point, prelude::*, px,
 };
 use gpui_base::input::{RopeExt as _, TextDecoration, TextDecorationCollection};
 use komet_proto::{
@@ -42,6 +42,31 @@ const EDITOR_COMMENT_DRAFT_HEIGHT: f32 = 92.0;
 // Protected documents may exceed either limit rather than risk losing work.
 const MAX_RETAINED_DOCUMENTS: usize = 16;
 const MAX_RETAINED_DOCUMENT_BYTES: usize = 32 * 1024 * 1024;
+
+fn file_line_position(text: &str, line: u32) -> (usize, usize) {
+    let line_index = (line.saturating_sub(1) as usize).min(text.split('\n').count() - 1);
+    let byte_offset = text
+        .split_inclusive('\n')
+        .take(line_index)
+        .map(str::len)
+        .sum();
+    (byte_offset, line_index)
+}
+
+fn set_editor_line(
+    editor: &Entity<super::editor::FileEditorState>,
+    text: &str,
+    line: u32,
+    font_size: f32,
+    cx: &mut Context<FilesSurface>,
+) {
+    let (offset, target_line) = file_line_position(text, line);
+    let line_height = (font_size + 8.5).max(PREVIEW_LINE_HEIGHT);
+    editor.update(cx, |state, cx| {
+        state.set_selected_range(offset..offset, cx);
+        state.set_scroll_offset(point(px(0.0), px(-(target_line as f32) * line_height)), cx);
+    });
+}
 
 struct HighlightedFile {
     content_hash: String,
@@ -90,6 +115,7 @@ pub(super) struct FilePreviewState {
     documents: HashMap<String, FileDocument>,
     document_recency: VecDeque<String>,
     active: Option<String>,
+    pending_line: Option<u32>,
     highlights: HashMap<String, HighlightedFile>,
     syntax_cache: SyntaxHighlightCache,
     list: ListState,
@@ -114,6 +140,7 @@ impl FilePreviewState {
             documents: HashMap::new(),
             document_recency: VecDeque::new(),
             active: None,
+            pending_line: None,
             highlights: HashMap::new(),
             syntax_cache: SyntaxHighlightCache::default(),
             list: ListState::new(0, ListAlignment::Top, px(520.0)),
@@ -137,6 +164,7 @@ impl FilePreviewState {
         self.documents.clear();
         self.document_recency.clear();
         self.active = None;
+        self.pending_line = None;
         self.highlights.clear();
         self.list.reset(0);
         self.reload_confirmation = None;
@@ -848,6 +876,24 @@ impl FilesSurface {
             self.sync_preview_list();
         }
         self.trim_document_cache(cx);
+        cx.notify();
+    }
+
+    pub(super) fn navigate_to_line(&mut self, path: &str, line: u32, cx: &mut Context<Self>) {
+        if line == 0 {
+            return;
+        }
+        self.preview.pending_line = Some(line);
+        if let Some((editor, text)) = self.preview.documents.get(path).and_then(|document| {
+            Some((
+                document.editor.clone()?,
+                document.file.as_ref()?.text.clone()?,
+            ))
+        }) {
+            set_editor_line(&editor, &text, line, self.preview.editor_font_size, cx);
+            self.preview.pending_line = None;
+        }
+        self.sync_preview_list();
         cx.notify();
     }
 
@@ -1604,6 +1650,13 @@ impl FilesSurface {
         self.preview
             .list
             .reset_with_uniform_height(count, px(PREVIEW_LINE_HEIGHT));
+        if let Some(line) = self.preview.pending_line
+            && count > 0
+        {
+            self.preview
+                .list
+                .scroll_to_reveal_item((line.saturating_sub(1) as usize).min(count - 1));
+        }
     }
 
     fn request_reload_active_document(&mut self, cx: &mut Context<Self>) {
@@ -2429,8 +2482,18 @@ impl FilesSurface {
             return None;
         }
         let text = document.file.as_ref()?.text.clone()?;
-        let editor =
-            super::editor::new_file_editor(text, path, self.preview.word_wrap, theme, window, cx);
+        let editor = super::editor::new_file_editor(
+            text.clone(),
+            path,
+            self.preview.word_wrap,
+            theme,
+            window,
+            cx,
+        );
+        if let Some(line) = self.preview.pending_line {
+            set_editor_line(&editor, &text, line, self.preview.editor_font_size, cx);
+            self.preview.pending_line = None;
+        }
         let event_path = path.to_string();
         let editor_events = super::editor::subscribe_to_changes(&editor, event_path, cx);
         let editor_observer = cx.observe(&editor, |_, _, cx| cx.notify());
@@ -2678,6 +2741,12 @@ mod tests {
             read_only_message(Some(WorkspaceReadOnlyReason::UnsupportedEncoding))
                 .contains("encoding")
         );
+    }
+
+    #[test]
+    fn file_line_positions_use_utf8_byte_offsets_and_clamp_to_eof() {
+        assert_eq!(file_line_position("one\néclair\nlast", 2), (4, 1));
+        assert_eq!(file_line_position("one\néclair\nlast", 99), (12, 2));
     }
 
     #[test]

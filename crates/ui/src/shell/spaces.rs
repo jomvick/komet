@@ -11,7 +11,7 @@
 use super::*;
 use crate::pickers::{breadcrumbs, browser_rows, completion_prefix_len, parent_path};
 use gpui::FocusHandle;
-use komet_proto::{ChatIndicator, Device, FolderListing, Space};
+use komet_proto::{ChatIndicator, Device, FolderListing, RepoRef, Space};
 
 /// The space-filter dropdown, `Some` while open. The same searchable-menu
 /// recipe as the composer's ref picker: filter input on top
@@ -19,6 +19,7 @@ use komet_proto::{ChatIndicator, Device, FolderListing, Space};
 /// rows, keyboard highlight.
 pub(super) struct SpacesMenu {
     search: Entity<ComposerInput>,
+    page: SpacesMenuPage,
     /// Keyboard highlight within [`Shell::spaces_menu_rows`].
     active: usize,
     /// Tracked on the card — puts it on the keyboard dispatch path while the
@@ -26,6 +27,15 @@ pub(super) struct SpacesMenu {
     focus: FocusHandle,
     list_scroll: gpui::ScrollHandle,
     _search_events: Subscription,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SpacesMenuPage {
+    #[default]
+    Actions,
+    Projects,
+    Settings,
+    Worktrees,
 }
 
 /// One row of the open dropdown, in display order.
@@ -177,7 +187,7 @@ impl Shell {
         rows
     }
 
-    fn open_spaces_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn open_spaces_menu(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         // "PaletteSearch" context: ↑↓/⏎ stay unbound in the input and bubble
         // to the card's key handler.
         let search =
@@ -190,29 +200,57 @@ impl Shell {
                 cx.notify();
             }
         });
-        // The highlight starts ON the current filter row.
-        let current = self.settings.space_filter.clone();
-        let handle = search.read(cx).focus_handle(cx);
         self.spaces_menu.open(SpacesMenu {
             search,
+            page: SpacesMenuPage::Actions,
             active: 0,
             focus: cx.focus_handle(),
             list_scroll: gpui::ScrollHandle::new(),
             _search_events: search_events,
         });
-        let rows = self.spaces_menu_rows(cx);
-        let start = match &current {
-            None => 0,
-            Some(id) => rows
-                .iter()
-                .position(|row| matches!(row, SpacesMenuRow::Space(s) if s == id))
-                .unwrap_or(0),
-        };
+        cx.notify();
+    }
+
+    fn open_project_menu_page(
+        &mut self,
+        page: SpacesMenuPage,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut changed = false;
         if let Some(menu) = self.spaces_menu.open_mut() {
-            menu.active = start;
+            changed = menu.page != page;
+            menu.page = page;
+            menu.active = 0;
+            menu.list_scroll.set_offset(gpui::Point::default());
+            if changed {
+                let placeholder = match page {
+                    SpacesMenuPage::Projects => "Search projects…",
+                    SpacesMenuPage::Worktrees => "Search worktrees…",
+                    _ => "Search…",
+                };
+                menu.search.update(cx, |search, cx| {
+                    search.set_text("", cx);
+                    search.set_placeholder(placeholder, cx);
+                });
+            }
+            if matches!(page, SpacesMenuPage::Projects | SpacesMenuPage::Worktrees) {
+                let handle = menu.search.read(cx).focus_handle(cx);
+                window.focus(&handle, cx);
+            } else {
+                window.blur();
+            }
         }
-        // Focusable before first paint (the add-space palette's proven order).
-        window.focus(&handle, cx);
+        if changed
+            && page == SpacesMenuPage::Worktrees
+            && let Some(space) = self.context_space(cx)
+        {
+            self.composer.update(cx, |composer, cx| {
+                composer
+                    .pickers()
+                    .update(cx, |pickers, cx| pickers.prepare_worktree_menu(space, cx));
+            });
+        }
         cx.notify();
     }
 
@@ -227,9 +265,83 @@ impl Shell {
         }
     }
 
+    fn context_space(&self, cx: &App) -> Option<Space> {
+        let state = self.state.read(cx);
+        let id = self
+            .settings
+            .space_filter
+            .clone()
+            .or_else(|| {
+                state
+                    .selected_chat_row()
+                    .and_then(|chat| chat.space_id.clone())
+            })
+            .or_else(|| state.selected_space.clone())?;
+        state.space_row(&id).cloned()
+    }
+
+    fn open_project_menu_worktrees(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_project_menu_page(SpacesMenuPage::Worktrees, window, cx);
+    }
+
+    fn select_project_worktree(
+        &mut self,
+        space_id: String,
+        branch: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_new_session_in(Some(space_id), cx);
+        self.composer.update(cx, |composer, cx| {
+            composer.pickers().update(cx, |pickers, cx| {
+                pickers.select_worktree_from_menu(&branch, cx);
+            });
+        });
+        self.close_spaces_menu(cx);
+    }
+
+    fn project_menu_action_row(
+        &self,
+        id: &'static str,
+        icon_path: &'static str,
+        label: &'static str,
+        enabled: bool,
+        theme: &Theme,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id(id)
+            .h(px(32.0))
+            .mx(px(4.0))
+            .px(px(8.0))
+            .rounded(px(6.0))
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .text_size(px(12.5))
+            .text_color(if enabled {
+                theme.text
+            } else {
+                theme.text_faint.opacity(0.45)
+            })
+            .when(enabled, |el| {
+                el.cursor_pointer().hover(|el| el.bg(theme.element_hover))
+            })
+            .child(icon(icon_path).size(px(15.0)).text_color(theme.text_muted))
+            .child(div().flex_1().child(SharedString::from(label)))
+            .child(
+                icon(icons::ALT_ARROW_RIGHT)
+                    .size(px(13.0))
+                    .text_color(theme.text_muted.opacity(0.55)),
+            )
+    }
+
     /// Dropdown keys (bubbling from the focused search input): ↑↓ navigate,
     /// ⏎ activates the highlighted row, esc closes.
-    fn spaces_menu_key(&mut self, event: &gpui::KeyDownEvent, cx: &mut Context<Self>) {
+    fn spaces_menu_key(
+        &mut self,
+        event: &gpui::KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // The card stays mounted (and focused) through the exit animation —
         // keys must not drive a dying menu.
         if !self.spaces_menu.is_open() {
@@ -245,7 +357,37 @@ impl Shell {
                 self.close_spaces_menu(cx);
             }
             popover::MenuKey::Up | popover::MenuKey::Down => {
-                let count = self.spaces_menu_rows(cx).len();
+                let count = match self.spaces_menu.get().map(|menu| menu.page) {
+                    Some(SpacesMenuPage::Actions) => {
+                        if self.settings.space_filter.is_some() {
+                            3
+                        } else {
+                            1
+                        }
+                    }
+                    Some(SpacesMenuPage::Settings) => 2,
+                    Some(SpacesMenuPage::Worktrees) => self
+                        .context_space(cx)
+                        .map(|space| {
+                            let pickers = self.composer.read(cx).pickers().clone();
+                            pickers
+                                .read(cx)
+                                .worktree_menu_refs(&space.id)
+                                .ready()
+                                .map_or(0, |refs| {
+                                    let query = self
+                                        .spaces_menu
+                                        .get()
+                                        .map(|menu| menu.search.read(cx).text().to_string())
+                                        .unwrap_or_default();
+                                    let names: Vec<String> =
+                                        refs.iter().map(|row| row.name.clone()).collect();
+                                    popover::filter_indices(&query, &names).len()
+                                })
+                        })
+                        .unwrap_or(0),
+                    _ => self.spaces_menu_rows(cx).len(),
+                };
                 let delta = if key == popover::MenuKey::Up { -1 } else { 1 };
                 if let Some(menu) = self.spaces_menu.open_mut() {
                     menu.active = popover::menu_step(Some(menu.active), count, delta).unwrap_or(0);
@@ -254,6 +396,65 @@ impl Shell {
                 }
             }
             popover::MenuKey::Enter | popover::MenuKey::ModEnter => {
+                match self.spaces_menu.get().map(|menu| (menu.page, menu.active)) {
+                    Some((SpacesMenuPage::Actions, 0)) if self.settings.space_filter.is_some() => {
+                        self.open_project_menu_worktrees(window, cx);
+                        return;
+                    }
+                    Some((SpacesMenuPage::Actions, active))
+                        if active == usize::from(self.settings.space_filter.is_some()) =>
+                    {
+                        self.open_project_menu_page(SpacesMenuPage::Projects, window, cx);
+                        return;
+                    }
+                    Some((SpacesMenuPage::Actions, 2)) if self.settings.space_filter.is_some() => {
+                        self.open_project_menu_page(SpacesMenuPage::Settings, window, cx);
+                        return;
+                    }
+                    Some((SpacesMenuPage::Settings, 0)) => {
+                        if let Some(space) = self.context_space(cx) {
+                            self.close_spaces_menu(cx);
+                            self.open_rename_space(space.id, cx);
+                        }
+                        return;
+                    }
+                    Some((SpacesMenuPage::Settings, 1)) => {
+                        if let Some(space) = self.context_space(cx) {
+                            self.close_spaces_menu(cx);
+                            self.delete_space_confirm = Some(space.id);
+                            self.space_delete_focus_pending = true;
+                            cx.notify();
+                        }
+                        return;
+                    }
+                    Some((SpacesMenuPage::Worktrees, active)) => {
+                        if let Some(space) = self.context_space(cx) {
+                            let pickers = self.composer.read(cx).pickers().clone();
+                            let rows = pickers
+                                .read(cx)
+                                .worktree_menu_refs(&space.id)
+                                .ready()
+                                .cloned()
+                                .unwrap_or_default();
+                            let query = self
+                                .spaces_menu
+                                .get()
+                                .map(|menu| menu.search.read(cx).text().to_string())
+                                .unwrap_or_default();
+                            let names: Vec<String> =
+                                rows.iter().map(|row| row.name.clone()).collect();
+                            if let Some(row) = popover::filter_indices(&query, &names)
+                                .into_iter()
+                                .nth(active)
+                            {
+                                let branch = rows[row].name.clone();
+                                self.select_project_worktree(space.id, branch, cx);
+                            }
+                        }
+                        return;
+                    }
+                    _ => {}
+                }
                 let row = {
                     let active = self.spaces_menu.get().map(|m| m.active).unwrap_or(0);
                     self.spaces_menu_rows(cx).get(active).cloned()
@@ -319,18 +520,16 @@ impl Shell {
                     theme.glass_hover(),
                 )
             })
-            .on_hover(motion::hover_listener("spaces-filter"))
+            .on_hover(cx.listener(|this, hovered: &bool, window, cx| {
+                motion::set_hover("spaces-filter", *hovered, motion::reduced_motion(cx));
+                window.refresh();
+                if *hovered && !this.spaces_menu.is_open() {
+                    this.open_spaces_menu(window, cx);
+                }
+            }))
             .cursor_pointer()
-            .on_mouse_down(
-                gpui::MouseButton::Left,
-                cx.listener(|this, _, _, _| this.spaces_menu.note_trigger_press()),
-            )
             .on_click(cx.listener(|this, _, window, cx| {
-                // A press that found the menu open closes it (the card's
-                // mouse-down-out already began the close) — never reopen.
-                if this.spaces_menu.take_press_was_open() {
-                    this.close_spaces_menu(cx);
-                } else {
+                if !this.spaces_menu.is_open() {
                     this.open_spaces_menu(window, cx);
                 }
             }))
@@ -434,7 +633,7 @@ impl Shell {
     /// The dropdown card: search on top, "All projects" + space rows (check on
     /// the active filter; right-click for rename/remove) + "New project…".
     fn render_spaces_menu(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
-        let (search, active, focus, list_scroll) = {
+        let (search, active, focus, list_scroll, page) = {
             let Some(menu) = self.spaces_menu.get() else {
                 return div().into_any_element();
             };
@@ -443,130 +642,395 @@ impl Shell {
                 menu.active,
                 menu.focus.clone(),
                 menu.list_scroll.clone(),
+                menu.page,
             )
         };
-        let rows = self.spaces_menu_rows(cx);
-        let filter = self.settings.space_filter.clone();
-        let now = Utc::now();
-        // (name, device tag) per space row — presence reuses the session
-        // rows' heartbeat signal.
-        let details: Vec<(SpacesMenuRow, SharedString, Option<SharedString>, bool)> = {
-            let state = self.state.read(cx);
-            rows.iter()
-                .map(|row| match row {
-                    SpacesMenuRow::All => {
-                        (row.clone(), SharedString::from("All projects"), None, false)
-                    }
-                    SpacesMenuRow::Space(id) => match state.space_row(id) {
-                        Some(space) => {
-                            let (tag, offline) = state.space_device_tag(space, now);
-                            (
-                                row.clone(),
-                                space.display_name().to_string().into(),
-                                Some(tag.into()),
-                                offline,
-                            )
-                        }
-                        None => (row.clone(), SharedString::from("?"), None, false),
-                    },
-                    SpacesMenuRow::AddSpace => {
-                        (row.clone(), SharedString::from("New project…"), None, false)
-                    }
-                })
-                .collect()
-        };
+        let context_space = self.context_space(cx);
+        let mut actions = popover::popover_card(theme).w(px(220.0)).flex().flex_col();
 
-        let list =
-            div()
-                .id("spaces-menu-list")
-                .flex()
-                .flex_col()
-                .gap(px(2.0))
-                .max_h(px(224.0))
-                .overflow_y_scroll()
-                .track_scroll(&list_scroll)
-                .children(details.into_iter().enumerate().map(
-                    |(ix, (row, label, tag, offline))| {
-                        let is_selected = match &row {
-                            SpacesMenuRow::All => filter.is_none(),
-                            SpacesMenuRow::Space(id) => filter.as_deref() == Some(id.as_str()),
-                            SpacesMenuRow::AddSpace => false,
-                        };
-                        let leading = match &row {
-                            SpacesMenuRow::AddSpace => icons::PLUS,
-                            _ => icons::FOLDER,
-                        };
-                        let menu_space = match &row {
-                            SpacesMenuRow::Space(id) => Some(id.clone()),
-                            _ => None,
-                        };
-                        let activate = row.clone();
-                        popover::menu_row_nav(
-                            theme,
-                            is_selected,
-                            ix == active,
-                            format!("spaces-menu-row-{ix}"),
-                        )
-                        .id(("spaces-menu-row", ix))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.activate_spaces_menu_row(activate.clone(), cx);
-                        }))
-                        .when_some(menu_space, |el, space_id| {
-                            el.on_mouse_down(
-                                MouseButton::Right,
-                                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                                    this.space_menu.open((space_id.clone(), event.position));
-                                    cx.notify();
-                                }),
-                            )
+        let has_project_filter = self.settings.space_filter.is_some();
+        let worktrees_enabled = context_space
+            .as_ref()
+            .is_some_and(|space| space.git_detected);
+        let settings_enabled = has_project_filter && context_space.is_some();
+        actions = actions.when(has_project_filter, |menu| {
+            menu.child(
+                self.project_menu_action_row(
+                    "project-menu-worktree",
+                    icons::GIT_BRANCH,
+                    "Switch worktree",
+                    worktrees_enabled,
+                    theme,
+                )
+                .when(worktrees_enabled, |el| {
+                    el.on_hover(cx.listener(|this, hovered: &bool, window, cx| {
+                        if *hovered {
+                            this.open_project_menu_worktrees(window, cx);
+                        }
+                    }))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.open_project_menu_worktrees(window, cx);
+                    }))
+                }),
+            )
+        });
+        actions = actions.child(
+            self.project_menu_action_row(
+                "project-menu-switch",
+                icons::FOLDER,
+                "Switch project",
+                true,
+                theme,
+            )
+            .on_hover(cx.listener(|this, hovered: &bool, window, cx| {
+                if *hovered {
+                    this.open_project_menu_page(SpacesMenuPage::Projects, window, cx);
+                }
+            }))
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.open_project_menu_page(SpacesMenuPage::Projects, window, cx);
+            })),
+        );
+        actions = actions.when(settings_enabled, |menu| {
+            menu.child(
+                self.project_menu_action_row(
+                    "project-menu-settings",
+                    icons::SETTINGS_MINIMALISTIC,
+                    "Project settings",
+                    settings_enabled,
+                    theme,
+                )
+                .when(settings_enabled, |el| {
+                    el.on_hover(cx.listener(|this, hovered: &bool, window, cx| {
+                        if *hovered {
+                            this.open_project_menu_page(SpacesMenuPage::Settings, window, cx);
+                        }
+                    }))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.open_project_menu_page(SpacesMenuPage::Settings, window, cx);
+                    }))
+                }),
+            )
+        });
+        let actions = crate::frost::frosted(popover::CARD_RADIUS, crate::frost::MENU_BLUR, actions)
+            .into_any_element();
+
+        let submenu: Option<AnyElement> = match page {
+            SpacesMenuPage::Actions => None,
+            SpacesMenuPage::Projects => {
+                let rows = self.spaces_menu_rows(cx);
+                let filter = self.settings.space_filter.clone();
+                let now = Utc::now();
+                let details: Vec<(SpacesMenuRow, SharedString, Option<SharedString>, bool)> = {
+                    let state = self.state.read(cx);
+                    rows.iter()
+                        .map(|row| match row {
+                            SpacesMenuRow::All => (row.clone(), "All projects".into(), None, false),
+                            SpacesMenuRow::Space(id) => match state.space_row(id) {
+                                Some(space) => {
+                                    let (tag, offline) = state.space_device_tag(space, now);
+                                    (
+                                        row.clone(),
+                                        space.display_name().to_string().into(),
+                                        Some(tag.into()),
+                                        offline,
+                                    )
+                                }
+                                None => (row.clone(), "?".into(), None, false),
+                            },
+                            SpacesMenuRow::AddSpace => {
+                                (row.clone(), "New project…".into(), None, false)
+                            }
                         })
+                        .collect()
+                };
+                let list = div()
+                    .id("spaces-menu-list")
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .max_h(px(224.0))
+                    .overflow_y_scroll()
+                    .track_scroll(&list_scroll)
+                    .children(details.into_iter().enumerate().map(
+                        |(ix, (row, label, tag, offline))| {
+                            let is_selected = match &row {
+                                SpacesMenuRow::All => filter.is_none(),
+                                SpacesMenuRow::Space(id) => filter.as_deref() == Some(id.as_str()),
+                                SpacesMenuRow::AddSpace => false,
+                            };
+                            let leading = if matches!(row, SpacesMenuRow::AddSpace) {
+                                icons::PLUS
+                            } else {
+                                icons::FOLDER
+                            };
+                            let activate = row.clone();
+                            popover::menu_row_nav(
+                                theme,
+                                is_selected,
+                                ix == active,
+                                format!("spaces-menu-row-{ix}"),
+                            )
+                            .id(("spaces-menu-row", ix))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.activate_spaces_menu_row(activate.clone(), cx);
+                            }))
+                            .child(
+                                icon(leading)
+                                    .size(px(15.0))
+                                    .flex_none()
+                                    .text_color(theme.text_muted.opacity(0.8)),
+                            )
+                            .child(div().flex_1().min_w_0().truncate().child(label))
+                            .when_some(tag, |el, tag| {
+                                el.child(
+                                    div()
+                                        .flex_none()
+                                        .text_size(px(10.0))
+                                        .text_color(theme.text_muted.opacity(0.45))
+                                        .child(tag),
+                                )
+                                .when(offline, |el| {
+                                    el.child(
+                                        icon(icons::WIFI_OFF)
+                                            .size(px(12.0))
+                                            .flex_none()
+                                            .text_color(theme.warning.opacity(0.8)),
+                                    )
+                                })
+                            })
+                        },
+                    ));
+                Some(
+                    crate::frost::frosted(
+                        popover::CARD_RADIUS,
+                        crate::frost::MENU_BLUR,
+                        popover::popover_card(theme)
+                            .w(px(248.0))
+                            .flex()
+                            .flex_col()
+                            .child(popover::search_input_frame(
+                                theme,
+                                search.clone().into_any_element(),
+                            ))
+                            .child(list)
+                            .into_any_element(),
+                    )
+                    .into_any_element(),
+                )
+            }
+            SpacesMenuPage::Settings => {
+                let body = if let Some(space) = context_space {
+                    let rename_id = space.id.clone();
+                    let delete_id = space.id.clone();
+                    div()
+                        .flex()
+                        .flex_col()
                         .child(
-                            icon(leading)
-                                .size(px(15.0))
-                                .flex_none()
-                                .text_color(theme.text_muted.opacity(0.8)),
+                            div()
+                                .px(px(12.0))
+                                .py(px(10.0))
+                                .text_size(px(12.5))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(theme.text)
+                                .child(SharedString::from(space.display_name().to_owned())),
                         )
-                        .child(div().flex_1().min_w_0().truncate().child(label))
-                        .when_some(tag, |el, tag| {
-                            el.child(
+                        .child(popover::menu_separator())
+                        .child(
+                            popover::menu_row(theme, false, "project-settings-rename")
+                                .id("project-settings-rename")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.close_spaces_menu(cx);
+                                    this.open_rename_space(rename_id.clone(), cx);
+                                }))
+                                .child(icon(icons::PEN).size(px(15.0)).text_color(theme.text_muted))
+                                .child(SharedString::from("Rename…")),
+                        )
+                        .child(
+                            popover::menu_row(theme, false, "project-settings-delete")
+                                .id("project-settings-delete")
+                                .text_color(theme.danger)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.close_spaces_menu(cx);
+                                    this.delete_space_confirm = Some(delete_id.clone());
+                                    this.space_delete_focus_pending = true;
+                                    cx.notify();
+                                }))
+                                .child(
+                                    icon(icons::TRASH_BIN_MINIMALISTIC)
+                                        .size(px(15.0))
+                                        .text_color(theme.danger),
+                                )
+                                .child(SharedString::from("Remove…")),
+                        )
+                } else {
+                    div()
+                        .p(px(12.0))
+                        .text_size(px(12.0))
+                        .text_color(theme.text_faint)
+                        .child("Select a project first")
+                };
+                Some(
+                    crate::frost::frosted(
+                        popover::CARD_RADIUS,
+                        crate::frost::MENU_BLUR,
+                        popover::popover_card(theme)
+                            .w(px(220.0))
+                            .flex()
+                            .flex_col()
+                            .child(body)
+                            .into_any_element(),
+                    )
+                    .into_any_element(),
+                )
+            }
+            SpacesMenuPage::Worktrees => {
+                let Some(space) = context_space else {
+                    return actions;
+                };
+                let pickers = self.composer.read(cx).pickers().clone();
+                let refs = pickers.read(cx).worktree_menu_refs(&space.id);
+                let query = search.read(cx).text().to_string();
+                let rows = refs
+                    .ready()
+                    .map(|refs| {
+                        let names: Vec<String> = refs.iter().map(|row| row.name.clone()).collect();
+                        popover::filter_indices(&query, &names)
+                            .into_iter()
+                            .map(|ix| refs[ix].clone())
+                            .collect::<Vec<RepoRef>>()
+                    })
+                    .unwrap_or_default();
+                let selected = pickers.read(cx).draft().branch.clone();
+                let body: AnyElement = match refs {
+                    popover::Loadable::Idle | popover::Loadable::Loading => div()
+                        .px(px(12.0))
+                        .py(px(10.0))
+                        .text_size(px(12.0))
+                        .text_color(theme.text_faint)
+                        .child("Loading worktrees…")
+                        .into_any_element(),
+                    popover::Loadable::Error(message) => {
+                        let retry_space = space.clone();
+                        div()
+                            .p(px(10.0))
+                            .flex()
+                            .flex_col()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .text_size(px(11.5))
+                                    .text_color(theme.danger)
+                                    .child(SharedString::from(message)),
+                            )
+                            .child(
+                                popover::menu_row(theme, false, "worktrees-retry")
+                                    .id("worktrees-retry")
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.composer.update(cx, |composer, cx| {
+                                            composer.pickers().update(cx, |pickers, cx| {
+                                                pickers
+                                                    .retry_worktree_menu(retry_space.clone(), cx);
+                                            });
+                                        });
+                                    }))
+                                    .child(SharedString::from("Retry")),
+                            )
+                            .into_any_element()
+                    }
+                    popover::Loadable::Ready(_) if rows.is_empty() => div()
+                        .px(px(12.0))
+                        .py(px(10.0))
+                        .text_size(px(12.0))
+                        .text_color(theme.text_faint)
+                        .child(if query.is_empty() {
+                            "No worktrees found."
+                        } else {
+                            "No matching worktrees."
+                        })
+                        .into_any_element(),
+                    popover::Loadable::Ready(_) => div()
+                        .id("project-worktree-list")
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .max_h(px(224.0))
+                        .overflow_y_scroll()
+                        .children(rows.into_iter().enumerate().map(|(ix, row)| {
+                            let branch = row.name.clone();
+                            let space_id = space.id.clone();
+                            let is_selected = selected.as_deref() == Some(row.name.as_str());
+                            popover::menu_row_nav(
+                                theme,
+                                is_selected,
+                                ix == active,
+                                format!("project-worktree-{ix}"),
+                            )
+                            .id(("project-worktree", ix))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.select_project_worktree(space_id.clone(), branch.clone(), cx);
+                            }))
+                            .child(
+                                icon(icons::GIT_BRANCH)
+                                    .size(px(15.0))
+                                    .flex_none()
+                                    .text_color(theme.text_muted),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .child(SharedString::from(row.name.clone())),
+                            )
+                            .child(
                                 div()
                                     .flex_none()
                                     .text_size(px(10.0))
                                     .text_color(theme.text_muted.opacity(0.45))
-                                    .child(tag),
+                                    .child("worktree"),
                             )
-                            // Disconnected glyph, not the word (user request).
-                            .when(offline, |el| {
-                                el.child(
-                                    icon(icons::WIFI_OFF)
-                                        .size(px(12.0))
-                                        .flex_none()
-                                        .text_color(theme.warning.opacity(0.8)),
-                                )
-                            })
-                        })
-                        // No check glyph — the selected row's wash (menu_row's
-                        // active styling) is the selection signal.
-                    },
-                ));
+                        }))
+                        .into_any_element(),
+                };
+                Some(
+                    crate::frost::frosted(
+                        popover::CARD_RADIUS,
+                        crate::frost::MENU_BLUR,
+                        popover::popover_card(theme)
+                            .w(px(280.0))
+                            .flex()
+                            .flex_col()
+                            .child(popover::search_input_frame(
+                                theme,
+                                search.clone().into_any_element(),
+                            ))
+                            .child(body)
+                            .into_any_element(),
+                    )
+                    .into_any_element(),
+                )
+            }
+        };
 
-        popover::popover_card(theme)
-            .w(px(248.0))
+        let mut menu = div()
+            .id("spaces-filter-menu-surface")
             .track_focus(&focus)
-            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
-                this.spaces_menu_key(event, cx)
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                this.spaces_menu_key(event, window, cx)
             }))
             .on_mouse_down_out(cx.listener(|this, _, _, cx| {
                 this.close_spaces_menu(cx);
             }))
             .flex()
-            .flex_col()
-            .child(popover::search_input_frame(
-                theme,
-                search.into_any_element(),
-            ))
-            .child(list)
-            .into_any_element()
+            .flex_row()
+            .items_start()
+            .gap(px(2.0))
+            .child(actions);
+        if let Some(submenu) = submenu {
+            menu = menu.child(submenu);
+        }
+        menu.into_any_element()
     }
 
     /// The sidebar's Sessions list: every session (idle included) of the

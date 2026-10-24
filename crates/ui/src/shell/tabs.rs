@@ -132,7 +132,13 @@ impl Shell {
     /// `[fading +] [harness icon + session title] … [toggle-changes]`.
     /// Replaces the tab strip; inherits its titlebar duties (drag region,
     /// animated left inset, the toggle-changes button on git projects).
-    pub(super) fn render_session_title_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_session_title_bar(
+        &mut self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (linux_left_controls, linux_right_controls) =
+            self.linux_titlebar_controls_width(window, cx);
         let theme = Theme::of(cx).clone();
         // The canvas titles as NOTHING (user request — a "New session"
         // header over the empty canvas was noise); the bar keeps its height,
@@ -180,8 +186,8 @@ impl Shell {
         // Same glide as the old strip: content starts at the inset card's
         // left edge while the sidebar is open, and slides toward the control
         // cluster as it collapses.
-        let content_left =
-            (sidebar_now + Theme::SPACE_LG).max(self.title_bar_content_start() + plus_inset);
+        let content_left = (sidebar_now + Theme::SPACE_LG)
+            .max(self.title_bar_content_start(linux_left_controls) + plus_inset);
 
         // Trailing titlebar section. With the changes pane open this is the
         // PANE'S HEADER — a strip exactly as wide as the pane carrying its
@@ -210,7 +216,8 @@ impl Shell {
             // own 8px pad lands the first chip on the pane gutter. The
             // window-control cluster still wins while the sidebar is
             // collapsed (the chips clear it instead of underlapping).
-            let cluster_end = self.title_bar_content_start() - 10.0 + plus_inset - 14.0;
+            let cluster_end =
+                self.title_bar_content_start(linux_left_controls) - 10.0 + plus_inset - 14.0;
             (sidebar_now - 8.0).max(cluster_end)
         } else {
             content_left
@@ -222,7 +229,11 @@ impl Shell {
         };
         let trailing: Option<gpui::AnyElement> = if self.right_pane_open(cx) {
             let right_now = self.eval_tween(self.right_tween, self.right_target(cx));
-            let pr = titlebar_right_padding(cfg!(target_os = "windows"), Theme::SPACE_LG);
+            let pr = titlebar_right_padding(
+                cfg!(target_os = "windows"),
+                linux_right_controls,
+                Theme::SPACE_LG,
+            );
             // The row's own left padding is part of its content box: a strip
             // wider than what's left after it overflows and clips at the right
             // edge (flex_none never shrinks) — cap to the available width. The
@@ -298,6 +309,7 @@ impl Shell {
             .pl(px(row_left))
             .pr(px(titlebar_right_padding(
                 cfg!(target_os = "windows"),
+                linux_right_controls,
                 Theme::SPACE_LG,
             )))
             // In panel takeover the header strip spans the whole band — the
