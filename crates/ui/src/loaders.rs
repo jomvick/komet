@@ -213,6 +213,7 @@ pub fn splash_overlay(_theme: &Theme, fading: bool) -> AnyElement {
         img(splash_image())
             .absolute()
             .inset_0()
+            .size_full()
             .object_fit(ObjectFit::Cover),
     );
     if fading {

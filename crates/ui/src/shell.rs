@@ -16,9 +16,10 @@ use std::time::Duration;
 
 use chrono::Utc;
 use gpui::{
-    AnyElement, App, Context, Empty, Entity, Focusable as _, IntoElement, KeyBinding, Keystroke,
-    MouseButton, MouseDownEvent, MouseUpEvent, Pixels, Point, Render, SharedString, Subscription,
-    Task, Window, WindowControlArea, actions, div, prelude::*, px,
+    AnyElement, App, Context, Decorations, Empty, Entity, Focusable as _, IntoElement, KeyBinding,
+    Keystroke, MouseButton, MouseDownEvent, MouseUpEvent, ObjectFit, Pixels, Point, Render,
+    ResizeEdge, SharedString, Size, StyledImage, Subscription, Task, Tiling, Window, WindowButton,
+    WindowButtonLayout, WindowControlArea, actions, div, img, prelude::*, px,
 };
 
 use gpui_tokio::Tokio;
@@ -44,6 +45,7 @@ use crate::settings::integrations::IntegrationsPage;
 use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
 use crate::settings::security::{SecurityDefaults, SecurityEvent, SecurityPage};
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
+use crate::settings::wallpaper;
 use crate::settings::{
     KeymapConfig, RIGHT_PANE_DEFAULT, RIGHT_PANE_MAX, RIGHT_PANE_MIN, RememberedNavigation,
     SAVE_DEBOUNCE_MS, SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, TERMINAL_DEFAULT_HEIGHT,
@@ -56,7 +58,7 @@ use crate::state::{
 use crate::terminal::panel::{TerminalPanel, ToggleTerminal, clamp_terminal_height};
 use crate::theme::Theme;
 use crate::transcript::{
-    self, ErrorOpenAccounts, ErrorOpenModelPicker, ErrorRetryTurn, Transcript,
+    self, ErrorOpenAccounts, ErrorOpenModelPicker, ErrorRetryTurn, Transcript, TranscriptEvent,
 };
 
 /// Wider floor for the right pane while it shows the Files+FileEditor split
@@ -217,6 +219,25 @@ impl SettingsSection {
             SettingsSection::Sync => "Sync",
             SettingsSection::Security => "Security",
             SettingsSection::Integrations => "Integrations",
+        }
+    }
+
+    /// Outline glyphs identify distinct destinations. The selected destination
+    /// receives a solid tile in the navigation, keeping hierarchy without
+    /// reusing one generic settings icon for unrelated pages.
+    pub const fn nav_icon(self) -> &'static str {
+        match self {
+            SettingsSection::Devices => icons::MONITOR,
+            SettingsSection::Harnesses => icons::WIDGET,
+            SettingsSection::Agents => icons::KEY_MINIMALISTIC,
+            SettingsSection::Appearance => icons::TUNING,
+            SettingsSection::Files => icons::FOLDER_WITH_FILES,
+            SettingsSection::Notifications => icons::BELL,
+            SettingsSection::Shortcuts => icons::KEYBOARD,
+            SettingsSection::Archived => icons::ARCHIVE_MINIMALISTIC,
+            SettingsSection::Sync => icons::CLOUD,
+            SettingsSection::Security => icons::SHIELD,
+            SettingsSection::Integrations => icons::PLUG,
         }
     }
 }
@@ -825,6 +846,10 @@ struct OrgGateUi {
 pub struct Shell {
     state: Entity<AppState>,
     transcript: Entity<Transcript>,
+    /// A file link clicked from an agent response. Rendering owns the window,
+    /// so the subscription stores the intent until it can open and focus the
+    /// corresponding editor surface on this frame.
+    pending_workspace_file: Option<(String, Option<u32>)>,
     composer: Entity<Composer>,
     /// External file drag hovering the conversation column — shows the
     /// "Drop images to attach" veil over the whole chat area; a drop stages
@@ -1032,6 +1057,8 @@ pub struct Shell {
     _ticker: Task<()>,
     _state_observation: Subscription,
     _composer_events: Subscription,
+    _pickers_observation: Subscription,
+    _transcript_events: Subscription,
 }
 
 impl Shell {
@@ -1043,6 +1070,15 @@ impl Shell {
         let transcript = cx.new(|cx| Transcript::new(state.clone(), cx));
         let composer = cx.new(|cx| Composer::new(state.clone(), cx));
         transcript.update(cx, |t, _| t.bind_composer(composer.downgrade()));
+        let transcript_events = cx.subscribe(
+            &transcript,
+            |this: &mut Shell, _, event: &TranscriptEvent, cx| match event {
+                TranscriptEvent::OpenWorkspaceFile { path, line } => {
+                    this.pending_workspace_file = Some((path.clone(), *line));
+                    cx.notify();
+                }
+            },
+        );
         // Every send glides the prompt to the viewport top and reserves the
         // reply's space below it (notes-app parity).
         let composer_events = cx.subscribe(&composer, {
@@ -1058,6 +1094,8 @@ impl Shell {
                 }
             }
         });
+        let pickers = composer.read(cx).pickers().clone();
+        let pickers_observation = cx.observe(&pickers, |_, _, cx| cx.notify());
         // Working-indicator heartbeat: notify once a second while a session is
         // live so elapsed time and the flavour word stay fresh.
         let ticker = cx.spawn(async move |this, cx| {
@@ -1126,6 +1164,7 @@ impl Shell {
         Self {
             state,
             transcript,
+            pending_workspace_file: None,
             composer,
             file_drag_active: false,
             // Seed with the compact composer stack's rough height so the
@@ -1236,6 +1275,8 @@ impl Shell {
             _ticker: ticker,
             _state_observation: observation,
             _composer_events: composer_events,
+            _pickers_observation: pickers_observation,
+            _transcript_events: transcript_events,
         }
     }
 
@@ -1810,7 +1851,9 @@ impl Shell {
                 &files,
                 window,
                 move |this: &mut Self, _, event, window, cx| match event {
-                    FilesEvent::OpenFile(path) => this.add_file_surface(path.clone(), window, cx),
+                    FilesEvent::OpenFile(path) => {
+                        this.add_file_surface(path.clone(), None, window, cx)
+                    }
                     FilesEvent::TitleChanged => cx.notify(),
                     FilesEvent::FileRenamed { .. } => cx.notify(),
                     FilesEvent::WordWrapChanged(word_wrap) => {
@@ -1837,12 +1880,23 @@ impl Shell {
     /// Open a workspace file as a first-class right-pane tab. Every editor is
     /// a separate FilesSurface so its tree, search, watcher and split layout
     /// stay stable while users move among open files.
-    fn add_file_surface(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
+    fn add_file_surface(
+        &mut self,
+        path: String,
+        line: Option<u32>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let panel_key = self.panel_key(cx);
         let lookup = (panel_key.clone(), path.clone());
         if let Some(id) = self.file_surface_keys.get(&lookup).copied() {
             let surface = RightSurface::File(id);
             self.set_right_active(surface, cx);
+            if let Some(line) = line
+                && let Some(file) = self.file_surfaces.get(&id)
+            {
+                file.update(cx, |file, cx| file.open_at_line(line, cx));
+            }
             self.focus_right_file_editor(surface, window, cx);
             return;
         }
@@ -1866,7 +1920,7 @@ impl Shell {
             &file,
             window,
             move |this: &mut Self, _, event, window, cx| match event {
-                FilesEvent::OpenFile(path) => this.add_file_surface(path.clone(), window, cx),
+                FilesEvent::OpenFile(path) => this.add_file_surface(path.clone(), None, window, cx),
                 FilesEvent::TitleChanged => cx.notify(),
                 FilesEvent::FileRenamed { old_path, new_path } => {
                     this.rename_file_surface(id, &event_panel_key, old_path, new_path, cx)
@@ -1883,6 +1937,9 @@ impl Shell {
                 FilesEvent::CloseCancelled => this.cancel_file_close(RightSurface::File(id), cx),
             },
         );
+        if let Some(line) = line {
+            file.update(cx, |file, cx| file.open_at_line(line, cx));
+        }
         self.file_surfaces.insert(id, file);
         self.file_surface_paths.insert(id, path);
         self.file_surface_keys.insert(lookup, id);
@@ -3392,31 +3449,34 @@ impl Shell {
     /// instant swap, zero horizontal motion).
     /// Where unified-titlebar content (tabs / the settings label) starts: past
     /// the traffic lights + control cluster, riding the fullscreen inset tween.
-    pub(super) fn title_bar_content_start(&self) -> f32 {
+    pub(super) fn title_bar_content_start(&self, linux_left_controls: f32) -> f32 {
         let fullscreen = self.fullscreen.unwrap_or(false);
         let is_macos = cfg!(target_os = "macos");
         let cluster = self.eval_tween(
             self.titlebar_tween,
             cluster_buttons_start(is_macos, fullscreen),
         );
-        cluster + CLUSTER_BUTTONS_WIDTH + 10.0
+        cluster + linux_left_controls + CLUSTER_BUTTONS_WIDTH + 10.0
     }
 
     /// The unified window titlebar: chat → the session tab strip; settings →
     /// the section label. Full-width on the glass shell; the traffic lights
     /// and control cluster overlay its left end.
-    fn render_title_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_title_bar(&mut self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let (linux_left_controls, linux_right_controls) =
+            self.linux_titlebar_controls_width(window, cx);
         match self.route {
-            Route::Chat => self.render_session_title_bar(cx),
+            Route::Chat => self.render_session_title_bar(window, cx),
             Route::Settings(_) => {
                 let inner = div()
                     .size_full()
                     .flex()
                     .items_center()
                     .pt(px(Theme::TITLEBAR_TOP_PAD))
-                    .pl(px(self.title_bar_content_start()))
+                    .pl(px(self.title_bar_content_start(linux_left_controls)))
                     .pr(px(titlebar_right_padding(
                         cfg!(target_os = "windows"),
+                        linux_right_controls,
                         Theme::SPACE_LG,
                     )));
                 let bar = div().h(px(Theme::TITLEBAR_HEIGHT)).flex_none().child(inner);
@@ -3486,7 +3546,11 @@ impl Shell {
     /// fullscreen traffic-light inset tweens (the animated spacer). The
     /// container has no id/listeners — everything between the buttons falls
     /// through to the titlebar drag strips below.
-    fn render_titlebar_cluster(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_titlebar_cluster(
+        &mut self,
+        linux_left_controls: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let can_back = self.nav.can_back();
         let can_forward = self.nav.can_forward();
@@ -3500,7 +3564,7 @@ impl Shell {
         div()
             .absolute()
             .top_0()
-            .left_0()
+            .left(px(linux_left_controls))
             .h(px(Theme::TITLEBAR_HEIGHT))
             .flex()
             .flex_row()
@@ -3606,6 +3670,130 @@ impl Shell {
         )
     }
 
+    pub(super) fn linux_titlebar_controls_width(&self, window: &Window, cx: &App) -> (f32, f32) {
+        if !cfg!(target_os = "linux") {
+            return (0.0, 0.0);
+        }
+        let controls = window.window_controls();
+        let layout = linux_button_layout(cx, controls);
+        (
+            linux_control_side_width(layout.left, controls.minimize, controls.maximize),
+            linux_control_side_width(layout.right, controls.minimize, controls.maximize),
+        )
+    }
+
+    fn render_linux_caption_controls(
+        &mut self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        if !cfg!(target_os = "linux") {
+            return Vec::new();
+        }
+
+        let controls = window.window_controls();
+        let layout = linux_button_layout(cx, controls);
+        let theme = Theme::of(cx).clone();
+        let maximized = window.is_maximized();
+        let side = |buttons: [Option<WindowButton>; 3], this: &mut Self, cx: &mut Context<Self>| {
+            buttons
+                .into_iter()
+                .flatten()
+                .filter(|button| match button {
+                    WindowButton::Minimize => controls.minimize,
+                    WindowButton::Maximize => controls.maximize,
+                    WindowButton::Close => true,
+                })
+                .map(|button| this.linux_caption_button(button, maximized, &theme, cx))
+                .collect::<Vec<_>>()
+        };
+        let left = side(layout.left, self, cx);
+        let right = side(layout.right, self, cx);
+        let group = |buttons: Vec<AnyElement>, is_left: bool| {
+            if buttons.is_empty() {
+                return None;
+            }
+            let mut group = div()
+                .absolute()
+                .top_0()
+                .h(px(Theme::TITLEBAR_HEIGHT))
+                .flex()
+                .flex_row()
+                .items_center()
+                .pt(px(Theme::TITLEBAR_TOP_PAD))
+                .gap(px(2.0))
+                .px(px(4.0))
+                .children(buttons);
+            group = if is_left {
+                group.left_0()
+            } else {
+                group.right_0()
+            };
+            Some(group.into_any_element())
+        };
+        group(left, true)
+            .into_iter()
+            .chain(group(right, false))
+            .collect()
+    }
+
+    fn linux_caption_button(
+        &mut self,
+        button: WindowButton,
+        maximized: bool,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = match button {
+            WindowButton::Minimize => "linux-window-minimize",
+            WindowButton::Maximize => "linux-window-maximize",
+            WindowButton::Close => "linux-window-close",
+        };
+        let icon_path = match button {
+            WindowButton::Minimize => icons::WINDOW_MINIMIZE,
+            WindowButton::Maximize if maximized => icons::WINDOW_RESTORE,
+            WindowButton::Maximize => icons::WINDOW_MAXIMIZE,
+            WindowButton::Close => icons::WINDOW_CLOSE,
+        };
+        let close = button == WindowButton::Close;
+        let hover_bg: gpui::Hsla = if close {
+            gpui::rgb(0xe81123).into()
+        } else {
+            theme.glass_hover()
+        };
+        let hover_fg = gpui::white();
+        let foreground = theme.text;
+        let action = cx.listener(move |this, _, window, cx| {
+            cx.stop_propagation();
+            match button {
+                WindowButton::Minimize => window.minimize_window(),
+                WindowButton::Maximize => window.zoom_window(),
+                WindowButton::Close => {
+                    if this.prepare_window_close(cx) {
+                        window.remove_window();
+                    }
+                }
+            }
+        });
+        div()
+            .id(id)
+            .w(px(LINUX_CAPTION_BUTTON_WIDTH))
+            .h(px(LINUX_CAPTION_BUTTON_WIDTH))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(6.0))
+            .text_color(foreground)
+            .hover(move |style| style.bg(hover_bg).text_color(hover_fg))
+            .active(move |style| style.bg(hover_bg.opacity(0.7)))
+            .occlude()
+            .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
+            .on_click(action)
+            .child(icon(icon_path).size(px(18.0)))
+            .into_any_element()
+    }
+
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let inner: AnyElement = match self.route {
@@ -3613,18 +3801,12 @@ impl Shell {
             Route::Chat => self.render_chat_sidebar(&theme, cx),
         };
         let target = self.sidebar_target();
-        // Transparent — the sidebar sits directly on the frost shell; the main
-        // card's own border provides the separation. The content row spans the
-        // full window height (the titlebar overlays it), so the column pads
-        // itself below the chrome.
+        // Transparent — the sidebar sits directly on the shell surface; the
+        // rounded workspace border provides the separation.
         self.pane_container(
             self.sidebar_tween,
             target,
-            div()
-                .h_full()
-                .pt(px(Theme::TITLEBAR_HEIGHT))
-                .child(inner)
-                .into_any_element(),
+            div().h_full().child(inner).into_any_element(),
         )
     }
 
@@ -3637,19 +3819,6 @@ impl Shell {
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let section_icon = |item: SettingsSection| match item {
-            SettingsSection::Devices => icons::MONITOR,
-            SettingsSection::Harnesses => icons::WIDGET,
-            SettingsSection::Agents => icons::KEY_MINIMALISTIC,
-            SettingsSection::Appearance => icons::TUNING,
-            SettingsSection::Files => icons::FOLDER_WITH_FILES,
-            SettingsSection::Notifications => icons::BELL,
-            SettingsSection::Shortcuts => icons::KEYBOARD,
-            SettingsSection::Archived => icons::ARCHIVE_MINIMALISTIC,
-            SettingsSection::Sync => icons::GLOBAL,
-            SettingsSection::Security => icons::SHIELD,
-            SettingsSection::Integrations => icons::WIDGET,
-        };
         // Match the user's dragged sidebar width — the pane container clips to
         // it, so a hardcoded default here left hover washes stopping short of
         // the sidebar's right edge (user-reported). Device identity lives on
@@ -3661,7 +3830,12 @@ impl Shell {
             .flex_col()
             .child(
                 div()
+                    .id("settings-nav-scroll")
                     .flex_1()
+                    .min_h_0()
+                    // Keep the navigation scrollable on compact windows while
+                    // keeping the Back control reachable below.
+                    .overflow_y_scroll()
                     .px(px(Theme::SPACE_SM))
                     .flex()
                     .flex_col()
@@ -3678,6 +3852,11 @@ impl Shell {
                     .child(div().flex().flex_col().gap(px(2.0)).children(
                         SettingsSection::ALL.into_iter().map(|item| {
                             let selected = item == section;
+                            let icon_tint = if selected {
+                                theme.on_accent
+                            } else {
+                                theme.text_muted
+                            };
                             div()
                                 .id(SharedString::from(format!("settings-nav-{}", item.label())))
                                 .flex()
@@ -3689,8 +3868,6 @@ impl Shell {
                                 .py(px(6.0))
                                 .text_size(px(13.0))
                                 .when(selected, |el| {
-                                    // Same tokens as the main sidebar's session
-                                    // rows — the two sidebars must feel alike.
                                     el.bg(crate::theme::glass_selected_bg())
                                         .font_weight(gpui::FontWeight::MEDIUM)
                                 })
@@ -3705,9 +3882,19 @@ impl Shell {
                                     cx.listener(move |this, _, _, cx| this.open_settings(item, cx)),
                                 )
                                 .child(
-                                    icon(section_icon(item))
-                                        .size(px(16.0))
-                                        .text_color(theme.text_muted),
+                                    div()
+                                        .size(px(24.0))
+                                        .flex_none()
+                                        .rounded(px(7.0))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .when(selected, |el| el.bg(theme.accent))
+                                        .child(
+                                            icon(item.nav_icon())
+                                                .size(px(15.0))
+                                                .text_color(icon_tint),
+                                        ),
                                 )
                                 .child(SharedString::from(item.label()))
                         }),
@@ -5306,7 +5493,6 @@ impl Shell {
                 .flex_1()
                 .min_w_0()
                 .h_full()
-                .pt(px(Theme::TITLEBAR_HEIGHT))
                 .flex()
                 .flex_col()
                 .child(div().flex_1().min_h_0().child(outlet))
@@ -5504,10 +5690,7 @@ impl Shell {
                                 true,
                                 div().size_full().child(outlet),
                             )
-                            // Fully faded BY the titlebar's bottom edge (the
-                            // title text is opaque — overlap read as collision),
-                            // ramping in the band just below it.
-                            .inset_top(Theme::TITLEBAR_HEIGHT)
+                            .inset_top(0.0)
                             .band_top(Theme::TRANSCRIPT_FADE_BAND)
                             .band_bottom(bottom_band),
                         )
@@ -5787,9 +5970,7 @@ impl Shell {
     /// terminal, or the "Open a surface" picker when no tabs exist.
     fn render_right_pane(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
-        // Match the sidebar tone: the right pane reads as the same glass
-        // surface as the session list instead of a darker `bg`.
-        let bg = theme.glass();
+        let bg = theme.bg;
         let content: AnyElement = if self.right_pane_open(cx) {
             let active = self.resolved_right_active(cx);
             let main: AnyElement = match active {
@@ -5935,9 +6116,6 @@ impl Shell {
             })
             .bg(panel_bg)
             .overflow_hidden()
-            // The titlebar is a glass overlay over the full-height content
-            // row; the panel's own chrome starts below it.
-            .pt(px(Theme::TITLEBAR_HEIGHT))
             .child(content);
         let target = self.right_target(cx);
         // Takeover mode has no drag width — the handle would fight the
@@ -7010,12 +7188,97 @@ fn window_control_button(
 
 const WINDOWS_CAPTION_BUTTON_WIDTH: f32 = 36.0;
 const WINDOWS_CAPTION_WIDTH: f32 = WINDOWS_CAPTION_BUTTON_WIDTH * 3.0;
+const LINUX_CAPTION_BUTTON_WIDTH: f32 = 34.0;
 
-fn titlebar_right_padding(is_windows: bool, base: f32) -> f32 {
+fn linux_control_side_width(
+    buttons: [Option<WindowButton>; 3],
+    has_minimize: bool,
+    has_maximize: bool,
+) -> f32 {
+    let count = buttons
+        .iter()
+        .flatten()
+        .filter(|button| match button {
+            WindowButton::Minimize => has_minimize,
+            WindowButton::Maximize => has_maximize,
+            WindowButton::Close => true,
+        })
+        .count();
+    if count == 0 {
+        0.0
+    } else {
+        count as f32 * LINUX_CAPTION_BUTTON_WIDTH + (count - 1) as f32 * 2.0 + 8.0
+    }
+}
+
+fn linux_button_layout(cx: &App, controls: gpui::WindowControls) -> WindowButtonLayout {
+    effective_linux_button_layout(
+        cx.button_layout().unwrap_or(WindowButtonLayout {
+            left: [None; 3],
+            right: [
+                Some(WindowButton::Minimize),
+                Some(WindowButton::Maximize),
+                Some(WindowButton::Close),
+            ],
+        }),
+        controls,
+    )
+}
+
+fn effective_linux_button_layout(
+    layout: WindowButtonLayout,
+    controls: gpui::WindowControls,
+) -> WindowButtonLayout {
+    if linux_control_side_width(layout.left, controls.minimize, controls.maximize)
+        + linux_control_side_width(layout.right, controls.minimize, controls.maximize)
+        > 0.0
+    {
+        layout
+    } else {
+        WindowButtonLayout {
+            left: [None; 3],
+            right: [
+                Some(WindowButton::Minimize),
+                Some(WindowButton::Maximize),
+                Some(WindowButton::Close),
+            ],
+        }
+    }
+}
+
+fn titlebar_right_padding(is_windows: bool, linux_controls: f32, base: f32) -> f32 {
     base + if is_windows {
         WINDOWS_CAPTION_WIDTH
     } else {
-        0.0
+        linux_controls
+    }
+}
+
+fn client_resize_edge(
+    position: Point<Pixels>,
+    size: Size<Pixels>,
+    inset: f32,
+    tiling: Tiling,
+) -> Option<ResizeEdge> {
+    let x = f32::from(position.x);
+    let y = f32::from(position.y);
+    let width = f32::from(size.width);
+    let height = f32::from(size.height);
+    let left = x < inset && !tiling.left;
+    let right = x >= width - inset && !tiling.right;
+    let top = y < inset && !tiling.top;
+    let bottom = y >= height - inset && !tiling.bottom;
+
+    match (top, right, bottom, left) {
+        (true, false, false, true) => Some(ResizeEdge::TopLeft),
+        (true, true, false, false) => Some(ResizeEdge::TopRight),
+        (false, true, true, false) => Some(ResizeEdge::BottomRight),
+        (false, false, true, true) => Some(ResizeEdge::BottomLeft),
+        (true, _, _, _) => Some(ResizeEdge::Top),
+        (_, true, _, _) => Some(ResizeEdge::Right),
+        (_, _, true, _) => Some(ResizeEdge::Bottom),
+        (_, _, _, true) => Some(ResizeEdge::Left),
+        _ => None,
     }
 }
 
@@ -7131,17 +7394,22 @@ fn header_icon_button(
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if let Some((path, line)) = self.pending_workspace_file.take() {
+            if !self.right_pane_open(cx) {
+                self.toggle_right_pane(cx);
+            }
+            self.add_file_surface(path, line, window, cx);
+        }
         if self.window_close_pending && self.all_file_edits_flushed(cx) {
             self.window_close_pending = false;
             window.defer(cx, |window, _| window.remove_window());
         }
         let theme = Theme::of(cx);
-        // The shell tone (komet `.frost`): the surface the sidebar sits on and
-        // the main panel floats over as an inset rounded card. On macOS the
-        // window background is the blurred desktop (lib.rs `Blurred`), so the
-        // frost paints translucent — the sidebar and card margins read as
-        // glass while the opaque card keeps text off it.
-        let (frost, text, font) = (theme.glass(), theme.text, theme.font_sans.clone());
+        // Sidebar and titlebar share one opaque shell tone; the workspace card
+        // uses the separate content tone. Keeping both explicit makes their
+        // reference colors identical across platforms and Settings.
+        let (shell_surface, text, font) = (theme.surface, theme.text, theme.font_sans.clone());
+        let workspace_bg = theme.bg;
         let (workspace_scope, auth) = {
             let state = self.state.read(cx);
             (state.workspace_scope, state.auth.clone())
@@ -7200,7 +7468,7 @@ impl Render for Shell {
             .flex()
             .flex_row()
             .size_full()
-            .bg(frost)
+            .bg(shell_surface)
             .text_color(text)
             .font_family(font)
             .text_size(px(14.0))
@@ -7254,6 +7522,19 @@ impl Render for Shell {
                     composer.resubmit_last(cx);
                 });
             }));
+        let root = if let Some(path) = wallpaper::path(cx).filter(|path| path.is_file()) {
+            root.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left_0()
+                    .right_0()
+                    .child(img(path).size_full().object_fit(ObjectFit::Cover)),
+            )
+        } else {
+            root
+        };
 
         let render_gate = if restart_required {
             GatePhase::Loading
@@ -7335,17 +7616,24 @@ impl Render for Shell {
                 let overlays = self.render_overlays(window.viewport_size(), window, cx);
                 // Copied out (not held) — `render_title_bar` needs `cx` mutable.
                 let border_color = Theme::of(cx).border;
-                // No inset cards (user request): the conversation column sits
-                // flush and unbordered, the transcript directly on the frost
-                // glass; the changes pane is a flush left-bordered glass panel
-                // (built inside `render_right_pane`).
+                // The workspace is one inset surface: the transcript and any
+                // open side panel share its rounded boundary.
                 let card: AnyElement = div()
                     .flex_1()
                     .min_w_0()
+                    .mt(px(8.0))
+                    .mb(px(8.0))
+                    .ml(px(8.0))
+                    .mr(px(8.0))
                     .flex()
                     .flex_row()
                     .overflow_hidden()
+                    .rounded(px(Theme::PANEL_RADIUS))
+                    .border_1()
+                    .border_color(border_color)
+                    .bg(workspace_bg)
                     .child(main)
+                    .child(right)
                     .into_any_element();
                 // The whole app page is one keyed `animate-in` entrance (komet
                 // App.tsx `<div key={phase} className="animate-in h-full">`):
@@ -7361,29 +7649,23 @@ impl Render for Shell {
                     .flex_none()
                     .relative()
                     .child(sidebar_handle.absolute().top_0().bottom_0().left(px(-2.0)));
-                let title_bar = self.render_title_bar(cx);
-                // Sidebar tone: a slightly lighter column behind the sidebar,
-                // spanning the FULL window height (under the traffic lights,
-                // through the titlebar, down to the bottom edge). Its width
+                let (linux_left_controls, _) = self.linux_titlebar_controls_width(window, cx);
+                let title_bar = self.render_title_bar(window, cx);
+                // The sidebar and titlebar share the shell surface. Its width
                 // rides the same tween as the sidebar, so the tone melts away
                 // with the collapse instead of vanishing in a frame.
                 let sidebar_now = self.eval_tween(self.sidebar_tween, self.sidebar_target());
-                // Hairline on its right edge — full height like the tone,
-                // so the sidebar column reads as its own surface.
+                // The sidebar and titlebar are one uninterrupted shell surface.
                 let sidebar_tone = div()
                     .absolute()
                     .top_0()
                     .bottom_0()
                     .left_0()
                     .w(px(sidebar_now))
-                    .bg(crate::theme::wash(0.05))
-                    .border_r_1()
-                    .border_color(border_color);
-                // The content row spans the FULL window height — the titlebar
-                // overlays it (glass, no fill), so the transcript can scroll
-                // under the header and fade out at its edge. Columns that
-                // must NOT underlap (sidebar content, the changes panel,
-                // settings) pad themselves down by the titlebar height.
+                    .bg(shell_surface);
+                // Start the content row below the unified titlebar. The
+                // sidebar stays flush with the shell; the workspace gets its
+                // own inset and rounded boundary.
                 let explorer: AnyElement = Empty.into_any_element();
                 let page = div()
                     .size_full()
@@ -7393,14 +7675,14 @@ impl Render for Shell {
                             .size_full()
                             .flex()
                             .flex_row()
+                            .pt(px(Theme::TITLEBAR_HEIGHT))
                             .child(sidebar)
                             .child(sidebar_seam)
                             .child(explorer)
-                            .child(card)
-                            .child(right),
+                            .child(card),
                     )
                     .child(div().absolute().top_0().left_0().right_0().child(title_bar))
-                    .child(self.render_titlebar_cluster(cx))
+                    .child(self.render_titlebar_cluster(linux_left_controls, cx))
                     .children(overlays);
                 root.child(sidebar_tone)
                     .child(motion::fade_in("phase-app", page))
@@ -7462,7 +7744,48 @@ impl Render for Shell {
                     .window_control_area(WindowControlArea::Drag),
             )
         };
-        root.children(self.render_windows_caption_controls(window, cx))
+        let root = root
+            .children(self.render_windows_caption_controls(window, cx))
+            .children(self.render_linux_caption_controls(window, cx));
+        if cfg!(target_os = "linux")
+            && let Decorations::Client { tiling } = window.window_decorations()
+        {
+            const CLIENT_INSET: f32 = 10.0;
+            window.set_client_inset(px(CLIENT_INSET));
+            let bounds_size = window.window_bounds().get_bounds().size;
+            let root = root
+                .when(!tiling.top && !tiling.left, |el| {
+                    el.rounded_tl(px(Theme::PANEL_RADIUS))
+                })
+                .when(!tiling.top && !tiling.right, |el| {
+                    el.rounded_tr(px(Theme::PANEL_RADIUS))
+                })
+                .when(!tiling.bottom && !tiling.left, |el| {
+                    el.rounded_bl(px(Theme::PANEL_RADIUS))
+                })
+                .when(!tiling.bottom && !tiling.right, |el| {
+                    el.rounded_br(px(Theme::PANEL_RADIUS))
+                })
+                .overflow_hidden();
+            div()
+                .size_full()
+                .bg(gpui::transparent_black())
+                .when(!tiling.top, |el| el.pt(px(CLIENT_INSET)))
+                .when(!tiling.bottom, |el| el.pb(px(CLIENT_INSET)))
+                .when(!tiling.left, |el| el.pl(px(CLIENT_INSET)))
+                .when(!tiling.right, |el| el.pr(px(CLIENT_INSET)))
+                .on_mouse_down(MouseButton::Left, move |event, window, _| {
+                    if let Some(edge) =
+                        client_resize_edge(event.position, bounds_size, CLIENT_INSET, tiling)
+                    {
+                        window.start_window_resize(edge);
+                    }
+                })
+                .child(root)
+                .into_any_element()
+        } else {
+            root.into_any_element()
+        }
     }
 }
 
@@ -7844,8 +8167,92 @@ mod tests {
 
     #[test]
     fn windows_caption_controls_reserve_titlebar_space() {
-        assert_eq!(titlebar_right_padding(true, 16.0), 124.0);
-        assert_eq!(titlebar_right_padding(false, 16.0), 16.0);
+        assert_eq!(titlebar_right_padding(true, 0.0, 16.0), 124.0);
+        assert_eq!(titlebar_right_padding(false, 0.0, 16.0), 16.0);
+        assert_eq!(titlebar_right_padding(false, 78.0, 16.0), 94.0);
+        assert_eq!(titlebar_right_padding(true, 78.0, 16.0), 124.0);
+    }
+
+    #[test]
+    fn linux_control_width_respects_layout_and_platform_capabilities() {
+        let buttons = [
+            Some(WindowButton::Minimize),
+            Some(WindowButton::Maximize),
+            Some(WindowButton::Close),
+        ];
+        assert_eq!(linux_control_side_width(buttons, true, true), 114.0);
+        assert_eq!(linux_control_side_width(buttons, false, true), 78.0);
+        assert_eq!(linux_control_side_width([None; 3], true, true), 0.0);
+    }
+
+    #[test]
+    fn linux_empty_desktop_button_layout_uses_visible_fallback_controls() {
+        let controls = gpui::WindowControls::default();
+        let layout = effective_linux_button_layout(
+            WindowButtonLayout {
+                left: [None; 3],
+                right: [None; 3],
+            },
+            controls,
+        );
+        assert_eq!(
+            layout.right,
+            [
+                Some(WindowButton::Minimize),
+                Some(WindowButton::Maximize),
+                Some(WindowButton::Close),
+            ]
+        );
+
+        let only_close = effective_linux_button_layout(
+            WindowButtonLayout {
+                left: [None; 3],
+                right: [None; 3],
+            },
+            gpui::WindowControls {
+                minimize: false,
+                maximize: false,
+                ..controls
+            },
+        );
+        assert_eq!(
+            linux_control_side_width(only_close.right, false, false),
+            42.0
+        );
+    }
+
+    #[test]
+    fn client_resize_edges_skip_tiled_edges() {
+        let size = gpui::size(px(100.0), px(80.0));
+        assert_eq!(
+            client_resize_edge(gpui::point(px(1.0), px(1.0)), size, 8.0, Tiling::default()),
+            Some(ResizeEdge::TopLeft)
+        );
+        assert_eq!(
+            client_resize_edge(gpui::point(px(50.0), px(1.0)), size, 8.0, Tiling::default()),
+            Some(ResizeEdge::Top)
+        );
+        assert_eq!(
+            client_resize_edge(
+                gpui::point(px(50.0), px(40.0)),
+                size,
+                8.0,
+                Tiling::default()
+            ),
+            None
+        );
+        assert_eq!(
+            client_resize_edge(
+                gpui::point(px(50.0), px(1.0)),
+                size,
+                8.0,
+                Tiling {
+                    top: true,
+                    ..Tiling::default()
+                },
+            ),
+            None
+        );
     }
 
     #[test]
@@ -8094,5 +8501,14 @@ mod tests {
         assert_eq!(SettingsSection::Security.label(), "Security");
         assert!(SettingsSection::ALL.contains(&SettingsSection::Integrations));
         assert_eq!(SettingsSection::Integrations.label(), "Integrations");
+    }
+
+    #[test]
+    fn settings_navigation_is_a_flat_list_with_unique_icons() {
+        let unique_icons: std::collections::HashSet<_> = SettingsSection::ALL
+            .into_iter()
+            .map(SettingsSection::nav_icon)
+            .collect();
+        assert_eq!(unique_icons.len(), SettingsSection::ALL.len());
     }
 }

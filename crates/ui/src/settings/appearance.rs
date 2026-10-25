@@ -9,20 +9,106 @@
 //! Stateless. The choice lives in the [`crate::appearance`] globals, and
 //! `set_mode` repaints every window, so this page has nothing of its own to hold.
 
+use std::path::Path;
+
 use gpui::{
-    AnyElement, Context, Hsla, IntoElement, Render, SharedString, Window, div, prelude::*, px,
+    AnyElement, Context, Hsla, IntoElement, PathPromptOptions, Render, SharedString, Task, Window,
+    div, prelude::*, px,
 };
 
 use crate::appearance::{self, AppearanceMode};
-use crate::settings::widgets;
+use crate::icons::icon;
+use crate::settings::{wallpaper, widgets};
 use crate::theme::{Appearance, Theme};
 
-pub struct AppearancePage;
+pub struct AppearancePage {
+    picker_task: Option<Task<()>>,
+    wallpaper_error: Option<String>,
+}
 
 impl AppearancePage {
     pub fn new(_cx: &mut Context<Self>) -> Self {
-        Self
+        Self {
+            picker_task: None,
+            wallpaper_error: None,
+        }
     }
+
+    fn open_wallpaper_picker(&mut self, cx: &mut Context<Self>) {
+        let receiver = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Choose wallpaper".into()),
+        });
+        self.picker_task = Some(cx.spawn(async move |this, cx| match receiver.await {
+            Ok(Ok(Some(paths))) => {
+                let Some(path) = paths.into_iter().next() else {
+                    return;
+                };
+                let error = if !is_image_file(&path) {
+                    Some("Choose a supported image file.".to_string())
+                } else {
+                    None
+                };
+                if let Err(err) = this.update(cx, |page, cx| {
+                    if let Some(error) = error {
+                        page.wallpaper_error = Some(error);
+                    } else {
+                        page.wallpaper_error =
+                            wallpaper::set_path(Some(path), cx).err().map(|err| {
+                                tracing::warn!(error = %err, "could not save wallpaper");
+                                format!("Could not save wallpaper: {err}")
+                            });
+                    }
+                    cx.notify();
+                }) {
+                    tracing::debug!(error = %err, "appearance page closed while picking wallpaper");
+                }
+            }
+            Ok(Ok(None)) => {}
+            Ok(Err(err)) => {
+                report_picker_error(this, cx, format!("Could not open image picker: {err}"));
+            }
+            Err(err) => {
+                report_picker_error(this, cx, format!("Image picker was interrupted: {err}"));
+            }
+        }));
+    }
+
+    fn remove_wallpaper(&mut self, cx: &mut Context<Self>) {
+        self.wallpaper_error = wallpaper::set_path(None, cx).err().map(|err| {
+            tracing::warn!(error = %err, "could not remove wallpaper");
+            format!("Could not remove wallpaper: {err}")
+        });
+        cx.notify();
+    }
+}
+
+fn report_picker_error(
+    page: gpui::WeakEntity<AppearancePage>,
+    cx: &mut gpui::AsyncApp,
+    message: String,
+) {
+    tracing::warn!(error = %message, "wallpaper image picker failed");
+    if let Err(err) = page.update(cx, |page, cx| {
+        page.wallpaper_error = Some(message);
+        cx.notify();
+    }) {
+        tracing::debug!(error = %err, "appearance page closed while reporting wallpaper picker error");
+    }
+}
+
+fn is_image_file(path: &Path) -> bool {
+    path.is_file()
+        && path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                gpui::Img::extensions()
+                    .iter()
+                    .any(|supported| supported.eq_ignore_ascii_case(extension))
+            })
 }
 
 /// One placeholder bar in the miniature, width given as a fraction of its
@@ -170,6 +256,8 @@ impl Render for AppearancePage {
             .try_global::<appearance::AppearanceState>()
             .map(|state| state.system)
             .unwrap_or_default();
+        let wallpaper_path = wallpaper::path(cx);
+        let has_wallpaper = wallpaper_path.is_some();
 
         let cards = AppearanceMode::ALL.into_iter().map(|mode| {
             widgets::option_card(&theme, mode.label(), mode == current, preview(mode))
@@ -179,6 +267,16 @@ impl Render for AppearancePage {
                     cx.notify();
                 }))
         });
+
+        let wallpaper_preview = wallpaper_path
+            .as_ref()
+            .filter(|path| path.is_file())
+            .map(|path| {
+                gpui::img(path.clone())
+                    .size_full()
+                    .object_fit(gpui::ObjectFit::Cover)
+                    .into_any_element()
+            });
 
         div()
             .id("appearance-page")
@@ -204,6 +302,165 @@ impl Render for AppearancePage {
                             .gap(px(12.0))
                             .child(widgets::field_label(&theme, "Theme"))
                             .child(widgets::option_card_row().children(cards)),
+                    )
+                    .child(
+                        div()
+                            .mt(px(20.0))
+                            .flex()
+                            .flex_col()
+                            .gap(px(10.0))
+                            .child(widgets::field_label(&theme, "Wallpaper"))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap(px(12.0))
+                                    .rounded(px(12.0))
+                                    .border_1()
+                                    .border_color(theme.border)
+                                    .bg(theme.surface.opacity(0.52))
+                                    .p(px(12.0))
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap(px(10.0))
+                                            .text_size(px(13.0))
+                                            .text_color(theme.text)
+                                            .child(
+                                                div()
+                                                    .size(px(54.0))
+                                                    .rounded(px(10.0))
+                                                    .border_1()
+                                                    .border_color(theme.border)
+                                                    .overflow_hidden()
+                                                    .bg(theme.surface)
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .child(
+                                                        wallpaper_preview
+                                                            .unwrap_or_else(|| {
+                                                                icon(crate::icons::IMAGE)
+                                                                    .size(px(24.0))
+                                                                    .text_color(theme.text_muted)
+                                                                    .into_any_element()
+                                                            }),
+                                                    ),
+                                            )
+                                            .child(div().child("No image")),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_row()
+                                            .items_center()
+                                            .gap(px(8.0))
+                                            .child(
+                                                div()
+                                                    .px(px(12.0))
+                                                    .py(px(8.0))
+                                                    .rounded(px(10.0))
+                                                    .border_1()
+                                                    .border_color(theme.border)
+                                                    .bg(theme.surface_raised.opacity(0.8))
+                                                    .text_size(px(12.5))
+                                                    .text_color(theme.text)
+                                                    .child("Image"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .px(px(12.0))
+                                                    .py(px(8.0))
+                                                    .rounded(px(10.0))
+                                                    .text_size(px(12.5))
+                                                    .text_color(theme.text_muted)
+                                                    .child("Gradient"),
+                                            ),
+                                    ),
+                            )
+                            .child(
+                                if has_wallpaper {
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap(px(8.0))
+                                        .child(
+                                            widgets::ghost_action(&theme)
+                                                .id("wallpaper-choose")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.open_wallpaper_picker(cx);
+                                                }))
+                                                .child(
+                                                    icon(crate::icons::IMAGE)
+                                                        .size(px(16.0))
+                                                        .text_color(theme.text_muted),
+                                                )
+                                                .child("Choose image"),
+                                        )
+                                        .child(
+                                            widgets::ghost_action(&theme)
+                                                .id("wallpaper-remove")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.remove_wallpaper(cx);
+                                                }))
+                                                .child(
+                                                    icon(crate::icons::TRASH_BIN_MINIMALISTIC)
+                                                        .size(px(16.0))
+                                                        .text_color(theme.text_muted),
+                                                )
+                                                .child("Remove"),
+                                        )
+                                } else {
+                                    div()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap(px(8.0))
+                                        .child(
+                                            widgets::ghost_action(&theme)
+                                                .id("wallpaper-choose")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.open_wallpaper_picker(cx);
+                                                }))
+                                                .child(
+                                                    icon(crate::icons::IMAGE)
+                                                        .size(px(16.0))
+                                                        .text_color(theme.text_muted),
+                                                )
+                                                .child("Choose image"),
+                                        )
+                                        .child(
+                                            widgets::ghost_action(&theme)
+                                                .id("wallpaper-link")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.wallpaper_error = Some(
+                                                        "Remote wallpaper URLs are not yet supported in this build."
+                                                            .to_string(),
+                                                    );
+                                                    cx.notify();
+                                                }))
+                                                .child(
+                                                    icon(crate::icons::GLOBAL)
+                                                        .size(px(16.0))
+                                                        .text_color(theme.text_muted),
+                                                )
+                                                .child("From a link"),
+                                        )
+                                }
+                            )
+                            .when_some(self.wallpaper_error.clone(), |el, error| {
+                                el.child(
+                                    div()
+                                        .mt(px(4.0))
+                                        .text_size(px(12.0))
+                                        .text_color(theme.danger_muted)
+                                        .child(error),
+                                )
+                            }),
                     )
                     .child(
                         div()

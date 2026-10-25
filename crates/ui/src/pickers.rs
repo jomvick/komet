@@ -470,6 +470,8 @@ pub struct Pickers {
     refs: Loadable<Vec<RepoRef>>,
     /// Space id the `refs` slot belongs to (invalidated on space change).
     refs_space: Option<String>,
+    /// Filter the project-menu picker to refs already checked out as worktrees.
+    worktrees_only: bool,
     /// Highlighted row in the open list (keyboard nav).
     active: usize,
     /// Models-list scroll — keyboard nav keeps the highlighted row in view
@@ -553,15 +555,18 @@ impl Pickers {
                 this.config.model_options.clear();
                 this.switch_error = None;
             }
-            // A space switch invalidates the branch draft + cache — the folder
-            // (and possibly the device) changed under them.
+            // A space switch invalidates the branch draft. Keep refs only when
+            // they were already loaded for the target space.
             let space = state.read(cx).selected_space.clone();
             if space != this.space_owner {
+                let refs_match = space.is_some() && this.refs_space.as_deref() == space.as_deref();
                 this.space_owner = space;
                 this.config.branch = None;
                 this.config.checkout = CheckoutKind::default();
-                this.refs = Loadable::Idle;
-                this.refs_space = None;
+                if !refs_match {
+                    this.refs = Loadable::Idle;
+                    this.refs_space = None;
+                }
                 // Catalogs are per-DEVICE (fetched from the space's host):
                 // a space switch may land on another device, so refetch.
                 this.harnesses = Loadable::Idle;
@@ -633,6 +638,7 @@ impl Pickers {
             models_loaded_at: HashMap::new(),
             refs: Loadable::Idle,
             refs_space: None,
+            worktrees_only: false,
             active: 0,
             model_scroll: gpui::ScrollHandle::new(),
             search,
@@ -883,7 +889,15 @@ impl Pickers {
         }
     }
 
+    pub fn open_worktree_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle(PickerKind::Branch, window, cx);
+        self.worktrees_only = true;
+        self.active = self.selected_ref_index(cx);
+        cx.notify();
+    }
+
     fn toggle(&mut self, kind: PickerKind, window: &mut Window, cx: &mut Context<Self>) {
+        self.worktrees_only = false;
         // A press that found this picker open used to close it — but the
         // trigger chip must stay clickable even while its popover is
         // mounted. Clicking the active chip is now a no-op; the picker
@@ -1189,6 +1203,10 @@ impl Pickers {
         let Some(space) = self.state.read(cx).selected_space_row().cloned() else {
             return;
         };
+        self.ensure_refs_for_space(space, force, cx);
+    }
+
+    fn ensure_refs_for_space(&mut self, space: Space, force: bool, cx: &mut Context<Self>) {
         if !space.git_detected {
             return;
         }
@@ -1251,6 +1269,43 @@ impl Pickers {
             })
             .ok();
         }));
+    }
+
+    pub fn prepare_worktree_menu(&mut self, space: Space, cx: &mut Context<Self>) {
+        self.worktrees_only = true;
+        self.ensure_refs_for_space(space, true, cx);
+    }
+
+    pub fn retry_worktree_menu(&mut self, space: Space, cx: &mut Context<Self>) {
+        self.worktrees_only = true;
+        self.ensure_refs_for_space(space, true, cx);
+    }
+
+    pub fn worktree_menu_refs(&self, space_id: &str) -> Loadable<Vec<RepoRef>> {
+        if self.refs_space.as_deref() != Some(space_id) {
+            return Loadable::Loading;
+        }
+        match &self.refs {
+            Loadable::Idle | Loadable::Loading => Loadable::Loading,
+            Loadable::Error(message) => Loadable::Error(message.clone()),
+            Loadable::Ready(refs) => Loadable::Ready(
+                refs.iter()
+                    .filter(|row| row.worktree_path.is_some())
+                    .cloned()
+                    .collect(),
+            ),
+        }
+    }
+
+    pub fn select_worktree_from_menu(&mut self, branch: &str, cx: &mut Context<Self>) {
+        let Some(row) = self.refs.ready().and_then(|refs| {
+            refs.iter()
+                .find(|row| row.name == branch && row.worktree_path.is_some())
+        }) else {
+            return;
+        };
+        self.pick_ref(row.clone(), cx);
+        self.worktrees_only = false;
     }
 
     // ---- selections ----
@@ -1741,11 +1796,15 @@ impl Pickers {
         let Some(refs) = self.refs.ready() else {
             return Vec::new();
         };
+        let refs: Vec<&RepoRef> = refs
+            .iter()
+            .filter(|row| !self.worktrees_only || row.worktree_path.is_some())
+            .collect();
         let names: Vec<String> = refs.iter().map(|r| r.name.clone()).collect();
         let query = self.search.read(cx).text().to_string();
         popover::filter_indices(&query, &names)
             .into_iter()
-            .map(|ix| refs[ix].clone())
+            .map(|ix| refs[ix].to_owned())
             .collect()
     }
 
@@ -2861,7 +2920,11 @@ impl Pickers {
                     .p(px(Theme::SPACE_SM))
                     .text_size(px(12.0))
                     .text_color(theme.text_faint)
-                    .child(SharedString::from("No refs found."))
+                    .child(SharedString::from(if self.worktrees_only {
+                        "No worktrees found."
+                    } else {
+                        "No refs found."
+                    }))
                     .into_any_element(),
                 Loadable::Ready(_) => {
                     let active = self.active;

@@ -1015,6 +1015,134 @@ impl EngineRpc {
             other => Err(RpcError::UnknownMethod(other.to_string())),
         }
     }
+
+    fn composio_api(&self) -> Result<crate::composio::ComposioApi, RpcError> {
+        let api_key = self
+            .mcp_secrets()?
+            .composio_platform_api_key()
+            .map_err(|error| RpcError::Failed(format!("Composio credential store: {error}")))?
+            .ok_or_else(|| {
+                RpcError::Failed("Composio Platform API key is not configured".into())
+            })?;
+        crate::composio::ComposioApi::new(api_key, self.engine_info.device_id.clone())
+            .map_err(|error| RpcError::Failed(format!("Composio configuration: {error}")))
+    }
+
+    async fn handle_composio(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<RpcReply, RpcError> {
+        match method {
+            methods::GET_COMPOSIO_STATUS => {
+                let configured = self
+                    .mcp_secrets()?
+                    .composio_platform_api_key()
+                    .map_err(|error| {
+                        RpcError::Failed(format!("Composio credential store: {error}"))
+                    })?
+                    .is_some();
+                RpcReply::value(&serde_json::json!({ "configured": configured }))
+            }
+            methods::SAVE_COMPOSIO_API_KEY => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct Params {
+                    api_key: String,
+                }
+                let Params { api_key } = parse_params(params)?;
+                let api = crate::composio::ComposioApi::new(
+                    api_key.clone(),
+                    self.engine_info.device_id.clone(),
+                )
+                .map_err(|error| RpcError::BadParams(error.to_string()))?;
+                api.validate_key().await.map_err(|error| {
+                    RpcError::Failed(format!("Composio key validation failed: {error}"))
+                })?;
+                self.mcp_secrets()?
+                    .set_composio_platform_api_key(&api_key)
+                    .map_err(|error| {
+                        RpcError::Failed(format!("Composio credential store: {error}"))
+                    })?;
+                RpcReply::value(&serde_json::json!({ "configured": true }))
+            }
+            methods::DELETE_COMPOSIO_API_KEY => {
+                self.mcp_secrets()?
+                    .delete_composio_platform_api_key()
+                    .map_err(|error| {
+                        RpcError::Failed(format!("Composio credential store: {error}"))
+                    })?;
+                RpcReply::value(&serde_json::json!({ "configured": false }))
+            }
+            methods::SEARCH_COMPOSIO_INTEGRATIONS => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct Params {
+                    #[serde(default)]
+                    query: String,
+                }
+                let Params { query } = parse_params(params)?;
+                if query.chars().count() > 80 {
+                    return Err(RpcError::BadParams(
+                        "Composio search query exceeds 80 characters".into(),
+                    ));
+                }
+                let integrations = self
+                    .composio_api()?
+                    .search_toolkits(query.trim())
+                    .await
+                    .map_err(|error| {
+                        RpcError::Failed(format!("Composio search failed: {error}"))
+                    })?;
+                RpcReply::value(&serde_json::json!({ "integrations": integrations }))
+            }
+            methods::LIST_COMPOSIO_ACCOUNTS => {
+                let accounts =
+                    self.composio_api()?
+                        .connected_accounts()
+                        .await
+                        .map_err(|error| {
+                            RpcError::Failed(format!("Composio account lookup failed: {error}"))
+                        })?;
+                RpcReply::value(&serde_json::json!({ "accounts": accounts }))
+            }
+            methods::CONNECT_COMPOSIO_INTEGRATION => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct Params {
+                    toolkit_slug: String,
+                }
+                let Params { toolkit_slug } = parse_params(params)?;
+                let link = self
+                    .composio_api()?
+                    .connect(&toolkit_slug)
+                    .await
+                    .map_err(|error| {
+                        RpcError::Failed(format!("Composio connection could not start: {error}"))
+                    })?;
+                RpcReply::value(&serde_json::json!({
+                    "url": link.url,
+                    "connectedAccountId": link.connected_account_id
+                }))
+            }
+            methods::DISCONNECT_COMPOSIO_ACCOUNT => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct Params {
+                    account_id: String,
+                }
+                let Params { account_id } = parse_params(params)?;
+                self.composio_api()?
+                    .disconnect(&account_id)
+                    .await
+                    .map_err(|error| {
+                        RpcError::Failed(format!("Composio account disconnect failed: {error}"))
+                    })?;
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            other => Err(RpcError::UnknownMethod(other.to_string())),
+        }
+    }
 }
 
 /// ControlRpc methods that honor `targetDeviceId` (feature-inventory §2.1). Extend this
@@ -1342,6 +1470,19 @@ impl RpcService for EngineRpc {
             }
             let registry = self.mcp_registry()?;
             return self.handle_mcp(registry, method, params).await;
+        }
+        let is_composio_method = matches!(
+            method,
+            methods::GET_COMPOSIO_STATUS
+                | methods::SAVE_COMPOSIO_API_KEY
+                | methods::DELETE_COMPOSIO_API_KEY
+                | methods::SEARCH_COMPOSIO_INTEGRATIONS
+                | methods::LIST_COMPOSIO_ACCOUNTS
+                | methods::CONNECT_COMPOSIO_INTEGRATION
+                | methods::DISCONNECT_COMPOSIO_ACCOUNT
+        );
+        if is_composio_method {
+            return self.handle_composio(method, params).await;
         }
         match method {
             methods::ENGINE_INFO => RpcReply::value(&self.engine_info),

@@ -15,6 +15,11 @@ use std::ops::Range;
 
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag};
 
+/// Internal destination used for a workspace file cited by an agent. This is
+/// deliberately separate from `file:`: destinations always stay relative to
+/// the active workspace and the UI never asks the OS to open them.
+pub const WORKSPACE_FILE_SCHEME: &str = "komet-file:";
+
 // ---------------------------------------------------------------------------
 // Tree model
 // ---------------------------------------------------------------------------
@@ -381,7 +386,121 @@ fn parse_inline_container(cur: &mut Cursor, style: &InlineStyle) -> Vec<InlineRu
     // Autolink AFTER merging: pulldown splits Text events at would-be
     // emphasis chars ("…/Foo_(bar)" arrives as three events), so scanning
     // per-event would truncate URLs at every underscore.
-    autolink_runs(merge_runs(runs))
+    workspace_file_runs(autolink_runs(merge_runs(runs)))
+}
+
+/// Turn conservative workspace-file references in prose into internal links.
+/// A candidate must be a safe relative path with an extension (or a recognised
+/// root manifest); absolute and parent-traversal paths are always plain text.
+fn workspace_file_runs(runs: Vec<InlineRun>) -> Vec<InlineRun> {
+    let mut out = Vec::new();
+    for run in runs {
+        if run.style.link.is_some() || run.style.code {
+            out.push(run);
+        } else {
+            push_workspace_file_runs(&mut out, &run.text, &run.style);
+        }
+    }
+    merge_runs(out)
+}
+
+fn push_workspace_file_runs(out: &mut Vec<InlineRun>, text: &str, style: &InlineStyle) {
+    let mut cursor = 0;
+    for token in text.split_inclusive(char::is_whitespace) {
+        let bare_end = token.trim_end_matches(char::is_whitespace).len();
+        let bare = &token[..bare_end];
+        let suffix = &token[bare_end..];
+        let prefix_len = bare.len() - bare.trim_start_matches(['(', '[']).len();
+        let trimmed = bare[prefix_len..].trim_end_matches([')', ']', ',', ';', '.', ':', '!', '?']);
+        if let Some((path, line)) = parse_workspace_file_reference(trimmed) {
+            if prefix_len > 0 {
+                out.push(InlineRun {
+                    text: bare[..prefix_len].to_string(),
+                    style: style.clone(),
+                });
+            }
+            let label_end = prefix_len + trimmed.len();
+            out.push(InlineRun {
+                text: bare[prefix_len..label_end].to_string(),
+                style: InlineStyle {
+                    link: Some(workspace_file_destination(&path, line)),
+                    ..style.clone()
+                },
+            });
+            if label_end < bare.len() {
+                out.push(InlineRun {
+                    text: bare[label_end..].to_string(),
+                    style: style.clone(),
+                });
+            }
+        } else if !bare.is_empty() {
+            out.push(InlineRun {
+                text: bare.to_string(),
+                style: style.clone(),
+            });
+        }
+        if !suffix.is_empty() {
+            out.push(InlineRun {
+                text: suffix.to_string(),
+                style: style.clone(),
+            });
+        }
+        cursor += token.len();
+    }
+    debug_assert_eq!(cursor, text.len());
+}
+
+fn workspace_file_destination(path: &str, line: Option<u32>) -> String {
+    match line {
+        Some(line) => format!("{WORKSPACE_FILE_SCHEME}{path}:{line}"),
+        None => format!("{WORKSPACE_FILE_SCHEME}{path}"),
+    }
+}
+
+/// Parse an internal workspace file destination or a prose path. Exposed for
+/// the renderer so user interaction receives only a validated relative path.
+pub fn parse_workspace_file_reference(value: &str) -> Option<(String, Option<u32>)> {
+    let value = value.strip_prefix(WORKSPACE_FILE_SCHEME).unwrap_or(value);
+    fn parse_line<'a>(path: &'a str, line: &str) -> Option<(&'a str, Option<u32>)> {
+        let line = line.split_once("-L").map_or(line, |(line, _)| line);
+        line.parse::<u32>()
+            .ok()
+            .filter(|line| *line > 0)
+            .map(|line| (path, Some(line)))
+    }
+    let line_reference = value
+        .rsplit_once("#L")
+        .and_then(|(path, line)| parse_line(path, line))
+        .or_else(|| {
+            value
+                .rsplit_once(':')
+                .and_then(|(path, line)| parse_line(path, line))
+        });
+    let (path, line) = line_reference.unwrap_or((value, None));
+    let root_manifest = matches!(path, "Cargo.toml" | "README.md" | "ARCHITECTURE.md");
+    let has_extension = path.rsplit('/').next().is_some_and(|name| {
+        name.rsplit_once('.').is_some_and(|(_, extension)| {
+            extension.starts_with(|c: char| c.is_ascii_alphabetic())
+                && (path.contains('/')
+                    || [
+                        "c", "cc", "cpp", "css", "csv", "go", "h", "hpp", "html", "java", "js",
+                        "json", "jsx", "kt", "lock", "md", "mdx", "mjs", "mts", "php", "py", "rb",
+                        "rs", "sass", "scala", "scss", "sh", "sql", "svelte", "swift", "toml",
+                        "ts", "tsx", "txt", "vue", "xml", "yaml", "yml",
+                    ]
+                    .iter()
+                    .any(|known| extension.eq_ignore_ascii_case(known)))
+        })
+    });
+    let safe = !path.is_empty()
+        && !path.starts_with('/')
+        && !path.contains('\\')
+        && !path.contains(':')
+        && !path.chars().any(char::is_control)
+        && path
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..");
+    (safe && (has_extension || root_manifest)).then(|| (path.to_string(), line))
 }
 
 fn parse_inline_event(cur: &mut Cursor, runs: &mut Vec<InlineRun>, style: &InlineStyle) {
@@ -933,6 +1052,61 @@ mod tests {
             .expect("link run");
         assert_eq!(link.text, "zed");
         assert_eq!(link.style.link.as_deref(), Some("https://zed.dev"));
+    }
+
+    #[test]
+    fn workspace_file_references_become_internal_links() {
+        assert_eq!(
+            only_link("Open crates/ui/src/shell.rs:42.\n"),
+            Some((
+                "crates/ui/src/shell.rs:42".into(),
+                "komet-file:crates/ui/src/shell.rs:42".into()
+            ))
+        );
+        assert_eq!(
+            parse_workspace_file_reference("komet-file:crates/ui/src/shell.rs:42"),
+            Some(("crates/ui/src/shell.rs".into(), Some(42)))
+        );
+        assert_eq!(
+            parse_workspace_file_reference("crates/ui/src/shell.rs#L42-L45"),
+            Some(("crates/ui/src/shell.rs".into(), Some(42)))
+        );
+        assert_eq!(
+            only_link("Open crates/ui/src/shell.rs#L42-L45.\n"),
+            Some((
+                "crates/ui/src/shell.rs#L42-L45".into(),
+                "komet-file:crates/ui/src/shell.rs:42".into()
+            ))
+        );
+        assert_eq!(
+            only_link("Open .github/workflows/ci.yml\n"),
+            Some((
+                ".github/workflows/ci.yml".into(),
+                "komet-file:.github/workflows/ci.yml".into()
+            ))
+        );
+        assert_eq!(
+            only_link("Open src/main.rs: \n"),
+            Some(("src/main.rs".into(), "komet-file:src/main.rs".into()))
+        );
+        assert_eq!(
+            only_link("Open .src/é.rsé\n"),
+            Some((".src/é.rsé".into(), "komet-file:.src/é.rsé".into()))
+        );
+    }
+
+    #[test]
+    fn workspace_file_references_reject_unsafe_paths() {
+        assert_eq!(parse_workspace_file_reference("/tmp/secret.rs"), None);
+        assert_eq!(parse_workspace_file_reference("../secret.rs"), None);
+        assert_eq!(parse_workspace_file_reference("src\\secret.rs"), None);
+        assert_eq!(parse_workspace_file_reference("C:/Users/x.rs"), None);
+        assert_eq!(parse_workspace_file_reference("foo.rs:42-45"), None);
+        assert_eq!(parse_workspace_file_reference("e.g."), None);
+        assert_eq!(parse_workspace_file_reference("i.e."), None);
+        assert_eq!(parse_workspace_file_reference("3.14"), None);
+        assert_eq!(parse_workspace_file_reference("v2.0"), None);
+        assert_eq!(parse_workspace_file_reference("example.com"), None);
     }
 
     /// The paragraph's single link run: (text, url).

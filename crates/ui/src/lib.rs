@@ -47,7 +47,10 @@ pub mod transcript;
 use std::borrow::Cow;
 use std::path::PathBuf;
 
-use gpui::{App, AppContext as _, Bounds, TitlebarOptions, WindowBounds, WindowOptions, px, size};
+use gpui::{
+    App, AppContext as _, Bounds, TitlebarOptions, WindowBounds, WindowDecorations, WindowOptions,
+    px, size,
+};
 
 /// Embedded UI fonts — Geist and Geist Mono (variable), © Vercel Inc.,
 /// licensed under the SIL Open Font License 1.1 (https://openfontlicense.org).
@@ -150,11 +153,9 @@ pub fn run_app(config: UiConfig) {
         // final one on the very first frame, or the window flashes the wrong
         // palette while settings load.
         let data_dir = config.boot().data_dir.clone();
-        appearance::init(
-            settings::UiSettings::load(&data_dir).appearance,
-            data_dir,
-            cx,
-        );
+        let ui_settings = settings::UiSettings::load(&data_dir);
+        settings::wallpaper::init(ui_settings.wallpaper_path.clone(), data_dir.clone(), cx);
+        appearance::init(ui_settings.appearance, data_dir, cx);
         composer::init(cx);
         terminal::panel::init(cx);
         app_menus::init(cx);
@@ -216,9 +217,12 @@ fn open_main_window(state: gpui::Entity<state::AppState>, boot: EngineBootConfig
             // macOS: frameless-inset chrome like the original Electron app
             // (`titleBarStyle: "hiddenInset"`, traffic lights at 14,15 —
             // feature-inventory §1.1). No title text — the strip is
-            // custom-drawn (zed sets `title: None` the same way). On
-            // Linux/Windows `appears_transparent` hides the system titlebar
-            // for our custom-drawn chrome; harmless where unsupported.
+            // custom-drawn (zed sets `title: None` the same way). Windows
+            // also hides the system caption so Komet's titlebar and caption
+            // controls form one surface. Linux requests client decorations;
+            // Wayland supports this, while an X11 window manager without CSD
+            // support can fall back to server decorations. `appears_transparent`
+            // is unsupported on Linux.
             titlebar: Some(TitlebarOptions {
                 title: None,
                 appears_transparent: true,
@@ -226,6 +230,7 @@ fn open_main_window(state: gpui::Entity<state::AppState>, boot: EngineBootConfig
                 // shifted 4px down, lights ~12px tall → center 22).
                 traffic_light_position: Some(gpui::point(px(14.), px(14.))),
             }),
+            window_decorations: cfg!(target_os = "linux").then_some(WindowDecorations::Client),
             // Our own titlebar strip drags the window (WindowControlArea::
             // Drag + start_window_move) — mark the content view app-owned
             // so AppKit neither dead-zones the strip nor delays clicks.

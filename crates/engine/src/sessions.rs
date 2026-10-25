@@ -34,11 +34,12 @@ use komet_proto::{
     UserInputAnswer, UserInputQuestion,
 };
 
+use crate::composio::ComposioApi;
 use crate::doc_host::{ChatDocHandle, DocHost};
 use crate::mcp::catalog::McpCatalog;
 use crate::mcp::host::EngineMcpHost;
 use crate::mcp::policy::McpPolicy;
-use crate::mcp::server::{AskDecision, McpEndpoint, RunningEndpoint};
+use crate::mcp::server::{AskDecision, AskFn, McpEndpoint, PermissionAsk, RunningEndpoint};
 use crate::mcp::{McpRegistry, McpSecretStore, ResolvedMcpServer};
 use crate::registry::HarnessRegistry;
 use crate::run_journal::RunJournal;
@@ -63,6 +64,48 @@ pub enum SteerOutcome {
 type PendingInputs = Arc<Mutex<HashMap<String, oneshot::Sender<Vec<UserInputAnswer>>>>>;
 type PendingPermissionChoices =
     Arc<Mutex<HashMap<String, oneshot::Sender<komet_proto::PermissionChoice>>>>;
+
+struct McpPermissionCancellation {
+    pending: PendingPermissionChoices,
+    engine_tx: mpsc::UnboundedSender<AgentEvent>,
+    sessions: SessionsEngine,
+    chat_id: String,
+    request_id: String,
+}
+
+impl Drop for McpPermissionCancellation {
+    fn drop(&mut self) {
+        let Some(resolver) = lock(&self.pending).remove(&self.request_id) else {
+            return;
+        };
+        drop(resolver);
+        let choice = komet_proto::PermissionChoice::Deny;
+        let _ = self.engine_tx.send(AgentEvent::PermissionResolved {
+            request_id: self.request_id.clone(),
+            choice,
+        });
+        match self.sessions.doc_handle(&self.chat_id) {
+            Ok(handle) => {
+                if let Err(error) = handle.doc().resolve_permission(&self.request_id) {
+                    tracing::warn!(
+                        chat = %self.chat_id,
+                        request = %self.request_id,
+                        error = %error,
+                        "failed to resolve cancelled MCP permission"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    chat = %self.chat_id,
+                    request = %self.request_id,
+                    error = %error,
+                    "failed to find document for cancelled MCP permission"
+                );
+            }
+        }
+    }
+}
 
 /// A harness-native session id plus the cwd it was created under. Harness
 /// session stores are cwd-scoped (claude keys conversations by project
@@ -318,23 +361,61 @@ impl SessionsEngine {
     /// Per-run localhost Komet MCP. Bind failure is visible then the run
     /// continues without internal tools — the agent's own MCP config is
     /// unaffected.
-    async fn start_internal_mcp(&self, chat_id: &str, run_id: &str) -> Option<RunningEndpoint> {
+    async fn start_internal_mcp(
+        &self,
+        chat_id: &str,
+        run_id: &str,
+        ask: AskFn,
+    ) -> Option<RunningEndpoint> {
         let Some(workspace) = self.inner.workspace() else {
             tracing::warn!(chat = %chat_id, "internal MCP skipped: workspace not wired");
             return None;
         };
-        let catalog = Arc::new(McpCatalog::komet_default(Arc::new(EngineMcpHost::new(
-            self.clone(),
-            workspace,
-        ))));
-        match McpEndpoint::start(
-            run_id,
-            catalog,
-            McpPolicy::komet_default(),
-            Arc::new(|_| Box::pin(async { AskDecision::Deny })),
-        )
-        .await
-        {
+        let mut catalog =
+            McpCatalog::komet_default(Arc::new(EngineMcpHost::new(self.clone(), workspace)));
+        match self.inner.mcp_secrets.composio_platform_api_key() {
+            Ok(Some(api_key)) => {
+                let api = ComposioApi::new(api_key, self.inner.device_id.clone());
+                let session = match api {
+                    Ok(api) => {
+                        match tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                            let session = api.create_session().await?;
+                            let tools = session.tools().await?;
+                            Ok::<_, anyhow::Error>((session, tools))
+                        })
+                        .await
+                        {
+                            Ok(result) => result,
+                            Err(_) => Err(anyhow::anyhow!("Composio startup timed out")),
+                        }
+                    }
+                    Err(error) => Err(error),
+                };
+                match session {
+                    Ok((session, tools)) => {
+                        catalog = catalog.with_composio(session, tools);
+                    }
+                    Err(error) => {
+                        let message = format!("Composio tools unavailable: {error}");
+                        tracing::warn!(chat = %chat_id, error = %error, "Composio session unavailable");
+                        self.inner.publish(
+                            chat_id,
+                            &AgentEvent::Error {
+                                message,
+                                kind: ErrorKind::Unknown,
+                                detail: None,
+                                retryable: true,
+                            },
+                        );
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::warn!(chat = %chat_id, error = %error, "Composio credential unavailable");
+            }
+        }
+        match McpEndpoint::start(run_id, Arc::new(catalog), McpPolicy::komet_default(), ask).await {
             Ok(endpoint) => Some(endpoint),
             Err(err) => {
                 let message = format!("Komet MCP unavailable: {err}");
@@ -438,12 +519,12 @@ impl SessionsEngine {
         startup_retry: bool,
     ) -> Result<String, EngineError> {
         // External server secrets are resolved on the host immediately before
-        // launch. The Composio key never enters chat state or sync documents.
-        let composio_allowed = composio_supported_by_harness(harness_id);
+        // launch. Composio is handled by Komet's own MCP bridge so tool calls
+        // can pass through the permission panel instead of reaching it directly.
         request.mcp_external = self
             .prepare_mcp_for_run(chat_id)
             .into_iter()
-            .filter(|server| server.config.id != "composio" || composio_allowed)
+            .filter(|server| server.config.id != "composio")
             .map(resolved_mcp_to_proto)
             .collect();
         // Project-less chats store cwd `~` (the creating device can't know the
@@ -676,15 +757,6 @@ impl SessionsEngine {
             resume_injected = request.resume.is_some();
         }
         let run_id = new_id();
-        let internal_mcp = self.start_internal_mcp(chat_id, &run_id).await;
-        if let Some(endpoint) = internal_mcp.as_ref() {
-            request.mcp = Some(komet_proto::McpInjection {
-                server_name: "komet".into(),
-                url: endpoint.url().to_string(),
-                auth_token: endpoint.auth_token().to_string(),
-            });
-        }
-        lock(&self.inner.last_requests).insert(chat_id.to_string(), request.clone());
         let (steer_tx, steer_rx) = mpsc::channel::<SteerMessage>(32);
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let (engine_tx, engine_rx) = mpsc::unbounded_channel::<AgentEvent>();
@@ -711,7 +783,7 @@ impl SessionsEngine {
         // request id, park the resolver for `respond_permission`, and surface
         // `PermissionRequested` through the run pipeline (mirror of the input
         // bridge above).
-        let request_permission = {
+        let request_permission = Arc::new({
             let pending = pending_permissions.clone();
             let engine_tx = engine_tx.clone();
             let sessions = self.clone();
@@ -743,34 +815,83 @@ impl SessionsEngine {
                     if let Some(timeout) = permission_timeout {
                         let watchdog_sessions = sessions.clone();
                         let watchdog_chat = chat.clone();
+                        let watchdog_request_id = request_id.clone();
                         tokio::spawn(async move {
                             tokio::time::sleep(timeout).await;
                             if let Ok(true) = watchdog_sessions.respond_permission(
                                 &watchdog_chat,
-                                &request_id,
+                                &watchdog_request_id,
                                 komet_proto::PermissionChoice::Deny,
                             ) {
                                 // The doc part must resolve too, or a dead
                                 // approval panel would keep rendering.
                                 if let Ok(handle) = watchdog_sessions.doc_handle(&watchdog_chat) {
-                                    let _ = handle.doc().resolve_permission(&request_id.clone());
+                                    let _ = handle.doc().resolve_permission(&watchdog_request_id);
                                 }
                                 tracing::info!(
                                     chat = %watchdog_chat,
-                                    request = %request_id,
+                                    request = %watchdog_request_id,
                                     "permission auto-denied: bridge timeout"
                                 );
                             }
                         });
                     }
-                    rx
+                    (request_id, rx)
                 },
             )
+        });
+        let mcp_ask: AskFn = {
+            let request_permission = request_permission.clone();
+            let pending = pending_permissions.clone();
+            let engine_tx = engine_tx.clone();
+            let sessions = self.clone();
+            let chat = chat_id.to_string();
+            Arc::new(move |ask: PermissionAsk| {
+                let (request_id, receiver) = request_permission(
+                    komet_proto::PermissionKind::Tool {
+                        name: format!("{}: {}", ask.server, ask.tool),
+                    },
+                    ask.summary,
+                    vec![
+                        komet_proto::PermissionChoice::Allow,
+                        komet_proto::PermissionChoice::Deny,
+                    ],
+                );
+                let cancellation = McpPermissionCancellation {
+                    pending: pending.clone(),
+                    engine_tx: engine_tx.clone(),
+                    sessions: sessions.clone(),
+                    chat_id: chat.clone(),
+                    request_id,
+                };
+                Box::pin(async move {
+                    let _cancellation = cancellation;
+                    match receiver.await {
+                        Ok(komet_proto::PermissionChoice::Allow) => AskDecision::Allow,
+                        Ok(komet_proto::PermissionChoice::AllowAlways { .. }) => {
+                            AskDecision::AllowSession
+                        }
+                        Ok(komet_proto::PermissionChoice::Deny) | Err(_) => AskDecision::Deny,
+                    }
+                })
+            })
         };
+        let internal_mcp = self.start_internal_mcp(chat_id, &run_id, mcp_ask).await;
+        if let Some(endpoint) = internal_mcp.as_ref() {
+            request.mcp = Some(komet_proto::McpInjection {
+                server_name: "komet".into(),
+                url: endpoint.url().to_string(),
+                auth_token: endpoint.auth_token().to_string(),
+            });
+        }
+        lock(&self.inner.last_requests).insert(chat_id.to_string(), request.clone());
         let interrupt_token = CancellationToken::new();
         let controls = RunControls {
             request_input,
-            request_permission,
+            request_permission: Box::new({
+                let request_permission = request_permission.clone();
+                move |kind, summary, choices| request_permission(kind, summary, choices).1
+            }),
             steering: steer_rx,
             interrupt: interrupt_token.clone(),
         };
@@ -1168,11 +1289,6 @@ impl SessionsEngine {
     fn set_status(&self, chat_id: &str, status: SessionStatus, fresh_start: bool) {
         self.inner.set_status(chat_id, status, fresh_start);
     }
-}
-
-fn composio_supported_by_harness(harness_id: HarnessId) -> bool {
-    harness_id != HarnessId::ClaudeCode
-        && komet_harness::capabilities::supports_dynamic_mcp(harness_id).0
 }
 
 fn resolved_mcp_to_proto(server: crate::mcp::ResolvedMcpServer) -> komet_proto::ResolvedMcpServer {
@@ -2405,6 +2521,34 @@ mod tests {
         )
     }
 
+    #[test]
+    fn dropping_mcp_permission_cleans_up_pending_request_without_interrupting() {
+        let (_dir, sessions) = test_engine();
+        let pending: PendingPermissionChoices = Arc::default();
+        let (resolver, mut receiver) = oneshot::channel();
+        let request_id = "permission-1".to_string();
+        lock(&pending).insert(request_id.clone(), resolver);
+        let (engine_tx, mut engine_rx) = mpsc::unbounded_channel();
+
+        drop(McpPermissionCancellation {
+            pending: pending.clone(),
+            engine_tx,
+            sessions,
+            chat_id: "chat-1".into(),
+            request_id: request_id.clone(),
+        });
+
+        assert!(!lock(&pending).contains_key(&request_id));
+        assert!(receiver.try_recv().is_err());
+        assert!(matches!(
+            engine_rx.try_recv(),
+            Ok(AgentEvent::PermissionResolved {
+                request_id: resolved_id,
+                choice: komet_proto::PermissionChoice::Deny,
+            }) if resolved_id == request_id
+        ));
+    }
+
     fn native_window(used: u64, input: u64, output: u64) -> AgentEvent {
         AgentEvent::ContextWindow {
             stats: ContextUsageStats::window(
@@ -2627,14 +2771,6 @@ mod tests {
             mcp: None,
             mcp_external: Vec::new(),
         }
-    }
-
-    #[test]
-    fn composio_is_available_only_on_safe_dynamic_mcp_harnesses() {
-        assert!(composio_supported_by_harness(HarnessId::Opencode));
-        assert!(composio_supported_by_harness(HarnessId::Cline));
-        assert!(!composio_supported_by_harness(HarnessId::ClaudeCode));
-        assert!(!composio_supported_by_harness(HarnessId::Codex));
     }
 
     #[tokio::test]

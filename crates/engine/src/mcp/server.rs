@@ -307,7 +307,7 @@ async fn handle_conn(
                 .unwrap_or(serde_json::Value::Object(Default::default()));
             // policy check
             let definition = catalog.list().into_iter().find(|t| t.name == tool_name);
-            let readonly = definition.as_ref().map(|d| d.readonly).unwrap_or(false);
+            let readonly = definition.is_some() && catalog.is_readonly(&tool_name, &arguments);
             let decision = policy
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
