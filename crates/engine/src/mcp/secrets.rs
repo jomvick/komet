@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 
 const COMPOSIO_SERVER_ID: &str = "composio";
 const COMPOSIO_KEY: &str = "x-consumer-api-key";
+const COMPOSIO_PLATFORM_API_KEY: &str = "composio-platform-api-key";
 const KEYRING_SERVICE: &str = "dev.komet.mcp";
 
 trait CredentialBackend: Send + Sync {
@@ -40,9 +41,9 @@ impl CredentialBackend for SystemCredentialBackend {
 
 /// Local secret store for MCP servers.
 ///
-/// Generic MCP values use an atomically replaced 0600 JSON file. Composio's
-/// consumer key is stored only in the OS credential store. Values leave these
-/// stores only through `resolve` for in-memory provider launch.
+/// Generic MCP values use an atomically replaced 0600 JSON file. Composio
+/// credentials use the OS credential store; the Platform key is read only by
+/// the Composio API client, while legacy MCP secrets are resolved for launch.
 pub struct McpSecretStore {
     path: PathBuf,
     /// outer key = server id, inner = secret key -> value (header name or env var).
@@ -154,6 +155,22 @@ impl McpSecretStore {
     /// Create with default path and load.
     pub fn with_default_path() -> Self {
         Self::new(Self::default_path())
+    }
+
+    pub fn composio_platform_api_key(&self) -> anyhow::Result<Option<String>> {
+        self.credentials.get(COMPOSIO_PLATFORM_API_KEY)
+    }
+
+    pub fn set_composio_platform_api_key(&self, value: &str) -> anyhow::Result<()> {
+        let value = value.trim();
+        if value.is_empty() {
+            anyhow::bail!("Composio Platform API key cannot be empty");
+        }
+        self.credentials.set(COMPOSIO_PLATFORM_API_KEY, value)
+    }
+
+    pub fn delete_composio_platform_api_key(&self) -> anyhow::Result<()> {
+        self.credentials.delete(COMPOSIO_PLATFORM_API_KEY)
     }
 
     fn load(&mut self) -> anyhow::Result<()> {
@@ -384,6 +401,31 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn composio_platform_key_uses_os_credential_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp-secrets.json");
+        let backend = Arc::new(MemoryCredentialBackend::default());
+        let store = McpSecretStore::with_backend(&path, backend.clone());
+
+        store
+            .set_composio_platform_api_key("platform-secret")
+            .unwrap();
+        assert_eq!(
+            store.composio_platform_api_key().unwrap().as_deref(),
+            Some("platform-secret")
+        );
+        assert!(
+            !path.exists()
+                || !std::fs::read_to_string(&path)
+                    .unwrap()
+                    .contains("platform-secret")
+        );
+
+        store.delete_composio_platform_api_key().unwrap();
+        assert_eq!(backend.get(COMPOSIO_PLATFORM_API_KEY).unwrap(), None);
     }
 
     #[test]

@@ -155,6 +155,7 @@ icon_assets![
     (STAR, "star"),
     (STAR_BOLD, "star-bold"),
     (KOMET_LOGO, "komet-logo"),
+    (COMPOSIO_MARK, "composio-mark"),
     // Blobatar animated avatar layers
     (BLOBATAR_BODY, "blobatar-body"),
     (BLOBATAR_EYE, "blobatar-eye"),
