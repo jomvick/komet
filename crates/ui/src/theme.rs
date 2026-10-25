@@ -771,13 +771,27 @@ impl Theme {
     /// change — setting the global directly leaves [`current_appearance`] stale.
     pub fn install(appearance: Appearance, cx: &mut App) {
         set_current_appearance(appearance);
-        let theme = Self::for_appearance(appearance);
+        let mut theme = Self::for_appearance(appearance);
+        if crate::settings::wallpaper::is_enabled(cx) {
+            theme = theme.with_wallpaper();
+        }
         let (normal, hover, active) = scrollbar_thumb_colors(&theme);
         gpui_base::Theme::global_mut(cx).scrollbar.styles = gpui_base::ScrollbarStyles::default()
             .thumb(|style| style.bg(normal))
             .thumb_hover(|style| style.bg(hover))
             .thumb_active(|style| style.bg(active));
         cx.set_global(theme);
+    }
+
+    fn with_wallpaper(mut self) -> Self {
+        self.bg = self.bg.opacity(0.78);
+        self.surface = self.surface.opacity(0.78);
+        self.surface_raised = self.surface_raised.opacity(0.9);
+        self.surface_card = self.surface_card.opacity(0.84);
+        self.surface_dialog = self.surface_dialog.opacity(0.94);
+        self.surface_overlay = self.surface_overlay.opacity(0.94);
+        self.input_bg = self.input_bg.opacity(0.92);
+        self
     }
 
     /// Read the theme global.
@@ -1191,6 +1205,16 @@ mod tests {
         assert!(light.0.l < Theme::light().bg.l);
         assert_eq!([dark.0.a, dark.1.a, dark.2.a], [0.30, 0.42, 0.55]);
         assert_eq!([light.0.a, light.1.a, light.2.a], [0.30, 0.42, 0.55]);
+    }
+
+    #[test]
+    fn wallpaper_theme_translucency_is_limited_to_surfaces() {
+        let theme = Theme::dark().with_wallpaper();
+        assert_eq!(theme.bg.a, 0.78);
+        assert_eq!(theme.surface.a, 0.78);
+        assert_eq!(theme.surface_raised.a, 0.9);
+        assert_eq!(theme.surface_card.a, 0.84);
+        assert_eq!(theme.text.a, 1.0);
     }
 
     #[test]

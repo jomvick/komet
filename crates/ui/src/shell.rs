@@ -17,9 +17,9 @@ use std::time::Duration;
 use chrono::Utc;
 use gpui::{
     AnyElement, App, Context, Decorations, Empty, Entity, Focusable as _, IntoElement, KeyBinding,
-    Keystroke, MouseButton, MouseDownEvent, MouseUpEvent, Pixels, Point, Render, ResizeEdge,
-    SharedString, Size, Subscription, Task, Tiling, Window, WindowButton, WindowButtonLayout,
-    WindowControlArea, actions, div, prelude::*, px,
+    Keystroke, MouseButton, MouseDownEvent, MouseUpEvent, ObjectFit, Pixels, Point, Render,
+    ResizeEdge, SharedString, Size, StyledImage, Subscription, Task, Tiling, Window, WindowButton,
+    WindowButtonLayout, WindowControlArea, actions, div, img, prelude::*, px,
 };
 
 use gpui_tokio::Tokio;
@@ -45,6 +45,7 @@ use crate::settings::integrations::IntegrationsPage;
 use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
 use crate::settings::security::{SecurityDefaults, SecurityEvent, SecurityPage};
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
+use crate::settings::wallpaper;
 use crate::settings::{
     KeymapConfig, RIGHT_PANE_DEFAULT, RIGHT_PANE_MAX, RIGHT_PANE_MIN, RememberedNavigation,
     SAVE_DEBOUNCE_MS, SIDEBAR_DEFAULT, SIDEBAR_MAX, SIDEBAR_MIN, TERMINAL_DEFAULT_HEIGHT,
@@ -7394,6 +7395,9 @@ fn header_icon_button(
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if let Some((path, line)) = self.pending_workspace_file.take() {
+            if !self.right_pane_open(cx) {
+                self.toggle_right_pane(cx);
+            }
             self.add_file_surface(path, line, window, cx);
         }
         if self.window_close_pending && self.all_file_edits_flushed(cx) {
@@ -7518,6 +7522,19 @@ impl Render for Shell {
                     composer.resubmit_last(cx);
                 });
             }));
+        let root = if let Some(path) = wallpaper::path(cx).filter(|path| path.is_file()) {
+            root.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    .left_0()
+                    .right_0()
+                    .child(img(path).size_full().object_fit(ObjectFit::Cover)),
+            )
+        } else {
+            root
+        };
 
         let render_gate = if restart_required {
             GatePhase::Loading

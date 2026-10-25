@@ -410,11 +410,8 @@ fn push_workspace_file_runs(out: &mut Vec<InlineRun>, text: &str, style: &Inline
         let bare_end = token.trim_end_matches(char::is_whitespace).len();
         let bare = &token[..bare_end];
         let suffix = &token[bare_end..];
-        let trimmed =
-            bare.trim_matches(|c: char| matches!(c, '(' | ')' | '[' | ']' | ',' | ';' | '.'));
-        let prefix_len = bare
-            .len()
-            .saturating_sub(bare.trim_start_matches(['(', '[']).len());
+        let prefix_len = bare.len() - bare.trim_start_matches(['(', '[']).len();
+        let trimmed = bare[prefix_len..].trim_end_matches([')', ']', ',', ';', '.', ':', '!', '?']);
         if let Some((path, line)) = parse_workspace_file_reference(trimmed) {
             if prefix_len > 0 {
                 out.push(InlineRun {
@@ -482,12 +479,23 @@ pub fn parse_workspace_file_reference(value: &str) -> Option<(String, Option<u32
     let (path, line) = line_reference.unwrap_or((value, None));
     let root_manifest = matches!(path, "Cargo.toml" | "README.md" | "ARCHITECTURE.md");
     let has_extension = path.rsplit('/').next().is_some_and(|name| {
-        name.rsplit_once('.')
-            .is_some_and(|(_, extension)| !extension.is_empty())
+        name.rsplit_once('.').is_some_and(|(_, extension)| {
+            extension.starts_with(|c: char| c.is_ascii_alphabetic())
+                && (path.contains('/')
+                    || [
+                        "c", "cc", "cpp", "css", "csv", "go", "h", "hpp", "html", "java", "js",
+                        "json", "jsx", "kt", "lock", "md", "mdx", "mjs", "mts", "php", "py", "rb",
+                        "rs", "sass", "scala", "scss", "sh", "sql", "svelte", "swift", "toml",
+                        "ts", "tsx", "txt", "vue", "xml", "yaml", "yml",
+                    ]
+                    .iter()
+                    .any(|known| extension.eq_ignore_ascii_case(known)))
+        })
     });
     let safe = !path.is_empty()
         && !path.starts_with('/')
         && !path.contains('\\')
+        && !path.contains(':')
         && !path.chars().any(char::is_control)
         && path
             .split('/')
@@ -1070,6 +1078,21 @@ mod tests {
                 "komet-file:crates/ui/src/shell.rs:42".into()
             ))
         );
+        assert_eq!(
+            only_link("Open .github/workflows/ci.yml\n"),
+            Some((
+                ".github/workflows/ci.yml".into(),
+                "komet-file:.github/workflows/ci.yml".into()
+            ))
+        );
+        assert_eq!(
+            only_link("Open src/main.rs: \n"),
+            Some(("src/main.rs".into(), "komet-file:src/main.rs".into()))
+        );
+        assert_eq!(
+            only_link("Open .src/é.rsé\n"),
+            Some((".src/é.rsé".into(), "komet-file:.src/é.rsé".into()))
+        );
     }
 
     #[test]
@@ -1077,6 +1100,13 @@ mod tests {
         assert_eq!(parse_workspace_file_reference("/tmp/secret.rs"), None);
         assert_eq!(parse_workspace_file_reference("../secret.rs"), None);
         assert_eq!(parse_workspace_file_reference("src\\secret.rs"), None);
+        assert_eq!(parse_workspace_file_reference("C:/Users/x.rs"), None);
+        assert_eq!(parse_workspace_file_reference("foo.rs:42-45"), None);
+        assert_eq!(parse_workspace_file_reference("e.g."), None);
+        assert_eq!(parse_workspace_file_reference("i.e."), None);
+        assert_eq!(parse_workspace_file_reference("3.14"), None);
+        assert_eq!(parse_workspace_file_reference("v2.0"), None);
+        assert_eq!(parse_workspace_file_reference("example.com"), None);
     }
 
     /// The paragraph's single link run: (text, url).

@@ -3368,11 +3368,7 @@ impl Transcript {
     /// provider stream without putting it in a heavy card.
     fn render_reasoning_block(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let expanded = self.reasoning_expanded;
-        let visible_text = if expanded {
-            self.reasoning_text.clone()
-        } else {
-            reasoning_preview(&self.reasoning_text, 1)?
-        };
+        let visible_text = reasoning_preview(&self.reasoning_text, 1)?;
         let theme = Theme::of(cx).clone();
         let full_text = expanded.then(|| self.reasoning_text.clone());
         Some(

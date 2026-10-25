@@ -116,6 +116,7 @@ icon_assets![
     (TUNING, "tuning"),
     (EYE, "eye"),
     (EYE_CLOSED, "eye-closed"),
+    (IMAGE, "image"),
     (PAPERCLIP, "paperclip"),
     (PEN, "pen"),
     (PIN, "pin"),
