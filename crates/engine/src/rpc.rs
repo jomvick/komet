@@ -1152,6 +1152,8 @@ fn forwardable(method: &str) -> bool {
     matches!(
         method,
         methods::LIST_HARNESSES
+            | methods::GET_HARNESS_CLI_STATUS
+            | methods::MANAGE_HARNESS_CLI
             | methods::SET_HARNESS_ENABLED
             | methods::LIST_MODELS
             | methods::LIST_COMMANDS
@@ -1488,6 +1490,23 @@ impl RpcService for EngineRpc {
             methods::ENGINE_INFO => RpcReply::value(&self.engine_info),
             methods::ENGINE_READY => RpcReply::value(&serde_json::json!({ "ready": true })),
             methods::LIST_HARNESSES => RpcReply::value(&self.registry.descriptors()),
+            methods::GET_HARNESS_CLI_STATUS => {
+                let harnesses = self
+                    .registry
+                    .descriptors()
+                    .into_iter()
+                    .map(|descriptor| descriptor.id)
+                    .filter(|harness| *harness != HarnessId::Mock)
+                    .collect::<Vec<_>>();
+                RpcReply::value(&crate::harness_cli::statuses(&harnesses).await)
+            }
+            methods::MANAGE_HARNESS_CLI => {
+                let params: crate::harness_cli::ManageHarnessCliParams = parse_params(params)?;
+                crate::harness_cli::manage(params.harness)
+                    .await
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&self.registry.descriptors())
+            }
             methods::SET_HARNESS_ENABLED => {
                 let p: SetHarnessEnabledParams = parse_params(params)?;
                 self.registry

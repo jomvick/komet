@@ -24,7 +24,7 @@ use gpui::{
 
 use gpui_tokio::Tokio;
 use komet_engine::InstanceLock;
-use komet_proto::{AuthState, WorkspaceScope};
+use komet_proto::{AuthState, HarnessId, WorkspaceScope};
 use komet_rpc::methods;
 
 use crate::changes::{Changes, ChangesEvent};
@@ -929,6 +929,8 @@ pub struct Shell {
     shortcuts_sub: Option<Subscription>,
     notifications_sub: Option<Subscription>,
     security_sub: Option<Subscription>,
+    harnesses_sub: Option<Subscription>,
+    pending_account_harness: Option<HarnessId>,
     /// Session-row context menu: (chat id, window position).
     chat_menu: popover::Popup<(String, Point<Pixels>)>,
     rename_dialog: Option<RenameChatDialog>,
@@ -1208,6 +1210,8 @@ impl Shell {
             shortcuts_sub: None,
             notifications_sub: None,
             security_sub: None,
+            harnesses_sub: None,
+            pending_account_harness: None,
             chat_menu: popover::Popup::default(),
             rename_dialog: None,
             delete_confirm: None,
@@ -1632,6 +1636,15 @@ impl Shell {
         self.sidebar_tween = Some(WidthTween::new(from, self.sidebar_target()));
         self.schedule_save(cx);
         cx.notify();
+    }
+
+    fn open_accounts_for_harness(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
+        self.pending_account_harness = Some(harness);
+        self.open_settings(SettingsSection::Agents, cx);
+        if let Some(page) = self.accounts_page.clone() {
+            page.update(cx, |page, cx| page.focus_harness(harness, cx));
+            self.pending_account_harness = None;
+        }
     }
 
     fn toggle_right_pane(&mut self, cx: &mut Context<Self>) {
@@ -2526,7 +2539,18 @@ impl Shell {
             SettingsSection::Harnesses => {
                 if self.harnesses_page.is_none() {
                     let state = self.state.clone();
-                    self.harnesses_page = Some(cx.new(|cx| HarnessesPage::new(state, cx)));
+                    let page = cx.new(|cx| HarnessesPage::new(state, cx));
+                    self.harnesses_sub = Some(cx.subscribe(
+                        &page,
+                        |this, _, event: &crate::settings::harnesses::HarnessesEvent, cx| {
+                            match *event {
+                                crate::settings::harnesses::HarnessesEvent::Connect(harness) => {
+                                    this.open_accounts_for_harness(harness, cx);
+                                }
+                            }
+                        },
+                    ));
+                    self.harnesses_page = Some(page);
                 }
                 match &self.harnesses_page {
                     Some(page) => page.clone().into_any_element(),
@@ -2536,7 +2560,11 @@ impl Shell {
             SettingsSection::Agents => {
                 if self.accounts_page.is_none() {
                     let state = self.state.clone();
-                    self.accounts_page = Some(cx.new(|cx| AccountsPage::new(state, cx)));
+                    let page = cx.new(|cx| AccountsPage::new(state, cx));
+                    if let Some(harness) = self.pending_account_harness.take() {
+                        page.update(cx, |page, cx| page.focus_harness(harness, cx));
+                    }
+                    self.accounts_page = Some(page);
                 }
                 match &self.accounts_page {
                     Some(page) => page.clone().into_any_element(),
@@ -3676,9 +3704,11 @@ impl Shell {
         }
         let controls = window.window_controls();
         let layout = linux_button_layout(cx, controls);
+        let (left_has_min, left_has_max) = effective_controls(layout.left, controls);
+        let (right_has_min, right_has_max) = effective_controls(layout.right, controls);
         (
-            linux_control_side_width(layout.left, controls.minimize, controls.maximize),
-            linux_control_side_width(layout.right, controls.minimize, controls.maximize),
+            linux_control_side_width(layout.left, left_has_min, left_has_max),
+            linux_control_side_width(layout.right, right_has_min, right_has_max),
         )
     }
 
@@ -3695,20 +3725,26 @@ impl Shell {
         let layout = linux_button_layout(cx, controls);
         let theme = Theme::of(cx).clone();
         let maximized = window.is_maximized();
-        let side = |buttons: [Option<WindowButton>; 3], this: &mut Self, cx: &mut Context<Self>| {
+        let side = |buttons: [Option<WindowButton>; 3],
+                    has_min: bool,
+                    has_max: bool,
+                    this: &mut Self,
+                    cx: &mut Context<Self>| {
             buttons
                 .into_iter()
                 .flatten()
                 .filter(|button| match button {
-                    WindowButton::Minimize => controls.minimize,
-                    WindowButton::Maximize => controls.maximize,
+                    WindowButton::Minimize => has_min,
+                    WindowButton::Maximize => has_max,
                     WindowButton::Close => true,
                 })
                 .map(|button| this.linux_caption_button(button, maximized, &theme, cx))
                 .collect::<Vec<_>>()
         };
-        let left = side(layout.left, self, cx);
-        let right = side(layout.right, self, cx);
+        let (left_has_min, left_has_max) = effective_controls(layout.left, controls);
+        let (right_has_min, right_has_max) = effective_controls(layout.right, controls);
+        let left = side(layout.left, left_has_min, left_has_max, self, cx);
+        let right = side(layout.right, right_has_min, right_has_max, self, cx);
         let group = |buttons: Vec<AnyElement>, is_left: bool| {
             if buttons.is_empty() {
                 return None;
@@ -5610,6 +5646,84 @@ impl Shell {
         // files in the composer. `has_active_drag` gates the veil so a drag
         // that left the window (FileDrop Exited) can't strand it.
         let file_drag_active = self.file_drag_active && cx.has_active_drag();
+        let provider_switch_notice = self
+            .composer
+            .read(cx)
+            .pickers()
+            .read(cx)
+            .provider_switch_notice()
+            .map(|notice| {
+                let theme = Theme::of(cx).clone();
+                let (from_icon, from_tint) = crate::pickers::harness_brand_icon(notice.from);
+                let (to_icon, to_tint) = crate::pickers::harness_brand_icon(notice.to);
+                let transition = div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(10.0))
+                    .child(
+                        icon(from_icon)
+                            .size(px(18.0))
+                            .text_color(from_tint.unwrap_or(theme.text_muted)),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(theme.text_muted)
+                            .child(notice.from.display_name()),
+                    )
+                    .child(
+                        icon(crate::icons::ARROW_RIGHT)
+                            .size(px(14.0))
+                            .text_color(theme.text_muted.opacity(0.75)),
+                    )
+                    .child(
+                        icon(to_icon)
+                            .size(px(18.0))
+                            .text_color(to_tint.unwrap_or(theme.text)),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(theme.text)
+                            .child(notice.to.display_name()),
+                    );
+                let card = div()
+                    .px(px(16.0))
+                    .py(px(11.0))
+                    .rounded(px(14.0))
+                    .border_1()
+                    .border_color(crate::theme::hairline(0.12))
+                    .bg(theme.surface)
+                    .shadow(crate::theme::card_selected_shadows())
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(5.0))
+                    .child(transition)
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .text_color(theme.text_muted.opacity(0.8))
+                            .child(format!(
+                                "{} is selected for this session",
+                                notice.to.display_name()
+                            )),
+                    );
+                div()
+                    .absolute()
+                    .top(px(24.0))
+                    .left_0()
+                    .right_0()
+                    .flex()
+                    .justify_center()
+                    .child(motion::fade_in(
+                        ("provider-switch-notice", notice.sequence),
+                        card,
+                    ))
+                    .into_any_element()
+            });
         div()
             .id("chat-dropzone")
             .relative()
@@ -5652,6 +5766,7 @@ impl Shell {
                     cx.notify();
                 },
             ))
+            .children(provider_switch_notice)
             .child(
                 // Full-height underlay: the transcript viewport spans the
                 // whole column, scrolling UNDER the titlebar above and the
@@ -7211,6 +7326,23 @@ fn linux_control_side_width(
     }
 }
 
+fn effective_controls(
+    buttons: [Option<WindowButton>; 3],
+    controls: gpui::WindowControls,
+) -> (bool, bool) {
+    // If the platform/compositor advertises controls (or on X11), respect them.
+    // However, on Wayland compositors without xdg-decoration / WmCapabilities (e.g. GNOME Mutter),
+    // controls.minimize and controls.maximize default to false even though the desktop
+    // button-layout expects them. If the button layout explicitly includes minimize/maximize,
+    // allow them unless controls explicitly signaled support and excluded them.
+    let has_layout_min = buttons.iter().any(|b| *b == Some(WindowButton::Minimize));
+    let has_layout_max = buttons.iter().any(|b| *b == Some(WindowButton::Maximize));
+    (
+        controls.minimize || has_layout_min,
+        controls.maximize || has_layout_max,
+    )
+}
+
 fn linux_button_layout(cx: &App, controls: gpui::WindowControls) -> WindowButtonLayout {
     effective_linux_button_layout(
         cx.button_layout().unwrap_or(WindowButtonLayout {
@@ -7229,8 +7361,10 @@ fn effective_linux_button_layout(
     layout: WindowButtonLayout,
     controls: gpui::WindowControls,
 ) -> WindowButtonLayout {
-    if linux_control_side_width(layout.left, controls.minimize, controls.maximize)
-        + linux_control_side_width(layout.right, controls.minimize, controls.maximize)
+    let (left_min, left_max) = effective_controls(layout.left, controls);
+    let (right_min, right_max) = effective_controls(layout.right, controls);
+    if linux_control_side_width(layout.left, left_min, left_max)
+        + linux_control_side_width(layout.right, right_min, right_max)
         > 0.0
     {
         layout
@@ -7658,10 +7792,17 @@ impl Render for Shell {
                 // The sidebar and titlebar are one uninterrupted shell surface.
                 let sidebar_tone = div()
                     .absolute()
-                    .top_0()
+                    .top(px(Theme::TITLEBAR_HEIGHT))
                     .bottom_0()
                     .left_0()
                     .w(px(sidebar_now))
+                    .bg(shell_surface);
+                let titlebar_tone = div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .h(px(Theme::TITLEBAR_HEIGHT))
                     .bg(shell_surface);
                 // Start the content row below the unified titlebar. The
                 // sidebar stays flush with the shell; the workspace gets its
@@ -7685,6 +7826,7 @@ impl Render for Shell {
                     .child(self.render_titlebar_cluster(linux_left_controls, cx))
                     .children(overlays);
                 root.child(sidebar_tone)
+                    .child(titlebar_tone)
                     .child(motion::fade_in("phase-app", page))
             }
             GatePhase::Loading => root, // splash overlay covers boot

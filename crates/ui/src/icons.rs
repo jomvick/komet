@@ -11,9 +11,8 @@
 //! - The harness brand marks (`claude-mark`, `openai-mark`, `cursor-mark`) are
 //!   ports of komet's `icons.tsx`. gpui tints SVGs with the text color, so the
 //!   Claude mark's brand orange is applied at the call site ([`CLAUDE_BRAND`]).
-//! - `opencode-mark` is the official opencode brand mark, and `cline-mark` the
-//!   official Cline brand mark, both sourced from the LobeHub icons set
-//!   (lobehub.com/icons, `@lobehub/icons-static-svg`).
+//! - Provider marks sourced from LobeHub's `@lobehub/icons-static-svg`
+//!   package are embedded as static SVGs because Komet renders with gpui.
 //!
 //! Icons render via [`icon`]: `icon(icons::PAPERCLIP).size(px(16.)).text_color(…)`.
 
@@ -173,12 +172,19 @@ icon_assets![
     (ANTIGRAVITY_MARK, "antigravity-mark"),
     (PI_MARK, "pi-mark"),
     (CLINE_MARK, "cline-mark"),
+    (DEVIN_MARK, "devin-mark"),
+    (MUSE_MARK, "muse-mark"),
+    (COPILOT_MARK, "copilot-mark"),
 ];
 
 /// The Claude mark's brand orange (`#D97757`) — komet keeps it even on the
 /// monochrome surface.
 pub fn claude_brand() -> Hsla {
     gpui::rgb(0xD97757).into()
+}
+
+pub fn muse_brand() -> Hsla {
+    gpui::rgb(0x131313).into()
 }
 
 /// An icon element for an embedded asset path. Size and colour are set by the

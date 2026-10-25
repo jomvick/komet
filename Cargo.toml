@@ -10,6 +10,7 @@ members = [
     "crates/update",
     "crates/ui",
     "crates/syntax",
+    "crates/voice",
     "crates/sync-server",
     "apps/komet",
 ]
@@ -30,6 +31,7 @@ komet-rpc = { path = "crates/rpc" }
 komet-update = { path = "crates/update" }
 komet-ui = { path = "crates/ui" }
 komet-syntax = { path = "crates/syntax" }
+komet-voice = { path = "crates/voice" }
 komet-sync-server = { path = "crates/sync-server" }
 
 # CRDT
@@ -110,8 +112,12 @@ alacritty_terminal = "0.26"
 pulldown-cmark = "0.12"
 unicode-segmentation = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+semver = "1"
 ignore = "0.4"
 nucleo-matcher = "0.3"
+cpal = "=0.17.3"
+parakeet-rs = "=0.3.8"
+rubato = "=0.16.2"
 
 [profile.release]
 # Distribution profile (scripts/package-linux.sh): thin LTO buys most of fat

@@ -784,7 +784,7 @@ impl Theme {
     }
 
     fn with_wallpaper(mut self) -> Self {
-        self.bg = self.bg.opacity(0.78);
+        self.bg = self.bg.opacity(0.96);
         self.surface = self.surface.opacity(0.78);
         self.surface_raised = self.surface_raised.opacity(0.9);
         self.surface_card = self.surface_card.opacity(0.84);
@@ -1210,7 +1210,7 @@ mod tests {
     #[test]
     fn wallpaper_theme_translucency_is_limited_to_surfaces() {
         let theme = Theme::dark().with_wallpaper();
-        assert_eq!(theme.bg.a, 0.78);
+        assert_eq!(theme.bg.a, 0.96);
         assert_eq!(theme.surface.a, 0.78);
         assert_eq!(theme.surface_raised.a, 0.9);
         assert_eq!(theme.surface_card.a, 0.84);

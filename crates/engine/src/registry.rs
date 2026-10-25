@@ -726,18 +726,12 @@ reason: None,
             supports_steering: true,
             steering_mode: SteeringMode::TurnBoundary,
             reasoning_levels: Vec::new(),
-            // Always show OpenCode in the Agents list even if the CLI is not
-            // yet installed — the row renders with an install hint and an inert
-            // toggle, matching the pattern used by Codex, Grok, etc.  The real
-            // probe only gates the toggle and the send path.
+            // Always show OpenCode in the Agents list; the live CLI probe
+            // determines whether it can be enabled or managed.
             installed: true,
             enabled: None,
         },
-        // The install probe returns true unconditionally so that the Agents
-        // page always shows the OpenCode row (with an install-hint when the
-        // CLI is absent and an inert toggle).  The real CLI check is enforced
-        // by set_enabled and by the send path when the harness is resolved.
-        Box::new(|| true),
+        Box::new(|| komet_harness::AcpHarness::opencode().installed()),
         Box::new(|| Ok(Arc::new(komet_harness::AcpHarness::opencode()) as Arc<dyn Harness>)),
     );
     // pi over ACP (community `pi-acp` adapter), same lazy pattern: the static
@@ -798,6 +792,48 @@ reason: None,
         Box::new(|| komet_harness::AcpHarness::cline().installed()),
         Box::new(|| Ok(Arc::new(komet_harness::AcpHarness::cline()) as Arc<dyn Harness>)),
     );
+    // Devin CLI over its native ACP server (`devin acp`).
+    registry.register_lazy(
+        HarnessDescriptor {
+            id: HarnessId::Devin,
+            name: "Devin".into(),
+            supports_steering: true,
+            steering_mode: SteeringMode::TurnBoundary,
+            reasoning_levels: Vec::new(),
+            installed: true,
+            enabled: None,
+        },
+        Box::new(|| komet_harness::AcpHarness::devin().installed()),
+        Box::new(|| Ok(Arc::new(komet_harness::AcpHarness::devin()) as Arc<dyn Harness>)),
+    );
+    // GitHub Copilot CLI over its native ACP server (`copilot --acp`).
+    registry.register_lazy(
+        HarnessDescriptor {
+            id: HarnessId::Copilot,
+            name: "GitHub Copilot".into(),
+            supports_steering: true,
+            steering_mode: SteeringMode::TurnBoundary,
+            reasoning_levels: Vec::new(),
+            installed: true,
+            enabled: None,
+        },
+        Box::new(|| komet_harness::AcpHarness::copilot().installed()),
+        Box::new(|| Ok(Arc::new(komet_harness::AcpHarness::copilot()) as Arc<dyn Harness>)),
+    );
+    // Muse Code's native Muse Session Protocol driver (`muse serve`).
+    registry.register_lazy(
+        HarnessDescriptor {
+            id: HarnessId::Muse,
+            name: "Muse Code".into(),
+            supports_steering: true,
+            steering_mode: SteeringMode::StepBoundary,
+            reasoning_levels: Vec::new(),
+            installed: true,
+            enabled: None,
+        },
+        Box::new(|| komet_harness::MuseHarness::new().installed()),
+        Box::new(|| Ok(Arc::new(komet_harness::MuseHarness::new()) as Arc<dyn Harness>)),
+    );
     registry
 }
 
@@ -842,7 +878,7 @@ mod tests {
     }
 
     #[test]
-    fn default_registry_lists_mock_claude_codex_and_grok_slots() {
+    fn default_registry_lists_all_supported_agent_slots() {
         let registry = default_registry();
         let ids: Vec<HarnessId> = registry.descriptors().iter().map(|d| d.id).collect();
         assert_eq!(
@@ -858,6 +894,9 @@ mod tests {
                 HarnessId::Pi,
                 HarnessId::Antigravity,
                 HarnessId::Cline,
+                HarnessId::Devin,
+                HarnessId::Copilot,
+                HarnessId::Muse,
             ]
         );
         assert!(registry.resolve(HarnessId::Mock).is_ok());
@@ -935,6 +974,22 @@ mod tests {
             .find(|d| d.id == HarnessId::Cline)
             .expect("cline descriptor");
         assert!(cline_desc.reasoning_levels.is_empty());
+        let devin = registry.resolve(HarnessId::Devin).unwrap();
+        assert_eq!(devin.id(), HarnessId::Devin);
+        assert_eq!(devin.display_name(), "Devin");
+        assert_eq!(devin.steering_mode(), SteeringMode::TurnBoundary);
+        assert!(devin.reasoning_levels().is_empty());
+        let copilot = registry.resolve(HarnessId::Copilot).unwrap();
+        assert_eq!(copilot.id(), HarnessId::Copilot);
+        assert_eq!(copilot.display_name(), "GitHub Copilot");
+        assert_eq!(copilot.steering_mode(), SteeringMode::TurnBoundary);
+        assert!(copilot.reasoning_levels().is_empty());
+        let muse = registry.resolve(HarnessId::Muse).unwrap();
+        assert_eq!(muse.id(), HarnessId::Muse);
+        assert_eq!(muse.display_name(), "Muse Code");
+        assert_eq!(muse.steering_mode(), SteeringMode::StepBoundary);
+        assert!(muse.supports_steering());
+        assert!(muse.reasoning_levels().is_empty());
         let agy_desc = registry
             .descriptors()
             .into_iter()

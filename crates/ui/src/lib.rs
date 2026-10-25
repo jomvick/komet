@@ -116,6 +116,7 @@ impl UiConfig {
             org_id: self.org_id.clone(),
             sync_token: self.sync_token.clone(),
             default_harness: self.default_harness,
+            managed_engine: true,
         }
     }
 }

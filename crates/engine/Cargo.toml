@@ -35,6 +35,7 @@ dirs.workspace = true
 keyring.workspace = true
 tempfile.workspace = true
 reqwest.workspace = true
+semver.workspace = true
 ignore.workspace = true
 nucleo-matcher.workspace = true
 
