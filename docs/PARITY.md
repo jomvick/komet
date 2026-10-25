@@ -61,6 +61,9 @@ not built yet).
 | Grok (ACP) | done | Shared `AcpHarness` spec; `grok agent stdio`, turn-boundary steering. |
 | Hermes (ACP) | done | Shared `AcpHarness` spec; `hermes acp` (Nous Research's native ACP server), turn-boundary steering, no effort ladder yet. |
 | Pi (ACP) | done | Shared `AcpHarness` spec; community `pi-acp` adapter (pinned 0.0.33, npx fallback), turn-boundary steering, minimal→max thinking ladder. |
+| Devin (ACP) | done | Native `devin acp` server, turn-boundary steering, descriptor/surface test. |
+| GitHub Copilot (ACP) | done | Native `copilot --acp` server, turn-boundary steering, descriptor/surface test. |
+| Muse Code (MSP) | done | Native `muse serve` JSON-RPC driver; model discovery, workspace sandbox, permissions, resume, steering, cancellation, and unsupported MCP notices covered by protocol-fixture tests. |
 | Mock harness | done | Scripted event replay; powers tests + the e2e smoke. |
 
 ## §5 Session doc schema
@@ -72,6 +75,7 @@ not built yet).
 | Continuation splitting / joining (MSG_INLINE_MAX 256KB) | done | `split at part boundaries`, `root#cN`, render-time join. |
 | Render-parts privacy policy | done | WriteFile content / Edit bodies / etc. stripped; full inputs only in the host journal. |
 | Sidecars (tail, diff) + constants | done | — |
+| Provider switching | done | Provider-owned session ids, transcript replay after each provider watermark, and visible switch markers in the transcript. |
 
 ## §6 Sync (self-hosted)
 

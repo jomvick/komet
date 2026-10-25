@@ -842,6 +842,20 @@ fn cline_descriptor_surface_matches_registry_expectations() {
     assert!(harness.reasoning_levels().is_empty());
 }
 
+#[test]
+fn devin_and_copilot_descriptor_surfaces_match_registry_expectations() {
+    for (harness, id, name) in [
+        (AcpHarness::devin(), HarnessId::Devin, "Devin"),
+        (AcpHarness::copilot(), HarnessId::Copilot, "GitHub Copilot"),
+    ] {
+        assert_eq!(harness.id(), id);
+        assert_eq!(harness.display_name(), name);
+        assert!(harness.supports_steering());
+        assert_eq!(harness.steering_mode(), SteeringMode::TurnBoundary);
+        assert!(harness.reasoning_levels().is_empty());
+    }
+}
+
 #[tokio::test]
 async fn models_are_discovered_from_the_acp_session() {
     // ACP is the source of truth: the fixture advertises a model config

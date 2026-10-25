@@ -22,6 +22,7 @@ pub mod composio;
 pub mod crash_shield;
 pub mod diff_sync;
 pub mod doc_host;
+pub mod harness_cli;
 pub mod instance_lock;
 pub mod legacy_home;
 pub mod local_import;

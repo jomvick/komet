@@ -443,6 +443,13 @@ enum ModelsLoad {
     Force,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ProviderSwitchNotice {
+    pub from: HarnessId,
+    pub to: HarnessId,
+    pub sequence: u64,
+}
+
 pub struct Pickers {
     state: Entity<AppState>,
     config: DraftConfig,
@@ -496,6 +503,9 @@ pub struct Pickers {
     switch_task: Option<Task<()>>,
     /// Last mid-session switch failure (shown in the ref popover).
     switch_error: Option<String>,
+    provider_switch_notice: Option<ProviderSwitchNotice>,
+    provider_switch_sequence: u64,
+    provider_switch_task: Option<Task<()>>,
     mutate_task: Option<Task<()>>,
     _search_events: Subscription,
     _state_observe: Subscription,
@@ -650,6 +660,9 @@ impl Pickers {
             switching: None,
             switch_task: None,
             switch_error: None,
+            provider_switch_notice: None,
+            provider_switch_sequence: 0,
+            provider_switch_task: None,
             mutate_task: None,
             _search_events: search_events,
             _state_observe: state_observe,
@@ -670,9 +683,8 @@ impl Pickers {
         &self.config
     }
 
-    /// Harness is locked once the chat exists (feature-inventory §1.7).
-    fn harness_locked(&self, cx: &App) -> bool {
-        self.state.read(cx).selected_chat.is_some()
+    pub(crate) fn provider_switch_notice(&self) -> Option<ProviderSwitchNotice> {
+        self.provider_switch_notice
     }
 
     fn engine(&self, cx: &App) -> Option<EngineHandle> {
@@ -925,9 +937,9 @@ impl Pickers {
         // Prime the model picker's rail BEFORE anchoring the highlight (the
         // visible rows depend on it): the favorites view when stars exist —
         // t3 ModelPickerContent's initial selection — else the effective
-        // harness. Locked chats stay on their own harness.
+        // harness.
         if kind == PickerKind::HarnessModel {
-            self.model_rail = if !self.harness_locked(cx) && !self.defaults.favorites.is_empty() {
+            self.model_rail = if !self.defaults.favorites.is_empty() {
                 ModelRail::Favorites
             } else {
                 ModelRail::Harness
@@ -1407,17 +1419,54 @@ impl Pickers {
     }
 
     fn pick_harness(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
-        if self.harness_locked(cx) {
-            return;
-        }
+        let existing_chat = self.state.read(cx).selected_chat.is_some();
+        let previous_harness = self.effective_harness(cx);
         if self.config.harness != Some(harness) {
-            // The remembered model for this harness takes over via the
-            // defaults fallback; a foreign pick must not linger.
+            // Model, effort, and options are provider-specific.
             self.config.model = None;
             self.config.reasoning = None;
             self.config.model_options.clear();
         }
         self.config.harness = Some(harness);
+        if existing_chat {
+            let model = self
+                .defaults
+                .model_for(harness)
+                .map(|remembered| remembered.id.clone());
+            self.update_chat_config(cx, |config| {
+                config.harness = harness;
+                config.model = model;
+                config.reasoning = None;
+                config.model_options.clear();
+            });
+            if let Some(from) = previous_harness.filter(|from| *from != harness) {
+                self.provider_switch_sequence = self.provider_switch_sequence.wrapping_add(1);
+                let sequence = self.provider_switch_sequence;
+                self.provider_switch_notice = Some(ProviderSwitchNotice {
+                    from,
+                    to: harness,
+                    sequence,
+                });
+                self.provider_switch_task = Some(cx.spawn(async move |this, cx| {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(1800))
+                        .await;
+                    this.update(cx, |pickers, cx| {
+                        if pickers
+                            .provider_switch_notice
+                            .is_some_and(|notice| notice.sequence == sequence)
+                        {
+                            pickers.provider_switch_notice = None;
+                            pickers.provider_switch_task = None;
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+                }));
+                cx.notify();
+            }
+            self.animate_close(cx);
+        }
         self.defaults.harness = Some(harness);
         self.save_defaults();
         self.model_scroll.set_offset(gpui::Point::default());
@@ -1640,14 +1689,10 @@ impl Pickers {
     /// opencode then searching surfaced Cline's 300+ catalog); with no harness
     /// resolved it spans every ready one. Otherwise the rail selection decides
     /// — favorites across harnesses, or the effective harness's list with its
-    /// starred rows floated to the top (t3 `groupFavorites`). A locked chat
-    /// restricts every view to its own harness.
+    /// starred rows floated to the top (t3 `groupFavorites`).
     fn visible_model_rows(&self, cx: &App) -> Vec<ModelRowData> {
         let effective = self.effective_harness(cx);
         let mut descriptors = self.rail_descriptors(cx);
-        if self.harness_locked(cx) {
-            descriptors.retain(|d| Some(d.id) == effective);
-        }
         let row = |descriptor: &HarnessDescriptor, model: &Model| ModelRowData {
             harness: descriptor.id,
             harness_name: SharedString::from(descriptor.name.clone()),
@@ -1771,9 +1816,6 @@ impl Pickers {
             return;
         };
         if self.effective_harness(cx) != Some(row.harness) {
-            if self.harness_locked(cx) {
-                return;
-            }
             self.pick_harness(row.harness, cx);
         }
         self.pick_model(row.model.id, cx);
@@ -3130,7 +3172,6 @@ impl Pickers {
             Loadable::Ready(_) => {}
         }
 
-        let locked = self.harness_locked(cx);
         let effective = self.effective_harness(cx);
         let model_scroll = self.model_scroll.clone();
         let query = self.search.read(cx).text().trim().to_string();
@@ -3202,7 +3243,6 @@ impl Pickers {
             for (ix, descriptor) in descriptors.iter().enumerate() {
                 let harness = descriptor.id;
                 let is_viewed = !favorites_view && effective == Some(harness);
-                let is_disabled = locked && effective != Some(harness);
                 let (icon_path, tint) = harness_brand_icon(harness);
                 column = column.child(
                     div()
@@ -3214,11 +3254,8 @@ impl Pickers {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .when(is_disabled, |el| el.opacity(0.35))
-                        .when(!is_disabled, |el| el.cursor_pointer())
-                        .when(!is_disabled && !is_viewed, |el| {
-                            el.hover(|s| s.bg(crate::theme::ink(0.06)))
-                        })
+                        .cursor_pointer()
+                        .when(!is_viewed, |el| el.hover(|s| s.bg(crate::theme::ink(0.06))))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.model_rail = ModelRail::Harness;
                             this.pick_harness(harness, cx);
@@ -3866,6 +3903,9 @@ pub(crate) fn harness_brand_icon(harness: HarnessId) -> (&'static str, Option<gp
         // Google Antigravity's mark, sourced from the LobeHub icons set
         // (lobehub.com/icons, `@lobehub/icons-static-svg`), monochrome.
         HarnessId::Antigravity => (crate::icons::ANTIGRAVITY_MARK, None),
+        HarnessId::Devin => (crate::icons::DEVIN_MARK, None),
+        HarnessId::Muse => (crate::icons::MUSE_MARK, Some(crate::icons::muse_brand())),
+        HarnessId::Copilot => (crate::icons::COPILOT_MARK, None),
         // Cline's official brand mark (same LobeHub set), monochrome.
         HarnessId::Cline => (crate::icons::CLINE_MARK, None),
     }

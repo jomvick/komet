@@ -1,8 +1,10 @@
 //! ACP harness: spawns an Agent Client Protocol agent (JSON-RPC 2.0 over
 //! stdio, protocol v1) and maps its session updates onto [`AgentEvent`]s.
 //!
-//! KEPT ONLY for agents built ground-up on ACP: Grok ([`AcpHarness::grok`],
-//! `grok agent stdio`), Hermes ([`AcpHarness::hermes`], `hermes acp`),
+//! KEPT ONLY for agents built ground-up on ACP: Devin ([`AcpHarness::devin`],
+//! `devin acp`), GitHub Copilot ([`AcpHarness::copilot`], `copilot --acp`),
+//! Grok ([`AcpHarness::grok`], `grok agent stdio`), Hermes
+//! ([`AcpHarness::hermes`], `hermes acp`),
 //! opencode ([`AcpHarness::opencode`], `opencode acp`) and Cline
 //! ([`AcpHarness::cline`], `cline --acp`) — plus pi ([`AcpHarness::pi`])
 //! via the community `pi-acp` adapter until a native driver exists.
@@ -558,6 +560,105 @@ fn cline_install_paths() -> Vec<PathBuf> {
     dirs
 }
 
+fn devin_install_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        paths.push(home.join(".local").join("bin").join("devin"));
+    }
+    paths.push(PathBuf::from("/opt/homebrew/bin/devin"));
+    paths.push(PathBuf::from("/usr/local/bin/devin"));
+    paths
+}
+
+fn devin_spec() -> AcpAgentSpec {
+    AcpAgentSpec {
+        id: HarnessId::Devin,
+        display_name: "Devin",
+        executable: "devin",
+        env_override: "DEVIN_EXECUTABLE",
+        args: &["acp"],
+        npm_package: None,
+        extra_paths: devin_install_paths,
+        cli_executable: "devin",
+        cli_extra_paths: devin_install_paths,
+        install_hint: "devin (install with `curl -fsSL https://cli.devin.ai/install.sh | bash` \
+             or `brew install --cask devin-cli`, then run `devin auth login`; \
+             set DEVIN_EXECUTABLE to override)",
+        models: || {
+            vec![
+                Model {
+                    id: "swe-1-7-medium".into(),
+                    label: "SWE-1.7 Medium".into(),
+                    description: Some("Devin's default coding model".into()),
+                    reasoning_levels: Vec::new(),
+                    options: Vec::new(),
+                },
+                Model {
+                    id: "adaptive".into(),
+                    label: "Adaptive".into(),
+                    description: Some("Devin selects the model for each request".into()),
+                    reasoning_levels: Vec::new(),
+                    options: Vec::new(),
+                },
+            ]
+        },
+        steering_mode: SteeringMode::TurnBoundary,
+        reasoning_levels: &[],
+        prompt_transform: identity_transform,
+        effort_values: default_effort_values,
+        ladder_extras: &[],
+        prompt_complete_extension: false,
+        prompt_stall: Some(Duration::from_secs(60)),
+        stall_hint: "Check Devin CLI authentication with `devin auth login`.",
+        http_sidecar: false,
+    }
+}
+
+fn copilot_install_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        paths.push(home.join(".local").join("bin").join("copilot"));
+        paths.push(home.join(".npm-global").join("bin").join("copilot"));
+    }
+    paths.push(PathBuf::from("/opt/homebrew/bin/copilot"));
+    paths.push(PathBuf::from("/usr/local/bin/copilot"));
+    paths
+}
+
+fn copilot_spec() -> AcpAgentSpec {
+    AcpAgentSpec {
+        id: HarnessId::Copilot,
+        display_name: "GitHub Copilot",
+        executable: "copilot",
+        env_override: "COPILOT_EXECUTABLE",
+        args: &["--acp"],
+        npm_package: None,
+        extra_paths: copilot_install_paths,
+        cli_executable: "copilot",
+        cli_extra_paths: copilot_install_paths,
+        install_hint: "GitHub Copilot CLI (install from https://github.com/github/copilot-cli, \
+             then run `copilot login`; set COPILOT_EXECUTABLE to override)",
+        models: || {
+            vec![Model {
+                id: "auto".into(),
+                label: "Copilot Auto".into(),
+                description: Some("Let GitHub Copilot choose the model".into()),
+                reasoning_levels: Vec::new(),
+                options: Vec::new(),
+            }]
+        },
+        steering_mode: SteeringMode::TurnBoundary,
+        reasoning_levels: &[],
+        prompt_transform: identity_transform,
+        effort_values: default_effort_values,
+        ladder_extras: &[],
+        prompt_complete_extension: false,
+        prompt_stall: Some(Duration::from_secs(60)),
+        stall_hint: "Check Copilot CLI authentication with `copilot login`.",
+        http_sidecar: false,
+    }
+}
+
 fn cline_spec() -> AcpAgentSpec {
     AcpAgentSpec {
         id: HarnessId::Cline,
@@ -820,6 +921,16 @@ pub struct AcpHarness {
 }
 
 impl AcpHarness {
+    /// Devin's native ACP server (`devin acp`).
+    pub fn devin() -> Self {
+        Self::with_spec(devin_spec())
+    }
+
+    /// GitHub Copilot CLI's official ACP server (`copilot --acp`).
+    pub fn copilot() -> Self {
+        Self::with_spec(copilot_spec())
+    }
+
     fn with_spec(spec: AcpAgentSpec) -> Self {
         Self {
             spec,

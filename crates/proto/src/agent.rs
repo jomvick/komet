@@ -10,6 +10,7 @@ pub enum HarnessId {
     ClaudeCode,
     Codex,
     Cursor,
+    Devin,
     /// xAI's Grok Build agent, driven over ACP (`grok agent stdio`).
     Grok,
     /// Nous Research's Hermes Agent, driven over ACP (`hermes acp`).
@@ -21,9 +22,68 @@ pub enum HarnessId {
     Opencode,
     /// Cline's autonomous coding agent CLI, driven over ACP (`cline --acp`).
     Cline,
+    Antigravity,
+    Muse,
+    Copilot,
     /// Test harness; never shown in production pickers.
     Mock,
-    Antigravity,
+}
+
+impl HarnessId {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            HarnessId::ClaudeCode => "claude-code",
+            HarnessId::Codex => "codex",
+            HarnessId::Cursor => "cursor",
+            HarnessId::Devin => "devin",
+            HarnessId::Grok => "grok",
+            HarnessId::Hermes => "hermes",
+            HarnessId::Pi => "pi",
+            HarnessId::Opencode => "opencode",
+            HarnessId::Cline => "cline",
+            HarnessId::Antigravity => "antigravity",
+            HarnessId::Muse => "muse",
+            HarnessId::Copilot => "copilot",
+            HarnessId::Mock => "mock",
+        }
+    }
+
+    pub fn from_slug(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "claude-code" | "claude" => Some(HarnessId::ClaudeCode),
+            "codex" => Some(HarnessId::Codex),
+            "cursor" | "cursor-agent" => Some(HarnessId::Cursor),
+            "devin" => Some(HarnessId::Devin),
+            "grok" => Some(HarnessId::Grok),
+            "hermes" => Some(HarnessId::Hermes),
+            "pi" => Some(HarnessId::Pi),
+            "opencode" | "open-code" => Some(HarnessId::Opencode),
+            "cline" => Some(HarnessId::Cline),
+            "antigravity" | "agy" => Some(HarnessId::Antigravity),
+            "muse" => Some(HarnessId::Muse),
+            "copilot" | "github-copilot" => Some(HarnessId::Copilot),
+            "mock" => Some(HarnessId::Mock),
+            _ => None,
+        }
+    }
+
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            HarnessId::ClaudeCode => "Claude Code",
+            HarnessId::Codex => "Codex",
+            HarnessId::Cursor => "Cursor",
+            HarnessId::Devin => "Devin",
+            HarnessId::Grok => "Grok",
+            HarnessId::Hermes => "Hermes",
+            HarnessId::Pi => "Pi",
+            HarnessId::Opencode => "OpenCode",
+            HarnessId::Cline => "Cline",
+            HarnessId::Antigravity => "Antigravity CLI",
+            HarnessId::Muse => "Muse",
+            HarnessId::Copilot => "GitHub Copilot",
+            HarnessId::Mock => "Mock",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

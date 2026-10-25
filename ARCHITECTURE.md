@@ -2,7 +2,7 @@
 
 > Fork of [zeronsh/comet](https://github.com/zeronsh/comet) — MIT, Copyright Wing. See `LICENSE` and `THIRD_PARTY_NOTICES.md`.
 
-A native controller for coding agents (Claude Code, Codex, Cursor, Grok, Hermes, OpenCode, Pi, Cline) —
+A native controller for coding agents (Claude Code, Codex, Cursor, Grok, Hermes, OpenCode, Pi, Cline, Devin, GitHub Copilot, Muse Code) —
 Rust engine + gpui UI, single binary. **100% local by default**: no account, no login
 screen, no network calls. Multi-device sync is built (Loro CRDT docs through the self-hosted
 `komet-sync` server) but **disabled by default** — see "Multi-device sync" in the README.
@@ -274,6 +274,8 @@ Live reference matrix (branch + mechanism):
 | Grok | 1 | native CLI flags `--sandbox` / `--permission-mode` / `--always-approve` (`grok_args_for_sandbox`) |
 | Antigravity | 1 | native CLI `--sandbox` + `--mode plan` (`crates/harness/src/antigravity/mod.rs`) |
 | Cline | 1 (partial) | native `auto_approve` boolean on Full access + native `provider` select injection; ReadOnly/WorkspaceWrite rely on branch 2 |
+| Devin / GitHub Copilot | 2 | native ACP permission requests mapped through the engine permission bridge |
+| Muse Code | 1 | native Muse Session Protocol permission requests and sandbox mode (`--disable-sandbox` only for Full access) |
 | Cursor | 1 | `sandbox` passed through the shim into SDK params (`crates/harness/src/cursor/mod.rs`) |
 | Hermes / Pi | 2 | documented "no CLI sandbox, so the ACP permission policy is their access control" (branch-2 fallback) |
 | Any | 3 | `sandbox_options` for unsupported providers → `ProviderOptionsRejected` (`crates/proto/src/agent.rs`) |
