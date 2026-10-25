@@ -555,15 +555,18 @@ impl Pickers {
                 this.config.model_options.clear();
                 this.switch_error = None;
             }
-            // A space switch invalidates the branch draft + cache — the folder
-            // (and possibly the device) changed under them.
+            // A space switch invalidates the branch draft. Keep refs only when
+            // they were already loaded for the target space.
             let space = state.read(cx).selected_space.clone();
             if space != this.space_owner {
+                let refs_match = space.is_some() && this.refs_space.as_deref() == space.as_deref();
                 this.space_owner = space;
                 this.config.branch = None;
                 this.config.checkout = CheckoutKind::default();
-                this.refs = Loadable::Idle;
-                this.refs_space = None;
+                if !refs_match {
+                    this.refs = Loadable::Idle;
+                    this.refs_space = None;
+                }
                 // Catalogs are per-DEVICE (fetched from the space's host):
                 // a space switch may land on another device, so refetch.
                 this.harnesses = Loadable::Idle;
@@ -1270,7 +1273,7 @@ impl Pickers {
 
     pub fn prepare_worktree_menu(&mut self, space: Space, cx: &mut Context<Self>) {
         self.worktrees_only = true;
-        self.ensure_refs_for_space(space, false, cx);
+        self.ensure_refs_for_space(space, true, cx);
     }
 
     pub fn retry_worktree_menu(&mut self, space: Space, cx: &mut Context<Self>) {

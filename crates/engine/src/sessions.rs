@@ -65,6 +65,48 @@ type PendingInputs = Arc<Mutex<HashMap<String, oneshot::Sender<Vec<UserInputAnsw
 type PendingPermissionChoices =
     Arc<Mutex<HashMap<String, oneshot::Sender<komet_proto::PermissionChoice>>>>;
 
+struct McpPermissionCancellation {
+    pending: PendingPermissionChoices,
+    engine_tx: mpsc::UnboundedSender<AgentEvent>,
+    sessions: SessionsEngine,
+    chat_id: String,
+    request_id: String,
+}
+
+impl Drop for McpPermissionCancellation {
+    fn drop(&mut self) {
+        let Some(resolver) = lock(&self.pending).remove(&self.request_id) else {
+            return;
+        };
+        drop(resolver);
+        let choice = komet_proto::PermissionChoice::Deny;
+        let _ = self.engine_tx.send(AgentEvent::PermissionResolved {
+            request_id: self.request_id.clone(),
+            choice,
+        });
+        match self.sessions.doc_handle(&self.chat_id) {
+            Ok(handle) => {
+                if let Err(error) = handle.doc().resolve_permission(&self.request_id) {
+                    tracing::warn!(
+                        chat = %self.chat_id,
+                        request = %self.request_id,
+                        error = %error,
+                        "failed to resolve cancelled MCP permission"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    chat = %self.chat_id,
+                    request = %self.request_id,
+                    error = %error,
+                    "failed to find document for cancelled MCP permission"
+                );
+            }
+        }
+    }
+}
+
 /// A harness-native session id plus the cwd it was created under. Harness
 /// session stores are cwd-scoped (claude keys conversations by project
 /// directory — komet sessions.ts:563 "harness session stores are keyed by
@@ -336,12 +378,16 @@ impl SessionsEngine {
                 let api = ComposioApi::new(api_key, self.inner.device_id.clone());
                 let session = match api {
                     Ok(api) => {
-                        async {
+                        match tokio::time::timeout(std::time::Duration::from_secs(10), async {
                             let session = api.create_session().await?;
                             let tools = session.tools().await?;
                             Ok::<_, anyhow::Error>((session, tools))
-                        }
+                        })
                         .await
+                        {
+                            Ok(result) => result,
+                            Err(_) => Err(anyhow::anyhow!("Composio startup timed out")),
+                        }
                     }
                     Err(error) => Err(error),
                 };
@@ -366,17 +412,7 @@ impl SessionsEngine {
             }
             Ok(None) => {}
             Err(error) => {
-                let message = format!("Composio credential unavailable: {error}");
                 tracing::warn!(chat = %chat_id, error = %error, "Composio credential unavailable");
-                self.inner.publish(
-                    chat_id,
-                    &AgentEvent::Error {
-                        message,
-                        kind: ErrorKind::Unknown,
-                        detail: None,
-                        retryable: true,
-                    },
-                );
             }
         }
         match McpEndpoint::start(run_id, Arc::new(catalog), McpPolicy::komet_default(), ask).await {
@@ -779,34 +815,39 @@ impl SessionsEngine {
                     if let Some(timeout) = permission_timeout {
                         let watchdog_sessions = sessions.clone();
                         let watchdog_chat = chat.clone();
+                        let watchdog_request_id = request_id.clone();
                         tokio::spawn(async move {
                             tokio::time::sleep(timeout).await;
                             if let Ok(true) = watchdog_sessions.respond_permission(
                                 &watchdog_chat,
-                                &request_id,
+                                &watchdog_request_id,
                                 komet_proto::PermissionChoice::Deny,
                             ) {
                                 // The doc part must resolve too, or a dead
                                 // approval panel would keep rendering.
                                 if let Ok(handle) = watchdog_sessions.doc_handle(&watchdog_chat) {
-                                    let _ = handle.doc().resolve_permission(&request_id.clone());
+                                    let _ = handle.doc().resolve_permission(&watchdog_request_id);
                                 }
                                 tracing::info!(
                                     chat = %watchdog_chat,
-                                    request = %request_id,
+                                    request = %watchdog_request_id,
                                     "permission auto-denied: bridge timeout"
                                 );
                             }
                         });
                     }
-                    rx
+                    (request_id, rx)
                 },
             )
         });
         let mcp_ask: AskFn = {
             let request_permission = request_permission.clone();
+            let pending = pending_permissions.clone();
+            let engine_tx = engine_tx.clone();
+            let sessions = self.clone();
+            let chat = chat_id.to_string();
             Arc::new(move |ask: PermissionAsk| {
-                let receiver = request_permission(
+                let (request_id, receiver) = request_permission(
                     komet_proto::PermissionKind::Tool {
                         name: format!("{}: {}", ask.server, ask.tool),
                     },
@@ -816,7 +857,15 @@ impl SessionsEngine {
                         komet_proto::PermissionChoice::Deny,
                     ],
                 );
+                let cancellation = McpPermissionCancellation {
+                    pending: pending.clone(),
+                    engine_tx: engine_tx.clone(),
+                    sessions: sessions.clone(),
+                    chat_id: chat.clone(),
+                    request_id,
+                };
                 Box::pin(async move {
+                    let _cancellation = cancellation;
                     match receiver.await {
                         Ok(komet_proto::PermissionChoice::Allow) => AskDecision::Allow,
                         Ok(komet_proto::PermissionChoice::AllowAlways { .. }) => {
@@ -841,7 +890,7 @@ impl SessionsEngine {
             request_input,
             request_permission: Box::new({
                 let request_permission = request_permission.clone();
-                move |kind, summary, choices| request_permission(kind, summary, choices)
+                move |kind, summary, choices| request_permission(kind, summary, choices).1
             }),
             steering: steer_rx,
             interrupt: interrupt_token.clone(),
@@ -2470,6 +2519,34 @@ mod tests {
             dir,
             SessionsEngine::new_for_tests("dev".into(), journal, registry),
         )
+    }
+
+    #[test]
+    fn dropping_mcp_permission_cleans_up_pending_request_without_interrupting() {
+        let (_dir, sessions) = test_engine();
+        let pending: PendingPermissionChoices = Arc::default();
+        let (resolver, mut receiver) = oneshot::channel();
+        let request_id = "permission-1".to_string();
+        lock(&pending).insert(request_id.clone(), resolver);
+        let (engine_tx, mut engine_rx) = mpsc::unbounded_channel();
+
+        drop(McpPermissionCancellation {
+            pending: pending.clone(),
+            engine_tx,
+            sessions,
+            chat_id: "chat-1".into(),
+            request_id: request_id.clone(),
+        });
+
+        assert!(!lock(&pending).contains_key(&request_id));
+        assert!(receiver.try_recv().is_err());
+        assert!(matches!(
+            engine_rx.try_recv(),
+            Ok(AgentEvent::PermissionResolved {
+                request_id: resolved_id,
+                choice: komet_proto::PermissionChoice::Deny,
+            }) if resolved_id == request_id
+        ));
     }
 
     fn native_window(used: u64, input: u64, output: u64) -> AgentEvent {

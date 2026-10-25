@@ -173,9 +173,9 @@ impl IntegrationsPage {
                     Ok(_) => {
                         page.key_input
                             .update(cx, |input, cx| input.set_text(String::new(), cx));
+                        page.refresh(cx);
                         page.status =
                             Some("Composio API key saved securely on this device.".into());
-                        page.refresh(cx);
                     }
                     Err(error) => page.status = Some(error.to_string().into()),
                 }
@@ -330,8 +330,8 @@ impl IntegrationsPage {
                 page.busy = false;
                 match result {
                     Ok(_) => {
-                        page.status = Some("Connected account removed.".into());
                         page.refresh(cx);
+                        page.status = Some("Connected account removed.".into());
                     }
                     Err(error) => page.status = Some(error.to_string().into()),
                 }

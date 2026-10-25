@@ -187,7 +187,7 @@ impl Shell {
         rows
     }
 
-    fn open_spaces_menu(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    fn open_spaces_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // "PaletteSearch" context: ↑↓/⏎ stay unbound in the input and bubble
         // to the card's key handler.
         let search =
@@ -200,14 +200,16 @@ impl Shell {
                 cx.notify();
             }
         });
+        let focus = cx.focus_handle();
         self.spaces_menu.open(SpacesMenu {
             search,
             page: SpacesMenuPage::Actions,
             active: 0,
-            focus: cx.focus_handle(),
+            focus: focus.clone(),
             list_scroll: gpui::ScrollHandle::new(),
             _search_events: search_events,
         });
+        window.focus(&focus, cx);
         cx.notify();
     }
 
@@ -238,7 +240,8 @@ impl Shell {
                 let handle = menu.search.read(cx).focus_handle(cx);
                 window.focus(&handle, cx);
             } else {
-                window.blur();
+                let handle = menu.focus.clone();
+                window.focus(&handle, cx);
             }
         }
         if changed
@@ -280,6 +283,17 @@ impl Shell {
         state.space_row(&id).cloned()
     }
 
+    fn project_menu_action_availability(&self, cx: &App) -> (bool, bool) {
+        let has_project_filter = self.settings.space_filter.is_some();
+        let context_space = self.context_space(cx);
+        let worktrees_enabled = has_project_filter
+            && context_space
+                .as_ref()
+                .is_some_and(|space| space.git_detected);
+        let settings_enabled = has_project_filter && context_space.is_some();
+        (worktrees_enabled, settings_enabled)
+    }
+
     fn open_project_menu_worktrees(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.open_project_menu_page(SpacesMenuPage::Worktrees, window, cx);
     }
@@ -291,9 +305,12 @@ impl Shell {
         cx: &mut Context<Self>,
     ) {
         self.open_new_session_in(Some(space_id), cx);
-        self.composer.update(cx, |composer, cx| {
-            composer.pickers().update(cx, |pickers, cx| {
-                pickers.select_worktree_from_menu(&branch, cx);
+        let composer = self.composer.clone();
+        cx.defer(move |cx| {
+            composer.update(cx, |composer, cx| {
+                composer.pickers().update(cx, |pickers, cx| {
+                    pickers.select_worktree_from_menu(&branch, cx);
+                });
             });
         });
         self.close_spaces_menu(cx);
@@ -305,6 +322,7 @@ impl Shell {
         icon_path: &'static str,
         label: &'static str,
         enabled: bool,
+        active: bool,
         theme: &Theme,
     ) -> gpui::Stateful<gpui::Div> {
         div()
@@ -325,6 +343,7 @@ impl Shell {
             .when(enabled, |el| {
                 el.cursor_pointer().hover(|el| el.bg(theme.element_hover))
             })
+            .when(active, |el| el.bg(theme.element_active))
             .child(icon(icon_path).size(px(15.0)).text_color(theme.text_muted))
             .child(div().flex_1().child(SharedString::from(label)))
             .child(
@@ -359,11 +378,9 @@ impl Shell {
             popover::MenuKey::Up | popover::MenuKey::Down => {
                 let count = match self.spaces_menu.get().map(|menu| menu.page) {
                     Some(SpacesMenuPage::Actions) => {
-                        if self.settings.space_filter.is_some() {
-                            3
-                        } else {
-                            1
-                        }
+                        let (worktrees_enabled, settings_enabled) =
+                            self.project_menu_action_availability(cx);
+                        1 + usize::from(worktrees_enabled) + usize::from(settings_enabled)
                     }
                     Some(SpacesMenuPage::Settings) => 2,
                     Some(SpacesMenuPage::Worktrees) => self
@@ -396,18 +413,22 @@ impl Shell {
                 }
             }
             popover::MenuKey::Enter | popover::MenuKey::ModEnter => {
+                let (worktrees_enabled, settings_enabled) =
+                    self.project_menu_action_availability(cx);
                 match self.spaces_menu.get().map(|menu| (menu.page, menu.active)) {
-                    Some((SpacesMenuPage::Actions, 0)) if self.settings.space_filter.is_some() => {
+                    Some((SpacesMenuPage::Actions, 0)) if worktrees_enabled => {
                         self.open_project_menu_worktrees(window, cx);
                         return;
                     }
                     Some((SpacesMenuPage::Actions, active))
-                        if active == usize::from(self.settings.space_filter.is_some()) =>
+                        if active == usize::from(worktrees_enabled) =>
                     {
                         self.open_project_menu_page(SpacesMenuPage::Projects, window, cx);
                         return;
                     }
-                    Some((SpacesMenuPage::Actions, 2)) if self.settings.space_filter.is_some() => {
+                    Some((SpacesMenuPage::Actions, active))
+                        if settings_enabled && active == usize::from(worktrees_enabled) + 1 =>
+                    {
                         self.open_project_menu_page(SpacesMenuPage::Settings, window, cx);
                         return;
                     }
@@ -648,30 +669,25 @@ impl Shell {
         let context_space = self.context_space(cx);
         let mut actions = popover::popover_card(theme).w(px(220.0)).flex().flex_col();
 
-        let has_project_filter = self.settings.space_filter.is_some();
-        let worktrees_enabled = context_space
-            .as_ref()
-            .is_some_and(|space| space.git_detected);
-        let settings_enabled = has_project_filter && context_space.is_some();
-        actions = actions.when(has_project_filter, |menu| {
+        let (worktrees_enabled, settings_enabled) = self.project_menu_action_availability(cx);
+        actions = actions.when(worktrees_enabled, |menu| {
             menu.child(
                 self.project_menu_action_row(
                     "project-menu-worktree",
                     icons::GIT_BRANCH,
                     "Switch worktree",
-                    worktrees_enabled,
+                    true,
+                    active == 0,
                     theme,
                 )
-                .when(worktrees_enabled, |el| {
-                    el.on_hover(cx.listener(|this, hovered: &bool, window, cx| {
-                        if *hovered {
-                            this.open_project_menu_worktrees(window, cx);
-                        }
-                    }))
-                    .on_click(cx.listener(|this, _, window, cx| {
+                .on_hover(cx.listener(|this, hovered: &bool, window, cx| {
+                    if *hovered {
                         this.open_project_menu_worktrees(window, cx);
-                    }))
-                }),
+                    }
+                }))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.open_project_menu_worktrees(window, cx);
+                })),
             )
         });
         actions = actions.child(
@@ -680,6 +696,7 @@ impl Shell {
                 icons::FOLDER,
                 "Switch project",
                 true,
+                active == usize::from(worktrees_enabled),
                 theme,
             )
             .on_hover(cx.listener(|this, hovered: &bool, window, cx| {
@@ -697,19 +714,18 @@ impl Shell {
                     "project-menu-settings",
                     icons::SETTINGS_MINIMALISTIC,
                     "Project settings",
-                    settings_enabled,
+                    true,
+                    active == usize::from(worktrees_enabled) + 1,
                     theme,
                 )
-                .when(settings_enabled, |el| {
-                    el.on_hover(cx.listener(|this, hovered: &bool, window, cx| {
-                        if *hovered {
-                            this.open_project_menu_page(SpacesMenuPage::Settings, window, cx);
-                        }
-                    }))
-                    .on_click(cx.listener(|this, _, window, cx| {
+                .on_hover(cx.listener(|this, hovered: &bool, window, cx| {
+                    if *hovered {
                         this.open_project_menu_page(SpacesMenuPage::Settings, window, cx);
-                    }))
-                }),
+                    }
+                }))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.open_project_menu_page(SpacesMenuPage::Settings, window, cx);
+                })),
             )
         });
         let actions = crate::frost::frosted(popover::CARD_RADIUS, crate::frost::MENU_BLUR, actions)

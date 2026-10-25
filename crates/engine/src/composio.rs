@@ -389,9 +389,7 @@ fn ensure_success_status(status: reqwest::StatusCode) -> anyhow::Result<()> {
 }
 
 fn normalize_input_schema(schema: serde_json::Value) -> serde_json::Value {
-    if schema.get("type").and_then(serde_json::Value::as_str) == Some("object")
-        && schema.get("properties").is_some()
-    {
+    if schema.get("type").and_then(serde_json::Value::as_str) == Some("object") {
         schema
     } else if schema.is_object() {
         serde_json::json!({
@@ -475,6 +473,12 @@ mod tests {
             "properties": {"query": {"type": "string"}}
         });
         assert_eq!(normalize_input_schema(schema.clone()), schema);
+        for schema in [
+            serde_json::json!({"type": "object"}),
+            serde_json::json!({"type": "object", "additionalProperties": true}),
+        ] {
+            assert_eq!(normalize_input_schema(schema.clone()), schema);
+        }
     }
 
     #[test]

@@ -38,6 +38,7 @@ pub mod prompts;
 pub mod security;
 pub mod shortcuts;
 pub mod sync;
+pub mod wallpaper;
 pub mod widgets;
 
 pub const FILES_AUTOSAVE_DELAY_DEFAULT_MS: u64 = 1_000;
@@ -131,6 +132,9 @@ pub struct UiSettings {
     pub keymap: KeymapConfig,
     /// Light/dark preference. Defaults to following the OS.
     pub appearance: crate::appearance::AppearanceMode,
+    /// Local image painted behind translucent app surfaces.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wallpaper_path: Option<String>,
     /// Idle time before an edited workspace file is saved automatically.
     pub files_autosave_delay_ms: u64,
     /// Wrap long lines in workspace file editors and previews.
@@ -163,6 +167,7 @@ impl Default for UiSettings {
             terminal_open: false,
             keymap: KeymapConfig::default(),
             appearance: crate::appearance::AppearanceMode::default(),
+            wallpaper_path: None,
             files_autosave_delay_ms: FILES_AUTOSAVE_DELAY_DEFAULT_MS,
             files_word_wrap: false,
             files_editor_font_size: FILES_EDITOR_FONT_SIZE_DEFAULT,
@@ -462,6 +467,7 @@ mod tests {
                 ..KeymapConfig::default()
             },
             appearance: crate::appearance::AppearanceMode::Light,
+            wallpaper_path: Some("/wallpapers/aurora.webp".into()),
             files_autosave_delay_ms: 1000,
             files_word_wrap: true,
             files_editor_font_size: 13.0,
@@ -475,6 +481,20 @@ mod tests {
             "expanded folder state is written under the camelCase key"
         );
         assert_eq!(UiSettings::load(dir.path()), settings);
+    }
+
+    #[test]
+    fn settings_without_wallpaper_default_to_none() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            UiSettings::path(dir.path()),
+            r#"{"sidebarWidth": 300, "soundEnabled": false}"#,
+        )
+        .unwrap();
+
+        let loaded = UiSettings::load(dir.path());
+        assert_eq!(loaded.wallpaper_path, None);
+        assert_eq!(loaded.sidebar_width, 300.0);
     }
 
     /// A settings file written before light mode existed has no `appearance`
