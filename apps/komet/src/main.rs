@@ -31,6 +31,11 @@ enum Command {
     SyncInit,
     /// Run the engine without a UI (local-only unless a saved session enables sync).
     Headless,
+    /// Manage the detached engine started by the desktop app.
+    Engine {
+        #[command(subcommand)]
+        command: Option<EngineCommand>,
+    },
     /// Sign in and enable sync on the next engine start.
     Login,
     /// Remove the saved session and return to local-only on the next start.
@@ -74,6 +79,12 @@ enum Command {
         #[arg(long)]
         check: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum EngineCommand {
+    /// Gracefully stop the background engine.
+    Stop,
 }
 
 #[derive(Subcommand)]
@@ -124,7 +135,11 @@ fn main() -> anyhow::Result<()> {
     // journald on every snapshot export — enough to fill a disk on a
     // long-running headless host. Quiet them by default (RUST_LOG still
     // overrides the whole filter).
-    let long_running = cli.service || matches!(&cli.command, None | Some(Command::Headless));
+    let long_running = cli.service
+        || matches!(
+            &cli.command,
+            None | Some(Command::Headless | Command::Engine { command: None })
+        );
     let default_filter = if long_running {
         "info,loro_internal=warn,loro=warn"
     } else {
@@ -201,6 +216,19 @@ fn main() -> anyhow::Result<()> {
                 let engine = komet_engine::Engine::new(engine_config_from_env());
                 engine.run().await
             })
+        }
+        Some(Command::Engine { command: None }) => {
+            let runtime = tokio::runtime::Runtime::new()?;
+            runtime.block_on(async {
+                let engine = komet_engine::Engine::new(engine_config_from_env());
+                engine.run().await
+            })
+        }
+        Some(Command::Engine {
+            command: Some(EngineCommand::Stop),
+        }) => {
+            let runtime = tokio::runtime::Runtime::new()?;
+            runtime.block_on(stop_engine(engine_config_from_env().ipc_port))
         }
         Some(Command::Login) => {
             let runtime = tokio::runtime::Runtime::new()?;
@@ -321,6 +349,33 @@ fn dirs_data_dir() -> std::path::PathBuf {
         .or_else(|| std::env::var_os("USERPROFILE").filter(|s| !s.is_empty()))
         .expect("HOME not set");
     std::path::PathBuf::from(home).join(".komet")
+}
+
+async fn stop_engine(ipc_port: u16) -> anyhow::Result<()> {
+    let token = komet_rpc::ipc_token::read_default(ipc_port)
+        .map_err(|err| anyhow::anyhow!("no engine token for port {ipc_port}: {err}"))?;
+    let client = komet_rpc::connect_ws(&format!("ws://127.0.0.1:{ipc_port}"), &token)
+        .await
+        .map_err(|err| anyhow::anyhow!("no engine listening on port {ipc_port}: {err}"))?;
+    client
+        .call(komet_rpc::methods::STOP_ENGINE, serde_json::json!({}))
+        .await
+        .map_err(|err| anyhow::anyhow!("engine does not support graceful stop: {err}"))?;
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+    loop {
+        if tokio::net::TcpStream::connect(("127.0.0.1", ipc_port))
+            .await
+            .is_err()
+        {
+            println!("Engine stopped.");
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!("engine accepted the stop request but did not release port {ipc_port}");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 }
 
 /// `komet sync`: dial the running engine's IPC and print per-room sync state.

@@ -11,8 +11,8 @@
 
 use chrono::{DateTime, Utc};
 use gpui::{
-    AnyElement, Context, Entity, Hsla, SharedString, Subscription, Task, Window, div, prelude::*,
-    px,
+    AnyElement, ClipboardItem, Context, Entity, EventEmitter, Hsla, ScrollHandle, SharedString,
+    Subscription, Task, Window, div, prelude::*, px,
 };
 use std::time::Duration;
 
@@ -132,15 +132,69 @@ pub fn format_reset(resets_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Opt
     })
 }
 
-/// The provider cards, in display order: (harness, name, CLI command — named
-/// in the empty-state copy, komet settings.agents.tsx `PROVIDERS`).
-pub const PROVIDERS: [(HarnessId, &str, &str); 4] = [
+/// Agents whose CLI login or provider credentials are required before runs.
+/// The first four have native account management; the rest authenticate in
+/// their own CLI and are listed here with the corresponding hand-off command.
+pub const PROVIDERS: [(HarnessId, &str, &str); 12] = [
     (HarnessId::ClaudeCode, "Claude Code", "claude"),
     (HarnessId::Codex, "Codex", "codex"),
     (HarnessId::Antigravity, "Antigravity", "agy"),
-    (HarnessId::Cursor, "Cursor", "cursor.com"),
+    (HarnessId::Cursor, "Cursor", "cursor-agent"),
+    (HarnessId::Devin, "Devin", "devin"),
+    (HarnessId::Grok, "Grok", "grok"),
+    (HarnessId::Hermes, "Hermes", "hermes"),
+    (HarnessId::Opencode, "OpenCode", "opencode"),
+    (HarnessId::Pi, "Pi", "pi"),
+    (HarnessId::Muse, "Muse", "muse"),
+    (HarnessId::Copilot, "GitHub Copilot", "copilot"),
+    (HarnessId::Cline, "Cline", "cline"),
 ];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountsEvent {
+    FocusProvider(HarnessId),
+}
+
+impl EventEmitter<AccountsEvent> for AccountsPage {}
+
+pub fn requires_login(harness: HarnessId) -> bool {
+    PROVIDERS
+        .iter()
+        .any(|(provider, _, _)| *provider == harness)
+}
+
+pub fn cli_login_command(harness: HarnessId) -> Option<&'static str> {
+    match harness {
+        HarnessId::Devin => Some("devin auth login"),
+        HarnessId::Grok => Some("grok"),
+        HarnessId::Hermes => Some("hermes"),
+        HarnessId::Opencode => Some("opencode auth login"),
+        HarnessId::Pi => Some("pi"),
+        HarnessId::Muse => Some("muse"),
+        HarnessId::Copilot => Some("copilot login"),
+        HarnessId::Cline => Some("cline"),
+        HarnessId::ClaudeCode | HarnessId::Codex | HarnessId::Cursor | HarnessId::Antigravity => {
+            None
+        }
+        HarnessId::Mock => None,
+    }
+}
+
+pub fn login_instructions(harness: HarnessId) -> &'static str {
+    match harness {
+        HarnessId::Devin => {
+            "Run `devin auth login` in a terminal and complete the browser sign-in."
+        }
+        HarnessId::Grok => "Run `grok` and sign in when prompted.",
+        HarnessId::Hermes => "Run `hermes` and configure/sign in to a model provider.",
+        HarnessId::Opencode => "Run `opencode auth login` and choose your model provider.",
+        HarnessId::Pi => "Run `pi` and use `/login` to connect a model provider.",
+        HarnessId::Muse => "Run `muse` and use `/login` to connect your account.",
+        HarnessId::Copilot => "Run `copilot login` and authorize GitHub in your browser.",
+        HarnessId::Cline => "Run `cline` and choose a provider in its sign-in flow.",
+        _ => "Use the Add account flow to sign in.",
+    }
+}
 /// Accounts of one provider, active first (stable otherwise). Pure.
 pub fn provider_accounts(
     snapshot: &AgentAccountsSnapshot,
@@ -227,6 +281,9 @@ impl LoginFlow {
             HarnessId::Codex => "Add Codex account",
             HarnessId::Antigravity => "Add Antigravity account",
             HarnessId::Cursor => "Add Cursor account",
+            HarnessId::Devin => "Add Devin account",
+            HarnessId::Muse => "Add Muse account",
+            HarnessId::Copilot => "Add Copilot account",
             _ => "Add Claude account",
         }
     }
@@ -265,6 +322,10 @@ pub struct AccountsPage {
     busy_account: Option<String>,
     login: Option<LoginFlow>,
     error: Option<SharedString>,
+    focused_harness: Option<HarnessId>,
+    scroll_target_pending: bool,
+    copied_login_command: Option<HarnessId>,
+    page_scroll: ScrollHandle,
     code_input: Entity<ComposerInput>,
     load_task: Option<Task<()>>,
     load_generation: u64,
@@ -292,6 +353,10 @@ impl AccountsPage {
             busy_account: None,
             login: None,
             error: None,
+            focused_harness: None,
+            scroll_target_pending: false,
+            copied_login_command: None,
+            page_scroll: ScrollHandle::new(),
             code_input,
             load_task: None,
             load_generation: 0,
@@ -307,6 +372,20 @@ impl AccountsPage {
         // "Usage unavailable" is reserved for a probe that genuinely failed.
         page.load(usage_mode_for(LoadTrigger::Mount), cx);
         page
+    }
+
+    pub fn focus_harness(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
+        self.focused_harness = Some(harness);
+        self.scroll_target_pending = true;
+        cx.notify();
+    }
+
+    fn copy_login_command(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
+        if let Some(command) = cli_login_command(harness) {
+            cx.write_to_clipboard(ClipboardItem::new_string(command.to_string()));
+            self.copied_login_command = Some(harness);
+            cx.notify();
+        }
     }
 
     /// Retarget the page at another device's logins: every accounts RPC is
@@ -1417,6 +1496,10 @@ impl Render for AccountsPage {
             HarnessId::Opencode => (crate::icons::OPENCODE_MARK, None),
             HarnessId::Antigravity => (crate::icons::ANTIGRAVITY_MARK, None),
             HarnessId::Pi => (crate::icons::PI_MARK, None),
+            HarnessId::Devin => (crate::icons::DEVIN_MARK, None),
+            HarnessId::Muse => (crate::icons::MUSE_MARK, Some(crate::icons::muse_brand())),
+            HarnessId::Copilot => (crate::icons::COPILOT_MARK, None),
+            HarnessId::Cline => (crate::icons::CLINE_MARK, None),
             _ => (
                 crate::icons::CLAUDE_MARK,
                 Some(crate::icons::claude_brand()),
@@ -1515,7 +1598,8 @@ impl Render for AccountsPage {
                 let snapshot = snapshot.clone();
                 PROVIDERS
                     .into_iter()
-                    .map(|(harness, name, cli)| {
+                    .enumerate()
+                    .map(|(provider_index, (harness, name, cli))| {
                         let accounts = provider_accounts(&snapshot, harness);
                         // EVERY warning renders its own strip (komet maps them).
                         let warnings: Vec<String> = snapshot
@@ -1532,24 +1616,89 @@ impl Render for AccountsPage {
                             })
                             .collect();
                         let add_id: SharedString = format!("add-account-{name}").into();
-                        let card = widgets::section_card(&theme).mt(px(8.0));
+                        let focused = self.focused_harness == Some(harness);
+                        let card = widgets::section_card(&theme)
+                            .mt(px(8.0))
+                            .when(focused, |card| {
+                                card.border_1().border_color(theme.accent.opacity(0.65))
+                            });
                         let card = if rows.is_empty() {
-                            card.child(
-                                div()
-                                    .px(px(20.0))
-                                    .py(px(32.0))
-                                    .text_center()
-                                    .text_size(px(14.0))
-                                    .text_color(theme.text_muted.opacity(0.6))
-                                    .child(SharedString::from(format!(
-                                        "No {name} login detected on this device — sign in \
-                                         with \u{201C}{cli}\u{201D} or add an account."
-                                    ))),
-                            )
+                            let mut empty = div()
+                                .px(px(20.0))
+                                .py(px(24.0))
+                                .flex()
+                                .flex_col()
+                                .items_center()
+                                .gap(px(8.0))
+                                .text_center()
+                                .text_size(px(13.0))
+                                .text_color(theme.text_muted.opacity(0.75))
+                                .child(SharedString::from(if cli_login_command(harness).is_some() {
+                                    format!("{name} sign-in is managed by its own CLI.")
+                                } else {
+                                    format!("No {name} login detected on this device.")
+                                }));
+                            if let Some(command) = cli_login_command(harness) {
+                                empty = empty
+                                    .child(
+                                        div()
+                                            .max_w(px(460.0))
+                                            .text_size(px(12.0))
+                                            .text_color(theme.text_muted)
+                                            .child(SharedString::from(login_instructions(harness))),
+                                    )
+                                    .child(
+                                        widgets::ghost_action(&theme)
+                                            .id(("accounts-copy-login-command", provider_index))
+                                            .hover(|s| widgets::ghost_hover(&theme, s))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.copy_login_command(harness, cx);
+                                            }))
+                                            .child(
+                                                crate::icons::icon(crate::icons::DOCUMENT)
+                                                    .size(px(14.0))
+                                                    .text_color(theme.text_muted),
+                                            )
+                                            .child(SharedString::from(if self.copied_login_command
+                                                == Some(harness)
+                                            {
+                                                "Command copied"
+                                            } else {
+                                                "Copy sign-in command"
+                                            }))
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(10.5))
+                                            .text_color(theme.text_muted.opacity(0.5))
+                                            .child(SharedString::from(command)),
+                                    );
+                            } else {
+                                empty = empty.child(
+                                    div()
+                                        .max_w(px(460.0))
+                                        .text_size(px(12.0))
+                                        .text_color(theme.text_muted)
+                                        .child(SharedString::from(format!(
+                                            "Sign in with the {cli} CLI, or use Add account to connect another login."
+                                        ))),
+                                );
+                            }
+                            card.child(empty)
                         } else {
                             card.children(rows)
                         };
                         div()
+                            .id(("accounts-provider-section", provider_index))
+                            .when(focused, |el| {
+                                el.child(
+                                    div()
+                                        .mb(px(6.0))
+                                        .text_size(px(11.0))
+                                        .text_color(theme.accent)
+                                        .child(SharedString::from("Selected agent")),
+                                )
+                            })
                             .mt(px(24.0))
                             .flex()
                             .flex_col()
@@ -1568,20 +1717,22 @@ impl Render for AccountsPage {
                                             .child(SharedString::from(name)),
                                     )
                                     .child(div().flex_1())
-                                    .child(
-                                        widgets::ghost_action(&theme)
-                                            .id(add_id)
-                                            .hover(|s| widgets::ghost_hover(&theme, s))
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.start_login(harness, cx);
-                                            }))
-                                            .child(
-                                                crate::icons::icon(crate::icons::ADD_CIRCLE)
-                                                    .size(px(16.0))
-                                                    .text_color(theme.text_muted),
-                                            )
-                                            .child(SharedString::from("Add account")),
-                                    ),
+                                    .when(cli_login_command(harness).is_none(), |el| {
+                                        el.child(
+                                            widgets::ghost_action(&theme)
+                                                .id(add_id)
+                                                .hover(|s| widgets::ghost_hover(&theme, s))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.start_login(harness, cx);
+                                                }))
+                                                .child(
+                                                    crate::icons::icon(crate::icons::ADD_CIRCLE)
+                                                        .size(px(16.0))
+                                                        .text_color(theme.text_muted),
+                                                )
+                                                .child(SharedString::from("Add account")),
+                                        )
+                                    }),
                             )
                             .children(
                                 warnings
@@ -1595,75 +1746,93 @@ impl Render for AccountsPage {
             }
         };
 
+        if self.scroll_target_pending
+            && let Some(harness) = self.focused_harness
+            && matches!(self.snapshot, Loadable::Ready(_))
+            && let Some(provider_index) = PROVIDERS
+                .iter()
+                .position(|(provider, _, _)| *provider == harness)
+        {
+            self.page_scroll
+                .scroll_to_item(provider_index + 2 + usize::from(self.error.is_some()));
+            self.scroll_target_pending = false;
+        }
+
         div()
             .id("accounts-page")
             .size_full()
             .overflow_y_scroll()
+            .track_scroll(&self.page_scroll)
+            .w_full()
+            .max_w(px(768.0))
+            .mx_auto()
+            .px(px(24.0))
+            .pt(px(32.0))
+            .pb(px(64.0))
+            .flex()
+            .flex_col()
             .child(
-                widgets::page_column()
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(10.0))
+                    .child(widgets::page_header(&theme, "Accounts", account_count))
+                    .child(div().flex_1())
                     .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(10.0))
-                            .child(widgets::page_header(&theme, "Accounts", account_count))
-                            .child(div().flex_1())
+                        // `text-[12.5px]` + leading 16px Refresh icon,
+                        // dimmed while a refresh is in flight (komet
+                        // `disabled:opacity-50`).
+                        widgets::ghost_action(&theme)
+                            .id("accounts-refresh")
+                            .flex_none()
+                            .text_size(px(12.5))
+                            .hover(|s| widgets::ghost_hover(&theme, s))
+                            .when(refreshing, |el| el.opacity(0.5))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.load(usage_mode_for(LoadTrigger::Refresh), cx)
+                            }))
                             .child(
-                                // `text-[12.5px]` + leading 16px Refresh icon,
-                                // dimmed while a refresh is in flight (komet
-                                // `disabled:opacity-50`).
-                                widgets::ghost_action(&theme)
-                                    .id("accounts-refresh")
-                                    .flex_none()
-                                    .text_size(px(12.5))
-                                    .hover(|s| widgets::ghost_hover(&theme, s))
-                                    .when(refreshing, |el| el.opacity(0.5))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.load(usage_mode_for(LoadTrigger::Refresh), cx)
-                                    }))
-                                    .child(
-                                        crate::icons::icon(crate::icons::REFRESH)
-                                            .size(px(16.0))
-                                            .text_color(theme.text_muted),
-                                    )
-                                    .child(SharedString::from("Refresh")),
+                                crate::icons::icon(crate::icons::REFRESH)
+                                    .size(px(16.0))
+                                    .text_color(theme.text_muted),
                             )
-                            .child(self.render_device_switcher(&theme, cx)),
+                            .child(SharedString::from("Refresh")),
                     )
-                    .child(widgets::page_subtitle(
-                        &theme,
-                        "The Claude Code, Codex, Antigravity and Cursor logins on this \
-                         device. Komet detects the live session, keeps each account backed \
-                         up, and can swap between them.",
-                    ))
-                    .when_some(self.error.clone(), |el, message| {
-                        el.child(
-                            widgets::error_strip(&theme, message)
-                                .id("accounts-action-error")
-                                .cursor_pointer()
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.error = None;
-                                    cx.notify();
-                                })),
-                        )
-                    })
-                    .children(sections)
-                    // Footer note (komet: `mt-6 text-[12px] leading-relaxed
-                    // text-muted-foreground/60`).
-                    .child(
-                        div()
-                            .mt(px(24.0))
-                            .text_size(px(12.0))
-                            .line_height(px(19.0))
-                            .text_color(theme.text_muted.opacity(0.6))
-                            .child(SharedString::from(
-                                "Switching rewrites the CLI\u{2019}s stored login, so new \
-                                 agent sessions use the selected account immediately. On \
-                                 macOS, an already-running Claude Code can hold the previous \
-                                 login for up to ~30 seconds (Keychain cache).",
-                            )),
-                    ),
+                    .child(self.render_device_switcher(&theme, cx)),
+            )
+            .child(widgets::page_subtitle(
+                &theme,
+                "Connect the agents that require an account or model-provider \
+                         credentials. Claude Code, Codex, Antigravity and Cursor support \
+                         account management here; other agents use their own CLI login.",
+            ))
+            .when_some(self.error.clone(), |el, message| {
+                el.child(
+                    widgets::error_strip(&theme, message)
+                        .id("accounts-action-error")
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.error = None;
+                            cx.notify();
+                        })),
+                )
+            })
+            .children(sections)
+            // Footer note (komet: `mt-6 text-[12px] leading-relaxed
+            // text-muted-foreground/60`).
+            .child(
+                div()
+                    .mt(px(24.0))
+                    .text_size(px(12.0))
+                    .line_height(px(19.0))
+                    .text_color(theme.text_muted.opacity(0.6))
+                    .child(SharedString::from(
+                        "Switching rewrites the CLI\u{2019}s stored login, so new \
+                         agent sessions use the selected account immediately. On \
+                         macOS, an already-running Claude Code can hold the previous \
+                         login for up to ~30 seconds (Keychain cache).",
+                    )),
             )
             .when_some(dialog, |el, dialog| el.child(dialog))
     }
@@ -1695,6 +1864,33 @@ mod tests {
         // A just-completed login must show the new account's real numbers, not
         // whatever the previous list cached for that slot id.
         assert_eq!(usage_mode_for(LoadTrigger::PostLogin), UsageMode::Fresh);
+    }
+
+    #[test]
+    fn accounts_lists_every_login_required_agent() {
+        let agents = [
+            HarnessId::ClaudeCode,
+            HarnessId::Codex,
+            HarnessId::Cursor,
+            HarnessId::Devin,
+            HarnessId::Grok,
+            HarnessId::Hermes,
+            HarnessId::Opencode,
+            HarnessId::Pi,
+            HarnessId::Antigravity,
+            HarnessId::Muse,
+            HarnessId::Copilot,
+            HarnessId::Cline,
+        ];
+        for agent in agents {
+            assert!(
+                requires_login(agent),
+                "{} should be listed in Accounts",
+                agent.display_name()
+            );
+            assert!(PROVIDERS.iter().any(|(provider, _, _)| *provider == agent));
+        }
+        assert!(!requires_login(HarnessId::Mock));
     }
 
     #[test]

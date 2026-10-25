@@ -3,10 +3,12 @@
 //! NATIVE DRIVERS speak each agent's own wire directly: Claude Code over
 //! stream-json ([`ClaudeHarness`]), Codex over the app-server JSON-RPC
 //! ([`CodexHarness`]), Cursor through a pinned @cursor/sdk shim
-//! ([`CursorHarness`]). The shared [`AcpHarness`] remains ONLY for agents
-//! built ground-up on ACP — Grok (`grok agent stdio`), Hermes
-//! (`hermes acp`) and opencode (`opencode acp`) — plus pi via the community
-//! `pi-acp` adapter until a native driver exists. Adapter-mediated ACP for
+//! ([`CursorHarness`]), and Muse Code over its Muse Session Protocol
+//! ([`MuseHarness`]). The shared [`AcpHarness`] remains ONLY for agents
+//! built ground-up on ACP — Devin (`devin acp`), GitHub Copilot
+//! (`copilot --acp`), Grok (`grok agent stdio`), Hermes (`hermes acp`) and
+//! opencode (`opencode acp`) — plus pi via the community `pi-acp` adapter
+//! until a native driver exists. Adapter-mediated ACP for
 //! claude/codex/cursor was retired: the
 //! adapters held prompt turns open for background work the
 //! CLIs themselves settle eagerly, manufacturing done-status bugs the
@@ -198,6 +200,7 @@ pub mod cursor;
 pub mod errors;
 pub(crate) mod jsonrpc;
 pub mod mock;
+mod muse;
 pub mod shell_env;
 
 /// Bin directories where npm-installed CLIs land under Node version managers.
@@ -239,6 +242,50 @@ pub(crate) fn node_version_manager_bins() -> Vec<std::path::PathBuf> {
         }
     }
     dirs
+}
+
+/// Resolve an agent CLI through the app PATH, login-shell PATH, and common
+/// per-user install locations used by the harness drivers.
+pub fn find_cli_path(binary: &str) -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let mut dirs = std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>());
+    let mut search = dirs.by_ref().collect::<Vec<_>>();
+    if let Some(path) = shell_env::login_shell_path() {
+        search.extend(std::env::split_paths(path));
+    }
+    search.extend(node_version_manager_bins());
+    if let Some(home) = &home {
+        search.extend([
+            home.join(".local/bin"),
+            home.join(".npm-global/bin"),
+            home.join(".opencode/bin"),
+            home.join(".grok/bin"),
+            home.join(".hermes/bin"),
+            home.join(".cursor/bin"),
+        ]);
+    }
+    search.extend([
+        PathBuf::from("/opt/homebrew/bin"),
+        PathBuf::from("/usr/local/bin"),
+    ]);
+
+    #[cfg(windows)]
+    let mut candidates = search.into_iter().flat_map(|dir| {
+        let exe = dir.join(binary);
+        [
+            exe.clone(),
+            exe.with_extension("exe"),
+            exe.with_extension("cmd"),
+        ]
+    });
+    #[cfg(not(windows))]
+    let mut candidates = search.into_iter().map(|dir| dir.join(binary));
+
+    candidates.find(|candidate| candidate.is_file())
 }
 
 /// Add the login shell's PATH to a child process while preserving the PATH of
@@ -356,6 +403,7 @@ pub use antigravity::AntigravityHarness;
 pub use claude::ClaudeHarness;
 pub use codex::CodexHarness;
 pub use cursor::CursorHarness;
+pub use muse::MuseHarness;
 
 // ---------------------------------------------------------------------------
 // Child lifecycle (shared by the codex and ACP harnesses)

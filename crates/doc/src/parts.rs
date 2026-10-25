@@ -191,6 +191,16 @@ pub enum MessagePart {
         #[serde(default)]
         resolved: bool,
     },
+    #[serde(rename_all = "camelCase")]
+    Switch {
+        id: String,
+        from: String,
+        to: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_harness: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        to_harness: Option<String>,
+    },
     Error {
         id: String,
         message: String,
@@ -232,6 +242,7 @@ impl MessagePart {
             MessagePart::Text { id, .. }
             | MessagePart::Tool { id, .. }
             | MessagePart::Input { id, .. }
+            | MessagePart::Switch { id, .. }
             | MessagePart::Error { id, .. }
             | MessagePart::Permission { id, .. } => id,
         }
@@ -258,6 +269,18 @@ impl MessagePart {
             }
             MessagePart::Input { questions, .. } => {
                 serde_json::to_vec(questions).map_or(0, |v| v.len())
+            }
+            MessagePart::Switch {
+                from,
+                to,
+                from_harness,
+                to_harness,
+                ..
+            } => {
+                from.len()
+                    + to.len()
+                    + from_harness.as_ref().map_or(0, String::len)
+                    + to_harness.as_ref().map_or(0, String::len)
             }
             MessagePart::Error { message, .. } => message.len(),
             MessagePart::Permission { summary, .. } => summary.len(),
