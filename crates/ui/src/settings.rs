@@ -131,6 +131,7 @@ pub struct UiSettings {
     /// Customizable shortcut combos (feature-inventory §1.4).
     pub keymap: KeymapConfig,
     /// Light/dark preference. Defaults to following the OS.
+    #[serde(deserialize_with = "deserialize_appearance")]
     pub appearance: crate::appearance::AppearanceMode,
     /// Local image painted behind translucent app surfaces.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -173,6 +174,22 @@ impl Default for UiSettings {
             files_editor_font_size: FILES_EDITOR_FONT_SIZE_DEFAULT,
             files_show_all: false,
         }
+    }
+}
+
+fn deserialize_appearance<'de, D>(
+    deserializer: D,
+) -> Result<crate::appearance::AppearanceMode, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value == "digitalHand" {
+        Ok(crate::appearance::AppearanceMode::Dark)
+    } else {
+        crate::appearance::AppearanceMode::deserialize(serde::de::value::StringDeserializer::<
+            D::Error,
+        >::new(value))
     }
 }
 
@@ -520,6 +537,21 @@ mod tests {
             loaded.notifications_background_only,
             "pre-banner files default background-only on"
         );
+    }
+
+    #[test]
+    fn removed_digital_hand_appearance_migrates_to_dark() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            UiSettings::path(dir.path()),
+            r#"{"appearance":"digitalHand","sidebarWidth":300,"soundEnabled":false}"#,
+        )
+        .unwrap();
+
+        let loaded = UiSettings::load(dir.path());
+        assert_eq!(loaded.appearance, crate::appearance::AppearanceMode::Dark);
+        assert_eq!(loaded.sidebar_width, 300.0);
+        assert!(!loaded.sound_enabled);
     }
 
     #[test]

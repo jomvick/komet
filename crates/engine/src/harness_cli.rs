@@ -30,6 +30,13 @@ pub struct ManageHarnessCliParams {
     pub harness: HarnessId,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HarnessCliStatusParams {
+    #[serde(default)]
+    pub check_latest: bool,
+}
+
 #[derive(Clone, Copy)]
 enum InstallSource {
     Npm(&'static str),
@@ -93,31 +100,52 @@ fn executable(harness: HarnessId) -> &'static str {
     }
 }
 
-pub async fn statuses(harnesses: &[HarnessId]) -> Vec<HarnessCliStatus> {
-    join_all(harnesses.iter().copied().map(status)).await
+pub async fn statuses(harnesses: &[HarnessId], check_latest: bool) -> Vec<HarnessCliStatus> {
+    let client = check_latest.then(version_client);
+    join_all(
+        harnesses
+            .iter()
+            .copied()
+            .map(|harness| status(harness, client.as_ref())),
+    )
+    .await
 }
 
-async fn status(harness: HarnessId) -> HarnessCliStatus {
+async fn status(
+    harness: HarnessId,
+    client: Option<&Result<reqwest::Client, String>>,
+) -> HarnessCliStatus {
     let source = install_source(harness);
     let installed_version = version(harness).await;
     let mut check_error = None;
-    let latest_version = match source {
-        Some(InstallSource::Npm(package)) => match npm_latest(package).await {
-            Ok(version) => Some(version),
-            Err(error) => {
-                check_error = Some(error);
-                None
+    let latest_version = match (installed_version.is_some(), source, client) {
+        (true, Some(InstallSource::Npm(package)), Some(client)) => {
+            let result = match client {
+                Ok(client) => npm_latest(client, package).await,
+                Err(error) => Err(error.clone()),
+            };
+            match result {
+                Ok(version) => Some(version),
+                Err(error) => {
+                    check_error = Some(error);
+                    None
+                }
             }
-        },
-        Some(InstallSource::CursorOfficialInstaller) => match cursor_latest().await {
-            Ok(version) => Some(version),
-            Err(error) => {
-                check_error = Some(error);
-                None
+        }
+        (true, Some(InstallSource::CursorOfficialInstaller), Some(client)) => {
+            let result = match client {
+                Ok(client) => cursor_latest(client).await,
+                Err(error) => Err(error.clone()),
+            };
+            match result {
+                Ok(version) => Some(version),
+                Err(error) => {
+                    check_error = Some(error);
+                    None
+                }
             }
-        },
-        Some(InstallSource::ShellInstaller(_) | InstallSource::HermesInstaller) => None,
-        None => None,
+        }
+        _ => None,
     };
     let update_available = installed_version
         .as_deref()
@@ -162,18 +190,24 @@ async fn version(harness: HarnessId) -> Option<String> {
     (!output.is_empty()).then_some(output)
 }
 
-async fn npm_latest(package: &str) -> Result<String, String> {
-    let url = format!(
-        "https://registry.npmjs.org/{}/latest",
-        package.replace('/', "%2f").replace('@', "%40")
-    );
-    let client = reqwest::Client::builder()
+fn version_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
         .timeout(VERSION_TIMEOUT)
         .user_agent(concat!("Komet/", env!("CARGO_PKG_VERSION")))
         .build()
-        .map_err(|err| format!("Could not create the version-check client: {err}"))?;
+        .map_err(|err| format!("Could not create the version-check client: {err}"))
+}
+
+fn npm_latest_url(package: &str) -> String {
+    format!(
+        "https://registry.npmjs.org/{}/latest",
+        package.replace('/', "%2F")
+    )
+}
+
+async fn npm_latest(client: &reqwest::Client, package: &str) -> Result<String, String> {
     let response = client
-        .get(url)
+        .get(npm_latest_url(package))
         .send()
         .await
         .and_then(reqwest::Response::error_for_status)
@@ -185,12 +219,7 @@ async fn npm_latest(package: &str) -> Result<String, String> {
     Ok(latest.version)
 }
 
-async fn cursor_latest() -> Result<String, String> {
-    let client = reqwest::Client::builder()
-        .timeout(VERSION_TIMEOUT)
-        .user_agent(concat!("Komet/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .map_err(|err| format!("Could not create the version-check client: {err}"))?;
+async fn cursor_latest(client: &reqwest::Client) -> Result<String, String> {
     let response = client
         .get(CURSOR_INSTALLER_URL)
         .send()
@@ -426,6 +455,29 @@ mod tests {
         assert!(is_newer("2.0.0", "1.9.9"));
         assert!(!is_newer("1.2.3", "1.2.3 (Claude Code)"));
         assert!(!is_newer("latest", "unknown"));
+    }
+
+    #[test]
+    fn npm_scoped_package_urls_preserve_the_scope_marker() {
+        assert_eq!(
+            npm_latest_url("@anthropic-ai/claude-code"),
+            "https://registry.npmjs.org/@anthropic-ai%2Fclaude-code/latest"
+        );
+        assert_eq!(
+            npm_latest_url("opencode-ai"),
+            "https://registry.npmjs.org/opencode-ai/latest"
+        );
+    }
+
+    #[test]
+    fn latest_version_checks_are_opt_in() {
+        let default_params: HarnessCliStatusParams = serde_json::from_value(serde_json::json!({}))
+            .expect("empty status params should preserve the local-only default");
+        assert!(!default_params.check_latest);
+
+        let explicit_params: HarnessCliStatusParams =
+            serde_json::from_value(serde_json::json!({ "checkLatest": true })).unwrap();
+        assert!(explicit_params.check_latest);
     }
 
     #[test]

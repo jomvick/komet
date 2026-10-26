@@ -35,7 +35,8 @@ pub use server::{serve_connection, serve_ws_listener};
 /// Full surface: docs/research/feature-inventory.md §2.
 pub mod methods {
     pub const LIST_HARNESSES: &str = "ListHarnesses";
-    /// Read installed and latest CLI versions for the agents page.
+    /// Read installed CLI versions; query provider versions only with
+    /// `{checkLatest: true}`.
     pub const GET_HARNESS_CLI_STATUS: &str = "GetHarnessCliStatus";
     /// Install or update an agent CLI using its configured official source.
     pub const MANAGE_HARNESS_CLI: &str = "ManageHarnessCli";
@@ -105,6 +106,7 @@ pub mod methods {
     /// Titlebar GitHub control data for a checkout (`Option<GitHubStatus>`):
     /// repo URL, branch, the branch's PR + checks, recent commits, diff stats.
     pub const GET_GITHUB_STATUS: &str = "GetGitHubStatus";
+    pub const OPEN_PROJECT: &str = "OpenProject";
     pub const LIST_GIT_HISTORY: &str = "ListGitHistory";
     /// Update remote-tracking refs without changing HEAD, the index, or files.
     pub const FETCH_ALL: &str = "FetchAll";

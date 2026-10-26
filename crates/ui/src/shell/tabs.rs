@@ -9,9 +9,8 @@ use super::*;
 use crate::settings::RememberedNavigation;
 
 impl Shell {
-    /// Boot landing: remembered navigation per device (waku parity) takes
-    /// priority when the referenced session/project still exists; otherwise
-    /// falls back to the most recently active visible chat.
+    /// Apply remembered/most-recent chat fallback only when no destination has
+    /// already been chosen; normal startup marks the new-session canvas chosen.
     pub(super) fn boot_select_chat(&mut self, cx: &mut Context<Self>) {
         let should_run = {
             let state = self.state.read(cx);

@@ -21,7 +21,8 @@
 //! - Repos (§3.5): `ListRepos`, `AddRepo {path}`, `CloneRepo {url}`,
 //!   `CreateRepo {name}`, `ListBranches {repoPath}` (default branch first),
 //!   `ListFolders {path?}`, `CreateWorktree {repoPath, branch}`, `DeleteWorktree
-//!   {repoPath, worktreePath}`; `WatchCheckoutDiffs` → stream of `CheckoutDiff[]`
+//!   {repoPath, worktreePath}`, `OpenProject {repoPath, target}`; `WatchCheckoutDiffs`
+//!   → stream of `CheckoutDiff[]`
 //! - Terminals (§3.4): `OpenTerminal {chatId?, spaceId?, cols, rows}` → `TerminalSession`,
 //!   `SubscribeTerminal {terminalId, afterSeq?}` → stream of `TerminalEvent`
 //!   (replay then live tail), `WriteTerminal {terminalId, data}`, `ResizeTerminal`,
@@ -1169,6 +1170,7 @@ fn forwardable(method: &str) -> bool {
             | methods::LIST_BRANCHES
             | methods::LIST_REFS
             | methods::GET_GITHUB_STATUS
+            | methods::OPEN_PROJECT
             | methods::LIST_GIT_HISTORY
             | methods::FETCH_ALL
             | methods::SWITCH_REF
@@ -1491,6 +1493,7 @@ impl RpcService for EngineRpc {
             methods::ENGINE_READY => RpcReply::value(&serde_json::json!({ "ready": true })),
             methods::LIST_HARNESSES => RpcReply::value(&self.registry.descriptors()),
             methods::GET_HARNESS_CLI_STATUS => {
+                let params: crate::harness_cli::HarnessCliStatusParams = parse_params(params)?;
                 let harnesses = self
                     .registry
                     .descriptors()
@@ -1498,7 +1501,9 @@ impl RpcService for EngineRpc {
                     .map(|descriptor| descriptor.id)
                     .filter(|harness| *harness != HarnessId::Mock)
                     .collect::<Vec<_>>();
-                RpcReply::value(&crate::harness_cli::statuses(&harnesses).await)
+                RpcReply::value(
+                    &crate::harness_cli::statuses(&harnesses, params.check_latest).await,
+                )
             }
             methods::MANAGE_HARNESS_CLI => {
                 let params: crate::harness_cli::ManageHarnessCliParams = parse_params(params)?;
@@ -1988,13 +1993,37 @@ impl RpcService for EngineRpc {
                 RpcReply::value(&refs)
             }
             methods::GET_GITHUB_STATUS => {
-                let p: RepoPathParams = parse_params(params)?;
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    #[serde(alias = "repo")]
+                    repo_path: String,
+                    #[serde(default)]
+                    branch: Option<String>,
+                }
+                let p: P = parse_params(params)?;
                 let status = self
                     .repos
-                    .github_status(std::path::Path::new(&p.repo_path))
+                    .github_status_for_branch(
+                        std::path::Path::new(&p.repo_path),
+                        p.branch.as_deref(),
+                    )
                     .await
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&status)
+            }
+            methods::OPEN_PROJECT => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    repo_path: String,
+                    target: crate::repos::ProjectOpenTarget,
+                }
+                let p: P = parse_params(params)?;
+                self.repos
+                    .open_project(std::path::Path::new(&p.repo_path), p.target)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "opened": true }))
             }
             methods::LIST_GIT_HISTORY => {
                 #[derive(Deserialize)]
@@ -2333,6 +2362,7 @@ mod tests {
         assert!(forwardable(methods::SEARCH_FILES));
         assert!(forwardable(methods::FETCH_ALL));
         assert!(forwardable(methods::GET_GITHUB_STATUS));
+        assert!(forwardable(methods::OPEN_PROJECT));
         // Issues #31 + #10 ride the same hub/philosophy as WatchDocMessages.
         assert!(forwardable(methods::WATCH_REASONING));
         assert!(forwardable(methods::GET_TOOL_DETAIL));

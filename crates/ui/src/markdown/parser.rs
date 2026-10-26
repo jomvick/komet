@@ -389,13 +389,14 @@ fn parse_inline_container(cur: &mut Cursor, style: &InlineStyle) -> Vec<InlineRu
     workspace_file_runs(autolink_runs(merge_runs(runs)))
 }
 
-/// Turn conservative workspace-file references in prose into internal links.
-/// A candidate must be a safe relative path with an extension (or a recognised
-/// root manifest); absolute and parent-traversal paths are always plain text.
+/// Turn conservative workspace-file references in prose and inline code into
+/// internal links. A candidate must be a safe relative path with an extension
+/// (or a recognised root manifest); absolute and parent-traversal paths are
+/// always plain text. Other code spans retain their original styling.
 fn workspace_file_runs(runs: Vec<InlineRun>) -> Vec<InlineRun> {
     let mut out = Vec::new();
     for run in runs {
-        if run.style.link.is_some() || run.style.code {
+        if run.style.link.is_some() {
             out.push(run);
         } else {
             push_workspace_file_runs(&mut out, &run.text, &run.style);
@@ -1093,6 +1094,30 @@ mod tests {
             only_link("Open .src/é.rsé\n"),
             Some((".src/é.rsé".into(), "komet-file:.src/é.rsé".into()))
         );
+    }
+
+    #[test]
+    fn inline_code_file_references_become_internal_links() {
+        let tree = parse_full("Open `crates/ui/src/shell.rs:42` and keep `let x = 1` as code.\n");
+        let Block::Paragraph { runs } = &tree.blocks[0].block else {
+            panic!("expected paragraph");
+        };
+        let file = runs
+            .iter()
+            .find(|run| run.style.link.is_some())
+            .expect("inline file path should be clickable");
+        assert_eq!(file.text, "crates/ui/src/shell.rs:42");
+        assert_eq!(
+            file.style.link.as_deref(),
+            Some("komet-file:crates/ui/src/shell.rs:42")
+        );
+        assert!(file.style.code);
+        let code = runs
+            .iter()
+            .find(|run| run.text == "let x = 1")
+            .expect("ordinary inline code should remain");
+        assert!(code.style.code);
+        assert!(code.style.link.is_none());
     }
 
     #[test]

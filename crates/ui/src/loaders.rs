@@ -235,18 +235,6 @@ fn splash_image() -> Arc<Image> {
         .clone()
 }
 
-pub fn digital_hand_image() -> Arc<Image> {
-    static IMAGE: OnceLock<Arc<Image>> = OnceLock::new();
-    IMAGE
-        .get_or_init(|| {
-            Arc::new(Image::from_bytes(
-                ImageFormat::Png,
-                include_bytes!("../assets/digital-hand.png").to_vec(),
-            ))
-        })
-        .clone()
-}
-
 // Compile-time proof the specs referenced here stay wired to the catalog.
 const _: () = {
     assert!(SPLASH_OUT.delay_ms == 150);

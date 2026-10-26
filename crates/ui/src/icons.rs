@@ -8,11 +8,11 @@
 //! - The terminal tab glyphs (`terminal`, `plus`, `close`) and the stop square
 //!   are ports of the hand-drawn inline SVGs in komet's `terminal-panel.tsx` /
 //!   `composer-actions.tsx`.
-//! - The harness brand marks (`claude-mark`, `openai-mark`, `cursor-mark`) are
-//!   ports of komet's `icons.tsx`. gpui tints SVGs with the text color, so the
-//!   Claude mark's brand orange is applied at the call site ([`CLAUDE_BRAND`]).
-//! - Provider marks sourced from LobeHub's `@lobehub/icons-static-svg`
-//!   package are embedded as static SVGs because Komet renders with gpui.
+//! - AI harness brand marks are sourced from LobeHub's
+//!   `@lobehub/icons-static-svg` package and embedded as static SVGs because
+//!   Komet renders with gpui. Claude's mark keeps its brand-orange tint.
+//!
+//! Integration marks are sourced from Simple Icons (CC0 1.0).
 //!
 //! Icons render via [`icon`]: `icon(icons::PAPERCLIP).size(px(16.)).text_color(…)`.
 
@@ -162,7 +162,7 @@ icon_assets![
     (BLOBATAR_EYE_WINK, "blobatar-eye-wink"),
     (BLOBATAR_MOUTH, "blobatar-mouth"),
     (BLOBATAR_BLUSH, "blobatar-blush"),
-    // Harness brand marks (icons.tsx).
+    // AI harness brand marks (LobeHub Icons; static SVG).
     (CLAUDE_MARK, "claude-mark"),
     (OPENAI_MARK, "openai-mark"),
     (CURSOR_MARK, "cursor-mark"),
@@ -175,6 +175,31 @@ icon_assets![
     (DEVIN_MARK, "devin-mark"),
     (MUSE_MARK, "muse-mark"),
     (COPILOT_MARK, "copilot-mark"),
+    // Common model providers (LobeHub Icons; static SVG).
+    (ANTHROPIC_MARK, "anthropic-mark"),
+    (GEMINI_MARK, "gemini-mark"),
+    (META_MARK, "meta-mark"),
+    (MISTRAL_MARK, "mistral-mark"),
+    (QWEN_MARK, "qwen-mark"),
+    (DEEPSEEK_MARK, "deepseek-mark"),
+    (COHERE_MARK, "cohere-mark"),
+    (MICROSOFT_AI_MARK, "microsoft-ai-mark"),
+    (NVIDIA_MARK, "nvidia-mark"),
+    (PERPLEXITY_MARK, "perplexity-mark"),
+    (OPENROUTER_MARK, "openrouter-mark"),
+    (XAI_MARK, "xai-mark"),
+    (GMAIL_MARK, "gmail-mark"),
+    (GOOGLE_CALENDAR_MARK, "google-calendar-mark"),
+    (GOOGLE_DRIVE_MARK, "google-drive-mark"),
+    (SLACK_MARK, "slack-mark"),
+    (NOTION_MARK, "notion-mark"),
+    (LINEAR_MARK, "linear-mark"),
+    (POSTHOG_MARK, "posthog-mark"),
+    (SENTRY_MARK, "sentry-mark"),
+    (STRIPE_MARK, "stripe-mark"),
+    (SUPABASE_MARK, "supabase-mark"),
+    (HUBSPOT_MARK, "hubspot-mark"),
+    (MICROSOFT_OUTLOOK_MARK, "microsoft-outlook-mark"),
 ];
 
 /// The Claude mark's brand orange (`#D97757`) — komet keeps it even on the

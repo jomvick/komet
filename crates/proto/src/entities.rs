@@ -1079,6 +1079,10 @@ pub struct GitHubPullRequest {
     pub base_ref: String,
     #[serde(default)]
     pub checks: GitHubChecks,
+    /// GitHub's review status: `APPROVED`, `CHANGES_REQUESTED`,
+    /// `REVIEW_REQUIRED`, or absent when there is no review decision.
+    #[serde(default)]
+    pub review_decision: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

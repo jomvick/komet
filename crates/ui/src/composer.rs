@@ -3671,10 +3671,12 @@ struct QueuedPrompt {
 pub struct Composer {
     state: Entity<AppState>,
     input: Entity<ComposerInput>,
-    /// Composer actions row: repo/branch/harness-model/traits (§1.7).
-    /// Shared with the shell's new-session canvas, which renders the
-    /// device/project target selectors ([`Pickers::render_target_selectors`]).
+    /// Picker controls for the selected chat; on the new-session canvas, the
+    /// shell moves draft controls above the prompt with the target selectors.
     pickers: Entity<Pickers>,
+    /// Draft checkout controls move above the composer on the home canvas;
+    /// agent/model controls remain in the composer action row.
+    home_canvas: bool,
     /// Draft text per chat key ("" = new-chat canvas), surviving navigation.
     drafts: HashMap<String, String>,
     /// Last user prompt sent as a full turn (steers excluded): the error
@@ -3693,6 +3695,7 @@ pub struct Composer {
     preview_focus_pending: bool,
     /// In-flight file-picker prompt (paperclip).
     picker_task: Option<Task<()>>,
+    attach_menu_open: bool,
     mention_task: Option<Task<()>>,
     mention_scroll: gpui::ScrollHandle,
     mention: FileMentionState,
@@ -3767,6 +3770,14 @@ fn next_access(level: komet_proto::SandboxLevel) -> komet_proto::SandboxLevel {
 }
 
 impl Composer {
+    /// Keep draft checkout controls above the composer on the home canvas.
+    pub fn set_home_canvas(&mut self, visible: bool, cx: &mut Context<Self>) {
+        if self.home_canvas != visible {
+            self.home_canvas = visible;
+            cx.notify();
+        }
+    }
+
     /// Advance the access chip. In an existing chat the new level is saved to
     /// that chat, so it reopens at this level on every device. On the new-chat
     /// screen it applies to the draft only and leaves the Security default as is.
@@ -3878,7 +3889,7 @@ impl Composer {
                     .collect();
                 this.add_staged(staged, cx);
             }
-            ComposerInputEvent::PastedPaths(paths) => this.add_paths(paths.clone(), cx),
+            ComposerInputEvent::PastedPaths(paths) => this.add_paths(paths.clone(), true, cx),
             ComposerInputEvent::Cancelled => {}
         });
         let current_key = state.read(cx).selected_chat.clone().unwrap_or_default();
@@ -3886,6 +3897,7 @@ impl Composer {
             state,
             input,
             pickers,
+            home_canvas: false,
             drafts: HashMap::new(),
             last_sent: None,
             attachments: HashMap::new(),
@@ -3893,6 +3905,7 @@ impl Composer {
             preview_focus: cx.focus_handle(),
             preview_focus_pending: false,
             picker_task: None,
+            attach_menu_open: false,
             mention_task: None,
             mention_scroll: gpui::ScrollHandle::new(),
             mention: FileMentionState::default(),
@@ -3947,10 +3960,11 @@ impl Composer {
                 .collect();
             if std::env::var("KOMET_ATTACH_PREVIEW").is_ok_and(|v| v == "1")
                 && let Some(first) = staged.first()
+                && let Some(image) = first.image.as_ref()
             {
                 composer.preview = Some(attachments::PreviewImage {
                     name: first.name.clone().into(),
-                    image: first.image.clone(),
+                    image: image.clone(),
                 });
                 composer.preview_focus_pending = true;
             }
@@ -3997,16 +4011,24 @@ impl Composer {
         cx.notify();
     }
 
-    /// Stage image files (picker / drop / pasted paths). Non-images are
-    /// skipped silently (matching the original's `image/*` filter); read
-    /// failures and oversize files surface in the failure notice.
-    pub(crate) fn add_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+    /// Stage files selected by the image-only or generic-file picker.
+    pub(crate) fn add_paths(
+        &mut self,
+        paths: Vec<PathBuf>,
+        images_only: bool,
+        cx: &mut Context<Self>,
+    ) {
         let mut staged = Vec::new();
         for path in &paths {
-            if attachments::format_by_extension(path).is_none() {
+            if images_only && attachments::format_by_extension(path).is_none() {
                 continue;
             }
-            match attachments::stage_file(path) {
+            let result = if images_only {
+                attachments::stage_file(path)
+            } else {
+                attachments::stage_any_file(path)
+            };
+            match result {
                 Ok(att) => staged.push(att),
                 Err(message) => {
                     self.failure = Some(message.into());
@@ -4055,9 +4077,7 @@ impl Composer {
         self.attachments.remove(chat_id);
     }
 
-    /// The staged-thumbnail strip (attachment-ui.tsx AttachmentStrip):
-    /// `flex flex-wrap gap-2 px-4 pt-3`, 56px rounded thumbs, a remove button
-    /// revealed on hover, click opens the full-size preview.
+    /// Staged files share the same strip; only image entries open a preview.
     fn render_attachment_strip(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<gpui::Div> {
         let staged = self.staged();
         if staged.is_empty() {
@@ -4072,45 +4092,67 @@ impl Composer {
             .pt(px(STRIP_PAD_TOP));
         for (ix, att) in staged.iter().enumerate() {
             let group: SharedString = format!("composer-att-{}", att.id).into();
-            let preview = attachments::PreviewImage {
-                name: att.name.clone().into(),
-                image: att.image.clone(),
-            };
             let remove_id = att.id.clone();
+            let body: gpui::AnyElement = if let Some(image) = att.image.as_ref() {
+                let preview = attachments::PreviewImage {
+                    name: att.name.clone().into(),
+                    image: image.clone(),
+                };
+                div()
+                    .id(("composer-att-thumb", ix))
+                    .size(px(STRIP_THUMB))
+                    .rounded(px(8.0))
+                    .overflow_hidden()
+                    .border_1()
+                    .border_color(crate::theme::hairline(0.10))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.preview = Some(preview.clone());
+                        this.preview_focus_pending = true;
+                        cx.notify();
+                    }))
+                    .child(
+                        img(image.clone())
+                            .w(px(STRIP_THUMB - 2.0))
+                            .h(px(STRIP_THUMB - 2.0))
+                            .rounded(px(7.0))
+                            .object_fit(ObjectFit::Cover),
+                    )
+                    .into_any_element()
+            } else {
+                div()
+                    .id(("composer-att-thumb", ix))
+                    .size(px(STRIP_THUMB))
+                    .rounded(px(8.0))
+                    .overflow_hidden()
+                    .border_1()
+                    .border_color(crate::theme::hairline(0.10))
+                    .bg(crate::theme::ink(0.035))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(4.0))
+                    .child(
+                        crate::icons::icon(crate::icons::PAPERCLIP)
+                            .size(px(18.0))
+                            .text_color(theme.text_muted),
+                    )
+                    .child(
+                        div()
+                            .px(px(4.0))
+                            .text_size(px(9.0))
+                            .text_color(theme.text_muted)
+                            .overflow_hidden()
+                            .child(SharedString::from(att.name.clone())),
+                    )
+                    .into_any_element()
+            };
             strip = strip.child(
                 div()
                     .group(group.clone())
                     .relative()
-                    .child(
-                        div()
-                            .id(("composer-att-thumb", ix))
-                            .size(px(STRIP_THUMB))
-                            .rounded(px(8.0))
-                            .overflow_hidden()
-                            .border_1()
-                            .border_color(crate::theme::hairline(0.10))
-                            .cursor_pointer()
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.preview = Some(preview.clone());
-                                this.preview_focus_pending = true;
-                                cx.notify();
-                            }))
-                            .child(
-                                img(att.image.clone())
-                                    // EXPLICIT dims, not size_full: img layout
-                                    // honors the image's intrinsic aspect
-                                    // ratio over a percent height, so size_full let a
-                                    // tall photo grow past the frame — the
-                                    // rectangular overflow clip then squared
-                                    // the bottom corners.
-                                    .w(px(STRIP_THUMB - 2.0))
-                                    .h(px(STRIP_THUMB - 2.0))
-                                    // Own radii — the frame's rounding only
-                                    // clips rectangularly (7 = 8 - border).
-                                    .rounded(px(7.0))
-                                    .object_fit(ObjectFit::Cover),
-                            ),
-                    )
+                    .child(body)
                     // Own layer: inside the frosted pill everything shares one
                     // draw order and images render last, so without it the
                     // thumbnail paints OVER this button (user report).
@@ -4148,19 +4190,43 @@ impl Composer {
         Some(strip)
     }
 
-    /// Paperclip: the native image picker (the original's hidden
-    /// `<input type=file accept=image/* multiple>`).
-    fn open_file_picker(&mut self, cx: &mut Context<Self>) {
+    /// Open the native picker for images or arbitrary file attachments.
+    fn open_file_picker(&mut self, images_only: bool, cx: &mut Context<Self>) {
+        let attachment_kind = if images_only { "image" } else { "file" };
         let rx = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
             multiple: true,
-            prompt: Some("Attach".into()),
+            prompt: Some(format!("Attach {attachment_kind}").into()),
         });
-        self.picker_task = Some(cx.spawn(async move |this, cx| {
-            if let Ok(Ok(Some(paths))) = rx.await {
-                this.update(cx, |composer, cx| composer.add_paths(paths, cx))
-                    .ok();
+        self.picker_task = Some(cx.spawn(async move |this, cx| match rx.await {
+            Ok(Ok(Some(paths))) => {
+                if let Err(err) =
+                    this.update(cx, |composer, cx| composer.add_paths(paths, images_only, cx))
+                {
+                    tracing::debug!(error = %err, "composer closed while attaching files");
+                }
+            }
+            Ok(Ok(None)) => {}
+            Ok(Err(err)) => {
+                let message = format!("Could not open {attachment_kind} picker: {err}");
+                tracing::warn!(error = %message, "attachment picker failed");
+                if let Err(err) = this.update(cx, |composer, cx| {
+                    composer.failure = Some(message.into());
+                    cx.notify();
+                }) {
+                    tracing::debug!(error = %err, "composer closed after attachment picker failure");
+                }
+            }
+            Err(err) => {
+                let message = format!("{attachment_kind} picker was interrupted: {err}");
+                tracing::warn!(error = %message, "attachment picker interrupted");
+                if let Err(err) = this.update(cx, |composer, cx| {
+                    composer.failure = Some(message.into());
+                    cx.notify();
+                }) {
+                    tracing::debug!(error = %err, "composer closed after attachment picker interruption");
+                }
             }
         }));
     }
@@ -5086,7 +5152,7 @@ impl Composer {
             }
             "attach" => {
                 self.input.update(cx, |input, cx| input.set_text("", cx));
-                self.open_file_picker(cx);
+                self.open_file_picker(false, cx);
                 true
             }
             "sandbox" => {
@@ -5291,13 +5357,16 @@ impl Composer {
             .collect();
         let echo_text = attachments::with_attachments(&text, &echo_paths);
         for (path, att) in echo_paths.iter().zip(&staged) {
-            attachments::seed_attachment(&device_id, path, &att.name, att.image.clone());
-            attachments::seed_attachment_alias(&device_id, &att.id, &att.name, att.image.clone());
+            if let Some(image) = att.image.as_ref() {
+                attachments::seed_attachment(&device_id, path, &att.name, image.clone());
+                attachments::seed_attachment_alias(&device_id, &att.id, &att.name, image.clone());
+            }
             if let Some(local) = local_device_id.as_deref()
                 && local != device_id
+                && let Some(image) = att.image.as_ref()
             {
-                attachments::seed_attachment(local, path, &att.name, att.image.clone());
-                attachments::seed_attachment_alias(local, &att.id, &att.name, att.image.clone());
+                attachments::seed_attachment(local, path, &att.name, image.clone());
+                attachments::seed_attachment_alias(local, &att.id, &att.name, image.clone());
             }
         }
 
@@ -5406,9 +5475,11 @@ impl Composer {
                     // Attachment in the original send path).
                     let seed_device = host_device_id.clone().unwrap_or_else(|| device_id.clone());
                     for (path, att) in attachment_paths.iter().zip(&staged) {
-                        attachments::seed_attachment(&seed_device, path, &att.name, att.image.clone());
-                        if seed_device != device_id {
-                            attachments::seed_attachment(&device_id, path, &att.name, att.image.clone());
+                        if let Some(image) = att.image.as_ref() {
+                            attachments::seed_attachment(&seed_device, path, &att.name, image.clone());
+                            if seed_device != device_id {
+                                attachments::seed_attachment(&device_id, path, &att.name, image.clone());
+                            }
                         }
                     }
                     content = attachments::with_attachments(&text, &attachment_paths);
@@ -7024,13 +7095,9 @@ impl Render for Composer {
         self.last_rendered_height = pill_height;
 
         let send_button = self.render_send_button(mode, cx);
-        // Attach button — opens the native image picker (the original's hidden
-        // `<input type=file accept="image/*" multiple>`); paste/drop also feed
-        // the same strip. `ml-1` per the source cluster — chips→attach reads
-        // 8px (4 gap + 4 margin) in BOTH modes.
-        let attach = div()
+        // The plus button offers separate image and generic-file pickers.
+        let mut attach = div()
             .id("composer-attach")
-            .ml(px(4.0))
             .size(px(28.0))
             .flex_none()
             .flex()
@@ -7045,12 +7112,57 @@ impl Render for Composer {
                 crate::theme::ink(0.10),
             ))
             .on_hover(motion::hover_listener("composer-attach"))
-            .on_click(cx.listener(|this, _, _, cx| this.open_file_picker(cx)))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.attach_menu_open = !this.attach_menu_open;
+                cx.notify();
+            }))
             .child(
-                crate::icons::icon(crate::icons::PAPERCLIP)
+                crate::icons::icon(crate::icons::PLUS)
                     .size(px(16.0))
                     .text_color(theme.text_muted),
             );
+        if self.attach_menu_open {
+            let image_row = crate::popover::menu_row(&theme, false, "composer-attach-image")
+                .id("composer-attach-image")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.attach_menu_open = false;
+                    this.open_file_picker(true, cx);
+                    cx.notify();
+                }))
+                .child(
+                    crate::icons::icon(crate::icons::IMAGE)
+                        .size(px(16.0))
+                        .text_color(theme.text_muted),
+                )
+                .child(SharedString::from("Image"));
+            let file_row = crate::popover::menu_row(&theme, false, "composer-attach-file")
+                .id("composer-attach-file")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.attach_menu_open = false;
+                    this.open_file_picker(false, cx);
+                    cx.notify();
+                }))
+                .child(
+                    crate::icons::icon(crate::icons::PAPERCLIP)
+                        .size(px(16.0))
+                        .text_color(theme.text_muted),
+                )
+                .child(SharedString::from("File"));
+            let menu = div()
+                .w(px(170.0))
+                .flex()
+                .flex_col()
+                .child(image_row)
+                .child(file_row)
+                .into_any_element();
+            attach = attach.child(crate::popover::anchored_menu_above(
+                "composer-attach-menu",
+                menu,
+                None,
+            ));
+        }
         // Staged-thumbnail strip (attachment-ui.tsx AttachmentStrip), above
         // the input inside the pill in both modes.
         let strip = self.render_attachment_strip(&theme, cx);
@@ -7121,7 +7233,7 @@ impl Render for Composer {
                         .pr(px(morph_cluster_inset(true, morph_t)))
                         .pt(px(4.0))
                         .pb(px(10.0))
-                        .child(div().flex_1().min_w_0().child(self.pickers.clone()))
+                        .child(attach)
                         .child(
                             div()
                                 .id("composer-access-mode")
@@ -7138,7 +7250,7 @@ impl Render for Composer {
                                     komet_proto::SandboxLevel::WorkspaceWrite => "Sandboxed",
                                 }),
                         )
-                        .child(attach)
+                        .child(div().flex_1().min_w_0().child(self.pickers.clone()))
                         .child(send_button),
                 )
         } else {
@@ -7179,6 +7291,7 @@ impl Render for Composer {
                         .child(
                             div()
                                 .flex_none()
+                                .when(self.home_canvas, |el| el.flex_1().min_w_0())
                                 .flex()
                                 .flex_row()
                                 .items_center()
@@ -7191,7 +7304,7 @@ impl Render for Composer {
                                 .pr(px(morph_cluster_inset(false, morph_t)))
                                 .relative()
                                 .top(px(-cluster_dy))
-                                .child(div().flex_none().child(self.pickers.clone()))
+                                .child(attach)
                                 .child(
                                     div()
                                         .id("composer-access-mode")
@@ -7212,7 +7325,8 @@ impl Render for Composer {
                                             }
                                         }),
                                 )
-                                .child(attach)
+                                .when(self.home_canvas, |el| el.child(div().flex_1().min_w_0()))
+                                .child(div().flex_none().child(self.pickers.clone()))
                                 .child(send_button),
                         ),
                 )
@@ -7230,9 +7344,12 @@ impl Render for Composer {
         // Branch/worktree toolbar under the pill (t3code BranchToolbar): the
         // checkout-kind selector + ref picker for new sessions, read-only
         // labels once the session exists. Git spaces only.
-        let footer = self
-            .pickers
-            .update(cx, |pickers, cx| pickers.render_footer(cx));
+        let footer = (!self.home_canvas)
+            .then(|| {
+                self.pickers
+                    .update(cx, |pickers, cx| pickers.render_footer(cx))
+            })
+            .flatten();
         let container = match footer {
             Some(footer) => container.child(footer),
             None => container,

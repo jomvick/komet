@@ -511,7 +511,7 @@ pub enum RowKind {
         mentions: Arc<Vec<crate::composer::SentMentionSpan>>,
         /// Image refs parsed out of the message text (message-attachments.ts):
         /// thumbnails load from the owning device via ReadAttachmentChunk.
-        attachments: Arc<Vec<crate::attachments::UserImageAttachment>>,
+        attachments: Arc<Vec<crate::attachments::UserAttachment>>,
         /// Optimistic echo not yet confirmed by a doc frame.
         pending: bool,
     },
@@ -3207,7 +3207,7 @@ impl Transcript {
     fn render_user_attachments(
         &mut self,
         row_id: &SharedString,
-        atts: &[crate::attachments::UserImageAttachment],
+        atts: &[crate::attachments::UserAttachment],
         cx: &mut Context<Self>,
     ) -> AnyElement {
         use crate::attachments::AttachmentSnapshot;
@@ -3224,100 +3224,126 @@ impl Transcript {
             .px(px(4.0))
             .pt(px(4.0));
         for (aix, att) in atts.iter().enumerate() {
-            let state = self.attachment_state(&device_ids, &att.path, cx);
             let sending = att.path.starts_with("pending://") || att.path.starts_with("pending/");
             let uploading = sending
                 .then(|| self.state.read(cx).upload_progress_percent())
                 .flatten();
             let frame = div()
                 .flex_none()
-                .w(px(ATT_THUMB_W))
+                .w(px(if att.is_image { ATT_THUMB_W } else { 132.0 }))
                 .h(px(ATT_THUMB_H))
                 .rounded(px(8.0))
                 .overflow_hidden();
-            let thumb: AnyElement = match state {
-                AttachmentSnapshot::Loaded(image) => {
-                    let preview = crate::attachments::PreviewImage {
-                        name: image.name.clone(),
-                        image: image.image.clone(),
-                    };
-                    frame
-                        .id(SharedString::from(format!("{row_id}#att{aix}")))
-                        .border_1()
-                        .border_color(crate::theme::hairline(0.11))
-                        .bg(crate::theme::ink(0.035))
-                        .cursor_pointer()
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.attachment_preview = Some(preview.clone());
-                            window.focus(&this.attachment_preview_focus, cx);
-                            cx.notify();
-                        }))
-                        .child(
-                            img(image.image.clone())
-                                // EXPLICIT dims, not size_full: img layout
-                                // honors the intrinsic aspect ratio over a
-                                // percent height, so size_full let a tall photo
-                                // grow past the frame and the rectangular overflow
-                                // clip squared the bottom corners.
-                                .w(px(ATT_THUMB_W - 2.0))
-                                .h(px(ATT_THUMB_H - 2.0))
-                                // The IMG needs its own radii: the frame's
-                                // rounding only clips rectangularly, so the
-                                // sprite must round its own corners (7 = the
-                                // frame's 8 minus its 1px border).
-                                .rounded(px(7.0))
-                                .object_fit(ObjectFit::Cover),
-                        )
-                        .when(sending, |el| {
-                            let pulse = motion::pulse_wave(motion::pulse_delta(
-                                &motion::KOMET_PULSE,
-                                cx.entity_id(),
-                                cx,
-                            ));
-                            let indicator: AnyElement = match uploading {
-                                Some(pct) => crate::loaders::upload_progress_ring(pct, 34.0),
-                                None => crate::loaders::mini_gradient_spinner(
-                                    format!("att-sending-{row_id}-{aix}"),
-                                    3.0,
+            let thumb: AnyElement = if !att.is_image {
+                frame
+                    .border_1()
+                    .border_color(crate::theme::hairline(0.10))
+                    .bg(crate::theme::ink(0.035))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .px(px(8.0))
+                    .child(
+                        crate::icons::icon(crate::icons::DOCUMENT)
+                            .size(px(18.0))
+                            .text_color(crate::theme::Theme::of(cx).text_muted),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .overflow_hidden()
+                            .text_size(px(11.0))
+                            .text_color(crate::theme::Theme::of(cx).text)
+                            .child(SharedString::from(att.name.clone())),
+                    )
+                    .into_any_element()
+            } else {
+                let state = self.attachment_state(&device_ids, &att.path, cx);
+                match state {
+                    AttachmentSnapshot::Loaded(image) => {
+                        let preview = crate::attachments::PreviewImage {
+                            name: image.name.clone(),
+                            image: image.image.clone(),
+                        };
+                        frame
+                            .id(SharedString::from(format!("{row_id}#att{aix}")))
+                            .border_1()
+                            .border_color(crate::theme::hairline(0.11))
+                            .bg(crate::theme::ink(0.035))
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.attachment_preview = Some(preview.clone());
+                                window.focus(&this.attachment_preview_focus, cx);
+                                cx.notify();
+                            }))
+                            .child(
+                                img(image.image.clone())
+                                    // EXPLICIT dims, not size_full: img layout
+                                    // honors the intrinsic aspect ratio over a
+                                    // percent height, so size_full let a tall photo
+                                    // grow past the frame and the rectangular overflow
+                                    // clip squared the bottom corners.
+                                    .w(px(ATT_THUMB_W - 2.0))
+                                    .h(px(ATT_THUMB_H - 2.0))
+                                    // The IMG needs its own radii: the frame's
+                                    // rounding only clips rectangularly, so the
+                                    // sprite must round its own corners (7 = the
+                                    // frame's 8 minus its 1px border).
+                                    .rounded(px(7.0))
+                                    .object_fit(ObjectFit::Cover),
+                            )
+                            .when(sending, |el| {
+                                let pulse = motion::pulse_wave(motion::pulse_delta(
+                                    &motion::KOMET_PULSE,
                                     cx.entity_id(),
                                     cx,
+                                ));
+                                let indicator: AnyElement = match uploading {
+                                    Some(pct) => crate::loaders::upload_progress_ring(pct, 34.0),
+                                    None => crate::loaders::mini_gradient_spinner(
+                                        format!("att-sending-{row_id}-{aix}"),
+                                        3.0,
+                                        cx.entity_id(),
+                                        cx,
+                                    )
+                                    .into_any_element(),
+                                };
+                                el.child(
+                                    div()
+                                        .absolute()
+                                        .inset_0()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .bg(gpui::hsla(0.0, 0.0, 0.0, 0.38 + 0.05 * pulse))
+                                        .child(indicator),
                                 )
-                                .into_any_element(),
-                            };
-                            el.child(
-                                div()
-                                    .absolute()
-                                    .inset_0()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .bg(gpui::hsla(0.0, 0.0, 0.0, 0.38 + 0.05 * pulse))
-                                    .child(indicator),
-                            )
-                        })
-                        .into_any_element()
+                            })
+                            .into_any_element()
+                    }
+                    // Errored/unavailable: the dashed "missing" thumb.
+                    AttachmentSnapshot::Error { .. } => frame
+                        .border_1()
+                        .border_dashed()
+                        .border_color(crate::theme::hairline(0.14))
+                        .bg(crate::theme::ink(0.025))
+                        .into_any_element(),
+                    // Loading: the pulsing skeleton (same wash as popover skeletons).
+                    AttachmentSnapshot::Loading => frame
+                        .border_1()
+                        .border_color(crate::theme::hairline(0.08))
+                        .bg(crate::theme::ink(0.055))
+                        .opacity(
+                            0.35 + 0.4
+                                * motion::pulse_wave(motion::pulse_delta(
+                                    &motion::KOMET_PULSE,
+                                    cx.entity_id(),
+                                    cx,
+                                )),
+                        )
+                        .into_any_element(),
                 }
-                // Errored/unavailable: the dashed "missing" thumb.
-                AttachmentSnapshot::Error { .. } => frame
-                    .border_1()
-                    .border_dashed()
-                    .border_color(crate::theme::hairline(0.14))
-                    .bg(crate::theme::ink(0.025))
-                    .into_any_element(),
-                // Loading: the pulsing skeleton (same wash as popover skeletons).
-                AttachmentSnapshot::Loading => frame
-                    .border_1()
-                    .border_color(crate::theme::hairline(0.08))
-                    .bg(crate::theme::ink(0.055))
-                    .opacity(
-                        0.35 + 0.4
-                            * motion::pulse_wave(motion::pulse_delta(
-                                &motion::KOMET_PULSE,
-                                cx.entity_id(),
-                                cx,
-                            )),
-                    )
-                    .into_any_element(),
             };
             strip = strip.child(thumb);
         }

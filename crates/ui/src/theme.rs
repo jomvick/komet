@@ -772,9 +772,7 @@ impl Theme {
     pub fn install(appearance: Appearance, cx: &mut App) {
         set_current_appearance(appearance);
         let mut theme = Self::for_appearance(appearance);
-        if crate::appearance::mode(cx) != crate::appearance::AppearanceMode::DigitalHand
-            && crate::settings::wallpaper::is_enabled(cx)
-        {
+        if crate::settings::wallpaper::is_enabled(cx) {
             theme = theme.with_wallpaper();
         }
         let (normal, hover, active) = scrollbar_thumb_colors(&theme);

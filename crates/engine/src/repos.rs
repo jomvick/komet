@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use komet_proto::{
@@ -36,8 +37,53 @@ const FOLDER_LIST_MAX_ENTRIES: usize = 500;
 const FILE_SEARCH_MAX_RESULTS: usize = 8;
 /// A dead network mount must not leave the composer search spinning forever.
 const FILE_SEARCH_TIMEOUT: Duration = Duration::from_secs(6);
+const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const GIT_WORKTREE_TIMEOUT: Duration = Duration::from_secs(120);
+const GIT_NETWORK_TIMEOUT: Duration = Duration::from_secs(600);
 pub const GIT_HISTORY_DEFAULT_LIMIT: usize = 100;
 pub const GIT_HISTORY_MAX_LIMIT: usize = 200;
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ProjectOpenTarget {
+    Cursor,
+    VsCode,
+    Files,
+}
+
+fn project_open_command(linux: &str, macos: &str, windows: &str) -> std::process::Command {
+    #[cfg(target_os = "macos")]
+    {
+        let mut command = std::process::Command::new("open");
+        command.args(["-a", macos, "--args"]);
+        command
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = (linux, macos);
+        std::process::Command::new(windows)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = (macos, windows);
+        std::process::Command::new(linux)
+    }
+}
+
+fn file_manager_command() -> std::process::Command {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer.exe")
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        std::process::Command::new("xdg-open")
+    }
+}
 
 const ADJECTIVES: &[&str] = &[
     "swift", "calm", "bright", "bold", "keen", "brave", "clever", "lucky", "quiet", "warm", "cool",
@@ -113,6 +159,38 @@ impl Repos {
         }
     }
 
+    pub fn open_project(
+        &self,
+        repo_path: &Path,
+        target: ProjectOpenTarget,
+    ) -> Result<(), EngineError> {
+        let path = std::fs::canonicalize(repo_path)?;
+        if !path.is_dir() {
+            return Err(EngineError::Other(format!(
+                "project path is not a directory: {}",
+                path.display()
+            )));
+        }
+
+        let mut command = match target {
+            ProjectOpenTarget::Cursor => project_open_command("cursor", "Cursor", "cursor.exe"),
+            ProjectOpenTarget::VsCode => {
+                project_open_command("code", "Visual Studio Code", "code.exe")
+            }
+            ProjectOpenTarget::Files => file_manager_command(),
+        };
+        command
+            .arg(&path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|error| {
+                EngineError::Other(format!("could not open project in {target:?}: {error}"))
+            })?;
+        Ok(())
+    }
+
     // ── registry (repos.json) ───────────────────────────────────────────────
 
     fn registry_path(&self) -> PathBuf {
@@ -151,11 +229,25 @@ impl Repos {
         if let Some(cwd) = cwd {
             cmd.current_dir(cwd);
         }
-        cmd.stdin(std::process::Stdio::null());
-        let output = cmd
-            .output()
-            .await
-            .map_err(|e| EngineError::Other(format!("git spawn failed: {e}")))?;
+        cmd.stdin(std::process::Stdio::null()).kill_on_drop(true);
+        let operation = args.first().copied().unwrap_or("unknown");
+        let timeout = match operation {
+            "clone" | "fetch" => GIT_NETWORK_TIMEOUT,
+            "worktree" => GIT_WORKTREE_TIMEOUT,
+            _ => GIT_COMMAND_TIMEOUT,
+        };
+        let output = match tokio::time::timeout(timeout, cmd.output()).await {
+            Ok(Ok(output)) => output,
+            Ok(Err(error)) => {
+                return Err(EngineError::Other(format!("git spawn failed: {error}")));
+            }
+            Err(_) => {
+                return Err(EngineError::Other(format!(
+                    "git {operation} timed out after {} seconds",
+                    timeout.as_secs()
+                )));
+            }
+        };
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let message = stderr.trim();
@@ -170,6 +262,34 @@ impl Repos {
             }));
         }
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    async fn remote_branches_matching(
+        &self,
+        cwd: &Path,
+        branch: &str,
+    ) -> Result<Vec<String>, EngineError> {
+        let remotes = self.git(&["remote"], Some(cwd)).await?;
+        let mut matches = Vec::new();
+        for remote in remotes.lines().filter(|remote| !remote.is_empty()) {
+            let remote_branch = format!("{remote}/{branch}");
+            if self
+                .git(
+                    &[
+                        "show-ref",
+                        "--verify",
+                        "--quiet",
+                        &format!("refs/remotes/{remote_branch}"),
+                    ],
+                    Some(cwd),
+                )
+                .await
+                .is_ok()
+            {
+                matches.push(remote_branch);
+            }
+        }
+        Ok(matches)
     }
 
     /// Async existence probe with a timeout: a wedged network mount just reads
@@ -434,29 +554,73 @@ impl Repos {
         &self,
         repo_path: &Path,
     ) -> Result<Option<GitHubStatus>, EngineError> {
+        self.github_status_for_branch(repo_path, None).await
+    }
+
+    /// GitHub panel data for the checked-out branch or a branch selected for
+    /// read-only browsing. The requested ref is validated and resolved before
+    /// it is passed to Git or `gh`.
+    pub async fn github_status_for_branch(
+        &self,
+        repo_path: &Path,
+        branch: Option<&str>,
+    ) -> Result<Option<GitHubStatus>, EngineError> {
         let Some(repo_url) = self.github_repo_url(repo_path).await? else {
             return Ok(None);
         };
-        let branch = self.current_branch(repo_path).await?;
+        let checkout_branch = self.current_branch(repo_path).await?;
+        let branch = match branch {
+            Some(branch) => {
+                if !self
+                    .branches(repo_path)
+                    .await?
+                    .iter()
+                    .any(|available| available == branch)
+                {
+                    return Err(EngineError::Other(
+                        "Branch is not available in this repository".into(),
+                    ));
+                }
+                self.git(&["check-ref-format", "--branch", branch], Some(repo_path))
+                    .await
+                    .map_err(|_| EngineError::Other("Invalid branch name".into()))?;
+                let revision = format!("{branch}^{{commit}}");
+                self.git(
+                    &["rev-parse", "--verify", "--quiet", &revision],
+                    Some(repo_path),
+                )
+                .await
+                .map_err(|_| EngineError::Other("Branch is not available locally".into()))?;
+                branch.to_string()
+            }
+            None => checkout_branch.clone(),
+        };
         let detached = branch == "HEAD";
+        let read_only_branch = branch != checkout_branch;
         let (pull_request, recent_commits) = tokio::join!(
             async {
                 if detached {
                     None
                 } else {
-                    github_pull_request(repo_path).await
+                    github_pull_request(repo_path, Some(&branch)).await
                 }
             },
-            self.recent_commits(repo_path, GITHUB_RECENT_COMMITS),
+            self.recent_commits(repo_path, GITHUB_RECENT_COMMITS, &branch),
         );
         let base = self
             .changes_base(
                 repo_path,
+                &branch,
                 pull_request.as_ref().map(|pr| pr.base_ref.as_str()),
             )
             .await;
+        let diff_args = if read_only_branch {
+            vec!["diff", "--shortstat", base.as_str(), branch.as_str()]
+        } else {
+            vec!["diff", "--shortstat", base.as_str()]
+        };
         let (insertions, deletions) = self
-            .git(&["diff", "--shortstat", &base], Some(repo_path))
+            .git(&diff_args, Some(repo_path))
             .await
             .map(|out| parse_shortstat(&out))
             .unwrap_or_default();
@@ -470,8 +634,13 @@ impl Repos {
         }))
     }
 
-    /// Latest `limit` commits reachable from HEAD (empty for an unborn branch).
-    async fn recent_commits(&self, repo_path: &Path, limit: usize) -> Vec<GitHistoryCommit> {
+    /// Latest `limit` commits reachable from `revision`.
+    async fn recent_commits(
+        &self,
+        repo_path: &Path,
+        limit: usize,
+        revision: &str,
+    ) -> Vec<GitHistoryCommit> {
         let count = format!("-n{limit}");
         self.git(
             &[
@@ -480,7 +649,7 @@ impl Repos {
                 "--no-show-signature",
                 &count,
                 "--format=%H%x00%P%x00%s%x00%an%x00%ae%x00%aI%x00",
-                "HEAD",
+                revision,
             ],
             Some(repo_path),
         )
@@ -490,8 +659,13 @@ impl Repos {
     }
 
     /// The commit the branch's changes are measured from: the merge base with
-    /// the PR base, else with `origin/HEAD`, else HEAD itself (uncommitted only).
-    async fn changes_base(&self, repo_path: &Path, pr_base: Option<&str>) -> String {
+    /// the PR base, else with `origin/HEAD`, else the current checkout HEAD.
+    async fn changes_base(
+        &self,
+        repo_path: &Path,
+        revision: &str,
+        pr_base: Option<&str>,
+    ) -> String {
         let mut candidates = Vec::new();
         if let Some(base) = pr_base.filter(|base| !base.is_empty()) {
             candidates.push(format!("origin/{base}"));
@@ -507,7 +681,7 @@ impl Repos {
         }
         for candidate in candidates {
             if let Ok(base) = self
-                .git(&["merge-base", "HEAD", &candidate], Some(repo_path))
+                .git(&["merge-base", revision, &candidate], Some(repo_path))
                 .await
                 && !base.is_empty()
             {
@@ -523,34 +697,32 @@ impl Repos {
     /// and its checkout-kind selector.
     pub async fn refs(&self, repo_path: &Path) -> Result<Vec<RepoRef>, EngineError> {
         let names = self.branches(repo_path).await?;
-        let current = self.current_branch(repo_path).await.ok();
+        let current = self.current_branch(repo_path).await?;
         // `git worktree list --porcelain`: stanzas of `worktree <path>` /
         // `HEAD <sha>` / `branch refs/heads/<name>`. The first stanza is the
         // main checkout — excluded (it's `current`, not a linked worktree).
         let mut worktrees: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
-        if let Ok(out) = self
+        let out = self
             .git(&["worktree", "list", "--porcelain"], Some(repo_path))
-            .await
-        {
-            let mut stanza = 0usize;
-            let mut path: Option<String> = None;
-            for line in out.lines().map(str::trim) {
-                if let Some(p) = line.strip_prefix("worktree ") {
-                    stanza += 1;
-                    // The first stanza is the main checkout, not a linked tree.
-                    path = (stanza > 1).then(|| p.to_string());
-                } else if let Some(branch) = line.strip_prefix("branch refs/heads/")
-                    && let Some(path) = path.take()
-                {
-                    worktrees.insert(branch.to_string(), path);
-                }
+            .await?;
+        let mut stanza = 0usize;
+        let mut path: Option<String> = None;
+        for line in out.lines().map(str::trim) {
+            if let Some(p) = line.strip_prefix("worktree ") {
+                stanza += 1;
+                // The first stanza is the main checkout, not a linked tree.
+                path = (stanza > 1).then(|| p.to_string());
+            } else if let Some(branch) = line.strip_prefix("branch refs/heads/")
+                && let Some(path) = path.take()
+            {
+                worktrees.insert(branch.to_string(), path);
             }
         }
         Ok(names
             .into_iter()
             .map(|name| RepoRef {
-                current: current.as_deref() == Some(name.as_str()),
+                current: current == name,
                 worktree_path: worktrees.get(&name).cloned(),
                 name,
             })
@@ -682,6 +854,14 @@ impl Repos {
     /// already checked out in another worktree fails with git's own message.
     /// Returns the resulting current branch.
     pub async fn switch_ref(&self, cwd: &Path, ref_name: &str) -> Result<String, EngineError> {
+        if ref_name == "HEAD" {
+            return Err(EngineError::Other(
+                "Detached HEAD is not a selectable branch".into(),
+            ));
+        }
+        self.git(&["check-ref-format", "--branch", ref_name], Some(cwd))
+            .await
+            .map_err(|_| EngineError::Other("Invalid branch name".into()))?;
         let local = self
             .git(
                 &[
@@ -697,25 +877,18 @@ impl Repos {
         if local {
             self.git(&["checkout", ref_name], Some(cwd)).await?;
         } else {
-            let remote = format!("origin/{ref_name}");
-            let has_remote = self
-                .git(
-                    &[
-                        "show-ref",
-                        "--verify",
-                        "--quiet",
-                        &format!("refs/remotes/{remote}"),
-                    ],
-                    Some(cwd),
-                )
-                .await
-                .is_ok();
-            if has_remote {
-                self.git(&["checkout", "--track", &remote], Some(cwd))
-                    .await?;
-            } else {
-                // Unknown ref: let git produce the authoritative error.
-                self.git(&["checkout", ref_name], Some(cwd)).await?;
+            let matches = self.remote_branches_matching(cwd, ref_name).await?;
+            match matches.as_slice() {
+                [remote_branch] => {
+                    self.git(&["checkout", "--track", remote_branch], Some(cwd))
+                        .await?;
+                }
+                [] => return Err(EngineError::Other(format!("Branch not found: {ref_name}"))),
+                _ => {
+                    return Err(EngineError::Other(format!(
+                        "Branch '{ref_name}' exists on multiple remotes; create a local branch or remove the ambiguity first"
+                    )));
+                }
             }
         }
         let out = self.git(&["branch", "--show-current"], Some(cwd)).await?;
@@ -732,6 +905,43 @@ impl Repos {
         repo_path: &Path,
         branch: &str,
     ) -> Result<Worktree, EngineError> {
+        if branch == "HEAD" {
+            return Err(EngineError::Other(
+                "Detached HEAD is not a selectable worktree base".into(),
+            ));
+        }
+        self.git(&["check-ref-format", "--branch", branch], Some(repo_path))
+            .await
+            .map_err(|_| EngineError::Other("Invalid branch name".into()))?;
+        let local_branch = self
+            .git(
+                &[
+                    "show-ref",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{branch}"),
+                ],
+                Some(repo_path),
+            )
+            .await
+            .is_ok();
+        let base_ref = if local_branch {
+            branch.to_string()
+        } else {
+            match self
+                .remote_branches_matching(repo_path, branch)
+                .await?
+                .as_slice()
+            {
+                [remote_branch] => remote_branch.clone(),
+                [] => return Err(EngineError::Other(format!("Branch not found: {branch}"))),
+                _ => {
+                    return Err(EngineError::Other(format!(
+                        "Branch '{branch}' exists on multiple remotes; create a local branch or remove the ambiguity first"
+                    )));
+                }
+            }
+        };
         let repo_name = repo_path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -739,12 +949,7 @@ impl Repos {
         let base = self.inner.worktrees_root.join(&repo_name);
         std::fs::create_dir_all(&base)?;
         // Auto-generate a name colliding with neither an existing dir nor branch.
-        let existing: HashSet<String> = self
-            .branches(repo_path)
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .collect();
+        let existing: HashSet<String> = self.branches(repo_path).await?.into_iter().collect();
         let mut name = None;
         for attempt in 0..50u64 {
             let seed = std::time::SystemTime::now()
@@ -774,7 +979,7 @@ impl Repos {
                 "-b",
                 &branch_name,
                 &path.to_string_lossy(),
-                branch,
+                &base_ref,
             ],
             Some(repo_path),
         )
@@ -859,31 +1064,48 @@ impl Repos {
         repo_path: &Path,
         worktree_path: &Path,
     ) -> Result<(), EngineError> {
-        let branch = if worktree_path.exists() {
-            self.current_branch(worktree_path).await.unwrap_or_default()
-        } else {
-            String::new()
-        };
-        if worktree_path.exists() {
-            let removed = self
-                .git(
-                    &[
-                        "worktree",
-                        "remove",
-                        "--force",
-                        &worktree_path.to_string_lossy(),
-                    ],
-                    Some(repo_path),
-                )
-                .await;
-            if removed.is_err() {
-                // git refused (or the dir is half-gone) — delete the folder directly.
-                let _ = std::fs::remove_dir_all(worktree_path);
+        if !worktree_path.exists() {
+            self.git(&["worktree", "prune"], Some(repo_path)).await?;
+            return Ok(());
+        }
+
+        let requested = std::fs::canonicalize(worktree_path)?;
+        let worktrees = self
+            .git(&["worktree", "list", "--porcelain"], Some(repo_path))
+            .await?;
+        let mut stanza = 0usize;
+        let mut is_linked_worktree = false;
+        for line in worktrees.lines() {
+            if let Some(path) = line.strip_prefix("worktree ") {
+                stanza += 1;
+                if stanza > 1 && std::fs::canonicalize(path).ok().as_ref() == Some(&requested) {
+                    is_linked_worktree = true;
+                    break;
+                }
             }
         }
-        let _ = self.git(&["worktree", "prune"], Some(repo_path)).await;
-        if branch.starts_with("komet/") {
-            let _ = self.git(&["branch", "-D", &branch], Some(repo_path)).await;
+        if !is_linked_worktree {
+            return Err(EngineError::Other(format!(
+                "Not a linked worktree: {}",
+                requested.display()
+            )));
+        }
+
+        let branch = self.current_branch(&requested).await?;
+        self.git(
+            &[
+                "worktree",
+                "remove",
+                "--force",
+                &requested.to_string_lossy(),
+            ],
+            Some(repo_path),
+        )
+        .await?;
+        self.git(&["worktree", "prune"], Some(repo_path)).await?;
+        if branch.starts_with("komet/") && self.branch_exists(repo_path, &branch).await {
+            self.git(&["branch", "-D", "--", &branch], Some(repo_path))
+                .await?;
         }
         Ok(())
     }
@@ -1275,13 +1497,15 @@ const GH_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// `gh pr view` for the checked-out branch. Every failure (no `gh`, signed
 /// out, offline, no PR, timeout) reads as "no pull request".
-async fn github_pull_request(repo_path: &Path) -> Option<GitHubPullRequest> {
+async fn github_pull_request(repo_path: &Path, branch: Option<&str>) -> Option<GitHubPullRequest> {
     let mut cmd = tokio::process::Command::new("gh");
+    cmd.args(["pr", "view"]);
+    if let Some(branch) = branch {
+        cmd.arg(branch);
+    }
     cmd.args([
-        "pr",
-        "view",
         "--json",
-        "number,title,url,state,isDraft,baseRefName,statusCheckRollup",
+        "number,title,url,state,isDraft,baseRefName,statusCheckRollup,reviewDecision",
     ])
     .current_dir(repo_path)
     .env("GH_PROMPT_DISABLED", "1")
@@ -1327,6 +1551,10 @@ fn parse_gh_pull_request(json: &[u8]) -> Option<GitHubPullRequest> {
         is_draft: value["isDraft"].as_bool().unwrap_or(false),
         base_ref: value["baseRefName"].as_str().unwrap_or("").to_string(),
         checks,
+        review_decision: value["reviewDecision"]
+            .as_str()
+            .filter(|decision| !decision.is_empty())
+            .map(str::to_string),
     })
 }
 
@@ -1462,6 +1690,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn project_open_targets_use_the_rpc_names() {
+        assert!(matches!(
+            serde_json::from_str::<ProjectOpenTarget>("\"vsCode\""),
+            Ok(ProjectOpenTarget::VsCode)
+        ));
+        assert!(matches!(
+            serde_json::from_str::<ProjectOpenTarget>("\"files\""),
+            Ok(ProjectOpenTarget::Files)
+        ));
+    }
+
+    #[test]
+    fn opening_a_missing_project_returns_an_error() {
+        let data = tempfile::tempdir().unwrap();
+        let repos = Repos::new(data.path(), "device");
+        let missing = data.path().join("missing-project");
+
+        assert!(
+            repos
+                .open_project(&missing, ProjectOpenTarget::Cursor)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn github_remote_urls_normalize_https_and_ssh_forms() {
         for remote in [
             "https://github.com/owner/repo",
@@ -1541,6 +1794,7 @@ mod tests {
         let json = br#"{
             "number": 52, "title": "feat(ui): add GitHub", "url": "https://github.com/o/r/pull/52",
             "state": "OPEN", "isDraft": false, "baseRefName": "main",
+            "reviewDecision": "REVIEW_REQUIRED",
             "statusCheckRollup": [
                 {"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS"},
                 {"__typename": "CheckRun", "status": "IN_PROGRESS", "conclusion": ""},
@@ -1552,6 +1806,7 @@ mod tests {
         let pr = parse_gh_pull_request(json).unwrap();
         assert_eq!(pr.number, 52);
         assert_eq!(pr.base_ref, "main");
+        assert_eq!(pr.review_decision.as_deref(), Some("REVIEW_REQUIRED"));
         assert_eq!(
             pr.checks,
             GitHubChecks {
@@ -1613,14 +1868,55 @@ mod tests {
             )
             .await
             .unwrap();
+        repos
+            .git(&["branch", "review"], Some(root.path()))
+            .await
+            .unwrap();
+        std::fs::write(root.path().join("a.txt"), "branch version\n").unwrap();
+        repos
+            .git(&["add", "a.txt"], Some(root.path()))
+            .await
+            .unwrap();
+        repos
+            .git(
+                &[
+                    "-c",
+                    "user.name=T",
+                    "-c",
+                    "user.email=t@example.com",
+                    "commit",
+                    "--quiet",
+                    "-m",
+                    "second commit",
+                ],
+                Some(root.path()),
+            )
+            .await
+            .unwrap();
         std::fs::write(root.path().join("a.txt"), "two\nthree\n").unwrap();
 
         let status = repos.github_status(root.path()).await.unwrap().unwrap();
         assert_eq!(status.repo_url, "https://github.com/owner/repo");
         assert_eq!(status.branch, "feature");
-        assert_eq!(status.recent_commits.len(), 1);
-        assert_eq!(status.recent_commits[0].subject, "first commit");
+        assert_eq!(status.recent_commits.len(), 2);
+        assert_eq!(status.recent_commits[0].subject, "second commit");
         assert_eq!((status.insertions, status.deletions), (2, 1));
+
+        let review = repos
+            .github_status_for_branch(root.path(), Some("review"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(review.branch, "review");
+        assert_eq!(review.recent_commits.len(), 1);
+        assert_eq!(review.recent_commits[0].subject, "first commit");
+        assert_eq!(repos.current_branch(root.path()).await.unwrap(), "feature");
+        assert!(
+            repos
+                .github_status_for_branch(root.path(), Some("not-a-branch"))
+                .await
+                .is_err()
+        );
     }
 
     #[test]

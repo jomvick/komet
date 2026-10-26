@@ -273,8 +273,25 @@ impl Uploads {
         if meta.len() > MAX_BYTES {
             return Err(EngineError::Other("Attachment is too large".into()));
         }
-        let mime_type = mime_by_ext(&resolved)
-            .ok_or_else(|| EngineError::Other("Attachment is not a supported image".into()))?;
+        let upload_root = std::fs::canonicalize(&self.inner.dir).ok();
+        let is_upload = upload_root
+            .as_ref()
+            .is_some_and(|root| resolved.starts_with(root) && resolved != *root);
+        let mime_type = match mime_by_ext(&resolved) {
+            Some(mime) if mime.starts_with("image/") || is_upload => mime,
+            Some(_) if !is_upload => {
+                return Err(EngineError::Other(
+                    "Non-image attachments must be in the upload cache".into(),
+                ));
+            }
+            Some(mime) => mime,
+            None if is_upload => "application/octet-stream",
+            None => {
+                return Err(EngineError::Other(
+                    "Attachment type is not supported".into(),
+                ));
+            }
+        };
         Ok(InspectedFile {
             name: resolved
                 .file_name()
@@ -363,6 +380,21 @@ fn mime_by_ext(path: &Path) -> Option<&'static str> {
         "tif" | "tiff" => Some("image/tiff"),
         "avif" => Some("image/avif"),
         "heic" => Some("image/heic"),
+        "txt" | "log" | "md" | "markdown" | "csv" => Some("text/plain"),
+        "html" | "htm" => Some("text/html"),
+        "css" => Some("text/css"),
+        "js" | "mjs" => Some("text/javascript"),
+        "json" => Some("application/json"),
+        "pdf" => Some("application/pdf"),
+        "zip" => Some("application/zip"),
+        "tar" => Some("application/x-tar"),
+        "gz" => Some("application/gzip"),
+        "doc" => Some("application/msword"),
+        "docx" => Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+        "xls" => Some("application/vnd.ms-excel"),
+        "xlsx" => Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        "ppt" => Some("application/vnd.ms-powerpoint"),
+        "pptx" => Some("application/vnd.openxmlformats-officedocument.presentationml.presentation"),
         _ => None,
     }
 }
@@ -420,5 +452,51 @@ mod tests {
 
         assert_eq!(std::fs::read(&path).unwrap(), b"local");
         assert!(!dir.path().join("tmp").join("upload-1").exists());
+    }
+
+    #[test]
+    fn generic_types_are_readable_only_from_the_upload_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let uploads = Uploads::from_root(&dir.path().join("uploads"));
+        uploads
+            .append("upload-1", &BASE64.encode(b"document"), Some(0))
+            .unwrap();
+        let uploaded = uploads.commit("upload-1", "report.pdf").unwrap();
+        let chunk = uploads.read_chunk(&uploaded, 0, &[]).unwrap();
+        assert_eq!(chunk.mime_type, "application/pdf");
+
+        uploads
+            .append("upload-2", &BASE64.encode(b"unknown"), Some(0))
+            .unwrap();
+        let uploaded = uploads.commit("upload-2", "bundle.unknown").unwrap();
+        let chunk = uploads.read_chunk(&uploaded, 0, &[]).unwrap();
+        assert_eq!(chunk.mime_type, "application/octet-stream");
+
+        let workspace = dir.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let unknown_workspace_file = workspace.join("bundle.unknown");
+        std::fs::write(&unknown_workspace_file, b"not an upload").unwrap();
+        let document_in_workspace = workspace.join("report.pdf");
+        std::fs::write(&document_in_workspace, b"not an upload").unwrap();
+        assert!(
+            uploads
+                .read_chunk(
+                    unknown_workspace_file.to_str().unwrap(),
+                    0,
+                    std::slice::from_ref(&workspace),
+                )
+                .is_err(),
+            "generic MIME fallback must not widen workspace-file access"
+        );
+        assert!(
+            uploads
+                .read_chunk(
+                    document_in_workspace.to_str().unwrap(),
+                    0,
+                    std::slice::from_ref(&workspace),
+                )
+                .is_err(),
+            "non-image MIME types must not widen workspace-file access"
+        );
     }
 }

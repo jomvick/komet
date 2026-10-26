@@ -55,7 +55,30 @@ pub struct IntegrationsPage {
     accounts: Vec<ConnectedAccount>,
     busy: bool,
     status: Option<SharedString>,
+    status_is_error: bool,
     task: Option<Task<()>>,
+}
+
+fn project_key_kind_error(api_key: &str) -> Option<&'static str> {
+    if api_key.starts_with("ck_") {
+        Some(
+            "This looks like a Composio consumer key. Use a Platform project API key from the project's API Keys settings.",
+        )
+    } else if api_key.starts_with("uak_") {
+        Some(
+            "This looks like a Composio user API key. This screen requires a Platform project API key from the project's API Keys settings.",
+        )
+    } else {
+        None
+    }
+}
+
+fn project_key_validation_error(error: &str) -> String {
+    if error.contains("401") {
+        "Composio rejected this key (HTTP 401). Check that it is an active Platform project API key for an accessible project. Consumer and user API keys are not accepted here.".into()
+    } else {
+        error.to_owned()
+    }
 }
 
 impl IntegrationsPage {
@@ -71,6 +94,7 @@ impl IntegrationsPage {
             accounts: Vec::new(),
             busy: false,
             status: None,
+            status_is_error: false,
             task: None,
         };
         page.refresh(cx);
@@ -79,11 +103,12 @@ impl IntegrationsPage {
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
-            self.status = Some("The local engine is unavailable.".into());
+            self.set_status("The local engine is unavailable.", true);
             return;
         };
         self.busy = true;
         self.status = None;
+        self.status_is_error = false;
         self.task = Some(cx.spawn(async move |this, cx| {
             let result: Result<_, String> = async {
                 let configured = engine
@@ -137,7 +162,7 @@ impl IntegrationsPage {
                             page.accounts.clear();
                         }
                     }
-                    Err(error) => page.status = Some(error.into()),
+                    Err(error) => page.set_status(error, true),
                 }
                 cx.notify();
             })
@@ -148,17 +173,22 @@ impl IntegrationsPage {
     fn save_key(&mut self, cx: &mut Context<Self>) {
         let api_key = self.key_input.read(cx).text().trim().to_owned();
         if api_key.is_empty() {
-            self.status = Some("Enter your Composio Platform API key.".into());
+            self.set_status("Enter your Composio Platform API key.", true);
+            cx.notify();
+            return;
+        }
+        if let Some(message) = project_key_kind_error(&api_key) {
+            self.set_status(message, true);
             cx.notify();
             return;
         }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
-            self.status = Some("The local engine is unavailable.".into());
+            self.set_status("The local engine is unavailable.", true);
             cx.notify();
             return;
         };
         self.busy = true;
-        self.status = Some("Validating the Composio API key…".into());
+        self.set_status("Validating the Composio API key…", false);
         self.task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
@@ -174,10 +204,11 @@ impl IntegrationsPage {
                         page.key_input
                             .update(cx, |input, cx| input.set_text(String::new(), cx));
                         page.refresh(cx);
-                        page.status =
-                            Some("Composio API key saved securely on this device.".into());
+                        page.set_status("Composio API key saved securely on this device.", false);
                     }
-                    Err(error) => page.status = Some(error.to_string().into()),
+                    Err(error) => {
+                        page.set_status(project_key_validation_error(&error.to_string()), true)
+                    }
                 }
                 cx.notify();
             })
@@ -187,7 +218,7 @@ impl IntegrationsPage {
 
     fn remove_key(&mut self, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
-            self.status = Some("The local engine is unavailable.".into());
+            self.set_status("The local engine is unavailable.", true);
             cx.notify();
             return;
         };
@@ -204,12 +235,12 @@ impl IntegrationsPage {
                         page.configured = Some(false);
                         page.apps.clear();
                         page.accounts.clear();
-                        page.status = Some(
-                            "The API key was removed from this device. Composio still retains connected accounts."
-                                .into(),
+                        page.set_status(
+                            "The API key was removed from this device. Composio still retains connected accounts.",
+                            false,
                         );
                     }
-                    Err(error) => page.status = Some(error.to_string().into()),
+                    Err(error) => page.set_status(error.to_string(), true),
                 }
                 cx.notify();
             })
@@ -221,17 +252,18 @@ impl IntegrationsPage {
         let query = self.search_input.read(cx).text().trim().to_owned();
         let show_featured = query.is_empty();
         if query.chars().count() > 80 {
-            self.status = Some("Search is limited to 80 characters.".into());
+            self.set_status("Search is limited to 80 characters.", true);
             cx.notify();
             return;
         }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
-            self.status = Some("The local engine is unavailable.".into());
+            self.set_status("The local engine is unavailable.", true);
             cx.notify();
             return;
         };
         self.busy = true;
         self.status = None;
+        self.status_is_error = false;
         self.task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
@@ -256,8 +288,9 @@ impl IntegrationsPage {
                         } else {
                             None
                         };
+                        page.status_is_error = false;
                     }
-                    Err(error) => page.status = Some(error.into()),
+                    Err(error) => page.set_status(error, true),
                 }
                 cx.notify();
             })
@@ -267,12 +300,12 @@ impl IntegrationsPage {
 
     fn connect(&mut self, toolkit_slug: String, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
-            self.status = Some("The local engine is unavailable.".into());
+            self.set_status("The local engine is unavailable.", true);
             cx.notify();
             return;
         };
         self.busy = true;
-        self.status = Some("Preparing secure authorization…".into());
+        self.set_status("Preparing secure authorization…", false);
         self.task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
@@ -297,12 +330,12 @@ impl IntegrationsPage {
                 match result {
                     Ok(url) => {
                         cx.open_url(&url);
-                        page.status = Some(
-                            "Finish authorization in your browser, then refresh the integrations list."
-                                .into(),
+                        page.set_status(
+                            "Finish authorization in your browser, then refresh the integrations list.",
+                            false,
                         );
                     }
-                    Err(error) => page.status = Some(error.to_string().into()),
+                    Err(error) => page.set_status(error.to_string(), true),
                 }
                 cx.notify();
             })
@@ -312,12 +345,13 @@ impl IntegrationsPage {
 
     fn disconnect(&mut self, account_id: String, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
-            self.status = Some("The local engine is unavailable.".into());
+            self.set_status("The local engine is unavailable.", true);
             cx.notify();
             return;
         };
         self.busy = true;
         self.status = None;
+        self.status_is_error = false;
         self.task = Some(cx.spawn(async move |this, cx| {
             let result = engine
                 .client()
@@ -331,14 +365,19 @@ impl IntegrationsPage {
                 match result {
                     Ok(_) => {
                         page.refresh(cx);
-                        page.status = Some("Connected account removed.".into());
+                        page.set_status("Connected account removed.", false);
                     }
-                    Err(error) => page.status = Some(error.to_string().into()),
+                    Err(error) => page.set_status(error.to_string(), true),
                 }
                 cx.notify();
             })
             .ok();
         }));
+    }
+
+    fn set_status(&mut self, message: impl Into<SharedString>, is_error: bool) {
+        self.status = Some(message.into());
+        self.status_is_error = is_error;
     }
 }
 
@@ -350,6 +389,25 @@ fn parse_apps(value: serde_json::Value) -> Result<Vec<IntegrationApp>, String> {
             .ok_or_else(|| "Missing Composio integrations in response".to_string())?,
     )
     .map_err(|error| error.to_string())
+}
+
+fn integration_logo(name: &str) -> Option<(&'static str, gpui::Hsla)> {
+    let (path, color) = match name.to_ascii_lowercase().as_str() {
+        "gmail" => (crate::icons::GMAIL_MARK, 0xEA4335),
+        "google calendar" => (crate::icons::GOOGLE_CALENDAR_MARK, 0x4285F4),
+        "google drive" => (crate::icons::GOOGLE_DRIVE_MARK, 0x0F9D58),
+        "slack" => (crate::icons::SLACK_MARK, 0xE01E5A),
+        "notion" => (crate::icons::NOTION_MARK, 0xFFFFFF),
+        "linear" => (crate::icons::LINEAR_MARK, 0x5E6AD2),
+        "posthog" => (crate::icons::POSTHOG_MARK, 0xF54E00),
+        "sentry" => (crate::icons::SENTRY_MARK, 0xA08BFA),
+        "stripe" => (crate::icons::STRIPE_MARK, 0x635BFF),
+        "supabase" => (crate::icons::SUPABASE_MARK, 0x3FCF8E),
+        "hubspot" => (crate::icons::HUBSPOT_MARK, 0xFF7A59),
+        "outlook" => (crate::icons::MICROSOFT_OUTLOOK_MARK, 0x0078D4),
+        _ => return None,
+    };
+    Some((path, gpui::rgb(color).into()))
 }
 
 fn featured_apps(apps: Vec<IntegrationApp>) -> Vec<IntegrationApp> {
@@ -368,6 +426,7 @@ impl Render for IntegrationsPage {
         let theme = Theme::of(cx).clone();
         let configured = self.configured == Some(true);
         let busy = self.busy;
+        let status_is_error = self.status_is_error;
         let apps = self.apps.clone();
         let accounts = self.accounts.clone();
         let about_composio_url = COMPOSIO_HOME_URL.to_string();
@@ -500,7 +559,7 @@ impl Render for IntegrationsPage {
                                                         .size(px(14.0))
                                                         .text_color(theme.text_muted),
                                                 )
-                                                .child("Validated and stored in this device’s OS credential store. Never synced."),
+                                                .child("Use a Platform project key (ak_…). Consumer (ck_) and user (uak_) keys are not accepted."),
                                         )
                                         .child(
                                             div()
@@ -658,6 +717,25 @@ impl Render for IntegrationsPage {
                                         .cloned()
                                         .collect();
                                     let slug = app.slug.clone();
+                                    let logo_icon: gpui::AnyElement =
+                                        if let Some((path, color)) = integration_logo(&app.name) {
+                                            crate::icons::icon(path)
+                                                .size(px(18.0))
+                                                .text_color(color)
+                                                .into_any_element()
+                                        } else {
+                                            div()
+                                                .text_color(theme.text)
+                                                .child(
+                                                    app.name
+                                                        .chars()
+                                                        .next()
+                                                        .unwrap_or('?')
+                                                        .to_ascii_uppercase()
+                                                        .to_string(),
+                                                )
+                                                .into_any_element()
+                                        };
                                     div()
                                         .w(px(224.0))
                                         .rounded(px(10.0))
@@ -681,15 +759,7 @@ impl Render for IntegrationsPage {
                                                         .flex()
                                                         .items_center()
                                                         .justify_center()
-                                                        .text_color(theme.text)
-                                                        .child(
-                                                            app.name
-                                                                .chars()
-                                                                .next()
-                                                                .unwrap_or('?')
-                                                                .to_ascii_uppercase()
-                                                                .to_string(),
-                                                        ),
+                                                        .child(logo_icon),
                                                 )
                                                 .child(
                                                     div()
@@ -818,10 +888,46 @@ impl Render for IntegrationsPage {
                             div()
                                 .mt(px(12.0))
                                 .text_size(px(12.0))
-                                .text_color(theme.text_muted)
+                                .text_color(if status_is_error {
+                                    theme.danger
+                                } else {
+                                    theme.text_muted
+                                })
                                 .child(status),
                         )
                     }),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn featured_integrations_use_brand_marks() {
+        for name in FEATURED_APPS {
+            assert!(integration_logo(name).is_some(), "missing logo for {name}");
+        }
+    }
+
+    #[test]
+    fn rejects_composio_keys_for_the_wrong_authentication_surface() {
+        assert!(project_key_kind_error("ck_consumer").is_some());
+        assert!(project_key_kind_error("uak_user").is_some());
+        assert!(project_key_kind_error("ak_project").is_none());
+    }
+
+    #[test]
+    fn explains_unauthorized_project_keys_without_exposing_them() {
+        let error = project_key_validation_error(
+            "Composio key validation failed: Composio API returned HTTP 401 Unauthorized",
+        );
+        assert!(error.contains("active Platform project API key"));
+        assert!(!error.contains("secret"));
+        assert_eq!(
+            project_key_validation_error("network timeout"),
+            "network timeout"
+        );
     }
 }

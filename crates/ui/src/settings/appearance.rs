@@ -227,17 +227,6 @@ fn preview(mode: AppearanceMode) -> AnyElement {
         AppearanceMode::System => miniature_split(),
         AppearanceMode::Light => miniature(&Theme::light(), Corners::All),
         AppearanceMode::Dark => miniature(&Theme::dark(), Corners::All),
-        AppearanceMode::DigitalHand => div()
-            .size_full()
-            .rounded(px(widgets::OPTION_CARD_RADIUS))
-            .overflow_hidden()
-            .bg(gpui::rgb(0x000000))
-            .child(
-                gpui::img(crate::loaders::digital_hand_image())
-                    .size_full()
-                    .object_fit(gpui::ObjectFit::Contain),
-            )
-            .into_any_element(),
     }
 }
 
@@ -256,9 +245,6 @@ fn helper(mode: AppearanceMode, system: Appearance) -> SharedString {
         }
         AppearanceMode::Light => "Always light, whatever the system is set to.".into(),
         AppearanceMode::Dark => "Always dark, whatever the system is set to.".into(),
-        AppearanceMode::DigitalHand => {
-            "Black theme with the hand artwork on the home screen only.".into()
-        }
     }
 }
 
@@ -302,8 +288,7 @@ impl Render for AppearancePage {
                     .child(
                         widgets::page_subtitle(
                             &theme,
-                            "Choose a theme for this device. Digital Hand keeps the black base \
-                             and adds its artwork to the home screen.",
+                            "Choose a theme for this device.",
                         )
                         .max_w(px(512.0))
                         .line_height(px(20.0)),
@@ -485,7 +470,7 @@ mod tests {
 
     #[test]
     fn every_mode_gets_a_card() {
-        assert_eq!(AppearanceMode::ALL.len(), 4);
+        assert_eq!(AppearanceMode::ALL.len(), 3);
         for mode in AppearanceMode::ALL {
             assert!(!mode.label().is_empty());
         }

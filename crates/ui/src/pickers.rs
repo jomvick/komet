@@ -2504,10 +2504,8 @@ impl Pickers {
             .child(div().min_w_0().truncate().child(label))
     }
 
-    /// The new-session canvas's target row — device + project selector chips
-    /// under the canvas logo (their popovers anchor BELOW; the composer
-    /// footer carries only checkout + ref now, and sessions show their
-    /// target in the titlebar instead).
+    /// The new-session canvas's project selector. Its popover anchors below;
+    /// device selection lives in the sidebar above Settings.
     pub fn render_target_selectors(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let closing = self.open.closing_since();
@@ -2516,41 +2514,16 @@ impl Pickers {
                 let content = self.render_space_popover(cx);
                 Some((PickerKind::Space, self.popover_frame(280.0, content, cx)))
             }
-            Some(PickerKind::Device) => {
-                let content = self.render_device_popover(cx);
-                Some((PickerKind::Device, self.popover_frame(224.0, content, cx)))
-            }
             _ => None,
         };
-        let (device_label, project_label, offline) = {
+        let project_label: SharedString = {
             let state = self.state.read(cx);
-            let device_id = state.effective_device_id();
-            let device_label: SharedString = device_id
-                .as_deref()
-                .and_then(|id| state.device_name(id))
-                .map(str::to_string)
-                .unwrap_or_else(|| "This device".to_string())
-                .into();
-            let offline = device_id
-                .as_deref()
-                .is_some_and(|id| !state.device_online(id, chrono::Utc::now()));
-            let project_label: SharedString = state
+            state
                 .selected_space_row()
                 .map(|s| s.display_name().to_string())
                 .unwrap_or_else(|| "No project".to_string())
-                .into();
-            (device_label, project_label, offline)
+                .into()
         };
-        let device_chip = self
-            .footer_chip(
-                PickerKind::Device,
-                "picker-device",
-                crate::icons::MONITOR,
-                device_label,
-                &theme,
-                cx,
-            )
-            .when(offline, |el| el.text_color(theme.warning.opacity(0.8)));
         let project_chip = self.footer_chip(
             PickerKind::Space,
             "picker-project",
@@ -2565,13 +2538,6 @@ impl Pickers {
             .items_center()
             .gap(px(4.0))
             .child(attach_overlay_below(
-                device_chip,
-                &mut overlay,
-                PickerKind::Device,
-                "device-popover",
-                closing,
-            ))
-            .child(attach_overlay_below(
                 project_chip,
                 &mut overlay,
                 PickerKind::Space,
@@ -2581,10 +2547,53 @@ impl Pickers {
             .into_any_element()
     }
 
-    /// The composer footer row: checkout-kind + ref, LEFT-aligned, only when
-    /// the picked (or session's) project has git. Device + project moved to
-    /// the new-session canvas ([`Self::render_target_selectors`]); sessions
-    /// name their target in the titlebar.
+    /// Device selector placed in the sidebar above Settings.
+    pub fn render_device_selector(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = Theme::of(cx).clone();
+        let closing = self.open.closing_since();
+        let mut overlay = if self.mounted_kind() == Some(PickerKind::Device) {
+            let content = self.render_device_popover(cx);
+            Some((PickerKind::Device, self.popover_frame(224.0, content, cx)))
+        } else {
+            None
+        };
+        let (device_label, offline) = {
+            let state = self.state.read(cx);
+            let device_id = state.effective_device_id();
+            let label = device_id
+                .as_deref()
+                .and_then(|id| state.device_name(id))
+                .unwrap_or("This device");
+            let offline = device_id
+                .as_deref()
+                .is_some_and(|id| !state.device_online(id, chrono::Utc::now()));
+            (SharedString::from(label), offline)
+        };
+        let chip = self
+            .footer_chip(
+                PickerKind::Device,
+                "picker-device",
+                crate::icons::MONITOR,
+                device_label,
+                &theme,
+                cx,
+            )
+            .when(offline, |el| el.text_color(theme.warning.opacity(0.8)));
+        div()
+            .w_full()
+            .child(attach_overlay(
+                chip,
+                &mut overlay,
+                PickerKind::Device,
+                "device-popover",
+                closing,
+            ))
+            .into_any_element()
+    }
+
+    /// The checkout-kind + ref toolbar, only when the picked (or session's)
+    /// project has git. Draft controls sit above the new-session prompt;
+    /// existing sessions keep their read-only toolbar below the composer.
     pub fn render_footer(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let theme = Theme::of(cx).clone();
         // A selected chat whose workspace row hasn't synced yet (the moment
@@ -2600,10 +2609,7 @@ impl Pickers {
                 .and_then(|_| state.selected_chat_row().cloned());
             (space, session)
         };
-        let row = || {
-            // Symmetric: the container's 8px gap sits above the toolbar;
-            // bleeding 8 of the container's 16px bottom padding (mb -8)
-            // leaves 8 below — equal air on both sides of the row.
+        let row = |docked: bool| {
             // `w_full` is load-bearing: without it the canvas layout sizes
             // the row to CONTENT, and the left cluster's flex_1 (basis 0)
             // collapsed to zero width — both clusters painted from the same
@@ -2616,34 +2622,31 @@ impl Pickers {
                 .justify_between()
                 .gap(px(8.0))
                 .px(px(10.0))
-                .mb(px(-8.0))
+                .when(docked, |el| el.mb(px(-8.0)))
         };
 
         if let Some(chat) = &session {
-            // Sessions never move: read-only checkout-kind + ref labels,
-            // LEFT-aligned, only when the session's project has git. The
-            // target (project @ device) lives in the titlebar now.
-            let space = space.as_ref().filter(|s| s.git_detected)?;
-            let is_worktree = chat.cwd.as_deref().is_some_and(|cwd| cwd != space.path);
-            let (icon_path, label) = if is_worktree {
-                (crate::icons::FOLDER_WITH_FILES, "Worktree")
-            } else {
-                (crate::icons::FOLDER, "Local checkout")
-            };
-            // Mirrors the draft chips: checkout hugs the left edge, ref the
-            // right.
+            // Session checkout/ref labels are read-only and only apply to git
+            // projects. Context usage belongs to every launched session.
+            let git_space = space.as_ref().filter(|s| s.git_detected);
+            let checkout = git_space.map(|space| {
+                let is_worktree = chat.cwd.as_deref().is_some_and(|cwd| cwd != space.path);
+                let (icon_path, label) = if is_worktree {
+                    (crate::icons::FOLDER_WITH_FILES, "Worktree")
+                } else {
+                    (crate::icons::FOLDER, "Local checkout")
+                };
+                Self::footer_label(icon_path, SharedString::from(label), &theme)
+            });
             let left = div()
                 .flex()
                 .flex_row()
                 .items_center()
                 .min_w_0()
-                .child(Self::footer_label(
-                    icon_path,
-                    SharedString::from(label),
-                    &theme,
-                ));
+                .when_some(checkout, |el, checkout| el.child(checkout));
 
-            // Context usage ring (interactive — opens the usage popover).
+            // Show context usage only for an existing session. The new-session
+            // canvas stays clear until its first prompt creates a chat.
             let closing = self.open.closing_since();
             let context_stats = self.state.read(cx).current_context_usage();
             let chat_harness = chat.config.as_ref().map(|c| c.harness);
@@ -2671,23 +2674,21 @@ impl Pickers {
                     chat_harness,
                     &theme,
                 ));
-            let mut overlay: Option<(PickerKind, AnyElement)> =
-                if self.mounted_kind() == Some(PickerKind::ContextUsage) {
-                    let stats = self.state.read(cx).current_context_usage();
-                    let popover_theme = Theme::of(cx).clone();
-                    let content = crate::context_usage::render_context_popover(
-                        &stats,
-                        chat_harness,
-                        chat_model,
-                        &popover_theme,
-                    );
-                    Some((
-                        PickerKind::ContextUsage,
-                        self.popover_frame(280.0, content, cx),
-                    ))
-                } else {
-                    None
-                };
+            let mut overlay: Option<(PickerKind, AnyElement)> = if is_context_open {
+                let popover_theme = Theme::of(cx).clone();
+                let content = crate::context_usage::render_context_popover(
+                    &context_stats,
+                    chat_harness,
+                    chat_model,
+                    &popover_theme,
+                );
+                Some((
+                    PickerKind::ContextUsage,
+                    self.popover_frame(280.0, content, cx),
+                ))
+            } else {
+                None
+            };
 
             let right = div()
                 .flex()
@@ -2702,19 +2703,21 @@ impl Pickers {
                     "context-popover",
                     closing,
                 ))
-                .child(Self::footer_label(
-                    crate::icons::GIT_BRANCH,
-                    chat.branch
-                        .clone()
-                        .map(SharedString::from)
-                        .unwrap_or_else(|| SharedString::from("No ref")),
-                    &theme,
-                ));
-            return Some(row().child(left).child(right).into_any_element());
+                .when(git_space.is_some(), |el| {
+                    el.child(Self::footer_label(
+                        crate::icons::GIT_BRANCH,
+                        chat.branch
+                            .clone()
+                            .map(SharedString::from)
+                            .unwrap_or_else(|| SharedString::from("No ref")),
+                        &theme,
+                    ))
+                });
+            return Some(row(true).child(left).child(right).into_any_element());
         }
 
         // New-session canvas: checkout + ref only, LEFT-aligned (device +
-        // project live under the canvas logo now).
+        // project and harness/model controls render alongside this toolbar).
         let git = space.as_ref().is_some_and(|s| s.git_detected);
         if !git {
             return None;
@@ -2722,9 +2725,6 @@ impl Pickers {
         // Refs feed the draft labels — eager + idempotent.
         self.ensure_refs(false, cx);
         let closing = self.open.closing_since();
-        let resolved = self.resolved(cx);
-        let draft_harness = resolved.harness;
-        let draft_model = resolved.model.as_deref();
         let mut overlay: Option<(PickerKind, AnyElement)> = match self.mounted_kind() {
             Some(PickerKind::Branch) => {
                 let content = self.render_branch_popover(cx);
@@ -2733,20 +2733,6 @@ impl Pickers {
             Some(PickerKind::Checkout) => {
                 let content = self.render_checkout_popover(cx);
                 Some((PickerKind::Checkout, self.popover_frame(224.0, content, cx)))
-            }
-            Some(PickerKind::ContextUsage) => {
-                let stats = self.state.read(cx).current_context_usage();
-                let popover_theme = Theme::of(cx).clone();
-                let content = crate::context_usage::render_context_popover(
-                    &stats,
-                    draft_harness,
-                    draft_model,
-                    &popover_theme,
-                );
-                Some((
-                    PickerKind::ContextUsage,
-                    self.popover_frame(280.0, content, cx),
-                ))
             }
             // Space/Device popovers mount on the canvas selectors
             // (`render_target_selectors`), not here.
@@ -2774,31 +2760,6 @@ impl Pickers {
             &theme,
             cx,
         );
-        // Context usage ring (interactive — opens the usage popover).
-        let context_stats = self.state.read(cx).current_context_usage();
-        let is_context_open = self.open_kind() == Some(PickerKind::ContextUsage);
-        let context_chip = div()
-            .id("context-usage-ring")
-            .flex()
-            .items_center()
-            .justify_center()
-            .px(px(6.0))
-            .py(px(2.0))
-            .rounded_lg()
-            .cursor_pointer()
-            .hover(|s| s.bg(theme.element_hover))
-            .when(is_context_open, |s| s.bg(theme.element_active))
-            .on_mouse_down(
-                gpui::MouseButton::Left,
-                cx.listener(|this, _, window, cx| {
-                    this.toggle(PickerKind::ContextUsage, window, cx);
-                }),
-            )
-            .child(crate::context_usage::render_context_ring(
-                &context_stats,
-                draft_harness,
-                &theme,
-            ));
         // Checkout on the left edge, ref on the right — the row's
         // justify_between splits them (user request).
         let left = div()
@@ -2818,14 +2779,6 @@ impl Pickers {
             .flex_row()
             .items_center()
             .min_w_0()
-            .gap(px(4.0))
-            .child(attach_overlay_end(
-                context_chip,
-                &mut overlay,
-                PickerKind::ContextUsage,
-                "context-popover",
-                closing,
-            ))
             .child(attach_overlay_end(
                 ref_chip,
                 &mut overlay,
@@ -2833,7 +2786,7 @@ impl Pickers {
                 "branch-popover",
                 closing,
             ));
-        Some(row().child(left).child(right).into_any_element())
+        Some(row(false).child(left).child(right).into_any_element())
     }
 
     fn popover_frame(&self, width: f32, content: AnyElement, cx: &mut Context<Self>) -> AnyElement {
@@ -3348,6 +3301,14 @@ impl Pickers {
                             cx.notify();
                         }
                     }));
+                    if let Some(model_icon) = model_provider_icon(row.provider) {
+                        el = el.child(
+                            crate::icons::icon(model_icon)
+                                .size(px(15.0))
+                                .flex_none()
+                                .text_color(theme.text_muted.opacity(0.8)),
+                        );
+                    }
                     el = el
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.activate_model_index(ix, cx);
@@ -3794,6 +3755,27 @@ pub(crate) fn model_provider(harness: HarnessId, model_id: &str) -> &'static str
             }
             "Other"
         }
+    }
+}
+
+fn model_provider_icon(provider: &str) -> Option<&'static str> {
+    match provider {
+        "Anthropic" => Some(crate::icons::ANTHROPIC_MARK),
+        "OpenAI" => Some(crate::icons::OPENAI_MARK),
+        "Meta" => Some(crate::icons::META_MARK),
+        "Google Gemini" => Some(crate::icons::GEMINI_MARK),
+        "Mistral" => Some(crate::icons::MISTRAL_MARK),
+        "Qwen / Alibaba" => Some(crate::icons::QWEN_MARK),
+        "DeepSeek" => Some(crate::icons::DEEPSEEK_MARK),
+        "Nous Research" => Some(crate::icons::HERMES_MARK),
+        "xAI" => Some(crate::icons::XAI_MARK),
+        "Cohere" => Some(crate::icons::COHERE_MARK),
+        "Microsoft" => Some(crate::icons::MICROSOFT_AI_MARK),
+        "NVIDIA" => Some(crate::icons::NVIDIA_MARK),
+        "Perplexity" => Some(crate::icons::PERPLEXITY_MARK),
+        "OpenRouter" => Some(crate::icons::OPENROUTER_MARK),
+        "Cursor Curated" => Some(crate::icons::CURSOR_MARK),
+        _ => None,
     }
 }
 
@@ -4766,6 +4748,34 @@ mod tests {
             model_provider(HarnessId::Cline, "cline-free/deepseek-v3:free"),
             "Free Models"
         );
+    }
+
+    #[test]
+    fn model_provider_icons_cover_supported_brands_without_guessing_unknowns() {
+        for provider in [
+            "Anthropic",
+            "OpenAI",
+            "Meta",
+            "Google Gemini",
+            "Mistral",
+            "Qwen / Alibaba",
+            "DeepSeek",
+            "Nous Research",
+            "xAI",
+            "Cohere",
+            "Microsoft",
+            "NVIDIA",
+            "Perplexity",
+            "OpenRouter",
+            "Cursor Curated",
+        ] {
+            assert!(
+                model_provider_icon(provider).is_some(),
+                "missing icon for {provider}"
+            );
+        }
+        assert_eq!(model_provider_icon("Free Models"), None);
+        assert_eq!(model_provider_icon("Other"), None);
     }
 
     #[test]

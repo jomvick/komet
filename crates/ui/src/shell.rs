@@ -852,8 +852,7 @@ pub struct Shell {
     pending_workspace_file: Option<(String, Option<u32>)>,
     composer: Entity<Composer>,
     /// External file drag hovering the conversation column — shows the
-    /// "Drop images to attach" veil over the whole chat area; a drop stages
-    /// the files in the composer.
+    /// "Drop files or images to attach" veil; a drop stages them in the composer.
     file_drag_active: bool,
     /// Measured height of the bottom chrome stack (status strip + composer +
     /// terminal dock) the full-height transcript scrolls under — written by a
@@ -884,6 +883,7 @@ pub struct Shell {
     right_plus: popover::Popup<()>,
     /// Titlebar GitHub control: its dropdown + the checkout's status.
     github_menu: popover::Popup<()>,
+    project_open_menu: popover::Popup<()>,
     github: github::GitHubHeader,
     /// Diff surfaces by id — each tab its own [`Changes`] viewer with its own
     /// scope/base pick and diff watch (multiple diff panels, user request).
@@ -1143,7 +1143,12 @@ impl Shell {
                 state.update(cx, |s, _| s.auto_selected = true);
                 Route::Chat
             }
-            _ => Route::Chat,
+            // Default startup opens the new-session canvas. Existing sessions
+            // remain available in the sidebar and are opened explicitly.
+            _ => {
+                state.update(cx, |s, _| s.auto_selected = true);
+                Route::Chat
+            }
         };
         // More capture knobs of the same kind: `KOMET_OPEN_DIALOG=rename|delete`
         // opens that dialog for the first chat once chats land; `=model` pops
@@ -1179,6 +1184,7 @@ impl Shell {
             right_terminal: None,
             right_plus: popover::Popup::default(),
             github_menu: popover::Popup::default(),
+            project_open_menu: popover::Popup::default(),
             github: github::GitHubHeader::default(),
             diffs: std::collections::HashMap::new(),
             diff_subs: std::collections::HashMap::new(),
@@ -1640,6 +1646,8 @@ impl Shell {
 
     fn open_accounts_for_harness(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
         self.pending_account_harness = Some(harness);
+        self.harnesses_page = None;
+        self.harnesses_sub = None;
         self.open_settings(SettingsSection::Agents, cx);
         if let Some(page) = self.accounts_page.clone() {
             page.update(cx, |page, cx| page.focus_harness(harness, cx));
@@ -4403,6 +4411,8 @@ impl Shell {
             self.render_user_menu(user_line.clone(), trigger_subline, menu_identity, theme, cx)
         };
         let user_menu = bottom_bar;
+        let pickers = self.composer.read(cx).pickers().clone();
+        let device_selector = pickers.update(cx, |pickers, cx| pickers.render_device_selector(cx));
 
         // The space filter lives ABOVE the scroll region (fixed) so its
         // dropdown can float without being clipped by the list's overflow.
@@ -4490,6 +4500,13 @@ impl Shell {
                         .child(notice),
                 )
             })
+            .child(
+                div()
+                    .px(px(Theme::SPACE_SM))
+                    .pb(px(Theme::SPACE_XS))
+                    .flex_none()
+                    .child(device_selector),
+            )
             .child(div().p(px(Theme::SPACE_SM)).flex_none().child(user_menu))
             .into_any_element()
     }
@@ -5543,19 +5560,14 @@ impl Shell {
         let _ = (text, border);
         let has_selection = self.state.read(cx).selected_chat.is_some();
         let has_spaces = !self.state.read(cx).spaces.is_empty();
+        let home_canvas = !has_selection;
+        self.composer.update(cx, |composer, cx| {
+            composer.set_home_canvas(home_canvas, cx);
+        });
         let no_project = self.state.read(cx).no_project;
-        let space_name: SharedString = self
-            .state
-            .read(cx)
-            .selected_space_row()
-            .map(|s| s.display_name().to_string())
-            .unwrap_or_default()
-            .into();
 
         // Content outlet: selected chat → transcript; nothing selected → the
-        // "Send a message to start" canvas with a watermark; no spaces at all
-        // → the onboarding card. The composer sits below the first two
-        // (new-chat mode mints the chat id on first send).
+        // centered new-session canvas; no spaces at all → the onboarding card.
         let outlet: AnyElement = if has_selection {
             self.transcript.clone().into_any_element()
         } else if !has_spaces && !no_project {
@@ -5579,20 +5591,6 @@ impl Shell {
                         .flex_col()
                         .items_center()
                         .justify_center()
-                        .when(
-                            crate::appearance::mode(cx)
-                                == crate::appearance::AppearanceMode::DigitalHand,
-                            |el| {
-                                el.child(
-                                    img(crate::loaders::digital_hand_image())
-                                        .absolute()
-                                        .inset_0()
-                                        .size_full()
-                                        .object_fit(ObjectFit::Contain)
-                                        .opacity(0.72),
-                                )
-                            },
-                        )
                         .child(crate::blobatar::blobatar(
                             "onboarding-blobatar",
                             64.0,
@@ -5624,16 +5622,12 @@ impl Shell {
                 ))
                 .into_any_element()
         } else {
-            // New-chat canvas (komet index.tsx): the komet mark over the
-            // TARGET selectors (device + project — moved up from the
-            // composer footer, user request) and the helper line.
-            let helper: SharedString = if space_name.is_empty() {
-                "Send a message to start a new session.".into()
-            } else {
-                format!("Send a message to start a session in {space_name}.").into()
-            };
+            // Keep destination and checkout selectors in one row; agent/model
+            // selection stays in the composer's action bar.
             let pickers = self.composer.read(cx).pickers().clone();
-            let selectors = pickers.update(cx, |p, cx| p.render_target_selectors(cx));
+            let (target_selectors, checkout_selectors) = pickers.update(cx, |p, cx| {
+                (p.render_target_selectors(cx), p.render_footer(cx))
+            });
             div()
                 .size_full()
                 .flex()
@@ -5643,41 +5637,34 @@ impl Shell {
                 .child(motion::fade_in(
                     "new-chat-canvas",
                     div()
-                        .relative()
                         .w_full()
-                        .max_w(px(1187.0))
-                        .h(px(451.0))
+                        .max_w(px(768.0))
                         .flex()
                         .flex_col()
                         .items_center()
-                        .justify_center()
-                        .when(
-                            crate::appearance::mode(cx)
-                                == crate::appearance::AppearanceMode::DigitalHand,
-                            |el| {
-                                el.child(
-                                    img(crate::loaders::digital_hand_image())
-                                        .absolute()
-                                        .inset_0()
-                                        .size_full()
-                                        .object_fit(ObjectFit::Contain)
-                                        .opacity(0.72),
-                                )
-                            },
-                        )
-                        .child(crate::blobatar::blobatar(
-                            "new-chat-blobatar",
-                            64.0,
-                            Some(theme.text.opacity(0.85)),
-                        ))
-                        .child(div().mt(px(16.0)).child(selectors))
                         .child(
                             div()
-                                .mt(px(12.0))
-                                .text_size(px(14.0))
-                                .text_color(theme.text_muted.opacity(0.6))
-                                .child(helper),
-                        ),
+                                .mb(px(28.0))
+                                .text_size(px(20.0))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(theme.text)
+                                .child("What are we building?"),
+                        )
+                        .child(
+                            div()
+                                .w_full()
+                                .px(px(Theme::SPACE_LG))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(Theme::SPACE_MD))
+                                .child(div().flex_none().child(target_selectors))
+                                .when_some(checkout_selectors, |el, controls| {
+                                    el.child(div().flex_1().min_w_0().child(controls))
+                                }),
+                        )
+                        .child(div().h(px(12.0)).flex_none())
+                        .child(self.composer.clone()),
                 ))
                 .into_any_element()
         };
@@ -5685,8 +5672,8 @@ impl Shell {
         let status = self.render_status_strip(cx);
         // File dropzone over the ENTIRE conversation column (transcript +
         // composer, not just the pill): dragging OS files anywhere across the
-        // chat area shows the "Drop images to attach" veil; a drop stages the
-        // files in the composer. `has_active_drag` gates the veil so a drag
+        // chat area shows the "Drop files or images to attach" veil; a drop
+        // stages them in the composer. `has_active_drag` gates the veil so a drag
         // that left the window (FileDrop Exited) can't strand it.
         let file_drag_active = self.file_drag_active && cx.has_active_drag();
         let provider_switch_notice = self
@@ -5788,7 +5775,7 @@ impl Shell {
                 this.file_drag_active = false;
                 let paths = paths.paths().to_vec();
                 this.composer
-                    .update(cx, |composer, cx| composer.add_paths(paths, cx));
+                    .update(cx, |composer, cx| composer.add_paths(paths, false, cx));
                 cx.notify();
             }))
             .on_drag_move::<WorkspacePathDrag>(cx.listener(
@@ -5877,8 +5864,10 @@ impl Shell {
                         .absolute()
                         .inset_0(),
                     )
-                    .child(status)
-                    .when(has_spaces, |el| el.child(self.composer.clone()))
+                    .when(has_selection, |el| el.child(status))
+                    .when(has_spaces && has_selection, |el| {
+                        el.child(self.composer.clone())
+                    })
                     .child(self.render_terminal_container(cx))
             })
             .when(file_drag_active, |el| {
@@ -5892,7 +5881,7 @@ impl Shell {
                         .justify_center()
                         .text_size(px(13.0))
                         .text_color(theme.text)
-                        .child("Drop images to attach"),
+                        .child("Drop files or images to attach"),
                 )
             })
             .into_any_element()
@@ -7699,9 +7688,7 @@ impl Render for Shell {
                     composer.resubmit_last(cx);
                 });
             }));
-        let root = if crate::appearance::mode(cx) != crate::appearance::AppearanceMode::DigitalHand
-            && let Some(path) = wallpaper::path(cx).filter(|path| path.is_file())
-        {
+        let root = if let Some(path) = wallpaper::path(cx).filter(|path| path.is_file()) {
             root.child(
                 div()
                     .absolute()

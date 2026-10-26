@@ -37,7 +37,6 @@ pub enum AppearanceMode {
     System,
     Light,
     Dark,
-    DigitalHand,
 }
 
 impl AppearanceMode {
@@ -47,11 +46,10 @@ impl AppearanceMode {
             Self::System => "System",
             Self::Light => "Light",
             Self::Dark => "Dark",
-            Self::DigitalHand => "Digital Hand",
         }
     }
 
-    pub const ALL: [Self; 4] = [Self::System, Self::Light, Self::Dark, Self::DigitalHand];
+    pub const ALL: [Self; 3] = [Self::System, Self::Light, Self::Dark];
 }
 
 /// Global state behind the current theme: what the user chose, and what the OS
@@ -73,7 +71,7 @@ pub fn resolve(mode: AppearanceMode, system: Appearance) -> Appearance {
     match mode {
         AppearanceMode::System => system,
         AppearanceMode::Light => Appearance::Light,
-        AppearanceMode::Dark | AppearanceMode::DigitalHand => Appearance::Dark,
+        AppearanceMode::Dark => Appearance::Dark,
     }
 }
 
@@ -223,7 +221,7 @@ fn sync_ns_appearance(mode: AppearanceMode) {
     let name = match mode {
         AppearanceMode::System => None,
         AppearanceMode::Light => Some(c"NSAppearanceNameAqua"),
-        AppearanceMode::Dark | AppearanceMode::DigitalHand => Some(c"NSAppearanceNameDarkAqua"),
+        AppearanceMode::Dark => Some(c"NSAppearanceNameDarkAqua"),
     };
     unsafe {
         let appearance: *mut Object = match name {
@@ -280,10 +278,6 @@ mod tests {
         for system in [Appearance::Light, Appearance::Dark] {
             assert_eq!(resolve(AppearanceMode::Light, system), Appearance::Light);
             assert_eq!(resolve(AppearanceMode::Dark, system), Appearance::Dark);
-            assert_eq!(
-                resolve(AppearanceMode::DigitalHand, system),
-                Appearance::Dark
-            );
         }
     }
 
@@ -299,7 +293,6 @@ mod tests {
             (AppearanceMode::System, "\"system\""),
             (AppearanceMode::Light, "\"light\""),
             (AppearanceMode::Dark, "\"dark\""),
-            (AppearanceMode::DigitalHand, "\"digitalHand\""),
         ] {
             assert_eq!(serde_json::to_string(&mode).unwrap(), json);
             assert_eq!(
