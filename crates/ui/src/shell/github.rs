@@ -1221,77 +1221,6 @@ fn pr_state_label(pr: &GitHubPullRequest) -> &'static str {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{encode_ref, pr_state_label};
-    use komet_proto::{GitHubChecks, GitHubPullRequest};
-
-    fn pr(state: &str, checks: GitHubChecks, review_decision: Option<&str>) -> GitHubPullRequest {
-        GitHubPullRequest {
-            number: 1,
-            title: String::new(),
-            url: String::new(),
-            state: state.into(),
-            is_draft: false,
-            base_ref: "main".into(),
-            checks,
-            review_decision: review_decision.map(str::to_string),
-        }
-    }
-
-    #[test]
-    fn pull_request_status_follows_checks_reviews_and_merge_state() {
-        assert_eq!(
-            pr_state_label(&pr("OPEN", GitHubChecks::default(), None)),
-            "Open"
-        );
-        assert_eq!(
-            pr_state_label(&pr(
-                "OPEN",
-                GitHubChecks::default(),
-                Some("REVIEW_REQUIRED")
-            )),
-            "In review"
-        );
-        assert_eq!(
-            pr_state_label(&pr(
-                "OPEN",
-                GitHubChecks {
-                    failed: 1,
-                    ..GitHubChecks::default()
-                },
-                None
-            )),
-            "Checks failing"
-        );
-        assert_eq!(
-            pr_state_label(&pr(
-                "OPEN",
-                GitHubChecks::default(),
-                Some("CHANGES_REQUESTED")
-            )),
-            "Changes requested"
-        );
-        assert_eq!(
-            pr_state_label(&pr(
-                "MERGED",
-                GitHubChecks {
-                    failed: 1,
-                    ..GitHubChecks::default()
-                },
-                None
-            )),
-            "Merged"
-        );
-    }
-
-    #[test]
-    fn branch_refs_encode_url_breaking_characters() {
-        assert_eq!(encode_ref("feat/github-link"), "feat/github-link");
-        assert_eq!(encode_ref("fix#1 a?b%"), "fix%231%20a%3Fb%25");
-    }
-}
-
 fn divider() -> impl IntoElement {
     div()
         .h(px(1.0))
@@ -1380,4 +1309,75 @@ fn encode_ref(branch: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{encode_ref, pr_state_label};
+    use komet_proto::{GitHubChecks, GitHubPullRequest};
+
+    fn pr(state: &str, checks: GitHubChecks, review_decision: Option<&str>) -> GitHubPullRequest {
+        GitHubPullRequest {
+            number: 1,
+            title: String::new(),
+            url: String::new(),
+            state: state.into(),
+            is_draft: false,
+            base_ref: "main".into(),
+            checks,
+            review_decision: review_decision.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn pull_request_status_follows_checks_reviews_and_merge_state() {
+        assert_eq!(
+            pr_state_label(&pr("OPEN", GitHubChecks::default(), None)),
+            "Open"
+        );
+        assert_eq!(
+            pr_state_label(&pr(
+                "OPEN",
+                GitHubChecks::default(),
+                Some("REVIEW_REQUIRED")
+            )),
+            "In review"
+        );
+        assert_eq!(
+            pr_state_label(&pr(
+                "OPEN",
+                GitHubChecks {
+                    failed: 1,
+                    ..GitHubChecks::default()
+                },
+                None
+            )),
+            "Checks failing"
+        );
+        assert_eq!(
+            pr_state_label(&pr(
+                "OPEN",
+                GitHubChecks::default(),
+                Some("CHANGES_REQUESTED")
+            )),
+            "Changes requested"
+        );
+        assert_eq!(
+            pr_state_label(&pr(
+                "MERGED",
+                GitHubChecks {
+                    failed: 1,
+                    ..GitHubChecks::default()
+                },
+                None
+            )),
+            "Merged"
+        );
+    }
+
+    #[test]
+    fn branch_refs_encode_url_breaking_characters() {
+        assert_eq!(encode_ref("feat/github-link"), "feat/github-link");
+        assert_eq!(encode_ref("fix#1 a?b%"), "fix%231%20a%3Fb%25");
+    }
 }

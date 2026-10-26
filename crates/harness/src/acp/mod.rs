@@ -93,7 +93,6 @@ const OPENCODE_STARTUP_TIMEOUT_ENV: &str = "KOMET_OPENCODE_STARTUP_TIMEOUT_SECS"
 
 fn opencode_startup_timeout() -> Duration {
     std::env::var(OPENCODE_STARTUP_TIMEOUT_ENV)
-        .or_else(|_| std::env::var("KOMET_OPENCODE_STARTUP_TIMEOUT_SECS"))
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|seconds| *seconds > 0)
@@ -3868,9 +3867,8 @@ async fn run_session(session: Session) {
     let mut prompt_seq: u64 = 1;
     let mut current_prompt_id = prompt_complete_extension.then(|| format!("komet-p{prompt_seq}"));
     let mut completed_prompts: VecDeque<String> = VecDeque::new();
-    // `KOMET_ACP_PROMPT_STALL_MS` (fallback `KOMET_ACP_PROMPT_STALL_MS`) overrides the spec's bound; 0 disables.
+    // `KOMET_ACP_PROMPT_STALL_MS` overrides the spec's bound; 0 disables.
     let prompt_stall: Option<Duration> = match std::env::var("KOMET_ACP_PROMPT_STALL_MS")
-        .or_else(|_| std::env::var("KOMET_ACP_PROMPT_STALL_MS"))
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
     {
@@ -3931,9 +3929,8 @@ async fn run_session(session: Session) {
     // Done ever comes, and the session strands Working until the engine's
     // quiesce watchdog parks it.
     //
-    // `KOMET_ACP_QUIET_SETTLE_MS` (fallback `KOMET_ACP_QUIET_SETTLE_MS`) overrides; 0 disables.
+    // `KOMET_ACP_QUIET_SETTLE_MS` overrides; 0 disables.
     let quiet_settle: Option<Duration> = match std::env::var("KOMET_ACP_QUIET_SETTLE_MS")
-        .or_else(|_| std::env::var("KOMET_ACP_QUIET_SETTLE_MS"))
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
     {

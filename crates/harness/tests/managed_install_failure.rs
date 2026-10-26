@@ -1,4 +1,4 @@
-//! The kometsh/komet#95 condition, reproduced: npm dying silently with an
+//! The npm-dies-silently condition, reproduced: npm dying silently with an
 //! errno-encoded exit (254 = ENOENT — npm/cli#4838) during the adapter
 //! fallback. The old `npx -y` path surfaced this as "harness protocol error:
 //! initialize: app-server exited before responding; Codex exited unexpectedly

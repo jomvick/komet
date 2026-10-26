@@ -4,7 +4,7 @@
 //! user's npm state in the hot path: a cold cache meant a multi-minute
 //! download while the chat showed "Working", and a broken one meant npm dying
 //! before the adapter ever ran — silently, with an errno-encoded exit code
-//! (254 = ENOENT, the kometsh/komet#95 crash) that surfaced as an opaque
+//! (254 = ENOENT) that surfaced as an opaque
 //! "harness protocol error". Instead, pinned adapter packages are installed
 //! ONCE into a komet-owned prefix (`~/.komet/adapters/<pkg>/<version>`, own
 //! npm cache beside it, so a root-owned or read-only `~/.npm` can't break
@@ -59,11 +59,8 @@ impl NpmPin {
 const OK_MARKER: &str = ".komet-install-ok";
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// `$KOMET_ADAPTERS_DIR` (fallback `$KOMET_ADAPTERS_DIR`), else `~/.komet/adapters`.
+/// `$KOMET_ADAPTERS_DIR`, else `~/.komet/adapters`.
 fn adapters_root() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("KOMET_ADAPTERS_DIR").filter(|d| !d.is_empty()) {
-        return Some(PathBuf::from(dir));
-    }
     if let Some(dir) = std::env::var_os("KOMET_ADAPTERS_DIR").filter(|d| !d.is_empty()) {
         return Some(PathBuf::from(dir));
     }

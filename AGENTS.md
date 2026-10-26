@@ -22,7 +22,7 @@ the crate table in `ARCHITECTURE.md` §3 is authoritative.
 
 ## Toolchain gotchas
 
-- gpui-component comes from our fork jomvick/gpui-component (branch komet), whose gpui deps point
+- gpui-component comes from our fork jomvick/gpui-component, whose gpui deps point
   at jomvick/zed. When bumping gpui, bump the rev in the gpui-component fork first, then every
   jomvick/zed rev and the gpui-base rev in the root Cargo.toml together. Never use Zed's GPL crates
   (`markdown`, `ui`, `theme`, `editor`) — markdown/theme/components are Komet's own.

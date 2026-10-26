@@ -4387,16 +4387,11 @@ impl Transcript {
                                     .or_insert(false);
                                 *is_open = !*is_open;
                                 let is_open = *is_open;
-                                if is_open {
-                                    if let Some((chat_id, part_id)) = &journal_fetch_target
-                                        && !part_id.is_empty()
-                                    {
-                                        this.spawn_journal_fetch(
-                                            chat_id.clone(),
-                                            part_id.clone(),
-                                            cx,
-                                        );
-                                    }
+                                if is_open
+                                    && let Some((chat_id, part_id)) = &journal_fetch_target
+                                    && !part_id.is_empty()
+                                {
+                                    this.spawn_journal_fetch(chat_id.clone(), part_id.clone(), cx);
                                 }
                                 cx.notify();
                             })),

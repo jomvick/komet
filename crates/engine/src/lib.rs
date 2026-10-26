@@ -24,7 +24,6 @@ pub mod diff_sync;
 pub mod doc_host;
 pub mod harness_cli;
 pub mod instance_lock;
-pub mod legacy_home;
 pub mod local_import;
 pub mod mcp;
 pub mod profile;
@@ -204,10 +203,6 @@ impl EngineCore {
         // marker) before any store opens, then arm the panic hook. Every
         // construction path funnels through here.
         crash_shield::install(data_dir);
-        // One-time legacy `~/.komet` → `~/.komet` sweep (Cursor resume stores,
-        // managed adapters, worktrees). Best-effort, before anything reads
-        // those roots; never blocks boot.
-        legacy_home::migrate(data_dir);
         let legacy_uploads_root = profile.claim_legacy_uploads_root()?;
         let device_id = load_or_create_device_id(data_dir)?;
         // This device's harness enablement (Settings → Agents) rides the

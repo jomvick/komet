@@ -110,9 +110,8 @@ pub enum MessageStatus {
     Aborted,
 }
 
-/// Lifecycle of a spawned subagent, carried on its spawn chip. Ported from
-/// Komet (komet/komet) alongside the fold logic below — Komet had no
-/// equivalent before this.
+/// Lifecycle of a spawned subagent, carried on its spawn chip. Ported
+/// alongside the fold logic below — Komet had no equivalent before this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum SubagentStatus {
@@ -462,9 +461,9 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
         }
         // Subagent-attributed CONTENT belongs to the subagent's own doc (the
         // engine routes it there); the parent doc keeps only the spawn chip —
-        // which this refreshes in place: LIFECYCLE ONLY. Ported from Komet
-        // (komet/komet, commit 454a1dd "subagent steers: durable across
-        // harnesses") — Komet had a no-op here before this (the schema
+        // which this refreshes in place: LIFECYCLE ONLY. Ported with the
+        // "subagent steers: durable across harnesses" lifecycle — Komet had a
+        // no-op here before this (the schema
         // fields didn't exist yet either; see `subagent_status` above).
         AgentEvent::Subagent {
             parent_tool_use_id,

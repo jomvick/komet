@@ -7367,8 +7367,8 @@ fn effective_controls(
     // controls.minimize and controls.maximize default to false even though the desktop
     // button-layout expects them. If the button layout explicitly includes minimize/maximize,
     // allow them unless controls explicitly signaled support and excluded them.
-    let has_layout_min = buttons.iter().any(|b| *b == Some(WindowButton::Minimize));
-    let has_layout_max = buttons.iter().any(|b| *b == Some(WindowButton::Maximize));
+    let has_layout_min = buttons.contains(&Some(WindowButton::Minimize));
+    let has_layout_max = buttons.contains(&Some(WindowButton::Maximize));
     (
         controls.minimize || has_layout_min,
         controls.maximize || has_layout_max,
