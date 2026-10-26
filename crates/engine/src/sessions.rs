@@ -34,6 +34,7 @@ use komet_proto::{
     UserInputAnswer, UserInputQuestion,
 };
 
+use crate::agent_accounts::AgentAccounts;
 use crate::composio::ComposioApi;
 use crate::doc_host::{ChatDocHandle, DocHost};
 use crate::mcp::catalog::McpCatalog;
@@ -152,6 +153,7 @@ struct Inner {
     registry: Arc<HarnessRegistry>,
     mcp_registry: Arc<McpRegistry>,
     mcp_secrets: Arc<McpSecretStore>,
+    agent_accounts: OnceLock<AgentAccounts>,
     /// Set-once (first wins), cleared on runtime retirement: sessions and
     /// doc-host reference each other through Arcs, so this back-edge must be
     /// severable for a replaced engine graph to drop.
@@ -212,6 +214,7 @@ impl SessionsEngine {
                 registry,
                 mcp_registry,
                 mcp_secrets,
+                agent_accounts: OnceLock::new(),
                 doc_host: Mutex::new(None),
                 runs: Mutex::new(HashMap::new()),
                 hubs: Mutex::new(HashMap::new()),
@@ -224,6 +227,12 @@ impl SessionsEngine {
                 turn_listener: OnceLock::new(),
                 permission_timeout: Mutex::new(Some(std::time::Duration::from_secs(10 * 60))),
             }),
+        }
+    }
+
+    pub fn set_agent_accounts(&self, accounts: AgentAccounts) {
+        if self.inner.agent_accounts.set(accounts).is_err() {
+            tracing::warn!("agent accounts service was already wired to sessions");
         }
     }
 
@@ -946,6 +955,18 @@ impl SessionsEngine {
                 auth_token: endpoint.auth_token().to_string(),
             });
         }
+        let env = if harness_id == HarnessId::Copilot {
+            self.inner
+                .agent_accounts
+                .get()
+                .map(AgentAccounts::copilot_token_for_run)
+                .transpose()?
+                .flatten()
+                .map(|token| vec![("COPILOT_GITHUB_TOKEN".into(), token)])
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         lock(&self.inner.last_requests).insert(chat_id.to_string(), request.clone());
         let interrupt_token = CancellationToken::new();
         let controls = RunControls {
@@ -956,6 +977,7 @@ impl SessionsEngine {
             }),
             steering: steer_rx,
             interrupt: interrupt_token.clone(),
+            env,
         };
 
         lock(&self.inner.runs).insert(

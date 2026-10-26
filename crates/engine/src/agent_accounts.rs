@@ -26,11 +26,12 @@
 //!    Claude, merge the identity back into `~/.claude.json`) with a saved slot.
 //! 3. **Add** (`start_login`…): drive an OAuth flow for a NEW account without
 //!    touching the live one. Claude uses the public PKCE code flow (paste-code);
-//!    Codex spawns `codex login` against a throwaway `CODEX_HOME` and polls
-//!    until its loopback callback lands.
+//!    Codex uses a throwaway `CODEX_HOME`, and Copilot uses an isolated
+//!    GitHub CLI config and device authorization.
 //!
-//! Usage probes: both providers expose the rate-limit view their own CLIs render
-//! (`/usage` in Claude Code, `/status` in Codex). Unlike komet (fetch on every
+//! Usage probes: providers expose the rate-limit view their own CLIs render
+//! (`/usage` in Claude Code, `/status` in Codex). Copilot billing totals are
+//! shown only when GitHub's official endpoint authorizes access. Unlike komet (fetch on every
 //! list, 60s cache), native never probes on a plain list — an offline list stays
 //! fast and deterministic. The caller picks the aggressiveness via [`UsageMode`]:
 //! `Offline` serves the cache only, `Cached` probes on a cache miss (page mount),
@@ -54,7 +55,7 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -75,6 +76,8 @@ const CLAUDE_TOKEN_URL: &str = "https://console.anthropic.com/v1/oauth/token";
 const CLAUDE_PROFILE_URL: &str = "https://api.anthropic.com/api/oauth/profile";
 const CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+const COPILOT_USAGE_URL: &str =
+    "https://api.github.com/users/{username}/settings/billing/ai_credit/usage";
 // Cursor's usage dashboard API — returns `{usage: {requestCount, requestLimit,
 // tokenCount, tokenLimit}, requestWindowSeconds}` for the billing period.
 const CURSOR_USAGE_URL: &str = "https://www.cursor.com/api/usage";
@@ -178,6 +181,10 @@ impl AgentAccountsConfig {
     fn root_dir(&self) -> PathBuf {
         self.data_dir.join("agent-accounts")
     }
+
+    fn copilot_active_file(&self) -> PathBuf {
+        self.root_dir().join("copilot-active")
+    }
 }
 
 // ── slot storage ────────────────────────────────────────────────────────────
@@ -243,6 +250,13 @@ enum LoginFlow {
         /// `Some(code)` once the child exited (`None` code = killed by signal).
         exit: Arc<Mutex<Option<Option<i32>>>>,
     },
+    GithubCli {
+        child: Arc<Mutex<Option<tokio::process::Child>>>,
+        config_dir: PathBuf,
+        started_at: Instant,
+        output: Arc<Mutex<String>>,
+        exit: Arc<Mutex<Option<Option<i32>>>>,
+    },
     /// `agy` behind a real PTY (headless print-mode auth): it prints the Google
     /// authorize URL, we paste the user's code into the PTY, and the flow
     /// completes when the global keyring item changes (see complete_login).
@@ -282,6 +296,7 @@ impl LoginFlow {
         match self {
             LoginFlow::Claude { started_at, .. }
             | LoginFlow::Codex { started_at, .. }
+            | LoginFlow::GithubCli { started_at, .. }
             | LoginFlow::Antigravity { started_at, .. }
             | LoginFlow::Cursor { started_at, .. } => *started_at,
         }
@@ -387,6 +402,86 @@ mod usage_mode_tests {
     use super::*;
 
     #[test]
+    fn github_device_code_is_extracted_without_opening_a_terminal() {
+        assert_eq!(
+            scan_github_device_code(
+                "! First copy your one-time code: AB12-CD34\nPress Enter to open GitHub."
+            ),
+            Some("AB12-CD34".into())
+        );
+        assert_eq!(scan_github_device_code("GitHub sign-in failed."), None);
+    }
+
+    #[test]
+    fn copilot_billing_report_shows_official_amount_without_inventing_a_quota() {
+        let windows = parse_copilot_usage_report(&serde_json::json!({
+            "usageItems": [
+                { "netAmount": 1.25 },
+                { "netAmount": "0.50" },
+                { "grossAmount": 10.0 }
+            ]
+        }))
+        .unwrap();
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].label, "This month");
+        assert_eq!(windows[0].display_value.as_deref(), Some("$1.75 billed"));
+        assert_eq!(windows[0].used_fraction, 0.0);
+    }
+
+    #[test]
+    fn copilot_switch_selects_only_the_saved_account_token() {
+        let dir = std::env::temp_dir().join(format!(
+            "komet-copilot-account-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let accounts = AgentAccounts::new(AgentAccountsConfig {
+            data_dir: dir.join("data"),
+            claude_config_dir: dir.join("claude"),
+            claude_config_file: dir.join("claude.json"),
+            codex_home: dir.join("codex"),
+            antigravity_home: dir.join("antigravity"),
+            cursor_auth_file: dir.join("cursor/auth.json"),
+        });
+        let make_slot = |id: &str, username: &str, token: &str| Slot {
+            id: id.into(),
+            harness: HarnessId::Copilot,
+            account_key: username.into(),
+            profile: SlotProfile {
+                email: format!("@{username}"),
+                display_name: None,
+                organization: None,
+                plan: None,
+                auth_kind: AgentAuthKind::Oauth,
+            },
+            credentials: serde_json::json!({
+                "username": username,
+                "githubToken": token,
+            }),
+            claude_config: None,
+            saved_at: now_ms(),
+            created_at: None,
+        };
+        let first = make_slot("copilot-one", "one", "token-one");
+        let second = make_slot("copilot-two", "two", "token-two");
+        accounts.write_slot(&first).unwrap();
+        accounts.write_slot(&second).unwrap();
+
+        assert_eq!(accounts.copilot_token_for_run().unwrap(), None);
+        accounts.activate_copilot(&first).unwrap();
+        assert_eq!(
+            accounts.copilot_token_for_run().unwrap().as_deref(),
+            Some("token-one")
+        );
+        accounts.activate_copilot(&second).unwrap();
+        assert_eq!(
+            accounts.copilot_token_for_run().unwrap().as_deref(),
+            Some("token-two")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn explicit_mode_wins_over_the_legacy_flag() {
         assert_eq!(
             UsageMode::from_params(Some("cached"), Some(true)),
@@ -462,6 +557,7 @@ mod usage_mode_tests {
             label: "Session".into(),
             used_fraction: 0.42,
             resets_at: None,
+            display_value: None,
         }];
         let key = format!("{}:{}", harness_slug(slot.harness), slot.account_key);
         lock(&accounts.inner.usage_cache).insert(key, (Some(windows.clone()), Instant::now()));
@@ -616,6 +712,28 @@ fn spawn_login_child(cmd: &mut tokio::process::Command) -> std::io::Result<Spawn
     Ok((child, output, exit))
 }
 
+fn set_directory_owner_only(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    }
+    let _ = path;
+    Ok(())
+}
+
+fn scan_github_device_code(output: &str) -> Option<String> {
+    output
+        .as_bytes()
+        .windows(9)
+        .find(|candidate| {
+            candidate[4] == b'-'
+                && candidate[..4].iter().all(u8::is_ascii_alphanumeric)
+                && candidate[5..].iter().all(u8::is_ascii_alphanumeric)
+        })
+        .map(|code| String::from_utf8_lossy(code).to_string())
+}
+
 #[derive(Clone)]
 pub struct AgentAccounts {
     inner: Arc<Inner>,
@@ -702,6 +820,14 @@ impl AgentAccounts {
             active_keys.insert(HarnessId::Cursor, detected.account_key.clone());
             self.snapshot_detected(HarnessId::Cursor, &detected)?;
         }
+        if let Some(active_id) = self.read_copilot_active_id()
+            && let Some(slot) = self
+                .read_slots(HarnessId::Copilot)
+                .into_iter()
+                .find(|slot| slot.id == active_id)
+        {
+            active_keys.insert(HarnessId::Copilot, slot.account_key);
+        }
 
         // Dedupe: a re-login mints a NEW refresh token, so `account_key`
         // (hash of the refresh token) changes and `snapshot_detected` writes a
@@ -716,7 +842,11 @@ impl AgentAccounts {
             HarnessId::Codex,
             HarnessId::Antigravity,
             HarnessId::Cursor,
+            HarnessId::Copilot,
         ] {
+            if harness == HarnessId::Copilot {
+                continue;
+            }
             let mut by_email: HashMap<String, Vec<Slot>> = HashMap::new();
             for slot in self.read_slots(harness) {
                 if harness == HarnessId::Antigravity
@@ -761,6 +891,7 @@ impl AgentAccounts {
             HarnessId::Codex,
             HarnessId::Antigravity,
             HarnessId::Cursor,
+            HarnessId::Copilot,
         ] {
             let active_key = active_keys.get(&harness).cloned();
             let slots = self.read_slots(harness);
@@ -860,6 +991,7 @@ impl AgentAccounts {
             HarnessId::Codex => self.activate_codex(&slot)?,
             HarnessId::Antigravity => self.activate_antigravity(&slot).await?,
             HarnessId::Cursor => self.activate_cursor(&slot)?,
+            HarnessId::Copilot => self.activate_copilot(&slot)?,
             other => {
                 return Err(EngineError::Other(format!(
                     "agent accounts are not supported for {other:?}"
@@ -867,6 +999,62 @@ impl AgentAccounts {
             }
         }
         self.list(UsageMode::Offline).await
+    }
+
+    /// Token for the selected Komet Copilot account. Returned only for the
+    /// Copilot child process; it is never placed in a serialized run request.
+    pub fn copilot_token_for_run(&self) -> Result<Option<String>, EngineError> {
+        let active_file = self.inner.config.copilot_active_file();
+        let active_id = match std::fs::read_to_string(&active_file) {
+            Ok(id) => id.trim().to_string(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let slot = self
+            .read_slots(HarnessId::Copilot)
+            .into_iter()
+            .find(|slot| slot.id == active_id)
+            .ok_or_else(|| {
+                EngineError::Other(
+                    "The selected GitHub Copilot account is missing; open Accounts and switch accounts again.".into(),
+                )
+            })?;
+        let token = slot
+            .credentials
+            .get("githubToken")
+            .and_then(serde_json::Value::as_str)
+            .filter(|token| !token.is_empty())
+            .ok_or_else(|| {
+                EngineError::Other(
+                    "The selected GitHub Copilot account has no saved token; reconnect it in Accounts.".into(),
+                )
+            })?;
+        Ok(Some(token.to_string()))
+    }
+
+    fn read_copilot_active_id(&self) -> Option<String> {
+        std::fs::read_to_string(self.inner.config.copilot_active_file())
+            .ok()
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+    }
+
+    fn activate_copilot(&self, slot: &Slot) -> Result<(), EngineError> {
+        if !slot
+            .credentials
+            .get("githubToken")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|token| !token.is_empty())
+        {
+            return Err(EngineError::Other(
+                "This Copilot account has no token.".into(),
+            ));
+        }
+        write_file_atomic(
+            &self.inner.config.copilot_active_file(),
+            slot.id.as_bytes(),
+            true,
+        )
     }
 
     async fn activate_claude(&self, slot: &Slot) -> Result<(), EngineError> {
@@ -1004,6 +1192,7 @@ impl AgentAccounts {
             HarnessId::Codex => self.start_codex_login().await,
             HarnessId::Antigravity => self.start_antigravity_login().await,
             HarnessId::Cursor => self.start_cursor_login().await,
+            HarnessId::Copilot => self.start_github_cli_login().await,
             other => Err(EngineError::Other(format!(
                 "agent logins are not supported for {other:?}"
             ))),
@@ -1039,6 +1228,7 @@ impl AgentAccounts {
             login_id,
             url,
             mode: AgentLoginMode::PasteCode,
+            user_code: None,
         }
     }
 
@@ -1113,6 +1303,7 @@ impl AgentAccounts {
             login_id,
             url,
             mode: AgentLoginMode::Browser,
+            user_code: None,
         })
     }
 
@@ -1182,6 +1373,107 @@ impl AgentAccounts {
             login_id,
             url,
             mode: AgentLoginMode::Browser,
+            user_code: None,
+        })
+    }
+
+    async fn start_github_cli_login(&self) -> Result<AgentLoginStart, EngineError> {
+        let stale: Vec<String> = lock(&self.inner.flows)
+            .iter()
+            .filter(|(_, flow)| matches!(flow, LoginFlow::GithubCli { .. }))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in stale {
+            self.cancel_login(&id);
+        }
+
+        let login_id = new_id();
+        let config_dir = self
+            .inner
+            .config
+            .root_dir()
+            .join(format!(".login-github-{login_id}"));
+        std::fs::create_dir_all(&config_dir)?;
+        set_directory_owner_only(&config_dir)?;
+
+        let mut command = tokio::process::Command::new("gh");
+        command
+            .args([
+                "auth",
+                "login",
+                "--hostname",
+                "github.com",
+                "--git-protocol",
+                "https",
+                "--web",
+                "--insecure-storage",
+                "--scopes",
+                "read:user",
+            ])
+            .env("GH_CONFIG_DIR", &config_dir)
+            .env("GIT_CONFIG_GLOBAL", config_dir.join("gitconfig"))
+            .env("GH_PROMPT_DISABLED", "1")
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .env_remove("GH_ENTERPRISE_TOKEN")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let (child, output, exit) = match spawn_login_child(&mut command) {
+            Ok(child) => child,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&config_dir);
+                return Err(EngineError::Other(
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        "GitHub CLI (`gh`) was not found on this device. Install it to connect Copilot accounts.".into()
+                    } else {
+                        format!("Could not start GitHub sign-in: {error}")
+                    },
+                ));
+            }
+        };
+        lock(&self.inner.flows).insert(
+            login_id.clone(),
+            LoginFlow::GithubCli {
+                child,
+                config_dir,
+                started_at: Instant::now(),
+                output: output.clone(),
+                exit: exit.clone(),
+            },
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let user_code = loop {
+            if let Some(code) = scan_github_device_code(&lock(&output)) {
+                break Some(code);
+            }
+            if lock(&exit).is_some() || Instant::now() >= deadline {
+                break None;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        let Some(user_code) = user_code else {
+            let output_snapshot = lock(&output).clone();
+            let detail = output_snapshot
+                .lines()
+                .rev()
+                .find(|line| !line.trim().is_empty())
+                .map(str::trim)
+                .map(str::to_string)
+                .unwrap_or_default();
+            self.cancel_login(&login_id);
+            return Err(EngineError::Other(if detail.is_empty() {
+                "GitHub CLI did not provide a device code. Update `gh` and try again.".into()
+            } else {
+                format!("GitHub sign-in could not start: {detail}")
+            }));
+        };
+        Ok(AgentLoginStart {
+            login_id,
+            url: "https://github.com/login/device".into(),
+            mode: AgentLoginMode::Browser,
+            user_code: Some(user_code),
         })
     }
 
@@ -1371,6 +1663,7 @@ impl AgentAccounts {
                 login_id,
                 url,
                 mode: AgentLoginMode::PasteCode,
+                user_code: None,
             })
         }
     }
@@ -1684,6 +1977,23 @@ impl AgentAccounts {
         self.sweep_flows();
         // Snapshot what we need, then drop `flows` before finish/cancel —
         // those re-lock the same mutex (std Mutex is not reentrant).
+        let github = {
+            let flows = lock(&self.inner.flows);
+            match flows.get(login_id) {
+                Some(LoginFlow::GithubCli {
+                    config_dir,
+                    exit,
+                    output,
+                    ..
+                }) => Some((config_dir.clone(), exit.clone(), output.clone())),
+                _ => None,
+            }
+        };
+        if let Some((config_dir, exit, output)) = github {
+            return self
+                .poll_github_cli_login(login_id, config_dir, exit, output)
+                .await;
+        }
         let cursor = {
             let flows = lock(&self.inner.flows);
             match flows.get(login_id) {
@@ -1724,6 +2034,12 @@ impl AgentAccounts {
                     let tuple = (home.clone(), exit.clone(), output.clone());
                     drop(flows);
                     return self.poll_codex_login(login_id, tuple.0, tuple.1, tuple.2);
+                }
+                Some(LoginFlow::GithubCli { .. }) => {
+                    return Ok(AgentLoginPoll {
+                        status: AgentLoginStatus::Pending,
+                        message: None,
+                    });
                 }
             }
         };
@@ -1810,6 +2126,7 @@ impl AgentAccounts {
                 message: None,
             });
         }
+
         // Also probe antigravity-specific filenames
         for name in ["oauth_token.json", "credentials.json"] {
             if let Some(detected) = read_json(&home.join(name)).and_then(parse_antigravity_auth) {
@@ -1864,6 +2181,117 @@ impl AgentAccounts {
         })
     }
 
+    async fn poll_github_cli_login(
+        &self,
+        login_id: &str,
+        config_dir: PathBuf,
+        exit: Arc<Mutex<Option<Option<i32>>>>,
+        output: Arc<Mutex<String>>,
+    ) -> Result<AgentLoginPoll, EngineError> {
+        let token_result = tokio::process::Command::new("gh")
+            .args(["auth", "token", "--hostname", "github.com"])
+            .env("GH_CONFIG_DIR", &config_dir)
+            .output()
+            .await;
+        if let Ok(result) = token_result
+            && result.status.success()
+        {
+            let token = String::from_utf8_lossy(&result.stdout).trim().to_string();
+            if !token.is_empty() {
+                let response = self
+                    .inner
+                    .http
+                    .get("https://api.github.com/user")
+                    .bearer_auth(&token)
+                    .header("Accept", "application/vnd.github+json")
+                    .header("X-GitHub-Api-Version", "2022-11-28")
+                    .header("User-Agent", "Komet")
+                    .send()
+                    .await;
+                if let Ok(response) = response
+                    && response.status().is_success()
+                    && let Ok(user) = response.json::<serde_json::Value>().await
+                    && let Some(username) = user.get("login").and_then(|v| v.as_str())
+                    && !username.is_empty()
+                {
+                    let account_key = username.to_lowercase();
+                    let slot = Slot {
+                        id: slot_id_for(HarnessId::Copilot, &account_key),
+                        harness: HarnessId::Copilot,
+                        account_key,
+                        profile: SlotProfile {
+                            email: user
+                                .get("email")
+                                .and_then(|v| v.as_str())
+                                .filter(|s| !s.is_empty())
+                                .map(str::to_string)
+                                .unwrap_or_else(|| format!("@{username}")),
+                            display_name: user
+                                .get("name")
+                                .and_then(|v| v.as_str())
+                                .filter(|s| !s.is_empty())
+                                .map(str::to_string),
+                            organization: None,
+                            plan: None,
+                            auth_kind: AgentAuthKind::Oauth,
+                        },
+                        credentials: serde_json::json!({
+                            "githubToken": token,
+                            "username": username,
+                        }),
+                        claude_config: None,
+                        saved_at: now_ms(),
+                        created_at: None,
+                    };
+                    self.write_slot(&slot)?;
+                    let active_exists = self.read_copilot_active_id().is_some_and(|active_id| {
+                        self.read_slots(HarnessId::Copilot)
+                            .iter()
+                            .any(|saved| saved.id == active_id)
+                    });
+                    if !active_exists {
+                        self.activate_copilot(&slot)?;
+                    }
+                    self.cancel_login(login_id);
+                    return Ok(AgentLoginPoll {
+                        status: AgentLoginStatus::Done,
+                        message: None,
+                    });
+                }
+                return Ok(AgentLoginPoll {
+                    status: AgentLoginStatus::Pending,
+                    message: Some("GitHub authorized; retrieving account details…".into()),
+                });
+            }
+        }
+
+        if let Some(code) = *lock(&exit) {
+            let output_snapshot = lock(&output).clone();
+            let detail = output_snapshot
+                .lines()
+                .rev()
+                .find(|line| !line.trim().is_empty())
+                .map(str::trim)
+                .map(str::to_string)
+                .unwrap_or_default();
+            self.cancel_login(login_id);
+            return Ok(AgentLoginPoll {
+                status: AgentLoginStatus::Error,
+                message: Some(if code == Some(0) {
+                    "GitHub sign-in ended without an account token.".into()
+                } else if detail.is_empty() {
+                    "GitHub sign-in failed. Check the `gh` CLI and try again.".into()
+                } else {
+                    format!("GitHub sign-in failed: {detail}")
+                }),
+            });
+        }
+        Ok(AgentLoginPoll {
+            status: AgentLoginStatus::Pending,
+            message: None,
+        })
+    }
+
     /// Drop a flow: kill a pending `codex login` child (it holds the fixed
     /// loopback OAuth port) and reclaim its throwaway home dir. Idempotent.
     ///
@@ -1904,6 +2332,14 @@ impl AgentAccounts {
                 if let Some(home) = store.parent() {
                     let _ = std::fs::remove_dir_all(home);
                 }
+            }
+            Some(LoginFlow::GithubCli {
+                child, config_dir, ..
+            }) => {
+                if let Some(c) = lock(&child).as_mut() {
+                    let _ = c.start_kill();
+                }
+                let _ = std::fs::remove_dir_all(&config_dir);
             }
             Some(LoginFlow::Antigravity {
                 killer, initial, ..
@@ -2314,6 +2750,7 @@ impl AgentAccounts {
             HarnessId::Codex => self.codex_usage(slot, is_active).await,
             HarnessId::Antigravity => self.antigravity_usage(slot, is_active).await,
             HarnessId::Cursor => self.cursor_usage(slot, is_active).await,
+            HarnessId::Copilot => self.copilot_usage(slot).await,
             _ => None,
         };
         // Cache successes only. Remembering a miss made a transient failure
@@ -2363,6 +2800,7 @@ impl AgentAccounts {
                     label: label.to_string(),
                     used_fraction: (utilization / 100.0).clamp(0.0, 1.0) as f32,
                     resets_at: parse_when(w.get("resets_at")),
+                    display_value: None,
                 });
             }
         }
@@ -2525,6 +2963,41 @@ impl AgentAccounts {
             }
         }
         None
+    }
+
+    async fn copilot_usage(&self, slot: &Slot) -> Option<Vec<AgentUsageWindow>> {
+        let token = slot.credentials.get("githubToken")?.as_str()?;
+        let username = slot.credentials.get("username")?.as_str()?;
+        if username.is_empty()
+            || !username
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+        {
+            return None;
+        }
+        let now = Utc::now();
+        let url = format!(
+            "{}?year={}&month={}",
+            COPILOT_USAGE_URL.replace("{username}", username),
+            now.format("%Y"),
+            now.month()
+        );
+        let response = self
+            .inner
+            .http
+            .get(url)
+            .bearer_auth(token)
+            .header("Accept", "application/vnd.github+json")
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .header("User-Agent", "Komet")
+            .send()
+            .await
+            .ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let body = response.json::<serde_json::Value>().await.ok()?;
+        parse_copilot_usage_report(&body)
     }
 
     async fn antigravity_usage(
@@ -3678,6 +4151,7 @@ fn parse_codex_usage_response(body: &serde_json::Value) -> Vec<AgentUsageWindow>
                 label: if span > 86_400 { "Week" } else { "Session" }.to_string(),
                 used_fraction: (used / 100.0) as f32,
                 resets_at: parse_when(w.get("reset_at")),
+                display_value: None,
             });
         }
     }
@@ -3717,6 +4191,7 @@ fn parse_cursor_usage_response(body: &serde_json::Value) -> Vec<AgentUsageWindow
                     label: format!("{model} Requests"),
                     used_fraction: (count / limit).clamp(0.0, 1.0) as f32,
                     resets_at: parse_when(body.get("billingCycleEnd")),
+                    display_value: None,
                 })
             })
             .collect();
@@ -3738,6 +4213,7 @@ fn parse_cursor_usage_response(body: &serde_json::Value) -> Vec<AgentUsageWindow
             label: format!("{label} Requests"),
             used_fraction: (count / limit).clamp(0.0, 1.0) as f32,
             resets_at: parse_when(body.get("resetsAt")).or_else(|| parse_when(body.get("resetAt"))),
+            display_value: None,
         });
     }
 
@@ -3751,6 +4227,7 @@ fn parse_cursor_usage_response(body: &serde_json::Value) -> Vec<AgentUsageWindow
             label: format!("{label} Tokens"),
             used_fraction: (count / limit).clamp(0.0, 1.0) as f32,
             resets_at: None,
+            display_value: None,
         });
     }
 
@@ -3782,6 +4259,7 @@ fn parse_cursor_usage_summary(body: &serde_json::Value) -> Option<Vec<AgentUsage
         label: "Plan".into(),
         used_fraction: used.clamp(0.0, 1.0) as f32,
         resets_at,
+        display_value: None,
     }])
 }
 
@@ -3948,6 +4426,7 @@ fn parse_antigravity_quota_response(body: &serde_json::Value) -> Vec<AgentUsageW
                             label: short_label.to_string(),
                             used_fraction: used,
                             resets_at,
+                            display_value: None,
                         });
                         break;
                     }
@@ -3972,6 +4451,7 @@ fn parse_antigravity_quota_response(body: &serde_json::Value) -> Vec<AgentUsageW
                     label: name,
                     used_fraction: used,
                     resets_at,
+                    display_value: None,
                 });
             }
         }
@@ -3988,6 +4468,20 @@ fn json_f64(value: &serde_json::Value) -> Option<f64> {
         serde_json::Value::Object(map) => map.get("value").and_then(json_f64),
         _ => None,
     }
+}
+
+fn parse_copilot_usage_report(body: &serde_json::Value) -> Option<Vec<AgentUsageWindow>> {
+    let items = body.get("usageItems")?.as_array()?;
+    let total = items
+        .iter()
+        .filter_map(|item| item.get("netAmount").and_then(json_f64))
+        .sum::<f64>();
+    Some(vec![AgentUsageWindow {
+        label: "This month".into(),
+        used_fraction: 0.0,
+        resets_at: None,
+        display_value: Some(format!("${total:.2} billed")),
+    }])
 }
 
 fn bucket_used_fraction(bucket: &serde_json::Value) -> Option<f32> {

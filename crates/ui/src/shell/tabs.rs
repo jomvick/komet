@@ -221,7 +221,8 @@ impl Shell {
         } else {
             content_left
         };
-        // GitHub control (issue #50): left of the pane strip / toggle.
+        // GitHub and project-open controls sit immediately before the
+        // right-pane toggle at the titlebar's trailing edge.
         let (github, github_slot) = match self.render_github_button(&theme, cx) {
             Some((button, width)) => (Some(button), width + 8.0),
             None => (None, 0.0),
@@ -240,11 +241,11 @@ impl Shell {
             // the strip in takeover, two with the title row present): without
             // budgeting them the capped strip overflows by exactly one gap and
             // the buttons slide right on expand (user report).
-            let gap_budget = if takeover { 8.0 } else { 16.0 } + github_slot;
+            let gap_budget = (if takeover { 8.0 } else { 16.0 }) + github_slot + 36.0;
             let avail = self.viewport_width - row_left - pr - gap_budget;
             // The right pane's SURFACE TABS (t3 RightPanelTabs) — the diff
             // options that used to live here moved into the pane's own
-            // second row; expand/close stay in this band (user request).
+            // second row; expand stays in this band.
             let controls = self.render_right_tab_strip(cx);
             Some(
                 div()
@@ -279,25 +280,17 @@ impl Shell {
                         &theme,
                         cx.listener(|this, _, _, cx| this.toggle_right_pane_expand(cx)),
                     ))
-                    .child(header_icon_button(
-                        "toggle-changes",
-                        icons::SIDEBAR_MINIMALISTIC,
-                        &theme,
-                        cx.listener(|this, _, _, cx| this.toggle_right_pane(cx)),
-                    ))
                     .into_any_element(),
             )
         } else {
-            Some(
-                header_icon_button(
-                    "toggle-changes",
-                    icons::SIDEBAR_MINIMALISTIC,
-                    &theme,
-                    cx.listener(|this, _, _, cx| this.toggle_right_pane(cx)),
-                )
-                .into_any_element(),
-            )
+            None
         };
+        let panel_toggle = header_icon_button(
+            "toggle-changes",
+            icons::SIDEBAR_MINIMALISTIC,
+            &theme,
+            cx.listener(|this, _, _, cx| this.toggle_right_pane(cx)),
+        );
 
         let inner = div()
             .size_full()
@@ -358,8 +351,9 @@ impl Shell {
                 )
             })
             .child(div().flex_1())
+            .children(trailing)
             .children(github)
-            .children(trailing);
+            .child(panel_toggle);
 
         // The unified window titlebar: full-width on the glass shell, ABOVE
         // the inset card. No bottom border — the card's own hairline is the

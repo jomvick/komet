@@ -1,8 +1,18 @@
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use futures::future::join_all;
 use komet_proto::HarnessId;
 use serde::{Deserialize, Serialize};
+use tokio::task::JoinHandle;
+use tokio::time::Instant;
+
+const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+const BINARY_WATCH_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const FIRST_RETRY: Duration = Duration::from_secs(5 * 60);
+const MAX_JITTER_SECS: u64 = 30 * 60;
 
 const VERSION_TIMEOUT: Duration = Duration::from_secs(6);
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(300);
@@ -35,6 +45,185 @@ pub struct ManageHarnessCliParams {
 pub struct HarnessCliStatusParams {
     #[serde(default)]
     pub check_latest: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BinaryFingerprint {
+    path: PathBuf,
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+}
+
+impl BinaryFingerprint {
+    fn of(executable: &Path) -> Option<Self> {
+        let path = std::fs::canonicalize(executable).ok()?;
+        let metadata = path.metadata().ok()?;
+        Some(Self {
+            path,
+            modified: metadata.modified().ok(),
+            len: metadata.len(),
+        })
+    }
+}
+
+struct CheckerInner {
+    harnesses: Vec<HarnessId>,
+    statuses: Mutex<HashMap<HarnessId, HarnessCliStatus>>,
+    fingerprints: Mutex<HashMap<HarnessId, Option<BinaryFingerprint>>>,
+    refresh_gate: tokio::sync::Mutex<()>,
+    shutdown: tokio::sync::watch::Sender<bool>,
+    worker: Mutex<Option<JoinHandle<()>>>,
+}
+
+/// Caches CLI update status and refreshes it independently of the Settings
+/// page, including when an agent's own updater replaces its executable.
+#[derive(Clone)]
+pub struct HarnessCliChecker {
+    inner: Arc<CheckerInner>,
+}
+
+impl HarnessCliChecker {
+    pub fn new(harnesses: Vec<HarnessId>) -> Self {
+        let (shutdown, _) = tokio::sync::watch::channel(false);
+        Self {
+            inner: Arc::new(CheckerInner {
+                harnesses,
+                statuses: Mutex::new(HashMap::new()),
+                fingerprints: Mutex::new(HashMap::new()),
+                refresh_gate: tokio::sync::Mutex::new(()),
+                shutdown,
+                worker: Mutex::new(None),
+            }),
+        }
+    }
+
+    /// Start the immediate check and background cadence. Idempotent.
+    pub fn start(&self) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let mut worker = lock(&self.inner.worker);
+        if worker.is_some() {
+            return;
+        }
+        let checker = self.clone();
+        *worker = Some(runtime.spawn(async move {
+            let mut shutdown = checker.inner.shutdown.subscribe();
+            let first = checker.refresh(true).await;
+            let mut retry = FIRST_RETRY;
+            let mut next_check = Instant::now()
+                + if has_check_errors(&first) {
+                    retry
+                } else {
+                    check_delay()
+                };
+            loop {
+                let tick = (Instant::now() + BINARY_WATCH_INTERVAL).min(next_check);
+                tokio::select! {
+                    changed = shutdown.changed() => {
+                        if changed.is_err() || *shutdown.borrow() {
+                            break;
+                        }
+                    }
+                    _ = tokio::time::sleep_until(tick) => {
+                        if Instant::now() >= next_check || checker.binaries_changed() {
+                            let statuses = checker.refresh(true).await;
+                            if has_check_errors(&statuses) {
+                                next_check = Instant::now() + retry;
+                                retry = (retry * 2).min(CHECK_INTERVAL);
+                            } else {
+                                retry = FIRST_RETRY;
+                                next_check = Instant::now() + check_delay();
+                            }
+                        }
+                    }
+                }
+            }
+        }));
+    }
+
+    pub async fn statuses(&self, check_latest: bool) -> Vec<HarnessCliStatus> {
+        if check_latest {
+            self.refresh(true).await
+        } else {
+            let cached = self.cached_statuses();
+            if cached.len() == self.inner.harnesses.len() {
+                cached
+            } else {
+                self.refresh(false).await
+            }
+        }
+    }
+
+    pub async fn shutdown(&self) {
+        self.inner.shutdown.send_replace(true);
+        let worker = lock(&self.inner.worker).take();
+        if let Some(worker) = worker {
+            let _ = worker.await;
+        }
+    }
+
+    fn cached_statuses(&self) -> Vec<HarnessCliStatus> {
+        let statuses = lock(&self.inner.statuses);
+        self.inner
+            .harnesses
+            .iter()
+            .filter_map(|harness| statuses.get(harness).cloned())
+            .collect()
+    }
+
+    async fn refresh(&self, check_latest: bool) -> Vec<HarnessCliStatus> {
+        let _refresh = self.inner.refresh_gate.lock().await;
+        let statuses = super::harness_cli::statuses(&self.inner.harnesses, check_latest).await;
+        {
+            let mut cached = lock(&self.inner.statuses);
+            for status in &statuses {
+                cached.insert(status.harness, status.clone());
+            }
+        }
+        let fingerprints = self
+            .inner
+            .harnesses
+            .iter()
+            .copied()
+            .map(|harness| (harness, binary_fingerprint(harness)))
+            .collect();
+        *lock(&self.inner.fingerprints) = fingerprints;
+        statuses
+    }
+
+    fn binaries_changed(&self) -> bool {
+        let previous = lock(&self.inner.fingerprints);
+        !previous.is_empty()
+            && self.inner.harnesses.iter().any(|harness| {
+                previous
+                    .get(harness)
+                    .is_some_and(|fingerprint| fingerprint != &binary_fingerprint(*harness))
+            })
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn binary_fingerprint(harness: HarnessId) -> Option<BinaryFingerprint> {
+    komet_harness::find_cli_path(executable(harness)).and_then(|path| BinaryFingerprint::of(&path))
+}
+
+fn has_check_errors(statuses: &[HarnessCliStatus]) -> bool {
+    statuses.iter().any(|status| status.check_error.is_some())
+}
+
+fn check_delay() -> Duration {
+    let jitter = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        % MAX_JITTER_SECS;
+    CHECK_INTERVAL + Duration::from_secs(jitter)
 }
 
 #[derive(Clone, Copy)]
@@ -488,5 +677,24 @@ mod tests {
             .nth(1)
             .and_then(|tail| tail.split('/').next());
         assert_eq!(version, Some("2026.10.22-build"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn binary_fingerprint_changes_when_an_installer_replaces_the_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("agent");
+        std::fs::write(&executable, b"old").unwrap();
+        let mut permissions = std::fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable, permissions).unwrap();
+        let before = BinaryFingerprint::of(&executable).unwrap();
+
+        std::fs::write(&executable, b"replacement").unwrap();
+
+        let after = BinaryFingerprint::of(&executable).unwrap();
+        assert_ne!(before, after);
     }
 }

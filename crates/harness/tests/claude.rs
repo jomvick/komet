@@ -76,6 +76,7 @@ fn controls(
         request_permission: RunControls::noop_permission(),
         steering: steer_rx,
         interrupt: token.clone(),
+        env: Vec::new(),
     };
     (controls, steer_tx, token)
 }
@@ -337,6 +338,7 @@ async fn ask_user_question_round_trips_through_the_control_channel() {
         request_permission: RunControls::noop_permission(),
         steering: steer_rx,
         interrupt: token.clone(),
+        env: Vec::new(),
     };
     let events = run_to_end(&harness(), request("scenario:askuser"), controls).await;
 

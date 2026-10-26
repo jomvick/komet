@@ -78,7 +78,10 @@ display EXCLUDED. File paths refer to the reference repo.
   RepoPicker (search, Open folder… in-app browser w/ breadcrumbs + keys + skeletons, Clone from
   URL…, Create new repo…), BranchPicker (search + isolated-worktree toggle ~/.komet/worktrees/…).
 - Agents settings: device-targeted CLI status/version checks and official install/update actions
-  where supported; latest-version checks query the provider package source. BranchPicker (search + isolated-worktree toggle ~/.komet/worktrees/…).
+  where supported; the engine checks at startup and every six hours with jitter, and rechecks
+  within five minutes when a CLI binary's path, size, or modification time changes. Latest-version
+  checks query the provider package source. BranchPicker (search + isolated-worktree toggle
+  ~/.komet/worktrees/…).
 
 ### 1.8 Conversation / transcript
 - ONE transcript source = doc projection. Optimistic echoes until first doc frame.
@@ -96,8 +99,11 @@ display EXCLUDED. File paths refer to the reference repo.
 ### 1.9 Accounts settings
 - Provider cards (Claude Code, Codex): avatar, email, usage meters (rate-limit windows,
   indigo->amber>=80%->red>=95%, reset time), Active/plan badges, Switch/Forget.
-- Add-account: paste-code (Claude) or browser-wait poll (Codex). Skeletons; device switcher
-  retargets which device's logins are shown (mesh-forwarded).
+- Add-account: paste-code (Claude), browser-wait poll (Codex/Copilot). Copilot uses an isolated
+  `gh` config for device login and Komet-owned account switching; its token is passed only to the
+  Copilot ACP child. Monthly billing usage is displayed only when GitHub's official endpoint
+  authorizes it. Skeletons; device switcher retargets which device's logins are shown
+  (mesh-forwarded).
 
 ### 1.10 Terminal panel
 - xterm.js equivalent needed. Session-scoped tabs, restored on return; PTYs on owning device

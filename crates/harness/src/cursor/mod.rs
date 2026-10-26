@@ -444,6 +444,7 @@ async fn run_session(session: Session) {
         request_permission: _request_permission,
         mut steering,
         interrupt,
+        env: _,
     } = controls;
 
     let mut assistant_message_id = new_message_id();
