@@ -118,6 +118,12 @@ pub trait Harness: Send + Sync {
         false
     }
     async fn models(&self) -> Result<Vec<Model>, HarnessError>;
+    /// Bypass any in-process discovery memo and query the CLI again. The
+    /// engine uses this at app startup and on explicit refreshes; adapters
+    /// that do not memoize may use the default.
+    async fn refresh_models(&self) -> Result<Vec<Model>, HarnessError> {
+        self.models().await
+    }
     /// Last-resort DISPLAY list used when live discovery fails and nothing has
     /// ever been cached: the harness's curated catalog, for the CLIs that
     /// still ship one. Display only — the engine keeps re-probing in the

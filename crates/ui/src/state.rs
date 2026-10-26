@@ -400,6 +400,7 @@ impl EngineHandle {
             .env("KOMET_DATA_DIR", &config.data_dir)
             .env("KOMET_IPC_PORT", config.ipc_port.to_string())
             .env("KOMET_EDGE_URL", &config.edge_url)
+            .env("KOMET_HARNESS", config.default_harness.as_str())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
@@ -429,7 +430,10 @@ impl EngineHandle {
         }
 
         #[cfg(unix)]
-        command.process_group(0);
+        {
+            use std::os::unix::process::CommandExt as _;
+            command.process_group(0);
+        }
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt as _;

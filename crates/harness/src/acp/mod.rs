@@ -1894,6 +1894,25 @@ impl Harness for AcpHarness {
         }
     }
 
+    async fn refresh_models(&self) -> Result<Vec<Model>, HarnessError> {
+        let _probe = self.models_probe.lock().await;
+        self.resolve_launch()?;
+        let models = self.discover_models().await?;
+        if models.is_empty() {
+            return Err(HarnessError::Protocol(format!(
+                "{} model discovery returned no usable models — {}",
+                self.spec.display_name, self.spec.install_hint
+            )));
+        }
+        let buster = acp_model_cache_buster_in(self.spec.id, self.cline_data_dir.as_ref());
+        *self.models_cache.lock().await = Some(ModelCacheEntry {
+            buster,
+            at: std::time::Instant::now(),
+            models: models.clone(),
+        });
+        Ok(models)
+    }
+
     async fn commands(&self, cwd: Option<&Path>) -> Result<Vec<SlashCommand>, HarnessError> {
         let cwd = crate::discovery_cwd(cwd);
         let key = cwd.to_string_lossy().into_owned();

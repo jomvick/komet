@@ -217,10 +217,9 @@ impl EngineCore {
         // boot instead of re-probing every agent (opencode's cold Node boot
         // measured ~13s under the app's 4-way boot prefetch).
         registry.load_models_cache(data_dir);
-        // Boot prefetch: warm the model cache for every offered harness with
-        // an installed CLI (except Mock) in the background, two at a time, so
-        // the first picker open renders instantly. Never blocks boot and never
-        // fails it — probe errors stay uncached for the live retry.
+        // Boot refresh: revalidate the persisted models for every offered
+        // harness with an installed CLI (except Mock) in the background, two
+        // at a time. Never blocks boot; a failed probe keeps the prior cache.
         {
             let reg = registry.clone();
             let ids: Vec<HarnessId> = reg
