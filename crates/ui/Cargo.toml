@@ -14,7 +14,6 @@ komet-harness.workspace = true
 komet-rpc.workspace = true
 komet-update.workspace = true
 komet-syntax.workspace = true
-komet-voice.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
 gpui_tokio.workspace = true

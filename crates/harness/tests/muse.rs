@@ -186,6 +186,24 @@ async fn model_discovery_reads_the_native_catalog() {
 }
 
 #[tokio::test]
+async fn model_refresh_bypasses_the_harness_catalog_cache() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let harness = test_harness(dir.path(), "complete");
+
+    harness.models().await.expect("initial model discovery");
+    harness
+        .refresh_models()
+        .await
+        .expect("forced live model discovery");
+
+    let model_list_calls = frames(dir.path())
+        .iter()
+        .filter(|frame| frame["method"] == "model/list")
+        .count();
+    assert_eq!(model_list_calls, 2);
+}
+
+#[tokio::test]
 async fn permissions_use_the_engine_bridge_and_restricted_auto_approval_keeps_sandbox() {
     let dir = tempfile::tempdir().expect("temp dir");
     let harness = test_harness(dir.path(), "permission");

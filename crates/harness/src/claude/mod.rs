@@ -880,6 +880,19 @@ impl Harness for ClaudeHarness {
         Ok(models)
     }
 
+    async fn refresh_models(&self) -> Result<Vec<Model>, HarnessError> {
+        self.resolve_executable()?;
+        let _probe = self.models_probe.lock().await;
+        let models = self.discover_live_models().await?;
+        if models.is_empty() {
+            return Err(HarnessError::Protocol(
+                "claude supported_models returned no usable models".into(),
+            ));
+        }
+        *self.models.lock().await = Some((std::time::Instant::now(), models.clone()));
+        Ok(models)
+    }
+
     /// Curated catalog, shown only until the first live probe succeeds (see
     /// [`Harness::fallback_models`]). Not served by `models()` — that stays
     /// live-only and error-honest.

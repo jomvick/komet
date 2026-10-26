@@ -22,6 +22,7 @@ not built yet).
 | 1.11 Changes viewer | done | Patch → file/hunk/line rows, per-file collapse, ±gutters, time-sliced highlighting, preparing/clean/error states, checkout_id → device+cwd resolution. |
 | 1.12 Motion catalog | partial | Motion kit (cubic-bezier curves, fade-in/quick, splash-out, pulse/gradient spinners, menu/dialog-in, resort glide). Gap: prefers-reduced-motion switch. |
 | 1.13 State & connection | done | All subscriptions (AuthStatus, WatchDevices/Chats/Sessions/CheckoutDiffs, per-chat WatchDocMessages, LocalDevice probe); reconnect from scratch. |
+| 1.14 Engine lifetime | done | The headed app starts a detached `komet engine` child when no engine is listening; sessions survive window/app close. `komet engine stop` gracefully stops it; startup falls back to embedded mode if the child fails to attach. |
 
 ## §2 Control plane
 
@@ -63,7 +64,7 @@ not built yet).
 | Pi (ACP) | done | Shared `AcpHarness` spec; community `pi-acp` adapter (pinned 0.0.33, npx fallback), turn-boundary steering, minimal→max thinking ladder. |
 | Devin (ACP) | done | Native `devin acp` server, turn-boundary steering, descriptor/surface test. |
 | GitHub Copilot (ACP) | done | Native `copilot --acp` server, turn-boundary steering, descriptor/surface test. |
-| Muse Code (MSP) | done | Native `muse serve` JSON-RPC driver; model discovery, workspace sandbox, permissions, resume, steering, cancellation, and unsupported MCP notices covered by protocol-fixture tests. |
+| Muse Code (MSP) | done | Native `muse serve` JSON-RPC driver; the picker uses every Meta model and per-model effort variant advertised by live `model/list`, default first. The persisted catalog is refreshed from the CLI at engine and UI startup (and on picker open), retaining known rows if a live probe fails. Workspace sandbox, permissions, resume, steering, cancellation, and unsupported MCP notices are covered by protocol-fixture tests. |
 | Mock harness | done | Scripted event replay; powers tests + the e2e smoke. |
 
 ## §5 Session doc schema

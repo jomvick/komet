@@ -213,6 +213,32 @@ mod tests {
     }
 
     #[test]
+    fn linux_caption_icons_render_visible_pixels() {
+        let assets = Assets;
+        let renderer = gpui::SvgRenderer::new(std::sync::Arc::new(Assets));
+        for path in [
+            WINDOW_MINIMIZE,
+            WINDOW_MAXIMIZE,
+            WINDOW_RESTORE,
+            WINDOW_CLOSE,
+        ] {
+            let bytes = assets
+                .load(path)
+                .unwrap()
+                .unwrap_or_else(|| panic!("missing asset {path}"));
+            let image = renderer
+                .render_single_frame(&bytes, 1.0)
+                .unwrap_or_else(|error| panic!("failed to render {path}: {error}"));
+            assert!(
+                image
+                    .as_bytes(0)
+                    .is_some_and(|pixels| pixels.chunks_exact(4).any(|pixel| pixel[3] > 0)),
+                "{path} rendered without visible pixels"
+            );
+        }
+    }
+
+    #[test]
     fn unknown_paths_are_none() {
         assert!(Assets.load("icons/nope.svg").unwrap().is_none());
     }
