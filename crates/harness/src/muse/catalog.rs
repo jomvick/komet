@@ -129,6 +129,51 @@ mod tests {
     }
 
     #[test]
+    fn model_list_keeps_every_current_meta_model_and_default_first() {
+        let models = models(&json!({"models":[
+            {"providerId":"meta","modelId":"muse-wonder-1.0","displayLabel":"muse-wonder-1.0",
+             "isDefault":false,"variants":["minimal","low","medium","high","xhigh","max"]},
+            {"providerId":"meta","modelId":"muse-spark-1.3","displayLabel":"muse-spark-1.3",
+             "isDefault":false,"variants":["minimal","low","medium","high","xhigh","max"]},
+            {"providerId":"meta","modelId":"muse-spark-1.3-contributor",
+             "displayLabel":"muse-spark-1.3-contributor","isDefault":true,
+             "variants":["minimal","low","medium","high","xhigh","max"]},
+            {"providerId":"meta","modelId":"muse-spark-1.2","displayLabel":"muse-spark-1.2",
+             "isDefault":false,"variants":["minimal","low","medium","high","xhigh"]},
+            {"providerId":"meta","modelId":"muse-spark-1.2-contributor",
+             "displayLabel":"muse-spark-1.2-contributor","isDefault":false,
+             "variants":["minimal","low","medium","high","xhigh"]}
+        ]}));
+
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "muse-spark-1.3-contributor",
+                "muse-wonder-1.0",
+                "muse-spark-1.3",
+                "muse-spark-1.2",
+                "muse-spark-1.2-contributor",
+            ]
+        );
+        assert_eq!(models[0].label, "Muse Spark 1.3 Contributor");
+        assert_eq!(models[1].label, "Muse Wonder 1.0");
+        assert_eq!(
+            models[0].reasoning_levels,
+            [
+                ReasoningLevel::Minimal,
+                ReasoningLevel::Low,
+                ReasoningLevel::Medium,
+                ReasoningLevel::High,
+                ReasoningLevel::XHigh,
+                ReasoningLevel::Max
+            ]
+        );
+    }
+
+    #[test]
     fn levels_round_trip_to_tiers() {
         for tier in ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"] {
             assert_eq!(effort(level(tier)), Some(tier));

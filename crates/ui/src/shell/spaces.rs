@@ -601,11 +601,13 @@ impl Shell {
         let trigger = if self.spaces_menu.get().is_some() {
             let closing = self.spaces_menu.closing_since();
             let menu = self.render_spaces_menu(theme, cx);
-            trigger.relative().child(popover::anchored_menu_below(
-                "spaces-filter-menu",
-                menu,
-                closing,
-            ))
+            trigger
+                .relative()
+                .child(popover::anchored_menu_below_unfrosted(
+                    "spaces-filter-menu",
+                    menu,
+                    closing,
+                ))
         } else {
             trigger
         };

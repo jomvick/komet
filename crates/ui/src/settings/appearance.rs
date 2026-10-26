@@ -227,6 +227,17 @@ fn preview(mode: AppearanceMode) -> AnyElement {
         AppearanceMode::System => miniature_split(),
         AppearanceMode::Light => miniature(&Theme::light(), Corners::All),
         AppearanceMode::Dark => miniature(&Theme::dark(), Corners::All),
+        AppearanceMode::DigitalHand => div()
+            .size_full()
+            .rounded(px(widgets::OPTION_CARD_RADIUS))
+            .overflow_hidden()
+            .bg(gpui::rgb(0x000000))
+            .child(
+                gpui::img(crate::loaders::digital_hand_image())
+                    .size_full()
+                    .object_fit(gpui::ObjectFit::Contain),
+            )
+            .into_any_element(),
     }
 }
 
@@ -245,6 +256,9 @@ fn helper(mode: AppearanceMode, system: Appearance) -> SharedString {
         }
         AppearanceMode::Light => "Always light, whatever the system is set to.".into(),
         AppearanceMode::Dark => "Always dark, whatever the system is set to.".into(),
+        AppearanceMode::DigitalHand => {
+            "Black theme with the hand artwork on the home screen only.".into()
+        }
     }
 }
 
@@ -288,8 +302,8 @@ impl Render for AppearancePage {
                     .child(
                         widgets::page_subtitle(
                             &theme,
-                            "How komet picks between light and dark. This setting stays on this \
-                             device.",
+                            "Choose a theme for this device. Digital Hand keeps the black base \
+                             and adds its artwork to the home screen.",
                         )
                         .max_w(px(512.0))
                         .line_height(px(20.0)),
@@ -369,15 +383,6 @@ impl Render for AppearancePage {
                                                     .text_size(px(12.5))
                                                     .text_color(theme.text)
                                                     .child("Image"),
-                                            )
-                                            .child(
-                                                div()
-                                                    .px(px(12.0))
-                                                    .py(px(8.0))
-                                                    .rounded(px(10.0))
-                                                    .text_size(px(12.5))
-                                                    .text_color(theme.text_muted)
-                                                    .child("Gradient"),
                                             ),
                                     ),
                             )
@@ -480,7 +485,7 @@ mod tests {
 
     #[test]
     fn every_mode_gets_a_card() {
-        assert_eq!(AppearanceMode::ALL.len(), 3);
+        assert_eq!(AppearanceMode::ALL.len(), 4);
         for mode in AppearanceMode::ALL {
             assert!(!mode.label().is_empty());
         }

@@ -11,7 +11,7 @@
 //! in free functions with unit tests; RPC results land in [`Loadable`] slots
 //! rendered as skeletons / inline errors with Retry.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use gpui::{
@@ -426,19 +426,14 @@ pub enum PickerKind {
     Device,
 }
 
-/// Minimum age of an already-loaded model list before a picker open / agent
-/// switch may revalidate it. A back-and-forth between two agents inside this
-/// window reuses what is already on screen — no spinner, no probe.
-const MODELS_REVALIDATE_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
-
 /// How a model load is allowed to start (see [`Pickers::ensure_models`]).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ModelsLoad {
     /// Render-loop prefetch: fill an absent / Idle slot only.
     Fill,
-    /// Picker open / agent switch: fill a missing slot, or revalidate one whose
-    /// list is older than [`MODELS_REVALIDATE_AFTER`] — rows stay on screen.
-    Revalidate,
+    /// Opening the model picker or switching agents asks the engine to probe
+    /// the CLI live, keeping current rows visible until the fresh list returns.
+    LiveRefresh,
     /// Rescan / Retry: drop the slot and probe the CLI live.
     Force,
 }
@@ -470,10 +465,11 @@ pub struct Pickers {
     model_rail: ModelRail,
     harnesses: Loadable<Vec<HarnessDescriptor>>,
     models: HashMap<HarnessId, Loadable<Vec<Model>>>,
-    /// When each list in [`Self::models`] was last (re)loaded. Drives the
-    /// bounded revalidation on picker open / agent switch so a flip-flop
-    /// between two agents backs off instead of re-probing on every visit.
-    models_loaded_at: HashMap<HarnessId, std::time::Instant>,
+    /// A live refresh requested while the initial cached load was still in
+    /// flight; run it as soon as that load completes.
+    pending_live_refresh: HashSet<HarnessId>,
+    /// Harnesses already scheduled for this UI startup's live catalog sync.
+    startup_refresh_requested: HashSet<HarnessId>,
     refs: Loadable<Vec<RepoRef>>,
     /// Space id the `refs` slot belongs to (invalidated on space change).
     refs_space: Option<String>,
@@ -581,6 +577,8 @@ impl Pickers {
                 // a space switch may land on another device, so refetch.
                 this.harnesses = Loadable::Idle;
                 this.models.clear();
+                this.pending_live_refresh.clear();
+                this.startup_refresh_requested.clear();
             }
             cx.notify();
         });
@@ -645,7 +643,8 @@ impl Pickers {
             model_rail: ModelRail::default(),
             harnesses: Loadable::Idle,
             models: HashMap::new(),
-            models_loaded_at: HashMap::new(),
+            pending_live_refresh: HashSet::new(),
+            startup_refresh_requested: HashSet::new(),
             refs: Loadable::Idle,
             refs_space: None,
             worktrees_only: false,
@@ -1007,11 +1006,11 @@ impl Pickers {
                 // possibly from another viewer) — every open revalidates,
                 // keeping current rows visible until the fresh catalog lands.
                 self.ensure_harnesses(true, cx);
-                // Revalidate the effective harness (bounded: a list already on
-                // screen and younger than MODELS_REVALIDATE_AFTER is reused as
-                // is). Prefetch all other offered harnesses in the background.
+                // Force a live catalog for the effective harness while
+                // retaining the current rows until a fresh answer returns.
+                // Prefetch all other offered harnesses in the background.
                 if let Some(effective) = self.effective_harness(cx) {
-                    self.ensure_models(effective, ModelsLoad::Revalidate, cx);
+                    self.ensure_models(effective, ModelsLoad::LiveRefresh, cx);
                 }
                 self.prefetch_models(cx);
             }
@@ -1092,39 +1091,40 @@ impl Pickers {
             targets.push(effective);
         }
         for harness in targets {
+            let refresh_at_startup = !self.models.contains_key(&harness)
+                && self.startup_refresh_requested.insert(harness);
             self.ensure_models(harness, ModelsLoad::Fill, cx);
-        }
-    }
-
-    /// Whether `harness`'s in-memory list is old enough to revalidate.
-    fn models_slot_stale(&self, harness: HarnessId) -> bool {
-        match self.models_loaded_at.get(&harness) {
-            Some(at) => at.elapsed() >= MODELS_REVALIDATE_AFTER,
-            None => true,
+            // The engine may outlive this UI process. Refresh once per UI
+            // startup even when its persistent cache is still marked fresh;
+            // Fill leaves any cached list visible while this runs.
+            if refresh_at_startup {
+                self.ensure_models(harness, ModelsLoad::LiveRefresh, cx);
+            }
         }
     }
 
     /// Loads `harness`'s model list according to `load` (see [`ModelsLoad`]).
     /// The RPC goes out with `force: false` unless this is an explicit
-    /// Rescan/Retry: the engine answers from its persistent cache and
-    /// revalidates in the background, so a normal open never blocks on a cold
-    /// CLI and never drops a list it already knows.
+    /// live refresh or Rescan/Retry. Normal prefetch is cache-first; opening
+    /// the model picker forces a live CLI refresh without dropping visible
+    /// cached rows.
     fn ensure_models(&mut self, harness: HarnessId, load: ModelsLoad, cx: &mut Context<Self>) {
         if load == ModelsLoad::Force {
             // Reset to Idle so the guard below always triggers a fresh probe —
             // Rescan / Retry.
             self.models.insert(harness, Loadable::Idle);
-        } else if let Some(slot) = self.models.get(&harness) {
+        } else if load == ModelsLoad::LiveRefresh
+            && matches!(self.models.get(&harness), Some(Loadable::Loading))
+        {
+            self.pending_live_refresh.insert(harness);
+            return;
+        } else if self.models.contains_key(&harness) {
             let reload = match load {
                 // Render-loop prefetch: absent/Idle only — an Error must wait
                 // for an explicit reopen (same render-loop hazard as
                 // `ensure_harnesses`).
                 ModelsLoad::Fill => false,
-                ModelsLoad::Revalidate => match slot {
-                    Loadable::Loading => false,
-                    Loadable::Ready(_) => self.models_slot_stale(harness),
-                    Loadable::Idle | Loadable::Error(_) => true,
-                },
+                ModelsLoad::LiveRefresh => true,
                 ModelsLoad::Force => false,
             };
             if !reload {
@@ -1135,7 +1135,7 @@ impl Pickers {
             return;
         };
         let target = self.space_target(cx);
-        let force = load == ModelsLoad::Force;
+        let force = matches!(load, ModelsLoad::LiveRefresh | ModelsLoad::Force);
         // Stale-while-revalidate: an already-loaded list stays on screen while
         // the reload runs, so a revalidate never flashes a skeleton.
         if !matches!(self.models.get(&harness), Some(Loadable::Ready(_))) {
@@ -1188,9 +1188,6 @@ impl Pickers {
                     }
                 } else {
                     pickers.models.insert(harness, loaded);
-                    pickers
-                        .models_loaded_at
-                        .insert(harness, std::time::Instant::now());
                 }
                 // A list that landed while its popover is open re-anchors the
                 // keyboard highlight onto the selected row (it sat at 0 while
@@ -1199,6 +1196,9 @@ impl Pickers {
                     && pickers.effective_harness(cx) == Some(harness)
                 {
                     pickers.active = pickers.selected_model_index(cx);
+                }
+                if pickers.pending_live_refresh.remove(&harness) {
+                    pickers.ensure_models(harness, ModelsLoad::LiveRefresh, cx);
                 }
                 cx.notify();
             })
@@ -1470,9 +1470,7 @@ impl Pickers {
         self.defaults.harness = Some(harness);
         self.save_defaults();
         self.model_scroll.set_offset(gpui::Point::default());
-        // Switching back to an agent whose list is already on screen reuses it
-        // instead of re-probing — only a stale/burst-missing slot reloads.
-        self.ensure_models(harness, ModelsLoad::Revalidate, cx);
+        self.ensure_models(harness, ModelsLoad::LiveRefresh, cx);
         // Re-anchor the keyboard highlight onto the new harness's selected row.
         self.active = self.selected_model_index(cx);
         cx.notify();
@@ -3805,9 +3803,11 @@ pub(crate) fn model_provider(harness: HarnessId, model_id: &str) -> &'static str
 /// real row exists, an orphan `<model>[1m]` variant presents as its base id
 /// with the Context Window trait pinned to 1M, and Claude rows adopt the
 /// curated catalog's labels so the version number always shows ("Opus 5",
-/// not the wire's terse "Opus" alias — user request). Idempotent over
-/// already-clean lists. The send path recomposes the advertised id from the
-/// base + trait (`pick_model_value`), so a folded pick still runs.
+/// not the wire's terse "Opus" alias — user request). Duplicate ids and
+/// duplicate visible rows with identical capabilities are collapsed.
+/// Idempotent over already-clean lists. The send path recomposes the
+/// advertised id from the base + trait (`pick_model_value`), so a folded pick
+/// still runs.
 pub(crate) fn normalize_model_rows(harness: HarnessId, models: Vec<Model>) -> Vec<Model> {
     fn strip_1m(id: &str) -> Option<&str> {
         id.strip_suffix("[1m]").or_else(|| id.strip_suffix("-1m"))
@@ -3837,6 +3837,8 @@ pub(crate) fn normalize_model_rows(harness: HarnessId, models: Vec<Model>) -> Ve
     };
     let ids: Vec<String> = models.iter().map(|m| m.id.clone()).collect();
     let has_real = ids.iter().any(|id| !id.eq_ignore_ascii_case("default"));
+    let mut seen_ids = std::collections::HashSet::new();
+    let mut seen_rows: Vec<Model> = Vec::new();
     models
         .into_iter()
         .filter_map(|mut model| {
@@ -3880,6 +3882,16 @@ pub(crate) fn normalize_model_rows(harness: HarnessId, models: Vec<Model>) -> Ve
             if let Some(label) = curated_label(&model.id) {
                 model.label = label;
             }
+            if !seen_ids.insert(model.id.to_ascii_lowercase())
+                || seen_rows.iter().any(|seen| {
+                    seen.label.eq_ignore_ascii_case(&model.label)
+                        && seen.reasoning_levels == model.reasoning_levels
+                        && seen.options == model.options
+                })
+            {
+                return None;
+            }
+            seen_rows.push(model.clone());
             Some(model)
         })
         .collect()
@@ -4293,6 +4305,28 @@ mod tests {
         // Idempotent over a clean list.
         let clean = vec![bare_model("titan-5", "Titan 5")];
         assert_eq!(normalize_model_rows(HarnessId::Codex, clean.clone()), clean);
+    }
+
+    #[test]
+    fn normalize_collapses_duplicate_visible_rows_with_identical_capabilities() {
+        let mut distinct_model = bare_model("auto-balanced", "Auto");
+        distinct_model.reasoning_levels = vec![ReasoningLevel::High];
+        let models = normalize_model_rows(
+            HarnessId::Copilot,
+            vec![
+                bare_model("auto", "Auto"),
+                bare_model("AUTO", "Auto"),
+                distinct_model,
+            ],
+        );
+
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["auto", "auto-balanced"]
+        );
     }
 
     #[test]

@@ -122,7 +122,9 @@ pub struct CodexHarness {
     /// invalidates it when the CLI's skill dirs change.
     commands: tokio::sync::Mutex<HashMap<String, (u128, Vec<SlashCommand>)>>,
     /// Model discovery cache: live app-server model/list cached on success.
-    models: tokio::sync::OnceCell<Vec<Model>>,
+    models: tokio::sync::Mutex<Option<Vec<Model>>>,
+    /// Single-flight for normal and forced model discovery.
+    models_probe: tokio::sync::Mutex<()>,
 }
 
 impl Default for CodexHarness {
@@ -132,7 +134,8 @@ impl Default for CodexHarness {
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
             commands: tokio::sync::Mutex::new(HashMap::new()),
-            models: tokio::sync::OnceCell::new(),
+            models: tokio::sync::Mutex::new(None),
+            models_probe: tokio::sync::Mutex::new(()),
         }
     }
 }
@@ -361,6 +364,29 @@ fn parse_skill_commands(result: &Value) -> Vec<SlashCommand> {
     commands
 }
 
+impl CodexHarness {
+    async fn discover_and_cache_models(&self) -> Result<Vec<Model>, HarnessError> {
+        let models = self.discover_live_models().await.inspect_err(|e| {
+            tracing::warn!(
+                target: "komet_harness::codex",
+                "Codex live model discovery failed: {e}"
+            );
+        })?;
+        if models.is_empty() {
+            return Err(HarnessError::Protocol(
+                "codex model/list returned no usable models".into(),
+            ));
+        }
+        tracing::info!(
+            target: "komet_harness::codex",
+            count = models.len(),
+            "discovered live Codex models from app-server"
+        );
+        *self.models.lock().await = Some(models.clone());
+        Ok(models)
+    }
+}
+
 #[async_trait]
 impl Harness for CodexHarness {
     fn id(&self) -> HarnessId {
@@ -394,33 +420,21 @@ impl Harness for CodexHarness {
     /// Model discovery: live `codex app-server` `model/list` only — no
     /// static fallback, so the picker only shows models the CLI offers.
     /// Requires an installed CLI so an absent binary surfaces as [`HarnessError::NotInstalled`].
-    /// A failed probe is UNCACHED (`OnceCell` stores successes only) so the
-    /// next picker open retries. Concurrent calls share one probe:
-    /// `OnceCell` single-flights the initializer.
+    /// A failed probe is uncached so the next picker open retries. Concurrent
+    /// calls share one probe.
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         self.resolve_executable()?;
-        self.models
-            .get_or_try_init(|| async {
-                let models = self.discover_live_models().await.inspect_err(|e| {
-                    tracing::warn!(
-                        target: "komet_harness::codex",
-                        "Codex live model discovery failed: {e}"
-                    );
-                })?;
-                if models.is_empty() {
-                    return Err(HarnessError::Protocol(
-                        "codex model/list returned no usable models".into(),
-                    ));
-                }
-                tracing::info!(
-                    target: "komet_harness::codex",
-                    count = models.len(),
-                    "discovered live Codex models from app-server"
-                );
-                Ok(models)
-            })
-            .await
-            .cloned()
+        let _probe = self.models_probe.lock().await;
+        if let Some(models) = self.models.lock().await.as_ref() {
+            return Ok(models.clone());
+        }
+        self.discover_and_cache_models().await
+    }
+
+    async fn refresh_models(&self) -> Result<Vec<Model>, HarnessError> {
+        self.resolve_executable()?;
+        let _probe = self.models_probe.lock().await;
+        self.discover_and_cache_models().await
     }
 
     /// Curated catalog, shown only until the first live probe succeeds (see

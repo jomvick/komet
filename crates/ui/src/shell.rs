@@ -3826,7 +3826,12 @@ impl Shell {
             .occlude()
             .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
             .on_click(action)
-            .child(icon(icon_path).size(px(18.0)))
+            .child(
+                icon(icon_path)
+                    .size(px(18.0))
+                    .text_color(foreground)
+                    .hover(move |style| style.text_color(hover_fg)),
+            )
             .into_any_element()
     }
 
@@ -5566,9 +5571,28 @@ impl Shell {
                 .child(motion::fade_in(
                     "no-spaces-canvas",
                     div()
+                        .relative()
+                        .w_full()
+                        .max_w(px(1187.0))
+                        .h(px(451.0))
                         .flex()
                         .flex_col()
                         .items_center()
+                        .justify_center()
+                        .when(
+                            crate::appearance::mode(cx)
+                                == crate::appearance::AppearanceMode::DigitalHand,
+                            |el| {
+                                el.child(
+                                    img(crate::loaders::digital_hand_image())
+                                        .absolute()
+                                        .inset_0()
+                                        .size_full()
+                                        .object_fit(ObjectFit::Contain)
+                                        .opacity(0.72),
+                                )
+                            },
+                        )
                         .child(crate::blobatar::blobatar(
                             "onboarding-blobatar",
                             64.0,
@@ -5619,9 +5643,28 @@ impl Shell {
                 .child(motion::fade_in(
                     "new-chat-canvas",
                     div()
+                        .relative()
+                        .w_full()
+                        .max_w(px(1187.0))
+                        .h(px(451.0))
                         .flex()
                         .flex_col()
                         .items_center()
+                        .justify_center()
+                        .when(
+                            crate::appearance::mode(cx)
+                                == crate::appearance::AppearanceMode::DigitalHand,
+                            |el| {
+                                el.child(
+                                    img(crate::loaders::digital_hand_image())
+                                        .absolute()
+                                        .inset_0()
+                                        .size_full()
+                                        .object_fit(ObjectFit::Contain)
+                                        .opacity(0.72),
+                                )
+                            },
+                        )
                         .child(crate::blobatar::blobatar(
                             "new-chat-blobatar",
                             64.0,
@@ -7656,7 +7699,9 @@ impl Render for Shell {
                     composer.resubmit_last(cx);
                 });
             }));
-        let root = if let Some(path) = wallpaper::path(cx).filter(|path| path.is_file()) {
+        let root = if crate::appearance::mode(cx) != crate::appearance::AppearanceMode::DigitalHand
+            && let Some(path) = wallpaper::path(cx).filter(|path| path.is_file())
+        {
             root.child(
                 div()
                     .absolute()

@@ -61,9 +61,15 @@ Download `komet-<version>-linux-<arch>.tar.gz` then run `./install.sh` inside th
 ```bash
 komet status                          # engine status + local/sync mode
 komet update                          # check and install latest version
+komet engine stop                     # gracefully stop the desktop app's background engine
 komet daemon start|stop|restart|status
 komet headless                        # engine only (no UI)
 ```
+
+The desktop app starts its engine as a detached background process when one is not already
+running. Closing the window or quitting Komet does not interrupt active sessions. Use
+`komet engine stop` to stop that engine explicitly; `komet daemon` remains for service-managed
+headless deployments.
 
 ---
 

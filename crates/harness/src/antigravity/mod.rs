@@ -207,6 +207,11 @@ impl Harness for AntigravityHarness {
         Ok(parsed)
     }
 
+    async fn refresh_models(&self) -> Result<Vec<Model>, HarnessError> {
+        *self.models.lock().await = None;
+        self.models().await
+    }
+
     /// Curated `agy` catalog, shown only until the first live probe succeeds
     /// (see [`Harness::fallback_models`]). `models()` itself stays live-only.
     fn fallback_models(&self) -> Vec<Model> {

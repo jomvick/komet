@@ -337,7 +337,7 @@ impl HarnessRegistry {
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
         tokio::spawn(async move {
-            if let Ok(fresh) = harness.models().await
+            if let Ok(fresh) = harness.refresh_models().await
                 && !fresh.is_empty()
             {
                 cache.lock().unwrap_or_else(PoisonError::into_inner).insert(
@@ -361,7 +361,7 @@ impl HarnessRegistry {
     /// harness error propagates. A non-empty answer persists (success-only).
     pub async fn probe_live(&self, id: HarnessId) -> Result<Vec<Model>, HarnessError> {
         let harness = self.resolve(id)?;
-        let models = harness.models().await?;
+        let models = harness.refresh_models().await?;
         if models.is_empty() {
             return Err(HarnessError::Protocol(format!(
                 "{id:?} model discovery returned no usable models"
@@ -392,11 +392,10 @@ impl HarnessRegistry {
             .collect()
     }
 
-    /// Prefetch `ids` through the normal [`Self::models`] discipline
-    /// (cached path: instant when fresh, live probe on miss), two harnesses
-    /// at a time. Single-flight per harness: an id already being warmed is
-    /// skipped. Probe failures are ignored — boot prefetch must never fail;
-    /// the picker retries live.
+    /// Refresh `ids` from their CLIs on every engine start, two harnesses at
+    /// a time. Existing cached rows remain available until a successful live
+    /// probe replaces them. Single-flight per harness: an id already being
+    /// warmed is skipped. Failures are logged and leave the prior cache intact.
     pub async fn warm_models_cache(&self, ids: Vec<HarnessId>) {
         for chunk in ids.chunks(2) {
             if chunk.len() == 2 {
@@ -417,7 +416,13 @@ impl HarnessRegistry {
                 return;
             }
         }
-        let _ = self.models(id, false).await;
+        if let Err(error) = self.probe_live(id).await {
+            tracing::warn!(
+                harness = ?id,
+                error = %error,
+                "startup live model refresh failed; retaining cached models"
+            );
+        }
         self.warm_inflight
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -1117,6 +1122,39 @@ mod tests {
         let cached = reloaded.models(HarnessId::Mock, false).await;
         let ids: Vec<String> = cached.unwrap().into_iter().map(|m| m.id).collect();
         assert_eq!(ids, vec!["mock-1", "mock-fable-5"]);
+    }
+
+    #[tokio::test]
+    async fn startup_model_warm_replaces_a_fresh_disk_cache_with_live_models() {
+        use komet_harness::mock::MockHarness;
+        let dir = tempfile::tempdir().unwrap();
+        let registry = HarnessRegistry::new();
+        registry.load_models_cache(dir.path());
+        registry.register(Arc::new(MockHarness { script: Vec::new() }));
+
+        registry.models_cache_entries().insert(
+            HarnessId::Mock,
+            CachedModels {
+                discovered_at_ms: crate::now_ms(),
+                models: vec![Model {
+                    id: "obsolete-model".into(),
+                    label: "Obsolete".into(),
+                    description: None,
+                    reasoning_levels: vec![],
+                    options: vec![],
+                }],
+            },
+        );
+
+        registry.warm_models_cache(vec![HarnessId::Mock]).await;
+
+        let cache = registry.models_cache_entries();
+        let refreshed = cache[&HarnessId::Mock]
+            .models
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(refreshed, ["mock-1", "mock-fable-5"]);
     }
 
     /// A fresh cache entry serves instantly (age under the refresh window),
