@@ -19,6 +19,89 @@ pub struct AppState {
     /// Shared bearer token; never empty (see [`require_token`]).
     pub token: String,
     pub rooms: Arc<RwLock<HashMap<String, Room>>>,
+    /// This server's workspace namespace; served by `GET /env` so a client can
+    /// name its rooms without duplicating identity into a pairing link.
+    pub identity: ServerIdentity,
+}
+
+/// Who this server is: the `reg1/{org_id}/{user_id}` room namespace plus a
+/// display label. Generated once and persisted, so an existing deployment
+/// (Docker, compose) pairs without new configuration.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ServerIdentity {
+    pub org_id: String,
+    pub user_id: String,
+    pub label: String,
+}
+
+const IDENTITY_FILE: &str = "server-identity.json";
+
+/// Environment variables win (they are how `komet serve` hands its persisted
+/// identity to an embedded server); otherwise the file; otherwise fresh ids.
+pub fn load_or_create_identity(data_dir: &std::path::Path) -> anyhow::Result<ServerIdentity> {
+    let override_of = |key: &str| {
+        std::env::var(key)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+    load_or_create_identity_with(
+        data_dir,
+        override_of("KOMET_ORG_ID"),
+        override_of("KOMET_USER_ID"),
+        override_of("KOMET_ENV_LABEL"),
+    )
+}
+
+fn load_or_create_identity_with(
+    data_dir: &std::path::Path,
+    org_id: Option<String>,
+    user_id: Option<String>,
+    label: Option<String>,
+) -> anyhow::Result<ServerIdentity> {
+    let path = data_dir.join(IDENTITY_FILE);
+    let stored = match std::fs::read(&path) {
+        Ok(bytes) => Some(
+            serde_json::from_slice::<ServerIdentity>(&bytes)
+                .map_err(|err| anyhow::anyhow!("{}: {err}", path.display()))?,
+        ),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => return Err(err.into()),
+    };
+    let identity = ServerIdentity {
+        org_id: org_id
+            .or_else(|| stored.as_ref().map(|id| id.org_id.clone()))
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+        user_id: user_id
+            .or_else(|| stored.as_ref().map(|id| id.user_id.clone()))
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+        label: label
+            .or_else(|| stored.as_ref().map(|id| id.label.clone()))
+            .unwrap_or_else(|| "komet".to_string()),
+    };
+    if stored.as_ref() != Some(&identity) {
+        write_identity(&path, &identity)?;
+    }
+    Ok(identity)
+}
+
+fn write_identity(path: &std::path::Path, identity: &ServerIdentity) -> anyhow::Result<()> {
+    let bytes = serde_json::to_vec_pretty(identity)?;
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(&bytes)?;
+    }
+    #[cfg(not(unix))]
+    std::fs::write(path, &bytes)?;
+    Ok(())
 }
 
 pub struct Room {
@@ -128,6 +211,25 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 async fn health() -> impl IntoResponse {
     Json(serde_json::json!({"ok":true}))
+}
+
+/// The environment descriptor: enough for a client to build the room namespace
+/// and refuse a duplicate of a server it is already synced to. Same bearer as
+/// every other route.
+async fn env_descriptor(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, &'static str)> {
+    if !check_auth(&state, &headers) {
+        return Err((StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    Ok(Json(serde_json::json!({
+        "v": 1,
+        "label": state.identity.label,
+        "orgId": state.identity.org_id,
+        "userId": state.identity.user_id,
+        "version": env!("CARGO_PKG_VERSION"),
+    })))
 }
 
 async fn ws_handler(
@@ -270,6 +372,7 @@ async fn put_blob(
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/env", get(env_descriptor))
         .route("/session/:room/ws", get(ws_handler))
         .route("/chat2/:room/ws", get(ws_handler))
         .route("/registry/:room/ws", get(ws_handler))
@@ -281,19 +384,30 @@ pub fn router(state: AppState) -> Router {
 /// Run the sync server. A blank `token` is refused here as well as in
 /// [`require_token`], so no caller can start a server without authentication.
 pub async fn serve(data_dir: PathBuf, token: String, port: u16) -> anyhow::Result<()> {
+    let addr = format!("0.0.0.0:{port}");
+    info!("komet-sync listening on {addr}");
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    serve_listener(listener, data_dir, token).await
+}
+
+/// [`serve`] against a listener the caller already bound (ephemeral ports in
+/// tests, `komet serve` binding loopback before it has an identity to print).
+pub async fn serve_listener(
+    listener: tokio::net::TcpListener,
+    data_dir: PathBuf,
+    token: String,
+) -> anyhow::Result<()> {
     let token = require_token(Some(token))?;
     tokio::fs::create_dir_all(data_dir.join("rooms")).await.ok();
     tokio::fs::create_dir_all(data_dir.join("blobs")).await.ok();
+    let identity = load_or_create_identity(&data_dir)?;
     let state = AppState {
         data_dir,
         token,
         rooms: Arc::new(RwLock::new(HashMap::new())),
+        identity,
     };
-    let app = router(state);
-    let addr = format!("0.0.0.0:{port}");
-    info!("komet-sync listening on {addr}");
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, router(state)).await?;
     Ok(())
 }
 
@@ -312,6 +426,11 @@ mod tests {
             data_dir: data_dir.to_path_buf(),
             token: TOKEN.to_string(),
             rooms: Arc::new(RwLock::new(HashMap::new())),
+            identity: ServerIdentity {
+                org_id: "org-1".into(),
+                user_id: "user-1".into(),
+                label: "komet VPS".into(),
+            },
         }
     }
 
@@ -454,5 +573,63 @@ mod tests {
         assert!(!sync_url_is_insecure("http://[::1]:8787"));
         assert!(sync_url_is_insecure("http://192.168.1.10:8787"));
         assert!(sync_url_is_insecure("http://vps.example.com:8787"));
+    }
+
+    #[tokio::test]
+    async fn env_descriptor_requires_the_bearer_and_reports_the_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let app = router(test_state(root.path()));
+        let unauthenticated = Request::builder().uri("/env").body(Body::empty()).unwrap();
+        let response = app.clone().oneshot(unauthenticated).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app.oneshot(request(Method::GET, "/env", "")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["v"], 1);
+        assert_eq!(body["label"], "komet VPS");
+        assert_eq!(body["orgId"], "org-1");
+        assert_eq!(body["userId"], "user-1");
+        assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn identity_is_created_once_and_stays_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = load_or_create_identity_with(dir.path(), None, None, None).unwrap();
+        let second = load_or_create_identity_with(dir.path(), None, None, None).unwrap();
+        assert_eq!(first, second);
+        assert!(!first.org_id.is_empty() && !first.user_id.is_empty());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.path().join(IDENTITY_FILE))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    #[test]
+    fn identity_env_overrides_win_over_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        load_or_create_identity_with(dir.path(), None, None, None).unwrap();
+        let overridden = load_or_create_identity_with(
+            dir.path(),
+            Some("org-2".into()),
+            Some("user-2".into()),
+            Some("VPS ovh".into()),
+        )
+        .unwrap();
+        assert_eq!(overridden.org_id, "org-2");
+        assert_eq!(overridden.user_id, "user-2");
+        assert_eq!(overridden.label, "VPS ovh");
+        // The override is persisted, so the next boot without it keeps the identity.
+        let reloaded = load_or_create_identity_with(dir.path(), None, None, None).unwrap();
+        assert_eq!(reloaded, overridden);
     }
 }
