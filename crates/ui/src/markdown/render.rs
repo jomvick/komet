@@ -15,9 +15,9 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use gpui::{
-    AnyElement, BorderStyle, Bounds, FontStyle, FontWeight, Hsla, InteractiveText, SharedString,
-    StyledText, TextRun, UnderlineStyle, Window, canvas, div, font, point, prelude::*, px, quad,
-    size,
+    AnyElement, BorderStyle, Bounds, EntityId, FontStyle, FontWeight, Hsla, InteractiveText,
+    SharedString, StyledText, TextRun, UnderlineStyle, Window, canvas, div, font, point,
+    prelude::*, px, quad, size,
 };
 use komet_syntax::{HighlightKind, HighlightSpan, HighlightedDocument};
 
@@ -65,6 +65,8 @@ pub fn table_hairline() -> Hsla {
 pub struct RenderOptions {
     /// Stable row key — prefixes element ids (scroll state, animations).
     pub row_key: SharedString,
+    /// Entity that owns interactive controls rendered from this tree.
+    pub hover_owner: Option<EntityId>,
     /// Streaming veil state for a live row: newly appended text fades in via
     /// paint-only run opacity, keyed per (element, chunk offset) so each chunk
     /// fades exactly once. `None` renders without fades (completed rows).
@@ -79,6 +81,9 @@ pub struct RenderOptions {
     /// Code-block copy-button plumbing (round 9): `None` renders no button
     /// (previews outside the transcript).
     pub copy: Option<CopyUi>,
+    /// Opens a validated workspace-relative file link inside Komet. Ordinary
+    /// web links retain their existing OS-browser behavior.
+    pub open_workspace_file: Option<WorkspaceFileHandler>,
 }
 
 /// Copy-button wiring for one row's code blocks: the handler writes the code
@@ -88,6 +93,7 @@ pub struct RenderOptions {
 /// (`(block index, code, window, app)`); `copied_ix` is the block currently
 /// showing "Copied" feedback.
 pub type CopyHandler = Rc<dyn Fn(usize, SharedString, &mut Window, &mut gpui::App)>;
+pub type WorkspaceFileHandler = Rc<dyn Fn(String, Option<u32>, &mut gpui::App)>;
 
 #[derive(Clone)]
 pub struct CopyUi {
@@ -100,10 +106,12 @@ impl RenderOptions {
     pub fn settled(row_key: SharedString) -> Self {
         Self {
             row_key,
+            hover_owner: None,
             veil: None,
             cache: None,
             now: Instant::now(),
             copy: None,
+            open_workspace_file: None,
         }
     }
 }
@@ -669,9 +677,18 @@ fn flat_text_element(
     } else {
         let (ranges, urls): (Vec<_>, Vec<_>) = flat.links.iter().cloned().unzip();
         let id: SharedString = format!("{}-t{ix}", opts.row_key).into();
+        let open_workspace_file = opts.open_workspace_file.clone();
         InteractiveText::new(id, styled)
             .on_click(ranges, move |clicked_ix, _window, cx| {
                 if let Some(url) = urls.get(clicked_ix) {
+                    if let Some((path, line)) = super::parser::parse_workspace_file_reference(url)
+                        && url.starts_with(super::parser::WORKSPACE_FILE_SCHEME)
+                    {
+                        if let Some(handler) = &open_workspace_file {
+                            handler(path, line, cx);
+                        }
+                        return;
+                    }
                     cx.open_url(url);
                 }
             })
@@ -1090,7 +1107,9 @@ fn render_code_block(
                 gpui::transparent_black(),
                 crate::theme::ink(0.08),
             ))
-            .on_hover(crate::motion::hover_listener(fade_key))
+            .when_some(opts.hover_owner, |button, owner| {
+                button.on_hover(crate::motion::hover_listener(fade_key, owner))
+            })
             .text_size(px(10.5))
             .text_color(theme.text_muted)
             .on_click(move |_, window, cx| handler(ix, code_text.clone(), window, cx))

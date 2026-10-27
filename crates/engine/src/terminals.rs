@@ -32,18 +32,12 @@ const MAX_INPUT_BYTES: usize = 64 * 1024;
 const MAX_REPLAY_BYTES: usize = 1024 * 1024;
 const EXITED_TTL: Duration = Duration::from_secs(30 * 60);
 const REAPER_INTERVAL: Duration = Duration::from_secs(60);
-/// Bounded subscriber queue. A viewport that stops reading is disconnected
-/// instead of growing the engine's memory without limit.
-const SUBSCRIBER_QUEUE: usize = 256;
-/// Bounded raw-output queue between the blocking PTY reader and the batcher.
-/// Backpressure reaches the child process instead of buffering forever.
-const PTY_QUEUE: usize = 256;
 
 struct LiveTerminal {
     master: Box<dyn portable_pty::MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
-    subscribers: Vec<mpsc::Sender<TerminalEvent>>,
+    subscribers: Vec<mpsc::UnboundedSender<TerminalEvent>>,
     replay: VecDeque<TerminalEvent>,
     replay_bytes: usize,
     seq: u64,
@@ -71,10 +65,7 @@ impl LiveTerminal {
                 };
             }
         }
-        // `try_send`: a full queue means the subscriber stopped draining. Drop
-        // it (its stream ends) rather than buffer the terminal forever.
-        self.subscribers
-            .retain(|tx| tx.try_send(event.clone()).is_ok());
+        self.subscribers.retain(|tx| tx.send(event.clone()).is_ok());
         if matches!(event, TerminalEvent::Exit { .. }) {
             self.exited = true;
             self.subscribers.clear();
@@ -217,7 +208,7 @@ impl Terminals {
         lock(&self.inner.sessions).insert(id.clone(), session.clone());
 
         // Raw PTY bytes: blocking reader thread → batcher task (12ms windows).
-        let (raw_tx, raw_rx) = mpsc::channel::<Vec<u8>>(PTY_QUEUE);
+        let (raw_tx, raw_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         std::thread::Builder::new()
             .name(format!("pty-read-{id}"))
             .spawn(move || read_pty(reader, raw_tx))
@@ -245,20 +236,18 @@ impl Terminals {
         &self,
         terminal_id: &str,
         after_seq: Option<u64>,
-    ) -> Result<mpsc::Receiver<TerminalEvent>, EngineError> {
+    ) -> Result<mpsc::UnboundedReceiver<TerminalEvent>, EngineError> {
         let session = self.session(terminal_id)?;
         let mut session = lock(&session);
         session.last_active_at = std::time::Instant::now();
+        let (tx, rx) = mpsc::unbounded_channel();
         let after = after_seq.unwrap_or(0);
-        // Capacity covers the whole replay window plus a live tail, so the
-        // bounded queue is never smaller than the snapshot it must deliver.
-        let (tx, rx) = mpsc::channel(session.replay.len() + SUBSCRIBER_QUEUE);
         for event in &session.replay {
             let seq = match event {
                 TerminalEvent::Data { seq, .. } | TerminalEvent::Exit { seq, .. } => *seq,
             };
             if seq > after {
-                let _ = tx.try_send(event.clone());
+                let _ = tx.send(event.clone());
             }
         }
         if !session.exited {
@@ -340,15 +329,13 @@ fn dispose(session: &Arc<Mutex<LiveTerminal>>, kill: bool) {
 
 /// Blocking PTY reader: forwards raw chunks until EOF. A closed PTY reads as an
 /// error on some platforms (EIO on Linux once the shell exits) — both end the loop.
-fn read_pty(mut reader: Box<dyn Read + Send>, tx: mpsc::Sender<Vec<u8>>) {
+fn read_pty(mut reader: Box<dyn Read + Send>, tx: mpsc::UnboundedSender<Vec<u8>>) {
     let mut buf = [0u8; 8192];
     loop {
         match reader.read(&mut buf) {
             Ok(0) | Err(_) => break,
             Ok(n) => {
-                // Bounded: block the reader thread (and therefore the PTY)
-                // instead of growing an unbounded queue on a fast producer.
-                if tx.blocking_send(buf[..n].to_vec()).is_err() {
+                if tx.send(buf[..n].to_vec()).is_err() {
                     break;
                 }
             }
@@ -361,7 +348,7 @@ fn read_pty(mut reader: Box<dyn Read + Send>, tx: mpsc::Sender<Vec<u8>>) {
 /// a weak session handle so a closed terminal tears this task down.
 async fn pump_output(
     session: Weak<Mutex<LiveTerminal>>,
-    mut raw_rx: mpsc::Receiver<Vec<u8>>,
+    mut raw_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     wait: tokio::task::JoinHandle<Result<portable_pty::ExitStatus, std::io::Error>>,
 ) {
     let batch = Duration::from_millis(TERMINAL_OUTPUT_BATCH_MS);

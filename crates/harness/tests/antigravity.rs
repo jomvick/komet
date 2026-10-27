@@ -360,7 +360,7 @@ async fn antigravity_failed_probe_returns_err() {
 
 #[tokio::test]
 async fn commands_come_from_the_antigravity_catalog() {
-    let commands = harness().commands().await.expect("catalog");
+    let commands = harness().commands(None).await.expect("catalog");
     assert!(commands.iter().any(|c| c.name == "goal"));
     assert!(commands.iter().any(|c| c.name == "schedule"));
     assert!(commands.iter().any(|c| c.name == "learn"));

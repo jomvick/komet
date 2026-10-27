@@ -20,7 +20,7 @@
 //!   printing (or grandchildren inheriting the pipe) can't wedge us.
 //! - A hard per-attempt timeout kills the shell.
 //!
-//! Set `KOMET_NO_LOGIN_SHELL=1` (fallback `ZERON_NO_LOGIN_SHELL=1`) to disable the snapshot entirely.
+//! Set `KOMET_NO_LOGIN_SHELL=1` to disable the snapshot entirely.
 
 use std::ffi::{OsStr, OsString};
 use std::sync::OnceLock;
@@ -73,10 +73,7 @@ mod unix {
     const EXIT_FLUSH_GRACE: Duration = Duration::from_millis(250);
 
     pub(super) fn capture() -> Option<OsString> {
-        if std::env::var_os("KOMET_NO_LOGIN_SHELL")
-            .or_else(|| std::env::var_os("ZERON_NO_LOGIN_SHELL"))
-            .is_some_and(|v| !v.is_empty())
-        {
+        if std::env::var_os("KOMET_NO_LOGIN_SHELL").is_some_and(|v| !v.is_empty()) {
             return None;
         }
         let shell = user_shell()?;

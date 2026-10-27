@@ -408,7 +408,10 @@ impl Render for GitHistoryFetchButton {
             .when(!fetching, |element| {
                 element
                     .cursor_pointer()
-                    .on_hover(crate::motion::hover_listener("history-fetch-all"))
+                    .on_hover(crate::motion::hover_listener(
+                        "history-fetch-all",
+                        cx.entity_id(),
+                    ))
                     .on_click(move |_, _, cx| {
                         cx.stop_propagation();
                         history.update(cx, |history, cx| history.fetch_all(cx));

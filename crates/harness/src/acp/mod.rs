@@ -1,8 +1,10 @@
 //! ACP harness: spawns an Agent Client Protocol agent (JSON-RPC 2.0 over
 //! stdio, protocol v1) and maps its session updates onto [`AgentEvent`]s.
 //!
-//! KEPT ONLY for agents built ground-up on ACP: Grok ([`AcpHarness::grok`],
-//! `grok agent stdio`), Hermes ([`AcpHarness::hermes`], `hermes acp`),
+//! KEPT ONLY for agents built ground-up on ACP: Devin ([`AcpHarness::devin`],
+//! `devin acp`), GitHub Copilot ([`AcpHarness::copilot`], `copilot --acp`),
+//! Grok ([`AcpHarness::grok`], `grok agent stdio`), Hermes
+//! ([`AcpHarness::hermes`], `hermes acp`),
 //! opencode ([`AcpHarness::opencode`], `opencode acp`) and Cline
 //! ([`AcpHarness::cline`], `cline --acp`) — plus pi ([`AcpHarness::pi`])
 //! via the community `pi-acp` adapter until a native driver exists.
@@ -41,7 +43,7 @@ mod subagent;
 mod subagent_opencode;
 
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -55,9 +57,9 @@ use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
 use komet_proto::{
-    AgentEvent, DoneStatus, ErrorKind, HarnessId, Model, ModelOption, ModelOptionChoice,
-    ReasoningLevel, RunRequest, SandboxLevel, SlashCommand, SteeringMode, UserInputAnswer,
-    UserInputQuestion,
+    AgentEvent, CommandSource, DoneStatus, ErrorKind, HarnessId, Model, ModelOption,
+    ModelOptionChoice, ReasoningLevel, RunRequest, SandboxLevel, SlashCommand, SteeringMode,
+    UserInputAnswer, UserInputQuestion,
 };
 
 use crate::jsonrpc::{Incoming, RpcClient};
@@ -91,7 +93,6 @@ const OPENCODE_STARTUP_TIMEOUT_ENV: &str = "KOMET_OPENCODE_STARTUP_TIMEOUT_SECS"
 
 fn opencode_startup_timeout() -> Duration {
     std::env::var(OPENCODE_STARTUP_TIMEOUT_ENV)
-        .or_else(|_| std::env::var("ZERON_OPENCODE_STARTUP_TIMEOUT_SECS"))
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|seconds| *seconds > 0)
@@ -558,6 +559,105 @@ fn cline_install_paths() -> Vec<PathBuf> {
     dirs
 }
 
+fn devin_install_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        paths.push(home.join(".local").join("bin").join("devin"));
+    }
+    paths.push(PathBuf::from("/opt/homebrew/bin/devin"));
+    paths.push(PathBuf::from("/usr/local/bin/devin"));
+    paths
+}
+
+fn devin_spec() -> AcpAgentSpec {
+    AcpAgentSpec {
+        id: HarnessId::Devin,
+        display_name: "Devin",
+        executable: "devin",
+        env_override: "DEVIN_EXECUTABLE",
+        args: &["acp"],
+        npm_package: None,
+        extra_paths: devin_install_paths,
+        cli_executable: "devin",
+        cli_extra_paths: devin_install_paths,
+        install_hint: "devin (install with `curl -fsSL https://cli.devin.ai/install.sh | bash` \
+             or `brew install --cask devin-cli`, then run `devin auth login`; \
+             set DEVIN_EXECUTABLE to override)",
+        models: || {
+            vec![
+                Model {
+                    id: "swe-1-7-medium".into(),
+                    label: "SWE-1.7 Medium".into(),
+                    description: Some("Devin's default coding model".into()),
+                    reasoning_levels: Vec::new(),
+                    options: Vec::new(),
+                },
+                Model {
+                    id: "adaptive".into(),
+                    label: "Adaptive".into(),
+                    description: Some("Devin selects the model for each request".into()),
+                    reasoning_levels: Vec::new(),
+                    options: Vec::new(),
+                },
+            ]
+        },
+        steering_mode: SteeringMode::TurnBoundary,
+        reasoning_levels: &[],
+        prompt_transform: identity_transform,
+        effort_values: default_effort_values,
+        ladder_extras: &[],
+        prompt_complete_extension: false,
+        prompt_stall: Some(Duration::from_secs(60)),
+        stall_hint: "Check Devin CLI authentication with `devin auth login`.",
+        http_sidecar: false,
+    }
+}
+
+fn copilot_install_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        paths.push(home.join(".local").join("bin").join("copilot"));
+        paths.push(home.join(".npm-global").join("bin").join("copilot"));
+    }
+    paths.push(PathBuf::from("/opt/homebrew/bin/copilot"));
+    paths.push(PathBuf::from("/usr/local/bin/copilot"));
+    paths
+}
+
+fn copilot_spec() -> AcpAgentSpec {
+    AcpAgentSpec {
+        id: HarnessId::Copilot,
+        display_name: "GitHub Copilot",
+        executable: "copilot",
+        env_override: "COPILOT_EXECUTABLE",
+        args: &["--acp"],
+        npm_package: None,
+        extra_paths: copilot_install_paths,
+        cli_executable: "copilot",
+        cli_extra_paths: copilot_install_paths,
+        install_hint: "GitHub Copilot CLI (install from https://github.com/github/copilot-cli, \
+             then run `copilot login`; set COPILOT_EXECUTABLE to override)",
+        models: || {
+            vec![Model {
+                id: "auto".into(),
+                label: "Copilot Auto".into(),
+                description: Some("Let GitHub Copilot choose the model".into()),
+                reasoning_levels: Vec::new(),
+                options: Vec::new(),
+            }]
+        },
+        steering_mode: SteeringMode::TurnBoundary,
+        reasoning_levels: &[],
+        prompt_transform: identity_transform,
+        effort_values: default_effort_values,
+        ladder_extras: &[],
+        prompt_complete_extension: false,
+        prompt_stall: Some(Duration::from_secs(60)),
+        stall_hint: "Check Copilot CLI authentication with `copilot login`.",
+        http_sidecar: false,
+    }
+}
+
 fn cline_spec() -> AcpAgentSpec {
     AcpAgentSpec {
         id: HarnessId::Cline,
@@ -797,8 +897,10 @@ pub struct AcpHarness {
     /// picker. OpenCode shares this with its real startup budget because both
     /// paths wait for the same plugin-heavy boot.
     model_discovery_timeout: Duration,
-    /// Discovery result cache: the advertised commands survive across calls.
-    commands: tokio::sync::OnceCell<Vec<SlashCommand>>,
+    /// Discovery result cache, keyed by the probe cwd. Each entry carries the
+    /// buster (newest mtime of the command/skill dirs) it was discovered
+    /// under, so a CLI-side change re-probes instead of serving the old list.
+    commands: tokio::sync::Mutex<std::collections::HashMap<String, (u128, Vec<SlashCommand>)>>,
     /// Model discovery cache: a successful, non-empty probe is reused while
     /// fresh AND the buster still matches, so a CLI-side change (Cline
     /// model/account switch) invalidates the list instead of serving it for
@@ -818,6 +920,16 @@ pub struct AcpHarness {
 }
 
 impl AcpHarness {
+    /// Devin's native ACP server (`devin acp`).
+    pub fn devin() -> Self {
+        Self::with_spec(devin_spec())
+    }
+
+    /// GitHub Copilot CLI's official ACP server (`copilot --acp`).
+    pub fn copilot() -> Self {
+        Self::with_spec(copilot_spec())
+    }
+
     fn with_spec(spec: AcpAgentSpec) -> Self {
         Self {
             spec,
@@ -830,7 +942,7 @@ impl AcpHarness {
             // wedged agent, not a slow one.
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             model_discovery_timeout: DEFAULT_MODEL_DISCOVERY_TIMEOUT,
-            commands: tokio::sync::OnceCell::new(),
+            commands: tokio::sync::Mutex::new(std::collections::HashMap::new()),
             models_cache: tokio::sync::Mutex::new(None),
             models_probe: tokio::sync::Mutex::new(()),
             cli_sync: true,
@@ -1089,7 +1201,7 @@ impl AcpHarness {
     /// briefly for `available_commands_update`. Best-effort — an agent that
     /// refuses sessions before login still surfaces whatever the handshake
     /// advertised.
-    async fn discover_commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
+    async fn discover_commands(&self, cwd: &Path) -> Result<Vec<SlashCommand>, HarnessError> {
         let (mut child, _stderr) = self.spawn_agent(None, false, None, &[], None, None).await?;
         let (client, mut incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
@@ -1104,7 +1216,7 @@ impl AcpHarness {
                 .await?;
             let mut commands = scan_available_commands(&init);
             if commands.is_empty() {
-                let cwd = std::env::var("HOME").unwrap_or_else(|_| "/".into());
+                let cwd = cwd.to_string_lossy();
                 let session = client
                     .request("session/new", build_acp_session_params(&cwd, None, vec![]))
                     .await;
@@ -1138,13 +1250,12 @@ impl AcpHarness {
                     }
                 }
             }
-            let mut all_commands = static_commands(self.spec.id);
-            for cmd in commands {
-                if !all_commands.iter().any(|c| c.name == cmd.name) {
-                    all_commands.push(cmd);
-                }
-            }
-            Ok::<Vec<SlashCommand>, HarnessError>(all_commands)
+            // An empty live response is meaningful: this CLI currently
+            // advertises no prompt commands.  Do not append the curated TUI
+            // catalog here; doing so made the composer show commands that the
+            // current agent could not execute (issue #27).  The caller keeps
+            // the static list only for a genuine probe failure below.
+            Ok::<Vec<SlashCommand>, HarnessError>(commands)
         };
         let result = tokio::time::timeout(Duration::from_secs(10), discovery).await;
         shutdown_child(&mut child, self.kill_grace).await;
@@ -1551,6 +1662,8 @@ fn cmd(name: &str, description: &str, hint: Option<&str>) -> SlashCommand {
         name: name.into(),
         description: description.into(),
         input_hint: hint.map(str::to_owned),
+        source: CommandSource::Fallback,
+        ..SlashCommand::default()
     }
 }
 
@@ -1780,16 +1893,47 @@ impl Harness for AcpHarness {
         }
     }
 
-    async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
+    async fn refresh_models(&self) -> Result<Vec<Model>, HarnessError> {
+        let _probe = self.models_probe.lock().await;
+        self.resolve_launch()?;
+        let models = self.discover_models().await?;
+        if models.is_empty() {
+            return Err(HarnessError::Protocol(format!(
+                "{} model discovery returned no usable models — {}",
+                self.spec.display_name, self.spec.install_hint
+            )));
+        }
+        let buster = acp_model_cache_buster_in(self.spec.id, self.cline_data_dir.as_ref());
+        *self.models_cache.lock().await = Some(ModelCacheEntry {
+            buster,
+            at: std::time::Instant::now(),
+            models: models.clone(),
+        });
+        Ok(models)
+    }
+
+    async fn commands(&self, cwd: Option<&Path>) -> Result<Vec<SlashCommand>, HarnessError> {
+        let cwd = crate::discovery_cwd(cwd);
+        let key = cwd.to_string_lossy().into_owned();
+        let buster = crate::commands_buster(&cwd, self.spec.id);
+        if let Some((stored, commands)) = self.commands.lock().await.get(&key)
+            && *stored == buster
+        {
+            return Ok(commands.clone());
+        }
+        let commands = match self.discover_commands(&cwd).await {
+            // A failure is NOT cached: the next open retries the live probe.
+            Err(error) => {
+                tracing::debug!(harness = ?self.spec.id, %error, "live command discovery failed; using fallback catalog");
+                return Ok(static_commands(self.spec.id));
+            }
+            Ok(commands) => commands,
+        };
         self.commands
-            .get_or_try_init(|| async {
-                match self.discover_commands().await {
-                    Ok(commands) if !commands.is_empty() => Ok(commands),
-                    _ => Ok(static_commands(self.spec.id)),
-                }
-            })
+            .lock()
             .await
-            .cloned()
+            .insert(key, (buster, commands.clone()));
+        Ok(commands)
     }
 
     async fn context_usage(&self) -> Result<komet_proto::ContextUsage, HarnessError> {
@@ -2197,17 +2341,18 @@ fn first_class_model_change(
         Some(requested.to_owned())
     } else if let Some(fuzzy) = pick_model_value(requested, &available, false) {
         Some(fuzzy)
-    } else if let Some(stripped_match) = available.iter().find(|m| {
-        let m_unprefixed = m.split_once(':').map(|(_, s)| s).unwrap_or(m);
-        m_unprefixed == requested
-            || m_unprefixed.rsplit('/').next() == Some(requested)
-            || requested.rsplit('/').next() == Some(m_unprefixed)
-            || m.contains(requested)
-            || requested.contains(*m)
-    }) {
-        Some((*stripped_match).to_owned())
     } else {
-        None
+        available
+            .iter()
+            .find(|m| {
+                let m_unprefixed = m.split_once(':').map(|(_, s)| s).unwrap_or(m);
+                m_unprefixed == requested
+                    || m_unprefixed.rsplit('/').next() == Some(requested)
+                    || requested.rsplit('/').next() == Some(m_unprefixed)
+                    || m.contains(requested)
+                    || requested.contains(*m)
+            })
+            .map(|stripped_match| (*stripped_match).to_owned())
     };
 
     let Some(target) = resolved else {
@@ -3245,6 +3390,40 @@ async fn request_draining(
     res
 }
 
+/// opencode's cold start rejects `session/new` with -32603 while its model
+/// catalog warms up (`/api/model` still 503s); the same call succeeds a few
+/// seconds later. Retry only that signature — a real protocol error must not
+/// be replayed.
+const SESSION_NEW_RETRIES: usize = 2;
+const SESSION_NEW_RETRY_DELAY: Duration = Duration::from_secs(3);
+
+fn session_new_not_ready(error: &HarnessError) -> bool {
+    let text = error.to_string().to_lowercase();
+    text.contains("-32603")
+        && (text.contains("serviceunavailable") || text.contains("service unavailable"))
+}
+
+async fn session_new_with_retry(
+    client: &RpcClient,
+    incoming: &mut mpsc::Receiver<Incoming>,
+    params: Value,
+) -> Result<Value, HarnessError> {
+    let mut attempt = 0;
+    loop {
+        match request_draining(client, incoming, "session/new", params.clone()).await {
+            Err(e) if attempt < SESSION_NEW_RETRIES && session_new_not_ready(&e) => {
+                attempt += 1;
+                tracing::debug!(
+                    target: "komet_harness::acp",
+                    "session/new not ready yet (attempt {attempt}), retrying: {e}"
+                );
+                tokio::time::sleep(SESSION_NEW_RETRY_DELAY).await;
+            }
+            res => return res,
+        }
+    }
+}
+
 fn prompt_like_request(
     client: RpcClient,
     method: &'static str,
@@ -3350,13 +3529,9 @@ async fn run_session(session: Session) {
                         target: "komet_harness::acp",
                         "session/load failed (starting fresh): {e}"
                     );
-                    let new = request_draining(
-                        &client,
-                        &mut incoming,
-                        "session/new",
-                        session_params.clone(),
-                    )
-                    .await?;
+                    let new =
+                        session_new_with_retry(&client, &mut incoming, session_params.clone())
+                            .await?;
                     (
                         new.get("sessionId")
                             .and_then(Value::as_str)
@@ -3367,8 +3542,7 @@ async fn run_session(session: Session) {
                 }
             }
         } else {
-            let new =
-                request_draining(&client, &mut incoming, "session/new", session_params).await?;
+            let new = session_new_with_retry(&client, &mut incoming, session_params).await?;
             (
                 new.get("sessionId")
                     .and_then(Value::as_str)
@@ -3693,9 +3867,8 @@ async fn run_session(session: Session) {
     let mut prompt_seq: u64 = 1;
     let mut current_prompt_id = prompt_complete_extension.then(|| format!("komet-p{prompt_seq}"));
     let mut completed_prompts: VecDeque<String> = VecDeque::new();
-    // `KOMET_ACP_PROMPT_STALL_MS` (fallback `ZERON_ACP_PROMPT_STALL_MS`) overrides the spec's bound; 0 disables.
+    // `KOMET_ACP_PROMPT_STALL_MS` overrides the spec's bound; 0 disables.
     let prompt_stall: Option<Duration> = match std::env::var("KOMET_ACP_PROMPT_STALL_MS")
-        .or_else(|_| std::env::var("ZERON_ACP_PROMPT_STALL_MS"))
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
     {
@@ -3756,9 +3929,8 @@ async fn run_session(session: Session) {
     // Done ever comes, and the session strands Working until the engine's
     // quiesce watchdog parks it.
     //
-    // `KOMET_ACP_QUIET_SETTLE_MS` (fallback `ZERON_ACP_QUIET_SETTLE_MS`) overrides; 0 disables.
+    // `KOMET_ACP_QUIET_SETTLE_MS` overrides; 0 disables.
     let quiet_settle: Option<Duration> = match std::env::var("KOMET_ACP_QUIET_SETTLE_MS")
-        .or_else(|_| std::env::var("ZERON_ACP_QUIET_SETTLE_MS"))
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
     {

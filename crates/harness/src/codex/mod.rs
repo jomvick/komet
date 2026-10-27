@@ -41,7 +41,7 @@ mod normalize;
 pub(crate) mod permissions;
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Duration;
@@ -55,8 +55,8 @@ use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 
 use komet_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SlashCommand,
-    SteeringMode, UserInputAnswer, UserInputQuestion,
+    AgentEvent, CommandSource, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest,
+    SlashCommand, SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
 use crate::jsonrpc::{Incoming, RpcClient};
@@ -118,11 +118,13 @@ pub struct CodexHarness {
     interrupt_grace: Duration,
     /// Grace between SIGTERM and SIGKILL.
     kill_grace: Duration,
-    /// Command discovery cache: only a successful probe is cached, so a
-    /// broken CLI retries on the next picker open (ACP-harness parity).
-    commands: tokio::sync::OnceCell<Vec<SlashCommand>>,
+    /// Command discovery cache keyed by probe cwd; the stored buster
+    /// invalidates it when the CLI's skill dirs change.
+    commands: tokio::sync::Mutex<HashMap<String, (u128, Vec<SlashCommand>)>>,
     /// Model discovery cache: live app-server model/list cached on success.
-    models: tokio::sync::OnceCell<Vec<Model>>,
+    models: tokio::sync::Mutex<Option<Vec<Model>>>,
+    /// Single-flight for normal and forced model discovery.
+    models_probe: tokio::sync::Mutex<()>,
 }
 
 impl Default for CodexHarness {
@@ -131,8 +133,9 @@ impl Default for CodexHarness {
             executable: None,
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
-            commands: tokio::sync::OnceCell::new(),
-            models: tokio::sync::OnceCell::new(),
+            commands: tokio::sync::Mutex::new(HashMap::new()),
+            models: tokio::sync::Mutex::new(None),
+            models_probe: tokio::sync::Mutex::new(()),
         }
     }
 }
@@ -175,7 +178,7 @@ impl CodexHarness {
     /// (custom `~/.codex/prompts` are NOT exposed; the TUI-only built-ins
     /// aren't either). Skills are what the codex TUI itself surfaces as
     /// slash-invocables, listed per-cwd and deduped by name here.
-    async fn discover_commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
+    async fn discover_commands(&self, cwd: &Path) -> Result<Vec<SlashCommand>, HarnessError> {
         let exe = self.resolve_executable()?;
         let mut cmd = Command::new(&exe);
         cmd.arg("app-server");
@@ -214,16 +217,13 @@ impl CodexHarness {
                 .await?;
             client.notify("initialized", None);
             let skills = client
-                .request("skills/list", json!({}))
+                .request("skills/list", json!({ "cwds": [cwd.to_string_lossy()] }))
                 .await
                 .unwrap_or(Value::Null);
-            let mut commands = catalog::static_commands();
-            let discovered = parse_skill_commands(&skills);
-            for cmd in discovered {
-                if !commands.iter().any(|c| c.name == cmd.name) {
-                    commands.push(cmd);
-                }
-            }
+            // `skills/list` is the live source for this CLI.  Do not add the
+            // curated TUI catalog: a command absent from the current Codex
+            // process must not be presented as executable (issue #27).
+            let commands = parse_skill_commands(&skills);
             Ok::<Vec<SlashCommand>, HarnessError>(commands)
         };
         let result = tokio::time::timeout(Duration::from_secs(10), discovery).await;
@@ -356,10 +356,35 @@ fn parse_skill_commands(result: &Value) -> Vec<SlashCommand> {
                 name: name.to_owned(),
                 description: description.to_owned(),
                 input_hint: None,
+                source: CommandSource::Skill,
+                ..SlashCommand::default()
             });
         }
     }
     commands
+}
+
+impl CodexHarness {
+    async fn discover_and_cache_models(&self) -> Result<Vec<Model>, HarnessError> {
+        let models = self.discover_live_models().await.inspect_err(|e| {
+            tracing::warn!(
+                target: "komet_harness::codex",
+                "Codex live model discovery failed: {e}"
+            );
+        })?;
+        if models.is_empty() {
+            return Err(HarnessError::Protocol(
+                "codex model/list returned no usable models".into(),
+            ));
+        }
+        tracing::info!(
+            target: "komet_harness::codex",
+            count = models.len(),
+            "discovered live Codex models from app-server"
+        );
+        *self.models.lock().await = Some(models.clone());
+        Ok(models)
+    }
 }
 
 #[async_trait]
@@ -368,7 +393,7 @@ impl Harness for CodexHarness {
         HarnessId::Codex
     }
     fn display_name(&self) -> &str {
-        // "Codex" (not "Codex CLI") — comet composer/defaults.ts
+        // "Codex" (not "Codex CLI") — komet composer/defaults.ts
         // HARNESS_LABEL; must also match the registry's lazy descriptor so
         // the catalog entry doesn't change after the first resolve.
         "Codex"
@@ -395,33 +420,21 @@ impl Harness for CodexHarness {
     /// Model discovery: live `codex app-server` `model/list` only — no
     /// static fallback, so the picker only shows models the CLI offers.
     /// Requires an installed CLI so an absent binary surfaces as [`HarnessError::NotInstalled`].
-    /// A failed probe is UNCACHED (`OnceCell` stores successes only) so the
-    /// next picker open retries. Concurrent calls share one probe:
-    /// `OnceCell` single-flights the initializer.
+    /// A failed probe is uncached so the next picker open retries. Concurrent
+    /// calls share one probe.
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
         self.resolve_executable()?;
-        self.models
-            .get_or_try_init(|| async {
-                let models = self.discover_live_models().await.inspect_err(|e| {
-                    tracing::warn!(
-                        target: "komet_harness::codex",
-                        "Codex live model discovery failed: {e}"
-                    );
-                })?;
-                if models.is_empty() {
-                    return Err(HarnessError::Protocol(
-                        "codex model/list returned no usable models".into(),
-                    ));
-                }
-                tracing::info!(
-                    target: "komet_harness::codex",
-                    count = models.len(),
-                    "discovered live Codex models from app-server"
-                );
-                Ok(models)
-            })
-            .await
-            .cloned()
+        let _probe = self.models_probe.lock().await;
+        if let Some(models) = self.models.lock().await.as_ref() {
+            return Ok(models.clone());
+        }
+        self.discover_and_cache_models().await
+    }
+
+    async fn refresh_models(&self) -> Result<Vec<Model>, HarnessError> {
+        self.resolve_executable()?;
+        let _probe = self.models_probe.lock().await;
+        self.discover_and_cache_models().await
     }
 
     /// Curated catalog, shown only until the first live probe succeeds (see
@@ -431,17 +444,22 @@ impl Harness for CodexHarness {
     }
 
     /// Skills from a short-lived `skills/list` probe (see
-    /// [`Self::discover_commands`]); cached on success.
-    async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
+    /// [`Self::discover_commands`]); cached on success per cwd + buster.
+    async fn commands(&self, cwd: Option<&Path>) -> Result<Vec<SlashCommand>, HarnessError> {
+        let cwd = crate::discovery_cwd(cwd);
+        let key = cwd.to_string_lossy().into_owned();
+        let buster = crate::commands_buster(&cwd, HarnessId::Codex);
+        if let Some((stored, commands)) = self.commands.lock().await.get(&key)
+            && *stored == buster
+        {
+            return Ok(commands.clone());
+        }
+        let commands = self.discover_commands(&cwd).await?;
         self.commands
-            .get_or_try_init(|| async {
-                match self.discover_commands().await {
-                    Ok(commands) => Ok(commands),
-                    Err(_) => Ok(catalog::static_commands()),
-                }
-            })
+            .lock()
             .await
-            .cloned()
+            .insert(key, (buster, commands.clone()));
+        Ok(commands)
     }
 
     async fn context_usage(&self) -> Result<komet_proto::ContextUsage, HarnessError> {

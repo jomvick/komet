@@ -198,15 +198,10 @@ async fn live_engine_scope(ipc_port: u16) -> Option<WorkspaceScope> {
     let client = komet_rpc::connect_ws(&format!("ws://127.0.0.1:{ipc_port}"), &token)
         .await
         .ok()?;
-    // Bounded: `komet status` is what one runs when the engine is wedged, so it
-    // must fall back to the next-boot scope instead of waiting forever.
-    let value = crate::ipc_call(
-        &client,
-        komet_rpc::methods::ENGINE_INFO,
-        serde_json::json!({}),
-    )
-    .await
-    .ok()?;
+    let value = client
+        .call(komet_rpc::methods::ENGINE_INFO, serde_json::json!({}))
+        .await
+        .ok()?;
     serde_json::from_value::<komet_engine::EngineInfo>(value)
         .ok()
         .map(|info| info.workspace_scope)

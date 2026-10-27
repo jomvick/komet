@@ -11,15 +11,15 @@
 
 use chrono::{DateTime, Utc};
 use gpui::{
-    AnyElement, Context, Entity, Hsla, SharedString, Subscription, Task, Window, div, prelude::*,
-    px,
+    AnyElement, ClipboardItem, Context, Entity, EventEmitter, Hsla, ScrollHandle, SharedString,
+    Subscription, Task, Window, div, prelude::*, px,
 };
 use std::time::Duration;
 
 use komet_engine::UsageMode;
 use komet_proto::{
     AgentAccount, AgentAccountsSnapshot, AgentLoginMode, AgentLoginPoll, AgentLoginStart,
-    AgentLoginStatus, HarnessId,
+    AgentLoginStatus, AgentUsageWindow, HarnessId,
 };
 use komet_rpc::methods;
 
@@ -132,15 +132,69 @@ pub fn format_reset(resets_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Opt
     })
 }
 
-/// The provider cards, in display order: (harness, name, CLI command — named
-/// in the empty-state copy, komet settings.agents.tsx `PROVIDERS`).
-pub const PROVIDERS: [(HarnessId, &str, &str); 4] = [
+/// Agents whose CLI login or provider credentials are required before runs.
+/// The first four have native account management; the rest authenticate in
+/// their own CLI and are listed here with the corresponding hand-off command.
+pub const PROVIDERS: [(HarnessId, &str, &str); 12] = [
     (HarnessId::ClaudeCode, "Claude Code", "claude"),
     (HarnessId::Codex, "Codex", "codex"),
     (HarnessId::Antigravity, "Antigravity", "agy"),
-    (HarnessId::Cursor, "Cursor", "cursor.com"),
+    (HarnessId::Cursor, "Cursor", "cursor-agent"),
+    (HarnessId::Devin, "Devin", "devin"),
+    (HarnessId::Grok, "Grok", "grok"),
+    (HarnessId::Hermes, "Hermes", "hermes"),
+    (HarnessId::Opencode, "OpenCode", "opencode"),
+    (HarnessId::Pi, "Pi", "pi"),
+    (HarnessId::Muse, "Muse", "muse"),
+    (HarnessId::Copilot, "GitHub Copilot", "copilot"),
+    (HarnessId::Cline, "Cline", "cline"),
 ];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountsEvent {
+    FocusProvider(HarnessId),
+}
+
+impl EventEmitter<AccountsEvent> for AccountsPage {}
+
+pub fn requires_login(harness: HarnessId) -> bool {
+    PROVIDERS
+        .iter()
+        .any(|(provider, _, _)| *provider == harness)
+}
+
+pub fn cli_login_command(harness: HarnessId) -> Option<&'static str> {
+    match harness {
+        HarnessId::Devin => Some("devin auth login"),
+        HarnessId::Grok => Some("grok"),
+        HarnessId::Hermes => Some("hermes"),
+        HarnessId::Opencode => Some("opencode auth login"),
+        HarnessId::Pi => Some("pi"),
+        HarnessId::Muse => Some("muse"),
+        HarnessId::Copilot => Some("copilot login"),
+        HarnessId::Cline => Some("cline"),
+        HarnessId::ClaudeCode | HarnessId::Codex | HarnessId::Cursor | HarnessId::Antigravity => {
+            None
+        }
+        HarnessId::Mock => None,
+    }
+}
+
+pub fn login_instructions(harness: HarnessId) -> &'static str {
+    match harness {
+        HarnessId::Devin => {
+            "Run `devin auth login` in a terminal and complete the browser sign-in."
+        }
+        HarnessId::Grok => "Run `grok` and sign in when prompted.",
+        HarnessId::Hermes => "Run `hermes` and configure/sign in to a model provider.",
+        HarnessId::Opencode => "Run `opencode auth login` and choose your model provider.",
+        HarnessId::Pi => "Run `pi` and use `/login` to connect a model provider.",
+        HarnessId::Muse => "Run `muse` and use `/login` to connect your account.",
+        HarnessId::Copilot => "Run `copilot login` and authorize GitHub in your browser.",
+        HarnessId::Cline => "Run `cline` and choose a provider in its sign-in flow.",
+        _ => "Use the Add account flow to sign in.",
+    }
+}
 /// Accounts of one provider, active first (stable otherwise). Pure.
 pub fn provider_accounts(
     snapshot: &AgentAccountsSnapshot,
@@ -153,6 +207,43 @@ pub fn provider_accounts(
         .collect();
     accounts.sort_by_key(|a| !a.active);
     accounts
+}
+
+/// Only the selected account's quota is meaningful for the live CLI session.
+fn displayed_usage(account: &AgentAccount) -> Option<&[AgentUsageWindow]> {
+    account.active.then_some(account.usage_windows.as_slice())
+}
+
+fn retain_previous_usage(
+    snapshot: &mut AgentAccountsSnapshot,
+    previous: Option<&AgentAccountsSnapshot>,
+) {
+    let Some(previous) = previous else { return };
+    for account in &mut snapshot.accounts {
+        if account.usage_windows.is_empty()
+            && let Some(old) = previous
+                .accounts
+                .iter()
+                .find(|old| old.id == account.id && !old.usage_windows.is_empty())
+        {
+            account.usage_windows = old.usage_windows.clone();
+        }
+    }
+}
+
+fn select_active_account(snapshot: &mut AgentAccountsSnapshot, harness: HarnessId, id: &str) {
+    if !snapshot
+        .accounts
+        .iter()
+        .any(|account| account.harness == harness && account.id == id)
+    {
+        return;
+    }
+    for account in &mut snapshot.accounts {
+        if account.harness == harness {
+            account.active = account.id == id;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -190,6 +281,9 @@ impl LoginFlow {
             HarnessId::Codex => "Add Codex account",
             HarnessId::Antigravity => "Add Antigravity account",
             HarnessId::Cursor => "Add Cursor account",
+            HarnessId::Devin => "Add Devin account",
+            HarnessId::Muse => "Add Muse account",
+            HarnessId::Copilot => "Add Copilot account",
             _ => "Add Claude account",
         }
     }
@@ -228,8 +322,13 @@ pub struct AccountsPage {
     busy_account: Option<String>,
     login: Option<LoginFlow>,
     error: Option<SharedString>,
+    focused_harness: Option<HarnessId>,
+    scroll_target_pending: bool,
+    copied_login_command: Option<HarnessId>,
+    page_scroll: ScrollHandle,
     code_input: Entity<ComposerInput>,
     load_task: Option<Task<()>>,
+    load_generation: u64,
     action_task: Option<Task<()>>,
     poll_task: Option<Task<()>>,
     _observe: Subscription,
@@ -254,8 +353,13 @@ impl AccountsPage {
             busy_account: None,
             login: None,
             error: None,
+            focused_harness: None,
+            scroll_target_pending: false,
+            copied_login_command: None,
+            page_scroll: ScrollHandle::new(),
             code_input,
             load_task: None,
+            load_generation: 0,
             action_task: None,
             poll_task: None,
             _observe: observe,
@@ -268,6 +372,20 @@ impl AccountsPage {
         // "Usage unavailable" is reserved for a probe that genuinely failed.
         page.load(usage_mode_for(LoadTrigger::Mount), cx);
         page
+    }
+
+    pub fn focus_harness(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
+        self.focused_harness = Some(harness);
+        self.scroll_target_pending = true;
+        cx.notify();
+    }
+
+    fn copy_login_command(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
+        if let Some(command) = cli_login_command(harness) {
+            cx.write_to_clipboard(ClipboardItem::new_string(command.to_string()));
+            self.copied_login_command = Some(harness);
+            cx.notify();
+        }
     }
 
     /// Retarget the page at another device's logins: every accounts RPC is
@@ -423,40 +541,45 @@ impl AccountsPage {
                     let name: SharedString = d.name.clone().into();
                     let pick_local = is_local;
                     let pick_id = d.id.clone();
-                    popover::menu_row(theme, is_active, format!("accounts-device-row-{ix}"))
-                        .id(("accounts-device-row", ix))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            // Local device = no passthrough (calls stay direct).
-                            let target = (!pick_local).then(|| pick_id.clone());
-                            this.set_target_device(target, cx);
-                        }))
-                        .child(
-                            icon(glyph)
-                                .size(px(16.0))
-                                .flex_none()
-                                .text_color(theme.text_muted),
-                        )
-                        .child(div().flex_1().min_w_0().truncate().child(name))
-                        .when(is_local, |el| {
-                            el.child(
-                                div()
-                                    .flex_none()
-                                    .text_size(px(10.5))
-                                    .text_color(theme.text_muted.opacity(0.35))
-                                    .child(SharedString::from("You")),
-                            )
-                        })
-                        .child(
+                    popover::menu_row(
+                        theme,
+                        is_active,
+                        format!("accounts-device-row-{ix}"),
+                        cx.entity_id(),
+                    )
+                    .id(("accounts-device-row", ix))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        // Local device = no passthrough (calls stay direct).
+                        let target = (!pick_local).then(|| pick_id.clone());
+                        this.set_target_device(target, cx);
+                    }))
+                    .child(
+                        icon(glyph)
+                            .size(px(16.0))
+                            .flex_none()
+                            .text_color(theme.text_muted),
+                    )
+                    .child(div().flex_1().min_w_0().truncate().child(name))
+                    .when(is_local, |el| {
+                        el.child(
                             div()
-                                .size(px(6.0))
-                                .rounded_full()
                                 .flex_none()
-                                .bg(if is_local {
-                                    emerald
-                                } else {
-                                    crate::theme::ink(0.2)
-                                }),
+                                .text_size(px(10.5))
+                                .text_color(theme.text_muted.opacity(0.35))
+                                .child(SharedString::from("You")),
                         )
+                    })
+                    .child(
+                        div()
+                            .size(px(6.0))
+                            .rounded_full()
+                            .flex_none()
+                            .bg(if is_local {
+                                emerald
+                            } else {
+                                crate::theme::ink(0.2)
+                            }),
+                    )
                 }))
                 .into_any_element();
             trigger = trigger.child(popover::anchored_menu(
@@ -469,8 +592,16 @@ impl AccountsPage {
     }
 
     fn load(&mut self, mode: UsageMode, cx: &mut Context<Self>) {
+        self.load_generation = self.load_generation.wrapping_add(1);
+        let generation = self.load_generation;
         let Some(engine) = self.state.read(cx).engine().cloned() else {
-            self.snapshot = Loadable::Error("Engine not connected".into());
+            self.refreshing = false;
+            if matches!(self.snapshot, Loadable::Ready(_)) {
+                self.error = Some("Usage refresh failed: engine not connected".into());
+            } else {
+                self.snapshot = Loadable::Error("Engine not connected".into());
+            }
+            cx.notify();
             return;
         };
         // Only the first load has nothing to show yet; afterwards the previous
@@ -489,39 +620,28 @@ impl AccountsPage {
                 .call(methods::LIST_AGENT_ACCOUNTS, params)
                 .await;
             this.update(cx, |page, cx| {
+                if page.load_generation != generation {
+                    return;
+                }
                 page.refreshing = false;
-                page.snapshot = match result {
-                    Ok(value) => match serde_json::from_value::<AgentAccountsSnapshot>(value) {
-                        Ok(mut snapshot) => {
-                            // Merge: a cached/offline re-list can return empty
-                            // `usage_windows` for an account whose cache entry
-                            // expired or was never warmed. Overwriting wholesale
-                            // made gauges flicker to "Usage unavailable" after
-                            // every Switch/Forget/watch frame — keep the
-                            // previous windows when the fresh ones are empty.
-                            // `page.snapshot` still holds the rendered snapshot
-                            // here, so this now actually fires.
-                            if let Some(prev) = page.snapshot.ready() {
-                                let prev = prev.clone();
-                                for account in &mut snapshot.accounts {
-                                    if !account.usage_windows.is_empty() {
-                                        continue;
-                                    }
-                                    if let Some(old) = prev
-                                        .accounts
-                                        .iter()
-                                        .find(|a| a.id == account.id)
-                                        .filter(|a| !a.usage_windows.is_empty())
-                                    {
-                                        account.usage_windows = old.usage_windows.clone();
-                                    }
-                                }
-                            }
-                            Loadable::Ready(snapshot)
-                        }
-                        Err(err) => Loadable::Error(err.to_string()),
-                    },
-                    Err(err) => Loadable::Error(err.to_string()),
+                let previous = page.snapshot.ready().cloned();
+                let parsed = result.map_err(|err| err.to_string()).and_then(|value| {
+                    serde_json::from_value::<AgentAccountsSnapshot>(value)
+                        .map_err(|err| err.to_string())
+                });
+                page.snapshot = match parsed {
+                    Ok(mut snapshot) => {
+                        retain_previous_usage(&mut snapshot, previous.as_ref());
+                        page.error = None;
+                        Loadable::Ready(snapshot)
+                    }
+                    Err(message) if previous.is_some() => {
+                        // Keep the last successful account and quota snapshot
+                        // visible when a background refresh fails transiently.
+                        page.error = Some(format!("Usage refresh failed: {message}").into());
+                        Loadable::Ready(previous.expect("checked above"))
+                    }
+                    Err(message) => Loadable::Error(message),
                 };
                 cx.notify();
             })
@@ -553,6 +673,9 @@ impl AccountsPage {
             "accountId": account.id,
             "harness": account.harness,
         }));
+        let account_id = account.id.clone();
+        let account_harness = account.harness;
+        let is_switch = method == methods::ACTIVATE_AGENT_ACCOUNT;
         tracing::debug!(method, account = %account.id, "account_action dispatching");
         self.action_task = Some(cx.spawn(async move |this, cx| {
             let result = engine.client().call(method, params).await;
@@ -564,7 +687,12 @@ impl AccountsPage {
             this.update(cx, |page, cx| {
                 page.busy_account = None;
                 match result {
-                    Ok(_) => page.load(usage_mode_for(LoadTrigger::PostAction), cx),
+                    Ok(_) => {
+                        if is_switch && let Loadable::Ready(snapshot) = &mut page.snapshot {
+                            select_active_account(snapshot, account_harness, &account_id);
+                        }
+                        page.load(usage_mode_for(LoadTrigger::PostAction), cx);
+                    }
                     Err(err) => page.error = Some(format!("{err}").into()),
                 }
                 cx.notify();
@@ -1021,40 +1149,43 @@ impl AccountsPage {
                     .map(|el| {
                         // Meters XOR the quiet fallback line — never both
                         // (komet: `usage ? meters : "Usage unavailable"…`).
-                        if account.usage_windows.is_empty() {
-                            el.child(
-                                div()
-                                    .mt(px(6.0))
-                                    .truncate()
-                                    .text_size(px(11.5))
-                                    .text_color(theme.text_muted.opacity(0.6))
-                                    .child(SharedString::from(if account.switchable {
-                                        // Cursor is probed too (its usage DB is
-                                        // read for the ACTIVE login only), so an
-                                        // empty reading here is a real miss, not
-                                        // a coverage gap. "Credentials
-                                        // unavailable" stays reserved for a
-                                        // live login we could not read.
-                                        "Usage unavailable"
-                                    } else {
-                                        "Credentials unavailable"
-                                    })),
-                            )
+                        if let Some(usage_windows) = displayed_usage(account) {
+                            if usage_windows.is_empty() {
+                                el.child(
+                                    div()
+                                        .mt(px(6.0))
+                                        .truncate()
+                                        .text_size(px(11.5))
+                                        .text_color(theme.text_muted.opacity(0.6))
+                                        .child(SharedString::from(if account.switchable {
+                                            // Cursor is probed too (its usage DB is
+                                            // read for the ACTIVE login only), so an
+                                            // empty reading here is a real miss, not
+                                            // a coverage gap. "Credentials
+                                            // unavailable" stays reserved for a
+                                            // live login we could not read.
+                                            "Usage unavailable"
+                                        } else {
+                                            "Credentials unavailable"
+                                        })),
+                                )
+                            } else {
+                                el.child(
+                                    div()
+                                        .mt(px(6.0))
+                                        .w_full()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(4.0))
+                                        .children(
+                                            usage_windows
+                                                .iter()
+                                                .map(|w| self.render_usage_meter(w, theme, now)),
+                                        ),
+                                )
+                            }
                         } else {
-                            el.child(
-                                div()
-                                    .mt(px(6.0))
-                                    .w_full()
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(4.0))
-                                    .children(
-                                        account
-                                            .usage_windows
-                                            .iter()
-                                            .map(|w| self.render_usage_meter(w, theme, now)),
-                                    ),
-                            )
+                            el
                         }
                     }),
             )
@@ -1164,9 +1295,14 @@ impl AccountsPage {
                             .justify_end()
                             .gap(px(8.0))
                             .child(
-                                popover::btn_ghost(&theme, "Cancel", "login-cancel")
-                                    .id("login-cancel")
-                                    .on_click(cx.listener(|this, _, _, cx| this.cancel_login(cx))),
+                                popover::btn_ghost(
+                                    &theme,
+                                    "Cancel",
+                                    "login-cancel",
+                                    cx.entity_id(),
+                                )
+                                .id("login-cancel")
+                                .on_click(cx.listener(|this, _, _, cx| this.cancel_login(cx))),
                             )
                             .child(
                                 popover::btn_primary(
@@ -1247,6 +1383,7 @@ impl AccountsPage {
                                 &theme,
                                 if has_error { "Close" } else { "Cancel" },
                                 "login-cancel",
+                                cx.entity_id(),
                             )
                             .id("login-cancel")
                             .on_click(cx.listener(|this, _, _, cx| this.cancel_login(cx))),
@@ -1370,6 +1507,10 @@ impl Render for AccountsPage {
             HarnessId::Opencode => (crate::icons::OPENCODE_MARK, None),
             HarnessId::Antigravity => (crate::icons::ANTIGRAVITY_MARK, None),
             HarnessId::Pi => (crate::icons::PI_MARK, None),
+            HarnessId::Devin => (crate::icons::DEVIN_MARK, None),
+            HarnessId::Muse => (crate::icons::MUSE_MARK, Some(crate::icons::muse_brand())),
+            HarnessId::Copilot => (crate::icons::COPILOT_MARK, None),
+            HarnessId::Cline => (crate::icons::CLINE_MARK, None),
             _ => (
                 crate::icons::CLAUDE_MARK,
                 Some(crate::icons::claude_brand()),
@@ -1468,7 +1609,8 @@ impl Render for AccountsPage {
                 let snapshot = snapshot.clone();
                 PROVIDERS
                     .into_iter()
-                    .map(|(harness, name, cli)| {
+                    .enumerate()
+                    .map(|(provider_index, (harness, name, cli))| {
                         let accounts = provider_accounts(&snapshot, harness);
                         // EVERY warning renders its own strip (komet maps them).
                         let warnings: Vec<String> = snapshot
@@ -1485,24 +1627,89 @@ impl Render for AccountsPage {
                             })
                             .collect();
                         let add_id: SharedString = format!("add-account-{name}").into();
-                        let card = widgets::section_card(&theme).mt(px(8.0));
+                        let focused = self.focused_harness == Some(harness);
+                        let card = widgets::section_card(&theme)
+                            .mt(px(8.0))
+                            .when(focused, |card| {
+                                card.border_1().border_color(theme.accent.opacity(0.65))
+                            });
                         let card = if rows.is_empty() {
-                            card.child(
-                                div()
-                                    .px(px(20.0))
-                                    .py(px(32.0))
-                                    .text_center()
-                                    .text_size(px(14.0))
-                                    .text_color(theme.text_muted.opacity(0.6))
-                                    .child(SharedString::from(format!(
-                                        "No {name} login detected on this device — sign in \
-                                         with \u{201C}{cli}\u{201D} or add an account."
-                                    ))),
-                            )
+                            let mut empty = div()
+                                .px(px(20.0))
+                                .py(px(24.0))
+                                .flex()
+                                .flex_col()
+                                .items_center()
+                                .gap(px(8.0))
+                                .text_center()
+                                .text_size(px(13.0))
+                                .text_color(theme.text_muted.opacity(0.75))
+                                .child(SharedString::from(if cli_login_command(harness).is_some() {
+                                    format!("{name} sign-in is managed by its own CLI.")
+                                } else {
+                                    format!("No {name} login detected on this device.")
+                                }));
+                            if let Some(command) = cli_login_command(harness) {
+                                empty = empty
+                                    .child(
+                                        div()
+                                            .max_w(px(460.0))
+                                            .text_size(px(12.0))
+                                            .text_color(theme.text_muted)
+                                            .child(SharedString::from(login_instructions(harness))),
+                                    )
+                                    .child(
+                                        widgets::ghost_action(&theme)
+                                            .id(("accounts-copy-login-command", provider_index))
+                                            .hover(|s| widgets::ghost_hover(&theme, s))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.copy_login_command(harness, cx);
+                                            }))
+                                            .child(
+                                                crate::icons::icon(crate::icons::DOCUMENT)
+                                                    .size(px(14.0))
+                                                    .text_color(theme.text_muted),
+                                            )
+                                            .child(SharedString::from(if self.copied_login_command
+                                                == Some(harness)
+                                            {
+                                                "Command copied"
+                                            } else {
+                                                "Copy sign-in command"
+                                            }))
+                                    )
+                                    .child(
+                                        div()
+                                            .text_size(px(10.5))
+                                            .text_color(theme.text_muted.opacity(0.5))
+                                            .child(SharedString::from(command)),
+                                    );
+                            } else {
+                                empty = empty.child(
+                                    div()
+                                        .max_w(px(460.0))
+                                        .text_size(px(12.0))
+                                        .text_color(theme.text_muted)
+                                        .child(SharedString::from(format!(
+                                            "Sign in with the {cli} CLI, or use Add account to connect another login."
+                                        ))),
+                                );
+                            }
+                            card.child(empty)
                         } else {
                             card.children(rows)
                         };
                         div()
+                            .id(("accounts-provider-section", provider_index))
+                            .when(focused, |el| {
+                                el.child(
+                                    div()
+                                        .mb(px(6.0))
+                                        .text_size(px(11.0))
+                                        .text_color(theme.accent)
+                                        .child(SharedString::from("Selected agent")),
+                                )
+                            })
                             .mt(px(24.0))
                             .flex()
                             .flex_col()
@@ -1521,20 +1728,22 @@ impl Render for AccountsPage {
                                             .child(SharedString::from(name)),
                                     )
                                     .child(div().flex_1())
-                                    .child(
-                                        widgets::ghost_action(&theme)
-                                            .id(add_id)
-                                            .hover(|s| widgets::ghost_hover(&theme, s))
-                                            .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.start_login(harness, cx);
-                                            }))
-                                            .child(
-                                                crate::icons::icon(crate::icons::ADD_CIRCLE)
-                                                    .size(px(16.0))
-                                                    .text_color(theme.text_muted),
-                                            )
-                                            .child(SharedString::from("Add account")),
-                                    ),
+                                    .when(cli_login_command(harness).is_none(), |el| {
+                                        el.child(
+                                            widgets::ghost_action(&theme)
+                                                .id(add_id)
+                                                .hover(|s| widgets::ghost_hover(&theme, s))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.start_login(harness, cx);
+                                                }))
+                                                .child(
+                                                    crate::icons::icon(crate::icons::ADD_CIRCLE)
+                                                        .size(px(16.0))
+                                                        .text_color(theme.text_muted),
+                                                )
+                                                .child(SharedString::from("Add account")),
+                                        )
+                                    }),
                             )
                             .children(
                                 warnings
@@ -1548,75 +1757,93 @@ impl Render for AccountsPage {
             }
         };
 
+        if self.scroll_target_pending
+            && let Some(harness) = self.focused_harness
+            && matches!(self.snapshot, Loadable::Ready(_))
+            && let Some(provider_index) = PROVIDERS
+                .iter()
+                .position(|(provider, _, _)| *provider == harness)
+        {
+            self.page_scroll
+                .scroll_to_item(provider_index + 2 + usize::from(self.error.is_some()));
+            self.scroll_target_pending = false;
+        }
+
         div()
             .id("accounts-page")
             .size_full()
             .overflow_y_scroll()
+            .track_scroll(&self.page_scroll)
+            .w_full()
+            .max_w(px(768.0))
+            .mx_auto()
+            .px(px(24.0))
+            .pt(px(32.0))
+            .pb(px(64.0))
+            .flex()
+            .flex_col()
             .child(
-                widgets::page_column()
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(10.0))
+                    .child(widgets::page_header(&theme, "Accounts", account_count))
+                    .child(div().flex_1())
                     .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(10.0))
-                            .child(widgets::page_header(&theme, "Accounts", account_count))
-                            .child(div().flex_1())
+                        // `text-[12.5px]` + leading 16px Refresh icon,
+                        // dimmed while a refresh is in flight (komet
+                        // `disabled:opacity-50`).
+                        widgets::ghost_action(&theme)
+                            .id("accounts-refresh")
+                            .flex_none()
+                            .text_size(px(12.5))
+                            .hover(|s| widgets::ghost_hover(&theme, s))
+                            .when(refreshing, |el| el.opacity(0.5))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.load(usage_mode_for(LoadTrigger::Refresh), cx)
+                            }))
                             .child(
-                                // `text-[12.5px]` + leading 16px Refresh icon,
-                                // dimmed while a refresh is in flight (komet
-                                // `disabled:opacity-50`).
-                                widgets::ghost_action(&theme)
-                                    .id("accounts-refresh")
-                                    .flex_none()
-                                    .text_size(px(12.5))
-                                    .hover(|s| widgets::ghost_hover(&theme, s))
-                                    .when(refreshing, |el| el.opacity(0.5))
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.load(usage_mode_for(LoadTrigger::Refresh), cx)
-                                    }))
-                                    .child(
-                                        crate::icons::icon(crate::icons::REFRESH)
-                                            .size(px(16.0))
-                                            .text_color(theme.text_muted),
-                                    )
-                                    .child(SharedString::from("Refresh")),
+                                crate::icons::icon(crate::icons::REFRESH)
+                                    .size(px(16.0))
+                                    .text_color(theme.text_muted),
                             )
-                            .child(self.render_device_switcher(&theme, cx)),
+                            .child(SharedString::from("Refresh")),
                     )
-                    .child(widgets::page_subtitle(
-                        &theme,
-                        "The Claude Code, Codex, Antigravity and Cursor logins on this \
-                         device. Komet detects the live session, keeps each account backed \
-                         up, and can swap between them.",
-                    ))
-                    .when_some(self.error.clone(), |el, message| {
-                        el.child(
-                            widgets::error_strip(&theme, message)
-                                .id("accounts-action-error")
-                                .cursor_pointer()
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.error = None;
-                                    cx.notify();
-                                })),
-                        )
-                    })
-                    .children(sections)
-                    // Footer note (komet: `mt-6 text-[12px] leading-relaxed
-                    // text-muted-foreground/60`).
-                    .child(
-                        div()
-                            .mt(px(24.0))
-                            .text_size(px(12.0))
-                            .line_height(px(19.0))
-                            .text_color(theme.text_muted.opacity(0.6))
-                            .child(SharedString::from(
-                                "Switching rewrites the CLI\u{2019}s stored login, so new \
-                                 agent sessions use the selected account immediately. On \
-                                 macOS, an already-running Claude Code can hold the previous \
-                                 login for up to ~30 seconds (Keychain cache).",
-                            )),
-                    ),
+                    .child(self.render_device_switcher(&theme, cx)),
+            )
+            .child(widgets::page_subtitle(
+                &theme,
+                "Connect the agents that require an account or model-provider \
+                         credentials. Claude Code, Codex, Antigravity and Cursor support \
+                         account management here; other agents use their own CLI login.",
+            ))
+            .when_some(self.error.clone(), |el, message| {
+                el.child(
+                    widgets::error_strip(&theme, message)
+                        .id("accounts-action-error")
+                        .cursor_pointer()
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.error = None;
+                            cx.notify();
+                        })),
+                )
+            })
+            .children(sections)
+            // Footer note (komet: `mt-6 text-[12px] leading-relaxed
+            // text-muted-foreground/60`).
+            .child(
+                div()
+                    .mt(px(24.0))
+                    .text_size(px(12.0))
+                    .line_height(px(19.0))
+                    .text_color(theme.text_muted.opacity(0.6))
+                    .child(SharedString::from(
+                        "Switching rewrites the CLI\u{2019}s stored login, so new \
+                         agent sessions use the selected account immediately. On \
+                         macOS, an already-running Claude Code can hold the previous \
+                         login for up to ~30 seconds (Keychain cache).",
+                    )),
             )
             .when_some(dialog, |el, dialog| el.child(dialog))
     }
@@ -1648,6 +1875,33 @@ mod tests {
         // A just-completed login must show the new account's real numbers, not
         // whatever the previous list cached for that slot id.
         assert_eq!(usage_mode_for(LoadTrigger::PostLogin), UsageMode::Fresh);
+    }
+
+    #[test]
+    fn accounts_lists_every_login_required_agent() {
+        let agents = [
+            HarnessId::ClaudeCode,
+            HarnessId::Codex,
+            HarnessId::Cursor,
+            HarnessId::Devin,
+            HarnessId::Grok,
+            HarnessId::Hermes,
+            HarnessId::Opencode,
+            HarnessId::Pi,
+            HarnessId::Antigravity,
+            HarnessId::Muse,
+            HarnessId::Copilot,
+            HarnessId::Cline,
+        ];
+        for agent in agents {
+            assert!(
+                requires_login(agent),
+                "{} should be listed in Accounts",
+                agent.display_name()
+            );
+            assert!(PROVIDERS.iter().any(|(provider, _, _)| *provider == agent));
+        }
+        assert!(!requires_login(HarnessId::Mock));
     }
 
     #[test]
@@ -1745,5 +1999,92 @@ mod tests {
         assert_eq!(ids, ["c2", "c1"], "active account leads");
         assert_eq!(provider_accounts(&snapshot, HarnessId::Codex).len(), 1);
         assert!(provider_accounts(&snapshot, HarnessId::Cursor).is_empty());
+    }
+
+    #[test]
+    fn usage_is_only_displayed_for_the_active_account() {
+        let mut account = AgentAccount {
+            id: "codex-1".into(),
+            harness: HarnessId::Codex,
+            email: None,
+            plan_label: None,
+            active: false,
+            usage_windows: vec![AgentUsageWindow {
+                label: "Week".into(),
+                used_fraction: 0.42,
+                resets_at: None,
+            }],
+            display_name: None,
+            organization: None,
+            auth_kind: None,
+            switchable: true,
+            saved_at: None,
+        };
+
+        assert!(displayed_usage(&account).is_none());
+        account.active = true;
+        assert_eq!(displayed_usage(&account).unwrap()[0].label, "Week");
+    }
+
+    #[test]
+    fn switching_moves_the_active_usage_to_the_selected_account() {
+        let account = |id: &str, active: bool| AgentAccount {
+            id: id.into(),
+            harness: HarnessId::Codex,
+            email: None,
+            plan_label: None,
+            active,
+            usage_windows: vec![],
+            display_name: None,
+            organization: None,
+            auth_kind: None,
+            switchable: true,
+            saved_at: None,
+        };
+        let mut snapshot = AgentAccountsSnapshot {
+            accounts: vec![account("old", true), account("selected", false)],
+            warnings: vec![],
+        };
+
+        select_active_account(&mut snapshot, HarnessId::Codex, "selected");
+
+        assert!(!snapshot.accounts[0].active);
+        assert!(snapshot.accounts[1].active);
+    }
+
+    #[test]
+    fn empty_refresh_keeps_the_last_known_usage_for_each_account() {
+        let account = |usage_windows| AgentAccount {
+            id: "codex-1".into(),
+            harness: HarnessId::Codex,
+            email: None,
+            plan_label: None,
+            active: true,
+            usage_windows,
+            display_name: None,
+            organization: None,
+            auth_kind: None,
+            switchable: true,
+            saved_at: None,
+        };
+        let previous = AgentAccountsSnapshot {
+            accounts: vec![account(vec![AgentUsageWindow {
+                label: "Week".into(),
+                used_fraction: 0.42,
+                resets_at: None,
+            }])],
+            warnings: vec![],
+        };
+        let mut refreshed = AgentAccountsSnapshot {
+            accounts: vec![account(vec![])],
+            warnings: vec![],
+        };
+
+        retain_previous_usage(&mut refreshed, Some(&previous));
+
+        assert_eq!(
+            refreshed.accounts[0].usage_windows,
+            previous.accounts[0].usage_windows
+        );
     }
 }

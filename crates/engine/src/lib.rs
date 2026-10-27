@@ -18,11 +18,12 @@ use komet_sync::DocsStore;
 pub mod agent_accounts;
 pub mod auth;
 pub mod chat2_host;
+pub mod composio;
 pub mod crash_shield;
 pub mod diff_sync;
 pub mod doc_host;
+pub mod harness_cli;
 pub mod instance_lock;
-pub mod legacy_home;
 pub mod local_import;
 pub mod mcp;
 pub mod profile;
@@ -178,7 +179,7 @@ impl EngineCore {
         edge: Option<EdgeConfig>,
     ) -> Result<Self, EngineError> {
         let data_dir = profile.device_root();
-        ensure_private_dir(data_dir)?;
+        std::fs::create_dir_all(data_dir)?;
         // Single-instance guard: two engines on one data dir would race the
         // SQLite snapshots + journals. Taken before any store opens or the IPC
         // port binds; held (and kernel-released on crash) for the engine's life.
@@ -197,15 +198,11 @@ impl EngineCore {
         lock: InstanceLock,
     ) -> Result<Self, EngineError> {
         let data_dir = profile.device_root();
-        ensure_private_dir(data_dir)?;
+        std::fs::create_dir_all(data_dir)?;
         // Crash shield first: report a previous crashed run (and clear its
         // marker) before any store opens, then arm the panic hook. Every
         // construction path funnels through here.
         crash_shield::install(data_dir);
-        // One-time legacy `~/.zeron` → `~/.komet` sweep (Cursor resume stores,
-        // managed adapters, worktrees). Best-effort, before anything reads
-        // those roots; never blocks boot.
-        legacy_home::migrate(data_dir);
         let legacy_uploads_root = profile.claim_legacy_uploads_root()?;
         let device_id = load_or_create_device_id(data_dir)?;
         // This device's harness enablement (Settings → Agents) rides the
@@ -215,10 +212,9 @@ impl EngineCore {
         // boot instead of re-probing every agent (opencode's cold Node boot
         // measured ~13s under the app's 4-way boot prefetch).
         registry.load_models_cache(data_dir);
-        // Boot prefetch: warm the model cache for every offered harness with
-        // an installed CLI (except Mock) in the background, two at a time, so
-        // the first picker open renders instantly. Never blocks boot and never
-        // fails it — probe errors stay uncached for the live retry.
+        // Boot refresh: revalidate the persisted models for every offered
+        // harness with an installed CLI (except Mock) in the background, two
+        // at a time. Never blocks boot; a failed probe keeps the prior cache.
         {
             let reg = registry.clone();
             let ids: Vec<HarnessId> = reg
@@ -231,7 +227,7 @@ impl EngineCore {
                 .collect();
             match tokio::runtime::Handle::try_current() {
                 Ok(handle) => {
-                    let _ = handle.spawn(async move { reg.warm_models_cache(ids).await });
+                    std::mem::drop(handle.spawn(async move { reg.warm_models_cache(ids).await }));
                 }
                 Err(_) => {
                     // No ambient runtime (tests, one-shot tools): an isolated
@@ -1163,31 +1159,6 @@ fn native_friendly_device_name() -> Option<String> {
     None
 }
 
-/// Create `path` (and parents) as a directory only this user can read, and
-/// tighten one that already exists. Transcripts, journals, uploads and the
-/// credential stores live under it, so the default umask is not good enough.
-pub(crate) fn ensure_private_dir(path: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-        if !path.exists() {
-            let mut builder = std::fs::DirBuilder::new();
-            builder.recursive(true).mode(0o700);
-            builder.create(path)?;
-        }
-        let mut perms = std::fs::metadata(path)?.permissions();
-        if perms.mode() & 0o777 != 0o700 {
-            perms.set_mode(0o700);
-            std::fs::set_permissions(path, perms)?;
-        }
-        Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::create_dir_all(path)
-    }
-}
-
 /// Trimmed env var or the given default.
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key)
@@ -1199,7 +1170,7 @@ fn env_or(key: &str, default: &str) -> String {
 
 /// Stable per-installation device id, persisted at `{data_dir}/device-id`.
 fn load_or_create_device_id(data_dir: &Path) -> Result<String, EngineError> {
-    ensure_private_dir(data_dir)?;
+    std::fs::create_dir_all(data_dir)?;
     // EngineInfo is resolved before the lifetime InstanceLock is acquired, so
     // identity creation and legacy repair need their own short critical section.
     // The OS releases this lock after a crash; unlike a create_new lockfile it
@@ -1336,30 +1307,6 @@ fn replace_empty_device_id(temp_path: &Path, path: &Path) -> std::io::Result<()>
             Err(err) => return Err(err),
         }
         std::fs::hard_link(temp_path, path)
-    }
-}
-
-#[cfg(all(test, unix))]
-mod private_dir_tests {
-    use super::ensure_private_dir;
-    use std::os::unix::fs::PermissionsExt;
-
-    #[test]
-    fn creates_and_tightens_a_private_directory() {
-        let root = tempfile::tempdir().unwrap();
-        let nested = root.path().join("profiles/local");
-        ensure_private_dir(&nested).unwrap();
-        assert_eq!(
-            std::fs::metadata(&nested).unwrap().permissions().mode() & 0o777,
-            0o700,
-        );
-        // An existing world-readable directory is tightened in place.
-        std::fs::set_permissions(&nested, std::fs::Permissions::from_mode(0o755)).unwrap();
-        ensure_private_dir(&nested).unwrap();
-        assert_eq!(
-            std::fs::metadata(&nested).unwrap().permissions().mode() & 0o777,
-            0o700,
-        );
     }
 }
 

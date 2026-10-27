@@ -33,10 +33,10 @@ use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, App, BorderStyle, ClipboardItem, Context, Entity, Focusable as _, ListAlignment,
-    ListOffset, ListScrollEvent, ListState, MouseButton, ObjectFit, SharedString, StyledImage as _,
-    StyledText, Subscription, Task, TextRun, WeakEntity, Window, actions, canvas, div, img, list,
-    prelude::*, px, quad,
+    AnyElement, App, BorderStyle, ClipboardItem, Context, Entity, EventEmitter, Focusable as _,
+    ListAlignment, ListOffset, ListScrollEvent, ListState, MouseButton, ObjectFit, SharedString,
+    StyledImage as _, StyledText, Subscription, Task, TextRun, WeakEntity, Window, actions, canvas,
+    div, img, list, prelude::*, px, quad,
 };
 
 use komet_doc::{MessagePart, MessageRole, MessageStatus, SessionMessageEntry};
@@ -69,14 +69,15 @@ pub const GAP_TURN: f32 = 14.0;
 pub const GAP_BLOCK: f32 = 8.0;
 /// Transcript column max width (komet 46rem).
 pub const MAX_CONTENT_WIDTH: f32 = 736.0;
-/// Tool chip row height / gap — analytic, so fold heights need no measurement.
-/// A row is the guide rail + a 30px chip card centered in it (komet
-/// tool-chip.tsx: `TOOL_CHIP_HEIGHT = 38`, card `h-[30px]`); rows stack with no
-/// gap so the rail reads continuous.
+/// Tool action row height / gap — analytic, so fold heights need no measurement.
+/// Rows stack without a gap so their connector rails read as one sequence.
 pub const CHIP_HEIGHT: f32 = 38.0;
 pub const CHIP_GAP: f32 = 0.0;
-pub const CHIP_CARD_HEIGHT: f32 = 30.0;
 const CHIPS_TOP_PAD: f32 = 2.0;
+const TOOL_ACTIVITY_HEADER_HEIGHT: f32 = 30.0;
+const TOOL_ACTION_INDENT: f32 = 12.0;
+const TOOL_ACTION_BRANCH: f32 = 10.0;
+const DETAIL_PANEL_GAP: f32 = 4.0;
 /// How long a user fold toggle keeps its height tween armed: the RESIZE
 /// spec's 200ms plus margin. Past this the fold renders statically — an armed
 /// tween replays on remount, i.e. on every scroll-back-into-view.
@@ -219,7 +220,7 @@ impl StickSpring {
 // Row model (pure)
 // ---------------------------------------------------------------------------
 
-/// One tool invocation inside a group row.
+/// One tool invocation inside an activity row.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolItem {
     pub call: ToolCall,
@@ -229,6 +230,8 @@ pub struct ToolItem {
     /// the on-demand `GetToolDetail` fetch (issue #10). Additive — existing
     /// rendering paths ignore it.
     pub part_id: SharedString,
+    pub chip_label: &'static str,
+    pub chip_detail: SharedString,
     /// Expandable detail: a code-block of output lines, or a real diff
     /// section rendered by the changes pane's component (ACP harnesses).
     /// Precomputed here because rows are cached by fingerprint — diffing and
@@ -508,7 +511,7 @@ pub enum RowKind {
         mentions: Arc<Vec<crate::composer::SentMentionSpan>>,
         /// Image refs parsed out of the message text (message-attachments.ts):
         /// thumbnails load from the owning device via ReadAttachmentChunk.
-        attachments: Arc<Vec<crate::attachments::UserImageAttachment>>,
+        attachments: Arc<Vec<crate::attachments::UserAttachment>>,
         /// Optimistic echo not yet confirmed by a doc frame.
         pending: bool,
     },
@@ -527,6 +530,8 @@ pub enum RowKind {
     },
     ToolGroup {
         tools: Arc<Vec<ToolItem>>,
+        summary: SharedString,
+        /// Whether this activity group belongs to the currently streaming turn.
         auto_open: bool,
     },
     InputChip {
@@ -658,9 +663,9 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 fn tool_fingerprint(tools: &[ToolItem], auto_open: bool) -> u64 {
     let mut acc = Vec::with_capacity(tools.len() * 8 + 1);
     for t in tools {
-        let (label, detail) = tool_chip_content(&t.call);
-        acc.extend_from_slice(label.as_bytes());
-        acc.extend_from_slice(&(detail.len() as u32).to_le_bytes());
+        acc.extend_from_slice(t.chip_label.as_bytes());
+        acc.extend_from_slice(t.chip_detail.as_bytes());
+        acc.push(0);
         acc.push(t.is_error as u8 | (t.resolved as u8) << 1);
         // Detail payload arriving (or growing) must re-splice the row even
         // when the resolved bit didn't change.
@@ -673,15 +678,45 @@ fn tool_fingerprint(tools: &[ToolItem], auto_open: bool) -> u64 {
                 acc.push(1);
                 acc.extend_from_slice(&(lines.len() as u32).to_le_bytes());
                 acc.extend_from_slice(&(*truncated_by as u32).to_le_bytes());
-                let bytes: usize = lines.iter().map(|l| l.len()).sum();
-                acc.extend_from_slice(&(bytes as u32).to_le_bytes());
+                for line in lines {
+                    acc.extend_from_slice(line.as_bytes());
+                    acc.push(0);
+                }
             }
             Some(ToolDetail::Diff { file, .. }) => {
                 acc.push(2);
                 acc.extend_from_slice(file.path.as_bytes());
+                acc.extend_from_slice(file.old_path.as_deref().unwrap_or("").as_bytes());
                 acc.extend_from_slice(&file.additions.to_le_bytes());
                 acc.extend_from_slice(&file.deletions.to_le_bytes());
                 acc.extend_from_slice(&(file.hunks.len() as u32).to_le_bytes());
+                acc.push(file.binary as u8);
+                acc.push(match file.status {
+                    crate::changes::FileStatus::Added => 0,
+                    crate::changes::FileStatus::Deleted => 1,
+                    crate::changes::FileStatus::Modified => 2,
+                    crate::changes::FileStatus::Renamed => 3,
+                });
+                for notice in &file.notices {
+                    acc.extend_from_slice(notice.as_bytes());
+                    acc.push(0);
+                }
+                for hunk in &file.hunks {
+                    acc.extend_from_slice(hunk.header.as_bytes());
+                    acc.push(0);
+                    for line in &hunk.lines {
+                        acc.push(match line.kind {
+                            crate::changes::LineKind::Context => 0,
+                            crate::changes::LineKind::Add => 1,
+                            crate::changes::LineKind::Del => 2,
+                            crate::changes::LineKind::Meta => 3,
+                        });
+                        acc.extend_from_slice(&line.old_no.unwrap_or_default().to_le_bytes());
+                        acc.extend_from_slice(&line.new_no.unwrap_or_default().to_le_bytes());
+                        acc.extend_from_slice(line.text.as_bytes());
+                        acc.push(0);
+                    }
+                }
             }
             Some(ToolDetail::Stats { stats }) => {
                 acc.push(3);
@@ -689,6 +724,7 @@ fn tool_fingerprint(tools: &[ToolItem], auto_open: bool) -> u64 {
                     acc.extend_from_slice(stat.path.as_bytes());
                     acc.extend_from_slice(&stat.additions.to_le_bytes());
                     acc.extend_from_slice(&stat.deletions.to_le_bytes());
+                    acc.push(0);
                 }
             }
         }
@@ -702,6 +738,7 @@ fn tool_fingerprint(tools: &[ToolItem], auto_open: bool) -> u64 {
         {
             for line in lines {
                 acc.extend_from_slice(line.as_bytes());
+                acc.push(0);
             }
             acc.extend_from_slice(&(*truncated_by as u32).to_le_bytes());
         }
@@ -732,10 +769,13 @@ pub fn rows_for_entry(
             .parts
             .iter()
             .filter_map(|p| match p {
-                MessagePart::Text { text, .. } => Some(text.as_str()),
+                MessagePart::Text { text, .. } => Some(text.clone()),
+                MessagePart::Switch { from, to, .. } => {
+                    Some(format!("Switched from {from} to {to}"))
+                }
                 _ => None,
             })
-            .collect::<Vec<_>>()
+            .collect::<Vec<String>>()
             .join("\n\n");
         // Attachment refs ride the plain text (the `withAttachments`
         // transport); split them back out for the thumbnail strip.
@@ -766,12 +806,11 @@ pub fn rows_for_entry(
         }];
     }
 
-    // Assistant/system: split parts into block rows, folding consecutive tools.
+    // Assistant/system: split parts into block rows, grouping consecutive tools.
     let last_part_ix = entry.parts.len().saturating_sub(1);
     let mut group_ix = 0usize;
     let mut pending_group: Vec<ToolItem> = Vec::new();
     let mut group_last_part_ix = 0usize;
-
     let flush_group =
         |rows: &mut Vec<Row>, group: &mut Vec<ToolItem>, group_ix: &mut usize, last_ix: usize| {
             if group.is_empty() {
@@ -779,12 +818,14 @@ pub fn rows_for_entry(
             }
             let tools = std::mem::take(group);
             let auto_open = streaming && last_ix == last_part_ix;
+            let summary = SharedString::from(tool_group_summary(&tools));
             rows.push(Row {
                 id: format!("{}#g{}", entry.id, group_ix).into(),
                 version: tool_fingerprint(&tools, auto_open),
                 turn_start: false,
                 kind: RowKind::ToolGroup {
                     tools: Arc::new(tools),
+                    summary,
                     auto_open,
                 },
                 entry_id: entry.id.clone().into(),
@@ -808,8 +849,11 @@ pub fn rows_for_entry(
                 diff_stats,
                 ..
             } => {
+                let (chip_label, chip_detail) = tool_chip_content(call);
                 pending_group.push(ToolItem {
                     part_id: SharedString::from(id.clone()),
+                    chip_label,
+                    chip_detail: SharedString::from(chip_detail),
                     call: call.clone(),
                     is_error: *is_error,
                     resolved: *resolved,
@@ -926,8 +970,11 @@ pub fn rows_for_entry(
                             timestamp: None,
                         });
                     }
-                    // Tools are grouped by the outer arm; nothing reaches here.
-                    MessagePart::Tool { .. } | MessagePart::Permission { .. } => {}
+                    // Tools are grouped by the outer arm; switch markers are
+                    // metadata-only and do not render as transcript rows.
+                    MessagePart::Tool { .. }
+                    | MessagePart::Permission { .. }
+                    | MessagePart::Switch { .. } => {}
                 }
             }
         }
@@ -1117,7 +1164,7 @@ pub fn diff_rows(old: &[Row], new: &[Row]) -> Option<(Range<usize>, usize)> {
 /// The rule lives in `komet_proto::view` so the terminal viewport reports the
 /// same summary; this only adapts the row model's [`ToolItem`] to it.
 pub fn tool_group_summary(tools: &[ToolItem]) -> String {
-    let pairs: Vec<(ToolCall, bool)> = tools.iter().map(|t| (t.call.clone(), t.is_error)).collect();
+    let pairs: Vec<(&ToolCall, bool)> = tools.iter().map(|t| (&t.call, t.is_error)).collect();
     komet_proto::view::tool_group_summary(&pairs)
 }
 
@@ -1159,22 +1206,49 @@ pub fn detail_height(detail: &ToolDetail) -> f32 {
 /// open detail whose full payload lives in the sidecar (chat2-sync A3).
 pub const BLOB_AFFORDANCE_HEIGHT: f32 = 24.0;
 
-/// Height of a journal-detail section label ("Request"/"Response", issue
-/// #10). Fixed, like the affordance row, so the analytic card height matches
-/// the render exactly.
-const JOURNAL_LABEL_H: f32 = 18.0;
+/// Height of an action or journal section label.
+const DETAIL_LABEL_H: f32 = 20.0;
+const DETAIL_PANEL_BORDER: f32 = 2.0;
 
-/// Section label inside an open chip's journal-detail block.
-fn journal_label(text: &str, theme: &Theme) -> gpui::Div {
+/// Analytic height of one Input/Output panel, including its gap and borders.
+fn detail_section_height(detail: &ToolDetail) -> f32 {
+    DETAIL_PANEL_GAP + DETAIL_PANEL_BORDER + DETAIL_LABEL_H + detail_height(detail)
+}
+
+/// Labeled Input/Output panel attached to an action row.
+fn detail_section(label: &str, body: AnyElement, theme: &Theme) -> AnyElement {
     div()
-        .h(px(JOURNAL_LABEL_H))
-        .flex_none()
-        .px(px(12.0))
+        .mt(px(DETAIL_PANEL_GAP))
+        .w_full()
+        .min_w_0()
         .flex()
-        .items_center()
-        .text_size(px(10.5))
-        .text_color(theme.text_faint)
-        .child(SharedString::from(text.to_owned()))
+        .flex_col()
+        .overflow_hidden()
+        .rounded(px(7.0))
+        .border_1()
+        .border_color(crate::theme::hairline(0.09))
+        .bg(theme.surface_raised)
+        .child(
+            div()
+                .h(px(DETAIL_LABEL_H))
+                .flex_none()
+                .px(px(11.0))
+                .flex()
+                .items_center()
+                .bg(theme.surface)
+                .text_size(px(10.8))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(theme.text_muted)
+                .child(SharedString::from(label.to_owned())),
+        )
+        .child(
+            div()
+                .h(px(DETAIL_SEPARATOR))
+                .flex_none()
+                .bg(crate::theme::hairline(0.06)),
+        )
+        .child(body)
+        .into_any_element()
 }
 
 /// Line cap for a FETCHED full output (a defensive ceiling, not a doc cap —
@@ -1471,7 +1545,7 @@ struct CachedRows {
 
 #[derive(Default, Clone, Copy)]
 struct FoldState {
-    /// User pin (click); `None` follows the auto-open rule.
+    /// User-selected disclosure state; an unset activity starts collapsed.
     open: Option<bool>,
     /// Bumped per toggle — keys the 200ms height tween.
     epoch: usize,
@@ -1523,13 +1597,9 @@ pub struct Transcript {
     live_parsers: HashMap<String, IncrementalParser>,
     tree_cache: HashMap<String, (usize, Arc<BlockTree>)>,
     folds: HashMap<SharedString, FoldState>,
-    /// Detail folds (output/diff) per chip, keyed `"{row_id}#d{ix}"` — full
-    /// [`FoldState`]s so detail bodies tween open/closed exactly like the
-    /// group fold. Render-local like `folds` — never part of the row
-    /// fingerprint.
-    tool_details: HashMap<SharedString, FoldState>,
+    tool_details: HashMap<SharedString, bool>,
     /// Expanded « Détails » bodies on error chips, keyed by row id.
-    /// Render-local like `tool_details` — never part of the row fingerprint.
+    /// Render-local like `folds` — never part of the row fingerprint.
     error_details: std::collections::HashSet<SharedString>,
     /// Streaming fade veils, one per live markdown row (dropped on completion).
     veils: HashMap<SharedString, Rc<RefCell<RowVeil>>>,
@@ -1625,6 +1695,10 @@ pub struct Transcript {
     /// for the selected chat, shown while the turn is Working. Local only —
     /// never written to the doc, cleared on Done / chat switch / unmount.
     reasoning_text: String,
+    /// Live reasoning starts compact so a verbose provider stream never
+    /// displaces the answer the user is waiting for. The user can expand it
+    /// for the current run; it resets when the stream ends or the chat moves.
+    reasoning_expanded: bool,
     /// The chat the live reasoning belongs to (`None` = no watch running).
     reasoning_chat: Option<String>,
     /// The live reasoning subscription task. Dropped on chat switch, which
@@ -1648,6 +1722,14 @@ pub struct Transcript {
     _observe: Subscription,
 }
 
+/// Actions from an agent response that require shell-level navigation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TranscriptEvent {
+    OpenWorkspaceFile { path: String, line: Option<u32> },
+}
+
+impl EventEmitter<TranscriptEvent> for Transcript {}
+
 /// One sidecar blob fetch's lifecycle.
 enum BlobFetch {
     Loading(#[allow(dead_code)] Task<()>),
@@ -1666,6 +1748,27 @@ enum JournalDetail {
         request: Arc<ToolDetail>,
         response: Arc<ToolDetail>,
     },
+}
+
+/// The latest reasoning lines are the useful status during a streaming turn.
+/// Keeping this pure lets the disclosure stay cheap even when the provider has
+/// emitted a long diagnostic stream.
+fn reasoning_preview(text: &str, max_lines: usize) -> Option<String> {
+    if max_lines == 0 {
+        return None;
+    }
+    let mut lines: Vec<_> = text
+        .lines()
+        .rev()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .take(max_lines)
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+    lines.reverse();
+    Some(lines.join("\n"))
 }
 
 /// Whether a journal-detail state renders its own section in an open chip.
@@ -1744,6 +1847,7 @@ impl Transcript {
             attachment_retries: HashMap::new(),
             blob_details: HashMap::new(),
             reasoning_text: String::new(),
+            reasoning_expanded: false,
             reasoning_chat: None,
             reasoning_task: None,
             journal_details: HashMap::new(),
@@ -1754,6 +1858,16 @@ impl Transcript {
         };
         this.sync(cx);
         this
+    }
+
+    fn workspace_file_handler(&self, cx: &Context<Self>) -> render::WorkspaceFileHandler {
+        let transcript = cx.weak_entity();
+        Rc::new(move |path, line, cx| {
+            let _ = transcript.update(cx, |_this, cx| {
+                cx.emit(TranscriptEvent::OpenWorkspaceFile { path, line });
+                cx.notify();
+            });
+        })
     }
 
     /// Wire Edit → Send to the chat composer. The shell calls this once both
@@ -2662,7 +2776,7 @@ impl Transcript {
     /// repeated dump). Todo items ship complete in the doc, so no fetch is
     /// needed — pure derivation over row order. An empty diff clears the
     /// invocation, collapsing the chip back to its one-line summary.
-    fn apply_todo_diffs(&mut self, rows: &mut Vec<Row>) {
+    fn apply_todo_diffs(&mut self, rows: &mut [Row]) {
         for row in rows.iter_mut() {
             let RowKind::ToolGroup { tools, .. } = &mut row.kind else {
                 continue;
@@ -2832,6 +2946,7 @@ impl Transcript {
         self.reasoning_task = None;
         self.reasoning_chat = None;
         self.reasoning_text.clear();
+        self.reasoning_expanded = false;
     }
 
     /// Start the live reasoning watch (issue #31) when the selected chat is
@@ -2941,9 +3056,9 @@ impl Transcript {
         self.reasoning_task = Some(task);
     }
 
-    fn toggle_fold(&mut self, row_id: SharedString, open_height: f32, auto_open: bool) {
+    fn toggle_fold(&mut self, row_id: SharedString, open_height: f32) {
         let entry = self.folds.entry(row_id).or_default();
-        let currently_open = entry.open.unwrap_or(auto_open);
+        let currently_open = entry.open.unwrap_or(false);
         entry.from = if currently_open { open_height } else { 0.0 };
         entry.open = Some(!currently_open);
         entry.epoch += 1;
@@ -3092,7 +3207,7 @@ impl Transcript {
     fn render_user_attachments(
         &mut self,
         row_id: &SharedString,
-        atts: &[crate::attachments::UserImageAttachment],
+        atts: &[crate::attachments::UserAttachment],
         cx: &mut Context<Self>,
     ) -> AnyElement {
         use crate::attachments::AttachmentSnapshot;
@@ -3109,100 +3224,126 @@ impl Transcript {
             .px(px(4.0))
             .pt(px(4.0));
         for (aix, att) in atts.iter().enumerate() {
-            let state = self.attachment_state(&device_ids, &att.path, cx);
             let sending = att.path.starts_with("pending://") || att.path.starts_with("pending/");
             let uploading = sending
                 .then(|| self.state.read(cx).upload_progress_percent())
                 .flatten();
             let frame = div()
                 .flex_none()
-                .w(px(ATT_THUMB_W))
+                .w(px(if att.is_image { ATT_THUMB_W } else { 132.0 }))
                 .h(px(ATT_THUMB_H))
                 .rounded(px(8.0))
                 .overflow_hidden();
-            let thumb: AnyElement = match state {
-                AttachmentSnapshot::Loaded(image) => {
-                    let preview = crate::attachments::PreviewImage {
-                        name: image.name.clone(),
-                        image: image.image.clone(),
-                    };
-                    frame
-                        .id(SharedString::from(format!("{row_id}#att{aix}")))
-                        .border_1()
-                        .border_color(crate::theme::hairline(0.11))
-                        .bg(crate::theme::ink(0.035))
-                        .cursor_pointer()
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.attachment_preview = Some(preview.clone());
-                            window.focus(&this.attachment_preview_focus, cx);
-                            cx.notify();
-                        }))
-                        .child(
-                            img(image.image.clone())
-                                // EXPLICIT dims, not size_full: img layout
-                                // honors the intrinsic aspect ratio over a
-                                // percent height, so size_full let a tall photo
-                                // grow past the frame and the rectangular overflow
-                                // clip squared the bottom corners.
-                                .w(px(ATT_THUMB_W - 2.0))
-                                .h(px(ATT_THUMB_H - 2.0))
-                                // The IMG needs its own radii: the frame's
-                                // rounding only clips rectangularly, so the
-                                // sprite must round its own corners (7 = the
-                                // frame's 8 minus its 1px border).
-                                .rounded(px(7.0))
-                                .object_fit(ObjectFit::Cover),
-                        )
-                        .when(sending, |el| {
-                            let pulse = motion::pulse_wave(motion::pulse_delta(
-                                &motion::KOMET_PULSE,
-                                cx.entity_id(),
-                                cx,
-                            ));
-                            let indicator: AnyElement = match uploading {
-                                Some(pct) => crate::loaders::upload_progress_ring(pct, 34.0),
-                                None => crate::loaders::mini_gradient_spinner(
-                                    format!("att-sending-{row_id}-{aix}"),
-                                    3.0,
+            let thumb: AnyElement = if !att.is_image {
+                frame
+                    .border_1()
+                    .border_color(crate::theme::hairline(0.10))
+                    .bg(crate::theme::ink(0.035))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .px(px(8.0))
+                    .child(
+                        crate::icons::icon(crate::icons::DOCUMENT)
+                            .size(px(18.0))
+                            .text_color(crate::theme::Theme::of(cx).text_muted),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .overflow_hidden()
+                            .text_size(px(11.0))
+                            .text_color(crate::theme::Theme::of(cx).text)
+                            .child(SharedString::from(att.name.clone())),
+                    )
+                    .into_any_element()
+            } else {
+                let state = self.attachment_state(&device_ids, &att.path, cx);
+                match state {
+                    AttachmentSnapshot::Loaded(image) => {
+                        let preview = crate::attachments::PreviewImage {
+                            name: image.name.clone(),
+                            image: image.image.clone(),
+                        };
+                        frame
+                            .id(SharedString::from(format!("{row_id}#att{aix}")))
+                            .border_1()
+                            .border_color(crate::theme::hairline(0.11))
+                            .bg(crate::theme::ink(0.035))
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.attachment_preview = Some(preview.clone());
+                                window.focus(&this.attachment_preview_focus, cx);
+                                cx.notify();
+                            }))
+                            .child(
+                                img(image.image.clone())
+                                    // EXPLICIT dims, not size_full: img layout
+                                    // honors the intrinsic aspect ratio over a
+                                    // percent height, so size_full let a tall photo
+                                    // grow past the frame and the rectangular overflow
+                                    // clip squared the bottom corners.
+                                    .w(px(ATT_THUMB_W - 2.0))
+                                    .h(px(ATT_THUMB_H - 2.0))
+                                    // The IMG needs its own radii: the frame's
+                                    // rounding only clips rectangularly, so the
+                                    // sprite must round its own corners (7 = the
+                                    // frame's 8 minus its 1px border).
+                                    .rounded(px(7.0))
+                                    .object_fit(ObjectFit::Cover),
+                            )
+                            .when(sending, |el| {
+                                let pulse = motion::pulse_wave(motion::pulse_delta(
+                                    &motion::KOMET_PULSE,
                                     cx.entity_id(),
                                     cx,
+                                ));
+                                let indicator: AnyElement = match uploading {
+                                    Some(pct) => crate::loaders::upload_progress_ring(pct, 34.0),
+                                    None => crate::loaders::mini_gradient_spinner(
+                                        format!("att-sending-{row_id}-{aix}"),
+                                        3.0,
+                                        cx.entity_id(),
+                                        cx,
+                                    )
+                                    .into_any_element(),
+                                };
+                                el.child(
+                                    div()
+                                        .absolute()
+                                        .inset_0()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .bg(gpui::hsla(0.0, 0.0, 0.0, 0.38 + 0.05 * pulse))
+                                        .child(indicator),
                                 )
-                                .into_any_element(),
-                            };
-                            el.child(
-                                div()
-                                    .absolute()
-                                    .inset_0()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .bg(gpui::hsla(0.0, 0.0, 0.0, 0.38 + 0.05 * pulse))
-                                    .child(indicator),
-                            )
-                        })
-                        .into_any_element()
+                            })
+                            .into_any_element()
+                    }
+                    // Errored/unavailable: the dashed "missing" thumb.
+                    AttachmentSnapshot::Error { .. } => frame
+                        .border_1()
+                        .border_dashed()
+                        .border_color(crate::theme::hairline(0.14))
+                        .bg(crate::theme::ink(0.025))
+                        .into_any_element(),
+                    // Loading: the pulsing skeleton (same wash as popover skeletons).
+                    AttachmentSnapshot::Loading => frame
+                        .border_1()
+                        .border_color(crate::theme::hairline(0.08))
+                        .bg(crate::theme::ink(0.055))
+                        .opacity(
+                            0.35 + 0.4
+                                * motion::pulse_wave(motion::pulse_delta(
+                                    &motion::KOMET_PULSE,
+                                    cx.entity_id(),
+                                    cx,
+                                )),
+                        )
+                        .into_any_element(),
                 }
-                // Errored/unavailable: the dashed "missing" thumb.
-                AttachmentSnapshot::Error { .. } => frame
-                    .border_1()
-                    .border_dashed()
-                    .border_color(crate::theme::hairline(0.14))
-                    .bg(crate::theme::ink(0.025))
-                    .into_any_element(),
-                // Loading: the pulsing skeleton (same wash as popover skeletons).
-                AttachmentSnapshot::Loading => frame
-                    .border_1()
-                    .border_color(crate::theme::hairline(0.08))
-                    .bg(crate::theme::ink(0.055))
-                    .opacity(
-                        0.35 + 0.4
-                            * motion::pulse_wave(motion::pulse_delta(
-                                &motion::KOMET_PULSE,
-                                cx.entity_id(),
-                                cx,
-                            )),
-                    )
-                    .into_any_element(),
             };
             strip = strip.child(thumb);
         }
@@ -3277,36 +3418,70 @@ impl Transcript {
         )
     }
 
-    /// Live reasoning block (issue #31): the in-progress turn's accumulated
-    /// `WatchReasoning` text, muted + italic like a "thinking" block. `None`
-    /// when empty (turn ended, chat switched, or never Working) — nothing
-    /// renders and nothing persists.
-    fn render_reasoning_block(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if self.reasoning_text.trim().is_empty() {
-            return None;
-        }
+    /// Live reasoning block (issue #31), styled as a compact activity row.
+    /// The latest line acts as the live summary; expanding reveals the complete
+    /// provider stream without putting it in a heavy card.
+    fn render_reasoning_block(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let expanded = self.reasoning_expanded;
+        let visible_text = reasoning_preview(&self.reasoning_text, 1)?;
         let theme = Theme::of(cx).clone();
+        let full_text = expanded.then(|| self.reasoning_text.clone());
         Some(
             div()
                 .w_full()
-                .pt(px(6.0))
-                .pl(px(12.0))
                 .flex()
                 .flex_col()
-                .gap(px(2.0))
                 .child(
                     div()
-                        .text_size(px(10.5))
-                        .text_color(theme.text_faint)
-                        .child(SharedString::from("thinking")),
+                        .id("reasoning-toggle")
+                        .h(px(TOOL_ACTIVITY_HEADER_HEIGHT))
+                        .px(px(4.0))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(9.0))
+                        .cursor_pointer()
+                        .hover(|el| el.text_color(theme.text))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.reasoning_expanded = !this.reasoning_expanded;
+                            cx.notify();
+                        }))
+                        .child(
+                            crate::icons::icon(crate::icons::THINKING)
+                                .size(px(14.0))
+                                .text_color(theme.text_muted),
+                        )
+                        .child(
+                            div()
+                                .min_w_0()
+                                .flex_1()
+                                .truncate()
+                                .text_size(px(10.5))
+                                .text_color(theme.text_muted)
+                                .child(SharedString::from(visible_text)),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_size(px(11.0))
+                                .text_color(theme.text_faint)
+                                .child(SharedString::from(if expanded { "▾" } else { "▸" })),
+                        ),
                 )
-                .child(
-                    div()
-                        .text_size(px(12.0))
-                        .italic()
-                        .text_color(theme.text_muted)
-                        .child(SharedString::from(self.reasoning_text.clone())),
-                )
+                .when_some(full_text, |el, text| {
+                    el.child(
+                        div()
+                            .ml(px(10.0))
+                            .pl(px(13.0))
+                            .pb(px(8.0))
+                            .border_l_1()
+                            .border_color(crate::theme::hairline(0.08))
+                            .text_size(px(12.0))
+                            .line_height(px(18.0))
+                            .text_color(theme.text_muted)
+                            .child(SharedString::from(text)),
+                    )
+                })
                 .into_any_element(),
         )
     }
@@ -3412,10 +3587,12 @@ impl Transcript {
             RowKind::Markdown { tree, block_ix } => {
                 let opts = RenderOptions {
                     row_key: row.id.clone(),
+                    hover_owner: Some(cx.entity_id()),
                     veil: None,
                     cache: (!render_cache_disabled()).then(|| self.render_cache.clone()),
                     now: Instant::now(),
                     copy: Some(self.copy_ui_for(&row.id, cx)),
+                    open_workspace_file: Some(self.workspace_file_handler(cx)),
                 };
                 let highlight = self.code_highlight_for(&row.id, tree, Some(*block_ix), cx);
                 let Some(top) = tree.blocks.get(*block_ix) else {
@@ -3454,10 +3631,12 @@ impl Transcript {
                 });
                 let opts = RenderOptions {
                     row_key: row.id.clone(),
+                    hover_owner: Some(cx.entity_id()),
                     veil: veil.clone(),
                     cache: (!render_cache_disabled()).then(|| self.render_cache.clone()),
                     now: Instant::now(),
                     copy: Some(self.copy_ui_for(&row.id, cx)),
+                    open_workspace_file: Some(self.workspace_file_handler(cx)),
                 };
                 let highlight = self.code_highlight_for(&row.id, tree, Some(*block_ix), cx);
                 let Some(top) = tree.blocks.get(*block_ix) else {
@@ -3493,9 +3672,11 @@ impl Transcript {
                 }
                 el
             }
-            RowKind::ToolGroup { tools, auto_open } => {
-                self.render_tool_group(&row.id, tools, *auto_open, &theme, cx)
-            }
+            RowKind::ToolGroup {
+                tools,
+                summary,
+                auto_open,
+            } => self.render_tool_group(&row.id, tools, summary, *auto_open, &theme, cx),
             RowKind::InputChip { header, resolved } => {
                 input_chip(header.clone(), *resolved, &theme)
             }
@@ -3506,7 +3687,6 @@ impl Transcript {
                 retryable,
             } => self.render_error_chip(&row.id, message, kind, detail, *retryable, &theme, cx),
         };
-
         // Hover-revealed timestamp strip (komet chat-view.tsx `Timestamp`):
         // a RESERVED 16px lane under the entry's last row — the label only
         // flips opacity, so revealing it never shifts the virtualizer's
@@ -3657,17 +3837,22 @@ impl Transcript {
                             .items_center()
                             .gap(px(8.0))
                             .child(
-                                crate::popover::btn_ghost(theme, "Cancel", "prompt-edit-cancel")
-                                    .id("prompt-edit-cancel")
-                                    .occlude()
-                                    .on_mouse_down(MouseButton::Left, |_, window, _| {
-                                        window.prevent_default()
-                                    })
-                                    .on_click(move |_, _, cx| {
-                                        cancel_entity
-                                            .update(cx, |this, cx| this.cancel_prompt_edit(cx))
-                                            .ok();
-                                    }),
+                                crate::popover::btn_ghost(
+                                    theme,
+                                    "Cancel",
+                                    "prompt-edit-cancel",
+                                    cx.entity_id(),
+                                )
+                                .id("prompt-edit-cancel")
+                                .occlude()
+                                .on_mouse_down(MouseButton::Left, |_, window, _| {
+                                    window.prevent_default()
+                                })
+                                .on_click(move |_, _, cx| {
+                                    cancel_entity
+                                        .update(cx, |this, cx| this.cancel_prompt_edit(cx))
+                                        .ok();
+                                }),
                             )
                             .child(
                                 crate::popover::btn_primary(theme, "Send")
@@ -3905,12 +4090,13 @@ impl Transcript {
         &mut self,
         row_id: &SharedString,
         tools: &Arc<Vec<ToolItem>>,
+        summary: &SharedString,
         auto_open: bool,
         theme: &Theme,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let fold = self.folds.get(row_id).copied().unwrap_or_default();
-        let open = fold.open.unwrap_or(auto_open);
+        let open = fold.open.unwrap_or(false);
         // Chips render their EFFECTIVE detail: the precomputed doc-resident
         // one, upgraded in place by a fetched sidecar blob (chat2-sync A3).
         // Resolved per paint (a HashMap probe per chip) so fetched content
@@ -3987,28 +4173,12 @@ impl Transcript {
                 None
             })
             .collect();
-        // Which chips have their detail block open (render-local, analytic —
-        // the FINAL state; a mid-tween detail already counts as its target).
-        let detail_folds: Vec<FoldState> = details
-            .iter()
-            .zip(&invocations)
-            .enumerate()
-            .map(|(ix, (detail, invocation))| {
-                if detail.is_none() && invocation.is_none() {
-                    return FoldState::default();
-                }
+        let action_open: Vec<bool> = (0..tools.len())
+            .map(|ix| {
                 self.tool_details
                     .get(&SharedString::from(format!("{row_id}#d{ix}")))
                     .copied()
-                    .unwrap_or_default()
-            })
-            .collect();
-        let detail_opens: Vec<bool> = details
-            .iter()
-            .zip(&invocations)
-            .zip(&detail_folds)
-            .map(|((detail, invocation), fold)| {
-                (detail.is_some() || invocation.is_some()) && fold.open.unwrap_or(false)
+                    .unwrap_or(false)
             })
             .collect();
         let detail_highlights: Vec<Option<Arc<crate::changes::DiffHighlights>>> = details
@@ -4017,13 +4187,12 @@ impl Transcript {
             .map(|(ix, detail)| {
                 detail
                     .as_deref()
-                    .filter(|_| detail_opens[ix])
+                    .filter(|_| open && action_open[ix])
                     .and_then(|detail| self.tool_diff_highlight_for(row_id, ix, detail, cx))
             })
             .collect();
         // Journal-detail height per chip (issue #10): Ready renders two
-        // labeled Output blocks, Loading one fixed row, Unavailable nothing.
-        // Gated by the chip's detail fold at the use sites, like `details`.
+        // labeled blocks, Loading one fixed row, Unavailable nothing.
         let journal_extras: Vec<f32> = tools
             .iter()
             .map(|tool| {
@@ -4033,10 +4202,7 @@ impl Transcript {
                     .map(|c| Self::journal_key(c, tool.part_id.as_ref()));
                 match key.and_then(|k| self.journal_details.get(&k)) {
                     Some(JournalDetail::Ready { request, response }) => {
-                        JOURNAL_LABEL_H
-                            + detail_height(request)
-                            + JOURNAL_LABEL_H
-                            + detail_height(response)
+                        detail_section_height(request) + detail_section_height(response)
                     }
                     Some(JournalDetail::Loading(_)) => BLOB_AFFORDANCE_HEIGHT,
                     _ => 0.0,
@@ -4044,69 +4210,115 @@ impl Transcript {
             })
             .collect();
         let open_height = chips_height(tools.len())
-            + details
+            + tools
                 .iter()
-                .zip(&invocations)
-                .zip(&affordances)
-                .zip(&detail_opens)
-                .zip(&journal_extras)
-                .filter(|((((_, _), _), open), _)| **open)
-                .map(|((((detail, invocation), affordance), _), extra)| {
-                    invocation.as_deref().map_or(0.0, detail_height)
-                        + detail.as_deref().map_or(0.0, detail_height)
-                        + if affordance.is_some() {
+                .enumerate()
+                .map(|(ix, tool)| {
+                    if !action_open[ix] {
+                        return 0.0;
+                    }
+                    let journal_ready = self
+                        .chat_id
+                        .as_deref()
+                        .map(|chat_id| Self::journal_key(chat_id, tool.part_id.as_ref()))
+                        .and_then(|key| self.journal_details.get(&key))
+                        .is_some_and(|detail| matches!(detail, JournalDetail::Ready { .. }));
+                    let invocation_height = if details[ix].is_none() && journal_ready {
+                        0.0
+                    } else {
+                        invocations[ix]
+                            .as_deref()
+                            .map_or(0.0, detail_section_height)
+                    };
+                    let journal_height = if details[ix].is_none() {
+                        journal_extras[ix]
+                    } else {
+                        0.0
+                    };
+                    invocation_height
+                        + details[ix].as_deref().map_or(0.0, detail_section_height)
+                        + if affordances[ix].is_some() {
                             BLOB_AFFORDANCE_HEIGHT
                         } else {
                             0.0
                         }
-                        + extra
+                        + journal_height
                 })
                 .sum::<f32>();
         let target = if open { open_height } else { 0.0 };
-        let summary = tool_group_summary(tools);
-
         let toggle_id = row_id.clone();
-        // Header (komet tool-group.tsx): a small chevron tile centered over the
-        // chips' guide rail, then the quiet 12px summary.
+        // Keep the group-level summary scannable; individual rows carry the
+        // operation and its outcome.
+        let failed = tools.iter().filter(|tool| tool.is_error).count();
+        let running = tools.iter().any(|tool| !tool.resolved);
+        let state = if failed > 0 {
+            Some((format!("{failed} failed"), theme.danger))
+        } else if auto_open || running {
+            Some(("In progress".to_owned(), theme.busy))
+        } else {
+            None
+        };
         let header = div()
             .id(SharedString::from(format!("{row_id}-hdr")))
+            .group("tool-activity-header")
+            .h(px(TOOL_ACTIVITY_HEADER_HEIGHT))
+            .w_full()
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(8.0))
+            .gap(px(10.0))
             .px(px(4.0))
-            .h(px(26.0))
             .cursor_pointer()
-            .text_size(px(12.0))
-            // Quiet even when children failed: agents routinely have failed
-            // probes mid-work, and a red HEADER read as "this whole step
-            // broke" (user report). Failures still show on the individual
-            // chips (destructive tint, komet tool-chip.tsx) and in the
-            // summary's "· N failed" count.
             .text_color(theme.text_muted)
             .hover(|s| s.text_color(theme.text))
             .on_click(cx.listener(move |this, _, _, cx| {
-                this.toggle_fold(toggle_id.clone(), open_height, auto_open);
+                cx.stop_propagation();
+                this.toggle_fold(toggle_id.clone(), open_height);
                 cx.notify();
             }))
             .child(
                 div()
-                    .size(px(18.0))
-                    .flex_none()
-                    .rounded(px(5.0))
-                    .bg(crate::theme::ink(0.06))
+                    .min_w_0()
+                    .flex_1()
+                    .h(px(TOOL_ACTIVITY_HEADER_HEIGHT))
                     .flex()
                     .items_center()
-                    .justify_center()
-                    .text_size(px(10.0))
-                    .text_color(theme.text_muted.opacity(0.7))
-                    .child(SharedString::from(if open { "▾" } else { "▸" })),
-            )
-            .child(
-                div()
                     .min_w_0()
                     .truncate()
-                    .child(SharedString::from(summary)),
+                    .text_size(px(11.0))
+                    .text_color(theme.text_muted)
+                    .child(summary.clone()),
+            )
+            .when_some(state, |header, (state_label, state_tint)| {
+                header.child(
+                    div()
+                        .flex_none()
+                        .h(px(22.0))
+                        .px(px(7.0))
+                        .rounded(px(6.0))
+                        .bg(state_tint.opacity(0.10))
+                        .flex()
+                        .items_center()
+                        .text_size(px(10.0))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(state_tint)
+                        .child(SharedString::from(state_label)),
+                )
+            })
+            .child(
+                crate::icons::icon(if open {
+                    crate::icons::ALT_ARROW_DOWN
+                } else {
+                    crate::icons::ALT_ARROW_RIGHT
+                })
+                .size(px(14.0))
+                .flex_none()
+                .when(!open, |arrow| {
+                    arrow
+                        .opacity(0.0)
+                        .group_hover("tool-activity-header", |style| style.opacity(1.0))
+                })
+                .text_color(theme.text_muted),
             );
 
         let chips = div()
@@ -4117,23 +4329,13 @@ impl Transcript {
             .children(tools.iter().enumerate().map(|(ix, tool)| {
                 let detail = details[ix].clone();
                 let invocation = invocations[ix].clone();
-                if detail.is_none() && invocation.is_none() {
-                    return tool_chip(tool, theme);
-                }
                 let affordance = affordances[ix].clone();
                 let affordance_h = if affordance.is_some() {
                     BLOB_AFFORDANCE_HEIGHT
                 } else {
                     0.0
                 };
-                let open = detail_opens[ix];
-                let dfold = detail_folds[ix];
                 let key = SharedString::from(format!("{row_id}#d{ix}"));
-                // Journal detail for this chip (issue #10): fetch on expand,
-                // render when open. `Unavailable`/absent renders nothing —
-                // the chip falls back to the summary already displayed.
-                // Todo chips skip it: their items ship complete in the doc
-                // and render as a local diff instead (no fetch needed).
                 let is_todo = matches!(tool.call, ToolCall::Todo { .. });
                 let journal_key = (!is_todo)
                     .then(|| {
@@ -4142,124 +4344,89 @@ impl Transcript {
                             .map(|c| Self::journal_key(c, tool.part_id.as_ref()))
                     })
                     .flatten();
-                let journal_extra = if open { journal_extras[ix] } else { 0.0 };
-                // Expandable chip: ONE card whose header row is the chip and
-                // whose body is the detail — not a floating card below it.
-                // The guide rail stretches with the row, so an open detail
-                // never breaks the rail.
-                //
-                // The card's height is EXPLICIT (border-box), not intrinsic:
-                // an auto-height card adds its 2px of borders on top of the
-                // 30px header, and with N chips that overflowed the group's
-                // analytic height by 2N px — the last chips rendered clipped
-                // (user report: "tool calls cut off at the bottom"). The
-                // explicit height is also what the open/close tween animates.
-                let closed_h = CHIP_CARD_HEIGHT;
-                let open_h = CHIP_CARD_HEIGHT
-                    + invocation.as_deref().map_or(0.0, detail_height)
-                    + detail.as_deref().map_or(0.0, detail_height)
+                let journal_fetch = journal_key
+                    .as_ref()
+                    .and_then(|key| self.journal_details.get(key));
+                let journal_ready = matches!(journal_fetch, Some(JournalDetail::Ready { .. }));
+                let action_is_open = action_open[ix];
+                let open_h = CHIP_HEIGHT
+                    + if detail.is_none() && journal_ready {
+                        0.0
+                    } else {
+                        invocation.as_deref().map_or(0.0, detail_section_height)
+                    }
+                    + detail.as_deref().map_or(0.0, detail_section_height)
                     + affordance_h
-                    + journal_extra;
-                let card_target = if open { open_h } else { closed_h };
-                let animating = dfold.epoch > 0
-                    && dfold
-                        .toggled_at
-                        .is_some_and(|at| at.elapsed() < FOLD_TWEEN_WINDOW);
-                let toggle_key = key.clone();
-                let group_key = row_id.clone();
-                // Journal fetch fires on expand (issue #10): the open body
-                // shows Loading, then Request/Response, or nothing when
-                // Unavailable (fallback = the summary already displayed).
-                // Todo chips skip it: items ship complete in the doc and
-                // render as a local diff instead.
-                let journal_chat = if is_todo { None } else { self.chat_id.clone() };
-                let journal_part = tool.part_id.to_string();
-                let journal_resolved = tool.resolved;
-                let mut card = div()
-                    .my(px((CHIP_HEIGHT - CHIP_CARD_HEIGHT) / 2.0))
-                    .ml(px(12.0))
+                    + if detail.is_none() {
+                        journal_extras[ix]
+                    } else {
+                        0.0
+                    };
+                let action_height = if open && action_is_open {
+                    open_h
+                } else {
+                    CHIP_HEIGHT
+                };
+                let journal_fetch_target = if tool.resolved && detail.is_none() && !is_todo {
+                    self.chat_id
+                        .as_ref()
+                        .map(|chat_id| (chat_id.clone(), tool.part_id.to_string()))
+                } else {
+                    None
+                };
+                let action_toggle_key = key.clone();
+                let mut action = div()
+                    .h(px(action_height))
                     .min_w_0()
                     .flex_1()
                     .flex()
                     .flex_col()
                     .overflow_hidden()
-                    .rounded(px(9.0))
-                    .border_1()
-                    .border_color(crate::theme::hairline(0.07))
-                    .bg(crate::theme::ink(0.03))
                     .child(
-                        div()
-                            .id(key.clone())
+                        chip_header_row(tool, theme, action_is_open)
+                            .id(SharedString::from(format!("{key}-hdr")))
                             .cursor_pointer()
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                let entry =
-                                    this.tool_details.entry(toggle_key.clone()).or_default();
-                                let currently_open = entry.open.unwrap_or(false);
-                                entry.from = if currently_open { open_h } else { closed_h };
-                                entry.open = Some(!currently_open);
-                                entry.epoch += 1;
-                                entry.toggled_at = Some(Instant::now());
-                                // Arm the GROUP body's height tween too (open
-                                // state untouched): the body's height is
-                                // analytic over the final detail state, so
-                                // without a tween the row snaps to the target
-                                // height while the card is still mid-tween —
-                                // content below teleported on expand and the
-                                // shrinking card clipped on collapse (user
-                                // report). `open_height` was computed with
-                                // the detail still in its pre-click state,
-                                // which is exactly the tween's start; both
-                                // tweens share the click instant and the
-                                // RESIZE curve, so the row tracks the card's
-                                // bottom edge frame-for-frame.
-                                let group = this.folds.entry(group_key.clone()).or_default();
-                                group.from = open_height;
-                                group.epoch += 1;
-                                group.toggled_at = Some(Instant::now());
-                                if let (Some(chat_id), part_id) =
-                                    (journal_chat.clone(), journal_part.clone())
+                                cx.stop_propagation();
+                                let is_open = this
+                                    .tool_details
+                                    .entry(action_toggle_key.clone())
+                                    .or_insert(false);
+                                *is_open = !*is_open;
+                                let is_open = *is_open;
+                                if is_open
+                                    && let Some((chat_id, part_id)) = &journal_fetch_target
+                                    && !part_id.is_empty()
                                 {
-                                    if journal_resolved && !part_id.is_empty() {
-                                        this.spawn_journal_fetch(chat_id, part_id, cx);
-                                    }
+                                    this.spawn_journal_fetch(chat_id.clone(), part_id.clone(), cx);
                                 }
                                 cx.notify();
-                            }))
-                            .child(chip_header(tool, open, theme)),
+                            })),
                     );
-                // The body stays mounted while the close tween shrinks over it.
-                // Invocation first (what was asked), then output/diff (what
-                // came back), each under its own hairline.
-                if open || animating {
-                    if let Some(invocation) = invocation.as_deref() {
-                        card = card
-                            .child(
-                                div()
-                                    .h(px(DETAIL_SEPARATOR))
-                                    .flex_none()
-                                    .bg(crate::theme::hairline(0.06)),
-                            )
-                            .child(detail_body(invocation, None, theme));
+                if open && action_is_open {
+                    if let Some(invocation) = invocation.as_deref()
+                        && !(detail.is_none() && journal_ready)
+                    {
+                        action = action.child(detail_section(
+                            "Input",
+                            detail_body(invocation, None, theme),
+                            theme,
+                        ));
                     }
                     if let Some(detail) = detail.as_deref() {
-                        card = card
-                            .child(
-                                div()
-                                    .h(px(DETAIL_SEPARATOR))
-                                    .flex_none()
-                                    .bg(crate::theme::hairline(0.06)),
-                            )
-                            .child(detail_body(detail, detail_highlights[ix].clone(), theme));
+                        action = action.child(detail_section(
+                            if tool.is_error {
+                                "Error output"
+                            } else {
+                                "Output"
+                            },
+                            detail_body(detail, detail_highlights[ix].clone(), theme),
+                            theme,
+                        ));
                     }
-                    // Journal request/response (issue #10): Loading shows a
-                    // fixed row, Ready two labeled blocks, Unavailable/absent
-                    // renders nothing — fallback is the summary above.
-                    let journal_fetch = journal_key
-                        .as_ref()
-                        .and_then(|k| self.journal_details.get(k));
-                    match journal_fetch {
+                    match (detail.is_none()).then_some(journal_fetch).flatten() {
                         Some(JournalDetail::Loading(_)) => {
-                            card = card.child(
+                            action = action.child(
                                 div()
                                     .h(px(BLOB_AFFORDANCE_HEIGHT))
                                     .flex_none()
@@ -4272,23 +4439,17 @@ impl Transcript {
                             );
                         }
                         Some(JournalDetail::Ready { request, response }) => {
-                            card = card
-                                .child(
-                                    div()
-                                        .h(px(DETAIL_SEPARATOR))
-                                        .flex_none()
-                                        .bg(crate::theme::hairline(0.06)),
-                                )
-                                .child(journal_label("Request", theme))
-                                .child(detail_body(request, None, theme))
-                                .child(
-                                    div()
-                                        .h(px(DETAIL_SEPARATOR))
-                                        .flex_none()
-                                        .bg(crate::theme::hairline(0.06)),
-                                )
-                                .child(journal_label("Response", theme))
-                                .child(detail_body(response, None, theme));
+                            action = action
+                                .child(detail_section(
+                                    "Input",
+                                    detail_body(request, None, theme),
+                                    theme,
+                                ))
+                                .child(detail_section(
+                                    "Output",
+                                    detail_body(response, None, theme),
+                                    theme,
+                                ));
                         }
                         Some(JournalDetail::Unavailable) | None => {}
                     }
@@ -4316,45 +4477,37 @@ impl Transcript {
                                     cx.notify();
                                 }));
                         }
-                        card = card.child(row);
+                        action = action.child(row);
                     }
                 }
-                let card: AnyElement = if animating {
-                    let from = dfold.from;
-                    card.with_animation(
-                        SharedString::from(format!("{key}-tween{}", dfold.epoch)),
-                        RESIZE.animation(),
-                        move |el, t| el.h(px(motion::lerp(from, card_target, t))),
-                    )
-                    .into_any_element()
-                } else {
-                    card.h(px(card_target)).into_any_element()
-                };
-                let card = div().min_w_0().flex_1().child(card);
                 div()
                     .w_full()
                     .flex_none()
                     .flex()
                     .flex_row()
-                    // Guide rail: no fixed height — stretches to the card,
-                    // detail included.
                     .child(
                         div()
-                            .ml(px(12.0))
+                            .ml(px(TOOL_ACTION_INDENT))
                             .w(px(1.0))
                             .flex_none()
                             .bg(crate::theme::ink(0.08)),
                     )
-                    .child(card)
+                    .child(
+                        div()
+                            .w(px(TOOL_ACTION_BRANCH))
+                            .h(px(CHIP_HEIGHT))
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .child(div().w_full().h(px(1.0)).bg(crate::theme::ink(0.12))),
+                    )
+                    .child(action)
                     .into_any_element()
             }));
 
-        // Fold body: 200ms committed-height tween on a USER toggle only — and
-        // only within a short window of the click. Auto-open (streaming) and
-        // content growth never tween, and a SETTLED fold renders at its static
-        // height: leaving the tween armed replayed it on every remount, which
-        // in a virtualized list means every scroll-back-into-view (only `open`
-        // toggles animate — composes with the stick spring).
+        // Fold body: 200ms committed-height tween on an explicit activity
+        // toggle only. Content growth never arms a new tween, and a settled
+        // fold renders at its static height so virtualization cannot replay it.
         let animating = fold.epoch > 0
             && fold
                 .toggled_at
@@ -4834,49 +4987,36 @@ fn detail_body(
     }
 }
 
-/// The chip's content row: icon tile + label + detail line (+ chevron tile
-/// when the chip expands). Shared between the plain chip and the header of an
-/// expandable chip card.
-fn chip_header_row(tool: &ToolItem, chevron: Option<bool>, theme: &Theme) -> gpui::Div {
-    let (label, detail) = tool_chip_content(&tool.call);
-    let tint = if tool.is_error {
-        theme.danger
+/// One tool action row: icon, operation, concise target, and completion state.
+fn chip_header_row(tool: &ToolItem, theme: &Theme, open: bool) -> gpui::Div {
+    let (state_label, state_tint) = if tool.is_error {
+        ("Failed", theme.danger)
+    } else if tool.resolved {
+        ("Done", theme.success)
     } else {
-        theme.text_muted
+        ("Running", theme.busy)
     };
     div()
-        .h(px(CHIP_CARD_HEIGHT))
+        .h(px(CHIP_HEIGHT))
         .w_full()
         .min_w_0()
         .flex()
         .flex_row()
         .items_center()
-        .gap(px(8.0))
-        .px(px(8.0))
+        .gap(px(7.0))
         .text_size(px(12.0))
         .child(
-            // Icon tile (`size-[18px] rounded-[5px] bg-white/[0.08]`,
-            // icon size-3).
-            div()
-                .size(px(18.0))
+            crate::icons::icon(tool_icon_path(&tool.call))
+                .size(px(14.0))
                 .flex_none()
-                .rounded(px(5.0))
-                .bg(crate::theme::ink(0.08))
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(
-                    crate::icons::icon(tool_icon_path(&tool.call))
-                        .size(px(12.0))
-                        .text_color(theme.text_muted),
-                ),
+                .text_color(theme.text_muted),
         )
         .child(
             div()
                 .flex_none()
                 .font_weight(gpui::FontWeight::MEDIUM)
-                .text_color(tint)
-                .child(SharedString::from(label)),
+                .text_color(theme.text)
+                .child(SharedString::from(tool.chip_label)),
         )
         .child(
             div()
@@ -4885,10 +5025,22 @@ fn chip_header_row(tool: &ToolItem, chevron: Option<bool>, theme: &Theme) -> gpu
                 .truncate()
                 .text_color(if tool.is_error {
                     theme.danger
-                } else {
+                } else if tool.resolved {
                     theme.text.opacity(0.85)
+                } else {
+                    theme.text_muted
                 })
-                .child(SharedString::from(detail)),
+                .child(tool.chip_detail.clone()),
+        )
+        .child(
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .text_size(px(10.0))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(state_tint)
+                .child(SharedString::from(state_label)),
         )
         .when_some(tool.call.subagent_model(), |row, model| {
             row.child(
@@ -4902,62 +5054,16 @@ fn chip_header_row(tool: &ToolItem, chevron: Option<bool>, theme: &Theme) -> gpu
                     .child(SharedString::from(model.to_owned())),
             )
         })
-        .when_some(chevron, |row, open| {
-            // Output/diff affordance: a chevron tile matching the group
-            // header's, flipped while the detail body is open.
-            row.child(
-                div()
-                    .size(px(18.0))
-                    .flex_none()
-                    .rounded(px(5.0))
-                    .bg(crate::theme::ink(0.06))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .text_size(px(10.0))
-                    .text_color(theme.text_muted.opacity(0.8))
-                    .child(SharedString::from(if open { "▾" } else { "▸" })),
-            )
-        })
-}
-
-/// The header row of an expandable chip card.
-fn chip_header(tool: &ToolItem, open: bool, theme: &Theme) -> gpui::Div {
-    chip_header_row(tool, Some(open), theme)
-}
-
-/// A plain (non-expandable) chip: guide rail + bordered card.
-fn tool_chip(tool: &ToolItem, theme: &Theme) -> AnyElement {
-    div()
-        .h(px(CHIP_HEIGHT))
-        .w_full()
-        .flex_none()
-        .flex()
-        .flex_row()
-        .items_center()
-        // Guide rail: hairline centered under the header's chevron tile.
         .child(
-            div()
-                .ml(px(12.0))
-                .h_full()
-                .w(px(1.0))
-                .flex_none()
-                .bg(crate::theme::ink(0.08)),
+            crate::icons::icon(if open {
+                crate::icons::ALT_ARROW_DOWN
+            } else {
+                crate::icons::ALT_ARROW_RIGHT
+            })
+            .size(px(13.0))
+            .flex_none()
+            .text_color(theme.text_muted),
         )
-        .child(
-            div()
-                .ml(px(12.0))
-                .h(px(CHIP_CARD_HEIGHT))
-                .min_w_0()
-                .flex_1()
-                .overflow_hidden()
-                .rounded(px(9.0))
-                .border_1()
-                .border_color(crate::theme::hairline(0.07))
-                .bg(crate::theme::ink(0.03))
-                .child(chip_header_row(tool, None, theme)),
-        )
-        .into_any_element()
 }
 
 fn entry_fingerprint(entry: &SessionMessageEntry, pending: bool) -> u64 {
@@ -5296,6 +5402,41 @@ mod tests {
         }
     }
 
+    #[test]
+    fn provider_switch_is_visible_in_the_user_message() {
+        let entry = SessionMessageEntry {
+            id: "user-switch".into(),
+            role: MessageRole::User,
+            parts: vec![
+                text_part("prompt", "Continue with this provider"),
+                MessagePart::Switch {
+                    id: "switch-1".into(),
+                    from: "Claude Code".into(),
+                    to: "Muse Code".into(),
+                    from_harness: Some("claude-code".into()),
+                    to_harness: Some("muse".into()),
+                },
+            ],
+            created_at: 0,
+            device_id: "dev".into(),
+            status: Some(MessageStatus::Complete),
+            continuation_of: None,
+        };
+
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        let Some(Row {
+            kind: RowKind::User { text, .. },
+            ..
+        }) = rows.first()
+        else {
+            panic!("expected user transcript row");
+        };
+        assert_eq!(
+            text.as_ref(),
+            "Continue with this provider\n\nSwitched from Claude Code to Muse Code"
+        );
+    }
+
     fn tool_part(id: &str, command: &str) -> MessagePart {
         MessagePart::Tool {
             id: id.into(),
@@ -5313,6 +5454,23 @@ mod tests {
             subagent_ref: None,
             subagent_status: None,
             subagent_tail: None,
+        }
+    }
+
+    fn test_tool_item(call: ToolCall) -> ToolItem {
+        let (chip_label, chip_detail) = tool_chip_content(&call);
+        ToolItem {
+            part_id: SharedString::from("t"),
+            call,
+            chip_label,
+            chip_detail: SharedString::from(chip_detail),
+            is_error: false,
+            resolved: true,
+            detail: None,
+            invocation: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_ref: None,
         }
     }
 
@@ -5365,6 +5523,26 @@ mod tests {
         assert_eq!(r1[1].version, r2[1].version, "settled block untouched");
         assert_ne!(r1[2].version, r2[2].version, "tail block respliced");
         assert_eq!(diff_rows(&r1, &r2), Some((2..3, 1)));
+    }
+
+    #[test]
+    fn streaming_tool_output_updates_with_same_length_are_rendered() {
+        let mut first_tool = tool_part("tool-1", "git status");
+        let mut second_tool = tool_part("tool-1", "git status");
+        if let MessagePart::Tool { output, .. } = &mut first_tool {
+            *output = Some("old".into());
+        }
+        if let MessagePart::Tool { output, .. } = &mut second_tool {
+            *output = Some("new".into());
+        }
+        let first = assistant("m1", MessageStatus::Streaming, vec![first_tool]);
+        let second = assistant("m1", MessageStatus::Streaming, vec![second_tool]);
+
+        let old_rows = rows_for_entry(&first, false, &mut parse);
+        let new_rows = rows_for_entry(&second, false, &mut parse);
+
+        assert_ne!(old_rows[0].version, new_rows[0].version);
+        assert_eq!(diff_rows(&old_rows, &new_rows), Some((0..1, 1)));
     }
 
     #[test]
@@ -5706,31 +5884,17 @@ mod tests {
 
     #[test]
     fn tool_group_summaries() {
-        let exec = |c: &str| ToolItem {
-            part_id: SharedString::from("t"),
-            call: ToolCall::Exec { command: c.into() },
-            is_error: false,
-            resolved: true,
-            detail: None,
-            invocation: None,
-            output_ref: None,
-            output_bytes: None,
-            diff_ref: None,
+        let exec = |command: &str| {
+            test_tool_item(ToolCall::Exec {
+                command: command.into(),
+            })
         };
-        let edit = |p: &str| ToolItem {
-            part_id: SharedString::from("t"),
-            call: ToolCall::EditFile {
-                path: p.into(),
+        let edit = |path: &str| {
+            test_tool_item(ToolCall::EditFile {
+                path: path.into(),
                 old_string: None,
                 new_string: None,
-            },
-            is_error: false,
-            resolved: true,
-            detail: None,
-            invocation: None,
-            output_ref: None,
-            output_bytes: None,
-            diff_ref: None,
+            })
         };
         let tools = vec![
             exec("ls"),
@@ -5752,41 +5916,11 @@ mod tests {
         assert_eq!(tool_group_summary(&[failing]), "Ran 1 command · 1 failed");
         // Reads / searches / misc.
         let tools = vec![
-            ToolItem {
-                part_id: SharedString::from("t"),
-                call: ToolCall::ReadFile { path: "x".into() },
-                is_error: false,
-                resolved: true,
-                detail: None,
-                invocation: None,
-                output_ref: None,
-                output_bytes: None,
-                diff_ref: None,
-            },
-            ToolItem {
-                part_id: SharedString::from("t"),
-                call: ToolCall::Glob {
-                    pattern: "*.rs".into(),
-                },
-                is_error: false,
-                resolved: true,
-                detail: None,
-                invocation: None,
-                output_ref: None,
-                output_bytes: None,
-                diff_ref: None,
-            },
-            ToolItem {
-                part_id: SharedString::from("t"),
-                call: ToolCall::WebSearch { query: "q".into() },
-                is_error: false,
-                resolved: true,
-                detail: None,
-                invocation: None,
-                output_ref: None,
-                output_bytes: None,
-                diff_ref: None,
-            },
+            test_tool_item(ToolCall::ReadFile { path: "x".into() }),
+            test_tool_item(ToolCall::Glob {
+                pattern: "*.rs".into(),
+            }),
+            test_tool_item(ToolCall::WebSearch { query: "q".into() }),
         ];
         assert_eq!(tool_group_summary(&tools), "Read 1 file · searched 2 times");
     }
@@ -6039,6 +6173,20 @@ mod tests {
             response: Arc::new(output_lines("ok", OUTPUT_DETAIL_MAX_LINES)),
         };
         assert!(journal_section_visible(Some(&ready)));
+    }
+
+    #[test]
+    fn reasoning_preview_keeps_the_latest_meaningful_lines_bounded() {
+        assert_eq!(
+            reasoning_preview("First line\nSecond line\nThird line", 2).as_deref(),
+            Some("Second line\nThird line")
+        );
+        assert_eq!(
+            reasoning_preview("First line\nSecond line\nThird line", 1).as_deref(),
+            Some("Third line")
+        );
+        assert_eq!(reasoning_preview("\n  \n", 2), None);
+        assert_eq!(reasoning_preview("A line", 0), None);
     }
 
     #[test]

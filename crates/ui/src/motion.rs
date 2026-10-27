@@ -38,23 +38,18 @@ use gpui::{
 pub use gpui::AnimationExt;
 
 // ---------------------------------------------------------------------------
-// Pulse clock — throttled drive for the repeating loaders
+// Pulse clock — frame-synchronized drive for the repeating loaders
 // ---------------------------------------------------------------------------
-
-/// window with no spinner mounted schedules nothing at all.
-const PULSE_TICK: Duration = Duration::from_millis(16);
 
 /// How long a view stays on the tick list after its last spinner paint. One
 /// lease outlives a few missed frames; an unmounted spinner stops renewing and
 /// the view drops off, letting the clock park.
-/// 100ms (was 300ms): the clock parks sooner after a spinner unmounts,
-/// avoiding ~12 extra forced frames per spinner disappearance.
+/// 100ms (was 300ms): the clock parks sooner after a spinner unmounts.
 const PULSE_LEASE: Duration = Duration::from_millis(100);
 
 struct PulseClock {
     epoch: Instant,
     leases: HashMap<EntityId, Instant>,
-    running: bool,
 }
 
 impl Global for PulseClock {}
@@ -64,86 +59,65 @@ impl Default for PulseClock {
         Self {
             epoch: Instant::now(),
             leases: HashMap::new(),
-            running: false,
         }
     }
 }
 
-/// Current phase `[0,1)` of a repeating spec, plus a lease that keeps the
-/// calling view re-rendering at [`PULSE_TICK`] while its spinner stays
-/// mounted. All cells across all views share one epoch, so multi-instance
-/// loaders stay phase-locked. Reduced motion returns a static 0 and schedules
-/// nothing.
-pub fn pulse_delta(spec: &MotionSpec, view: EntityId, cx: &mut App) -> f32 {
+impl PulseClock {
+    fn renew(&mut self, view: EntityId, now: Instant) -> bool {
+        let already_active = self.leases.get(&view).is_some_and(|until| *until > now);
+        self.leases.insert(view, now + PULSE_LEASE);
+        !already_active
+    }
+
+    fn active_views(&mut self, now: Instant) -> Vec<EntityId> {
+        self.leases.retain(|_, until| *until > now);
+        self.leases.keys().copied().collect()
+    }
+}
+
+fn renew_pulse_lease(view: EntityId, cx: &mut App) -> bool {
     if cx.reduce_motion() {
+        return false;
+    }
+    let now = Instant::now();
+    let first_frame = cx.default_global::<PulseClock>().renew(view, now);
+    if first_frame {
+        // Prime the frame loop when a spinner mounts after the root's
+        // `pulse_frame` check for this pass.
+        cx.notify(view);
+    }
+    true
+}
+
+/// Current phase `[0,1)` of a repeating spec, plus a lease that keeps the
+/// calling view re-rendering while its spinner stays mounted. The root frame
+/// driver requests the next vsync only while leases remain. All cells across
+/// all views share one epoch, so multi-instance loaders stay phase-locked.
+/// Reduced motion returns a static 0 and schedules nothing.
+pub fn pulse_delta(spec: &MotionSpec, view: EntityId, cx: &mut App) -> f32 {
+    if !renew_pulse_lease(view, cx) {
         return 0.0;
     }
     let clock = cx.default_global::<PulseClock>();
-    clock.leases.insert(view, Instant::now() + PULSE_LEASE);
-    let period = spec.total().as_secs_f32();
-    let phase = (clock.epoch.elapsed().as_secs_f32() / period).fract();
-    if !clock.running {
-        clock.running = true;
-        cx.spawn(async move |cx| {
-            loop {
-                cx.background_executor().timer(PULSE_TICK).await;
-                let parked = cx.update(|cx| {
-                    let clock = cx.default_global::<PulseClock>();
-                    let now = Instant::now();
-                    clock.leases.retain(|_, until| *until > now);
-                    if clock.leases.is_empty() {
-                        clock.running = false;
-                        return true;
-                    }
-                    let views: Vec<EntityId> = clock.leases.keys().copied().collect();
-                    for view in views {
-                        cx.notify(view);
-                    }
-                    false
-                });
-                if parked {
-                    break;
-                }
-            }
-        })
-        .detach();
-    }
-    phase
+    (clock.epoch.elapsed().as_secs_f32() / spec.total().as_secs_f32()).fract()
 }
 
-/// Register a view to receive continuous re-render notifications from the pulse clock.
+/// Register a view for redraws from the root's vsync-driven pulse clock.
 pub fn pulse_lease(view: EntityId, cx: &mut App) {
-    if cx.reduce_motion() {
-        return;
+    renew_pulse_lease(view, cx);
+}
+
+/// Advance pulse leases once per root frame. Active child views are notified;
+/// the root itself is already rendering and must not schedule an extra pass.
+pub fn pulse_frame(root: EntityId, cx: &mut App) -> bool {
+    let views = cx
+        .default_global::<PulseClock>()
+        .active_views(Instant::now());
+    for view in views.iter().copied().filter(|view| *view != root) {
+        cx.notify(view);
     }
-    let clock = cx.default_global::<PulseClock>();
-    clock.leases.insert(view, Instant::now() + PULSE_LEASE);
-    if !clock.running {
-        clock.running = true;
-        cx.spawn(async move |cx| {
-            loop {
-                cx.background_executor().timer(PULSE_TICK).await;
-                let parked = cx.update(|cx| {
-                    let clock = cx.default_global::<PulseClock>();
-                    let now = Instant::now();
-                    clock.leases.retain(|_, until| *until > now);
-                    if clock.leases.is_empty() {
-                        clock.running = false;
-                        return true;
-                    }
-                    let views: Vec<EntityId> = clock.leases.keys().copied().collect();
-                    for view in views {
-                        cx.notify(view);
-                    }
-                    false
-                });
-                if parked {
-                    break;
-                }
-            }
-        })
-        .detach();
-    }
+    !views.is_empty()
 }
 
 /// Elapsed time in seconds from the shared pulse clock epoch.
@@ -592,19 +566,16 @@ pub fn set_hover(key: &str, hovered: bool, reduced: bool) {
     });
 }
 
-/// An `.on_hover` listener driving the fade for `key` — pair with
+/// An `.on_hover` listener scoped to its owning entity. Pair with
 /// [`hover_t`]/[`hover_blend`] reads of the same key in the same element.
 pub fn hover_listener(
     key: impl Into<SharedString>,
+    owner: EntityId,
 ) -> impl Fn(&bool, &mut Window, &mut App) + 'static {
     let key = key.into();
-    move |hovered, window, cx| {
+    move |hovered, _window, cx| {
         set_hover(&key, *hovered, reduced_motion(cx));
-        // Event-dispatch context: `request_animation_frame` is draw-phase-only
-        // (it resolves the current view) — `refresh` marks the whole window
-        // dirty, the root render re-evaluates the blend and keeps frames
-        // coming via its tail while the fade is mid-flight.
-        window.refresh();
+        cx.notify(owner);
     }
 }
 
@@ -677,6 +648,42 @@ pub fn reduced_motion(cx: &App) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn pulse_clock_is_idle_without_leases() {
+        let mut clock = PulseClock::default();
+        assert!(clock.active_views(Instant::now()).is_empty());
+    }
+
+    #[test]
+    fn pulse_clock_prunes_expired_leases() {
+        let mut clock = PulseClock::default();
+        let now = Instant::now();
+        let active = EntityId::from(1);
+        let expired = EntityId::from(2);
+        clock.leases.insert(active, now + PULSE_LEASE);
+        clock.leases.insert(expired, now - Duration::from_millis(1));
+
+        assert_eq!(clock.active_views(now), vec![active]);
+        assert!(!clock.leases.contains_key(&expired));
+
+        clock.leases.insert(active, now - Duration::from_millis(1));
+        assert!(clock.active_views(now).is_empty());
+    }
+
+    #[test]
+    fn pulse_clock_requests_a_frame_only_for_new_or_expired_leases() {
+        let mut clock = PulseClock::default();
+        let now = Instant::now();
+        let view = EntityId::from(1);
+
+        assert!(clock.renew(view, now));
+        assert!(!clock.renew(view, now + Duration::from_millis(20)));
+        assert!(clock.renew(
+            view,
+            now + Duration::from_millis(20) + PULSE_LEASE + Duration::from_millis(1)
+        ));
+    }
+
     #[test]
     fn eval_never_escapes_unit_interval_dense_sweep() {
         // Regression: f32 rounding produced 1.000000119 near the tail of

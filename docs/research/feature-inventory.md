@@ -72,10 +72,13 @@ display EXCLUDED. File paths refer to the reference repo.
 - QuestionPanel replaces composer while run awaits input: paged 1-at-a-time "1/3", single-select
   auto-advances after 220ms, multi/typed explicit, number keys, free-text override, wizard state
   cached per requestId, latched across blips.
-- Pickers: HarnessModelPicker (harness rail + models, harness locked once chat exists),
+- Pickers: HarnessModelPicker (harness rail + models; changing the harness in an existing chat
+  switches providers on the next sent message),
   TraitsPicker (reasoning + advertised model options; trigger shows non-defaults "High · 1M · Fast"),
   RepoPicker (search, Open folder… in-app browser w/ breadcrumbs + keys + skeletons, Clone from
   URL…, Create new repo…), BranchPicker (search + isolated-worktree toggle ~/.komet/worktrees/…).
+- Agents settings: device-targeted CLI status/version checks and official install/update actions
+  where supported; latest-version checks query the provider package source. BranchPicker (search + isolated-worktree toggle ~/.komet/worktrees/…).
 
 ### 1.8 Conversation / transcript
 - ONE transcript source = doc projection. Optimistic echoes until first doc frame.
@@ -130,7 +133,7 @@ display EXCLUDED. File paths refer to the reference repo.
 
 ## 2. Control plane (RPC surface)
 ### ControlRpc (device-addressed, relay-forwardable; optional targetDeviceId)
-- ListHarnesses, ListModels{harness}
+- ListHarnesses, GetHarnessCliStatus, ManageHarnessCli{harness}, ListModels{harness}
 - Run(RunRequest)->RunAck{runId}; Subscribe{sessionId,afterSeq?}->stream SessionStreamEvent;
   Interrupt{runId?|sessionId?}; Steer{sessionId,prompt}->{accepted}; RespondInput{sessionId,
   requestId,answers}

@@ -628,7 +628,7 @@ async fn models_errors_on_failed_discovery() {
     // caller's path, so only the default resolution can report NotInstalled —
     // exercise the harness identity surface instead.
     assert_eq!(missing.id(), HarnessId::Codex);
-    // "Codex" — comet composer/defaults.ts HARNESS_LABEL (and the registry's
+    // "Codex" — komet composer/defaults.ts HARNESS_LABEL (and the registry's
     // lazy descriptor must stay in lockstep).
     assert_eq!(missing.display_name(), "Codex");
     assert_eq!(missing.reasoning_levels().len(), 7);
@@ -829,14 +829,9 @@ async fn live_real_app_server_single_turn() {
 #[tokio::test]
 async fn commands_come_from_skills_list() {
     let h = harness();
-    let commands = h.commands().await.expect("discovery succeeds");
-    assert!(
-        commands.len() >= 10,
-        "static commands and discovered skills present: len={}",
-        commands.len()
-    );
-    assert!(commands.iter().any(|c| c.name == "compact"));
-    assert!(commands.iter().any(|c| c.name == "diff"));
+    let commands = h.commands(None).await.expect("discovery succeeds");
+    // `skills/list` is the live source: no curated TUI catalog is appended.
+    assert!(!commands.iter().any(|c| c.name == "diff"));
 
     let imagegen = commands
         .iter()
@@ -854,7 +849,7 @@ async fn commands_come_from_skills_list() {
         bare.description, "No interface block",
         "top-level description is the fallback"
     );
-    assert_eq!(h.commands().await.expect("cache hit"), commands);
+    assert_eq!(h.commands(None).await.expect("cache hit"), commands);
 }
 
 /// Live smoke against the real CLI: `cargo test -p komet-harness --test
@@ -863,7 +858,7 @@ async fn commands_come_from_skills_list() {
 #[ignore]
 async fn live_commands_discovery() {
     let h = CodexHarness::new();
-    let commands = h.commands().await.expect("live discovery");
+    let commands = h.commands(None).await.expect("live discovery");
     eprintln!("{} commands, first: {:?}", commands.len(), commands.first());
 }
 

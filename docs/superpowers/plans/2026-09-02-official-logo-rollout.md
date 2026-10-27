@@ -50,7 +50,7 @@ Le nouveau `dist/logo.png` fourni EST déjà la variante (2). Comme le design es
 Source of truth: dist/logo.png (the squircle-masked, shadow-baked render —
 same convention scripts/package-macos.sh already expects for icon-1024.png).
 Everything else (the flat Linux/Windows variant) is derived from it
-automatically: the design is a monochrome white comet on solid black, so
+automatically: the design is a monochrome white komet on solid black, so
 recompositing "anything non-black" onto a flat black square removes the
 corner shadow/vignette without touching the artwork itself.
 
@@ -73,11 +73,11 @@ assert master.width == master.height, f"expected a square master, got {master.si
 
 ```python
 def flatten_to_square(img: Image.Image, threshold: int = 18) -> Image.Image:
-    """Recomposite the comet onto a flat black square, dropping the
+    """Recomposite the komet onto a flat black square, dropping the
     squircle-corner shadow/vignette baked into the macOS-shaped master.
     `threshold`: pixels with max(R,G,B) at or below this are treated as
     "background" (pure black) — comfortably above the ~0-10 shadow gradient
-    observed near the rounded corners, comfortably below the comet's dimmest
+    observed near the rounded corners, comfortably below the komet's dimmest
     visible gray."""
     px = img.load()
     out = Image.new("RGB", img.size, (0, 0, 0))

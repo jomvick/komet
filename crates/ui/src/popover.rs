@@ -427,10 +427,68 @@ pub fn anchored_menu_below(
     anchored_menu_below_gap(id, content, closing, 6.0)
 }
 
+/// [`anchored_menu_below`] for content that already contains its own frosted
+/// cards. Skips the wrapper blur so sibling cards do not get painted as one
+/// large surface across the empty space between their bounds.
+pub fn anchored_menu_below_unfrosted(
+    id: impl Into<SharedString>,
+    content: AnyElement,
+    closing: Option<std::time::Instant>,
+) -> AnyElement {
+    anchored_menu_below_gap_impl(id, content, closing, 6.0, false)
+}
+
 /// [`anchored_menu_below`] with a caller-chosen trigger→card gap — the
 /// changes-header dropdowns hang off a tight titlebar band and need more
 /// breathing room than the default 6px (user report; t3code sits near 10).
 pub fn anchored_menu_below_gap(
+    id: impl Into<SharedString>,
+    content: AnyElement,
+    closing: Option<std::time::Instant>,
+    gap: f32,
+) -> AnyElement {
+    anchored_menu_below_gap_impl(id, content, closing, gap, true)
+}
+
+fn anchored_menu_below_gap_impl(
+    id: impl Into<SharedString>,
+    content: AnyElement,
+    closing: Option<std::time::Instant>,
+    gap: f32,
+    frost_content: bool,
+) -> AnyElement {
+    let exit = closing.map(exit_progress);
+    let content = if frost_content {
+        frosted_menu(exit, content)
+    } else {
+        content
+    };
+    div()
+        .absolute()
+        .bottom_0()
+        .left_0()
+        .size_0()
+        .child(
+            gpui::deferred(
+                gpui::anchored()
+                    .anchor(Anchor::TopLeft)
+                    .snap_to_window_with_margin(px(8.0))
+                    .child(menu_motion(
+                        id.into(),
+                        exit,
+                        div().occlude().pt(px(gap)).child(content),
+                    )),
+            )
+            .priority(1)
+            .into_any_element(),
+        )
+        .into_any_element()
+}
+
+/// [`anchored_menu_below_gap`] right-aligned to the trigger's right edge, so
+/// the card grows leftward — for titlebar triggers sitting beside the right
+/// pane, which a left-aligned card would cover.
+pub fn anchored_menu_below_end(
     id: impl Into<SharedString>,
     content: AnyElement,
     closing: Option<std::time::Instant>,
@@ -441,12 +499,12 @@ pub fn anchored_menu_below_gap(
     div()
         .absolute()
         .bottom_0()
-        .left_0()
+        .right_0()
         .size_0()
         .child(
             gpui::deferred(
                 gpui::anchored()
-                    .anchor(Anchor::TopLeft)
+                    .anchor(Anchor::TopRight)
                     .snap_to_window_with_margin(px(8.0))
                     .child(menu_motion(
                         id.into(),
@@ -630,7 +688,12 @@ fn modal_with(
 /// per-`fade_key` [`motion::hover_blend`]. The caller adds the id/click
 /// listener — `fade_key` must be unique app-wide and stable across frames
 /// (the id string is a good choice).
-pub fn menu_row(theme: &Theme, active: bool, fade_key: impl Into<SharedString>) -> gpui::Div {
+pub fn menu_row(
+    theme: &Theme,
+    active: bool,
+    fade_key: impl Into<SharedString>,
+    owner: gpui::EntityId,
+) -> gpui::Div {
     let row = div()
         .flex()
         .flex_row()
@@ -660,7 +723,7 @@ pub fn menu_row(theme: &Theme, active: bool, fade_key: impl Into<SharedString>) 
         // Imperative form — the caller's `.id(...)` makes the element stateful
         // (hover listeners need element state, `.on_hover` needs `Stateful`).
         row.interactivity()
-            .on_hover(motion::hover_listener(fade_key));
+            .on_hover(motion::hover_listener(fade_key, owner));
         row
     }
 }
@@ -674,8 +737,9 @@ pub fn menu_row_nav(
     selected: bool,
     highlighted: bool,
     fade_key: impl Into<SharedString>,
+    owner: gpui::EntityId,
 ) -> gpui::Div {
-    let row = menu_row(theme, selected, fade_key);
+    let row = menu_row(theme, selected, fade_key, owner);
     if !selected && highlighted {
         row.bg(crate::theme::card_selected_bg())
             .text_color(theme.text)
@@ -923,7 +987,12 @@ pub fn dialog_field(input: AnyElement) -> gpui::Div {
 /// Ghost button (`btnGhost`): quiet text, hover wash fading over
 /// `transition-colors` (komet dialogs.tsx). Caller adds id + click; `fade_key`
 /// as in [`menu_row`].
-pub fn btn_ghost(theme: &Theme, label: &str, fade_key: impl Into<SharedString>) -> gpui::Div {
+pub fn btn_ghost(
+    theme: &Theme,
+    label: &str,
+    fade_key: impl Into<SharedString>,
+    owner: gpui::EntityId,
+) -> gpui::Div {
     let fade_key = fade_key.into();
     let mut btn = div()
         .px(px(12.0))
@@ -939,7 +1008,7 @@ pub fn btn_ghost(theme: &Theme, label: &str, fade_key: impl Into<SharedString>) 
         .cursor_pointer()
         .child(SharedString::from(label.to_string()));
     btn.interactivity()
-        .on_hover(motion::hover_listener(fade_key));
+        .on_hover(motion::hover_listener(fade_key, owner));
     btn
 }
 

@@ -659,18 +659,16 @@ async fn live_real_cli_single_turn() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn commands_discovery_merges_catalog_and_probes() {
+async fn commands_discovery_uses_live_wire_only() {
     let h = harness();
-    let commands = h.commands().await.expect("discovery succeeds");
-    assert!(
-        commands.len() >= 20,
-        "static commands + discovered skills present: len={}",
-        commands.len()
-    );
+    let commands = h.commands(None).await.expect("discovery succeeds");
 
-    // Static catalog entry
+    // Live control-channel commands and skill probe entries are returned.
     assert!(commands.iter().any(|c| c.name == "compact"));
-    assert!(commands.iter().any(|c| c.name == "diff"));
+    assert!(commands.iter().any(|c| c.name == "review"));
+
+    // The curated TUI catalog must not resurrect commands this CLI omitted.
+    assert!(!commands.iter().any(|c| c.name == "diff"));
 
     // Discovered custom skill from get_context_usage
     let custom = commands
@@ -680,7 +678,7 @@ async fn commands_discovery_merges_catalog_and_probes() {
     assert_eq!(custom.description, "Custom skill (custom-skill)");
 
     // Cached: the second call reuses the first probe's result
-    let again = h.commands().await.expect("cache hit");
+    let again = h.commands(None).await.expect("cache hit");
     assert_eq!(again, commands);
 }
 
@@ -868,7 +866,7 @@ async fn live_models_discovery() {
 #[ignore]
 async fn live_commands_discovery() {
     let h = ClaudeHarness::new();
-    let commands = h.commands().await.expect("live discovery");
+    let commands = h.commands(None).await.expect("live discovery");
     assert!(!commands.is_empty());
     eprintln!("{} commands, first: {:?}", commands.len(), commands.first());
 }

@@ -1,14 +1,49 @@
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+
+const COMPOSIO_SERVER_ID: &str = "composio";
+const COMPOSIO_KEY: &str = "x-consumer-api-key";
+const COMPOSIO_PLATFORM_API_KEY: &str = "composio-platform-api-key";
+const KEYRING_SERVICE: &str = "dev.komet.mcp";
+
+trait CredentialBackend: Send + Sync {
+    fn get(&self, account: &str) -> anyhow::Result<Option<String>>;
+    fn set(&self, account: &str, value: &str) -> anyhow::Result<()>;
+    fn delete(&self, account: &str) -> anyhow::Result<()>;
+}
+
+struct SystemCredentialBackend;
+
+impl CredentialBackend for SystemCredentialBackend {
+    fn get(&self, account: &str) -> anyhow::Result<Option<String>> {
+        let entry = keyring::Entry::new(KEYRING_SERVICE, account)?;
+        match entry.get_password() {
+            Ok(value) => Ok(Some(value)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn set(&self, account: &str, value: &str) -> anyhow::Result<()> {
+        keyring::Entry::new(KEYRING_SERVICE, account)?.set_password(value)?;
+        Ok(())
+    }
+
+    fn delete(&self, account: &str) -> anyhow::Result<()> {
+        match keyring::Entry::new(KEYRING_SERVICE, account)?.delete_credential() {
+            Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
 
 /// Local secret store for MCP servers.
 ///
-/// Persists to `~/.komet/mcp-secrets.json` (chmod 600) or any path provided.
-/// OS keychain fallback is noted but not required for Task 1 — file store is
-/// the canonical implementation. Secrets never leave this store except via
-/// `resolve` for in-memory provider launch.
-#[derive(Default)]
+/// Generic MCP values use an atomically replaced 0600 JSON file. Composio
+/// credentials use the OS credential store; the Platform key is read only by
+/// the Composio API client, while legacy MCP secrets are resolved for launch.
 pub struct McpSecretStore {
     path: PathBuf,
     /// outer key = server id, inner = secret key -> value (header name or env var).
@@ -16,6 +51,7 @@ pub struct McpSecretStore {
     /// engine (resolve at run time) and the RPC surface (write-only upserts —
     /// secret values flow in via RPC, never back out).
     secrets: Mutex<HashMap<String, HashMap<String, String>>>,
+    credentials: Arc<dyn CredentialBackend>,
 }
 
 impl Clone for McpSecretStore {
@@ -24,6 +60,7 @@ impl Clone for McpSecretStore {
         Self {
             path: self.path.clone(),
             secrets: Mutex::new(self.lock_secrets().clone()),
+            credentials: self.credentials.clone(),
         }
     }
 }
@@ -55,15 +92,24 @@ impl McpSecretStore {
         let mut store = Self {
             path,
             secrets: Mutex::new(HashMap::new()),
+            credentials: Arc::new(SystemCredentialBackend),
         };
-        // Best-effort load: a corrupt file must be visible, not a silent empty
-        // store that then overwrites every stored secret on the next save.
-        if let Err(err) = store.load() {
-            tracing::warn!(
-                path = %store.path.display(),
-                error = %err,
-                "mcp secret store could not be read; starting empty"
-            );
+        // Best-effort load; empty on failure.
+        if let Err(error) = store.load() {
+            tracing::warn!(error = %error, "mcp secrets could not be loaded");
+        }
+        store
+    }
+
+    #[cfg(test)]
+    fn with_backend(path: impl AsRef<Path>, credentials: Arc<dyn CredentialBackend>) -> Self {
+        let mut store = Self {
+            path: path.as_ref().to_path_buf(),
+            secrets: Mutex::new(HashMap::new()),
+            credentials,
+        };
+        if let Err(error) = store.load() {
+            tracing::warn!(error = %error, "mcp secrets could not be loaded");
         }
         store
     }
@@ -91,6 +137,7 @@ impl McpSecretStore {
         Self {
             path,
             secrets: Mutex::new(HashMap::new()),
+            credentials: Arc::new(SystemCredentialBackend),
         }
     }
 
@@ -110,6 +157,22 @@ impl McpSecretStore {
         Self::new(Self::default_path())
     }
 
+    pub fn composio_platform_api_key(&self) -> anyhow::Result<Option<String>> {
+        self.credentials.get(COMPOSIO_PLATFORM_API_KEY)
+    }
+
+    pub fn set_composio_platform_api_key(&self, value: &str) -> anyhow::Result<()> {
+        let value = value.trim();
+        if value.is_empty() {
+            anyhow::bail!("Composio Platform API key cannot be empty");
+        }
+        self.credentials.set(COMPOSIO_PLATFORM_API_KEY, value)
+    }
+
+    pub fn delete_composio_platform_api_key(&self) -> anyhow::Result<()> {
+        self.credentials.delete(COMPOSIO_PLATFORM_API_KEY)
+    }
+
     fn load(&mut self) -> anyhow::Result<()> {
         if !self.path.exists() {
             return Ok(());
@@ -118,47 +181,50 @@ impl McpSecretStore {
         if data.trim().is_empty() {
             return Ok(());
         }
-        let parsed: HashMap<String, HashMap<String, String>> = serde_json::from_str(&data)?;
+        let mut parsed: HashMap<String, HashMap<String, String>> = serde_json::from_str(&data)?;
+        let mut migrated = false;
+        if let Some(value) = parsed
+            .get_mut(COMPOSIO_SERVER_ID)
+            .and_then(|secrets| secrets.remove(COMPOSIO_KEY))
+        {
+            self.credentials.set(COMPOSIO_KEY, &value)?;
+            migrated = true;
+        }
+        if parsed
+            .get(COMPOSIO_SERVER_ID)
+            .is_some_and(HashMap::is_empty)
+        {
+            parsed.remove(COMPOSIO_SERVER_ID);
+        }
         *self.lock_secrets() = parsed;
+        if migrated {
+            self.save()?;
+        }
         Ok(())
     }
 
-    /// Atomic, 0600-from-birth write: a temp file in the same directory, fsync,
-    /// then rename. Writing in place would expose the secrets under the umask
-    /// between `write` and `chmod`, and a crash mid-write would truncate the
-    /// store (losing every secret on the next load).
     fn save(&self) -> anyhow::Result<()> {
-        let data = serde_json::to_string_pretty(&*self.lock_secrets())?;
-        if let Some(parent) = self.path.parent() {
-            crate::ensure_private_dir(parent)?;
-        }
-        let tmp = self
-            .path
-            .with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
+        let parent = parent_dir(&self.path);
+        std::fs::create_dir_all(parent)?;
+        let secrets = self.lock_secrets();
+        let data = serde_json::to_vec_pretty(&*secrets)?;
+        let mut temp = tempfile::NamedTempFile::new_in(parent)?;
         #[cfg(unix)]
         {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
+            use std::os::unix::fs::PermissionsExt;
+            temp.as_file()
+                .set_permissions(std::fs::Permissions::from_mode(0o600))?;
         }
-        let written = (|| -> std::io::Result<()> {
-            use std::io::Write as _;
-            let mut file = options.open(&tmp)?;
-            file.write_all(data.as_bytes())?;
-            file.sync_all()
-        })();
-        if let Err(err) = written {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(err.into());
-        }
-        if let Err(err) = std::fs::rename(&tmp, &self.path) {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(err.into());
-        }
+        temp.write_all(&data)?;
+        temp.as_file().sync_all()?;
+        temp.persist(&self.path).map_err(|error| error.error)?;
+        #[cfg(unix)]
+        std::fs::File::open(parent)?.sync_all()?;
+        let server_count = secrets.len();
+        drop(secrets);
         tracing::debug!(
             path = %self.path.display(),
-            keys = self.lock_secrets().len(),
+            keys = server_count,
             "mcp secrets saved (values masked)"
         );
         Ok(())
@@ -166,6 +232,20 @@ impl McpSecretStore {
 
     /// Store or update a secret for a server id.
     pub fn set_secret(&self, id: &str, key: &str, value: &str) -> anyhow::Result<()> {
+        if is_keyring_secret(id, key) {
+            self.credentials.set(key, value)?;
+            let mut secrets = self.lock_secrets();
+            if let Some(entry) = secrets.get_mut(id) {
+                entry.remove(key);
+                if entry.is_empty() {
+                    secrets.remove(id);
+                }
+            }
+            drop(secrets);
+            self.save()?;
+            tracing::debug!(server_id = %id, key = %key, "mcp secret stored in OS credential store");
+            return Ok(());
+        }
         {
             let mut secrets = self.lock_secrets();
             let entry = secrets.entry(id.to_string()).or_default();
@@ -181,7 +261,19 @@ impl McpSecretStore {
 
     /// Resolve all secrets for a server id (headers + env merged — caller distinguishes via config).
     pub fn resolve(&self, id: &str) -> HashMap<String, String> {
-        self.lock_secrets().get(id).cloned().unwrap_or_default()
+        let mut resolved = self.lock_secrets().get(id).cloned().unwrap_or_default();
+        if id == COMPOSIO_SERVER_ID {
+            match self.credentials.get(COMPOSIO_KEY) {
+                Ok(Some(value)) => {
+                    resolved.insert(COMPOSIO_KEY.to_string(), value);
+                }
+                Ok(None) => {}
+                Err(_) => {
+                    tracing::warn!(server_id = %id, "mcp credential could not be read from OS credential store")
+                }
+            }
+        }
+        resolved
     }
 
     /// Alias for header resolution — currently same underlying merged map.
@@ -223,6 +315,9 @@ impl McpSecretStore {
 
     /// Remove a secret.
     pub fn remove_secret(&self, id: &str, key: &str) -> anyhow::Result<()> {
+        if is_keyring_secret(id, key) {
+            self.credentials.delete(key)?;
+        }
         {
             let mut secrets = self.lock_secrets();
             if let Some(map) = secrets.get_mut(id) {
@@ -239,5 +334,120 @@ impl McpSecretStore {
     /// For Task 2 registry integration: return path for diagnostics (masked).
     pub fn path(&self) -> &Path {
         &self.path
+    }
+}
+
+impl Default for McpSecretStore {
+    fn default() -> Self {
+        Self::with_default_path()
+    }
+}
+
+fn is_keyring_secret(id: &str, key: &str) -> bool {
+    id == COMPOSIO_SERVER_ID && key == COMPOSIO_KEY
+}
+
+fn parent_dir(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct MemoryCredentialBackend(Mutex<HashMap<String, String>>);
+
+    impl CredentialBackend for MemoryCredentialBackend {
+        fn get(&self, account: &str) -> anyhow::Result<Option<String>> {
+            Ok(self.0.lock().unwrap().get(account).cloned())
+        }
+
+        fn set(&self, account: &str, value: &str) -> anyhow::Result<()> {
+            self.0
+                .lock()
+                .unwrap()
+                .insert(account.to_string(), value.to_string());
+            Ok(())
+        }
+
+        fn delete(&self, account: &str) -> anyhow::Result<()> {
+            self.0.lock().unwrap().remove(account);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn composio_credential_uses_backend_not_json_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp-secrets.json");
+        let store =
+            McpSecretStore::with_backend(&path, Arc::new(MemoryCredentialBackend::default()));
+
+        store
+            .set_secret(COMPOSIO_SERVER_ID, COMPOSIO_KEY, "consumer-secret")
+            .unwrap();
+
+        assert_eq!(
+            store.resolve(COMPOSIO_SERVER_ID)[COMPOSIO_KEY],
+            "consumer-secret"
+        );
+        let persisted = std::fs::read_to_string(path).unwrap();
+        assert!(!persisted.contains("consumer-secret"));
+        assert!(
+            serde_json::from_str::<HashMap<String, HashMap<String, String>>>(&persisted)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn composio_platform_key_uses_os_credential_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp-secrets.json");
+        let backend = Arc::new(MemoryCredentialBackend::default());
+        let store = McpSecretStore::with_backend(&path, backend.clone());
+
+        store
+            .set_composio_platform_api_key("platform-secret")
+            .unwrap();
+        assert_eq!(
+            store.composio_platform_api_key().unwrap().as_deref(),
+            Some("platform-secret")
+        );
+        assert!(
+            !path.exists()
+                || !std::fs::read_to_string(&path)
+                    .unwrap()
+                    .contains("platform-secret")
+        );
+
+        store.delete_composio_platform_api_key().unwrap();
+        assert_eq!(backend.get(COMPOSIO_PLATFORM_API_KEY).unwrap(), None);
+    }
+
+    #[test]
+    fn secret_file_replacement_keeps_valid_json_and_restrictive_permissions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mcp-secrets.json");
+        let store =
+            McpSecretStore::with_backend(&path, Arc::new(MemoryCredentialBackend::default()));
+
+        store.set_secret("other", "TOKEN", "value").unwrap();
+
+        let persisted: HashMap<String, HashMap<String, String>> =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(persisted["other"]["TOKEN"], "value");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
     }
 }

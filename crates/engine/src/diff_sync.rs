@@ -1214,13 +1214,7 @@ pub async fn capture_commit_diff(
 /// `git merge-base <base_ref> HEAD` — the diff base for "Branch changes".
 /// Errors when the ref is unknown or the histories are unrelated.
 pub async fn merge_base(root: &Path, base_ref: &str) -> Result<String, EngineError> {
-    // `base_ref` is an RPC-supplied argument: a leading `-` would be parsed as a
-    // git flag instead of a revision.
-    let trimmed = base_ref.trim();
-    if trimmed.is_empty() || trimmed.starts_with('-') {
-        return Err(EngineError::Other(format!("invalid base ref: {base_ref}")));
-    }
-    let capture = capture_git(root, &["merge-base", trimmed, "HEAD"], 256).await?;
+    let capture = capture_git(root, &["merge-base", base_ref, "HEAD"], 256).await?;
     let sha = String::from_utf8_lossy(&capture.stdout).trim().to_string();
     if sha.is_empty() {
         return Err(EngineError::Other(format!("no merge base with {base_ref}")));

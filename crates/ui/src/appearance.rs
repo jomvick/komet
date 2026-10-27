@@ -100,16 +100,28 @@ pub fn mode(cx: &App) -> AppearanceMode {
 /// Change the user's preference, repaint if that changed the palette, and write
 /// the choice to disk.
 pub fn set_mode(mode: AppearanceMode, cx: &mut App) {
-    if !cx.has_global::<AppearanceState>() {
+    let Some((current_mode, system)) = cx
+        .try_global::<AppearanceState>()
+        .map(|state| (state.mode, state.system))
+    else {
+        return;
+    };
+    if current_mode == mode {
         return;
     }
-    let state = cx.global_mut::<AppearanceState>();
-    if state.mode == mode {
-        return;
-    }
-    state.mode = mode;
-    let data_dir = state.data_dir.clone();
+    let palette_unchanged = cx
+        .try_global::<Theme>()
+        .is_some_and(|theme| theme.appearance == resolve(mode, system));
+    let data_dir = {
+        let state = cx.global_mut::<AppearanceState>();
+        state.mode = mode;
+        state.data_dir.clone()
+    };
     apply(cx);
+    if palette_unchanged {
+        Theme::install(resolve(mode, system), cx);
+        cx.refresh_windows();
+    }
     persist(mode, &data_dir);
 }
 

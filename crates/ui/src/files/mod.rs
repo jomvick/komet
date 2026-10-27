@@ -553,7 +553,7 @@ impl FilesSurface {
         action: editor::EditorContextAction,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        crate::popover::menu_row(theme, false, id)
+        crate::popover::menu_row(theme, false, id, cx.entity_id())
             .id(id)
             .when(!enabled, |row| row.opacity(0.38).cursor_default())
             .when(enabled, |row| {
@@ -648,6 +648,12 @@ impl FilesSurface {
     pub fn set_editor_font_size(&mut self, editor_font_size: f32, cx: &mut Context<Self>) {
         self.preview.set_editor_font_size(editor_font_size);
         cx.notify();
+    }
+
+    pub fn open_at_line(&mut self, line: u32, cx: &mut Context<Self>) {
+        if let Some(path) = self.editor_path.clone() {
+            self.navigate_to_line(&path, line, cx);
+        }
     }
 
     pub fn set_show_all_files(&mut self, show_all_files: bool, cx: &mut Context<Self>) {

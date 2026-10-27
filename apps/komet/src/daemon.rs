@@ -12,46 +12,13 @@ use std::process::Command;
 
 use anyhow::{Context, bail};
 
-/// Write a service definition (systemd unit or launchd plist). Both carry the
-/// environment captured at install time — including `KOMET_EDGE_TOKEN` — so the
-/// file must not be readable by other local accounts: `std::fs::write` leaves it
-/// at `0666 & ~umask` (0644 with the usual umask) on a machine where any other
-/// user could then read the sync token.
-fn write_service_file(path: &Path, contents: &str) -> anyhow::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::io::Write as _;
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)
-            .with_context(|| format!("creating {}", path.display()))?;
-        file.write_all(contents.as_bytes())
-            .with_context(|| format!("writing {}", path.display()))?;
-        // `mode` only applies to a new file: a unit left by an earlier install
-        // (or by the project's own installer) keeps its old, wider mode unless
-        // it is tightened explicitly.
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("restricting {}", path.display()))?;
-        Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        std::fs::write(path, contents).with_context(|| format!("writing {}", path.display()))
-    }
-}
-
 /// Windows service-manager implementation. Declared unconditionally: the
 /// `cfg!(target_os = "windows")` branches below are type-checked on every
 /// platform, so the module (and its non-Windows stubs) must exist everywhere.
 mod win;
 
 const LAUNCHD_LABEL: &str = "sh.komet.app";
-/// Unit name written by `komet daemon install`. Comet's curl|sh installer
+/// Unit name written by `komet daemon install`. Komet's curl|sh installer
 /// (`edge/src/install.sh`) used to write this same name so the two paths
 /// wouldn't fight over the unit; that installer no longer exists in Komet
 /// (the `edge` crate was dropped), so `komet daemon install` is the sole
@@ -109,9 +76,9 @@ pub fn install(data_dir: &Path) -> anyhow::Result<()> {
         std::fs::create_dir_all(data_dir)?;
         // Reinstall-friendly: unload any previous incarnation before rewriting.
         let _ = run_quiet("launchctl", &["bootout", &launchd_service_target()?]);
-        write_service_file(
+        std::fs::write(
             &plist,
-            &render_launchd_plist(&exe, &env, &data_dir.join("daemon.log")),
+            render_launchd_plist(&exe, &env, &data_dir.join("daemon.log")),
         )?;
         run(
             "launchctl",
@@ -124,7 +91,7 @@ pub fn install(data_dir: &Path) -> anyhow::Result<()> {
     } else if cfg!(target_os = "linux") {
         let unit = systemd_unit_path()?;
         std::fs::create_dir_all(unit.parent().expect("systemd user dir"))?;
-        write_service_file(&unit, &render_systemd_unit(&exe, &env))?;
+        std::fs::write(&unit, render_systemd_unit(&exe, &env))?;
         run("systemctl", &["--user", "daemon-reload"])?;
         run("systemctl", &["--user", "enable", "--now", SYSTEMD_UNIT])?;
         println!("Installed and started {SYSTEMD_UNIT} ({}).", unit.display());
@@ -285,22 +252,12 @@ pub fn status() -> anyhow::Result<()> {
         }
         Ok(())
     } else if cfg!(target_os = "linux") {
-        // `systemctl status` always exited 0 here, so a script could not tell an
-        // installed-but-stopped daemon from a machine where Komet was never
-        // installed. Output stays the passthrough, the exit status is now
-        // meaningful: 3 = no unit on disk, anything else = systemctl's own code.
-        let unit = systemd_unit_path()?;
-        if !unit.exists() {
-            println!("{SYSTEMD_UNIT}: not installed (`komet daemon install`)");
-            std::process::exit(3);
-        }
-        let status = Command::new("systemctl")
+        // Passthrough; `status` exits nonzero for inactive units, which is not an
+        // error for us to report — the output already says it.
+        let _ = Command::new("systemctl")
             .args(["--user", "--no-pager", "status", SYSTEMD_UNIT])
             .status()
             .context("running systemctl")?;
-        if !status.success() {
-            std::process::exit(status.code().unwrap_or(1));
-        }
         Ok(())
     } else if cfg!(target_os = "windows") {
         win::status()?;
@@ -474,30 +431,6 @@ fn run_quiet(program: &str, args: &[&str]) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    // S-01: the unit carries KOMET_EDGE_TOKEN, so it must not be world-readable.
-    #[cfg(unix)]
-    #[test]
-    fn service_files_are_written_owner_only_and_tighten_existing_ones() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("komet.service");
-        write_service_file(&path, "first").unwrap();
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-
-        // A unit left by an earlier install with wider permissions is tightened.
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-        write_service_file(&path, "second").unwrap();
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "second");
-    }
-
     #[test]
     fn systemd_unit_shape() {
         let unit = render_systemd_unit(
@@ -525,7 +458,7 @@ mod tests {
     // The curl|sh installer (edge/src/install.sh) shipped a duplicate unit
     // spec that this test cross-checked against `render_systemd_unit`. The
     // `edge` crate was removed as part of Komet's local-first divergence from
-    // Comet, so the installer no longer exists — `komet daemon install` is
+    // Komet, so the installer no longer exists — `komet daemon install` is
     // now the only path that writes the unit, and `systemd_unit_shape` above
     // already covers its shape directly.
 

@@ -32,10 +32,13 @@ pub mod composer;
 pub mod devices;
 pub mod files;
 pub mod harnesses;
+pub mod integrations;
 pub mod notifications;
+pub mod prompts;
 pub mod security;
 pub mod shortcuts;
 pub mod sync;
+pub mod wallpaper;
 pub mod widgets;
 
 pub const FILES_AUTOSAVE_DELAY_DEFAULT_MS: u64 = 1_000;
@@ -103,6 +106,11 @@ pub struct UiSettings {
     /// list. Kept for file compatibility; no longer read.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub space_order: Vec<String>,
+    /// "All projects" folders the user expanded, by space id. Absent =
+    /// collapsed (the default on first launch); pruned against existing
+    /// spaces like the remembered-navigation map.
+    #[serde(default, skip_serializing_if = "std::collections::HashSet::is_empty")]
+    pub expanded_spaces: std::collections::HashSet<String>,
     /// Session notification chimes (done / awaiting-input). `KOMET_DISABLE_SOUND`
     /// overrides.
     pub sound_enabled: bool,
@@ -123,7 +131,11 @@ pub struct UiSettings {
     /// Customizable shortcut combos (feature-inventory §1.4).
     pub keymap: KeymapConfig,
     /// Light/dark preference. Defaults to following the OS.
+    #[serde(deserialize_with = "deserialize_appearance")]
     pub appearance: crate::appearance::AppearanceMode,
+    /// Local image painted behind translucent app surfaces.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wallpaper_path: Option<String>,
     /// Idle time before an edited workspace file is saved automatically.
     pub files_autosave_delay_ms: u64,
     /// Wrap long lines in workspace file editors and previews.
@@ -146,6 +158,7 @@ impl Default for UiSettings {
             space_filter: None,
             tab_order: std::collections::HashMap::new(),
             space_order: Vec::new(),
+            expanded_spaces: std::collections::HashSet::new(),
             sound_enabled: true,
             notifications_enabled: true,
             notifications_background_only: true,
@@ -155,11 +168,28 @@ impl Default for UiSettings {
             terminal_open: false,
             keymap: KeymapConfig::default(),
             appearance: crate::appearance::AppearanceMode::default(),
+            wallpaper_path: None,
             files_autosave_delay_ms: FILES_AUTOSAVE_DELAY_DEFAULT_MS,
             files_word_wrap: false,
             files_editor_font_size: FILES_EDITOR_FONT_SIZE_DEFAULT,
             files_show_all: false,
         }
+    }
+}
+
+fn deserialize_appearance<'de, D>(
+    deserializer: D,
+) -> Result<crate::appearance::AppearanceMode, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    if value == "digitalHand" {
+        Ok(crate::appearance::AppearanceMode::Dark)
+    } else {
+        crate::appearance::AppearanceMode::deserialize(serde::de::value::StringDeserializer::<
+            D::Error,
+        >::new(value))
     }
 }
 
@@ -441,6 +471,7 @@ mod tests {
                 vec!["b".to_string(), "a".to_string()],
             )]),
             space_order: vec!["space-2".to_string(), "space-1".to_string()],
+            expanded_spaces: std::collections::HashSet::from(["space-1".to_string()]),
             sound_enabled: false,
             notifications_enabled: false,
             notifications_background_only: false,
@@ -453,13 +484,34 @@ mod tests {
                 ..KeymapConfig::default()
             },
             appearance: crate::appearance::AppearanceMode::Light,
+            wallpaper_path: Some("/wallpapers/aurora.webp".into()),
             files_autosave_delay_ms: 1000,
             files_word_wrap: true,
             files_editor_font_size: 13.0,
             files_show_all: false,
         };
         settings.save(dir.path()).unwrap();
+        let json = std::fs::read_to_string(UiSettings::path(dir.path())).unwrap();
+        let saved: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            saved["expandedSpaces"][0], "space-1",
+            "expanded folder state is written under the camelCase key"
+        );
         assert_eq!(UiSettings::load(dir.path()), settings);
+    }
+
+    #[test]
+    fn settings_without_wallpaper_default_to_none() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            UiSettings::path(dir.path()),
+            r#"{"sidebarWidth": 300, "soundEnabled": false}"#,
+        )
+        .unwrap();
+
+        let loaded = UiSettings::load(dir.path());
+        assert_eq!(loaded.wallpaper_path, None);
+        assert_eq!(loaded.sidebar_width, 300.0);
     }
 
     /// A settings file written before light mode existed has no `appearance`
@@ -485,6 +537,21 @@ mod tests {
             loaded.notifications_background_only,
             "pre-banner files default background-only on"
         );
+    }
+
+    #[test]
+    fn removed_digital_hand_appearance_migrates_to_dark() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            UiSettings::path(dir.path()),
+            r#"{"appearance":"digitalHand","sidebarWidth":300,"soundEnabled":false}"#,
+        )
+        .unwrap();
+
+        let loaded = UiSettings::load(dir.path());
+        assert_eq!(loaded.appearance, crate::appearance::AppearanceMode::Dark);
+        assert_eq!(loaded.sidebar_width, 300.0);
+        assert!(!loaded.sound_enabled);
     }
 
     #[test]
@@ -613,6 +680,8 @@ mod tests {
         let loaded = UiSettings::load(dir.path());
         assert_eq!(loaded.keymap, KeymapConfig::default());
         assert!(!loaded.sidebar_grouped);
+        // A file without the key means "every folder collapsed".
+        assert!(loaded.expanded_spaces.is_empty());
     }
 
     #[test]

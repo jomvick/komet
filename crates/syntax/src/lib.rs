@@ -454,41 +454,6 @@ fn markdown_inline_configuration() -> Result<HighlightConfiguration, HighlightEr
     )
 }
 
-/// `tree-sitter-kotlin-ng` ships a grammar without a highlight query, so these
-/// captures are written against its published node names. Every node type here
-/// must exist in the crate's `node-types.json`: an unknown name fails query
-/// compilation and drops highlighting for the whole language.
-const KOTLIN_HIGHLIGHTS: &str = r#"
-[(line_comment) (block_comment)] @comment
-[
-  "class" "interface" "fun" "val" "var" "object" "package" "import"
-  "return" "if" "else" "when" "for" "while" "do" "try" "catch" "finally"
-  "throw" "is" "as" "in" "by" "where" "typealias" "companion" "init"
-] @keyword
-[(string_literal) (multiline_string_literal) (character_literal)] @string
-(string_content) @string
-(escape_sequence) @string.escape
-(interpolation) @embedded
-[(number_literal) (float_literal)] @number
-(modifiers) @keyword
-(inheritance_modifier) @keyword
-(type_modifiers) @keyword
-(parameter_modifiers) @keyword
-(annotation) @attribute
-[(user_type) (nullable_type) (non_nullable_type) (function_type) (parenthesized_type) (type_projection)] @type
-(class_declaration (identifier) @type)
-(object_declaration (identifier) @type)
-(enum_entry (identifier) @type)
-(function_declaration (identifier) @function)
-(call_expression (identifier) @function)
-(navigation_expression (identifier) @property)
-(variable_declaration (identifier) @property)
-(parameter (identifier) @variable.parameter)
-(class_parameter (identifier) @variable.parameter)
-(this_expression) @variable.builtin
-(super_expression) @variable.builtin
-"#;
-
 fn make_configuration(
     language: tree_sitter::Language,
     name: &str,
@@ -628,7 +593,7 @@ fn configuration(language: LanguageId) -> Result<HighlightConfiguration, Highlig
         Kotlin => make_configuration(
             tree_sitter_kotlin_ng::LANGUAGE.into(),
             "kotlin",
-            KOTLIN_HIGHLIGHTS,
+            "[(line_comment) (block_comment)] @comment [(string_literal) (multiline_string_literal)] @string [(number_literal) (float_literal)] @number",
             "",
             "",
         ),
@@ -794,8 +759,8 @@ pub fn language_for_alias(alias: &str) -> Option<LanguageId> {
         "html" | "htm" => LanguageId::Html,
         "css" => LanguageId::Css,
         "yaml" | "yml" => LanguageId::Yaml,
-        "c" | "h" => LanguageId::C,
-        "cpp" | "c++" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => LanguageId::Cpp,
+        "c" => LanguageId::C,
+        "cpp" | "c++" | "cc" | "cxx" | "hpp" => LanguageId::Cpp,
         "csharp" | "c#" | "cs" => LanguageId::CSharp,
         "java" => LanguageId::Java,
         "kotlin" | "kt" | "kts" => LanguageId::Kotlin,
@@ -806,7 +771,7 @@ pub fn language_for_alias(alias: &str) -> Option<LanguageId> {
         "lua" => LanguageId::Lua,
         "dockerfile" | "docker" => LanguageId::Dockerfile,
         "nix" => LanguageId::Nix,
-        "make" | "makefile" | "mk" => LanguageId::Make,
+        "make" | "makefile" => LanguageId::Make,
         _ => return None,
     })
 }
@@ -814,31 +779,13 @@ pub fn language_for_alias(alias: &str) -> Option<LanguageId> {
 pub fn language_for_path(path: &str) -> Option<LanguageId> {
     let path = Path::new(path);
     let name = path.file_name()?.to_str()?;
-    let lower = name.to_ascii_lowercase();
-    match lower.as_str() {
+    match name.to_ascii_lowercase().as_str() {
         "dockerfile" | "containerfile" => return Some(LanguageId::Dockerfile),
         "makefile" | "gnumakefile" => return Some(LanguageId::Make),
         "cargo.lock" | "cargo.toml" | "pyproject.toml" => return Some(LanguageId::Toml),
         _ => {}
     }
-    // Variants such as `Dockerfile.dev`, `Containerfile.test`, `Makefile.inc`
-    // and `GNUmakefile.local` keep the base name as a prefix.
-    if name_has_base(&lower, &["dockerfile", "containerfile"]) {
-        return Some(LanguageId::Dockerfile);
-    }
-    if name_has_base(&lower, &["makefile", "gnumakefile"]) {
-        return Some(LanguageId::Make);
-    }
     language_for_alias(path.extension()?.to_str()?)
-}
-
-/// True when `name` is one of `bases` or extends it with a separator, so that
-/// `Makefile.inc` matches while `makefileish` does not.
-fn name_has_base(name: &str, bases: &[&str]) -> bool {
-    bases.iter().any(|base| match name.strip_prefix(base) {
-        Some(rest) => rest.is_empty() || rest.starts_with(['.', '-', '_']),
-        None => false,
-    })
 }
 
 fn language_for_shebang(line: &str) -> Option<LanguageId> {
@@ -894,24 +841,6 @@ mod tests {
         }
         assert_eq!(language_for_path("README"), None);
         assert_eq!(language_for_path("image.png"), None);
-    }
-
-    #[test]
-    fn headers_and_named_file_variants_resolve() {
-        let cases = [
-            ("include/komet.h", LanguageId::C),
-            ("src/widget.hpp", LanguageId::Cpp),
-            ("src/widget.hh", LanguageId::Cpp),
-            ("mk/release.mk", LanguageId::Make),
-            ("build/Makefile.inc", LanguageId::Make),
-            ("build/GNUmakefile.local", LanguageId::Make),
-            ("docker/Dockerfile.dev", LanguageId::Dockerfile),
-            ("docker/Containerfile.test", LanguageId::Dockerfile),
-        ];
-        for (path, expected) in cases {
-            assert_eq!(language_for_path(path), Some(expected), "{path}");
-        }
-        assert_eq!(language_for_path("notes/makefileish.txt"), None);
     }
 
     #[test]

@@ -93,6 +93,27 @@ fn claude_mcp_config_merges_without_duplicate() {
     assert_eq!(cfg["mcpServers"].as_object().unwrap().len(), 3); // komet + gh + notion
 }
 
+#[test]
+fn composio_secret_is_not_serialized_into_claude_process_arguments() {
+    let mut composio = resolved_github();
+    composio.config.id = "composio".into();
+    composio.config.name = "Composio".into();
+    composio.config.url = Some("https://connect.composio.dev/mcp".into());
+    composio.resolved_headers =
+        [("x-consumer-api-key".into(), "secret-consumer-key".into())].into();
+    let cmd = ClaudeHarness::new().build_command(
+        &PathBuf::from("claude"),
+        &base_request_with_mcp(vec![composio]),
+    );
+    let args: Vec<String> = cmd
+        .as_std()
+        .get_args()
+        .map(|arg| arg.to_string_lossy().to_string())
+        .collect();
+    assert!(!args.iter().any(|arg| arg.contains("secret-consumer-key")));
+    assert!(!args.iter().any(|arg| arg.contains("connect.composio.dev")));
+}
+
 /// The 1M context window rides the model id as a `[1m]` suffix. Ids discovered
 /// from the CLI's own `list_models` can already carry it (`opus[1m]`), so the
 /// suffix must never be doubled on the wire.

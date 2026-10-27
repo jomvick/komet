@@ -21,7 +21,8 @@
 //! - Repos (§3.5): `ListRepos`, `AddRepo {path}`, `CloneRepo {url}`,
 //!   `CreateRepo {name}`, `ListBranches {repoPath}` (default branch first),
 //!   `ListFolders {path?}`, `CreateWorktree {repoPath, branch}`, `DeleteWorktree
-//!   {repoPath, worktreePath}`; `WatchCheckoutDiffs` → stream of `CheckoutDiff[]`
+//!   {repoPath, worktreePath}`, `OpenProject {repoPath, target}`; `WatchCheckoutDiffs`
+//!   → stream of `CheckoutDiff[]`
 //! - Terminals (§3.4): `OpenTerminal {chatId?, spaceId?, cols, rows}` → `TerminalSession`,
 //!   `SubscribeTerminal {terminalId, afterSeq?}` → stream of `TerminalEvent`
 //!   (replay then live tail), `WriteTerminal {terminalId, data}`, `ResizeTerminal`,
@@ -87,6 +88,9 @@ struct ListModelsParams {
     harness: HarnessId,
     #[serde(default)]
     force: bool,
+    /// Chat project cwd for command discovery; absent = the engine's HOME.
+    #[serde(default)]
+    cwd: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1012,6 +1016,134 @@ impl EngineRpc {
             other => Err(RpcError::UnknownMethod(other.to_string())),
         }
     }
+
+    fn composio_api(&self) -> Result<crate::composio::ComposioApi, RpcError> {
+        let api_key = self
+            .mcp_secrets()?
+            .composio_platform_api_key()
+            .map_err(|error| RpcError::Failed(format!("Composio credential store: {error}")))?
+            .ok_or_else(|| {
+                RpcError::Failed("Composio Platform API key is not configured".into())
+            })?;
+        crate::composio::ComposioApi::new(api_key, self.engine_info.device_id.clone())
+            .map_err(|error| RpcError::Failed(format!("Composio configuration: {error}")))
+    }
+
+    async fn handle_composio(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<RpcReply, RpcError> {
+        match method {
+            methods::GET_COMPOSIO_STATUS => {
+                let configured = self
+                    .mcp_secrets()?
+                    .composio_platform_api_key()
+                    .map_err(|error| {
+                        RpcError::Failed(format!("Composio credential store: {error}"))
+                    })?
+                    .is_some();
+                RpcReply::value(&serde_json::json!({ "configured": configured }))
+            }
+            methods::SAVE_COMPOSIO_API_KEY => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct Params {
+                    api_key: String,
+                }
+                let Params { api_key } = parse_params(params)?;
+                let api = crate::composio::ComposioApi::new(
+                    api_key.clone(),
+                    self.engine_info.device_id.clone(),
+                )
+                .map_err(|error| RpcError::BadParams(error.to_string()))?;
+                api.validate_key().await.map_err(|error| {
+                    RpcError::Failed(format!("Composio key validation failed: {error}"))
+                })?;
+                self.mcp_secrets()?
+                    .set_composio_platform_api_key(&api_key)
+                    .map_err(|error| {
+                        RpcError::Failed(format!("Composio credential store: {error}"))
+                    })?;
+                RpcReply::value(&serde_json::json!({ "configured": true }))
+            }
+            methods::DELETE_COMPOSIO_API_KEY => {
+                self.mcp_secrets()?
+                    .delete_composio_platform_api_key()
+                    .map_err(|error| {
+                        RpcError::Failed(format!("Composio credential store: {error}"))
+                    })?;
+                RpcReply::value(&serde_json::json!({ "configured": false }))
+            }
+            methods::SEARCH_COMPOSIO_INTEGRATIONS => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct Params {
+                    #[serde(default)]
+                    query: String,
+                }
+                let Params { query } = parse_params(params)?;
+                if query.chars().count() > 80 {
+                    return Err(RpcError::BadParams(
+                        "Composio search query exceeds 80 characters".into(),
+                    ));
+                }
+                let integrations = self
+                    .composio_api()?
+                    .search_toolkits(query.trim())
+                    .await
+                    .map_err(|error| {
+                        RpcError::Failed(format!("Composio search failed: {error}"))
+                    })?;
+                RpcReply::value(&serde_json::json!({ "integrations": integrations }))
+            }
+            methods::LIST_COMPOSIO_ACCOUNTS => {
+                let accounts =
+                    self.composio_api()?
+                        .connected_accounts()
+                        .await
+                        .map_err(|error| {
+                            RpcError::Failed(format!("Composio account lookup failed: {error}"))
+                        })?;
+                RpcReply::value(&serde_json::json!({ "accounts": accounts }))
+            }
+            methods::CONNECT_COMPOSIO_INTEGRATION => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct Params {
+                    toolkit_slug: String,
+                }
+                let Params { toolkit_slug } = parse_params(params)?;
+                let link = self
+                    .composio_api()?
+                    .connect(&toolkit_slug)
+                    .await
+                    .map_err(|error| {
+                        RpcError::Failed(format!("Composio connection could not start: {error}"))
+                    })?;
+                RpcReply::value(&serde_json::json!({
+                    "url": link.url,
+                    "connectedAccountId": link.connected_account_id
+                }))
+            }
+            methods::DISCONNECT_COMPOSIO_ACCOUNT => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct Params {
+                    account_id: String,
+                }
+                let Params { account_id } = parse_params(params)?;
+                self.composio_api()?
+                    .disconnect(&account_id)
+                    .await
+                    .map_err(|error| {
+                        RpcError::Failed(format!("Composio account disconnect failed: {error}"))
+                    })?;
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            other => Err(RpcError::UnknownMethod(other.to_string())),
+        }
+    }
 }
 
 /// ControlRpc methods that honor `targetDeviceId` (feature-inventory §2.1). Extend this
@@ -1021,6 +1153,8 @@ fn forwardable(method: &str) -> bool {
     matches!(
         method,
         methods::LIST_HARNESSES
+            | methods::GET_HARNESS_CLI_STATUS
+            | methods::MANAGE_HARNESS_CLI
             | methods::SET_HARNESS_ENABLED
             | methods::LIST_MODELS
             | methods::LIST_COMMANDS
@@ -1035,6 +1169,8 @@ fn forwardable(method: &str) -> bool {
             | methods::CREATE_REPO
             | methods::LIST_BRANCHES
             | methods::LIST_REFS
+            | methods::GET_GITHUB_STATUS
+            | methods::OPEN_PROJECT
             | methods::LIST_GIT_HISTORY
             | methods::FETCH_ALL
             | methods::SWITCH_REF
@@ -1339,10 +1475,43 @@ impl RpcService for EngineRpc {
             let registry = self.mcp_registry()?;
             return self.handle_mcp(registry, method, params).await;
         }
+        let is_composio_method = matches!(
+            method,
+            methods::GET_COMPOSIO_STATUS
+                | methods::SAVE_COMPOSIO_API_KEY
+                | methods::DELETE_COMPOSIO_API_KEY
+                | methods::SEARCH_COMPOSIO_INTEGRATIONS
+                | methods::LIST_COMPOSIO_ACCOUNTS
+                | methods::CONNECT_COMPOSIO_INTEGRATION
+                | methods::DISCONNECT_COMPOSIO_ACCOUNT
+        );
+        if is_composio_method {
+            return self.handle_composio(method, params).await;
+        }
         match method {
             methods::ENGINE_INFO => RpcReply::value(&self.engine_info),
             methods::ENGINE_READY => RpcReply::value(&serde_json::json!({ "ready": true })),
             methods::LIST_HARNESSES => RpcReply::value(&self.registry.descriptors()),
+            methods::GET_HARNESS_CLI_STATUS => {
+                let params: crate::harness_cli::HarnessCliStatusParams = parse_params(params)?;
+                let harnesses = self
+                    .registry
+                    .descriptors()
+                    .into_iter()
+                    .map(|descriptor| descriptor.id)
+                    .filter(|harness| *harness != HarnessId::Mock)
+                    .collect::<Vec<_>>();
+                RpcReply::value(
+                    &crate::harness_cli::statuses(&harnesses, params.check_latest).await,
+                )
+            }
+            methods::MANAGE_HARNESS_CLI => {
+                let params: crate::harness_cli::ManageHarnessCliParams = parse_params(params)?;
+                crate::harness_cli::manage(params.harness)
+                    .await
+                    .map_err(RpcError::Failed)?;
+                RpcReply::value(&self.registry.descriptors())
+            }
             methods::SET_HARNESS_ENABLED => {
                 let p: SetHarnessEnabledParams = parse_params(params)?;
                 self.registry
@@ -1370,7 +1539,10 @@ impl RpcService for EngineRpc {
             methods::LIST_COMMANDS => {
                 let p: ListModelsParams = parse_params(params)?;
                 let commands = match self.registry.resolve(p.harness) {
-                    Ok(harness) => harness.commands().await.unwrap_or_default(),
+                    Ok(harness) => harness
+                        .commands(p.cwd.as_deref().map(std::path::Path::new))
+                        .await
+                        .unwrap_or_default(),
                     Err(_) => Vec::new(),
                 };
                 RpcReply::value(&commands)
@@ -1820,6 +1992,39 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 RpcReply::value(&refs)
             }
+            methods::GET_GITHUB_STATUS => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    #[serde(alias = "repo")]
+                    repo_path: String,
+                    #[serde(default)]
+                    branch: Option<String>,
+                }
+                let p: P = parse_params(params)?;
+                let status = self
+                    .repos
+                    .github_status_for_branch(
+                        std::path::Path::new(&p.repo_path),
+                        p.branch.as_deref(),
+                    )
+                    .await
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                RpcReply::value(&status)
+            }
+            methods::OPEN_PROJECT => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct P {
+                    repo_path: String,
+                    target: crate::repos::ProjectOpenTarget,
+                }
+                let p: P = parse_params(params)?;
+                self.repos
+                    .open_project(std::path::Path::new(&p.repo_path), p.target)
+                    .map_err(|error| RpcError::Failed(error.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "opened": true }))
+            }
             methods::LIST_GIT_HISTORY => {
                 #[derive(Deserialize)]
                 #[serde(rename_all = "camelCase")]
@@ -2156,6 +2361,8 @@ mod tests {
         assert!(forwardable(methods::QUEUE_COMMAND));
         assert!(forwardable(methods::SEARCH_FILES));
         assert!(forwardable(methods::FETCH_ALL));
+        assert!(forwardable(methods::GET_GITHUB_STATUS));
+        assert!(forwardable(methods::OPEN_PROJECT));
         // Issues #31 + #10 ride the same hub/philosophy as WatchDocMessages.
         assert!(forwardable(methods::WATCH_REASONING));
         assert!(forwardable(methods::GET_TOOL_DETAIL));

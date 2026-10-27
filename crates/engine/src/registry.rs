@@ -54,7 +54,7 @@ fn persist_models_cache_to(path: &Path, entries: &HashMap<HarnessId, CachedModel
         }
     };
     let tmp = path.with_extension("json.tmp");
-    if let Err(err) = std::fs::write(&tmp, json).and_then(|()| std::fs::rename(&tmp, &path)) {
+    if let Err(err) = std::fs::write(&tmp, json).and_then(|()| std::fs::rename(&tmp, path)) {
         tracing::warn!(error = %err, "model-cache save failed");
     }
 }
@@ -261,13 +261,13 @@ impl HarnessRegistry {
         // (opencode's cold Node start measured ~13s under the app's 4-way boot
         // prefetch; user report: "model loading is too slow"). A stale entry is
         // revalidated off the hot path.
-        if let Some(cached) = self.models_cache_entries().get(&id).cloned() {
-            if !cached.models.is_empty() {
-                if now - cached.discovered_at_ms >= refresh_after_ms {
-                    self.spawn_background_refresh(id);
-                }
-                return Ok(cached.models);
+        if let Some(cached) = self.models_cache_entries().get(&id).cloned()
+            && !cached.models.is_empty()
+        {
+            if now - cached.discovered_at_ms >= refresh_after_ms {
+                self.spawn_background_refresh(id);
             }
+            return Ok(cached.models);
         }
 
         // Nothing known yet: one blocking probe, then the curated fallback.
@@ -337,7 +337,7 @@ impl HarnessRegistry {
             .unwrap_or_else(PoisonError::into_inner)
             .clone();
         tokio::spawn(async move {
-            if let Ok(fresh) = harness.models().await
+            if let Ok(fresh) = harness.refresh_models().await
                 && !fresh.is_empty()
             {
                 cache.lock().unwrap_or_else(PoisonError::into_inner).insert(
@@ -361,7 +361,7 @@ impl HarnessRegistry {
     /// harness error propagates. A non-empty answer persists (success-only).
     pub async fn probe_live(&self, id: HarnessId) -> Result<Vec<Model>, HarnessError> {
         let harness = self.resolve(id)?;
-        let models = harness.models().await?;
+        let models = harness.refresh_models().await?;
         if models.is_empty() {
             return Err(HarnessError::Protocol(format!(
                 "{id:?} model discovery returned no usable models"
@@ -392,11 +392,10 @@ impl HarnessRegistry {
             .collect()
     }
 
-    /// Prefetch `ids` through the normal [`Self::models`] discipline
-    /// (cached path: instant when fresh, live probe on miss), two harnesses
-    /// at a time. Single-flight per harness: an id already being warmed is
-    /// skipped. Probe failures are ignored — boot prefetch must never fail;
-    /// the picker retries live.
+    /// Refresh `ids` from their CLIs on every engine start, two harnesses at
+    /// a time. Existing cached rows remain available until a successful live
+    /// probe replaces them. Single-flight per harness: an id already being
+    /// warmed is skipped. Failures are logged and leave the prior cache intact.
     pub async fn warm_models_cache(&self, ids: Vec<HarnessId>) {
         for chunk in ids.chunks(2) {
             if chunk.len() == 2 {
@@ -417,7 +416,13 @@ impl HarnessRegistry {
                 return;
             }
         }
-        let _ = self.models(id, false).await;
+        if let Err(error) = self.probe_live(id).await {
+            tracing::warn!(
+                harness = ?id,
+                error = %error,
+                "startup live model refresh failed; retaining cached models"
+            );
+        }
         self.warm_inflight
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -726,18 +731,12 @@ reason: None,
             supports_steering: true,
             steering_mode: SteeringMode::TurnBoundary,
             reasoning_levels: Vec::new(),
-            // Always show OpenCode in the Agents list even if the CLI is not
-            // yet installed — the row renders with an install hint and an inert
-            // toggle, matching the pattern used by Codex, Grok, etc.  The real
-            // probe only gates the toggle and the send path.
+            // Always show OpenCode in the Agents list; the live CLI probe
+            // determines whether it can be enabled or managed.
             installed: true,
             enabled: None,
         },
-        // The install probe returns true unconditionally so that the Agents
-        // page always shows the OpenCode row (with an install-hint when the
-        // CLI is absent and an inert toggle).  The real CLI check is enforced
-        // by set_enabled and by the send path when the harness is resolved.
-        Box::new(|| true),
+        Box::new(|| komet_harness::AcpHarness::opencode().installed()),
         Box::new(|| Ok(Arc::new(komet_harness::AcpHarness::opencode()) as Arc<dyn Harness>)),
     );
     // pi over ACP (community `pi-acp` adapter), same lazy pattern: the static
@@ -798,6 +797,48 @@ reason: None,
         Box::new(|| komet_harness::AcpHarness::cline().installed()),
         Box::new(|| Ok(Arc::new(komet_harness::AcpHarness::cline()) as Arc<dyn Harness>)),
     );
+    // Devin CLI over its native ACP server (`devin acp`).
+    registry.register_lazy(
+        HarnessDescriptor {
+            id: HarnessId::Devin,
+            name: "Devin".into(),
+            supports_steering: true,
+            steering_mode: SteeringMode::TurnBoundary,
+            reasoning_levels: Vec::new(),
+            installed: true,
+            enabled: None,
+        },
+        Box::new(|| komet_harness::AcpHarness::devin().installed()),
+        Box::new(|| Ok(Arc::new(komet_harness::AcpHarness::devin()) as Arc<dyn Harness>)),
+    );
+    // GitHub Copilot CLI over its native ACP server (`copilot --acp`).
+    registry.register_lazy(
+        HarnessDescriptor {
+            id: HarnessId::Copilot,
+            name: "GitHub Copilot".into(),
+            supports_steering: true,
+            steering_mode: SteeringMode::TurnBoundary,
+            reasoning_levels: Vec::new(),
+            installed: true,
+            enabled: None,
+        },
+        Box::new(|| komet_harness::AcpHarness::copilot().installed()),
+        Box::new(|| Ok(Arc::new(komet_harness::AcpHarness::copilot()) as Arc<dyn Harness>)),
+    );
+    // Muse Code's native Muse Session Protocol driver (`muse serve`).
+    registry.register_lazy(
+        HarnessDescriptor {
+            id: HarnessId::Muse,
+            name: "Muse Code".into(),
+            supports_steering: true,
+            steering_mode: SteeringMode::StepBoundary,
+            reasoning_levels: Vec::new(),
+            installed: true,
+            enabled: None,
+        },
+        Box::new(|| komet_harness::MuseHarness::new().installed()),
+        Box::new(|| Ok(Arc::new(komet_harness::MuseHarness::new()) as Arc<dyn Harness>)),
+    );
     registry
 }
 
@@ -842,7 +883,7 @@ mod tests {
     }
 
     #[test]
-    fn default_registry_lists_mock_claude_codex_and_grok_slots() {
+    fn default_registry_lists_all_supported_agent_slots() {
         let registry = default_registry();
         let ids: Vec<HarnessId> = registry.descriptors().iter().map(|d| d.id).collect();
         assert_eq!(
@@ -858,6 +899,9 @@ mod tests {
                 HarnessId::Pi,
                 HarnessId::Antigravity,
                 HarnessId::Cline,
+                HarnessId::Devin,
+                HarnessId::Copilot,
+                HarnessId::Muse,
             ]
         );
         assert!(registry.resolve(HarnessId::Mock).is_ok());
@@ -935,6 +979,22 @@ mod tests {
             .find(|d| d.id == HarnessId::Cline)
             .expect("cline descriptor");
         assert!(cline_desc.reasoning_levels.is_empty());
+        let devin = registry.resolve(HarnessId::Devin).unwrap();
+        assert_eq!(devin.id(), HarnessId::Devin);
+        assert_eq!(devin.display_name(), "Devin");
+        assert_eq!(devin.steering_mode(), SteeringMode::TurnBoundary);
+        assert!(devin.reasoning_levels().is_empty());
+        let copilot = registry.resolve(HarnessId::Copilot).unwrap();
+        assert_eq!(copilot.id(), HarnessId::Copilot);
+        assert_eq!(copilot.display_name(), "GitHub Copilot");
+        assert_eq!(copilot.steering_mode(), SteeringMode::TurnBoundary);
+        assert!(copilot.reasoning_levels().is_empty());
+        let muse = registry.resolve(HarnessId::Muse).unwrap();
+        assert_eq!(muse.id(), HarnessId::Muse);
+        assert_eq!(muse.display_name(), "Muse Code");
+        assert_eq!(muse.steering_mode(), SteeringMode::StepBoundary);
+        assert!(muse.supports_steering());
+        assert!(muse.reasoning_levels().is_empty());
         let agy_desc = registry
             .descriptors()
             .into_iter()
@@ -1062,6 +1122,39 @@ mod tests {
         let cached = reloaded.models(HarnessId::Mock, false).await;
         let ids: Vec<String> = cached.unwrap().into_iter().map(|m| m.id).collect();
         assert_eq!(ids, vec!["mock-1", "mock-fable-5"]);
+    }
+
+    #[tokio::test]
+    async fn startup_model_warm_replaces_a_fresh_disk_cache_with_live_models() {
+        use komet_harness::mock::MockHarness;
+        let dir = tempfile::tempdir().unwrap();
+        let registry = HarnessRegistry::new();
+        registry.load_models_cache(dir.path());
+        registry.register(Arc::new(MockHarness { script: Vec::new() }));
+
+        registry.models_cache_entries().insert(
+            HarnessId::Mock,
+            CachedModels {
+                discovered_at_ms: crate::now_ms(),
+                models: vec![Model {
+                    id: "obsolete-model".into(),
+                    label: "Obsolete".into(),
+                    description: None,
+                    reasoning_levels: vec![],
+                    options: vec![],
+                }],
+            },
+        );
+
+        registry.warm_models_cache(vec![HarnessId::Mock]).await;
+
+        let cache = registry.models_cache_entries();
+        let refreshed = cache[&HarnessId::Mock]
+            .models
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(refreshed, ["mock-1", "mock-fable-5"]);
     }
 
     /// A fresh cache entry serves instantly (age under the refresh window),

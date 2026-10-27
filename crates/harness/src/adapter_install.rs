@@ -4,7 +4,7 @@
 //! user's npm state in the hot path: a cold cache meant a multi-minute
 //! download while the chat showed "Working", and a broken one meant npm dying
 //! before the adapter ever ran — silently, with an errno-encoded exit code
-//! (254 = ENOENT, the kometsh/comet#95 crash) that surfaced as an opaque
+//! (254 = ENOENT) that surfaced as an opaque
 //! "harness protocol error". Instead, pinned adapter packages are installed
 //! ONCE into a komet-owned prefix (`~/.komet/adapters/<pkg>/<version>`, own
 //! npm cache beside it, so a root-owned or read-only `~/.npm` can't break
@@ -59,12 +59,9 @@ impl NpmPin {
 const OK_MARKER: &str = ".komet-install-ok";
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(600);
 
-/// `$KOMET_ADAPTERS_DIR` (fallback `$ZERON_ADAPTERS_DIR`), else `~/.komet/adapters`.
+/// `$KOMET_ADAPTERS_DIR`, else `~/.komet/adapters`.
 fn adapters_root() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("KOMET_ADAPTERS_DIR").filter(|d| !d.is_empty()) {
-        return Some(PathBuf::from(dir));
-    }
-    if let Some(dir) = std::env::var_os("ZERON_ADAPTERS_DIR").filter(|d| !d.is_empty()) {
         return Some(PathBuf::from(dir));
     }
     std::env::var_os("HOME")
@@ -233,7 +230,7 @@ pub(crate) async fn ensure_installed(
 /// A komet-owned shim script materialized INSIDE a managed install dir, for
 /// SDK packages with no bin entry (`@cursor/sdk`): the shim resolves the SDK
 /// from the sibling `node_modules`. Returns the shim path when the install is
-/// complete AND the shim contents match this build (a comet upgrade that
+/// complete AND the shim contents match this build (a komet upgrade that
 /// changes the shim rewrites it in place).
 pub(crate) fn installed_shim(pin: &NpmPin, shim_name: &str, contents: &str) -> Option<PathBuf> {
     let dir = install_dir(pin)?;

@@ -1077,6 +1077,13 @@ impl Changes {
         gpui::SharedString::from(self.scope.label())
     }
 
+    /// A pane currently showing the working tree (not a pinned commit or
+    /// another scope) — the GitHub menu's Changes row reuses such a tab
+    /// instead of stacking duplicates.
+    pub fn is_working_tree(&self) -> bool {
+        self.commit.is_none() && self.scope == DiffScope::WorkingTree
+    }
+
     /// The selected chat's host device when it differs from the connected
     /// engine's own — diffs are produced where the checkout lives, so a
     /// remote chat's watch must relay-forward (`targetDeviceId`) to its host.
@@ -2142,6 +2149,7 @@ impl Changes {
         id: &'static str,
         icon_path: &'static str,
         theme: &Theme,
+        owner: gpui::EntityId,
     ) -> gpui::Stateful<gpui::Div> {
         div()
             .id(id)
@@ -2157,7 +2165,7 @@ impl Changes {
                 crate::theme::wash(0.0),
                 crate::theme::wash(0.14),
             ))
-            .on_hover(motion::hover_listener(id))
+            .on_hover(motion::hover_listener(id, owner))
             .occlude()
             .on_mouse_down(gpui::MouseButton::Left, |_, window, _| {
                 window.prevent_default()
@@ -2212,11 +2220,16 @@ impl Changes {
                         .child(SharedString::from(commit.subject.clone())),
                 )
                 .child(
-                    Self::header_button("changes-fold-all", crate::icons::FOLD_VERTICAL, &theme)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.toggle_collapse_all(cx);
-                        })),
+                    Self::header_button(
+                        "changes-fold-all",
+                        crate::icons::FOLD_VERTICAL,
+                        &theme,
+                        cx.entity_id(),
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.toggle_collapse_all(cx);
+                    })),
                 )
                 .into_any_element();
         }
@@ -2240,7 +2253,10 @@ impl Changes {
                 crate::theme::wash(0.05),
                 crate::theme::wash(0.14),
             ))
-            .on_hover(motion::hover_listener("changes-scope-trigger"))
+            .on_hover(motion::hover_listener(
+                "changes-scope-trigger",
+                cx.entity_id(),
+            ))
             .occlude()
             .on_mouse_down(
                 gpui::MouseButton::Left,
@@ -2290,22 +2306,31 @@ impl Changes {
                 .gap(px(2.0))
                 .children(history_fetch_button)
                 .child(
-                    Self::header_button("history-refresh", crate::icons::REFRESH, &theme).on_click(
-                        cx.listener(|this, _, _, cx| {
-                            cx.stop_propagation();
-                            this.history_pane(cx)
-                                .update(cx, |history, cx| history.refresh(cx));
-                        }),
-                    ),
+                    Self::header_button(
+                        "history-refresh",
+                        crate::icons::REFRESH,
+                        &theme,
+                        cx.entity_id(),
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.history_pane(cx)
+                            .update(cx, |history, cx| history.refresh(cx));
+                    })),
                 )
                 .into_any_element()
         } else {
-            Self::header_button("changes-fold-all", crate::icons::FOLD_VERTICAL, &theme)
-                .on_click(cx.listener(|this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.toggle_collapse_all(cx);
-                }))
-                .into_any_element()
+            Self::header_button(
+                "changes-fold-all",
+                crate::icons::FOLD_VERTICAL,
+                &theme,
+                cx.entity_id(),
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                this.toggle_collapse_all(cx);
+            }))
+            .into_any_element()
         };
 
         div()
@@ -2341,6 +2366,7 @@ impl Changes {
                             theme,
                             scope == current,
                             format!("changes-scope-row-{ix}"),
+                            cx.entity_id(),
                         )
                         .id(("changes-scope-row", ix))
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -2397,7 +2423,10 @@ impl Changes {
                 crate::theme::wash(0.0),
                 crate::theme::wash(0.12),
             ))
-            .on_hover(motion::hover_listener("changes-ref-trigger"))
+            .on_hover(motion::hover_listener(
+                "changes-ref-trigger",
+                cx.entity_id(),
+            ))
             .occlude()
             .on_mouse_down(
                 gpui::MouseButton::Left,
@@ -2519,6 +2548,7 @@ impl Changes {
                         selected,
                         row_ix == active,
                         format!("changes-ref-row-{row_ix}"),
+                        cx.entity_id(),
                     )
                     .id(("changes-ref-row", row_ix))
                     .on_click(cx.listener(move |this, _, _, cx| {
