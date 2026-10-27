@@ -688,12 +688,7 @@ fn modal_with(
 /// per-`fade_key` [`motion::hover_blend`]. The caller adds the id/click
 /// listener — `fade_key` must be unique app-wide and stable across frames
 /// (the id string is a good choice).
-pub fn menu_row(
-    theme: &Theme,
-    active: bool,
-    fade_key: impl Into<SharedString>,
-    owner: gpui::EntityId,
-) -> gpui::Div {
+pub fn menu_row(theme: &Theme, active: bool, fade_key: impl Into<SharedString>) -> gpui::Div {
     let row = div()
         .flex()
         .flex_row()
@@ -723,7 +718,7 @@ pub fn menu_row(
         // Imperative form — the caller's `.id(...)` makes the element stateful
         // (hover listeners need element state, `.on_hover` needs `Stateful`).
         row.interactivity()
-            .on_hover(motion::hover_listener(fade_key, owner));
+            .on_hover(motion::hover_listener(fade_key));
         row
     }
 }
@@ -737,9 +732,8 @@ pub fn menu_row_nav(
     selected: bool,
     highlighted: bool,
     fade_key: impl Into<SharedString>,
-    owner: gpui::EntityId,
 ) -> gpui::Div {
-    let row = menu_row(theme, selected, fade_key, owner);
+    let row = menu_row(theme, selected, fade_key);
     if !selected && highlighted {
         row.bg(crate::theme::card_selected_bg())
             .text_color(theme.text)
@@ -987,12 +981,7 @@ pub fn dialog_field(input: AnyElement) -> gpui::Div {
 /// Ghost button (`btnGhost`): quiet text, hover wash fading over
 /// `transition-colors` (komet dialogs.tsx). Caller adds id + click; `fade_key`
 /// as in [`menu_row`].
-pub fn btn_ghost(
-    theme: &Theme,
-    label: &str,
-    fade_key: impl Into<SharedString>,
-    owner: gpui::EntityId,
-) -> gpui::Div {
+pub fn btn_ghost(theme: &Theme, label: &str, fade_key: impl Into<SharedString>) -> gpui::Div {
     let fade_key = fade_key.into();
     let mut btn = div()
         .px(px(12.0))
@@ -1008,7 +997,7 @@ pub fn btn_ghost(
         .cursor_pointer()
         .child(SharedString::from(label.to_string()));
     btn.interactivity()
-        .on_hover(motion::hover_listener(fade_key, owner));
+        .on_hover(motion::hover_listener(fade_key));
     btn
 }
 
@@ -1049,11 +1038,10 @@ pub fn skeleton_rows(
     _theme: &Theme,
     count: usize,
     view: gpui::EntityId,
-    window: &mut gpui::Window,
     cx: &mut gpui::App,
 ) -> AnyElement {
     let wash = ink(0.04);
-    let delta = motion::pulse_delta(&KOMET_PULSE, view, window, cx);
+    let delta = motion::pulse_delta(&KOMET_PULSE, view, cx);
     div()
         .flex()
         .flex_col()

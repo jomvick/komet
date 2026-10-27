@@ -11,7 +11,7 @@
 
 use gpui::{
     AnyElement, App, EntityId, Image, ImageFormat, IntoElement, ObjectFit, ParentElement,
-    PathBuilder, SharedString, Styled, StyledImage as _, Window, canvas, div, img, point, px,
+    PathBuilder, SharedString, Styled, StyledImage as _, canvas, div, img, point, px,
 };
 use std::sync::{Arc, OnceLock};
 
@@ -34,13 +34,12 @@ pub fn komet_mark_loader(
     theme: &Theme,
     height_px: f32,
     view: EntityId,
-    window: &mut Window,
     cx: &mut App,
 ) -> impl IntoElement {
     let color = theme.text;
     let scale = height_px / 940.0;
     let cell = 100.0 * scale;
-    let delta = motion::pulse_delta(&KOMET_PULSE, view, window, cx);
+    let delta = motion::pulse_delta(&KOMET_PULSE, view, cx);
     div()
         .relative()
         .w(px(820.0 * scale))
@@ -79,12 +78,11 @@ pub fn komet_loader(
     theme: &Theme,
     cell_px: f32,
     view: EntityId,
-    window: &mut Window,
     cx: &mut App,
 ) -> impl IntoElement {
     let color = theme.text;
     let slot = cell_px;
-    let delta = motion::pulse_delta(&KOMET_PULSE, view, window, cx);
+    let delta = motion::pulse_delta(&KOMET_PULSE, view, cx);
     div()
         .flex()
         .flex_row()
@@ -129,11 +127,10 @@ pub fn gradient_spinner(
     _theme: &Theme,
     cell_px: f32,
     view: EntityId,
-    window: &mut Window,
     cx: &mut App,
 ) -> impl IntoElement {
     let size = (cell_px * 6.0).max(18.0);
-    ThinkingOrb::new(OrbState::Working, size).driven(view, window, cx)
+    ThinkingOrb::new(OrbState::Working, size).driven(view, cx)
 }
 
 /// A miniature ThinkingOrb sized for a status-dot slot (sessions-sidebar working rows).
@@ -141,11 +138,10 @@ pub fn mini_gradient_spinner(
     _key: impl Into<SharedString>,
     cell_px: f32,
     view: EntityId,
-    window: &mut Window,
     cx: &mut App,
 ) -> impl IntoElement {
     let size = (cell_px * 5.0).max(14.0);
-    ThinkingOrb::new(OrbState::Working, size).driven(view, window, cx)
+    ThinkingOrb::new(OrbState::Working, size).driven(view, cx)
 }
 
 /// Stroke width of [`upload_progress_ring`].

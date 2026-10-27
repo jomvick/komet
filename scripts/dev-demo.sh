@@ -37,11 +37,8 @@ if [[ ! -f "$DAEMON_DIR/.demo-seeded" ]]; then
   # One space per demo folder, created up-front (chats join by space id).
   declare -A SPACES=()
   for project in komet soccertcg komet aether; do
-    [[ -n "${SPACES[$project]:-}" ]] && continue
-    sid="demo-space-$project"
-    path="$DAEMON_DIR/demo-spaces/$project"
-    mkdir -p "$path"
-    probe Mutate "{\"op\":\"createSpace\",\"spaceId\":\"$sid\",\"deviceId\":\"$DEV\",\"path\":\"$path\"}" >/dev/null
+    sid=$(uuidgen | tr 'A-Z' 'a-z')
+    probe Mutate "{\"op\":\"createSpace\",\"spaceId\":\"$sid\",\"deviceId\":\"$DEV\",\"path\":\"$HOME/github/$project\"}" >/dev/null
     SPACES[$project]="$sid"
   done
   seed() { # title project branch age_hours run

@@ -2099,7 +2099,6 @@ impl Pickers {
                                 is_selected,
                                 ix == active,
                                 format!("device-row-{ix}"),
-                                cx.entity_id(),
                             )
                             .id(("device-row", ix))
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -2182,7 +2181,6 @@ impl Pickers {
                         is_selected,
                         ix == active,
                         format!("space-row-{ix}"),
-                        cx.entity_id(),
                     )
                     .id(("space-row", ix))
                     .on_click(cx.listener(move |this, _, _, cx| {
@@ -2193,31 +2191,25 @@ impl Pickers {
                 .into_any_element()
         };
         // Action row under a hairline: mint a project.
-        let new_project = popover::menu_row_nav(
-            &theme,
-            false,
-            false,
-            "project-new".to_string(),
-            cx.entity_id(),
-        )
-        .id("project-new")
-        .on_click(cx.listener(|this, _, window, cx| {
-            this.close(cx);
-            window.dispatch_action(Box::new(crate::shell::AddSpacePalette), cx);
-        }))
-        .child(
-            crate::icons::icon(crate::icons::PLUS)
-                .size(px(12.0))
-                .flex_none()
-                .text_color(theme.text_muted.opacity(0.7)),
-        )
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .truncate()
-                .child(SharedString::from("New project…")),
-        );
+        let new_project = popover::menu_row_nav(&theme, false, false, "project-new".to_string())
+            .id("project-new")
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.close(cx);
+                window.dispatch_action(Box::new(crate::shell::AddSpacePalette), cx);
+            }))
+            .child(
+                crate::icons::icon(crate::icons::PLUS)
+                    .size(px(12.0))
+                    .flex_none()
+                    .text_color(theme.text_muted.opacity(0.7)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .truncate()
+                    .child(SharedString::from("New project…")),
+            );
         div()
             .flex()
             .flex_col()
@@ -2398,7 +2390,7 @@ impl Pickers {
             } else {
                 motion::hover_blend(id, gpui::transparent_black(), theme.element_hover)
             })
-            .on_hover(motion::hover_listener(id, cx.entity_id()))
+            .on_hover(motion::hover_listener(id))
             .cursor_pointer()
             .on_mouse_down(
                 gpui::MouseButton::Left,
@@ -2463,7 +2455,7 @@ impl Pickers {
             } else {
                 motion::hover_blend(id, gpui::transparent_black(), theme.element_hover)
             })
-            .on_hover(motion::hover_listener(id, cx.entity_id()))
+            .on_hover(motion::hover_listener(id))
             .cursor_pointer()
             .on_mouse_down(
                 gpui::MouseButton::Left,
@@ -2602,11 +2594,7 @@ impl Pickers {
     /// The checkout-kind + ref toolbar, only when the picked (or session's)
     /// project has git. Draft controls sit above the new-session prompt;
     /// existing sessions keep their read-only toolbar below the composer.
-    pub fn render_footer(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
+    pub fn render_footer(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let theme = Theme::of(cx).clone();
         // A selected chat whose workspace row hasn't synced yet (the moment
         // right after send mints it) still renders the DRAFT footer — the
@@ -2739,7 +2727,7 @@ impl Pickers {
         let closing = self.open.closing_since();
         let mut overlay: Option<(PickerKind, AnyElement)> = match self.mounted_kind() {
             Some(PickerKind::Branch) => {
-                let content = self.render_branch_popover(window, cx);
+                let content = self.render_branch_popover(cx);
                 Some((PickerKind::Branch, self.popover_frame(320.0, content, cx)))
             }
             Some(PickerKind::Checkout) => {
@@ -2890,7 +2878,7 @@ impl Pickers {
     /// The ref picker (t3code BranchToolbarBranchSelector): search on top,
     /// rows with right-aligned muted `current`/`worktree` tags, and a
     /// "Showing X of Y refs" footer when the list is capped.
-    fn render_branch_popover(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_branch_popover(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         if self.state.read(cx).selected_space_row().is_none() {
             return div()
@@ -2915,7 +2903,7 @@ impl Pickers {
         let body: AnyElement =
             match &self.refs {
                 Loadable::Loading | Loadable::Idle => {
-                    popover::skeleton_rows("branch-skeleton", &theme, 4, cx.entity_id(), window, cx)
+                    popover::skeleton_rows("branch-skeleton", &theme, 4, cx.entity_id(), cx)
                 }
                 Loadable::Error(message) => {
                     let message = message.clone();
@@ -2960,7 +2948,6 @@ impl Pickers {
                                     is_selected,
                                     ix == active,
                                     format!("branch-row-{ix}"),
-                                    cx.entity_id(),
                                 )
                                 .id(("branch-row", ix))
                                 .when(switching.is_some(), |el| el.opacity(0.55))
@@ -3067,7 +3054,6 @@ impl Pickers {
                             is_selected,
                             ix == active,
                             format!("checkout-row-{ix}"),
-                            cx.entity_id(),
                         )
                         .id(("checkout-row", ix))
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -3100,11 +3086,7 @@ impl Pickers {
     /// harness icon + name (t3 `showProvider`, replacing the description) —
     /// with a ⌘N jump chip and a star toggle trailing. Searching stays scoped
     /// to the viewed harness (the rail stays up and re-scopes on a click).
-    fn render_harness_model_popover(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn render_harness_model_popover(&mut self, cx: &mut Context<Self>) -> AnyElement {
         const HEIGHT: f32 = 346.0; // t3 max-h-86.5
 
         let theme = Theme::of(cx).clone();
@@ -3120,7 +3102,6 @@ impl Pickers {
                         &theme,
                         4,
                         cx.entity_id(),
-                        window,
                         cx,
                     ))
                     .into_any_element();
@@ -3465,7 +3446,6 @@ impl Pickers {
                     &theme,
                     4,
                     cx.entity_id(),
-                    window,
                     cx,
                 )],
             }
@@ -3513,21 +3493,10 @@ impl Pickers {
     /// label, a "Default" badge on the section's default choice, and the
     /// trailing check on the selected row. Sections split by hairline
     /// separators. Selecting keeps the menu open for multi-adjust.
-    fn render_traits_sections(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn render_traits_sections(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let Some(model) = self.selected_model(cx).cloned() else {
-            return popover::skeleton_rows(
-                "traits-skeleton",
-                &theme,
-                3,
-                cx.entity_id(),
-                window,
-                cx,
-            );
+            return popover::skeleton_rows("traits-skeleton", &theme, 3, cx.entity_id(), cx);
         };
         let levels = self.trait_ladder(cx);
         // Display the effective level (draft pick or the chat's config), so
@@ -3549,17 +3518,13 @@ impl Pickers {
                     .children(levels.into_iter().enumerate().map(|(ix, level)| {
                         let is_active = current == Some(level);
                         let is_default = default_level == Some(level);
-                        let mut row = popover::menu_row(
-                            &theme,
-                            is_active,
-                            format!("trait-reasoning-{ix}"),
-                            cx.entity_id(),
-                        )
-                        .id(("reasoning-row", ix))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.pick_reasoning(level, cx);
-                        }))
-                        .child(SharedString::from(reasoning_label(level)));
+                        let mut row =
+                            popover::menu_row(&theme, is_active, format!("trait-reasoning-{ix}"))
+                                .id(("reasoning-row", ix))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.pick_reasoning(level, cx);
+                                }))
+                                .child(SharedString::from(reasoning_label(level)));
                         row = row.child(div().flex_1());
                         if is_default {
                             row = row.child(default_badge(&theme));
@@ -3602,7 +3567,6 @@ impl Pickers {
                                     &theme,
                                     is_active,
                                     format!("trait-choice-{opt_ix}-{choice_ix}"),
-                                    cx.entity_id(),
                                 )
                                 .id(("trait-choice", opt_ix * 32 + choice_ix))
                                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -4158,7 +4122,7 @@ impl Render for Pickers {
             | Some(PickerKind::Device)
             | Some(PickerKind::ContextUsage) => None,
             Some(PickerKind::HarnessModel) => {
-                let content = self.render_harness_model_popover(window, cx);
+                let content = self.render_harness_model_popover(cx);
                 Some((
                     PickerKind::HarnessModel,
                     // t3 ModelPickerContent `max-w-90` — 360px.
@@ -4168,7 +4132,7 @@ impl Render for Pickers {
             Some(PickerKind::Traits) => {
                 let content = div()
                     .p(px(4.0))
-                    .child(self.render_traits_sections(window, cx))
+                    .child(self.render_traits_sections(cx))
                     .into_any_element();
                 Some((
                     PickerKind::Traits,

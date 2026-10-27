@@ -553,7 +553,7 @@ impl FilesSurface {
         action: editor::EditorContextAction,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        crate::popover::menu_row(theme, false, id, cx.entity_id())
+        crate::popover::menu_row(theme, false, id)
             .id(id)
             .when(!enabled, |row| row.opacity(0.38).cursor_default())
             .when(enabled, |row| {

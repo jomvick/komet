@@ -278,7 +278,7 @@ impl DevicesPage {
                     .justify_end()
                     .gap(px(8.0))
                     .child(
-                        popover::btn_ghost(&theme, "Cancel", "rename-cancel", cx.entity_id())
+                        popover::btn_ghost(&theme, "Cancel", "rename-cancel")
                             .id("rename-cancel")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.rename = None;
@@ -624,7 +624,6 @@ impl Render for DevicesPage {
                                     "updates-checking",
                                     3.0,
                                     view_id,
-                                    window,
                                     cx,
                                 )
                                 .into_any_element(),

@@ -4441,7 +4441,6 @@ impl Composer {
     fn render_file_mention_popup(
         &self,
         theme: &Theme,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
         let token = self.mention.token.as_ref()?;
@@ -4456,7 +4455,6 @@ impl Composer {
                 theme,
                 3,
                 cx.entity_id(),
-                window,
                 cx,
             ));
         } else if let Some(error) = self.mention.error.clone() {
@@ -4496,50 +4494,45 @@ impl Composer {
                 let path = result.path.clone();
                 let tooltip_path: SharedString = path.clone().into();
                 list = list.child(
-                    crate::popover::menu_row(
-                        theme,
-                        selected,
-                        format!("file-mention-result-{ix}"),
-                        cx.entity_id(),
-                    )
-                    .id(("file-mention-result", ix))
-                    .tooltip(move |_, cx| {
-                        cx.new(|_| MentionPathTooltip {
-                            path: tooltip_path.clone(),
-                            activation: ix as u64,
+                    crate::popover::menu_row(theme, selected, format!("file-mention-result-{ix}"))
+                        .id(("file-mention-result", ix))
+                        .tooltip(move |_, cx| {
+                            cx.new(|_| MentionPathTooltip {
+                                path: tooltip_path.clone(),
+                                activation: ix as u64,
+                            })
+                            .into()
                         })
-                        .into()
-                    })
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.mention.active = Some(ix);
-                        this.accept_mention(cx);
-                    }))
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(8.0))
-                            .child(
-                                crate::icons::icon(if result.is_dir {
-                                    crate::icons::FOLDER
-                                } else {
-                                    crate::icons::DOCUMENT
-                                })
-                                .size(px(14.0))
-                                .text_color(theme.text_muted),
-                            )
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .flex_1()
-                                    .overflow_hidden()
-                                    .truncate()
-                                    .text_size(px(12.5))
-                                    .text_color(theme.text)
-                                    .child(path),
-                            ),
-                    ),
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.mention.active = Some(ix);
+                            this.accept_mention(cx);
+                        }))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(8.0))
+                                .child(
+                                    crate::icons::icon(if result.is_dir {
+                                        crate::icons::FOLDER
+                                    } else {
+                                        crate::icons::DOCUMENT
+                                    })
+                                    .size(px(14.0))
+                                    .text_color(theme.text_muted),
+                                )
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .overflow_hidden()
+                                        .truncate()
+                                        .text_size(px(12.5))
+                                        .text_color(theme.text)
+                                        .child(path),
+                                ),
+                        ),
                 );
             }
             card = card.child(list);
@@ -4559,17 +4552,12 @@ impl Composer {
         ))
     }
 
-    fn render_input_with_completion(
-        &self,
-        theme: &Theme,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> gpui::Div {
+    fn render_input_with_completion(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
         div()
             .relative()
             .child(self.input.clone())
-            .children(self.render_file_mention_popup(theme, window, cx))
-            .children(self.render_slash_popup(theme, window, cx))
+            .children(self.render_file_mention_popup(theme, cx))
+            .children(self.render_slash_popup(theme, cx))
     }
 
     // ---- slash commands ---------------------------------------------------
@@ -4804,7 +4792,6 @@ impl Composer {
     fn render_slash_popup(
         &self,
         theme: &Theme,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
         let token = self.slash.token.as_ref()?;
@@ -4826,7 +4813,6 @@ impl Composer {
                 theme,
                 3,
                 cx.entity_id(),
-                window,
                 cx,
             ));
         } else if let Some(error) = self.slash.error.clone() {
@@ -4936,18 +4922,13 @@ impl Composer {
                         .child(description),
                 );
                 list = list.child(
-                    crate::popover::menu_row(
-                        theme,
-                        selected,
-                        format!("slash-result-{row_ix}"),
-                        cx.entity_id(),
-                    )
-                    .id(("slash-result", row_ix))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.slash.active = Some(row_ix);
-                        this.accept_slash(cx);
-                    }))
-                    .child(row),
+                    crate::popover::menu_row(theme, selected, format!("slash-result-{row_ix}"))
+                        .id(("slash-result", row_ix))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.slash.active = Some(row_ix);
+                            this.accept_slash(cx);
+                        }))
+                        .child(row),
                 );
             }
             card = card.child(list);
@@ -6281,10 +6262,7 @@ impl Composer {
                         crate::theme::ink(0.06),
                     )
                 })
-                .on_hover(motion::hover_listener(
-                    format!("wizard-option-{ix}"),
-                    cx.entity_id(),
-                ))
+                .on_hover(motion::hover_listener(format!("wizard-option-{ix}")))
                 .cursor_pointer()
                 .on_click(cx.listener(move |this, _, _, cx| this.wizard_select(ix, cx)))
                 .child(
@@ -6426,7 +6404,7 @@ impl Composer {
                     .pb(px(16.0))
                     .pt(px(4.0))
                     .child(if page > 0 {
-                        crate::popover::btn_ghost(&theme, "Back", "wizard-back", cx.entity_id())
+                        crate::popover::btn_ghost(&theme, "Back", "wizard-back")
                             .id("wizard-back")
                             .on_click(cx.listener(|this, _, _, cx| this.wizard_back(cx)))
                             .into_any_element()
@@ -7133,7 +7111,7 @@ impl Render for Composer {
                 gpui::transparent_black(),
                 crate::theme::ink(0.10),
             ))
-            .on_hover(motion::hover_listener("composer-attach", cx.entity_id()))
+            .on_hover(motion::hover_listener("composer-attach"))
             .on_click(cx.listener(|this, _, _, cx| {
                 this.attach_menu_open = !this.attach_menu_open;
                 cx.notify();
@@ -7144,36 +7122,34 @@ impl Render for Composer {
                     .text_color(theme.text_muted),
             );
         if self.attach_menu_open {
-            let image_row =
-                crate::popover::menu_row(&theme, false, "composer-attach-image", cx.entity_id())
-                    .id("composer-attach-image")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.attach_menu_open = false;
-                        this.open_file_picker(true, cx);
-                        cx.notify();
-                    }))
-                    .child(
-                        crate::icons::icon(crate::icons::IMAGE)
-                            .size(px(16.0))
-                            .text_color(theme.text_muted),
-                    )
-                    .child(SharedString::from("Image"));
-            let file_row =
-                crate::popover::menu_row(&theme, false, "composer-attach-file", cx.entity_id())
-                    .id("composer-attach-file")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        cx.stop_propagation();
-                        this.attach_menu_open = false;
-                        this.open_file_picker(false, cx);
-                        cx.notify();
-                    }))
-                    .child(
-                        crate::icons::icon(crate::icons::PAPERCLIP)
-                            .size(px(16.0))
-                            .text_color(theme.text_muted),
-                    )
-                    .child(SharedString::from("File"));
+            let image_row = crate::popover::menu_row(&theme, false, "composer-attach-image")
+                .id("composer-attach-image")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.attach_menu_open = false;
+                    this.open_file_picker(true, cx);
+                    cx.notify();
+                }))
+                .child(
+                    crate::icons::icon(crate::icons::IMAGE)
+                        .size(px(16.0))
+                        .text_color(theme.text_muted),
+                )
+                .child(SharedString::from("Image"));
+            let file_row = crate::popover::menu_row(&theme, false, "composer-attach-file")
+                .id("composer-attach-file")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.attach_menu_open = false;
+                    this.open_file_picker(false, cx);
+                    cx.notify();
+                }))
+                .child(
+                    crate::icons::icon(crate::icons::PAPERCLIP)
+                        .size(px(16.0))
+                        .text_color(theme.text_muted),
+                )
+                .child(SharedString::from("File"));
             let menu = div()
                 .w(px(170.0))
                 .flex()
@@ -7236,7 +7212,7 @@ impl Render for Composer {
                         .px(px(16.0))
                         .pt(px(text_pt))
                         .pb(px(4.0))
-                        .child(self.render_input_with_completion(&theme, window, cx)),
+                        .child(self.render_input_with_completion(&theme, cx)),
                 )
                 .child(
                     div()
@@ -7312,7 +7288,7 @@ impl Render for Composer {
                                 .pr(px(8.0))
                                 .relative()
                                 .top(px(-text_glide))
-                                .child(self.render_input_with_completion(&theme, window, cx)),
+                                .child(self.render_input_with_completion(&theme, cx)),
                         )
                         .child(
                             div()
@@ -7372,7 +7348,7 @@ impl Render for Composer {
         let footer = (!self.home_canvas)
             .then(|| {
                 self.pickers
-                    .update(cx, |pickers, cx| pickers.render_footer(window, cx))
+                    .update(cx, |pickers, cx| pickers.render_footer(cx))
             })
             .flatten();
         let container = match footer {

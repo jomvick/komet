@@ -1106,7 +1106,7 @@ impl TerminalPanel {
         run: fn(&mut Self, &mut Context<Self>),
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        crate::popover::menu_row(theme, false, id, cx.entity_id())
+        crate::popover::menu_row(theme, false, id)
             .id(id)
             .when(!enabled, |row| row.opacity(0.38).cursor_default())
             .when(enabled, |row| {
@@ -1393,10 +1393,7 @@ impl TerminalPanel {
                                 bg,
                                 theme.element_hover,
                             ))
-                            .on_hover(motion::hover_listener(
-                                format!("term-tab-{key}"),
-                                cx.entity_id(),
-                            ))
+                            .on_hover(motion::hover_listener(format!("term-tab-{key}")))
                             .text_size(px(12.0))
                             .text_color(text_color)
                             .cursor_pointer()
@@ -1474,7 +1471,7 @@ impl TerminalPanel {
                         gpui::transparent_black(),
                         crate::theme::ink(0.05),
                     ))
-                    .on_hover(motion::hover_listener("term-new-tab", cx.entity_id()))
+                    .on_hover(motion::hover_listener("term-new-tab"))
                     .on_click(cx.listener(|this, _, _, cx| {
                         let chat = this.session_key(cx);
                         this.open_tab(chat, cx);
@@ -1502,7 +1499,7 @@ impl TerminalPanel {
                         gpui::transparent_black(),
                         crate::theme::ink(0.05),
                     ))
-                    .on_hover(motion::hover_listener("term-collapse", cx.entity_id()))
+                    .on_hover(motion::hover_listener("term-collapse"))
                     .on_click(|_, window, cx| {
                         window.dispatch_action(Box::new(ToggleTerminal), cx);
                     })

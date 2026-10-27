@@ -15,9 +15,9 @@ use std::rc::Rc;
 use std::time::Instant;
 
 use gpui::{
-    AnyElement, BorderStyle, Bounds, EntityId, FontStyle, FontWeight, Hsla, InteractiveText,
-    SharedString, StyledText, TextRun, UnderlineStyle, Window, canvas, div, font, point,
-    prelude::*, px, quad, size,
+    AnyElement, BorderStyle, Bounds, FontStyle, FontWeight, Hsla, InteractiveText, SharedString,
+    StyledText, TextRun, UnderlineStyle, Window, canvas, div, font, point, prelude::*, px, quad,
+    size,
 };
 use komet_syntax::{HighlightKind, HighlightSpan, HighlightedDocument};
 
@@ -65,8 +65,6 @@ pub fn table_hairline() -> Hsla {
 pub struct RenderOptions {
     /// Stable row key — prefixes element ids (scroll state, animations).
     pub row_key: SharedString,
-    /// Entity that owns interactive controls rendered from this tree.
-    pub hover_owner: Option<EntityId>,
     /// Streaming veil state for a live row: newly appended text fades in via
     /// paint-only run opacity, keyed per (element, chunk offset) so each chunk
     /// fades exactly once. `None` renders without fades (completed rows).
@@ -106,7 +104,6 @@ impl RenderOptions {
     pub fn settled(row_key: SharedString) -> Self {
         Self {
             row_key,
-            hover_owner: None,
             veil: None,
             cache: None,
             now: Instant::now(),
@@ -1107,9 +1104,7 @@ fn render_code_block(
                 gpui::transparent_black(),
                 crate::theme::ink(0.08),
             ))
-            .when_some(opts.hover_owner, |button, owner| {
-                button.on_hover(crate::motion::hover_listener(fade_key, owner))
-            })
+            .on_hover(crate::motion::hover_listener(fade_key))
             .text_size(px(10.5))
             .text_color(theme.text_muted)
             .on_click(move |_, window, cx| handler(ix, code_text.clone(), window, cx))

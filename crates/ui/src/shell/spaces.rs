@@ -541,13 +541,8 @@ impl Shell {
                 )
             })
             .on_hover(cx.listener(|this, hovered: &bool, window, cx| {
-                motion::set_hover(
-                    "spaces-filter",
-                    cx.entity_id(),
-                    *hovered,
-                    motion::reduced_motion(cx),
-                );
-                cx.notify();
+                motion::set_hover("spaces-filter", *hovered, motion::reduced_motion(cx));
+                window.refresh();
                 if *hovered && !this.spaces_menu.is_open() {
                     this.open_spaces_menu(window, cx);
                 }
@@ -635,7 +630,7 @@ impl Shell {
                         crate::theme::wash(0.14),
                     )
                 })
-                .on_hover(motion::hover_listener("project-tree-menu", cx.entity_id()))
+                .on_hover(motion::hover_listener("project-tree-menu"))
                 .on_click(cx.listener(|this, _, window, cx| {
                     if !this.spaces_menu.is_open() {
                         this.open_spaces_menu(window, cx);
@@ -678,10 +673,7 @@ impl Shell {
                     crate::theme::wash(0.0),
                     crate::theme::wash(0.14),
                 ))
-                .on_hover(motion::hover_listener(
-                    "project-tree-toggle",
-                    cx.entity_id(),
-                ))
+                .on_hover(motion::hover_listener("project-tree-toggle"))
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.settings.project_tree_expanded = !this.settings.project_tree_expanded;
                     this.schedule_save(cx);
@@ -756,10 +748,7 @@ impl Shell {
                 crate::theme::wash(0.0),
                 crate::theme::wash(0.14),
             ))
-            .on_hover(motion::hover_listener(
-                "sidebar-new-session",
-                cx.entity_id(),
-            ))
+            .on_hover(motion::hover_listener("sidebar-new-session"))
             .on_click(cx.listener(|this, _, _, cx| this.open_new_session(cx)))
             .child(
                 icon(icons::PLUS)
@@ -916,7 +905,6 @@ impl Shell {
                                 is_selected,
                                 ix == active,
                                 format!("spaces-menu-row-{ix}"),
-                                cx.entity_id(),
                             )
                             .id(("spaces-menu-row", ix))
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -984,41 +972,31 @@ impl Shell {
                         )
                         .child(popover::menu_separator())
                         .child(
-                            popover::menu_row(
-                                theme,
-                                false,
-                                "project-settings-rename",
-                                cx.entity_id(),
-                            )
-                            .id("project-settings-rename")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.close_spaces_menu(cx);
-                                this.open_rename_space(rename_id.clone(), cx);
-                            }))
-                            .child(icon(icons::PEN).size(px(15.0)).text_color(theme.text_muted))
-                            .child(SharedString::from("Rename…")),
+                            popover::menu_row(theme, false, "project-settings-rename")
+                                .id("project-settings-rename")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.close_spaces_menu(cx);
+                                    this.open_rename_space(rename_id.clone(), cx);
+                                }))
+                                .child(icon(icons::PEN).size(px(15.0)).text_color(theme.text_muted))
+                                .child(SharedString::from("Rename…")),
                         )
                         .child(
-                            popover::menu_row(
-                                theme,
-                                false,
-                                "project-settings-delete",
-                                cx.entity_id(),
-                            )
-                            .id("project-settings-delete")
-                            .text_color(theme.danger)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.close_spaces_menu(cx);
-                                this.delete_space_confirm = Some(delete_id.clone());
-                                this.space_delete_focus_pending = true;
-                                cx.notify();
-                            }))
-                            .child(
-                                icon(icons::TRASH_BIN_MINIMALISTIC)
-                                    .size(px(15.0))
-                                    .text_color(theme.danger),
-                            )
-                            .child(SharedString::from("Remove…")),
+                            popover::menu_row(theme, false, "project-settings-delete")
+                                .id("project-settings-delete")
+                                .text_color(theme.danger)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.close_spaces_menu(cx);
+                                    this.delete_space_confirm = Some(delete_id.clone());
+                                    this.space_delete_focus_pending = true;
+                                    cx.notify();
+                                }))
+                                .child(
+                                    icon(icons::TRASH_BIN_MINIMALISTIC)
+                                        .size(px(15.0))
+                                        .text_color(theme.danger),
+                                )
+                                .child(SharedString::from("Remove…")),
                         )
                 } else {
                     div()
@@ -1081,7 +1059,7 @@ impl Shell {
                                     .child(SharedString::from(message)),
                             )
                             .child(
-                                popover::menu_row(theme, false, "worktrees-retry", cx.entity_id())
+                                popover::menu_row(theme, false, "worktrees-retry")
                                     .id("worktrees-retry")
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.composer.update(cx, |composer, cx| {
@@ -1122,7 +1100,6 @@ impl Shell {
                                 is_selected,
                                 ix == active,
                                 format!("project-worktree-{ix}"),
-                                cx.entity_id(),
                             )
                             .id(("project-worktree", ix))
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -1197,7 +1174,6 @@ impl Shell {
     pub(super) fn render_active_rows(
         &mut self,
         theme: &Theme,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<(String, f32, AnyElement)> {
         let now = Utc::now();
@@ -1259,7 +1235,6 @@ impl Shell {
                     false,
                     chat.pinned,
                     theme,
-                    window,
                     cx,
                 );
                 (format!("c:{}", chat.id), height, element)
@@ -1313,7 +1288,7 @@ impl Shell {
                 crate::theme::wash(0.0),
                 crate::theme::wash(0.14),
             ))
-            .on_hover(motion::hover_listener(hover_key, cx.entity_id()))
+            .on_hover(motion::hover_listener(hover_key))
             .on_click(cx.listener(move |this, _, _, cx| {
                 if this.expanded_spaces.contains(&toggle_id) {
                     this.expanded_spaces.remove(&toggle_id);
@@ -1390,7 +1365,7 @@ impl Shell {
                             crate::theme::wash(0.0),
                             crate::theme::wash(0.14),
                         ))
-                        .on_hover(motion::hover_listener(plus_hover.clone(), cx.entity_id()))
+                        .on_hover(motion::hover_listener(plus_hover.clone()))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             cx.stop_propagation();
                             if let Some(space) = &plus_space {
@@ -1412,7 +1387,6 @@ impl Shell {
             .into_any_element()
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn render_grouped_session_row(
         &mut self,
         status: ChatIndicator,
@@ -1422,7 +1396,6 @@ impl Shell {
         selected: Option<&str>,
         now: chrono::DateTime<Utc>,
         theme: &Theme,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let is_selected = selected == Some(chat.id.as_str());
@@ -1442,7 +1415,6 @@ impl Shell {
             false,
             chat.pinned,
             theme,
-            window,
             cx,
         )
     }
@@ -1455,7 +1427,6 @@ impl Shell {
     pub(super) fn render_grouped_rows(
         &mut self,
         theme: &Theme,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let now = Utc::now();
@@ -1573,7 +1544,6 @@ impl Shell {
                     selected.as_deref(),
                     now,
                     theme,
-                    window,
                     cx,
                 ));
             }
@@ -1613,7 +1583,6 @@ impl Shell {
                                 selected.as_deref(),
                                 now,
                                 theme,
-                                window,
                                 cx,
                             ))
                             .into_any_element(),
@@ -1642,7 +1611,6 @@ impl Shell {
                             selected.as_deref(),
                             now,
                             theme,
-                            window,
                             cx,
                         );
                         rows_div = rows_div.child(element);
@@ -1685,7 +1653,6 @@ impl Shell {
                                 selected.as_deref(),
                                 now,
                                 theme,
-                                window,
                                 cx,
                             ))
                             .into_any_element(),
@@ -1702,7 +1669,6 @@ impl Shell {
                         selected.as_deref(),
                         now,
                         theme,
-                        window,
                         cx,
                     );
                     rows_div = rows_div.child(element);
@@ -2666,7 +2632,6 @@ impl Shell {
                     &theme,
                     6,
                     cx.entity_id(),
-                    window,
                     cx,
                 ))
                 .into_any_element()
@@ -2737,7 +2702,6 @@ impl Shell {
                                 false,
                                 ix == active,
                                 format!("add-space-folder-{ix}"),
-                                cx.entity_id(),
                             )
                             // The floating-card selection language: the wash
                             // plus the ring-only inset outline.
@@ -3064,41 +3028,31 @@ impl Shell {
                 .flex()
                 .flex_col()
                 .child(
-                    popover::menu_row(
-                        &theme,
-                        false,
-                        format!("space-menu-rename-{space_id}"),
-                        cx.entity_id(),
-                    )
-                    .id("space-menu-rename")
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.open_rename_space(rename_id.clone(), cx)
-                    }))
-                    .child(icon(icons::PEN).size(px(16.0)).text_color(theme.text_muted))
-                    .child(SharedString::from("Rename…")),
+                    popover::menu_row(&theme, false, format!("space-menu-rename-{space_id}"))
+                        .id("space-menu-rename")
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.open_rename_space(rename_id.clone(), cx)
+                        }))
+                        .child(icon(icons::PEN).size(px(16.0)).text_color(theme.text_muted))
+                        .child(SharedString::from("Rename…")),
                 )
                 .child(popover::menu_separator())
                 .child(
-                    popover::menu_row(
-                        &theme,
-                        false,
-                        format!("space-menu-delete-{space_id}"),
-                        cx.entity_id(),
-                    )
-                    .id("space-menu-delete")
-                    .text_color(theme.danger)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.close_space_menu(cx);
-                        this.delete_space_confirm = Some(delete_id.clone());
-                        this.space_delete_focus_pending = true;
-                        cx.notify();
-                    }))
-                    .child(
-                        icon(icons::TRASH_BIN_MINIMALISTIC)
-                            .size(px(16.0))
-                            .text_color(theme.danger),
-                    )
-                    .child(SharedString::from("Remove…")),
+                    popover::menu_row(&theme, false, format!("space-menu-delete-{space_id}"))
+                        .id("space-menu-delete")
+                        .text_color(theme.danger)
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.close_space_menu(cx);
+                            this.delete_space_confirm = Some(delete_id.clone());
+                            this.space_delete_focus_pending = true;
+                            cx.notify();
+                        }))
+                        .child(
+                            icon(icons::TRASH_BIN_MINIMALISTIC)
+                                .size(px(16.0))
+                                .text_color(theme.danger),
+                        )
+                        .child(SharedString::from("Remove…")),
                 )
                 .into_any_element();
             overlays.push(popover::menu_at(
@@ -3135,17 +3089,12 @@ impl Shell {
                         .justify_end()
                         .gap(px(8.0))
                         .child(
-                            popover::btn_ghost(
-                                &theme,
-                                "Cancel",
-                                "rename-space-cancel",
-                                cx.entity_id(),
-                            )
-                            .id("rename-space-cancel")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.rename_space_dialog = None;
-                                cx.notify();
-                            })),
+                            popover::btn_ghost(&theme, "Cancel", "rename-space-cancel")
+                                .id("rename-space-cancel")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.rename_space_dialog = None;
+                                    cx.notify();
+                                })),
                         )
                         .child(
                             popover::btn_primary(&theme, "Rename")
@@ -3204,17 +3153,12 @@ impl Shell {
                         .justify_end()
                         .gap(px(8.0))
                         .child(
-                            popover::btn_ghost(
-                                &theme,
-                                "Cancel",
-                                "delete-space-cancel",
-                                cx.entity_id(),
-                            )
-                            .id("delete-space-cancel")
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.delete_space_confirm = None;
-                                cx.notify();
-                            })),
+                            popover::btn_ghost(&theme, "Cancel", "delete-space-cancel")
+                                .id("delete-space-cancel")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.delete_space_confirm = None;
+                                    cx.notify();
+                                })),
                         )
                         .child(
                             popover::btn_danger(&theme, "Remove")

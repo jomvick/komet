@@ -2454,24 +2454,12 @@ impl FilesSurface {
                     .justify_end()
                     .gap(px(6.0))
                     .child(
-                        editor_comment_action(
-                            "file-comment-cancel",
-                            "Cancel",
-                            false,
-                            theme,
-                            cx.entity_id(),
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| this.cancel_editor_comment(cx))),
+                        editor_comment_action("file-comment-cancel", "Cancel", false, theme)
+                            .on_click(cx.listener(|this, _, _, cx| this.cancel_editor_comment(cx))),
                     )
                     .child(
-                        editor_comment_action(
-                            "file-comment-commit",
-                            "Comment",
-                            true,
-                            theme,
-                            cx.entity_id(),
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| this.commit_editor_comment(cx))),
+                        editor_comment_action("file-comment-commit", "Comment", true, theme)
+                            .on_click(cx.listener(|this, _, _, cx| this.commit_editor_comment(cx))),
                     ),
             );
         crate::frost::frosted(crate::popover::CARD_RADIUS, crate::frost::MENU_BLUR, card)
@@ -2672,7 +2660,6 @@ fn editor_comment_action(
     label: &'static str,
     primary: bool,
     theme: &Theme,
-    owner: gpui::EntityId,
 ) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
@@ -2695,7 +2682,7 @@ fn editor_comment_action(
                     gpui::transparent_black(),
                     theme.element_hover,
                 ))
-                .on_hover(crate::motion::hover_listener(id, owner))
+                .on_hover(crate::motion::hover_listener(id))
         })
         .child(SharedString::from(label))
 }

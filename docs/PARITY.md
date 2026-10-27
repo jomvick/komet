@@ -20,7 +20,7 @@ not built yet).
 | 1.9 Accounts settings | done | Provider cards, usage meters with 80/95% thresholds + reset time, Switch/Forget, paste-code and browser-poll add flows, isolated GitHub CLI device login and per-account Copilot token injection, official monthly Copilot billing usage when GitHub grants access, device switcher (`targetDeviceId`). |
 | 1.10 Terminal panel | done | Session-scoped tabs, drag-reorder, middle-click close, height drag, replay-then-tail streams, input coalescing, ANSI emulator (`ui/src/terminal/`). |
 | 1.11 Changes viewer | done | Patch → file/hunk/line rows, per-file collapse, ±gutters, time-sliced highlighting, preparing/clean/error states, checkout_id → device+cwd resolution. |
-| 1.12 Motion catalog | partial | Motion kit (cubic-bezier curves, fade-in/quick, splash-out, pulse/gradient spinners, menu/dialog-in, resort glide). Core motion paths honor gpui's reduced-motion flag (loaders, hover fades, scroll and pane tweens); there is no Komet-specific preference control. |
+| 1.12 Motion catalog | partial | Motion kit (cubic-bezier curves, fade-in/quick, splash-out, pulse/gradient spinners, menu/dialog-in, resort glide). Gap: prefers-reduced-motion switch. |
 | 1.13 State & connection | done | All subscriptions (AuthStatus, WatchDevices/Chats/Sessions/CheckoutDiffs, per-chat WatchDocMessages, LocalDevice probe); reconnect from scratch. |
 | 1.14 Engine lifetime | done | The headed app starts a detached `komet engine` child when no engine is listening; sessions survive window/app close. `komet engine stop` gracefully stops it; startup falls back to embedded mode if the child fails to attach. |
 
