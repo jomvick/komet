@@ -6,6 +6,7 @@
 
 pub mod agent;
 pub mod entities;
+pub mod environment;
 pub mod mcp;
 pub mod motion;
 pub mod view;
@@ -13,6 +14,7 @@ pub mod workspace;
 
 pub use agent::*;
 pub use entities::*;
+pub use environment::{EnvError, Environment, Namespace, PAIR_SCHEME, PAIR_VERSION, PairPayload};
 pub use mcp::{McpServerConfig, McpTransport, PublicMcpServerConfig, ResolvedMcpServer};
 pub use workspace::*;
 
