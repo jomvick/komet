@@ -511,6 +511,10 @@ impl HoverFades {
         if target == 0.0 && !self.entries.contains_key(key) {
             return; // never-hovered element reporting a leave — nothing to do
         }
+        debug_assert!(
+            !self.shared_live_key(key, owner, now),
+            "hover key {key:?} is live for two views; give each element its own key"
+        );
         let origin = if reduced { target } else { current };
         let seen = self.frame;
         self.entries.insert(
@@ -523,6 +527,19 @@ impl HoverFades {
                 seen,
             },
         );
+    }
+
+    /// Whether `key` is still hovered by a *different* view. Debug guard for
+    /// keys shared between two elements: both would drive the same fade and
+    /// notify each other's owners every frame. A key that already started its
+    /// leave may change hands (the old element is gone).
+    fn shared_live_key(&self, key: &str, owner: EntityId, now: Instant) -> bool {
+        self.entries.get(key).is_some_and(|entry| {
+            entry.owner != owner
+                && entry.target == 1.0
+                && !entry.settled(now, Self::duration())
+                && entry.seen + 1 >= self.frame
+        })
     }
 
     /// Hover progress (0..1) for `key` at `now`; stamps liveness.
@@ -950,6 +967,41 @@ mod tests {
         fades.set_at("ghost", EntityId::from(1), false, false, t0);
         assert!(fades.entries.is_empty(), "no entry for a leave-only key");
         assert_eq!(fades.value_at("ghost", t0), 0.0);
+    }
+
+    #[test]
+    fn a_live_hover_key_is_owned_by_one_view() {
+        let mut fades = HoverFades::default();
+        let t0 = Instant::now();
+        let first = EntityId::from(1);
+        let second = EntityId::from(2);
+        fades.frame = 1;
+
+        fades.set_at("row-hover", first, true, false, t0);
+        assert!(!fades.shared_live_key("row-hover", first, t0), "same owner");
+        assert!(
+            fades.shared_live_key("row-hover", second, t0),
+            "a hovered key still being read belongs to one view"
+        );
+        // Past the fade the entry no longer drives frames, so a remount in
+        // another view may take the key over.
+        let after = t0 + HoverFades::duration() + Duration::from_millis(1);
+        assert!(!fades.shared_live_key("row-hover", second, after));
+
+        // A key that already started its leave is handing over, not shared.
+        fades.frame = 2;
+        fades.set_at("tab", first, true, false, t0);
+        fades.set_at("tab", first, false, false, t0);
+        assert!(!fades.shared_live_key("tab", second, t0));
+    }
+
+    #[test]
+    #[should_panic(expected = "is live for two views")]
+    fn two_views_cannot_share_a_live_hover_key() {
+        let mut fades = HoverFades::default();
+        let t0 = Instant::now();
+        fades.set_at("row-hover", EntityId::from(1), true, false, t0);
+        fades.set_at("row-hover", EntityId::from(2), true, false, t0);
     }
 
     #[test]

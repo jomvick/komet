@@ -16,12 +16,18 @@
 # The numbers only mean something while something animates: hover the
 # sidebar, scroll a transcript, or let a reply stream. An idle window shows
 # long intervals because nothing was scheduled — those are excluded from the
-# samples by `crates/ui/src/perf.rs`, but the capture still needs load.
+# samples by `crates/ui/src/perf.rs`, but the capture still needs load. An
+# unfocused window is excluded too (gpui throttles it to ~30 fps).
 #
-# Needs a graphical session and a running demo daemon: start `dev-demo.sh`
-# first (or a `komet headless` engine on `KOMET_IPC_PORT`, default 27921).
-# Reuses /tmp/komet-demo-ui when `dev-demo.sh` has seeded it, so the transcript
-# is realistic.
+# The table splits the frame into `build` (Shell's own render body),
+# `children` (Transcript/Composer/Changes renders) and `total`. The
+# `renders/frame` line counts child renders: with view caching active, a
+# sidebar-only animation must leave the models at 0.
+#
+# Needs a graphical session and a running demo daemon: start
+# `scripts/dev-demo.sh --daemon-only` first (or a `komet headless` engine on
+# `KOMET_IPC_PORT`, default 27921). Reuses /tmp/komet-demo-ui when
+# `dev-demo.sh` has seeded it, so the transcript is realistic.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -121,11 +127,22 @@ print(f"{'interval':<10}{ms('interval_p50_us'):>8}{ms('interval_p95_us'):>8}"
       f"{ms('interval_p99_us'):>8}{peak_ms('interval_max_us'):>8}")
 print(f"{'build':<10}{ms('build_p50_us'):>8}{ms('build_p95_us'):>8}"
       f"{ms('build_p99_us'):>8}{peak_ms('build_max_us'):>8}")
+print(f"{'children':<10}{ms('children_p50_us'):>8}{ms('children_p95_us'):>8}"
+      f"{ms('children_p99_us'):>8}{peak_ms('children_max_us'):>8}")
+print(f"{'total':<10}{ms('total_p50_us'):>8}{ms('total_p95_us'):>8}"
+      f"{ms('total_p99_us'):>8}{peak_ms('total_max_us'):>8}")
+print(f"renders/frame: transcript={ratio('transcript_renders'):.2f}"
+      f"  composer={ratio('composer_renders'):.2f}"
+      f"  changes={ratio('changes_renders'):.2f}")
 
 if csv_path:
     keys = ["frames", "missed", "interval_p50_us", "interval_p95_us",
             "interval_p99_us", "interval_max_us", "build_p50_us",
-            "build_p95_us", "build_p99_us", "build_max_us"]
+            "build_p95_us", "build_p99_us", "build_max_us",
+            "children_p50_us", "children_p95_us", "children_p99_us",
+            "children_max_us", "total_p50_us", "total_p95_us",
+            "total_p99_us", "total_max_us", "transcript_renders",
+            "composer_renders", "changes_renders"]
     with open(csv_path, "w", encoding="utf-8") as out:
         out.write(",".join(keys) + "\n")
         for w in active_windows:
