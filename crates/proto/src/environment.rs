@@ -136,7 +136,10 @@ mod tests {
     #[test]
     fn pair_link_round_trips() {
         let payload = valid();
-        assert_eq!(decode_pair_link(&encode_pair_link(&payload)).unwrap(), payload);
+        assert_eq!(
+            decode_pair_link(&encode_pair_link(&payload)).unwrap(),
+            payload
+        );
     }
 
     #[test]
@@ -148,7 +151,10 @@ mod tests {
 
     #[test]
     fn decode_rejects_wrong_scheme_and_versions() {
-        assert_eq!(decode_pair_link("http://example.com"), Err(EnvError::InvalidLink));
+        assert_eq!(
+            decode_pair_link("http://example.com"),
+            Err(EnvError::InvalidLink)
+        );
         assert_eq!(
             decode_pair_link(&encode_payload(&PairPayload { v: 2, ..valid() })),
             Err(EnvError::UnsupportedVersion(2))
@@ -161,12 +167,18 @@ mod tests {
             token: "  ".into(),
             ..valid()
         });
-        assert_eq!(decode_pair_link(&empty_token), Err(EnvError::EmptyField("token")));
+        assert_eq!(
+            decode_pair_link(&empty_token),
+            Err(EnvError::EmptyField("token"))
+        );
         let empty_label = encode_payload(&PairPayload {
             label: "".into(),
             ..valid()
         });
-        assert_eq!(decode_pair_link(&empty_label), Err(EnvError::EmptyField("label")));
+        assert_eq!(
+            decode_pair_link(&empty_label),
+            Err(EnvError::EmptyField("label"))
+        );
     }
 
     #[test]
@@ -182,7 +194,10 @@ mod tests {
 
     #[test]
     fn decode_rejects_garbage_and_trailing_slash_normalizes_url() {
-        assert_eq!(decode_pair_link("komet://pair/!!!!"), Err(EnvError::InvalidLink));
+        assert_eq!(
+            decode_pair_link("komet://pair/!!!!"),
+            Err(EnvError::InvalidLink)
+        );
         let raw = encode_payload(&PairPayload {
             url: "https://sync.example.com/".into(),
             ..valid()

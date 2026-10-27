@@ -136,6 +136,10 @@ pub struct WorkspaceHostConfig {
     /// When present, the host joins `/registry/{orgId}/ws`. `None` = fully offline
     /// (local snapshots only; the registry still drives everything device-side).
     pub edge: Option<EdgeConfig>,
+    /// Upsert this device's row at boot. True for the workspace on this machine;
+    /// false for a remote environment, where the laptop is a controller only and
+    /// must not appear in that environment's device list.
+    pub register_device: bool,
 }
 
 struct WorkspaceHostInner {
@@ -233,26 +237,28 @@ impl WorkspaceHost {
         // Boot: upsert our own device row. A user-set name (RenameDevice is LWW from
         // any device) survives restarts. The old fallback sentinel is repaired with
         // the platform-resolved name because it was never a user-selected name.
-        let now = Utc::now();
-        let existing = doc
-            .read_devices()?
-            .into_iter()
-            .find(|d| d.id == config.device_id);
-        doc.upsert_device(&Device {
-            id: config.device_id.clone(),
-            name: device_name_on_boot(
-                existing.as_ref().map(|device| device.name.as_str()),
-                &config.device_name,
-            ),
-            platform: config.platform.clone(),
-            last_seen_at: Some(now),
-            // First registration stamps `createdAt`; restarts keep the original
-            // (the Devices page "Added …" fragment).
-            created_at: existing.and_then(|d| d.created_at).or(Some(now)),
-            // Every boot restamps the running binary's version (fleet staleness
-            // on the Devices page; workspace version — same for every crate).
-            version: Some(env!("CARGO_PKG_VERSION").to_string()),
-        })?;
+        if config.register_device {
+            let now = Utc::now();
+            let existing = doc
+                .read_devices()?
+                .into_iter()
+                .find(|d| d.id == config.device_id);
+            doc.upsert_device(&Device {
+                id: config.device_id.clone(),
+                name: device_name_on_boot(
+                    existing.as_ref().map(|device| device.name.as_str()),
+                    &config.device_name,
+                ),
+                platform: config.platform.clone(),
+                last_seen_at: Some(now),
+                // First registration stamps `createdAt`; restarts keep the original
+                // (the Devices page "Added …" fragment).
+                created_at: existing.and_then(|d| d.created_at).or(Some(now)),
+                // Every boot restamps the running binary's version (fleet staleness
+                // on the Devices page; workspace version — same for every crate).
+                version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            })?;
+        }
 
         let state = doc.read_all()?;
         let (chats_tx, _) = watch::channel(state.chats);

@@ -15,6 +15,7 @@ use crate::EngineError;
 use crate::doc_host::{DocHost, DocHostConfig, EdgeConfig};
 use crate::workspace_host::{WorkspaceHost, WorkspaceHostConfig};
 
+#[derive(Clone)]
 pub struct WorkspaceRuntime {
     pub store: Arc<DocsStore>,
     pub doc_host: DocHost,
@@ -26,6 +27,7 @@ impl WorkspaceRuntime {
     ///
     /// The sessions engine is deliberately **not** attached here: the local workspace
     /// attaches it (it executes chats it hosts), while a remote environment never does.
+    #[allow(clippy::too_many_arguments)] // assembly seam, mirrors the engine config
     pub fn open(
         store_root: &Path,
         device_id: &str,
@@ -34,6 +36,7 @@ impl WorkspaceRuntime {
         user_id: &str,
         default_harness: HarnessId,
         edge: Option<EdgeConfig>,
+        register_device: bool,
     ) -> Result<Self, EngineError> {
         let store = Arc::new(DocsStore::open(store_root)?);
         let doc_host = DocHost::new(
@@ -53,6 +56,7 @@ impl WorkspaceRuntime {
                 org_id: org_id.to_string(),
                 user_id: user_id.to_string(),
                 edge,
+                register_device,
             },
         )?;
         doc_host.set_workspace(workspace.clone());

@@ -14,7 +14,10 @@ pub mod workspace;
 
 pub use agent::*;
 pub use entities::*;
-pub use environment::{EnvError, Environment, Namespace, PAIR_SCHEME, PAIR_VERSION, PairPayload};
+pub use environment::{
+    EnvError, Environment, Namespace, PAIR_SCHEME, PAIR_VERSION, PairPayload, decode_pair_link,
+    encode_pair_link,
+};
 pub use mcp::{McpServerConfig, McpTransport, PublicMcpServerConfig, ResolvedMcpServer};
 pub use workspace::*;
 

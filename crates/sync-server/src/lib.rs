@@ -237,11 +237,26 @@ async fn ws_handler(
     ws: WebSocketUpgrade,
     headers: HeaderMap,
     Path(room): Path<String>,
+    query: axum::extract::RawQuery,
 ) -> impl IntoResponse {
-    if !check_auth(&state, &headers) {
+    // Room clients carry the bearer as `?token=` (the protocol the engine's
+    // `RoomClient`/`RegistryClient` speak, and what the old Durable Object
+    // accepted); HTTP routes use the header. Either one authorizes the socket.
+    if !check_auth(&state, &headers) && !check_query_token(&state, query.0.as_deref()) {
         return Err((StatusCode::UNAUTHORIZED, "unauthorized"));
     }
     Ok(ws.on_upgrade(move |socket| handle_socket(state, room, socket)))
+}
+
+/// `?token=…` on a WebSocket upgrade. Note for operators: a URL token lands in
+/// reverse-proxy access logs, so keep the proxy's log level off for `/`.
+fn check_query_token(state: &AppState, query: Option<&str>) -> bool {
+    query.is_some_and(|query| {
+        query
+            .split('&')
+            .find_map(|pair| pair.strip_prefix("token="))
+            .is_some_and(|got| constant_time_eq(got.as_bytes(), state.token.as_bytes()))
+    })
 }
 
 async fn handle_socket(state: AppState, room: String, socket: WebSocket) {
@@ -573,6 +588,33 @@ mod tests {
         assert!(!sync_url_is_insecure("http://[::1]:8787"));
         assert!(sync_url_is_insecure("http://192.168.1.10:8787"));
         assert!(sync_url_is_insecure("http://vps.example.com:8787"));
+    }
+
+    #[tokio::test]
+    async fn room_upgrade_accepts_the_query_token_the_engine_sends() {
+        // axum's WebSocketUpgrade extractor needs a real hyper upgrade to run, so the
+        // auth gate is tested directly: the engine's room clients send only `?token=`.
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        assert!(check_query_token(
+            &state,
+            Some(&format!("token={TOKEN}&device=d"))
+        ));
+        assert!(!check_query_token(&state, Some("token=wrong&device=d")));
+        assert!(!check_query_token(&state, Some("device=d")));
+        assert!(!check_query_token(&state, None));
+        // A query token never authorizes an HTTP route (only the upgrade does).
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/env?token={TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

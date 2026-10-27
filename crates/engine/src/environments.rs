@@ -26,6 +26,8 @@ pub enum EnvStoreError {
     /// `"local"` is the machine's own workspace and cannot be removed.
     Reserved,
     NotFound,
+    /// The file could not be written; the list on disk is unchanged.
+    Io(String),
 }
 
 impl std::fmt::Display for EnvStoreError {
@@ -33,6 +35,7 @@ impl std::fmt::Display for EnvStoreError {
         match self {
             Self::Reserved => write!(f, "the local workspace is not a remote environment"),
             Self::NotFound => write!(f, "no such environment"),
+            Self::Io(detail) => write!(f, "environments file: {detail}"),
         }
     }
 }

@@ -182,6 +182,17 @@ pub mod methods {
     pub const LIST_COMPOSIO_ACCOUNTS: &str = "ListComposioAccounts";
     pub const CONNECT_COMPOSIO_INTEGRATION: &str = "ConnectComposioIntegration";
     pub const DISCONNECT_COMPOSIO_ACCOUNT: &str = "DisconnectComposioAccount";
+    // Environments — remote workspaces backed by their own sync server. All are
+    // local-connection only: an environment connection cannot manage the list.
+    pub const LIST_ENVIRONMENTS: &str = "ListEnvironments";
+    /// Stream of `Vec<Environment>`: current list, then every add/remove.
+    pub const WATCH_ENVIRONMENTS: &str = "WatchEnvironments";
+    /// `{link}` — decode + probe + persist + start the runtime.
+    pub const ADD_ENVIRONMENT: &str = "AddEnvironment";
+    /// `{id, purge}` — forget one (optionally delete its docs mirror).
+    pub const REMOVE_ENVIRONMENT: &str = "RemoveEnvironment";
+    /// `{link}` — decode only, for the paste preview: `{label, url}`.
+    pub const PREVIEW_ENVIRONMENT: &str = "PreviewEnvironment";
 }
 
 #[derive(Debug, thiserror::Error)]
