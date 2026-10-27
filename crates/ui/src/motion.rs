@@ -995,6 +995,8 @@ mod tests {
         assert!(!fades.shared_live_key("tab", second, t0));
     }
 
+    // The panic comes from `debug_assert!`, compiled out in release builds.
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "is live for two views")]
     fn two_views_cannot_share_a_live_hover_key() {

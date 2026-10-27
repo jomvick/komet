@@ -33,7 +33,9 @@
 //!
 //! An *inactive* window is not scored either: gpui throttles background
 //! windows to ~30 fps, so every interval sits near 33 ms and would count as
-//! missed even though nothing is late. Capture with the window focused.
+//! missed even though nothing is late. Their frames are skipped whole — no
+//! interval, build time, child time or render count — because none of it is
+//! comparable to a focused capture. Capture with the window focused.
 //!
 //! A window closes at `window` samples, or early — straight after an
 //! idle gap, once `MIN_FLUSH` samples have piled up — so a short capture
@@ -141,13 +143,14 @@ impl FrameBudget {
         }
     }
 
-    /// Record one frame. `interval_us` is `None` for the first frame of a run,
-    /// after an idle gap, or while the window is inactive (gpui throttles it).
-    /// `active` is the state of the frame being recorded. Returns a [`Summary`]
-    /// once the window holds `window` samples — or `MIN_FLUSH` samples
-    /// immediately after an idle gap, since a burst has just ended and waiting
-    /// for the full window could mean never emitting at all. The samples are
-    /// cleared either way.
+    /// Record one frame. `interval_us` is `None` for the first frame of a run
+    /// or after an idle gap. Inactive frames are skipped entirely: gpui
+    /// throttles the window, so their interval, render cost and child renders
+    /// are not comparable to a focused capture. Returns a [`Summary`] once the
+    /// window holds `window` samples — or `MIN_FLUSH` samples immediately
+    /// after an idle gap, since a burst has just ended and waiting for the
+    /// full window could mean never emitting at all. The samples are cleared
+    /// either way.
     pub fn record(
         &mut self,
         interval_us: Option<u64>,
@@ -156,7 +159,9 @@ impl FrameBudget {
         counts: [u32; 3],
         active: bool,
     ) -> Option<Summary> {
-        let interval_us = active.then_some(interval_us).flatten();
+        if !active {
+            return None;
+        }
         let scored = interval_us.filter(|us| *us > 0 && *us <= ACTIVE_GAP_US);
         // Nothing was scheduled before this frame: whatever piled up since the
         // last one is a complete burst, not a partial sample.
@@ -173,9 +178,8 @@ impl FrameBudget {
         for (slot, count) in self.counts.iter_mut().zip(counts) {
             *slot = slot.saturating_add(count);
         }
-        // The window is one frame long per build sample; idle and inactive
-        // frames contribute a build but no interval, so the frame count can
-        // trail it.
+        // The window is one frame long per build sample; an idle-gap frame
+        // contributes a build but no interval, so the frame count can trail it.
         if self.builds.len() < self.window && !(burst_ended && self.builds.len() >= MIN_FLUSH) {
             return None;
         }
@@ -288,8 +292,9 @@ fn record(interval_us: Option<u64>, build: u64, children: u64, counts: [u32; 3],
 /// Time the root render body. Returns `None` when the knob is off.
 ///
 /// The sample is finalized at the start of the next frame, because child views
-/// render after this guard drops. `window_active` excludes throttled
-/// background-window intervals from the scored samples.
+/// render after this guard drops. Frames rendered while the window was
+/// inactive are dropped whole by [`FrameBudget::record`] — gpui throttles
+/// them, so neither their interval nor their render cost is comparable.
 ///
 /// Bind it to a name that lives to the end of `render` (`let _frame = ...`):
 /// the drop is what records the build time.
@@ -384,16 +389,33 @@ mod tests {
     }
 
     #[test]
-    fn inactive_windows_are_not_scored() {
+    fn inactive_windows_contribute_nothing() {
         let mut budget = FrameBudget::new(2);
-        budget.record(Some(33_000), 1_000, 0, [0; 3], false);
+        // Throttled frames are dropped whole: no interval, build, child time
+        // or render count — the window does not even advance.
+        assert!(
+            budget
+                .record(Some(33_000), 1_000, 100, [3, 2, 1], false)
+                .is_none()
+        );
+        assert!(budget.intervals.is_empty());
+        assert!(budget.builds.is_empty());
+        assert!(budget.children.is_empty());
+        assert_eq!(budget.counts, [0; 3]);
+        // The next focused frames alone fill the window.
+        assert!(
+            budget
+                .record(Some(16_000), 500, 50, [1, 0, 0], true)
+                .is_none()
+        );
         let summary = budget
-            .record(Some(33_000), 1_000, 0, [0; 3], false)
+            .record(Some(16_000), 600, 60, [1, 0, 0], true)
             .expect("window full");
-        assert_eq!(summary.frames, 0);
+        assert_eq!(summary.frames, 2);
         assert_eq!(summary.missed, 0);
-        // Build samples are still reported: the render cost is real.
-        assert_eq!(summary.build_p50_us, 1_000);
+        assert_eq!(summary.build_p50_us, 600);
+        assert_eq!(summary.children_p50_us, 60);
+        assert_eq!(summary.transcript_renders, 2);
     }
 
     #[test]
