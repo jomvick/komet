@@ -13,8 +13,6 @@ use async_trait::async_trait;
 pub use komet_proto::{EngineInfo, HarnessId, WorkspaceScope};
 use komet_rpc::{RpcError, RpcReply, RpcService, methods};
 
-use komet_sync::DocsStore;
-
 pub mod agent_accounts;
 pub mod auth;
 pub mod chat2_host;
@@ -39,16 +37,17 @@ pub mod titles;
 pub mod uploads;
 pub mod workspace_files;
 pub mod workspace_host;
+pub mod workspace_runtime;
 
 pub use agent_accounts::{AgentAccounts, AgentAccountsConfig, UsageMode};
 pub use auth::{Auth, AuthConfig, AuthState, AuthUser, OrgMembership};
-pub use environments::{AddOutcome, EnvStoreError, EnvironmentStore};
 pub use diff_sync::{
     CheckoutDiffSync, DiffFileTextPair, DiffSidecar, DiffSnapshot, TurnSnapshot,
     capture_commit_diff, capture_diff, capture_diff_against, capture_turn_diff, merge_base,
     read_diff_file_text, snapshot_tree, working_diff_base,
 };
 pub use doc_host::{ChatDocHandle, DocHost, DocHostConfig, EdgeConfig};
+pub use environments::{AddOutcome, EnvStoreError, EnvironmentStore};
 pub use instance_lock::InstanceLock;
 pub use profile::EngineProfile;
 pub use registry::{HarnessDescriptor, HarnessRegistry, default_registry};
@@ -248,8 +247,6 @@ impl EngineCore {
                 }
             }
         }
-        let store = Arc::new(DocsStore::open(profile.store_root())?);
-        let store_for_import = store.clone();
         let journal = Arc::new(RunJournal::open(profile.store_root().join("journals"))?);
         let mcp_registry = Arc::new(crate::mcp::McpRegistry::load(data_dir).unwrap_or_else(|e| {
             tracing::warn!(error = %e, "mcp registry load failed, starting empty");
@@ -265,26 +262,19 @@ impl EngineCore {
             mcp_registry.clone(),
             mcp_secrets.clone(),
         );
-        let doc_host = DocHost::new(
-            store.clone(),
-            DocHostConfig {
-                device_id: device_id.clone(),
-                default_harness,
-                edge: edge.clone(),
-            },
-        );
-        let workspace = WorkspaceHost::open(
-            store,
-            WorkspaceHostConfig {
-                device_id: device_id.clone(),
-                device_name: local_device_name(&device_id),
-                platform: std::env::consts::OS.to_string(),
-                org_id: profile.org_id().to_string(),
-                user_id: profile.user_id().to_string(),
-                edge: edge.clone(),
-            },
+        let runtime = crate::workspace_runtime::WorkspaceRuntime::open(
+            profile.store_root(),
+            &device_id,
+            local_device_name(&device_id),
+            profile.org_id(),
+            profile.user_id(),
+            default_harness,
+            edge.clone(),
         )?;
-        doc_host.set_workspace(workspace.clone());
+        let store = runtime.store.clone();
+        let store_for_import = store.clone();
+        let doc_host = runtime.doc_host;
+        let workspace = runtime.workspace;
         doc_host.set_sessions(sessions.clone());
         sessions.set_doc_host(doc_host.clone());
         match sessions.recover_stale() {

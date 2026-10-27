@@ -58,9 +58,8 @@ impl EnvironmentStore {
         let path = data_dir.join(FILE_NAME);
         let envs = match std::fs::read(&path) {
             Ok(bytes) => {
-                let body: FileBody = serde_json::from_slice(&bytes).map_err(|err| {
-                    std::io::Error::other(format!("{}: {err}", path.display()))
-                })?;
+                let body: FileBody = serde_json::from_slice(&bytes)
+                    .map_err(|err| std::io::Error::other(format!("{}: {err}", path.display())))?;
                 if body.v != FILE_VERSION {
                     return Err(std::io::Error::other(format!(
                         "{}: unsupported environments file version {}",
@@ -174,7 +173,10 @@ mod tests {
     fn round_trips_after_save() {
         let dir = tempfile::tempdir().unwrap();
         let mut store = EnvironmentStore::load(dir.path()).unwrap();
-        assert_eq!(store.upsert(env("a", "https://one.example", "t1")), AddOutcome::Added);
+        assert_eq!(
+            store.upsert(env("a", "https://one.example", "t1")),
+            AddOutcome::Added
+        );
         store.save().unwrap();
         let reloaded = EnvironmentStore::load(dir.path()).unwrap();
         assert_eq!(reloaded.list(), store.list());
