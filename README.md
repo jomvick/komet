@@ -28,7 +28,8 @@ All binaries are available on [**GitHub Releases**](https://github.com/jomvick/k
 curl -fsSL https://raw.githubusercontent.com/jomvick/komet/main/install.sh | sh
 komet status
 ```
-Installs `komet` to `~/.komet/app` and enables the user systemd service.
+Installs `komet` to `~/.komet/app` and links it into `~/.local/bin`. To run the
+engine as a user service, run `komet daemon install`.
 
 **Standalone AppImage**
 ```bash
@@ -56,11 +57,41 @@ Download `komet-<version>-linux-<arch>.tar.gz` then run `./install.sh` inside th
 
 ---
 
+## Updating
+
+The self-updater supports Linux installs made with the one-line installer and
+the macOS app bundle:
+
+```bash
+komet update
+```
+
+On Linux, run the command above. On macOS, click the update banner in Komet and
+restart the app when prompted. For other installation types, download the latest
+release from [GitHub Releases](https://github.com/jomvick/komet/releases) and
+install or replace the existing app:
+
+| Platform / install type | Update |
+|-------------------------|--------|
+| Fedora / RPM (`x86_64`) | Download the latest `komet-<version>-1.x86_64.rpm`, then run `sudo dnf install ./komet-<version>-1.x86_64.rpm` |
+| Fedora / RPM (`aarch64`) | Download the latest `komet-<version>-1.aarch64.rpm`, then run `sudo dnf install ./komet-<version>-1.aarch64.rpm` |
+| Debian / Ubuntu (`amd64`) | Download the latest `komet_<version>_amd64.deb`, then run `sudo apt install ./komet_<version>_amd64.deb` |
+| Debian / Ubuntu (`arm64`) | Download the latest `komet_<version>_arm64.deb`, then run `sudo apt install ./komet_<version>_arm64.deb` |
+| Linux AppImage | Download the latest AppImage and replace the old file |
+| Linux tarball | Download and extract the latest tarball, then run its included `install.sh` |
+| macOS DMG | Download the latest DMG and replace `Komet.app` in Applications |
+| Windows portable EXE / ZIP | Download the latest EXE or ZIP and replace the existing `komet.exe` |
+
+`komet update` does not update RPM/DEB packages, AppImages, or Windows portable
+downloads; use the package manager or replace those files as described above.
+
+---
+
 ## Daily usage
 
 ```bash
 komet status                          # engine status + local/sync mode
-komet update                          # check and install latest version
+komet update                          # update a Linux install made with the one-line installer
 komet engine stop                     # gracefully stop the desktop app's background engine
 komet daemon start|stop|restart|status
 komet headless                        # engine only (no UI)

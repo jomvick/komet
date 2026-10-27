@@ -171,7 +171,7 @@ pub fn cli_login_command(harness: HarnessId) -> Option<&'static str> {
         HarnessId::Opencode => Some("opencode auth login"),
         HarnessId::Pi => Some("pi"),
         HarnessId::Muse => Some("muse"),
-        HarnessId::Copilot => Some("copilot login"),
+        HarnessId::Copilot => None,
         HarnessId::Cline => Some("cline"),
         HarnessId::ClaudeCode | HarnessId::Codex | HarnessId::Cursor | HarnessId::Antigravity => {
             None
@@ -190,7 +190,7 @@ pub fn login_instructions(harness: HarnessId) -> &'static str {
         HarnessId::Opencode => "Run `opencode auth login` and choose your model provider.",
         HarnessId::Pi => "Run `pi` and use `/login` to connect a model provider.",
         HarnessId::Muse => "Run `muse` and use `/login` to connect your account.",
-        HarnessId::Copilot => "Run `copilot login` and authorize GitHub in your browser.",
+        HarnessId::Copilot => "Use GitHub's device sign-in to connect and switch Copilot accounts.",
         HarnessId::Cline => "Run `cline` and choose a provider in its sign-in flow.",
         _ => "Use the Add account flow to sign in.",
     }
@@ -937,6 +937,13 @@ impl AccountsPage {
         let reset = format_reset(window.resets_at, now);
         let used_pct = (fraction * 100.0).round() as u32;
         let left_pct = (remaining_fraction * 100.0).round() as u32;
+        let value = window.display_value.clone().unwrap_or_else(|| {
+            if used_pct >= 100 {
+                "100% used (0% left)".to_string()
+            } else {
+                format!("{}% used ({}% left)", used_pct, left_pct)
+            }
+        });
 
         div()
             .flex()
@@ -953,48 +960,46 @@ impl AccountsPage {
                     .font_weight(gpui::FontWeight::MEDIUM)
                     .child(SharedString::from(window.label.clone())),
             )
-            .child(
-                // Absolute track so `relative()` fill has a definite parent
-                // width (`flex_1` + content-sized fill used to collapse).
-                // Always paint the track: unused windows are 0% fill, and
-                // hiding that child made Gemini/Session look like "no gauge".
-                div()
-                    .flex_1()
-                    .min_w(px(56.0))
-                    .max_w(px(220.0))
-                    .h(px(5.0))
-                    .relative()
-                    .child(
-                        div()
-                            .absolute()
-                            .inset_0()
-                            .rounded_full()
-                            .overflow_hidden()
-                            .bg(theme.border)
-                            .child(
-                                div()
-                                    .h_full()
-                                    // A 1.5% floor keeps tiny non-zero usage
-                                    // visible (komet `max(used, 1.5)%`).
-                                    .w(gpui::relative(if fraction > 0.0 {
-                                        fraction.max(0.015)
-                                    } else {
-                                        0.0
-                                    }))
-                                    .rounded_full()
-                                    .bg(fill),
-                            ),
-                    ),
-            )
+            .when(window.display_value.is_none(), |el| {
+                el.child(
+                    // Absolute track so `relative()` fill has a definite parent
+                    // width (`flex_1` + content-sized fill used to collapse).
+                    // Always paint the track: unused windows are 0% fill, and
+                    // hiding that child made Gemini/Session look like "no gauge".
+                    div()
+                        .flex_1()
+                        .min_w(px(56.0))
+                        .max_w(px(220.0))
+                        .h(px(5.0))
+                        .relative()
+                        .child(
+                            div()
+                                .absolute()
+                                .inset_0()
+                                .rounded_full()
+                                .overflow_hidden()
+                                .bg(theme.border)
+                                .child(
+                                    div()
+                                        .h_full()
+                                        // A 1.5% floor keeps tiny non-zero usage
+                                        // visible (komet `max(used, 1.5)%`).
+                                        .w(gpui::relative(if fraction > 0.0 {
+                                            fraction.max(0.015)
+                                        } else {
+                                            0.0
+                                        }))
+                                        .rounded_full()
+                                        .bg(fill),
+                                ),
+                        ),
+                )
+            })
             .child(
                 div()
                     .flex_none()
                     .text_right()
-                    .child(SharedString::from(if used_pct >= 100 {
-                        "100% used (0% left)".to_string()
-                    } else {
-                        format!("{}% used ({}% left)", used_pct, left_pct)
-                    })),
+                    .child(SharedString::from(value)),
             )
             .when_some(reset, |el, reset| {
                 el.child(
@@ -1321,21 +1326,54 @@ impl AccountsPage {
                     .into_any_element()
             }
             LoginFlow::Browser {
+                harness,
                 start,
                 message,
                 error,
-                ..
             } => {
                 let has_error = error.is_some();
+                let instructions = match harness {
+                    HarnessId::Copilot => {
+                        "Authorize GitHub in the browser to add this Copilot account. Komet keeps each connected account separate; your current selection is unchanged until you switch."
+                    }
+                    HarnessId::Codex => {
+                        "Finish signing in to OpenAI in your browser. The new login is captured in an isolated profile — your current session is untouched until you switch."
+                    }
+                    HarnessId::Cursor => {
+                        "Finish signing in to Cursor in your browser. Your current session is untouched until you switch."
+                    }
+                    _ => "Finish signing in to the provider in your browser.",
+                };
                 div()
                     .flex()
                     .flex_col()
-                    .child(div().mt(px(8.0)).child(popover::dialog_body(
-                        &theme,
-                        "Finish signing in to OpenAI in your browser. The new login is \
-                         captured in an isolated profile — your current session is untouched \
-                         until you switch.",
-                    )))
+                    .child(
+                        div()
+                            .mt(px(8.0))
+                            .child(popover::dialog_body(&theme, instructions)),
+                    )
+                    .when_some(start.user_code.clone(), |el, code| {
+                        el.child(
+                            div()
+                                .mt(px(12.0))
+                                .flex()
+                                .flex_col()
+                                .gap(px(4.0))
+                                .child(
+                                    div()
+                                        .text_size(px(11.5))
+                                        .text_color(theme.text_muted)
+                                        .child("Enter this one-time code on GitHub"),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(20.0))
+                                        .font_weight(gpui::FontWeight::BOLD)
+                                        .text_color(theme.text)
+                                        .child(code),
+                                ),
+                        )
+                    })
                     .child(url_link(
                         "login-open-url-browser",
                         "Reopen the sign-in page",
@@ -2013,6 +2051,7 @@ mod tests {
                 label: "Week".into(),
                 used_fraction: 0.42,
                 resets_at: None,
+                display_value: None,
             }],
             display_name: None,
             organization: None,
@@ -2072,6 +2111,7 @@ mod tests {
                 label: "Week".into(),
                 used_fraction: 0.42,
                 resets_at: None,
+                display_value: None,
             }])],
             warnings: vec![],
         };

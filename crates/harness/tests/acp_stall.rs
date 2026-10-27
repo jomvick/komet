@@ -43,6 +43,7 @@ async fn silent_agent_errors_via_the_prompt_stall_watchdog() {
         request_permission: RunControls::noop_permission(),
         steering: steer_rx,
         interrupt: token.clone(),
+        env: Vec::new(),
     };
     let request = RunRequest {
         prompt: "scenario:prompt-stall".into(),
@@ -112,6 +113,7 @@ async fn opencode_stall_hint_names_the_provider() {
         request_permission: RunControls::noop_permission(),
         steering: steer_rx,
         interrupt: token.clone(),
+        env: Vec::new(),
     };
     let request = RunRequest {
         prompt: "scenario:prompt-stall".into(),

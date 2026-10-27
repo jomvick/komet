@@ -488,9 +488,8 @@ impl Shell {
         }
     }
 
-    /// The sidebar's space-filter row: current filter ("All projects" or the
-    /// space's name) + chevron, the dropdown floating beneath while open.
-    /// Sits OUTSIDE the sidebar's scroll region so the float never clips.
+    /// The sidebar's Project tree header, project filter, and new-session
+    /// control. Sits outside the scroll region so the filter dropdown never clips.
     pub(super) fn render_spaces_filter(
         &mut self,
         theme: &Theme,
@@ -509,7 +508,7 @@ impl Shell {
                         Some((tag.into(), offline)),
                     )
                 }
-                None => (SharedString::from("All projects"), None),
+                None => (SharedString::from("Project"), None),
             }
         };
         let open = self.spaces_menu.is_open();
@@ -598,7 +597,7 @@ impl Shell {
                     .flex_none()
                     .text_color(theme.text_muted.opacity(0.6)),
             );
-        let trigger = if self.spaces_menu.get().is_some() {
+        let trigger = if filter.is_some() && self.spaces_menu.get().is_some() {
             let closing = self.spaces_menu.closing_since();
             let menu = self.render_spaces_menu(theme, cx);
             trigger
@@ -610,6 +609,124 @@ impl Shell {
                 ))
         } else {
             trigger
+        };
+        let trigger = if filter.is_none() {
+            let menu_open = self.spaces_menu.is_open();
+            let project_menu = div()
+                .id("project-tree-menu")
+                .size(px(24.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(6.0))
+                .cursor_pointer()
+                .bg(if menu_open {
+                    theme.glass_hover()
+                } else {
+                    motion::hover_blend(
+                        "project-tree-menu",
+                        crate::theme::wash(0.0),
+                        crate::theme::wash(0.14),
+                    )
+                })
+                .on_hover(motion::hover_listener("project-tree-menu"))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    if !this.spaces_menu.is_open() {
+                        this.open_spaces_menu(window, cx);
+                    }
+                }))
+                .child(
+                    icon(icons::FOLDER)
+                        .size(px(14.0))
+                        .text_color(theme.text_muted.opacity(0.7)),
+                );
+            let project_menu = if self.spaces_menu.get().is_some() {
+                let closing = self.spaces_menu.closing_since();
+                let menu = self.render_spaces_menu(theme, cx);
+                project_menu
+                    .relative()
+                    .child(popover::anchored_menu_below_unfrosted(
+                        "spaces-filter-menu",
+                        menu,
+                        closing,
+                    ))
+            } else {
+                project_menu
+            };
+            let expanded = self.settings.project_tree_expanded;
+            let project_count = self.state.read(cx).spaces.len();
+            let project_header = div()
+                .id("project-tree-toggle")
+                .flex_1()
+                .min_w_0()
+                .h(px(29.0))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(6.0))
+                .rounded(px(8.0))
+                .px(px(10.0))
+                .cursor_pointer()
+                .bg(motion::hover_blend(
+                    "project-tree-toggle",
+                    crate::theme::wash(0.0),
+                    crate::theme::wash(0.14),
+                ))
+                .on_hover(motion::hover_listener("project-tree-toggle"))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.settings.project_tree_expanded = !this.settings.project_tree_expanded;
+                    this.schedule_save(cx);
+                    cx.notify();
+                }))
+                .child(
+                    icon(icons::FOLDER_WITH_FILES)
+                        .size(px(15.0))
+                        .flex_none()
+                        .text_color(theme.text_muted),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(13.0))
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme.text.opacity(0.85))
+                        .child(SharedString::from("Project")),
+                )
+                .when(!expanded && project_count > 0, |el| {
+                    el.child(
+                        div()
+                            .flex_none()
+                            .text_size(px(11.0))
+                            .text_color(theme.text_muted.opacity(0.5))
+                            .child(SharedString::from(project_count.to_string())),
+                    )
+                })
+                .child(
+                    icon(if expanded {
+                        icons::ALT_ARROW_DOWN
+                    } else {
+                        icons::ALT_ARROW_RIGHT
+                    })
+                    .size(px(12.0))
+                    .flex_none()
+                    .text_color(theme.text_muted.opacity(0.65)),
+                );
+
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(4.0))
+                .child(project_header)
+                .child(project_menu)
+                .into_any_element()
+        } else {
+            trigger.into_any_element()
         };
 
         // NEW SESSION beside the trigger (adding a project lives in the
@@ -1285,6 +1402,38 @@ impl Shell {
             .into_any_element()
     }
 
+    fn render_grouped_session_row(
+        &mut self,
+        status: ChatIndicator,
+        chat: komet_proto::Chat,
+        folder: String,
+        branch: Option<String>,
+        selected: Option<&str>,
+        now: chrono::DateTime<Utc>,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let is_selected = selected == Some(chat.id.as_str());
+        let time_ago: SharedString =
+            format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now).into();
+        let harness = chat.config.as_ref().map(|config| config.harness);
+        self.render_chat_row(
+            chat.id.clone(),
+            transcript::single_line(&chat.title.clone().unwrap_or_else(|| "New session".into()))
+                .into(),
+            time_ago,
+            folder.into(),
+            branch.map(SharedString::from),
+            harness,
+            status,
+            is_selected,
+            false,
+            chat.pinned,
+            theme,
+            cx,
+        )
+    }
+
     /// "All projects" sidebar view: sessions grouped by project folder.
     /// Each `Space` becomes a collapsible folder header; clicking toggles it.
     /// Projects with no sessions show a "No conversations yet" placeholder.
@@ -1395,6 +1544,27 @@ impl Shell {
         let selected = self.state.read(cx).selected_chat.clone();
         let mut elements: Vec<AnyElement> = Vec::new();
 
+        if !self.settings.project_tree_expanded {
+            let selected_session = groups
+                .into_iter()
+                .flat_map(|group| group.sessions)
+                .chain(projectless)
+                .find(|(_, chat, _, _)| selected.as_deref() == Some(chat.id.as_str()));
+            if let Some((status, chat, folder, branch)) = selected_session {
+                elements.push(self.render_grouped_session_row(
+                    status,
+                    chat,
+                    folder,
+                    branch,
+                    selected.as_deref(),
+                    now,
+                    theme,
+                    cx,
+                ));
+            }
+            return elements;
+        }
+
         for group in groups {
             let is_collapsed = !self.expanded_spaces.contains(&group.id);
             let count = group.sessions.len();
@@ -1408,7 +1578,32 @@ impl Shell {
             );
             elements.push(header);
 
-            if !is_collapsed {
+            if is_collapsed {
+                if let Some((status, chat, folder, branch)) = group
+                    .sessions
+                    .into_iter()
+                    .find(|(_, chat, _, _)| selected.as_deref() == Some(chat.id.as_str()))
+                {
+                    elements.push(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .pb(px(4.0))
+                            .child(self.render_grouped_session_row(
+                                status,
+                                chat,
+                                folder,
+                                branch,
+                                selected.as_deref(),
+                                now,
+                                theme,
+                                cx,
+                            ))
+                            .into_any_element(),
+                    );
+                }
+            } else {
                 if group.sessions.is_empty() {
                     // Placeholder: "No conversations yet"
                     elements.push(
@@ -1423,25 +1618,13 @@ impl Shell {
                 } else {
                     let mut rows_div = div().flex().flex_col().gap(px(2.0)).pb(px(4.0));
                     for (status, chat, folder, branch) in group.sessions {
-                        let is_selected = selected.as_deref() == Some(chat.id.as_str());
-                        let time_ago: SharedString =
-                            format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now)
-                                .into();
-                        let harness = chat.config.as_ref().map(|c| c.harness);
-                        let element = self.render_chat_row(
-                            chat.id.clone(),
-                            transcript::single_line(
-                                &chat.title.clone().unwrap_or_else(|| "New session".into()),
-                            )
-                            .into(),
-                            time_ago,
-                            folder.into(),
-                            branch.map(SharedString::from),
-                            harness,
+                        let element = self.render_grouped_session_row(
                             status,
-                            is_selected,
-                            false,
-                            chat.pinned,
+                            chat,
+                            folder,
+                            branch,
+                            selected.as_deref(),
+                            now,
                             theme,
                             cx,
                         );
@@ -1466,28 +1649,40 @@ impl Shell {
                 cx,
             );
             elements.push(header);
-            if !is_collapsed {
+            if is_collapsed {
+                if let Some((status, chat, folder, branch)) = projectless
+                    .into_iter()
+                    .find(|(_, chat, _, _)| selected.as_deref() == Some(chat.id.as_str()))
+                {
+                    elements.push(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .pb(px(4.0))
+                            .child(self.render_grouped_session_row(
+                                status,
+                                chat,
+                                folder,
+                                branch,
+                                selected.as_deref(),
+                                now,
+                                theme,
+                                cx,
+                            ))
+                            .into_any_element(),
+                    );
+                }
+            } else {
                 let mut rows_div = div().flex().flex_col().gap(px(2.0)).pb(px(4.0));
                 for (status, chat, folder, branch) in projectless {
-                    let is_selected = selected.as_deref() == Some(chat.id.as_str());
-                    let time_ago: SharedString =
-                        format_time_ago(chat.last_message_at.unwrap_or(chat.created_at), now)
-                            .into();
-                    let harness = chat.config.as_ref().map(|c| c.harness);
-                    let element = self.render_chat_row(
-                        chat.id.clone(),
-                        transcript::single_line(
-                            &chat.title.clone().unwrap_or_else(|| "New session".into()),
-                        )
-                        .into(),
-                        time_ago,
-                        folder.into(),
-                        branch.map(SharedString::from),
-                        harness,
+                    let element = self.render_grouped_session_row(
                         status,
-                        is_selected,
-                        false,
-                        chat.pinned,
+                        chat,
+                        folder,
+                        branch,
+                        selected.as_deref(),
+                        now,
                         theme,
                         cx,
                     );

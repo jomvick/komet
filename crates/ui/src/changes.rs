@@ -513,16 +513,11 @@ pub enum DiffScope {
 }
 
 impl DiffScope {
-    pub const ALL: [DiffScope; 4] = [
-        Self::WorkingTree,
-        Self::Branch,
-        Self::LatestTurn,
-        Self::History,
-    ];
+    pub const ALL: [DiffScope; 2] = [Self::WorkingTree, Self::History];
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::WorkingTree => "Working tree",
+            Self::WorkingTree => "Changes",
             Self::Branch => "Branch changes",
             Self::LatestTurn => "Latest turn",
             Self::History => "History",
@@ -3479,6 +3474,13 @@ rename to new_name.rs
         assert_eq!(DiffScope::Branch.mode(), "branch");
         assert_eq!(DiffScope::LatestTurn.mode(), "turn");
         assert_eq!(DiffScope::default(), DiffScope::WorkingTree);
+    }
+
+    #[test]
+    fn scope_menu_keeps_only_changes_and_history() {
+        assert_eq!(DiffScope::ALL, [DiffScope::WorkingTree, DiffScope::History]);
+        assert_eq!(DiffScope::WorkingTree.label(), "Changes");
+        assert_eq!(DiffScope::History.label(), "History");
     }
 
     #[test]

@@ -169,6 +169,7 @@ fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
         request_permission: RunControls::noop_permission(),
         steering: steer_rx,
         interrupt: token.clone(),
+        env: Vec::new(),
     };
     (controls, steer_tx, token)
 }
@@ -381,6 +382,7 @@ async fn question_shaped_requests_bridge_to_the_input_panel() {
         request_permission: RunControls::noop_permission(),
         steering: steer_rx,
         interrupt: token.clone(),
+        env: Vec::new(),
     };
     let _keep = (steer_tx, token);
     let events = run_to_end(&harness(), request("scenario:question"), controls).await;
@@ -418,6 +420,7 @@ async fn permission_requests_block_on_the_permission_bridge() {
         }),
         steering: steer_rx,
         interrupt: token.clone(),
+        env: Vec::new(),
     };
     let _keep = (steer_tx, token);
     let events = run_to_end(&harness(), request("scenario:permission"), controls).await;
@@ -446,6 +449,7 @@ async fn permission_bridge_deny_selects_the_reject_option() {
         }),
         steering: steer_rx,
         interrupt: token.clone(),
+        env: Vec::new(),
     };
     let _keep = (steer_tx, token);
     let events = run_to_end(&harness(), request("scenario:perm-deny"), controls).await;
@@ -472,6 +476,7 @@ async fn full_access_auto_allows_without_the_permission_bridge() {
         }),
         steering: steer_rx,
         interrupt: token.clone(),
+        env: Vec::new(),
     };
     let _keep = (steer_tx, token);
     let mut req = request("scenario:permission");
@@ -498,6 +503,7 @@ async fn read_only_auto_denies_shell_without_the_permission_bridge() {
         }),
         steering: steer_rx,
         interrupt: token.clone(),
+        env: Vec::new(),
     };
     let _keep = (steer_tx, token);
     let mut req = request("scenario:perm-readonly");
@@ -1384,6 +1390,7 @@ async fn cline_workspace_write_blocks_on_the_permission_bridge() {
         }),
         steering: steer_rx,
         interrupt: token.clone(),
+        env: Vec::new(),
     };
     let _ = steer_tx;
     let mut req = request("cline permission bridge");
