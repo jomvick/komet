@@ -22,6 +22,7 @@ pub mod composio;
 pub mod crash_shield;
 pub mod diff_sync;
 pub mod doc_host;
+pub mod environments;
 pub mod harness_cli;
 pub mod instance_lock;
 pub mod local_import;
@@ -41,6 +42,7 @@ pub mod workspace_host;
 
 pub use agent_accounts::{AgentAccounts, AgentAccountsConfig, UsageMode};
 pub use auth::{Auth, AuthConfig, AuthState, AuthUser, OrgMembership};
+pub use environments::{AddOutcome, EnvStoreError, EnvironmentStore};
 pub use diff_sync::{
     CheckoutDiffSync, DiffFileTextPair, DiffSidecar, DiffSnapshot, TurnSnapshot,
     capture_commit_diff, capture_diff, capture_diff_against, capture_turn_diff, merge_base,
