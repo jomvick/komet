@@ -2898,7 +2898,7 @@ fn render_file_body_upto(
 }
 
 impl Render for Changes {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.scope == DiffScope::History {
             let history = self.history_pane(cx);
             history.update(cx, |history, cx| history.ensure_loaded(cx));
@@ -2975,7 +2975,7 @@ impl Render for Changes {
                             24.0,
                         )
                         .speed(1.25)
-                        .driven(cx.entity_id(), cx),
+                        .driven(cx.entity_id(), window, cx),
                     )
                     .child(
                         div()
@@ -3020,7 +3020,7 @@ impl Render for Changes {
                                     24.0,
                                 )
                                 .speed(1.25)
-                                .driven(cx.entity_id(), cx),
+                                .driven(cx.entity_id(), window, cx),
                             )
                             .into_any_element()
                     }

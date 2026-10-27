@@ -18,8 +18,10 @@
 # long intervals because nothing was scheduled — those are excluded from the
 # samples by `crates/ui/src/perf.rs`, but the capture still needs load.
 #
-# Needs a graphical session. Reuses /tmp/komet-demo-ui when `dev-demo.sh` has
-# seeded it, so the transcript is realistic.
+# Needs a graphical session and a running demo daemon: start `dev-demo.sh`
+# first (or a `komet headless` engine on `KOMET_IPC_PORT`, default 27921).
+# Reuses /tmp/komet-demo-ui when `dev-demo.sh` has seeded it, so the transcript
+# is realistic.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -46,11 +48,16 @@ if [[ ! -x "$BIN" ]]; then
 fi
 
 DATA_DIR="${KOMET_DATA_DIR:-/tmp/komet-demo-ui}"
+IPC="${KOMET_IPC_PORT:-27921}"
+if ! (exec 3<>/dev/tcp/127.0.0.1/"$IPC") 2>/dev/null; then
+  echo "▸ no engine daemon listening on 127.0.0.1:$IPC — start scripts/dev-demo.sh first" >&2
+  exit 1
+fi
 LOG=$(mktemp -t komet-frame-budget.XXXXXX.log)
-echo "▸ capturing ${SECONDS_TO_RUN}s into $LOG (data: $DATA_DIR)"
+echo "▸ capturing ${SECONDS_TO_RUN}s into $LOG (data: $DATA_DIR, daemon: :$IPC)"
 
 set +e
-env KOMET_DATA_DIR="$DATA_DIR" KOMET_HARNESS=mock \
+env KOMET_DATA_DIR="$DATA_DIR" KOMET_IPC_PORT="$IPC" KOMET_HARNESS=mock \
   KOMET_WINDOW_STATS=1 RUST_LOG=warn \
   timeout "${SECONDS_TO_RUN}s" "$BIN" >"$LOG" 2>&1
 STATUS=$?
@@ -94,14 +101,17 @@ def ratio(key):
 def ms(key):
     return f"{med(key) / 1000:.1f}"
 
+def peak_ms(key):
+    return f"{max(w[key] for w in active_windows) / 1000:.1f}"
+
 print()
 print(f"fenêtres actives: {len(active_windows)}   frames actives: {total_frames}")
 print(f"frames manquées: {ratio('missed') * 100:.1f} % (> 16.7 ms)")
 print(f"{'':<10}{'p50':>8}{'p95':>8}{'p99':>8}{'max':>8}   (ms)")
 print(f"{'interval':<10}{ms('interval_p50_us'):>8}{ms('interval_p95_us'):>8}"
-      f"{ms('interval_p99_us'):>8}{(med('interval_max_us') / 1000):>8.1f}")
+      f"{ms('interval_p99_us'):>8}{peak_ms('interval_max_us'):>8}")
 print(f"{'build':<10}{ms('build_p50_us'):>8}{ms('build_p95_us'):>8}"
-      f"{ms('build_p99_us'):>8}{(med('build_max_us') / 1000):>8.1f}")
+      f"{ms('build_p99_us'):>8}{peak_ms('build_max_us'):>8}")
 
 if csv_path:
     keys = ["frames", "missed", "interval_p50_us", "interval_p95_us",

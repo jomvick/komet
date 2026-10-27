@@ -1211,6 +1211,7 @@ impl AccountsPage {
     fn render_login_dialog(
         &mut self,
         viewport: gpui::Size<gpui::Pixels>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let theme = Theme::of(cx).clone();
@@ -1243,6 +1244,7 @@ impl AccountsPage {
                     &theme,
                     2,
                     cx.entity_id(),
+                    window,
                     cx,
                 ))
                 .into_any_element(),
@@ -1394,7 +1396,11 @@ impl AccountsPage {
                                         24.0,
                                     )
                                     .speed(1.25)
-                                    .driven(cx.entity_id(), cx),
+                                    .driven(
+                                        cx.entity_id(),
+                                        window,
+                                        cx,
+                                    ),
                                 )
                                 .child(
                                     div()
@@ -1446,10 +1452,11 @@ impl AccountsPage {
         dim: bool,
         first: bool,
         theme: &Theme,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         use crate::motion;
-        let delta = motion::pulse_delta(&motion::KOMET_PULSE, cx.entity_id(), cx);
+        let delta = motion::pulse_delta(&motion::KOMET_PULSE, cx.entity_id(), window, cx);
         let ghost = |w: gpui::Length, h: f32, round_full: bool| {
             div()
                 .w(w)
@@ -1527,7 +1534,7 @@ impl Render for AccountsPage {
         use crate::settings::widgets;
         let theme = Theme::of(cx).clone();
         let now = Utc::now();
-        let dialog = self.render_login_dialog(window.viewport_size(), cx);
+        let dialog = self.render_login_dialog(window.viewport_size(), window, cx);
         // Driven by the load flag, not the `Loadable` state: a reload keeps the
         // previous snapshot on screen, so `Loading` no longer marks "in flight".
         let refreshing = self.refreshing;
@@ -1610,6 +1617,7 @@ impl Render for AccountsPage {
                                     false,
                                     true,
                                     &theme,
+                                    window,
                                     cx,
                                 ))
                                 .child(self.render_skeleton_row(
@@ -1617,6 +1625,7 @@ impl Render for AccountsPage {
                                     true,
                                     false,
                                     &theme,
+                                    window,
                                     cx,
                                 )),
                         )

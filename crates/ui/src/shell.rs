@@ -3899,11 +3899,11 @@ impl Shell {
             .into_any_element()
     }
 
-    fn render_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let inner: AnyElement = match self.route {
             Route::Settings(section) => self.render_settings_nav(section, &theme, cx),
-            Route::Chat => self.render_chat_sidebar(&theme, cx),
+            Route::Chat => self.render_chat_sidebar(&theme, window, cx),
         };
         let target = self.sidebar_target();
         // Transparent — the sidebar sits directly on the shell surface; the
@@ -4053,6 +4053,7 @@ impl Shell {
         archived: bool,
         pinned: bool,
         theme: &Theme,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         // Activity, not position (t3code Sidebar): status is a small colored
@@ -4326,7 +4327,7 @@ impl Shell {
                                 14.0,
                             )
                             .speed(1.25)
-                            .driven(cx.entity_id(), cx),
+                            .driven(cx.entity_id(), window, cx),
                         )
                     }),
             )
@@ -4336,7 +4337,12 @@ impl Shell {
     /// Chat-mode sidebar (spaces overhaul): window-control strip, the Spaces
     /// section (folder + device rows, add-space), the global Active sessions
     /// list, the notice strip, and the UserMenu (§1.6).
-    fn render_chat_sidebar(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    fn render_chat_sidebar(
+        &mut self,
+        theme: &Theme,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let (user, workspace_scope) = {
             let state = self.state.read(cx);
             (state.auth_user().cloned(), state.workspace_scope)
@@ -4345,12 +4351,12 @@ impl Shell {
         // When "All projects" (filter = None) → grouped by project folder.
         // When a specific project is selected → flat list with FLIP resort.
         let list_items: Vec<AnyElement> = if self.settings.space_filter.is_none() {
-            self.render_grouped_rows(theme, cx)
+            self.render_grouped_rows(theme, window, cx)
         } else {
             // Keyed rows: (stable key, estimated height, element) — the key + height
             // list drives the §1.6 resort FLIP diff below (attention-bucket
             // promotions glide; cleared rows just go).
-            let keyed: Vec<(String, f32, AnyElement)> = self.render_active_rows(theme, cx);
+            let keyed: Vec<(String, f32, AnyElement)> = self.render_active_rows(theme, window, cx);
 
             // Resort glide (§1.6 View Transitions parity): when the ORDER of a live
             // list changes (new activity resort, grouping flip), surviving rows
@@ -5223,6 +5229,7 @@ impl Shell {
     fn render_sync_overlay(
         &mut self,
         viewport: gpui::Size<Pixels>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let theme = Theme::of(cx).clone();
@@ -5244,7 +5251,7 @@ impl Shell {
         };
 
         if self.sync_flow == SyncFlow::Enabling && needs_org {
-            return Some(self.render_org_gate(cx));
+            return Some(self.render_org_gate(window, cx));
         }
 
         let signed_in_email: Option<SharedString> = match self.state.read(cx).auth.as_ref() {
@@ -5790,7 +5797,7 @@ impl Shell {
             overlays.push(popover::modal("delete-chat-dialog", viewport, card));
         }
 
-        if let Some(sync) = self.render_sync_overlay(viewport, cx) {
+        if let Some(sync) = self.render_sync_overlay(viewport, window, cx) {
             overlays.push(sync);
         }
         if let Some(update) = self.render_update_modal(viewport, &theme, cx) {
@@ -5837,7 +5844,7 @@ impl Shell {
             )
     }
 
-    fn render_main(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_main(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let theme_owned = Theme::of(cx).clone();
         let theme = &theme_owned;
         let (border, text, faint) = (theme.border, theme.text, theme.text_faint);
@@ -5926,7 +5933,7 @@ impl Shell {
             // selection stays in the composer's action bar.
             let pickers = self.composer.read(cx).pickers().clone();
             let (target_selectors, checkout_selectors) = pickers.update(cx, |p, cx| {
-                (p.render_target_selectors(cx), p.render_footer(cx))
+                (p.render_target_selectors(cx), p.render_footer(window, cx))
             });
             div()
                 .size_full()
@@ -5968,7 +5975,7 @@ impl Shell {
                 ))
                 .into_any_element()
         };
-        let status = self.render_status_strip(cx);
+        let status = self.render_status_strip(window, cx);
         // File dropzone over the ENTIRE conversation column (transcript +
         // composer, not just the pill): dragging OS files anywhere across the
         // chat area shows the "Drop files or images to attach" veil; a drop
@@ -6337,7 +6344,7 @@ impl Shell {
     /// Working indicator strip: gradient spinner + rotating flavour word (7s,
     /// seeded per chat) + elapsed, staleness-gated via [`Indicator`]; falls back
     /// to a "Sending…" bridge and then the engine mode line.
-    fn render_status_strip(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_status_strip(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let now = Utc::now();
         let state = self.state.read(cx);
@@ -6397,7 +6404,7 @@ impl Shell {
                         20.0,
                     )
                     .speed(1.25)
-                    .driven(cx.entity_id(), cx),
+                    .driven(cx.entity_id(), window, cx),
                 )
                 .child(
                     div()
@@ -7271,7 +7278,7 @@ impl Shell {
 
     /// Organization onboarding used by the synced gate and, for a local
     /// runtime, only after the user explicitly starts the sync opt-in.
-    fn render_org_gate(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_org_gate(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         self.ensure_org_ui(cx);
         let theme = Theme::of(cx).clone();
         let local_setup = self.state.read(cx).workspace_scope == Some(WorkspaceScope::Local);
@@ -7298,6 +7305,7 @@ impl Shell {
                         &theme,
                         2,
                         cx.entity_id(),
+                        window,
                         cx,
                     ))
                     .into_any_element(),
@@ -8067,14 +8075,14 @@ impl Render for Shell {
                     t.set_bottom_clearance(stack_h, cx);
                 });
 
-                let sidebar = self.render_sidebar(cx);
+                let sidebar = self.render_sidebar(window, cx);
                 let sidebar_handle = self.resize_handle(
                     "sidebar-resize",
                     || SidebarResize,
                     |shell, _| shell.settings.sidebar_width = SIDEBAR_DEFAULT,
                     cx,
                 );
-                let main = self.render_main(cx);
+                let main = self.render_main(window, cx);
                 // The Changes pane is chat-scoped chrome: the Settings route
                 // never renders it (komet __root.tsx `!isSettings && activeChat`
                 // around the diff column) — the per-session open flags stay
@@ -8169,7 +8177,7 @@ impl Render for Shell {
             }
             GatePhase::Loading => root, // splash overlay covers boot
             GatePhase::OrgGate => {
-                let card = self.render_org_gate(cx);
+                let card = self.render_org_gate(window, cx);
                 root.child(card)
             }
             phase @ (GatePhase::Failed(_) | GatePhase::SignIn) => {
@@ -8187,7 +8195,7 @@ impl Render for Shell {
         // Manual tweens, hover fades, and leased pulse animations share this
         // root's vsync cadence; nothing polls while all three are idle.
         let pulses_active = motion::pulse_frame(cx.entity_id(), cx);
-        if self.motion_active.get() | motion::hover_fades_active() | pulses_active {
+        if self.motion_active.get() | motion::hover_frame(cx.entity_id(), cx) | pulses_active {
             window.request_animation_frame();
         }
 

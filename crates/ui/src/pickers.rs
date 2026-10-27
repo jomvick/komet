@@ -2602,7 +2602,11 @@ impl Pickers {
     /// The checkout-kind + ref toolbar, only when the picked (or session's)
     /// project has git. Draft controls sit above the new-session prompt;
     /// existing sessions keep their read-only toolbar below the composer.
-    pub fn render_footer(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub fn render_footer(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let theme = Theme::of(cx).clone();
         // A selected chat whose workspace row hasn't synced yet (the moment
         // right after send mints it) still renders the DRAFT footer — the
@@ -2735,7 +2739,7 @@ impl Pickers {
         let closing = self.open.closing_since();
         let mut overlay: Option<(PickerKind, AnyElement)> = match self.mounted_kind() {
             Some(PickerKind::Branch) => {
-                let content = self.render_branch_popover(cx);
+                let content = self.render_branch_popover(window, cx);
                 Some((PickerKind::Branch, self.popover_frame(320.0, content, cx)))
             }
             Some(PickerKind::Checkout) => {
@@ -2886,7 +2890,7 @@ impl Pickers {
     /// The ref picker (t3code BranchToolbarBranchSelector): search on top,
     /// rows with right-aligned muted `current`/`worktree` tags, and a
     /// "Showing X of Y refs" footer when the list is capped.
-    fn render_branch_popover(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_branch_popover(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         if self.state.read(cx).selected_space_row().is_none() {
             return div()
@@ -2911,7 +2915,7 @@ impl Pickers {
         let body: AnyElement =
             match &self.refs {
                 Loadable::Loading | Loadable::Idle => {
-                    popover::skeleton_rows("branch-skeleton", &theme, 4, cx.entity_id(), cx)
+                    popover::skeleton_rows("branch-skeleton", &theme, 4, cx.entity_id(), window, cx)
                 }
                 Loadable::Error(message) => {
                     let message = message.clone();
@@ -3096,7 +3100,11 @@ impl Pickers {
     /// harness icon + name (t3 `showProvider`, replacing the description) —
     /// with a ⌘N jump chip and a star toggle trailing. Searching stays scoped
     /// to the viewed harness (the rail stays up and re-scopes on a click).
-    fn render_harness_model_popover(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_harness_model_popover(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         const HEIGHT: f32 = 346.0; // t3 max-h-86.5
 
         let theme = Theme::of(cx).clone();
@@ -3112,6 +3120,7 @@ impl Pickers {
                         &theme,
                         4,
                         cx.entity_id(),
+                        window,
                         cx,
                     ))
                     .into_any_element();
@@ -3456,6 +3465,7 @@ impl Pickers {
                     &theme,
                     4,
                     cx.entity_id(),
+                    window,
                     cx,
                 )],
             }
@@ -3503,10 +3513,21 @@ impl Pickers {
     /// label, a "Default" badge on the section's default choice, and the
     /// trailing check on the selected row. Sections split by hairline
     /// separators. Selecting keeps the menu open for multi-adjust.
-    fn render_traits_sections(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_traits_sections(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let Some(model) = self.selected_model(cx).cloned() else {
-            return popover::skeleton_rows("traits-skeleton", &theme, 3, cx.entity_id(), cx);
+            return popover::skeleton_rows(
+                "traits-skeleton",
+                &theme,
+                3,
+                cx.entity_id(),
+                window,
+                cx,
+            );
         };
         let levels = self.trait_ladder(cx);
         // Display the effective level (draft pick or the chat's config), so
@@ -4137,7 +4158,7 @@ impl Render for Pickers {
             | Some(PickerKind::Device)
             | Some(PickerKind::ContextUsage) => None,
             Some(PickerKind::HarnessModel) => {
-                let content = self.render_harness_model_popover(cx);
+                let content = self.render_harness_model_popover(window, cx);
                 Some((
                     PickerKind::HarnessModel,
                     // t3 ModelPickerContent `max-w-90` — 360px.
@@ -4147,7 +4168,7 @@ impl Render for Pickers {
             Some(PickerKind::Traits) => {
                 let content = div()
                     .p(px(4.0))
-                    .child(self.render_traits_sections(cx))
+                    .child(self.render_traits_sections(window, cx))
                     .into_any_element();
                 Some((
                     PickerKind::Traits,

@@ -867,6 +867,7 @@ impl Render for HarnessesPage {
                     &theme,
                     4,
                     cx.entity_id(),
+                    window,
                     cx,
                 ))
                 .into_any_element(),

@@ -541,7 +541,12 @@ impl Shell {
                 )
             })
             .on_hover(cx.listener(|this, hovered: &bool, window, cx| {
-                motion::set_hover("spaces-filter", *hovered, motion::reduced_motion(cx));
+                motion::set_hover(
+                    "spaces-filter",
+                    cx.entity_id(),
+                    *hovered,
+                    motion::reduced_motion(cx),
+                );
                 cx.notify();
                 if *hovered && !this.spaces_menu.is_open() {
                     this.open_spaces_menu(window, cx);
@@ -630,7 +635,7 @@ impl Shell {
                         crate::theme::wash(0.14),
                     )
                 })
-                .on_hover(motion::hover_listener("project-tree-menu"))
+                .on_hover(motion::hover_listener("project-tree-menu", cx.entity_id()))
                 .on_click(cx.listener(|this, _, window, cx| {
                     if !this.spaces_menu.is_open() {
                         this.open_spaces_menu(window, cx);
@@ -673,7 +678,10 @@ impl Shell {
                     crate::theme::wash(0.0),
                     crate::theme::wash(0.14),
                 ))
-                .on_hover(motion::hover_listener("project-tree-toggle"))
+                .on_hover(motion::hover_listener(
+                    "project-tree-toggle",
+                    cx.entity_id(),
+                ))
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.settings.project_tree_expanded = !this.settings.project_tree_expanded;
                     this.schedule_save(cx);
@@ -1189,6 +1197,7 @@ impl Shell {
     pub(super) fn render_active_rows(
         &mut self,
         theme: &Theme,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<(String, f32, AnyElement)> {
         let now = Utc::now();
@@ -1250,6 +1259,7 @@ impl Shell {
                     false,
                     chat.pinned,
                     theme,
+                    window,
                     cx,
                 );
                 (format!("c:{}", chat.id), height, element)
@@ -1402,6 +1412,7 @@ impl Shell {
             .into_any_element()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_grouped_session_row(
         &mut self,
         status: ChatIndicator,
@@ -1411,6 +1422,7 @@ impl Shell {
         selected: Option<&str>,
         now: chrono::DateTime<Utc>,
         theme: &Theme,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let is_selected = selected == Some(chat.id.as_str());
@@ -1430,6 +1442,7 @@ impl Shell {
             false,
             chat.pinned,
             theme,
+            window,
             cx,
         )
     }
@@ -1442,6 +1455,7 @@ impl Shell {
     pub(super) fn render_grouped_rows(
         &mut self,
         theme: &Theme,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let now = Utc::now();
@@ -1559,6 +1573,7 @@ impl Shell {
                     selected.as_deref(),
                     now,
                     theme,
+                    window,
                     cx,
                 ));
             }
@@ -1598,6 +1613,7 @@ impl Shell {
                                 selected.as_deref(),
                                 now,
                                 theme,
+                                window,
                                 cx,
                             ))
                             .into_any_element(),
@@ -1626,6 +1642,7 @@ impl Shell {
                             selected.as_deref(),
                             now,
                             theme,
+                            window,
                             cx,
                         );
                         rows_div = rows_div.child(element);
@@ -1668,6 +1685,7 @@ impl Shell {
                                 selected.as_deref(),
                                 now,
                                 theme,
+                                window,
                                 cx,
                             ))
                             .into_any_element(),
@@ -1684,6 +1702,7 @@ impl Shell {
                         selected.as_deref(),
                         now,
                         theme,
+                        window,
                         cx,
                     );
                     rows_div = rows_div.child(element);
@@ -2647,6 +2666,7 @@ impl Shell {
                     &theme,
                     6,
                     cx.entity_id(),
+                    window,
                     cx,
                 ))
                 .into_any_element()

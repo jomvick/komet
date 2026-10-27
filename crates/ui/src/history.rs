@@ -378,7 +378,7 @@ impl GitHistoryFetchButton {
 }
 
 impl Render for GitHistoryFetchButton {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
         let fetching = self.history.read(cx).fetching_all;
         let history = self.history.clone();
@@ -423,7 +423,7 @@ impl Render for GitHistoryFetchButton {
                     14.0,
                 )
                 .speed(1.25)
-                .driven(cx.entity_id(), cx)
+                .driven(cx.entity_id(), window, cx)
                 .into_any_element()
             } else {
                 crate::icons::icon(crate::icons::CLOUD)
@@ -1192,7 +1192,7 @@ impl GitHistory {
 }
 
 impl Render for GitHistory {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_loaded(cx);
         let theme = Theme::of(cx).clone();
         let graph_column = graph_width(self.graph.max_lane_count);
@@ -1221,7 +1221,7 @@ impl Render for GitHistory {
                         24.0,
                     )
                     .speed(1.25)
-                    .driven(cx.entity_id(), cx),
+                    .driven(cx.entity_id(), window, cx),
                 )
                 .child(
                     div()

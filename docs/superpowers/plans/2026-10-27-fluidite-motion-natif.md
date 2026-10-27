@@ -22,7 +22,7 @@ des mêmes scénarios instrumentés.
 | Une instrumentation existe déjà, contrairement à l'hypothèse « rien n'est mesuré ». | `KOMET_FRAME_STATS` (coût de rendu des lignes live, [transcript.rs:1003](../../../crates/ui/src/transcript.rs#L1003)), `KOMET_NO_RENDER_CACHE` (A/B du cache, [transcript.rs:1017](../../../crates/ui/src/transcript.rs#L1017)), `KOMET_SCROLL_TRACE` ([rail.rs:222](../../../crates/ui/src/rail.rs#L222)), `KOMET_MOTION_SCALE` ([motion.rs:651](../../../crates/ui/src/motion.rs#L651)). `KOMET_GPU_STATS` n'apparaît que dans un commentaire du `Cargo.toml` racine (il appartient au fork gpui), pas dans `crates/`. |
 | Il manque la mesure au niveau **frame entière** et le harnais reproductible. | Aucun `scripts/mem-smoke.sh`, aucun scénario scripté ; `scripts/e2e-smoke.sh` est périmé (AGENTS.md). |
 | `crates/ui` n'a aucun test d'intégration ni de régression de frames. | Pas de répertoire `crates/ui/tests/` ; seuls des tests unitaires dans `src/`. |
-| `PARITY.md` se contredit avec le code sur reduced-motion. | Ligne 23 liste « Gap: prefers-reduced-motion switch » alors que `cx.reduce_motion()` est consommé par le pulse et le survol : doc périmée ou câblage partiel, à trancher. |
+| `PARITY.md` annonçait un gap reduced-motion déjà câblé. | Résolu : la ligne 23 de [PARITY.md](../../PARITY.md) documente que les chemins cœur honorent le flag gpui et qu'il n'existe pas de contrôle Komet dédié. |
 
 À mesurer avant d'agir (hypothèses, pas des faits) : coût réel d'un
 `window.refresh()` de survol sur le Shell complet ; nombre de clones par frame
@@ -124,7 +124,9 @@ La mesure de p95 en 1080p reste à faire avant d'affirmer un gain de frame.
   `cx.notify(owner)` ; les appels des popovers, du transcript Markdown, du
   terminal, des pickers, du composer, des panneaux et des contrôles du Shell
   transmettent leur propriétaire. Le filtre des espaces n'appelle plus
-  `window.refresh()`.
+  `window.refresh()`. Les fondus encore en vol notifient leur propriétaire à
+  chaque frame depuis le pied de rendu du Shell, y compris pour les vues
+  enfants dont le rendu est mis en cache.
 - Limite : les contrôles appartenant directement à `Shell` invalident encore
   le rendu de cette entité racine. Le découpage du Shell et la baseline
   graphique sont nécessaires pour quantifier le gain ; aucun seuil de p95
@@ -151,8 +153,14 @@ zéro frame quand rien ne tourne ; loaders toujours phase-locked.
   expirés sont purgés et les entités enfants actives sont notifiées, tandis que
   le Shell est déjà en rendu. `pulse_delta` et `pulse_lease` partagent leur
   renouvellement, le même registre et la même époque. Une première/ nouvelle
-  lease notifie sa vue une fois pour amorcer le pilote. Les tests couvrent
-  l'inactivité, l'expiration et le renouvellement des baux.
+  lease notifie sa vue et demande directement la frame suivante au `Window`
+  de rendu, pour amorcer le pilote même quand seule une vue enfant est
+  invalidée. Les tests couvrent l'inactivité, l'expiration et le renouvellement
+  des baux.
+- Fait : la décision reduced-motion est tranchée — `PARITY.md` documente que
+  les chemins cœur honorent le flag gpui (`cx.reduce_motion()`) et qu'il
+  n'existe pas de contrôle Komet dédié ; aucune tâche de câblage ne reste
+  ouverte.
 - Reste à mesurer : une capture de session graphique animée est nécessaire
   pour confirmer le rythme réel du compositeur et les frames manquées.
 
@@ -187,8 +195,6 @@ complet est le coût dominant.
 - Sorties animées au-delà des popovers (dialogues, fermeture d'onglet, toasts,
   insertion/retrait de ligne), puis orchestration (cascade d'entrée,
   transition Chat ↔ Settings).
-- Trancher la ligne 23 de `docs/PARITY.md` sur reduced-motion et corriger le
-  document ou le câblage.
 
 ## Phase 6 — Natif
 

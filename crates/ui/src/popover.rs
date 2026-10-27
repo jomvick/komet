@@ -1049,10 +1049,11 @@ pub fn skeleton_rows(
     _theme: &Theme,
     count: usize,
     view: gpui::EntityId,
+    window: &mut gpui::Window,
     cx: &mut gpui::App,
 ) -> AnyElement {
     let wash = ink(0.04);
-    let delta = motion::pulse_delta(&KOMET_PULSE, view, cx);
+    let delta = motion::pulse_delta(&KOMET_PULSE, view, window, cx);
     div()
         .flex()
         .flex_col()

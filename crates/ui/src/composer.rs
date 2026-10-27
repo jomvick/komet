@@ -4441,6 +4441,7 @@ impl Composer {
     fn render_file_mention_popup(
         &self,
         theme: &Theme,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
         let token = self.mention.token.as_ref()?;
@@ -4455,6 +4456,7 @@ impl Composer {
                 theme,
                 3,
                 cx.entity_id(),
+                window,
                 cx,
             ));
         } else if let Some(error) = self.mention.error.clone() {
@@ -4557,12 +4559,17 @@ impl Composer {
         ))
     }
 
-    fn render_input_with_completion(&self, theme: &Theme, cx: &mut Context<Self>) -> gpui::Div {
+    fn render_input_with_completion(
+        &self,
+        theme: &Theme,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
         div()
             .relative()
             .child(self.input.clone())
-            .children(self.render_file_mention_popup(theme, cx))
-            .children(self.render_slash_popup(theme, cx))
+            .children(self.render_file_mention_popup(theme, window, cx))
+            .children(self.render_slash_popup(theme, window, cx))
     }
 
     // ---- slash commands ---------------------------------------------------
@@ -4797,6 +4804,7 @@ impl Composer {
     fn render_slash_popup(
         &self,
         theme: &Theme,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
         let token = self.slash.token.as_ref()?;
@@ -4818,6 +4826,7 @@ impl Composer {
                 theme,
                 3,
                 cx.entity_id(),
+                window,
                 cx,
             ));
         } else if let Some(error) = self.slash.error.clone() {
@@ -7227,7 +7236,7 @@ impl Render for Composer {
                         .px(px(16.0))
                         .pt(px(text_pt))
                         .pb(px(4.0))
-                        .child(self.render_input_with_completion(&theme, cx)),
+                        .child(self.render_input_with_completion(&theme, window, cx)),
                 )
                 .child(
                     div()
@@ -7303,7 +7312,7 @@ impl Render for Composer {
                                 .pr(px(8.0))
                                 .relative()
                                 .top(px(-text_glide))
-                                .child(self.render_input_with_completion(&theme, cx)),
+                                .child(self.render_input_with_completion(&theme, window, cx)),
                         )
                         .child(
                             div()
@@ -7363,7 +7372,7 @@ impl Render for Composer {
         let footer = (!self.home_canvas)
             .then(|| {
                 self.pickers
-                    .update(cx, |pickers, cx| pickers.render_footer(cx))
+                    .update(cx, |pickers, cx| pickers.render_footer(window, cx))
             })
             .flatten();
         let container = match footer {

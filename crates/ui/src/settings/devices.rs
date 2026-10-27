@@ -624,6 +624,7 @@ impl Render for DevicesPage {
                                     "updates-checking",
                                     3.0,
                                     view_id,
+                                    window,
                                     cx,
                                 )
                                 .into_any_element(),
