@@ -107,9 +107,15 @@ impl HarnessCliChecker {
             return;
         }
         let checker = self.clone();
+        let mut shutdown = self.inner.shutdown.subscribe();
         *worker = Some(runtime.spawn(async move {
-            let mut shutdown = checker.inner.shutdown.subscribe();
-            let first = checker.refresh(true).await;
+            if *shutdown.borrow_and_update() {
+                return;
+            }
+            let first = tokio::select! {
+                _ = shutdown.changed() => return,
+                statuses = checker.refresh(true) => statuses,
+            };
             let mut retry = FIRST_RETRY;
             let mut next_check = Instant::now()
                 + if has_check_errors(&first) {
@@ -127,7 +133,10 @@ impl HarnessCliChecker {
                     }
                     _ = tokio::time::sleep_until(tick) => {
                         if Instant::now() >= next_check || checker.binaries_changed() {
-                            let statuses = checker.refresh(true).await;
+                            let statuses = tokio::select! {
+                                _ = shutdown.changed() => break,
+                                statuses = checker.refresh(true) => statuses,
+                            };
                             if has_check_errors(&statuses) {
                                 next_check = Instant::now() + retry;
                                 retry = (retry * 2).min(CHECK_INTERVAL);
@@ -174,6 +183,12 @@ impl HarnessCliChecker {
 
     async fn refresh(&self, check_latest: bool) -> Vec<HarnessCliStatus> {
         let _refresh = self.inner.refresh_gate.lock().await;
+        if !check_latest {
+            let cached = self.cached_statuses();
+            if cached.len() == self.inner.harnesses.len() {
+                return cached;
+            }
+        }
         let statuses = super::harness_cli::statuses(&self.inner.harnesses, check_latest).await;
         {
             let mut cached = lock(&self.inner.statuses);

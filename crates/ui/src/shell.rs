@@ -601,7 +601,7 @@ fn update_modal_should_show(
 fn harness_updates(statuses: Vec<HarnessCliStatus>) -> Vec<HarnessCliStatus> {
     statuses
         .into_iter()
-        .filter(|status| status.update_available)
+        .filter(|status| status.managed && status.update_available)
         .collect()
 }
 
@@ -4598,6 +4598,9 @@ impl Shell {
     /// Run the CLI's own installer, then drop its row. npm failures land in the
     /// card footer instead of a modal.
     fn update_harness_cli(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
+        if self.cli_updating.is_some() {
+            return;
+        }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
@@ -4675,6 +4678,7 @@ impl Shell {
             let harness = status.harness;
             let (brand, tint) = crate::pickers::harness_brand_icon(harness);
             let updating = self.cli_updating == Some(harness);
+            let install_running = self.cli_updating.is_some();
             card = card.child(
                 div()
                     .flex()
@@ -4706,6 +4710,11 @@ impl Shell {
                             .text_size(px(12.0))
                             .text_color(theme.text_muted)
                             .child(SharedString::from("Updating…"))
+                            .into_any_element()
+                    } else if install_running {
+                        popover::btn_primary(&theme, "Update")
+                            .opacity(0.5)
+                            .cursor_default()
                             .into_any_element()
                     } else {
                         popover::btn_primary(&theme, "Update")
@@ -8968,8 +8977,16 @@ mod tests {
                 true,
             ),
             cli_status(HarnessId::Codex, "0.9.0", "0.9.0", false),
+            HarnessCliStatus {
+                managed: false,
+                ..cli_status(HarnessId::Cursor, "1.0.0", "1.1.0", true)
+            },
         ]);
-        assert_eq!(updates.len(), 1, "an up-to-date CLI must not get a row");
+        assert_eq!(
+            updates.len(),
+            1,
+            "up-to-date and unmanaged CLIs must not get a row"
+        );
         assert_eq!(updates[0].harness, HarnessId::ClaudeCode);
         assert_eq!(cli_update_versions(&updates[0]), "2.1.309 → 2.1.310");
     }

@@ -611,6 +611,49 @@ impl Shell {
             trigger
         };
         let trigger = if filter.is_none() {
+            let menu_open = self.spaces_menu.is_open();
+            let project_menu = div()
+                .id("project-tree-menu")
+                .size(px(24.0))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(6.0))
+                .cursor_pointer()
+                .bg(if menu_open {
+                    theme.glass_hover()
+                } else {
+                    motion::hover_blend(
+                        "project-tree-menu",
+                        crate::theme::wash(0.0),
+                        crate::theme::wash(0.14),
+                    )
+                })
+                .on_hover(motion::hover_listener("project-tree-menu"))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    if !this.spaces_menu.is_open() {
+                        this.open_spaces_menu(window, cx);
+                    }
+                }))
+                .child(
+                    icon(icons::FOLDER)
+                        .size(px(14.0))
+                        .text_color(theme.text_muted.opacity(0.7)),
+                );
+            let project_menu = if self.spaces_menu.get().is_some() {
+                let closing = self.spaces_menu.closing_since();
+                let menu = self.render_spaces_menu(theme, cx);
+                project_menu
+                    .relative()
+                    .child(popover::anchored_menu_below_unfrosted(
+                        "spaces-filter-menu",
+                        menu,
+                        closing,
+                    ))
+            } else {
+                project_menu
+            };
             let expanded = self.settings.project_tree_expanded;
             let project_count = self.state.read(cx).spaces.len();
             let project_header = div()
@@ -672,7 +715,16 @@ impl Shell {
                     .text_color(theme.text_muted.opacity(0.65)),
                 );
 
-            project_header.into_any_element()
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(4.0))
+                .child(project_header)
+                .child(project_menu)
+                .into_any_element()
         } else {
             trigger.into_any_element()
         };

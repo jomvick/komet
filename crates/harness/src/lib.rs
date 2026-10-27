@@ -73,6 +73,7 @@ pub struct RunControls {
     /// period. The run's stream ends with `Done { status: Interrupted }`.
     pub interrupt: CancellationToken,
     /// Per-run child environment additions; never serialized or logged.
+    /// Only `AcpHarness` applies them; other harnesses ignore this field.
     pub env: Vec<(String, String)>,
 }
 

@@ -2191,6 +2191,10 @@ impl AgentAccounts {
         let token_result = tokio::process::Command::new("gh")
             .args(["auth", "token", "--hostname", "github.com"])
             .env("GH_CONFIG_DIR", &config_dir)
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .env_remove("GH_ENTERPRISE_TOKEN")
+            .stdin(std::process::Stdio::null())
             .output()
             .await;
         if let Ok(result) = token_result
