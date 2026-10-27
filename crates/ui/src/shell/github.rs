@@ -16,6 +16,7 @@ type GitHubKey = (String, Option<String>);
 /// Button footprint, budgeted by the titlebar strip so the pane header never
 /// overflows when the control is visible.
 pub(super) const GITHUB_BUTTON_WIDTH: f32 = 44.0;
+const GITHUB_RETRY_WIDTH: f32 = 78.0;
 const OPEN_PROJECT_BUTTON_WIDTH: f32 = 146.0;
 
 #[derive(Clone, Copy)]
@@ -42,6 +43,8 @@ pub(super) struct GitHubHeader {
     view_branch: Option<String>,
     checkout_branch: Option<String>,
     status: Option<GitHubStatus>,
+    status_checked: bool,
+    status_error: Option<SharedString>,
     task: Option<Task<()>>,
     branches_key: Option<GitHubKey>,
     branches: Vec<String>,
@@ -79,6 +82,8 @@ impl Shell {
     fn ensure_github_status(&mut self, key: GitHubKey, force: bool, cx: &mut Context<Self>) {
         if self.github.key.as_ref() != Some(&key) {
             self.github.status = None;
+            self.github.status_checked = false;
+            self.github.status_error = None;
             self.github.view_branch = None;
             self.github.checkout_branch = None;
             self.github.query_branch = None;
@@ -97,7 +102,9 @@ impl Shell {
         if !force
             && self.github.key.as_ref() == Some(&key)
             && self.github.query_branch == branch
-            && (self.github.status.is_some() || self.github.task.is_some())
+            && (self.github.status.is_some()
+                || self.github.task.is_some()
+                || self.github.status_checked)
         {
             return;
         }
@@ -109,6 +116,8 @@ impl Shell {
             self.github.status = None;
         }
         self.github.query_branch = branch.clone();
+        self.github.status_error = None;
+        self.github.status_checked = false;
         self.github.task = Some(cx.spawn(async move |this, cx| {
             let mut params = serde_json::Map::new();
             params.insert("repoPath".into(), key.0.clone().into());
@@ -129,6 +138,8 @@ impl Shell {
                 if shell.github.key.as_ref() != Some(&key) || shell.github.query_branch != branch {
                     return;
                 }
+                shell.github.task = None;
+                shell.github.status_checked = true;
                 match result.map(serde_json::from_value::<Option<GitHubStatus>>) {
                     Ok(Ok(status)) => {
                         if branch.is_none() {
@@ -136,11 +147,16 @@ impl Shell {
                                 status.as_ref().map(|status| status.branch.clone());
                         }
                         shell.github.status = status;
+                        shell.github.status_error = None;
                     }
                     Ok(Err(err)) => {
-                        tracing::warn!(error = %err, "GitHub status response was invalid")
+                        tracing::warn!(error = %err, "GitHub status response was invalid");
+                        shell.github.status_error = Some("Could not read GitHub status".into());
                     }
-                    Err(err) => tracing::warn!(error = %err, "GitHub status lookup failed"),
+                    Err(err) => {
+                        tracing::warn!(error = %err, "GitHub status lookup failed");
+                        shell.github.status_error = Some("Could not load GitHub status".into());
+                    }
                 }
                 cx.notify();
             })
@@ -465,11 +481,21 @@ impl Shell {
         let Some(key) = self.github_target(cx) else {
             self.github.key = None;
             self.github.status = None;
+            self.github.status_checked = false;
+            self.github.status_error = None;
             self.github.task = None;
             return None;
         };
         self.ensure_github_status(key, false, cx);
-        let status = self.github.status.clone()?;
+        let Some(status) = self.github.status.clone() else {
+            let failed = self.github.status_error.is_some();
+            return failed.then(|| {
+                (
+                    self.render_github_status_retry(theme, cx),
+                    GITHUB_RETRY_WIDTH,
+                )
+            });
+        };
 
         let pr_badge = status
             .pull_request
@@ -568,6 +594,59 @@ impl Shell {
             controls.into_any_element(),
             width + 6.0 + OPEN_PROJECT_BUTTON_WIDTH,
         ))
+    }
+
+    /// The status lookup failed: keep a control in the slot so the lookup can
+    /// be retried instead of the button silently vanishing for the session.
+    fn render_github_status_retry(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let fade = "github-retry-trigger";
+        div()
+            .id("github-retry-trigger")
+            .h(px(28.0))
+            .w(px(GITHUB_RETRY_WIDTH))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap(px(5.0))
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(crate::theme::hairline(0.10))
+            .bg(motion::hover_blend(
+                fade,
+                crate::theme::wash(0.03),
+                crate::theme::wash(0.11),
+            ))
+            .on_hover(motion::hover_listener(fade, cx.entity_id()))
+            .cursor_pointer()
+            .occlude()
+            .tab_index(0)
+            .aria_label("GitHub status unavailable — retry")
+            // Inside the titlebar drag region: carve the rect out of it.
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|_, _, window, _| window.prevent_default()),
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                if let Some(key) = this.github_target(cx) {
+                    this.ensure_github_status(key, true, cx);
+                }
+                cx.notify();
+            }))
+            .child(
+                icon(icons::REFRESH)
+                    .size(px(15.0))
+                    .text_color(theme.warning),
+            )
+            .child(
+                div()
+                    .text_size(px(11.5))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.warning)
+                    .child(SharedString::from("Retry")),
+            )
+            .into_any_element()
     }
 
     fn render_github_menu(

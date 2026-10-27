@@ -49,8 +49,17 @@ fi
 
 DATA_DIR="${KOMET_DATA_DIR:-/tmp/komet-demo-ui}"
 IPC="${KOMET_IPC_PORT:-27921}"
-if ! (exec 3<>/dev/tcp/127.0.0.1/"$IPC") 2>/dev/null; then
-  echo "▸ no engine daemon listening on 127.0.0.1:$IPC — start scripts/dev-demo.sh first" >&2
+# Authenticated probe: an open port proves nothing — the RPC handshake
+# presents the token published for this port, and `LocalDevice` only answers
+# from a Komet engine, so another process on the port cannot pass this check.
+probe() { cargo run -q -p komet-rpc --example rpc_probe -- "ws://127.0.0.1:$IPC" "$@"; }
+if ! DEVICE_JSON=$(probe LocalDevice '{}' 2>/dev/null); then
+  echo "▸ no authenticated engine on 127.0.0.1:$IPC — start scripts/dev-demo.sh first" >&2
+  exit 1
+fi
+if ! python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("deviceId") else 1)' \
+  <<<"$DEVICE_JSON"; then
+  echo "▸ 127.0.0.1:$IPC answered without a Komet device identity — refusing to capture" >&2
   exit 1
 fi
 LOG=$(mktemp -t komet-frame-budget.XXXXXX.log)

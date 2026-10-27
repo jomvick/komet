@@ -605,6 +605,17 @@ fn harness_updates(statuses: Vec<HarnessCliStatus>) -> Vec<HarnessCliStatus> {
         .collect()
 }
 
+/// A failed version lookup yields no update row; the engine retries it on its
+/// own cadence, and the shell must poll again for that later result to show.
+fn harness_check_needs_retry(statuses: &[HarnessCliStatus]) -> bool {
+    statuses.iter().any(|status| status.check_error.is_some())
+}
+
+/// Shell-side poll cadence while a lookup is failing: 5 min doubling to 6 h,
+/// mirroring the engine checker's retry schedule.
+const HARNESS_RETRY_FIRST: Duration = Duration::from_secs(5 * 60);
+const HARNESS_RETRY_MAX: Duration = Duration::from_secs(6 * 60 * 60);
+
 /// Row copy: `2.1.309 → 2.1.310`, or only the target when the installed
 /// version could not be read. Only the token the check actually compared is
 /// shown: `claude --version` answers `2.1.309 (Claude Code)`.
@@ -4566,40 +4577,61 @@ impl Shell {
 
     /// One pass over every agent CLI (`checkLatest` hits the npm registry /
     /// Cursor installer). Background: `<cli> --version` alone can cost 6s per
-    /// harness, so the canvas must not wait for it.
+    /// harness, so the canvas must not wait for it. A check that reports
+    /// `check_error` is polled again with backoff instead of being dropped
+    /// for the rest of the session.
     fn check_harness_updates(&mut self, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
         self.cli_check_started = true;
         cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(
-                    methods::GET_HARNESS_CLI_STATUS,
-                    serde_json::json!({ "checkLatest": true }),
-                )
-                .await;
-            let updates = match result {
-                Ok(value) => match serde_json::from_value::<Vec<HarnessCliStatus>>(value) {
-                    Ok(statuses) => Some(harness_updates(statuses)),
+            let mut check_latest = true;
+            let mut retry_in = HARNESS_RETRY_FIRST;
+            loop {
+                let result = engine
+                    .client()
+                    .call(
+                        methods::GET_HARNESS_CLI_STATUS,
+                        serde_json::json!({ "checkLatest": check_latest }),
+                    )
+                    .await;
+                // Only the first call does the network work; retries read the
+                // engine's cache, which its own background checker refreshes.
+                let (updates, retry) = match result {
+                    Ok(value) => match serde_json::from_value::<Vec<HarnessCliStatus>>(value) {
+                        Ok(statuses) => {
+                            let retry = harness_check_needs_retry(&statuses);
+                            (Some(harness_updates(statuses)), retry)
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                %error,
+                                "harness CLI update status response was invalid"
+                            );
+                            (None, false)
+                        }
+                    },
                     Err(error) => {
-                        tracing::warn!(%error, "harness CLI update status response was invalid");
-                        None
+                        tracing::warn!(%error, "could not check harness CLI updates");
+                        (None, true)
                     }
-                },
-                Err(error) => {
-                    tracing::warn!(%error, "could not check harness CLI updates");
-                    None
+                };
+                if let Err(error) = this.update(cx, |shell, cx| {
+                    if let Some(updates) = updates {
+                        shell.cli_updates = updates;
+                        cx.notify();
+                    }
+                }) {
+                    tracing::debug!(%error, "harness CLI update check completed after shell closed");
+                    break;
                 }
-            };
-            if let Err(error) = this.update(cx, |shell, cx| {
-                if let Some(updates) = updates {
-                    shell.cli_updates = updates;
-                    cx.notify();
+                if !retry {
+                    break;
                 }
-            }) {
-                tracing::debug!(%error, "harness CLI update check completed after shell closed");
+                cx.background_executor().timer(retry_in).await;
+                retry_in = (retry_in * 2).min(HARNESS_RETRY_MAX);
+                check_latest = false;
             }
         })
         .detach();
@@ -9039,5 +9071,19 @@ mod tests {
         );
         assert_eq!(updates[0].harness, HarnessId::ClaudeCode);
         assert_eq!(cli_update_versions(&updates[0]), "2.1.309 → 2.1.310");
+    }
+
+    #[test]
+    fn failed_cli_checks_are_polled_again_until_they_succeed() {
+        assert!(!harness_check_needs_retry(&[cli_status(
+            HarnessId::Codex,
+            "0.9.0",
+            "0.9.0",
+            false
+        )]));
+        let mut offline = cli_status(HarnessId::ClaudeCode, "2.1.309", "2.1.309", false);
+        offline.latest_version = None;
+        offline.check_error = Some("registry offline".into());
+        assert!(harness_check_needs_retry(&[offline]));
     }
 }
