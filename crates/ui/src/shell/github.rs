@@ -16,6 +16,7 @@ type GitHubKey = (String, Option<String>);
 /// Button footprint, budgeted by the titlebar strip so the pane header never
 /// overflows when the control is visible.
 pub(super) const GITHUB_BUTTON_WIDTH: f32 = 44.0;
+const GITHUB_RETRY_WIDTH: f32 = 78.0;
 const OPEN_PROJECT_BUTTON_WIDTH: f32 = 146.0;
 
 #[derive(Clone, Copy)]
@@ -42,6 +43,8 @@ pub(super) struct GitHubHeader {
     view_branch: Option<String>,
     checkout_branch: Option<String>,
     status: Option<GitHubStatus>,
+    status_checked: bool,
+    status_error: Option<SharedString>,
     task: Option<Task<()>>,
     branches_key: Option<GitHubKey>,
     branches: Vec<String>,
@@ -79,6 +82,8 @@ impl Shell {
     fn ensure_github_status(&mut self, key: GitHubKey, force: bool, cx: &mut Context<Self>) {
         if self.github.key.as_ref() != Some(&key) {
             self.github.status = None;
+            self.github.status_checked = false;
+            self.github.status_error = None;
             self.github.view_branch = None;
             self.github.checkout_branch = None;
             self.github.query_branch = None;
@@ -97,7 +102,9 @@ impl Shell {
         if !force
             && self.github.key.as_ref() == Some(&key)
             && self.github.query_branch == branch
-            && (self.github.status.is_some() || self.github.task.is_some())
+            && (self.github.status.is_some()
+                || self.github.task.is_some()
+                || self.github.status_checked)
         {
             return;
         }
@@ -109,6 +116,8 @@ impl Shell {
             self.github.status = None;
         }
         self.github.query_branch = branch.clone();
+        self.github.status_error = None;
+        self.github.status_checked = false;
         self.github.task = Some(cx.spawn(async move |this, cx| {
             let mut params = serde_json::Map::new();
             params.insert("repoPath".into(), key.0.clone().into());
@@ -129,6 +138,8 @@ impl Shell {
                 if shell.github.key.as_ref() != Some(&key) || shell.github.query_branch != branch {
                     return;
                 }
+                shell.github.task = None;
+                shell.github.status_checked = true;
                 match result.map(serde_json::from_value::<Option<GitHubStatus>>) {
                     Ok(Ok(status)) => {
                         if branch.is_none() {
@@ -136,11 +147,16 @@ impl Shell {
                                 status.as_ref().map(|status| status.branch.clone());
                         }
                         shell.github.status = status;
+                        shell.github.status_error = None;
                     }
                     Ok(Err(err)) => {
-                        tracing::warn!(error = %err, "GitHub status response was invalid")
+                        tracing::warn!(error = %err, "GitHub status response was invalid");
+                        shell.github.status_error = Some("Could not read GitHub status".into());
                     }
-                    Err(err) => tracing::warn!(error = %err, "GitHub status lookup failed"),
+                    Err(err) => {
+                        tracing::warn!(error = %err, "GitHub status lookup failed");
+                        shell.github.status_error = Some("Could not load GitHub status".into());
+                    }
                 }
                 cx.notify();
             })
@@ -291,14 +307,19 @@ impl Shell {
         let mut menu = div().w(px(188.0)).p(px(4.0)).flex().flex_col().gap(px(2.0));
         for (index, (choice, label, glyph)) in options.into_iter().enumerate() {
             menu = menu.child(
-                popover::menu_row(theme, false, format!("open-project-{label}"))
-                    .id(("open-project-option", index))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.close_project_open_menu(cx);
-                        this.request_open_project(choice, cx);
-                    }))
-                    .child(icon(glyph).size(px(15.0)).text_color(theme.text_muted))
-                    .child(SharedString::from(label)),
+                popover::menu_row(
+                    theme,
+                    false,
+                    format!("open-project-{label}"),
+                    cx.entity_id(),
+                )
+                .id(("open-project-option", index))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.close_project_open_menu(cx);
+                    this.request_open_project(choice, cx);
+                }))
+                .child(icon(glyph).size(px(15.0)).text_color(theme.text_muted))
+                .child(SharedString::from(label)),
             );
         }
         if let Some(error) = &self.github.open_project_error {
@@ -336,7 +357,7 @@ impl Shell {
             } else {
                 motion::hover_blend(fade, crate::theme::wash(0.03), crate::theme::wash(0.11))
             })
-            .on_hover(motion::hover_listener(fade))
+            .on_hover(motion::hover_listener(fade, cx.entity_id()))
             .occlude()
             .child(
                 div()
@@ -460,11 +481,21 @@ impl Shell {
         let Some(key) = self.github_target(cx) else {
             self.github.key = None;
             self.github.status = None;
+            self.github.status_checked = false;
+            self.github.status_error = None;
             self.github.task = None;
             return None;
         };
         self.ensure_github_status(key, false, cx);
-        let status = self.github.status.clone()?;
+        let Some(status) = self.github.status.clone() else {
+            let failed = self.github.status_error.is_some();
+            return failed.then(|| {
+                (
+                    self.render_github_status_retry(theme, cx),
+                    GITHUB_RETRY_WIDTH,
+                )
+            });
+        };
 
         let pr_badge = status
             .pull_request
@@ -495,7 +526,7 @@ impl Shell {
             } else {
                 motion::hover_blend(fade, crate::theme::wash(0.03), crate::theme::wash(0.11))
             })
-            .on_hover(motion::hover_listener(fade))
+            .on_hover(motion::hover_listener(fade, cx.entity_id()))
             .tab_index(0)
             .aria_label("GitHub: pull request, commits and changes")
             // Inside the titlebar drag region: carve the rect out of it.
@@ -563,6 +594,59 @@ impl Shell {
             controls.into_any_element(),
             width + 6.0 + OPEN_PROJECT_BUTTON_WIDTH,
         ))
+    }
+
+    /// The status lookup failed: keep a control in the slot so the lookup can
+    /// be retried instead of the button silently vanishing for the session.
+    fn render_github_status_retry(&self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let fade = "github-retry-trigger";
+        div()
+            .id("github-retry-trigger")
+            .h(px(28.0))
+            .w(px(GITHUB_RETRY_WIDTH))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap(px(5.0))
+            .rounded(px(8.0))
+            .border_1()
+            .border_color(crate::theme::hairline(0.10))
+            .bg(motion::hover_blend(
+                fade,
+                crate::theme::wash(0.03),
+                crate::theme::wash(0.11),
+            ))
+            .on_hover(motion::hover_listener(fade, cx.entity_id()))
+            .cursor_pointer()
+            .occlude()
+            .tab_index(0)
+            .aria_label("GitHub status unavailable — retry")
+            // Inside the titlebar drag region: carve the rect out of it.
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|_, _, window, _| window.prevent_default()),
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                cx.stop_propagation();
+                if let Some(key) = this.github_target(cx) {
+                    this.ensure_github_status(key, true, cx);
+                }
+                cx.notify();
+            }))
+            .child(
+                icon(icons::REFRESH)
+                    .size(px(15.0))
+                    .text_color(theme.warning),
+            )
+            .child(
+                div()
+                    .text_size(px(11.5))
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(theme.warning)
+                    .child(SharedString::from("Retry")),
+            )
+            .into_any_element()
     }
 
     fn render_github_menu(
@@ -664,7 +748,7 @@ impl Shell {
                         encode_ref(&status.branch)
                     );
                     body = body.child(
-                        popover::menu_row(theme, false, "github-create-pr")
+                        popover::menu_row(theme, false, "github-create-pr", cx.entity_id())
                             .id("github-create-pr")
                             .mx(px(4.0))
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -739,7 +823,7 @@ impl Shell {
                     .map(|t| crate::state::format_time_ago(t.with_timezone(&chrono::Utc), now));
                 let commit_for_click = commit.clone();
                 body = body.child(
-                    popover::menu_row(theme, false, format!("github-commit-{ix}"))
+                    popover::menu_row(theme, false, format!("github-commit-{ix}"), cx.entity_id())
                         .id(("github-commit-row", ix))
                         .mx(px(4.0))
                         .py(px(5.0))
@@ -786,7 +870,7 @@ impl Shell {
         // ── Changes: stats + proportion bar; click focuses the Git diff tab ──
         let (ins, del) = (status.insertions, status.deletions);
         body = body.child(divider()).child(
-            popover::menu_row(theme, false, "github-changes")
+            popover::menu_row(theme, false, "github-changes", cx.entity_id())
                 .id("github-changes-row")
                 .mx(px(4.0))
                 .mb(px(2.0))
@@ -911,7 +995,7 @@ impl Shell {
             .text_size(px(11.5))
             .text_color(motion::hover_blend(fade, theme.text_muted, theme.text))
             .cursor_pointer()
-            .on_hover(motion::hover_listener(fade))
+            .on_hover(motion::hover_listener(fade, cx.entity_id()))
             .on_click(cx.listener(|this, _, _, cx| {
                 this.toggle_github_branch_picker(cx);
             }))
@@ -989,41 +1073,46 @@ impl Shell {
                 let is_checkout = checkout_branch.as_deref() == Some(branch.as_str());
                 let select = branch.clone();
                 list = list.child(
-                    popover::menu_row(theme, selected, format!("github-branch-{ix}"))
-                        .id(("github-branch-row", ix))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.select_github_view_branch(select.clone(), cx);
-                        }))
-                        .child(
-                            icon(if selected {
-                                icons::CHECK
-                            } else {
-                                icons::GIT_BRANCH
-                            })
-                            .size(px(13.0))
-                            .text_color(if selected {
-                                theme.success
-                            } else {
-                                theme.text_muted
-                            }),
-                        )
-                        .child(
-                            div()
-                                .min_w_0()
-                                .flex_1()
-                                .truncate()
-                                .font_family(theme.font_mono.clone())
-                                .text_size(px(11.5))
-                                .child(SharedString::from(branch)),
-                        )
-                        .when(is_checkout && !selected, |el| {
-                            el.child(
-                                div()
-                                    .text_size(px(10.0))
-                                    .text_color(theme.text_faint)
-                                    .child(SharedString::from("checkout")),
-                            )
+                    popover::menu_row(
+                        theme,
+                        selected,
+                        format!("github-branch-{ix}"),
+                        cx.entity_id(),
+                    )
+                    .id(("github-branch-row", ix))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.select_github_view_branch(select.clone(), cx);
+                    }))
+                    .child(
+                        icon(if selected {
+                            icons::CHECK
+                        } else {
+                            icons::GIT_BRANCH
+                        })
+                        .size(px(13.0))
+                        .text_color(if selected {
+                            theme.success
+                        } else {
+                            theme.text_muted
                         }),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .truncate()
+                            .font_family(theme.font_mono.clone())
+                            .text_size(px(11.5))
+                            .child(SharedString::from(branch)),
+                    )
+                    .when(is_checkout && !selected, |el| {
+                        el.child(
+                            div()
+                                .text_size(px(10.0))
+                                .text_color(theme.text_faint)
+                                .child(SharedString::from("checkout")),
+                        )
+                    }),
                 );
             }
         }
@@ -1052,7 +1141,7 @@ impl Shell {
                 crate::theme::wash(0.0),
                 crate::theme::wash(0.10),
             ))
-            .on_hover(motion::hover_listener(id))
+            .on_hover(motion::hover_listener(id, cx.entity_id()))
             .on_click(cx.listener(move |this, _, _, cx| {
                 cx.open_url(&url);
                 this.close_github_menu(cx);
@@ -1096,7 +1185,7 @@ impl Shell {
                 crate::theme::wash(0.03),
                 crate::theme::wash(0.08),
             ))
-            .on_hover(motion::hover_listener(fade))
+            .on_hover(motion::hover_listener(fade, cx.entity_id()))
             .on_click(cx.listener(move |this, _, _, cx| {
                 cx.open_url(&url);
                 this.close_github_menu(cx);

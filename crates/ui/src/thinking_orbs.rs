@@ -1078,8 +1078,13 @@ impl ThinkingOrb {
     }
 
     /// Lease redraw notifications for the parent view while this orb is rendered.
-    pub fn driven(mut self, view: gpui::EntityId, cx: &mut gpui::App) -> Self {
-        crate::motion::pulse_lease(view, cx);
+    pub fn driven(
+        mut self,
+        view: gpui::EntityId,
+        window: &mut gpui::Window,
+        cx: &mut gpui::App,
+    ) -> Self {
+        crate::motion::pulse_lease(view, window, cx);
         self.driven_view = Some(view);
         self
     }
@@ -1113,7 +1118,7 @@ impl IntoElement for ThinkingOrb {
                             0.0
                         } else {
                             if let Some(v) = driven_view {
-                                crate::motion::pulse_lease(v, cx);
+                                crate::motion::pulse_lease(v, window, cx);
                             }
                             window.request_animation_frame();
                             orb_time()

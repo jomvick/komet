@@ -541,40 +541,45 @@ impl AccountsPage {
                     let name: SharedString = d.name.clone().into();
                     let pick_local = is_local;
                     let pick_id = d.id.clone();
-                    popover::menu_row(theme, is_active, format!("accounts-device-row-{ix}"))
-                        .id(("accounts-device-row", ix))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            // Local device = no passthrough (calls stay direct).
-                            let target = (!pick_local).then(|| pick_id.clone());
-                            this.set_target_device(target, cx);
-                        }))
-                        .child(
-                            icon(glyph)
-                                .size(px(16.0))
-                                .flex_none()
-                                .text_color(theme.text_muted),
-                        )
-                        .child(div().flex_1().min_w_0().truncate().child(name))
-                        .when(is_local, |el| {
-                            el.child(
-                                div()
-                                    .flex_none()
-                                    .text_size(px(10.5))
-                                    .text_color(theme.text_muted.opacity(0.35))
-                                    .child(SharedString::from("You")),
-                            )
-                        })
-                        .child(
+                    popover::menu_row(
+                        theme,
+                        is_active,
+                        format!("accounts-device-row-{ix}"),
+                        cx.entity_id(),
+                    )
+                    .id(("accounts-device-row", ix))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        // Local device = no passthrough (calls stay direct).
+                        let target = (!pick_local).then(|| pick_id.clone());
+                        this.set_target_device(target, cx);
+                    }))
+                    .child(
+                        icon(glyph)
+                            .size(px(16.0))
+                            .flex_none()
+                            .text_color(theme.text_muted),
+                    )
+                    .child(div().flex_1().min_w_0().truncate().child(name))
+                    .when(is_local, |el| {
+                        el.child(
                             div()
-                                .size(px(6.0))
-                                .rounded_full()
                                 .flex_none()
-                                .bg(if is_local {
-                                    emerald
-                                } else {
-                                    crate::theme::ink(0.2)
-                                }),
+                                .text_size(px(10.5))
+                                .text_color(theme.text_muted.opacity(0.35))
+                                .child(SharedString::from("You")),
                         )
+                    })
+                    .child(
+                        div()
+                            .size(px(6.0))
+                            .rounded_full()
+                            .flex_none()
+                            .bg(if is_local {
+                                emerald
+                            } else {
+                                crate::theme::ink(0.2)
+                            }),
+                    )
                 }))
                 .into_any_element();
             trigger = trigger.child(popover::anchored_menu(
@@ -1206,6 +1211,7 @@ impl AccountsPage {
     fn render_login_dialog(
         &mut self,
         viewport: gpui::Size<gpui::Pixels>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let theme = Theme::of(cx).clone();
@@ -1238,6 +1244,7 @@ impl AccountsPage {
                     &theme,
                     2,
                     cx.entity_id(),
+                    window,
                     cx,
                 ))
                 .into_any_element(),
@@ -1295,9 +1302,14 @@ impl AccountsPage {
                             .justify_end()
                             .gap(px(8.0))
                             .child(
-                                popover::btn_ghost(&theme, "Cancel", "login-cancel")
-                                    .id("login-cancel")
-                                    .on_click(cx.listener(|this, _, _, cx| this.cancel_login(cx))),
+                                popover::btn_ghost(
+                                    &theme,
+                                    "Cancel",
+                                    "login-cancel",
+                                    cx.entity_id(),
+                                )
+                                .id("login-cancel")
+                                .on_click(cx.listener(|this, _, _, cx| this.cancel_login(cx))),
                             )
                             .child(
                                 popover::btn_primary(
@@ -1384,7 +1396,11 @@ impl AccountsPage {
                                         24.0,
                                     )
                                     .speed(1.25)
-                                    .driven(cx.entity_id(), cx),
+                                    .driven(
+                                        cx.entity_id(),
+                                        window,
+                                        cx,
+                                    ),
                                 )
                                 .child(
                                     div()
@@ -1411,6 +1427,7 @@ impl AccountsPage {
                                 &theme,
                                 if has_error { "Close" } else { "Cancel" },
                                 "login-cancel",
+                                cx.entity_id(),
                             )
                             .id("login-cancel")
                             .on_click(cx.listener(|this, _, _, cx| this.cancel_login(cx))),
@@ -1435,10 +1452,11 @@ impl AccountsPage {
         dim: bool,
         first: bool,
         theme: &Theme,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         use crate::motion;
-        let delta = motion::pulse_delta(&motion::KOMET_PULSE, cx.entity_id(), cx);
+        let delta = motion::pulse_delta(&motion::KOMET_PULSE, cx.entity_id(), window, cx);
         let ghost = |w: gpui::Length, h: f32, round_full: bool| {
             div()
                 .w(w)
@@ -1516,7 +1534,7 @@ impl Render for AccountsPage {
         use crate::settings::widgets;
         let theme = Theme::of(cx).clone();
         let now = Utc::now();
-        let dialog = self.render_login_dialog(window.viewport_size(), cx);
+        let dialog = self.render_login_dialog(window.viewport_size(), window, cx);
         // Driven by the load flag, not the `Loadable` state: a reload keeps the
         // previous snapshot on screen, so `Loading` no longer marks "in flight".
         let refreshing = self.refreshing;
@@ -1599,6 +1617,7 @@ impl Render for AccountsPage {
                                     false,
                                     true,
                                     &theme,
+                                    window,
                                     cx,
                                 ))
                                 .child(self.render_skeleton_row(
@@ -1606,6 +1625,7 @@ impl Render for AccountsPage {
                                     true,
                                     false,
                                     &theme,
+                                    window,
                                     cx,
                                 )),
                         )
