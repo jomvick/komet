@@ -1167,11 +1167,7 @@ impl AcpHarness {
         let mut cmd = Command::new(&exe);
         cmd.args(args);
         cmd.args(extra_args);
-        if self.spec.id == HarnessId::Copilot
-            && extra_env
-                .iter()
-                .any(|(key, _)| key == "COPILOT_GITHUB_TOKEN")
-        {
+        if self.spec.id == HarnessId::Copilot {
             cmd.env_remove("GH_TOKEN")
                 .env_remove("GITHUB_TOKEN")
                 .env_remove("GH_ENTERPRISE_TOKEN");

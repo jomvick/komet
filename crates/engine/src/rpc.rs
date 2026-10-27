@@ -1524,6 +1524,9 @@ impl RpcService for EngineRpc {
                 crate::harness_cli::manage(params.harness)
                     .await
                     .map_err(RpcError::Failed)?;
+                if let Some(checker) = &self.harness_cli_checker {
+                    checker.statuses(true).await;
+                }
                 RpcReply::value(&self.registry.descriptors())
             }
             methods::SET_HARNESS_ENABLED => {
