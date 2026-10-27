@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -12,7 +13,7 @@ use tokio_tungstenite::tungstenite::handshake::server::{
 };
 use tokio_tungstenite::tungstenite::http::StatusCode;
 
-use crate::{ClientFrame, RpcError, RpcReply, RpcService, ServerFrame};
+use crate::{ClientFrame, RpcError, RpcReply, RpcService, ServerFrame, ServiceRouter};
 
 /// Serve one connection: read client frames from `inbound`, write server frames to `out`.
 /// Returns when `inbound` closes; all in-flight request tasks are aborted on exit.
@@ -128,11 +129,25 @@ pub async fn serve_ws_listener(
     service: Arc<dyn RpcService>,
     token: Arc<str>,
 ) {
+    serve_ws_listener_with_router(listener, Arc::new(SingleService(service)), token).await
+}
+
+/// One service per connection, chosen from the `?env=` query parameter.
+///
+/// The UI keeps a single IPC port and opens one connection per environment; the
+/// router maps the id to that environment's service. Resolving after the handshake
+/// keeps a connection for an unknown env from ever reaching a default service: it is
+/// closed instead.
+pub async fn serve_ws_listener_with_router(
+    listener: TcpListener,
+    router: Arc<dyn ServiceRouter>,
+    token: Arc<str>,
+) {
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
                 tracing::debug!(%peer, "rpc: connection accepted");
-                tokio::spawn(serve_ws_socket(stream, service.clone(), token.clone()));
+                tokio::spawn(serve_ws_socket(stream, router.clone(), token.clone()));
             }
             Err(err) => {
                 tracing::warn!(error = %err, "rpc: accept failed");
@@ -142,7 +157,30 @@ pub async fn serve_ws_listener(
     }
 }
 
-async fn serve_ws_socket(stream: TcpStream, service: Arc<dyn RpcService>, token: Arc<str>) {
+/// A router that serves every connection from one service (the pre-environment
+/// behaviour, kept so existing call sites and tests stay unchanged).
+pub struct SingleService(pub Arc<dyn RpcService>);
+
+#[async_trait]
+impl ServiceRouter for SingleService {
+    async fn service_for(&self, _env: Option<String>) -> Result<Arc<dyn RpcService>, String> {
+        Ok(self.0.clone())
+    }
+}
+
+fn env_query(uri: &tokio_tungstenite::tungstenite::http::Uri) -> Option<String> {
+    uri.query().and_then(|query| {
+        query
+            .split('&')
+            .find_map(|pair| pair.strip_prefix("env="))
+            .map(|value| value.to_string())
+    })
+}
+
+// tungstenite's `accept_hdr_async` callback fixes the Err type as a full `Response` —
+// its size is not ours to shrink.
+#[allow(clippy::result_large_err)]
+async fn serve_ws_socket(stream: TcpStream, router: Arc<dyn ServiceRouter>, token: Arc<str>) {
     // Native viewports dial this socket with a bare `connect_async` and send
     // no `Origin` header. A browser always attaches `Origin` to a WebSocket
     // handshake and cannot forge or suppress it from script, and WebSockets
@@ -153,7 +191,9 @@ async fn serve_ws_socket(stream: TcpStream, service: Arc<dyn RpcService>, token:
     // The large `Err` (ErrorResponse) is the shape tungstenite's Callback
     // trait requires; it can't be boxed away here.
     #[allow(clippy::result_large_err)]
+    let mut env: Option<String> = None;
     let reject_cross_origin = |req: &HandshakeRequest, resp: HandshakeResponse| {
+        env = env_query(req.uri());
         if let Some(origin) = req.headers().get("origin") {
             tracing::warn!(
                 origin = %String::from_utf8_lossy(origin.as_bytes()),
@@ -178,10 +218,25 @@ async fn serve_ws_socket(stream: TcpStream, service: Arc<dyn RpcService>, token:
         }
         Ok(resp)
     };
-    let ws = match tokio_tungstenite::accept_hdr_async(stream, reject_cross_origin).await {
+    let mut ws = match tokio_tungstenite::accept_hdr_async(stream, reject_cross_origin).await {
         Ok(ws) => ws,
         Err(err) => {
             tracing::warn!(error = %err, "rpc: websocket handshake failed");
+            return;
+        }
+    };
+    let service = match router.service_for(env).await {
+        Ok(service) => service,
+        Err(reason) => {
+            tracing::warn!(%reason, "rpc: closing connection for an unresolvable environment");
+            use tokio_tungstenite::tungstenite::protocol::CloseFrame;
+            use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+            let _ = ws
+                .close(Some(CloseFrame {
+                    code: CloseCode::Policy,
+                    reason: reason.into(),
+                }))
+                .await;
             return;
         }
     };

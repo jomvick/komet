@@ -23,13 +23,15 @@ pub mod device_room;
 pub mod ipc_token;
 mod server;
 
-pub use client::{RpcClient, connect_ws};
+pub use client::{RpcClient, connect_ws, connect_ws_for};
 pub use device_room::{
     DeviceFrameHeader, DeviceLink, HostRelay, HostRelayConfig, LinkCache, LinkCacheConfig,
     NudgeHandler, StaticToken, TokenSource, decode_device_frame, device_room_ws_url,
     encode_device_frame,
 };
-pub use server::{serve_connection, serve_ws_listener};
+pub use server::{
+    SingleService, serve_connection, serve_ws_listener, serve_ws_listener_with_router,
+};
 
 /// RPC method names — single source of truth for both ends.
 /// Full surface: docs/research/feature-inventory.md §2.
@@ -243,6 +245,16 @@ impl RpcReply {
 #[async_trait]
 pub trait RpcService: Send + Sync + 'static {
     async fn handle(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError>;
+}
+
+/// Server-side selection of the service that answers one connection.
+///
+/// The UI keeps a single IPC port for every environment: the environment id rides the
+/// WebSocket query (`?env=`) and the router resolves it once per connection. An
+/// unresolvable id closes the connection — it never falls back to the local workspace.
+#[async_trait]
+pub trait ServiceRouter: Send + Sync {
+    async fn service_for(&self, env: Option<String>) -> Result<Arc<dyn RpcService>, String>;
 }
 
 /// Deserialize typed params out of the envelope's `params` value.
