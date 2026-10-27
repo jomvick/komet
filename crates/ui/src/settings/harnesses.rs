@@ -380,6 +380,7 @@ impl HarnessesPage {
                             &Theme::of(cx).clone(),
                             "Later",
                             "cli-update-later",
+                            cx.entity_id(),
                         )
                         .id("cli-update-later")
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -590,40 +591,45 @@ impl HarnessesPage {
                     let name: SharedString = d.name.clone().into();
                     let pick_local = is_local;
                     let pick_id = d.id.clone();
-                    popover::menu_row(theme, is_active, format!("harnesses-device-row-{ix}"))
-                        .id(("harnesses-device-row", ix))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            // Local device = no passthrough (calls stay direct).
-                            let target = (!pick_local).then(|| pick_id.clone());
-                            this.set_target_device(target, cx);
-                        }))
-                        .child(
-                            icon(glyph)
-                                .size(px(16.0))
-                                .flex_none()
-                                .text_color(theme.text_muted),
-                        )
-                        .child(div().flex_1().min_w_0().truncate().child(name))
-                        .when(is_local, |el| {
-                            el.child(
-                                div()
-                                    .flex_none()
-                                    .text_size(px(10.5))
-                                    .text_color(theme.text_muted.opacity(0.35))
-                                    .child(SharedString::from("You")),
-                            )
-                        })
-                        .child(
+                    popover::menu_row(
+                        theme,
+                        is_active,
+                        format!("harnesses-device-row-{ix}"),
+                        cx.entity_id(),
+                    )
+                    .id(("harnesses-device-row", ix))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        // Local device = no passthrough (calls stay direct).
+                        let target = (!pick_local).then(|| pick_id.clone());
+                        this.set_target_device(target, cx);
+                    }))
+                    .child(
+                        icon(glyph)
+                            .size(px(16.0))
+                            .flex_none()
+                            .text_color(theme.text_muted),
+                    )
+                    .child(div().flex_1().min_w_0().truncate().child(name))
+                    .when(is_local, |el| {
+                        el.child(
                             div()
-                                .size(px(6.0))
-                                .rounded_full()
                                 .flex_none()
-                                .bg(if is_local {
-                                    emerald
-                                } else {
-                                    crate::theme::ink(0.2)
-                                }),
+                                .text_size(px(10.5))
+                                .text_color(theme.text_muted.opacity(0.35))
+                                .child(SharedString::from("You")),
                         )
+                    })
+                    .child(
+                        div()
+                            .size(px(6.0))
+                            .rounded_full()
+                            .flex_none()
+                            .bg(if is_local {
+                                emerald
+                            } else {
+                                crate::theme::ink(0.2)
+                            }),
+                    )
                 }))
                 .into_any_element();
             trigger = trigger.child(popover::anchored_menu("harnesses-device-menu", menu, None));
@@ -861,6 +867,7 @@ impl Render for HarnessesPage {
                     &theme,
                     4,
                     cx.entity_id(),
+                    window,
                     cx,
                 ))
                 .into_any_element(),
