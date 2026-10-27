@@ -163,6 +163,7 @@ impl MuseHarness {
                 request_permission,
                 mut steering,
                 interrupt,
+                env: _,
             } = controls;
             runner.input = Some(std::sync::Arc::from(request_input));
             runner.permission = Some(std::sync::Arc::from(request_permission));

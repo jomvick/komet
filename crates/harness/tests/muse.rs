@@ -92,6 +92,7 @@ fn controls(
             request_permission: Box::new(request_permission),
             steering,
             interrupt: interrupt.clone(),
+            env: Vec::new(),
         },
         steering_tx,
         interrupt,

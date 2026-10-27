@@ -72,6 +72,9 @@ pub struct RunControls {
     /// interrupt, then escalates to SIGTERM/SIGKILL on the child after a grace
     /// period. The run's stream ends with `Done { status: Interrupted }`.
     pub interrupt: CancellationToken,
+    /// Per-run child environment additions; never serialized or logged.
+    /// Only `AcpHarness` applies them; other harnesses ignore this field.
+    pub env: Vec<(String, String)>,
 }
 
 impl RunControls {

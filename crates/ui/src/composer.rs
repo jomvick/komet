@@ -7278,11 +7278,13 @@ impl Render for Composer {
                         .flex()
                         .flex_row()
                         .items_center()
+                        .pl(px(8.0))
+                        .child(attach)
                         .child(
                             div()
                                 .flex_1()
                                 .min_w_0()
-                                .pl(px(16.0))
+                                .pl(px(4.0))
                                 .pr(px(8.0))
                                 .relative()
                                 .top(px(-text_glide))
@@ -7304,7 +7306,6 @@ impl Render for Composer {
                                 .pr(px(morph_cluster_inset(false, morph_t)))
                                 .relative()
                                 .top(px(-cluster_dy))
-                                .child(attach)
                                 .child(
                                     div()
                                         .id("composer-access-mode")

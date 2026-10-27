@@ -658,6 +658,7 @@ async fn run_session(session: Session) {
         request_permission,
         mut steering,
         interrupt,
+        env: _,
     } = controls;
     let request_input = Arc::new(request_input);
     let request_permission = Arc::new(request_permission);

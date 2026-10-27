@@ -126,6 +126,7 @@ pub struct EngineCore {
     pub uploads: Uploads,
     pub agent_accounts: AgentAccounts,
     pub device_id: String,
+    harness_cli_checker: harness_cli::HarnessCliChecker,
     /// Local→synced profile import (account-scoped runtimes only).
     pub local_import: Option<local_import::LocalImporter>,
     workspace_scope: WorkspaceScope,
@@ -318,6 +319,7 @@ impl EngineCore {
             )
         });
         let agent_accounts = AgentAccounts::new(AgentAccountsConfig::detect(data_dir));
+        sessions.set_agent_accounts(agent_accounts.clone());
         sessions.set_titles(TitleGenerator::new(
             workspace.clone(),
             registry.clone(),
@@ -332,6 +334,14 @@ impl EngineCore {
         let spaces_sync = SpacesSync::start(repos.clone(), workspace.clone(), &device_id);
         let workspace_files =
             WorkspaceFiles::new(repos.clone(), workspace.clone(), device_id.clone());
+        let harness_cli_checker = harness_cli::HarnessCliChecker::new(
+            registry
+                .descriptors()
+                .into_iter()
+                .map(|descriptor| descriptor.id)
+                .filter(|harness| *harness != HarnessId::Mock)
+                .collect(),
+        );
         Ok(Self {
             sessions,
             doc_host,
@@ -347,6 +357,7 @@ impl EngineCore {
             uploads,
             agent_accounts,
             device_id,
+            harness_cli_checker,
             local_import,
             workspace_scope: profile.scope(),
             auth: std::sync::Mutex::new(None),
@@ -487,6 +498,7 @@ impl EngineCore {
         if let Some(updater) = self.updater() {
             rpc = rpc.with_updater(updater);
         }
+        rpc = rpc.with_harness_cli_checker(self.harness_cli_checker.clone());
         if let Some(importer) = self.local_import.clone() {
             rpc = rpc.with_local_import(importer);
         }
@@ -508,6 +520,7 @@ impl EngineCore {
     /// kill live PTYs, stamp our workspace `lastSeenAt`, and flush every open doc
     /// snapshot.
     pub async fn shutdown(&self) {
+        self.harness_cli_checker.shutdown().await;
         self.sessions.shutdown().await;
         self.terminals.shutdown();
         self.agent_accounts.shutdown();
@@ -774,6 +787,7 @@ impl Engine {
             )?,
         };
         core.set_auth(auth.clone());
+        core.harness_cli_checker.start();
         // Release checker: polls the GitHub releases on a 6h cadence;
         // headless installs with KOMET_AUTO_UPDATE=1 apply + restart
         // themselves — gated on quiescence so a restart never lands under

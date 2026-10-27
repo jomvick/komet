@@ -48,8 +48,8 @@ pub(super) struct GitHubHeader {
     branches_error: Option<SharedString>,
     branches_task: Option<Task<()>>,
     branch_picker_open: bool,
-    pr_collapsed: bool,
-    commits_collapsed: bool,
+    pr_expanded: bool,
+    commits_expanded: bool,
     open_project_error: Option<SharedString>,
 }
 
@@ -90,8 +90,8 @@ impl Shell {
             self.github.branches_key = None;
             self.github.branches_error = None;
             self.github.branch_picker_open = false;
-            self.github.pr_collapsed = false;
-            self.github.commits_collapsed = false;
+            self.github.pr_expanded = false;
+            self.github.commits_expanded = false;
         }
         let branch = self.github.view_branch.clone();
         if !force
@@ -105,8 +105,10 @@ impl Shell {
             return;
         };
         self.github.key = Some(key.clone());
+        if self.github.query_branch != branch {
+            self.github.status = None;
+        }
         self.github.query_branch = branch.clone();
-        self.github.status = None;
         self.github.task = Some(cx.spawn(async move |this, cx| {
             let mut params = serde_json::Map::new();
             params.insert("repoPath".into(), key.0.clone().into());
@@ -642,17 +644,17 @@ impl Shell {
                 .mx(px(4.0))
                 .cursor_pointer()
                 .on_click(cx.listener(|this, _, _, cx| {
-                    this.github.pr_collapsed = !this.github.pr_collapsed;
+                    this.github.pr_expanded = !this.github.pr_expanded;
                     cx.notify();
                 }))
                 .child(disclosure_label(
                     "Pull request",
                     pr_count,
-                    !self.github.pr_collapsed,
+                    self.github.pr_expanded,
                     theme,
                 )),
         );
-        if !self.github.pr_collapsed {
+        if self.github.pr_expanded {
             match &status.pull_request {
                 Some(pr) => body = body.child(self.github_pr_card(pr, &status.branch, theme, cx)),
                 None if !detached => {
@@ -714,18 +716,18 @@ impl Shell {
                 .mx(px(4.0))
                 .cursor_pointer()
                 .on_click(cx.listener(|this, _, _, cx| {
-                    this.github.commits_collapsed = !this.github.commits_collapsed;
+                    this.github.commits_expanded = !this.github.commits_expanded;
                     cx.notify();
                 }))
                 .child(disclosure_label(
                     "Recent commits",
                     (!status.recent_commits.is_empty())
                         .then(|| status.recent_commits.len().to_string()),
-                    !self.github.commits_collapsed,
+                    self.github.commits_expanded,
                     theme,
                 )),
         );
-        if !self.github.commits_collapsed {
+        if self.github.commits_expanded {
             if status.recent_commits.is_empty() {
                 body = body.child(empty_note("No commits yet", theme));
             }

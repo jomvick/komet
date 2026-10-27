@@ -510,6 +510,7 @@ pub struct EngineRpc {
     auth: Option<Auth>,
     links: Option<std::sync::Arc<LinkCache>>,
     updater: Option<komet_update::Updater>,
+    harness_cli_checker: Option<crate::harness_cli::HarnessCliChecker>,
     local_import: Option<crate::local_import::LocalImporter>,
     engine_info: EngineInfo,
     /// External MCP server registry (shared with `SessionsEngine`).
@@ -551,6 +552,7 @@ impl EngineRpc {
             auth: None,
             links: None,
             updater: None,
+            harness_cli_checker: None,
             local_import: None,
             engine_info,
             mcp_registry: None,
@@ -600,6 +602,14 @@ impl EngineRpc {
     /// Attach the release checker (UpdateStatus stream + ApplyUpdate).
     pub fn with_updater(mut self, updater: komet_update::Updater) -> Self {
         self.updater = Some(updater);
+        self
+    }
+
+    pub fn with_harness_cli_checker(
+        mut self,
+        checker: crate::harness_cli::HarnessCliChecker,
+    ) -> Self {
+        self.harness_cli_checker = Some(checker);
         self
     }
 
@@ -1494,22 +1504,29 @@ impl RpcService for EngineRpc {
             methods::LIST_HARNESSES => RpcReply::value(&self.registry.descriptors()),
             methods::GET_HARNESS_CLI_STATUS => {
                 let params: crate::harness_cli::HarnessCliStatusParams = parse_params(params)?;
-                let harnesses = self
-                    .registry
-                    .descriptors()
-                    .into_iter()
-                    .map(|descriptor| descriptor.id)
-                    .filter(|harness| *harness != HarnessId::Mock)
-                    .collect::<Vec<_>>();
-                RpcReply::value(
-                    &crate::harness_cli::statuses(&harnesses, params.check_latest).await,
-                )
+                let statuses = match &self.harness_cli_checker {
+                    Some(checker) => checker.statuses(params.check_latest).await,
+                    None => {
+                        let harnesses = self
+                            .registry
+                            .descriptors()
+                            .into_iter()
+                            .map(|descriptor| descriptor.id)
+                            .filter(|harness| *harness != HarnessId::Mock)
+                            .collect::<Vec<_>>();
+                        crate::harness_cli::statuses(&harnesses, params.check_latest).await
+                    }
+                };
+                RpcReply::value(&statuses)
             }
             methods::MANAGE_HARNESS_CLI => {
                 let params: crate::harness_cli::ManageHarnessCliParams = parse_params(params)?;
                 crate::harness_cli::manage(params.harness)
                     .await
                     .map_err(RpcError::Failed)?;
+                if let Some(checker) = &self.harness_cli_checker {
+                    checker.statuses(true).await;
+                }
                 RpcReply::value(&self.registry.descriptors())
             }
             methods::SET_HARNESS_ENABLED => {

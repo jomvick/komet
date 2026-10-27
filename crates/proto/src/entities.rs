@@ -739,6 +739,8 @@ pub struct AgentLoginStart {
     pub login_id: String,
     pub url: String,
     pub mode: AgentLoginMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_code: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -774,6 +776,9 @@ pub struct AgentUsageWindow {
     /// 0.0..=1.0
     pub used_fraction: f32,
     pub resets_at: Option<DateTime<Utc>>,
+    /// Provider-reported usage when no comparable quota denominator exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_value: Option<String>,
 }
 
 /// An open PTY session on the owning device (`OpenTerminal` reply).

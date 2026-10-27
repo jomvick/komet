@@ -79,6 +79,7 @@ fn controls() -> (RunControls, mpsc::Sender<SteerMessage>, CancellationToken) {
         request_permission: RunControls::noop_permission(),
         steering: steer_rx,
         interrupt: token.clone(),
+        env: Vec::new(),
     };
     (controls, steer_tx, token)
 }

@@ -919,6 +919,16 @@ pub struct AcpHarness {
     cline_data_dir: Option<PathBuf>,
 }
 
+struct SpawnAgentOptions<'a> {
+    cwd: Option<&'a str>,
+    block_on_install: bool,
+    sidecar_port: Option<u16>,
+    extra_args: &'a [String],
+    opencode_config_overlay: Option<&'a std::path::Path>,
+    sandbox: Option<SandboxLevel>,
+    extra_env: &'a [(String, String)],
+}
+
 impl AcpHarness {
     /// Devin's native ACP server (`devin acp`).
     pub fn devin() -> Self {
@@ -1137,13 +1147,17 @@ impl AcpHarness {
 
     async fn spawn_agent(
         &self,
-        cwd: Option<&str>,
-        block_on_install: bool,
-        sidecar_port: Option<u16>,
-        extra_args: &[String],
-        opencode_config_overlay: Option<&std::path::Path>,
-        sandbox: Option<SandboxLevel>,
+        options: SpawnAgentOptions<'_>,
     ) -> Result<(Child, crate::StderrTail), HarnessError> {
+        let SpawnAgentOptions {
+            cwd,
+            block_on_install,
+            sidecar_port,
+            extra_args,
+            opencode_config_overlay,
+            sandbox,
+            extra_env,
+        } = options;
         let (exe, mut args) = self.resolve_program(block_on_install).await?;
         if self.spec.id == HarnessId::Grok
             && let Some(level) = sandbox
@@ -1153,6 +1167,12 @@ impl AcpHarness {
         let mut cmd = Command::new(&exe);
         cmd.args(args);
         cmd.args(extra_args);
+        if self.spec.id == HarnessId::Copilot {
+            cmd.env_remove("GH_TOKEN")
+                .env_remove("GITHUB_TOKEN")
+                .env_remove("GH_ENTERPRISE_TOKEN");
+        }
+        cmd.envs(extra_env.iter().map(|(key, value)| (key, value)));
         if let Some(port) = sidecar_port {
             cmd.env("PORT", port.to_string());
             cmd.env("OPENCODE_PORT", port.to_string());
@@ -1202,7 +1222,17 @@ impl AcpHarness {
     /// refuses sessions before login still surfaces whatever the handshake
     /// advertised.
     async fn discover_commands(&self, cwd: &Path) -> Result<Vec<SlashCommand>, HarnessError> {
-        let (mut child, _stderr) = self.spawn_agent(None, false, None, &[], None, None).await?;
+        let (mut child, _stderr) = self
+            .spawn_agent(SpawnAgentOptions {
+                cwd: None,
+                block_on_install: false,
+                sidecar_port: None,
+                extra_args: &[],
+                opencode_config_overlay: None,
+                sandbox: None,
+                extra_env: &[],
+            })
+            .await?;
         let (client, mut incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
             _ => {
@@ -1271,7 +1301,17 @@ impl AcpHarness {
     /// wire is the source of truth — the spec's static catalog only enriches
     /// matching entries and names the pick when the agent advertises nothing.
     async fn discover_models(&self) -> Result<Vec<Model>, HarnessError> {
-        let (mut child, stderr_tail) = self.spawn_agent(None, false, None, &[], None, None).await?;
+        let (mut child, stderr_tail) = self
+            .spawn_agent(SpawnAgentOptions {
+                cwd: None,
+                block_on_install: false,
+                sidecar_port: None,
+                extra_args: &[],
+                opencode_config_overlay: None,
+                sandbox: None,
+                extra_env: &[],
+            })
+            .await?;
         let (client, _incoming) = match (child.stdin.take(), child.stdout.take()) {
             (Some(stdin), Some(stdout)) => RpcClient::new(stdin, stdout),
             _ => {
@@ -2017,14 +2057,15 @@ impl Harness for AcpHarness {
             (None, None)
         };
         let (mut child, stderr_tail) = self
-            .spawn_agent(
-                Some(&request.cwd),
-                true,
+            .spawn_agent(SpawnAgentOptions {
+                cwd: Some(&request.cwd),
+                block_on_install: true,
                 sidecar_port,
-                &extra_args,
-                opencode_overlay_path.as_deref(),
-                Some(request.sandbox),
-            )
+                extra_args: &extra_args,
+                opencode_config_overlay: opencode_overlay_path.as_deref(),
+                sandbox: Some(request.sandbox),
+                extra_env: &controls.env,
+            })
             .await?;
         let stdin = child
             .stdin
@@ -3501,6 +3542,7 @@ async fn run_session(session: Session) {
         request_permission,
         mut steering,
         interrupt,
+        env: _,
     } = controls;
     let request_input = std::sync::Arc::new(request_input);
     let request_permission = std::sync::Arc::new(request_permission);

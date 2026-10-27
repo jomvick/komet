@@ -33,6 +33,7 @@ async fn managed_install_reaches_session_started() {
         request_permission: RunControls::noop_permission(),
         steering,
         interrupt: interrupt.clone(),
+        env: Vec::new(),
     };
     let request = RunRequest {
         prompt: "say the word ok and stop".into(),

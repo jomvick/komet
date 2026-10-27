@@ -11,6 +11,10 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+fn default_project_tree_expanded() -> bool {
+    true
+}
+
 /// Last visited location per device (waku parity: `navigation-memory.ts`).
 /// Persisted in `ui-settings.json` as `lastSessionByDevice`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -95,7 +99,7 @@ pub struct UiSettings {
     /// written by a pre-tabs build; seeded once from the last space's sessions.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub open_tabs: Option<Vec<String>>,
-    /// Sidebar session filter: a space id, or `None` for "All spaces".
+    /// Sidebar session filter: a space id, or `None` for the Project tree.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub space_filter: Option<String>,
     /// Legacy: per-space tab order, from when tabs were the selected space's
@@ -111,6 +115,11 @@ pub struct UiSettings {
     /// spaces like the remembered-navigation map.
     #[serde(default, skip_serializing_if = "std::collections::HashSet::is_empty")]
     pub expanded_spaces: std::collections::HashSet<String>,
+    /// Whether the "Project" parent in the grouped sidebar shows its space
+    /// folders. Defaults to expanded for settings files written before it
+    /// existed.
+    #[serde(default = "default_project_tree_expanded")]
+    pub project_tree_expanded: bool,
     /// Session notification chimes (done / awaiting-input). `KOMET_DISABLE_SOUND`
     /// overrides.
     pub sound_enabled: bool,
@@ -159,6 +168,7 @@ impl Default for UiSettings {
             tab_order: std::collections::HashMap::new(),
             space_order: Vec::new(),
             expanded_spaces: std::collections::HashSet::new(),
+            project_tree_expanded: true,
             sound_enabled: true,
             notifications_enabled: true,
             notifications_background_only: true,
@@ -472,6 +482,7 @@ mod tests {
             )]),
             space_order: vec!["space-2".to_string(), "space-1".to_string()],
             expanded_spaces: std::collections::HashSet::from(["space-1".to_string()]),
+            project_tree_expanded: false,
             sound_enabled: false,
             notifications_enabled: false,
             notifications_background_only: false,
@@ -497,6 +508,7 @@ mod tests {
             saved["expandedSpaces"][0], "space-1",
             "expanded folder state is written under the camelCase key"
         );
+        assert_eq!(saved["projectTreeExpanded"], false);
         assert_eq!(UiSettings::load(dir.path()), settings);
     }
 
@@ -512,6 +524,12 @@ mod tests {
         let loaded = UiSettings::load(dir.path());
         assert_eq!(loaded.wallpaper_path, None);
         assert_eq!(loaded.sidebar_width, 300.0);
+    }
+
+    #[test]
+    fn project_tree_defaults_to_expanded_for_older_settings() {
+        let settings: UiSettings = serde_json::from_str(r#"{"soundEnabled": false}"#).unwrap();
+        assert!(settings.project_tree_expanded);
     }
 
     /// A settings file written before light mode existed has no `appearance`
