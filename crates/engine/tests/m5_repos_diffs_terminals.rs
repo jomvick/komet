@@ -92,7 +92,7 @@ fn decoded(events: &[TerminalEvent]) -> String {
 /// Drain a terminal subscription until `predicate` matches the decoded transcript
 /// (or the deadline hits).
 async fn drain_until(
-    rx: &mut tokio::sync::mpsc::UnboundedReceiver<TerminalEvent>,
+    rx: &mut tokio::sync::mpsc::Receiver<TerminalEvent>,
     events: &mut Vec<TerminalEvent>,
     predicate: impl Fn(&[TerminalEvent]) -> bool,
 ) {
@@ -230,99 +230,6 @@ async fn repos_round_trip_add_branches_worktrees() {
         repos.create("demo repo!").await.is_err(),
         "duplicate create rejected"
     );
-}
-
-#[tokio::test]
-async fn deleting_an_unregistered_directory_does_not_remove_its_files() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let repo_dir = tmp.path().join("repo");
-    init_repo(&repo_dir).await;
-    let unrelated_dir = tmp.path().join("unrelated");
-    std::fs::create_dir_all(&unrelated_dir).unwrap();
-    let sentinel = unrelated_dir.join("keep.txt");
-    std::fs::write(&sentinel, "user data").unwrap();
-    let repos = test_repos(&tmp.path().join("data"));
-
-    assert!(
-        repos
-            .delete_worktree(&repo_dir, &unrelated_dir)
-            .await
-            .is_err()
-    );
-    assert_eq!(
-        std::fs::read_to_string(sentinel).unwrap(),
-        "user data",
-        "a path Git does not recognize as a worktree must be left untouched"
-    );
-}
-
-#[tokio::test]
-async fn remote_branch_selection_is_explicit_and_does_not_detach_head() {
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let repo_dir = tmp.path().join("repo");
-    init_repo(&repo_dir).await;
-    git(
-        &repo_dir,
-        &[
-            "remote",
-            "add",
-            "origin",
-            "https://example.invalid/origin.git",
-        ],
-    )
-    .await;
-    git(
-        &repo_dir,
-        &[
-            "remote",
-            "add",
-            "upstream",
-            "https://example.invalid/upstream.git",
-        ],
-    )
-    .await;
-    git(
-        &repo_dir,
-        &["update-ref", "refs/remotes/origin/feature", "HEAD"],
-    )
-    .await;
-    git(
-        &repo_dir,
-        &["update-ref", "refs/remotes/upstream/feature", "HEAD"],
-    )
-    .await;
-    let repos = test_repos(&tmp.path().join("data"));
-
-    let ambiguous = repos.switch_ref(&repo_dir, "feature").await.unwrap_err();
-    assert!(
-        ambiguous.to_string().contains("multiple remotes"),
-        "ambiguous remote branches should be explained: {ambiguous}"
-    );
-    assert_eq!(repos.current_branch(&repo_dir).await.unwrap(), "main");
-
-    git(
-        &repo_dir,
-        &["update-ref", "-d", "refs/remotes/origin/feature"],
-    )
-    .await;
-    let worktree = repos
-        .create_worktree(&repo_dir, "feature")
-        .await
-        .expect("unambiguous remote branch can be used as a worktree base");
-    assert!(PathBuf::from(&worktree.path).join("a.txt").exists());
-
-    assert_eq!(
-        repos.switch_ref(&repo_dir, "feature").await.unwrap(),
-        "feature"
-    );
-    assert_eq!(
-        git_stdout(&repo_dir, &["config", "branch.feature.remote"]).await,
-        "upstream"
-    );
-    let head = git_stdout(&repo_dir, &["rev-parse", "HEAD"]).await;
-    assert!(repos.switch_ref(&repo_dir, &head).await.is_err());
-    assert_eq!(repos.current_branch(&repo_dir).await.unwrap(), "feature");
-    assert!(repos.switch_ref(&repo_dir, "HEAD").await.is_err());
 }
 
 #[tokio::test]

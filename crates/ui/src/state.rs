@@ -57,9 +57,6 @@ pub struct EngineBootConfig {
     pub sync_token: Option<String>,
     /// Harness for doc-command runs until per-chat config lands (M4).
     pub default_harness: HarnessId,
-    /// Start a detached engine child if no daemon is already serving IPC.
-    /// Disabled in tests and for callers that explicitly want an embedded engine.
-    pub managed_engine: bool,
 }
 
 /// How this UI reached its engine.
@@ -235,12 +232,6 @@ impl EngineHandle {
             return Ok(handle);
         }
 
-        if config.managed_engine
-            && let Some(handle) = Self::start_managed_engine(&config).await
-        {
-            return Ok(handle);
-        }
-
         tracing::info!(data_dir = %config.data_dir.display(), "no daemon on port; embedding engine");
         let engine_config = EngineConfig {
             data_dir: config.data_dir,
@@ -384,111 +375,6 @@ impl EngineHandle {
         Ok(handle)
     }
 
-    /// Launch this app's engine as a detached sibling process and attach over
-    /// the same authenticated IPC used by explicitly installed daemons.
-    async fn start_managed_engine(config: &EngineBootConfig) -> Option<EngineHandle> {
-        let executable = match std::env::current_exe() {
-            Ok(executable) => executable,
-            Err(err) => {
-                tracing::warn!(error = %err, "could not locate app executable for managed engine");
-                return None;
-            }
-        };
-        let mut command = std::process::Command::new(executable);
-        command
-            .arg("engine")
-            .env("KOMET_DATA_DIR", &config.data_dir)
-            .env("KOMET_IPC_PORT", config.ipc_port.to_string())
-            .env("KOMET_EDGE_URL", &config.edge_url)
-            .env("KOMET_HARNESS", config.default_harness.as_str())
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        match &config.edge_token {
-            Some(token) => {
-                command.env("KOMET_EDGE_TOKEN", token);
-            }
-            None => {
-                command.env_remove("KOMET_EDGE_TOKEN");
-            }
-        }
-        match &config.sync_token {
-            Some(token) => {
-                command.env("KOMET_SYNC_TOKEN", token);
-            }
-            None => {
-                command.env_remove("KOMET_SYNC_TOKEN");
-            }
-        }
-        match &config.org_id {
-            Some(org_id) => {
-                command.env("KOMET_ORG_ID", org_id);
-            }
-            None => {
-                command.env_remove("KOMET_ORG_ID");
-            }
-        }
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt as _;
-            command.process_group(0);
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt as _;
-            const DETACHED: u32 = 0x0000_0208 | 0x0800_0000;
-            command.creation_flags(DETACHED | 0x0100_0000);
-        }
-
-        #[cfg(windows)]
-        let spawned = {
-            use std::os::windows::process::CommandExt as _;
-            command.spawn().or_else(|_| {
-                command.creation_flags(0x0000_0208 | 0x0800_0000);
-                command.spawn()
-            })
-        };
-        #[cfg(not(windows))]
-        let spawned = command.spawn();
-        let mut child = match spawned {
-            Ok(child) => child,
-            Err(err) => {
-                tracing::warn!(error = %err, "could not start managed engine; embedding instead");
-                return None;
-            }
-        };
-        tracing::info!(pid = child.id(), "started detached managed engine");
-
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
-        loop {
-            if let Some(handle) = Self::attach_to_daemon(config.ipc_port).await {
-                reap_child(child);
-                return Some(handle);
-            }
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    tracing::warn!(%status, "managed engine exited before IPC became ready; embedding instead");
-                    return None;
-                }
-                Err(err) => {
-                    tracing::warn!(error = %err, "could not monitor managed engine; embedding instead");
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return None;
-                }
-                Ok(None) => {}
-            }
-            if tokio::time::Instant::now() >= deadline {
-                tracing::warn!("managed engine did not become ready; embedding instead");
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        }
-    }
-
     /// Probe the IPC port and, if a live engine answers, attach as a remote
     /// viewport. `None` means embed: nothing listening, a non-engine listener,
     /// or a listener without an identity.
@@ -502,7 +388,6 @@ impl EngineHandle {
         if !matches!(probe, Ok(Ok(_))) {
             return None;
         }
-
         tracing::info!(%url, "engine daemon detected; connecting");
         let token = match komet_rpc::ipc_token::read_default(ipc_port) {
             Ok(token) => token,
@@ -583,17 +468,6 @@ impl EngineHandle {
 
     pub async fn shutdown(&self) {
         self.inner.shutdown().await;
-    }
-}
-
-fn reap_child(mut child: std::process::Child) {
-    if let Err(err) = std::thread::Builder::new()
-        .name("komet-engine-reaper".into())
-        .spawn(move || {
-            let _ = child.wait();
-        })
-    {
-        tracing::warn!(error = %err, "could not create managed-engine reaper thread");
     }
 }
 
@@ -2159,7 +2033,6 @@ mod tests {
             org_id: None,
             sync_token: None,
             default_harness: HarnessId::Mock,
-            managed_engine: false,
         })
         .await
         .expect("legacy daemon remains attachable");
@@ -2190,7 +2063,6 @@ mod tests {
             org_id: None,
             sync_token: None,
             default_harness: HarnessId::Mock,
-            managed_engine: false,
         })
         .await
         .unwrap();
@@ -2230,7 +2102,6 @@ mod tests {
             org_id: None,
             sync_token: Some("client_test".into()),
             default_harness: HarnessId::Mock,
-            managed_engine: false,
         })
         .await
         {
@@ -2288,7 +2159,6 @@ mod tests {
             org_id: None,
             sync_token: None,
             default_harness: HarnessId::Mock,
-            managed_engine: false,
         })
         .await
         .expect("second viewport attaches over IPC");
@@ -2327,7 +2197,6 @@ mod tests {
             org_id: None,
             sync_token: None,
             default_harness: HarnessId::Mock,
-            managed_engine: false,
         })
         .await
         .unwrap();
@@ -2371,7 +2240,6 @@ mod tests {
             org_id: None,
             sync_token: None,
             default_harness: HarnessId::Mock,
-            managed_engine: false,
         };
         let (a, b) = tokio::join!(
             EngineHandle::bootstrap(config.clone()),
@@ -2432,7 +2300,6 @@ mod tests {
             org_id: None,
             sync_token: None,
             default_harness: HarnessId::Mock,
-            managed_engine: false,
         })
         .await
         .expect("a taken port must not fail the boot");
@@ -2460,7 +2327,6 @@ mod tests {
             org_id: None,
             sync_token: Some("client_test".into()),
             default_harness: HarnessId::Mock,
-            managed_engine: false,
         })
         .await
         .unwrap();
@@ -2525,7 +2391,6 @@ mod tests {
             org_id: None,
             sync_token: None,
             default_harness: HarnessId::Mock,
-            managed_engine: false,
         })
         .await
         .unwrap();

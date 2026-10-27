@@ -6,8 +6,8 @@ export default function BackgroundFX() {
       {/* twinkling stars via box-shadow */}
       <div className="stars" />
       <div className="stars2" />
-      {/* komet every 60s */}
-      <div className="komet" />
+      {/* comet every 60s */}
+      <div className="comet" />
       <style>{`
         .stars, .stars2 {
           position: absolute; inset: 0;
@@ -28,7 +28,7 @@ export default function BackgroundFX() {
         }
         .stars2 { opacity: 0.6; animation-duration: 6s; animation-delay: 1s; filter: blur(0.3px); }
         @keyframes twinkle { 0% { opacity: 0.5 } 100% { opacity: 1 } }
-        .komet {
+        .comet {
           position: absolute;
           top: -10%; left: -20%;
           width: 140px; height: 2px;
@@ -37,13 +37,13 @@ export default function BackgroundFX() {
           border-radius: 999px;
           transform: rotate(28deg);
           opacity: 0;
-          animation: komet-fly 1.8s ease-in 5s infinite;
+          animation: comet-fly 1.8s ease-in 5s infinite;
           animation-iteration-count: infinite;
           animation-delay: 3s;
           /* 60s interval: duration 1.8s + delay 58.2s => use long animation with keyframes */
-          animation: komet-cycle 60s linear infinite;
+          animation: comet-cycle 60s linear infinite;
         }
-        @keyframes komet-cycle {
+        @keyframes comet-cycle {
           0% { transform: translate3d(-20vw,-15vh,0) rotate(28deg); opacity: 0; }
           1% { opacity: 0; }
           2% { opacity: 1; }
@@ -52,7 +52,7 @@ export default function BackgroundFX() {
           100% { transform: translate3d(120vw,85vh,0) rotate(28deg); opacity: 0; }
         }
         @media (prefers-reduced-motion: reduce) {
-          .stars, .stars2, .komet { animation: none !important; }
+          .stars, .stars2, .comet { animation: none !important; }
         }
       `}</style>
     </div>

@@ -8,21 +8,19 @@
 //! device over the relay-forwarded RPCs.
 //!
 //! Only Claude Code and Codex ship enabled; the rest are opt-in. A harness
-//! whose CLI is missing on the target device offers its official installer
-//! when Komet has a verified install source, while its enable toggle stays
-//! inert. The engine enforces the same gate (plus "can't disable the last
-//! enabled harness") where the state lives, so stale toggles self-correct.
-
-use std::collections::{HashMap, HashSet};
+//! whose CLI is missing on the target device renders dimmed with an install
+//! hint and its toggle inert — enabling an agent that can't run would only
+//! manufacture NotInstalled errors at send time. The engine enforces the same
+//! gate (plus "can't disable the last enabled harness") where the state
+//! lives, so a raced or stale toggle self-corrects from the RPC reply.
 
 use gpui::{
-    AnyElement, Context, Entity, EventEmitter, IntoElement, Render, SharedString, Task, Window,
-    div, prelude::*, px,
+    AnyElement, Context, Entity, IntoElement, Render, SharedString, Task, Window, div, prelude::*,
+    px,
 };
 
-use komet_engine::harness_cli::HarnessCliStatus;
 use komet_engine::registry::{HarnessDescriptor, descriptor_enabled};
-use komet_proto::{AgentAccountsSnapshot, HarnessId};
+use komet_proto::HarnessId;
 use komet_rpc::methods;
 
 use crate::pickers::visible_harnesses;
@@ -31,11 +29,6 @@ use crate::settings::widgets;
 use crate::state::AppState;
 use crate::theme::Theme;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HarnessesEvent {
-    Connect(HarnessId),
-}
-
 /// One-line blurb per agent (the t3code models page pairs every toggle row
 /// with a description; the catalog descriptor doesn't carry one).
 pub fn blurb(harness: HarnessId) -> &'static str {
@@ -43,14 +36,11 @@ pub fn blurb(harness: HarnessId) -> &'static str {
         HarnessId::ClaudeCode => "Anthropic's coding agent, driven through the Claude Code CLI.",
         HarnessId::Codex => "OpenAI's coding agent, driven through the Codex CLI.",
         HarnessId::Cursor => "Cursor's coding agent, driven through the cursor-agent CLI.",
-        HarnessId::Devin => "Devin's agent, driven through the Devin ACP flow.",
         HarnessId::Grok => "xAI's Grok Build agent (grok CLI).",
         HarnessId::Hermes => "Nous Research's Hermes Agent (hermes CLI).",
         HarnessId::Opencode => "The opencode coding agent, driven through the opencode CLI.",
         HarnessId::Pi => "The pi coding agent (pi CLI).",
         HarnessId::Antigravity => "Google Antigravity agent, driven through the agy CLI.",
-        HarnessId::Muse => "Muse's session-based agent, driven through the MSP flow.",
-        HarnessId::Copilot => "GitHub Copilot, driven through the official Copilot CLI.",
         HarnessId::Cline => "Cline's autonomous coding agent, driven through the cline CLI (ACP).",
         HarnessId::Mock => "Scripted test harness.",
     }
@@ -62,81 +52,13 @@ pub fn cli_name(harness: HarnessId) -> &'static str {
         HarnessId::ClaudeCode => "claude",
         HarnessId::Codex => "codex",
         HarnessId::Cursor => "cursor-agent",
-        HarnessId::Devin => "devin",
         HarnessId::Grok => "grok",
         HarnessId::Hermes => "hermes",
         HarnessId::Opencode => "opencode",
         HarnessId::Pi => "pi",
         HarnessId::Antigravity => "agy",
-        HarnessId::Muse => "muse",
-        HarnessId::Copilot => "copilot",
         HarnessId::Cline => "cline",
         HarnessId::Mock => "mock",
-    }
-}
-
-#[derive(Default)]
-struct AgentConnectionStatus {
-    connected: HashSet<HarnessId>,
-    unknown: HashSet<HarnessId>,
-}
-
-impl From<AgentAccountsSnapshot> for AgentConnectionStatus {
-    fn from(snapshot: AgentAccountsSnapshot) -> Self {
-        Self {
-            connected: snapshot
-                .accounts
-                .into_iter()
-                .map(|account| account.harness)
-                .collect(),
-            unknown: snapshot
-                .warnings
-                .into_iter()
-                .map(|warning| warning.harness)
-                .collect(),
-        }
-    }
-}
-
-fn show_connect_button(harness: HarnessId, status: Option<&AgentConnectionStatus>) -> bool {
-    crate::settings::accounts::cli_login_command(harness).is_none()
-        && crate::settings::accounts::requires_login(harness)
-        && status.is_some_and(|status| {
-            !status.connected.contains(&harness) && !status.unknown.contains(&harness)
-        })
-}
-
-fn newly_available_cli_update(
-    statuses: &[HarnessCliStatus],
-    announced: &HashSet<(HarnessId, String)>,
-) -> Option<HarnessCliStatus> {
-    statuses
-        .iter()
-        .find(|status| {
-            status.update_available
-                && status
-                    .latest_version
-                    .as_ref()
-                    .is_some_and(|version| !announced.contains(&(status.harness, version.clone())))
-        })
-        .cloned()
-}
-
-fn harness_display_name(harness: HarnessId) -> &'static str {
-    match harness {
-        HarnessId::ClaudeCode => "Claude Code",
-        HarnessId::Codex => "Codex",
-        HarnessId::Cursor => "Cursor",
-        HarnessId::Devin => "Devin",
-        HarnessId::Grok => "Grok",
-        HarnessId::Hermes => "Hermes",
-        HarnessId::Opencode => "OpenCode",
-        HarnessId::Pi => "Pi",
-        HarnessId::Antigravity => "Antigravity",
-        HarnessId::Muse => "Muse",
-        HarnessId::Copilot => "Copilot",
-        HarnessId::Cline => "Cline",
-        HarnessId::Mock => "Mock",
     }
 }
 
@@ -146,7 +68,6 @@ pub struct HarnessesPage {
     /// Which device's harnesses are shown/edited; `None` = this device (no
     /// passthrough). Retargeted by the page-header device switcher.
     target_device: Option<String>,
-    target_generation: u64,
     device_menu_open: bool,
     /// Whether the menu was open when the trigger press began — the menu's
     /// `on_mouse_down_out` closes it on that same press, so by click time a
@@ -155,19 +76,9 @@ pub struct HarnessesPage {
     device_menu_pressed_open: bool,
     /// Last refused/failed toggle (engine guards), shown in the error strip.
     error: Option<String>,
-    cli_status: HashMap<HarnessId, HarnessCliStatus>,
-    cli_update_prompt: Option<HarnessCliStatus>,
-    announced_cli_updates: HashSet<(HarnessId, String)>,
-    connection_status: Option<AgentConnectionStatus>,
-    checking_updates: bool,
-    managing_cli: Option<HarnessId>,
     load_task: Option<Task<()>>,
     toggle_task: Option<Task<()>>,
-    cli_status_task: Option<Task<()>>,
-    manage_cli_task: Option<Task<()>>,
 }
-
-impl EventEmitter<HarnessesEvent> for HarnessesPage {}
 
 impl HarnessesPage {
     pub fn new(state: Entity<AppState>, cx: &mut Context<Self>) -> Self {
@@ -175,20 +86,11 @@ impl HarnessesPage {
             state,
             harnesses: Loadable::Idle,
             target_device: None,
-            target_generation: 0,
             device_menu_open: false,
             device_menu_pressed_open: false,
             error: None,
-            cli_status: HashMap::new(),
-            cli_update_prompt: None,
-            announced_cli_updates: HashSet::new(),
-            connection_status: None,
-            checking_updates: false,
-            managing_cli: None,
             load_task: None,
             toggle_task: None,
-            cli_status_task: None,
-            manage_cli_task: None,
         };
         page.load(cx);
         page
@@ -211,15 +113,8 @@ impl HarnessesPage {
             return;
         }
         self.target_device = target;
-        self.target_generation = self.target_generation.wrapping_add(1);
         self.error = None;
         self.harnesses = Loadable::Idle;
-        self.cli_status.clear();
-        self.cli_update_prompt = None;
-        self.announced_cli_updates.clear();
-        self.connection_status = None;
-        self.checking_updates = false;
-        self.managing_cli = None;
         self.load(cx);
         cx.notify();
     }
@@ -231,14 +126,10 @@ impl HarnessesPage {
             return;
         };
         let params = self.with_target(serde_json::json!({}));
-        let generation = self.target_generation;
         self.harnesses = Loadable::Loading;
         self.load_task = Some(cx.spawn(async move |this, cx| {
             let result = engine.client().call(methods::LIST_HARNESSES, params).await;
             this.update(cx, |page, cx| {
-                if page.target_generation != generation {
-                    return;
-                }
                 page.harnesses = match result {
                     Ok(value) => match serde_json::from_value::<Vec<HarnessDescriptor>>(value) {
                         Ok(list) => Loadable::Ready(list),
@@ -246,162 +137,10 @@ impl HarnessesPage {
                     },
                     Err(err) => Loadable::Error(err.to_string()),
                 };
-                if matches!(page.harnesses, Loadable::Ready(_)) {
-                    page.load_cli_status(cx, true);
-                    page.load_connection_status(cx);
-                }
                 cx.notify();
             })
             .ok();
         }));
-    }
-
-    fn load_connection_status(&mut self, cx: &mut Context<Self>) {
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
-            return;
-        };
-        let params = self.with_target(serde_json::json!({ "usageMode": "none" }));
-        let generation = self.target_generation;
-        self.connection_status = None;
-        cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(methods::LIST_AGENT_ACCOUNTS, params)
-                .await
-                .and_then(|value| {
-                    serde_json::from_value::<AgentAccountsSnapshot>(value)
-                        .map_err(|error| komet_rpc::RpcError::Failed(error.to_string()))
-                });
-            this.update(cx, |page, cx| {
-                if page.target_generation != generation {
-                    return;
-                }
-                match result {
-                    Ok(snapshot) => {
-                        page.connection_status = Some(snapshot.into());
-                    }
-                    Err(error) => {
-                        page.connection_status = None;
-                        page.error = Some(format!("Could not check connected agents: {error}"));
-                    }
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    fn load_cli_status(&mut self, cx: &mut Context<Self>, check_latest: bool) {
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
-            self.checking_updates = false;
-            return;
-        };
-        let params = self.with_target(serde_json::json!({ "checkLatest": check_latest }));
-        let generation = self.target_generation;
-        self.checking_updates = check_latest;
-        self.cli_status_task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(methods::GET_HARNESS_CLI_STATUS, params)
-                .await;
-            this.update(cx, |page, cx| {
-                if page.target_generation != generation {
-                    return;
-                }
-                page.checking_updates = false;
-                match result {
-                    Ok(value) => match serde_json::from_value::<Vec<HarnessCliStatus>>(value) {
-                        Ok(statuses) => {
-                            if check_latest
-                                && page.cli_update_prompt.is_none()
-                                && let Some(status) = newly_available_cli_update(
-                                    &statuses,
-                                    &page.announced_cli_updates,
-                                )
-                            {
-                                if let Some(version) = status.latest_version.clone() {
-                                    page.announced_cli_updates.insert((status.harness, version));
-                                }
-                                page.cli_update_prompt = Some(status);
-                            }
-                            page.cli_status = statuses
-                                .into_iter()
-                                .map(|status| (status.harness, status))
-                                .collect();
-                        }
-                        Err(err) => page.error = Some(err.to_string()),
-                    },
-                    Err(err) => page.error = Some(err.to_string()),
-                }
-                cx.notify();
-            })
-            .ok();
-        }));
-    }
-
-    fn check_updates(&mut self, cx: &mut Context<Self>) {
-        self.error = None;
-        self.load_cli_status(cx, true);
-    }
-
-    fn render_cli_update_dialog(
-        &mut self,
-        viewport: gpui::Size<gpui::Pixels>,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        let status = self.cli_update_prompt.as_ref()?;
-        let harness = status.harness;
-        let name = harness_display_name(harness);
-        let version_copy = match (&status.installed_version, &status.latest_version) {
-            (Some(installed), Some(latest)) => {
-                format!("Version {installed} is installed; version {latest} is available.")
-            }
-            _ => "A newer version is available.".to_string(),
-        };
-        let card = crate::popover::dialog_card(&Theme::of(cx).clone())
-            .child(crate::popover::dialog_title(
-                &Theme::of(cx).clone(),
-                &format!("{name} update available"),
-            ))
-            .child(div().mt(px(8.0)).child(crate::popover::dialog_body(
-                &Theme::of(cx).clone(),
-                format!("{version_copy} New models often need the latest version."),
-            )))
-            .child(
-                div()
-                    .mt(px(16.0))
-                    .flex()
-                    .flex_row()
-                    .justify_end()
-                    .gap(px(8.0))
-                    .child(
-                        crate::popover::btn_ghost(
-                            &Theme::of(cx).clone(),
-                            "Later",
-                            "cli-update-later",
-                        )
-                        .id("cli-update-later")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.cli_update_prompt = None;
-                            cx.notify();
-                        })),
-                    )
-                    .child(
-                        crate::popover::btn_primary(&Theme::of(cx).clone(), "Update")
-                            .id("cli-update-now")
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.cli_update_prompt = None;
-                                this.manage_cli(harness, cx);
-                            })),
-                    ),
-            )
-            .into_any_element();
-        Some(crate::popover::modal(
-            "harness-cli-update-dialog",
-            viewport,
-            card,
-        ))
     }
 
     /// Flip one harness on the target device. The reply carries the device's
@@ -432,41 +171,6 @@ impl HarnessesPage {
                         // old set until restart.
                         crate::pickers::bump_harness_catalog(cx);
                     }
-                    Err(err) => page.error = Some(err.to_string()),
-                }
-                cx.notify();
-            })
-            .ok();
-        }));
-    }
-
-    fn manage_cli(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
-            return;
-        };
-        let params = self.with_target(serde_json::json!({ "harness": harness }));
-        let generation = self.target_generation;
-        self.error = None;
-        self.managing_cli = Some(harness);
-        self.manage_cli_task = Some(cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(methods::MANAGE_HARNESS_CLI, params)
-                .await;
-            this.update(cx, |page, cx| {
-                if page.target_generation != generation {
-                    return;
-                }
-                page.managing_cli = None;
-                match result {
-                    Ok(value) => match serde_json::from_value::<Vec<HarnessDescriptor>>(value) {
-                        Ok(list) => {
-                            page.harnesses = Loadable::Ready(list);
-                            page.load_cli_status(cx, false);
-                            crate::pickers::bump_harness_catalog(cx);
-                        }
-                        Err(err) => page.error = Some(err.to_string()),
-                    },
                     Err(err) => page.error = Some(err.to_string()),
                 }
                 cx.notify();
@@ -645,15 +349,6 @@ impl HarnessesPage {
                 let harness = descriptor.id;
                 let installed = descriptor.installed;
                 let enabled = descriptor_enabled(&descriptor);
-                let cli_status = self.cli_status.get(&harness);
-                let update_available = cli_status.is_some_and(|status| status.update_available);
-                let show_manage_button = cli_status.is_some_and(|status| {
-                    status.managed
-                        && (!installed
-                            || status.update_available
-                            || status.latest_version.is_none())
-                });
-                let managing = self.managing_cli == Some(harness);
                 // The one enabled harness left can't be switched off — the
                 // composer needs something to run (mirrors the engine guard).
                 let last_enabled = enabled && enabled_count == 1;
@@ -675,71 +370,6 @@ impl HarnessesPage {
                             .into_any_element(),
                     );
                 }
-                if let Some(status) = cli_status {
-                    if installed && status.installed_version.is_none() {
-                        meta.push(
-                            div()
-                                .text_color(theme.warning_muted.opacity(0.9))
-                                .child(SharedString::from(
-                                    "The installed CLI version could not be read",
-                                ))
-                                .into_any_element(),
-                        );
-                    }
-                    if let Some(installed_version) = &status.installed_version {
-                        let version_text = if status.update_available {
-                            format!(
-                                "v{installed_version} → v{} available",
-                                status.latest_version.as_deref().unwrap_or_default()
-                            )
-                        } else {
-                            format!("Version {installed_version}")
-                        };
-                        meta.push(
-                            div()
-                                .text_color(if status.update_available {
-                                    theme.warning_muted
-                                } else {
-                                    theme.text_muted.opacity(0.75)
-                                })
-                                .child(SharedString::from(version_text))
-                                .into_any_element(),
-                        );
-                    } else if let Some(latest_version) = &status.latest_version {
-                        meta.push(
-                            div()
-                                .text_color(theme.text_muted.opacity(0.75))
-                                .child(SharedString::from(format!(
-                                    "Latest version {latest_version}"
-                                )))
-                                .into_any_element(),
-                        );
-                    }
-                    if status.managed && status.check_error.is_some() {
-                        meta.push(
-                            div()
-                                .text_color(theme.warning_muted.opacity(0.9))
-                                .child(SharedString::from(format!(
-                                    "Update check failed: {}",
-                                    status.check_error.as_deref().unwrap_or_default()
-                                )))
-                                .into_any_element(),
-                        );
-                    } else if status.managed
-                        && installed
-                        && status.latest_version.is_none()
-                        && status.installed_version.is_some()
-                    {
-                        meta.push(
-                            div()
-                                .text_color(theme.text_muted.opacity(0.65))
-                                .child(SharedString::from(
-                                    "Automatic update checks aren't available for this CLI",
-                                ))
-                                .into_any_element(),
-                        );
-                    }
-                }
                 // widgets::row_tile with the brand tint honored (the Claude
                 // mark keeps its orange, like the picker rail).
                 let tile = div()
@@ -759,6 +389,7 @@ impl HarnessesPage {
                     );
                 widgets::card_row(&theme, ix == 0)
                     .id(("harness-row", ix))
+                    .when(!installed, |el| el.opacity(0.55))
                     .child(tile)
                     .child(
                         div()
@@ -766,71 +397,7 @@ impl HarnessesPage {
                             .min_w_0()
                             .flex()
                             .flex_col()
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(8.0))
-                                    .child(
-                                        div().flex_1().min_w_0().child(widgets::row_title(
-                                            &theme,
-                                            descriptor.name.clone(),
-                                        )),
-                                    )
-                                    .when(show_manage_button, |el| {
-                                        let label = if managing {
-                                            "Working…"
-                                        } else if installed {
-                                            "Update"
-                                        } else {
-                                            "Install"
-                                        };
-                                        let action_icon = if installed && update_available {
-                                            crate::icons::REFRESH
-                                        } else {
-                                            crate::icons::ADD_CIRCLE
-                                        };
-                                        el.child(
-                                            widgets::ghost_action(&theme)
-                                                .id(("harness-cli-manage", ix))
-                                                .hover(|s| widgets::ghost_hover(&theme, s))
-                                                .when(!managing, |el| {
-                                                    el.on_click(cx.listener(
-                                                        move |this, _, _, cx| {
-                                                            this.manage_cli(harness, cx);
-                                                        },
-                                                    )                                                    )
-                                                })
-                                                .when(show_connect_button(
-                                                    harness,
-                                                    self.connection_status.as_ref(),
-                                                ), |el| {
-                                                    el.child(
-                                                        widgets::ghost_action(&theme)
-                                                            .id(("harness-connect", ix))
-                                                            .hover(|s| widgets::ghost_hover(&theme, s))
-                                                            .on_click(cx.listener(move |_, _, _, cx| {
-                                                                cx.emit(HarnessesEvent::Connect(harness));
-                                                            }))
-                                                            .child(
-                                                                crate::icons::icon(
-                                                                    crate::icons::KEY_MINIMALISTIC,
-                                                                )
-                                                                .size(px(14.0))
-                                                                .text_color(theme.text_muted),
-                                                            )
-                                                            .child(SharedString::from("Connect")),
-                                                    )
-                                                })
-                                                .child(
-                                                    crate::icons::icon(action_icon)
-                                                        .size(px(14.0))
-                                                        .text_color(theme.text_muted),
-                                                )
-                                                .child(SharedString::from(label)),
-                                        )
-                                    }),
-                            )
+                            .child(widgets::row_title(&theme, descriptor.name.clone()))
                             .child(widgets::meta_line(&theme, meta)),
                     )
                     .child(
@@ -850,9 +417,8 @@ impl HarnessesPage {
 }
 
 impl Render for HarnessesPage {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::of(cx).clone();
-        let update_dialog = self.render_cli_update_dialog(window.viewport_size(), cx);
         let body: gpui::AnyElement = match &self.harnesses {
             Loadable::Idle | Loadable::Loading => widgets::section_card(&theme)
                 .p(px(16.0))
@@ -913,70 +479,14 @@ impl Render for HarnessesPage {
                         widgets::page_subtitle(
                             &theme,
                             "Choose which coding agents the composer offers. The setting is per \
-                             device — switch devices in the header. Install or update supported \
-                             CLIs from their cards. Version checks run in the background when \
-                             this page opens and can also be started manually.",
+                             device — switch devices in the header. Agents whose CLI isn't \
+                             installed on a device can't be enabled there.",
                         )
                         .max_w(px(512.0))
                         .line_height(px(20.0)),
                     )
-                    .child(
-                        widgets::ghost_action(&theme)
-                            .id("harnesses-check-updates")
-                            .mt(px(12.0))
-                            .hover(|s| widgets::ghost_hover(&theme, s))
-                            .when(!self.checking_updates, |el| {
-                                el.on_click(cx.listener(|page, _, _, cx| page.check_updates(cx)))
-                            })
-                            .child(crate::icons::icon(crate::icons::REFRESH).size(px(14.0)))
-                            .child(if self.checking_updates {
-                                "Checking for updates…"
-                            } else {
-                                "Check for updates"
-                            }),
-                    )
                     .children(error)
                     .child(body),
             )
-            .when_some(update_dialog, |el, dialog| el.child(dialog))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn connect_is_only_offered_for_unconnected_app_managed_accounts() {
-        let status = AgentConnectionStatus {
-            connected: HashSet::from([HarnessId::ClaudeCode]),
-            unknown: HashSet::from([HarnessId::Antigravity]),
-        };
-
-        assert!(!show_connect_button(HarnessId::ClaudeCode, Some(&status)));
-        assert!(show_connect_button(HarnessId::Codex, Some(&status)));
-        assert!(!show_connect_button(HarnessId::Grok, Some(&status)));
-        assert!(!show_connect_button(HarnessId::Antigravity, Some(&status)));
-        assert!(!show_connect_button(HarnessId::Codex, None));
-    }
-
-    #[test]
-    fn newly_available_cli_updates_are_prompted_once_per_version() {
-        let status = HarnessCliStatus {
-            harness: HarnessId::ClaudeCode,
-            installed_version: Some("2.1.320".into()),
-            latest_version: Some("2.2.209".into()),
-            managed: true,
-            update_available: true,
-            check_error: None,
-        };
-
-        assert_eq!(
-            newly_available_cli_update(std::slice::from_ref(&status), &HashSet::new())
-                .map(|status| status.harness),
-            Some(HarnessId::ClaudeCode)
-        );
-        let announced = HashSet::from([(HarnessId::ClaudeCode, "2.2.209".to_string())]);
-        assert!(newly_available_cli_update(&[status], &announced).is_none());
     }
 }

@@ -10,7 +10,11 @@ mod update_cli;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "komet", about = "Multi-device controller for coding agents")]
+#[command(
+    name = "komet",
+    version,
+    about = "Multi-device controller for coding agents"
+)]
 struct Cli {
     /// Internal: run as the Windows service (invoked by the SCM via the
     /// `--service` launch argument set at `komet daemon install`).
@@ -31,11 +35,6 @@ enum Command {
     SyncInit,
     /// Run the engine without a UI (local-only unless a saved session enables sync).
     Headless,
-    /// Manage the detached engine started by the desktop app.
-    Engine {
-        #[command(subcommand)]
-        command: Option<EngineCommand>,
-    },
     /// Sign in and enable sync on the next engine start.
     Login,
     /// Remove the saved session and return to local-only on the next start.
@@ -79,12 +78,6 @@ enum Command {
         #[arg(long)]
         check: bool,
     },
-}
-
-#[derive(Subcommand)]
-enum EngineCommand {
-    /// Gracefully stop the background engine.
-    Stop,
 }
 
 #[derive(Subcommand)]
@@ -135,11 +128,7 @@ fn main() -> anyhow::Result<()> {
     // journald on every snapshot export — enough to fill a disk on a
     // long-running headless host. Quiet them by default (RUST_LOG still
     // overrides the whole filter).
-    let long_running = cli.service
-        || matches!(
-            &cli.command,
-            None | Some(Command::Headless | Command::Engine { command: None })
-        );
+    let long_running = cli.service || matches!(&cli.command, None | Some(Command::Headless));
     let default_filter = if long_running {
         "info,loro_internal=warn,loro=warn"
     } else {
@@ -217,19 +206,6 @@ fn main() -> anyhow::Result<()> {
                 engine.run().await
             })
         }
-        Some(Command::Engine { command: None }) => {
-            let runtime = tokio::runtime::Runtime::new()?;
-            runtime.block_on(async {
-                let engine = komet_engine::Engine::new(engine_config_from_env());
-                engine.run().await
-            })
-        }
-        Some(Command::Engine {
-            command: Some(EngineCommand::Stop),
-        }) => {
-            let runtime = tokio::runtime::Runtime::new()?;
-            runtime.block_on(stop_engine(engine_config_from_env().ipc_port))
-        }
         Some(Command::Login) => {
             let runtime = tokio::runtime::Runtime::new()?;
             runtime.block_on(auth_cli::login(engine_config_from_env()))
@@ -305,6 +281,29 @@ fn main() -> anyhow::Result<()> {
     }
 }
 
+/// Deadline for every IPC request the CLI makes. The dial itself already has a
+/// timeout, but the request did not: `komet status` — the command whose whole
+/// purpose is diagnosing a wedged engine — could wait forever on a socket that
+/// accepts and never answers.
+pub(crate) const CLI_IPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// [`komet_rpc::RpcClient::call`] with that deadline, plus a message that says
+/// what to do about it. Shared by `status`, `sync` and `models`.
+pub(crate) async fn ipc_call(
+    client: &komet_rpc::RpcClient,
+    method: &str,
+    params: serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    match tokio::time::timeout(CLI_IPC_TIMEOUT, client.call(method, params)).await {
+        Ok(result) => result.map_err(|e| anyhow::anyhow!("{method} failed: {e}")),
+        Err(_) => anyhow::bail!(
+            "{method} timed out after {}s — the engine accepted the connection but did \
+             not answer; restart it (`komet daemon restart`) or check its log",
+            CLI_IPC_TIMEOUT.as_secs()
+        ),
+    }
+}
+
 /// The env-resolved engine configuration shared by `headless`, `login`,
 /// `logout`, and `status` — one resolution so the CLI auth commands always
 /// operate on the exact session the daemon will load.
@@ -327,17 +326,42 @@ fn engine_config_from_env() -> komet_engine::EngineConfig {
 
 /// `KOMET_HARNESS` (kebab-case id) picks the default harness for chats without a
 /// config row — `mock` powers the e2e smoke; default `claude-code`.
+///
+/// `None` means the value is not a known harness: the caller keeps the default
+/// but says so, instead of silently running a different agent than the one the
+/// operator configured (`antigravity` used to fall back to `claude-code`).
+fn harness_from_value(value: &str) -> Option<komet_engine::HarnessId> {
+    use komet_engine::HarnessId;
+    Some(match value.trim().to_ascii_lowercase().as_str() {
+        "mock" => HarnessId::Mock,
+        "codex" => HarnessId::Codex,
+        "cursor" => HarnessId::Cursor,
+        "grok" => HarnessId::Grok,
+        "hermes" => HarnessId::Hermes,
+        "opencode" => HarnessId::Opencode,
+        "pi" => HarnessId::Pi,
+        "cline" => HarnessId::Cline,
+        "antigravity" | "gemini" => HarnessId::Antigravity,
+        "claude" | "claude-code" | "anthropic" => HarnessId::ClaudeCode,
+        _ => return None,
+    })
+}
+
 fn harness_from_env() -> komet_engine::HarnessId {
-    match std::env::var("KOMET_HARNESS").as_deref().map(str::trim) {
-        Ok("mock") => komet_engine::HarnessId::Mock,
-        Ok("codex") => komet_engine::HarnessId::Codex,
-        Ok("cursor") => komet_engine::HarnessId::Cursor,
-        Ok("grok") => komet_engine::HarnessId::Grok,
-        Ok("hermes") => komet_engine::HarnessId::Hermes,
-        Ok("opencode") => komet_engine::HarnessId::Opencode,
-        Ok("pi") => komet_engine::HarnessId::Pi,
-        Ok("cline") => komet_engine::HarnessId::Cline,
-        _ => komet_engine::HarnessId::ClaudeCode,
+    let Ok(raw) = std::env::var("KOMET_HARNESS") else {
+        return komet_engine::HarnessId::ClaudeCode;
+    };
+    match harness_from_value(&raw) {
+        Some(harness) => harness,
+        None => {
+            eprintln!(
+                "komet: ignoring unknown KOMET_HARNESS={:?} — using claude-code \
+                 (known: claude-code, cline, codex, opencode, cursor, grok, hermes, pi, \
+                 antigravity, mock)",
+                raw.trim()
+            );
+            komet_engine::HarnessId::ClaudeCode
+        }
     }
 }
 
@@ -349,33 +373,6 @@ fn dirs_data_dir() -> std::path::PathBuf {
         .or_else(|| std::env::var_os("USERPROFILE").filter(|s| !s.is_empty()))
         .expect("HOME not set");
     std::path::PathBuf::from(home).join(".komet")
-}
-
-async fn stop_engine(ipc_port: u16) -> anyhow::Result<()> {
-    let token = komet_rpc::ipc_token::read_default(ipc_port)
-        .map_err(|err| anyhow::anyhow!("no engine token for port {ipc_port}: {err}"))?;
-    let client = komet_rpc::connect_ws(&format!("ws://127.0.0.1:{ipc_port}"), &token)
-        .await
-        .map_err(|err| anyhow::anyhow!("no engine listening on port {ipc_port}: {err}"))?;
-    client
-        .call(komet_rpc::methods::STOP_ENGINE, serde_json::json!({}))
-        .await
-        .map_err(|err| anyhow::anyhow!("engine does not support graceful stop: {err}"))?;
-
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
-    loop {
-        if tokio::net::TcpStream::connect(("127.0.0.1", ipc_port))
-            .await
-            .is_err()
-        {
-            println!("Engine stopped.");
-            return Ok(());
-        }
-        if tokio::time::Instant::now() >= deadline {
-            anyhow::bail!("engine accepted the stop request but did not release port {ipc_port}");
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    }
 }
 
 /// `komet sync`: dial the running engine's IPC and print per-room sync state.
@@ -390,10 +387,12 @@ async fn sync_cli(ipc_port: u16) -> anyhow::Result<()> {
         .map_err(|e| {
             anyhow::anyhow!("no engine listening on 127.0.0.1:{ipc_port} ({e}) — is komet running?")
         })?;
-    let status = client
-        .call(komet_rpc::methods::SYNC_STATUS, serde_json::json!({}))
-        .await
-        .map_err(|e| anyhow::anyhow!("SyncStatus failed: {e}"))?;
+    let status = ipc_call(
+        &client,
+        komet_rpc::methods::SYNC_STATUS,
+        serde_json::json!({}),
+    )
+    .await?;
     let now = status.get("nowMs").and_then(|v| v.as_i64()).unwrap_or(0);
     let age = |ms: i64| -> String {
         if ms <= 0 {
@@ -530,6 +529,49 @@ fn open_log_file_in(dir: &std::path::Path, mode: &str) -> Option<std::fs::File> 
     {
         let _ = std::fs::rename(&path, dir.join(format!("komet-{mode}.log.old")));
         std::fs::File::create(&path).ok()
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    // S-06: the crate carried a version that no flag exposed.
+    #[test]
+    fn the_cli_exposes_its_version() {
+        let command = Cli::command();
+        let version = command.get_version().map(str::to_string);
+        // Panics on an invalid definition (duplicate flags, bad defaults…).
+        command.debug_assert();
+        assert_eq!(version.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+    }
+
+    // S-04: every harness the models help lists must be selectable, and an
+    // unknown value must be reported rather than silently ignored.
+    #[test]
+    fn harness_values_map_exactly_and_unknown_ones_are_rejected() {
+        use komet_engine::HarnessId;
+        for (value, expected) in [
+            ("claude-code", HarnessId::ClaudeCode),
+            ("claude", HarnessId::ClaudeCode),
+            ("cline", HarnessId::Cline),
+            ("codex", HarnessId::Codex),
+            ("opencode", HarnessId::Opencode),
+            ("cursor", HarnessId::Cursor),
+            ("grok", HarnessId::Grok),
+            ("hermes", HarnessId::Hermes),
+            ("pi", HarnessId::Pi),
+            ("antigravity", HarnessId::Antigravity),
+            ("gemini", HarnessId::Antigravity),
+            ("mock", HarnessId::Mock),
+            (" Codex ", HarnessId::Codex),
+        ] {
+            assert_eq!(harness_from_value(value), Some(expected), "{value}");
+        }
+        for value in ["", "nope", "claude_code", "antigraviti"] {
+            assert_eq!(harness_from_value(value), None, "{value}");
+        }
     }
 }
 

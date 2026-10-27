@@ -238,9 +238,9 @@ fn secret_store_partitioned_headers_and_env() {
     let headers = store.get_resolved_headers_for("gh", &cfg_headers);
     let env = store.get_resolved_env_for("gh", &cfg_env);
     assert_eq!(headers.get("Authorization").unwrap(), "Bearer x");
-    assert!(!headers.contains_key("GH_TOKEN"));
+    assert!(headers.get("GH_TOKEN").is_none());
     assert_eq!(env.get("GH_TOKEN").unwrap(), "tok123");
-    assert!(!env.contains_key("Authorization"));
+    assert!(env.get("Authorization").is_none());
     // Aliases still return merged (documented)
     assert_eq!(store.get_resolved_headers("gh").len(), 2);
     assert_eq!(store.get_resolved_env("gh").len(), 2);

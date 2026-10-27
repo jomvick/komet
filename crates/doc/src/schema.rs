@@ -11,8 +11,6 @@
 //! isError?, questions?: json, resolved?, message? }. Text bodies are **LoroText** so streaming
 //! appends RLE-merge (1.03x oplog overhead vs 125x for whole-value rewrites).
 
-use std::collections::BTreeMap;
-
 use loro::{ExportMode, LoroDoc, LoroError, LoroList, LoroMap, LoroText, LoroValue, ToJson};
 use serde::{Deserialize, Serialize};
 
@@ -36,14 +34,6 @@ pub enum MessageRole {
     User,
     Assistant,
     System,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ProviderSessionMark {
-    pub session_id: String,
-    pub cwd: String,
-    pub seen: Option<String>,
 }
 
 /// One entry in the doc's `messages` list (`SessionMessageEntry` in TS).
@@ -177,20 +167,6 @@ fn to_doc_part(part: &MessagePart) -> Result<DocPartJson, DocError> {
             resolved: Some(*resolved),
             ..Default::default()
         },
-        MessagePart::Switch {
-            id,
-            from,
-            to,
-            from_harness,
-            to_harness,
-        } => DocPartJson {
-            id: id.clone(),
-            kind: "switch".into(),
-            message: Some(format!("{from} → {to}")),
-            // store the switch metadata as the request tuple for round-tripping
-            questions: Some(serde_json::to_value((from, to, from_harness, to_harness))?),
-            ..Default::default()
-        },
         MessagePart::Error {
             id,
             message,
@@ -267,23 +243,6 @@ fn from_doc_part(p: DocPartJson) -> MessagePart {
                 .unwrap_or_default(),
             resolved: p.resolved.unwrap_or(false),
         },
-        "switch" => {
-            let tuple: Option<(String, String, Option<String>, Option<String>)> =
-                p.questions.and_then(|q| serde_json::from_value(q).ok());
-            match tuple {
-                Some((from, to, from_harness, to_harness)) => MessagePart::Switch {
-                    id: p.id,
-                    from,
-                    to,
-                    from_harness,
-                    to_harness,
-                },
-                None => MessagePart::Text {
-                    id: p.id,
-                    text: p.message.unwrap_or_default(),
-                },
-            }
-        }
         "error" => MessagePart::Error {
             id: p.id,
             message: p.message.unwrap_or_default(),
@@ -379,67 +338,6 @@ impl SessionDoc {
             Some(loro::ValueOrContainer::Value(LoroValue::String(s))) => Some(s.to_string()),
             _ => None,
         }
-    }
-
-    pub fn provider_switched(&self) -> bool {
-        matches!(
-            self.doc.get_map("meta").get("providerSwitched"),
-            Some(loro::ValueOrContainer::Value(LoroValue::Bool(true)))
-        )
-    }
-
-    pub fn mark_provider_switched(&self) -> Result<(), DocError> {
-        self.doc.get_map("meta").insert("providerSwitched", true)?;
-        self.doc.commit();
-        Ok(())
-    }
-
-    pub fn active_provider(&self) -> Option<String> {
-        match self.doc.get_map("meta").get("activeProvider") {
-            Some(loro::ValueOrContainer::Value(LoroValue::String(value))) => {
-                Some(value.to_string())
-            }
-            _ => None,
-        }
-    }
-
-    pub fn set_active_provider(&self, harness: &str) -> Result<(), DocError> {
-        if self.active_provider().as_deref() == Some(harness) {
-            return Ok(());
-        }
-        self.doc.get_map("meta").insert("activeProvider", harness)?;
-        self.doc.commit();
-        Ok(())
-    }
-
-    pub fn provider_sessions(&self) -> BTreeMap<String, ProviderSessionMark> {
-        let Some(loro::ValueOrContainer::Value(LoroValue::String(value))) =
-            self.doc.get_map("meta").get("providerSessions")
-        else {
-            return BTreeMap::new();
-        };
-        serde_json::from_str(&value).unwrap_or_default()
-    }
-
-    pub fn provider_session(&self, harness: &str) -> Option<ProviderSessionMark> {
-        self.provider_sessions().get(harness).cloned()
-    }
-
-    pub fn set_provider_session(
-        &self,
-        harness: &str,
-        mark: &ProviderSessionMark,
-    ) -> Result<(), DocError> {
-        let mut sessions = self.provider_sessions();
-        if sessions.get(harness) == Some(mark) {
-            return Ok(());
-        }
-        sessions.insert(harness.to_string(), mark.clone());
-        self.doc
-            .get_map("meta")
-            .insert("providerSessions", serde_json::to_string(&sessions)?)?;
-        self.doc.commit();
-        Ok(())
     }
 
     /// Insert a complete message entry (user/system messages, command-side inserts).
@@ -673,56 +571,6 @@ impl SessionDoc {
                     retryable: false,
                 },
             )?;
-            self.doc.commit();
-            return Ok(true);
-        }
-        Ok(false)
-    }
-
-    pub fn append_switch_part(
-        &self,
-        message_id: &str,
-        part: &MessagePart,
-    ) -> Result<bool, DocError> {
-        if !matches!(part, MessagePart::Switch { .. }) {
-            return Err(DocError::Schema(
-                "append_switch_part requires a switch part".into(),
-            ));
-        }
-        let messages = self.doc.get_list("messages");
-        for i in 0..messages.len() {
-            let Some(loro::ValueOrContainer::Container(loro::Container::Map(entry))) =
-                messages.get(i)
-            else {
-                continue;
-            };
-            let id_matches = matches!(
-                entry.get("id"),
-                Some(loro::ValueOrContainer::Value(LoroValue::String(s))) if s.as_str() == message_id
-            );
-            if !id_matches {
-                continue;
-            }
-            let Some(loro::ValueOrContainer::Container(loro::Container::List(parts))) =
-                entry.get("parts")
-            else {
-                return Err(DocError::Schema(format!(
-                    "message {message_id} has no parts list"
-                )));
-            };
-            if (0..parts.len()).any(|index| {
-                matches!(
-                    parts.get(index),
-                    Some(loro::ValueOrContainer::Container(loro::Container::Map(part_map)))
-                        if matches!(
-                            part_map.get("id"),
-                            Some(loro::ValueOrContainer::Value(LoroValue::String(id))) if id.as_str() == part.id()
-                        )
-                )
-            }) {
-                return Ok(true);
-            }
-            push_part(&parts, part)?;
             self.doc.commit();
             return Ok(true);
         }
@@ -1641,42 +1489,6 @@ mod tests {
         );
         let entries = doc.read_entries().unwrap();
         assert_eq!(entries[0].status, Some(MessageStatus::Aborted));
-    }
-
-    #[test]
-    fn provider_switch_state_and_transcript_marker_round_trip() {
-        let doc = SessionDoc::init("chat-1").unwrap();
-        doc.push_message(&user_entry("m1", "hello")).unwrap();
-        let marker = MessagePart::Switch {
-            id: "switch-1".into(),
-            from: "Claude Code".into(),
-            to: "Devin".into(),
-            from_harness: Some("claude-code".into()),
-            to_harness: Some("devin".into()),
-        };
-        assert!(doc.append_switch_part("m1", &marker).unwrap());
-        assert!(doc.append_switch_part("m1", &marker).unwrap());
-        doc.mark_provider_switched().unwrap();
-        doc.set_active_provider("devin").unwrap();
-        let session = ProviderSessionMark {
-            session_id: "devin-session".into(),
-            cwd: "/workspace".into(),
-            seen: Some("m1".into()),
-        };
-        doc.set_provider_session("devin", &session).unwrap();
-        assert!(doc.provider_switched());
-        assert_eq!(doc.active_provider().as_deref(), Some("devin"));
-        assert_eq!(doc.provider_session("devin"), Some(session));
-        let entries = doc.read_entries().unwrap();
-        assert!(entries[0].parts.contains(&marker));
-        assert_eq!(
-            entries[0]
-                .parts
-                .iter()
-                .filter(|part| matches!(part, MessagePart::Switch { .. }))
-                .count(),
-            1
-        );
     }
 
     #[test]

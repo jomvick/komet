@@ -34,7 +34,7 @@
 //! - Steering: turn-boundary — steers queue and become the next turn on the
 //!   parked session (parity with the previous ACP behavior).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -81,9 +81,7 @@ pub struct CursorHarness {
     kill_grace: Duration,
     /// Discovery cache: only a successful, non-empty catalog is cached, so a
     /// failed probe (offline, SDK churn) retries on the next picker open.
-    models_cache: tokio::sync::Mutex<Option<Vec<Model>>>,
-    /// Single-flight for normal and forced model discovery.
-    models_probe: tokio::sync::Mutex<()>,
+    models_cache: tokio::sync::OnceCell<Vec<Model>>,
 }
 
 impl Default for CursorHarness {
@@ -92,8 +90,7 @@ impl Default for CursorHarness {
             executable: None,
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
-            models_cache: tokio::sync::Mutex::new(None),
-            models_probe: tokio::sync::Mutex::new(()),
+            models_cache: tokio::sync::OnceCell::new(),
         }
     }
 }
@@ -210,31 +207,6 @@ impl CursorHarness {
                 .await?;
         crate::adapter_install::launch_for_entry(&shim)
     }
-
-    async fn discover_and_cache_models(&self) -> Result<Vec<Model>, HarnessError> {
-        let cli_err = match self.discover_cli_models().await {
-            Ok(models) if !models.is_empty() => {
-                *self.models_cache.lock().await = Some(models.clone());
-                return Ok(models);
-            }
-            Ok(_) => HarnessError::Protocol(
-                "cursor-agent --list-models returned no usable models".into(),
-            ),
-            Err(error) => error,
-        };
-        match self.discover_sdk_models().await {
-            Ok(models) if !models.is_empty() => {
-                *self.models_cache.lock().await = Some(models.clone());
-                Ok(models)
-            }
-            Ok(_) => Err(HarnessError::Protocol(format!(
-                "cursor probe failed — cli: {cli_err}; sdk: cursor models probe returned no usable models"
-            ))),
-            Err(sdk_err) => Err(HarnessError::Protocol(format!(
-                "cursor probe failed — cli: {cli_err}; sdk: {sdk_err}"
-            ))),
-        }
-    }
 }
 
 /// A ready-to-spawn command for the shim's LOGIN mode: the SDK's PKCE
@@ -288,16 +260,31 @@ impl Harness for CursorHarness {
     /// next picker open retries. When both probes fail, the error names both
     /// wire reasons.
     async fn models(&self) -> Result<Vec<Model>, HarnessError> {
-        let _probe = self.models_probe.lock().await;
-        if let Some(models) = self.models_cache.lock().await.as_ref() {
+        if let Some(models) = self.models_cache.get() {
             return Ok(models.clone());
         }
-        self.discover_and_cache_models().await
-    }
-
-    async fn refresh_models(&self) -> Result<Vec<Model>, HarnessError> {
-        let _probe = self.models_probe.lock().await;
-        self.discover_and_cache_models().await
+        let cli_err = match self.discover_cli_models().await {
+            Ok(models) if !models.is_empty() => {
+                let _ = self.models_cache.set(models.clone());
+                return Ok(models);
+            }
+            Ok(_) => HarnessError::Protocol(
+                "cursor-agent --list-models returned no usable models".into(),
+            ),
+            Err(e) => e,
+        };
+        match self.discover_sdk_models().await {
+            Ok(models) if !models.is_empty() => {
+                let _ = self.models_cache.set(models.clone());
+                Ok(models)
+            }
+            Ok(_) => Err(HarnessError::Protocol(format!(
+                "cursor probe failed — cli: {cli_err}; sdk: cursor models probe returned no usable models"
+            ))),
+            Err(sdk_err) => Err(HarnessError::Protocol(format!(
+                "cursor probe failed — cli: {cli_err}; sdk: {sdk_err}"
+            ))),
+        }
     }
 
     // No `fallback_models` override: cursor's catalog rows are test fixtures
@@ -307,7 +294,7 @@ impl Harness for CursorHarness {
     /// cursor-agent TUI built-ins (Bucket A). `@cursor/sdk` 1.0.28 still has
     /// no listing API, so the static catalog is the source — same prompt-line
     /// shape as Claude/Codex (`/name` sent as the turn text).
-    async fn commands(&self, _cwd: Option<&Path>) -> Result<Vec<SlashCommand>, HarnessError> {
+    async fn commands(&self) -> Result<Vec<SlashCommand>, HarnessError> {
         Ok(catalog::static_commands())
     }
 

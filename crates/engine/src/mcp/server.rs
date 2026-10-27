@@ -249,7 +249,7 @@ async fn handle_conn(
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(|token| {
             let h: [u8; 32] = Sha256::digest(token.as_bytes()).into();
-            h == auth.token_hash
+            constant_time_eq(&h, &auth.token_hash)
         })
         .unwrap_or(false);
     if !token_ok {
@@ -278,7 +278,10 @@ async fn handle_conn(
         .cloned()
         .unwrap_or(serde_json::Value::Null);
 
-    let (result, _is_error) = match method {
+    // `error` is the JSON-RPC channel: a denied tool or an unknown method must
+    // not be reported as a successful `result`, or a strict MCP client treats
+    // the refusal as a completed call.
+    let (result, is_error, error_code) = match method {
         "tools/list" => {
             let tools: Vec<serde_json::Value> = catalog
                 .list()
@@ -293,7 +296,7 @@ async fn handle_conn(
                     })
                 })
                 .collect();
-            (serde_json::json!({"tools": tools}), false)
+            (serde_json::json!({"tools": tools}), false, 0)
         }
         "tools/call" => {
             let tool_name = params
@@ -307,7 +310,7 @@ async fn handle_conn(
                 .unwrap_or(serde_json::Value::Object(Default::default()));
             // policy check
             let definition = catalog.list().into_iter().find(|t| t.name == tool_name);
-            let readonly = definition.is_some() && catalog.is_readonly(&tool_name, &arguments);
+            let readonly = definition.as_ref().map(|d| d.readonly).unwrap_or(false);
             let decision = policy
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -346,6 +349,7 @@ async fn handle_conn(
                 (
                     serde_json::json!({"content": [{"type":"text","text": err}], "isError": true}),
                     true,
+                    -32000,
                 )
             } else {
                 // execute with semaphore and timeout
@@ -364,10 +368,12 @@ async fn handle_conn(
                     Ok(v) => (
                         serde_json::json!({"content": [{"type":"text","text": serde_json::to_string(&v).unwrap_or_default()}], "structuredContent": v}),
                         false,
+                        0,
                     ),
                     Err(e) => (
                         serde_json::json!({"content": [{"type":"text","text": e}], "isError": true}),
                         true,
+                        -32000,
                     ),
                 }
             }
@@ -379,11 +385,23 @@ async fn handle_conn(
                 "serverInfo": {"name": "komet", "version": env!("CARGO_PKG_VERSION")}
             }),
             false,
+            0,
         ),
-        _ => (serde_json::json!({"error": "unknown method"}), true),
+        _ => (serde_json::json!({"error": "unknown method"}), true, -32601),
     };
 
-    let response_body = serde_json::json!({"jsonrpc":"2.0","id": id, "result": result});
+    let response_body = if is_error {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": {
+                "code": error_code,
+                "message": error_message(&result, error_code),
+            }
+        })
+    } else {
+        serde_json::json!({"jsonrpc":"2.0","id": id, "result": result})
+    };
     let body_bytes = serde_json::to_vec(&response_body).unwrap();
     let resp = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
@@ -392,6 +410,38 @@ async fn handle_conn(
     stream.write_all(resp.as_bytes()).await?;
     stream.write_all(&body_bytes).await?;
     Ok(())
+}
+
+/// Best available human message for a failed MCP call: the `isError` content
+/// text produced by the tool path, else the bare `error` string.
+fn error_message(result: &serde_json::Value, code: i64) -> String {
+    result
+        .get("content")
+        .and_then(|content| content.as_array())
+        .and_then(|items| items.first())
+        .and_then(|item| item.get("text"))
+        .and_then(|text| text.as_str())
+        .or_else(|| result.get("error").and_then(|err| err.as_str()))
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            if code == -32601 {
+                "unknown method".to_string()
+            } else {
+                "mcp call failed".to_string()
+            }
+        })
+}
+
+/// Compare two digests without an early exit. The bearer token is compared as
+/// its SHA-256, so this leaks only hash prefixes — but the rest of the codebase
+/// (komet-rpc) compares tokens in constant time and this endpoint should not be
+/// the exception.
+fn constant_time_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    std::hint::black_box(diff) == 0
 }
 
 fn query_value<'a>(query: Option<&'a str>, key: &str) -> Option<&'a str> {
@@ -486,6 +536,21 @@ mod tests {
             post(&endpoint, "tools/list", serde_json::json!({}), Some(&token)).await;
         assert_eq!(status, 200);
         assert_eq!(body["result"]["tools"].as_array().unwrap().len(), 3);
+        endpoint.shutdown();
+    }
+
+    #[tokio::test]
+    async fn unknown_method_returns_a_jsonrpc_error() {
+        let endpoint = start_test_endpoint().await;
+        let token = endpoint.token_for_test_only().to_string();
+        let (status, body) =
+            post(&endpoint, "nope/nope", serde_json::json!({}), Some(&token)).await;
+        assert_eq!(status, 200);
+        assert!(
+            body.get("result").is_none(),
+            "a failure must not ride in `result`: {body}"
+        );
+        assert_eq!(body["error"]["code"], -32601);
         endpoint.shutdown();
     }
 

@@ -78,7 +78,6 @@ const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 // Cursor's usage dashboard API — returns `{usage: {requestCount, requestLimit,
 // tokenCount, tokenLimit}, requestWindowSeconds}` for the billing period.
 const CURSOR_USAGE_URL: &str = "https://www.cursor.com/api/usage";
-const CURSOR_USAGE_SUMMARY_URL: &str = "https://www.cursor.com/api/usage-summary";
 // Codex CLI's public ChatGPT OAuth client (no secret; PKCE on login, refresh
 // is client_id + refresh_token). Same id the CLI posts to auth.openai.com.
 const CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -766,14 +765,7 @@ impl AgentAccounts {
             let slots = self.read_slots(harness);
             for slot in &slots {
                 let active = active_key.as_deref() == Some(slot.account_key.as_str());
-                // Quotas describe the live CLI session, not every saved login.
-                // Avoid probing inactive accounts and only attach usage to the
-                // account that is currently selected for this provider.
-                let usage = if active {
-                    self.usage_for(harness, slot, true, mode).await
-                } else {
-                    None
-                };
+                let usage = self.usage_for(harness, slot, active, mode).await;
                 accounts.push(AgentAccount {
                     id: slot.id.clone(),
                     harness,
@@ -2467,10 +2459,10 @@ impl AgentAccounts {
         let slot_token = str_field(&slot.credentials, "sessionToken")
             .or_else(|| str_field(&slot.credentials, "accessToken"));
 
-        if let Some(token) = slot_token.as_deref()
-            && let Some(windows) = self.query_cursor_usage(token).await
-        {
-            return Some(windows);
+        if let Some(token) = slot_token.as_deref() {
+            if let Some(windows) = self.query_cursor_usage(token).await {
+                return Some(windows);
+            }
         }
 
         // Fallback: try a fresh read from the local SQLite store (Cursor may
@@ -2496,35 +2488,25 @@ impl AgentAccounts {
     }
 
     async fn query_cursor_usage(&self, session_token: &str) -> Option<Vec<AgentUsageWindow>> {
-        for endpoint in [CURSOR_USAGE_URL, CURSOR_USAGE_SUMMARY_URL] {
-            let Ok(response) = self
-                .inner
-                .http
-                .get(endpoint)
-                .bearer_auth(session_token)
-                .header(
-                    reqwest::header::COOKIE,
-                    format!("WorkosCursorSessionToken={session_token}"),
-                )
-                .header("Accept", "application/json")
-                .header("Referer", "https://www.cursor.com/settings")
-                .send()
-                .await
-            else {
-                continue;
-            };
-            if !response.status().is_success() {
-                continue;
-            }
-            let Ok(body) = response.json::<serde_json::Value>().await else {
-                continue;
-            };
-            let windows = parse_cursor_usage_response(&body);
-            if !windows.is_empty() {
-                return Some(windows);
-            }
-        }
-        None
+        let body: serde_json::Value = self
+            .inner
+            .http
+            .get(CURSOR_USAGE_URL)
+            .bearer_auth(session_token)
+            // Cursor's dashboard page sets these; mimic it to avoid bot
+            // detection that might return an empty or error response.
+            .header("Accept", "application/json")
+            .header("Referer", "https://www.cursor.com/settings")
+            .send()
+            .await
+            .ok()?
+            .error_for_status()
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        let windows = parse_cursor_usage_response(&body);
+        (!windows.is_empty()).then_some(windows)
     }
 
     async fn antigravity_usage(
@@ -2544,7 +2526,14 @@ impl AgentAccounts {
             // is tried: the port recorded in `language_server.log` survives
             // restarts and is regularly stale, so the process's own listening
             // sockets are the ground truth (see `discover_language_servers`).
-            for (port, csrf) in discover_language_servers(&self.inner.config.antigravity_home) {
+            // The scan walks /proc and may shell out to `lsof`, so it belongs on
+            // a blocking thread rather than on a tokio worker.
+            let antigravity_home = self.inner.config.antigravity_home.clone();
+            let candidates =
+                tokio::task::spawn_blocking(move || discover_language_servers(&antigravity_home))
+                    .await
+                    .unwrap_or_default();
+            for (port, csrf) in candidates {
                 let url = format!(
                     "http://127.0.0.1:{port}/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary"
                 );
@@ -2567,9 +2556,7 @@ impl AgentAccounts {
             }
 
             let (Some(raw), _) = self.read_antigravity_keyring().await else {
-                // On macOS/Windows the active credentials are read from the
-                // provider's auth file, not the Linux Secret Service keyring.
-                return self.antigravity_slot_usage(ENDPOINT, slot).await;
+                return None;
             };
             // An access token we already know is past its `expiry` would only
             // earn a 401: refresh straight away (that path also keeps the
@@ -2579,7 +2566,7 @@ impl AgentAccounts {
             } else {
                 match antigravity_access_token(&raw) {
                     Some(live) => self.query_antigravity_pa(ENDPOINT, &live).await,
-                    None => return self.antigravity_slot_usage(ENDPOINT, slot).await,
+                    None => PaProbe::Unauthorized,
                 }
             };
             match probe {
@@ -2635,21 +2622,6 @@ impl AgentAccounts {
             };
         }
         None
-    }
-
-    async fn antigravity_slot_usage(
-        &self,
-        endpoint: &str,
-        slot: &Slot,
-    ) -> Option<Vec<AgentUsageWindow>> {
-        let token = antigravity_slot_access_token(&slot.credentials)?;
-        match self.query_antigravity_pa(endpoint, &token).await {
-            PaProbe::Windows(windows) => Some(windows),
-            PaProbe::Failed
-            | PaProbe::Unauthorized
-            | PaProbe::RateLimited
-            | PaProbe::QuotaExhausted => None,
-        }
     }
 
     /// Quota probe against the Cloud Code PA endpoint.
@@ -2938,13 +2910,6 @@ impl AgentAccounts {
         }
         Some(access_token)
     }
-}
-
-fn antigravity_slot_access_token(credentials: &serde_json::Value) -> Option<String> {
-    if antigravity_access_expired(credentials) {
-        return None;
-    }
-    antigravity_access_token(credentials)
 }
 
 // ── macOS Keychain (documented here; compiled only on macOS) ────────────────
@@ -3298,10 +3263,10 @@ mod wincred {
 fn cursor_state_db_paths() -> Vec<PathBuf> {
     let home = home_dir();
     let mut paths = Vec::new();
-    if let Ok(env) = std::env::var("CURSOR_STATE_DB")
-        && !env.is_empty()
-    {
-        paths.push(PathBuf::from(env));
+    if let Ok(env) = std::env::var("CURSOR_STATE_DB") {
+        if !env.is_empty() {
+            paths.push(PathBuf::from(env));
+        }
     }
     paths.push(home.join(".config/Cursor/User/globalStorage/state.vscdb"));
     paths.push(home.join(".cursor-server-data/User/globalStorage/state.vscdb"));
@@ -3361,7 +3326,12 @@ fn read_cursor_sqlite_token_once(db: &Path, flags: rusqlite::OpenFlags) -> Optio
         .prepare("SELECT value FROM ItemTable WHERE key LIKE '%SessionToken%' LIMIT 5")
         .ok()?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(0)).ok()?;
-    rows.flatten().find(|value| !value.trim().is_empty())
+    for value in rows.flatten() {
+        if !value.trim().is_empty() {
+            return Some(value);
+        }
+    }
+    None
 }
 
 /// Build a [`Detected`] from a raw Workos session JWT (identity mined from
@@ -3452,7 +3422,11 @@ fn parse_proc_net_tcp_listening(
 /// nothing (non-Linux, containers without /proc, permission gaps).
 #[cfg(target_os = "linux")]
 fn listening_ports_lsof(pid: u32) -> Vec<u16> {
-    let out = std::process::Command::new("lsof")
+    use std::process::Stdio;
+
+    const LSOF_TIMEOUT: Duration = Duration::from_secs(2);
+    let started = std::time::Instant::now();
+    let mut child = match std::process::Command::new("lsof")
         .args([
             "-a",
             "-p",
@@ -3462,11 +3436,36 @@ fn listening_ports_lsof(pid: u32) -> Vec<u16> {
             "-P",
             "-n",
         ])
-        .output();
-    parse_lsof_listening(
-        &out.map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-            .unwrap_or_default(),
-    )
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return Vec::new(),
+    };
+    let mut stdout = child.stdout.take();
+    // `lsof` can wedge on a dead mount; a killed child is better than a stuck
+    // account listing.
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if started.elapsed() < LSOF_TIMEOUT => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Vec::new();
+            }
+        }
+    }
+    let mut output = String::new();
+    if let Some(handle) = stdout.as_mut() {
+        use std::io::Read as _;
+        let _ = handle.read_to_string(&mut output);
+    }
+    parse_lsof_listening(&output)
 }
 
 /// Pure parser over `lsof -P -n` output: trailing `:port` on loopback lines.
@@ -3503,14 +3502,11 @@ fn harness_slug(harness: HarnessId) -> &'static str {
         HarnessId::ClaudeCode => "claude-code",
         HarnessId::Codex => "codex",
         HarnessId::Cursor => "cursor",
-        HarnessId::Devin => "devin",
         HarnessId::Grok => "grok",
         HarnessId::Hermes => "hermes",
         HarnessId::Opencode => "opencode",
         HarnessId::Pi => "pi",
         HarnessId::Antigravity => "antigravity",
-        HarnessId::Muse => "muse",
-        HarnessId::Copilot => "copilot",
         HarnessId::Cline => "cline",
         HarnessId::Mock => "mock",
     }
@@ -3700,26 +3696,8 @@ fn parse_codex_usage_response(body: &serde_json::Value) -> Vec<AgentUsageWindow>
 /// ```
 /// `requestWindowSeconds` > 86 400 → label "Month", otherwise "Session".
 fn parse_cursor_usage_response(body: &serde_json::Value) -> Vec<AgentUsageWindow> {
-    if let Some(windows) = parse_cursor_usage_summary(body)
-        && !windows.is_empty()
-    {
-        return windows;
-    }
     let Some(usage) = body.get("usage") else {
-        return body
-            .as_object()
-            .into_iter()
-            .flat_map(|models| models.iter())
-            .filter_map(|(model, value)| {
-                let count = value.get("numRequests").and_then(json_f64)?;
-                let limit = value.get("maxRequestUsage").and_then(json_f64)?;
-                (limit > 0.0).then(|| AgentUsageWindow {
-                    label: format!("{model} Requests"),
-                    used_fraction: (count / limit).clamp(0.0, 1.0) as f32,
-                    resets_at: parse_when(body.get("billingCycleEnd")),
-                })
-            })
-            .collect();
+        return Vec::new();
     };
     let span = body
         .get("requestWindowSeconds")
@@ -3732,57 +3710,32 @@ fn parse_cursor_usage_response(body: &serde_json::Value) -> Vec<AgentUsageWindow
     if let (Some(count), Some(limit)) = (
         usage.get("requestCount").and_then(json_f64),
         usage.get("requestLimit").and_then(json_f64),
-    ) && limit > 0.0
-    {
-        windows.push(AgentUsageWindow {
-            label: format!("{label} Requests"),
-            used_fraction: (count / limit).clamp(0.0, 1.0) as f32,
-            resets_at: parse_when(body.get("resetsAt")).or_else(|| parse_when(body.get("resetAt"))),
-        });
+    ) {
+        if limit > 0.0 {
+            windows.push(AgentUsageWindow {
+                label: format!("{label} Requests"),
+                used_fraction: (count / limit).clamp(0.0, 1.0) as f32,
+                resets_at: parse_when(body.get("resetsAt"))
+                    .or_else(|| parse_when(body.get("resetAt"))),
+            });
+        }
     }
 
     // Token quota window (optional — not all Cursor plans expose it).
     if let (Some(count), Some(limit)) = (
         usage.get("tokenCount").and_then(json_f64),
         usage.get("tokenLimit").and_then(json_f64),
-    ) && limit > 0.0
-    {
-        windows.push(AgentUsageWindow {
-            label: format!("{label} Tokens"),
-            used_fraction: (count / limit).clamp(0.0, 1.0) as f32,
-            resets_at: None,
-        });
+    ) {
+        if limit > 0.0 {
+            windows.push(AgentUsageWindow {
+                label: format!("{label} Tokens"),
+                used_fraction: (count / limit).clamp(0.0, 1.0) as f32,
+                resets_at: None,
+            });
+        }
     }
 
     windows
-}
-
-fn parse_cursor_usage_summary(body: &serde_json::Value) -> Option<Vec<AgentUsageWindow>> {
-    let plan = body.get("individualUsage")?.get("plan")?;
-    let used = ["totalPercentUsed", "apiPercentUsed", "autoPercentUsed"]
-        .into_iter()
-        .find_map(|key| {
-            plan.get(key)
-                .and_then(json_f64)
-                .map(|percent| percent / 100.0)
-        })
-        .or_else(|| {
-            let amount = plan.get("used").and_then(json_f64)?;
-            let limit = plan.get("limit").and_then(json_f64)?;
-            (limit > 0.0).then_some(amount / limit)
-        })?;
-    let resets_at = [
-        "billingCycleEnd",
-        "billingCycleEndDate",
-        "billingCycleEndTime",
-    ]
-    .into_iter()
-    .find_map(|key| parse_when(body.get(key)));
-    Some(vec![AgentUsageWindow {
-        label: "Plan".into(),
-        used_fraction: used.clamp(0.0, 1.0) as f32,
-        resets_at,
-    }])
 }
 
 /// `chatgpt-account-id` header: stored `account_id`, then the JWT claim, then
@@ -5150,50 +5103,6 @@ mod tests {
         // Zero limit — divide-by-zero guard; must produce no window.
         let json = serde_json::json!({"usage": {"requestCount": 10, "requestLimit": 0}});
         assert!(parse_cursor_usage_response(&json).is_empty());
-    }
-
-    #[test]
-    fn parse_cursor_usage_summary_plan_percentage() {
-        let json = serde_json::json!({
-            "billingCycleEnd": "2026-11-01T00:00:00Z",
-            "individualUsage": {
-                "plan": {"totalPercentUsed": 37.5}
-            }
-        });
-        let windows = parse_cursor_usage_response(&json);
-        assert_eq!(windows.len(), 1);
-        assert_eq!(windows[0].label, "Plan");
-        assert!((windows[0].used_fraction - 0.375).abs() < 0.001);
-        assert!(windows[0].resets_at.is_some());
-    }
-
-    #[test]
-    fn parse_cursor_legacy_model_request_usage() {
-        let json = serde_json::json!({
-            "billingCycleEnd": "2026-11-01T00:00:00Z",
-            "gpt-4": {"numRequests": 20, "maxRequestUsage": 100}
-        });
-        let windows = parse_cursor_usage_response(&json);
-        assert_eq!(windows.len(), 1);
-        assert_eq!(windows[0].label, "gpt-4 Requests");
-        assert!((windows[0].used_fraction - 0.2).abs() < 0.001);
-    }
-
-    #[test]
-    fn active_antigravity_can_probe_a_valid_saved_access_token() {
-        let credentials = serde_json::json!({
-            "token": {"access_token": "test-access-token"}
-        });
-        assert_eq!(
-            antigravity_slot_access_token(&credentials).as_deref(),
-            Some("test-access-token")
-        );
-
-        let expired = serde_json::json!({
-            "access_token": "expired-token",
-            "expiry": (chrono::Utc::now() - chrono::Duration::minutes(1)).to_rfc3339()
-        });
-        assert_eq!(antigravity_slot_access_token(&expired), None);
     }
 
     // ── Phase 0 — filet de sécurité : course dédup/switch ────────────────

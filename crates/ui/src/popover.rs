@@ -427,68 +427,10 @@ pub fn anchored_menu_below(
     anchored_menu_below_gap(id, content, closing, 6.0)
 }
 
-/// [`anchored_menu_below`] for content that already contains its own frosted
-/// cards. Skips the wrapper blur so sibling cards do not get painted as one
-/// large surface across the empty space between their bounds.
-pub fn anchored_menu_below_unfrosted(
-    id: impl Into<SharedString>,
-    content: AnyElement,
-    closing: Option<std::time::Instant>,
-) -> AnyElement {
-    anchored_menu_below_gap_impl(id, content, closing, 6.0, false)
-}
-
 /// [`anchored_menu_below`] with a caller-chosen trigger→card gap — the
 /// changes-header dropdowns hang off a tight titlebar band and need more
 /// breathing room than the default 6px (user report; t3code sits near 10).
 pub fn anchored_menu_below_gap(
-    id: impl Into<SharedString>,
-    content: AnyElement,
-    closing: Option<std::time::Instant>,
-    gap: f32,
-) -> AnyElement {
-    anchored_menu_below_gap_impl(id, content, closing, gap, true)
-}
-
-fn anchored_menu_below_gap_impl(
-    id: impl Into<SharedString>,
-    content: AnyElement,
-    closing: Option<std::time::Instant>,
-    gap: f32,
-    frost_content: bool,
-) -> AnyElement {
-    let exit = closing.map(exit_progress);
-    let content = if frost_content {
-        frosted_menu(exit, content)
-    } else {
-        content
-    };
-    div()
-        .absolute()
-        .bottom_0()
-        .left_0()
-        .size_0()
-        .child(
-            gpui::deferred(
-                gpui::anchored()
-                    .anchor(Anchor::TopLeft)
-                    .snap_to_window_with_margin(px(8.0))
-                    .child(menu_motion(
-                        id.into(),
-                        exit,
-                        div().occlude().pt(px(gap)).child(content),
-                    )),
-            )
-            .priority(1)
-            .into_any_element(),
-        )
-        .into_any_element()
-}
-
-/// [`anchored_menu_below_gap`] right-aligned to the trigger's right edge, so
-/// the card grows leftward — for titlebar triggers sitting beside the right
-/// pane, which a left-aligned card would cover.
-pub fn anchored_menu_below_end(
     id: impl Into<SharedString>,
     content: AnyElement,
     closing: Option<std::time::Instant>,
@@ -499,12 +441,12 @@ pub fn anchored_menu_below_end(
     div()
         .absolute()
         .bottom_0()
-        .right_0()
+        .left_0()
         .size_0()
         .child(
             gpui::deferred(
                 gpui::anchored()
-                    .anchor(Anchor::TopRight)
+                    .anchor(Anchor::TopLeft)
                     .snap_to_window_with_margin(px(8.0))
                     .child(menu_motion(
                         id.into(),

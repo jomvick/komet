@@ -79,9 +79,6 @@ pub struct RenderOptions {
     /// Code-block copy-button plumbing (round 9): `None` renders no button
     /// (previews outside the transcript).
     pub copy: Option<CopyUi>,
-    /// Opens a validated workspace-relative file link inside Komet. Ordinary
-    /// web links retain their existing OS-browser behavior.
-    pub open_workspace_file: Option<WorkspaceFileHandler>,
 }
 
 /// Copy-button wiring for one row's code blocks: the handler writes the code
@@ -91,7 +88,6 @@ pub struct RenderOptions {
 /// (`(block index, code, window, app)`); `copied_ix` is the block currently
 /// showing "Copied" feedback.
 pub type CopyHandler = Rc<dyn Fn(usize, SharedString, &mut Window, &mut gpui::App)>;
-pub type WorkspaceFileHandler = Rc<dyn Fn(String, Option<u32>, &mut gpui::App)>;
 
 #[derive(Clone)]
 pub struct CopyUi {
@@ -108,7 +104,6 @@ impl RenderOptions {
             cache: None,
             now: Instant::now(),
             copy: None,
-            open_workspace_file: None,
         }
     }
 }
@@ -674,18 +669,9 @@ fn flat_text_element(
     } else {
         let (ranges, urls): (Vec<_>, Vec<_>) = flat.links.iter().cloned().unzip();
         let id: SharedString = format!("{}-t{ix}", opts.row_key).into();
-        let open_workspace_file = opts.open_workspace_file.clone();
         InteractiveText::new(id, styled)
             .on_click(ranges, move |clicked_ix, _window, cx| {
                 if let Some(url) = urls.get(clicked_ix) {
-                    if let Some((path, line)) = super::parser::parse_workspace_file_reference(url)
-                        && url.starts_with(super::parser::WORKSPACE_FILE_SCHEME)
-                    {
-                        if let Some(handler) = &open_workspace_file {
-                            handler(path, line, cx);
-                        }
-                        return;
-                    }
                     cx.open_url(url);
                 }
             })

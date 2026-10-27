@@ -35,11 +35,6 @@ pub use server::{serve_connection, serve_ws_listener};
 /// Full surface: docs/research/feature-inventory.md §2.
 pub mod methods {
     pub const LIST_HARNESSES: &str = "ListHarnesses";
-    /// Read installed CLI versions; query provider versions only with
-    /// `{checkLatest: true}`.
-    pub const GET_HARNESS_CLI_STATUS: &str = "GetHarnessCliStatus";
-    /// Install or update an agent CLI using its configured official source.
-    pub const MANAGE_HARNESS_CLI: &str = "ManageHarnessCli";
     /// Flip a harness's enablement on the target device (Settings → Agents);
     /// replies with the device's fresh `ListHarnesses` catalog.
     pub const SET_HARNESS_ENABLED: &str = "SetHarnessEnabled";
@@ -103,10 +98,6 @@ pub mod methods {
     pub const CREATE_REPO: &str = "CreateRepo";
     pub const LIST_BRANCHES: &str = "ListBranches";
     pub const LIST_REFS: &str = "ListRefs";
-    /// Titlebar GitHub control data for a checkout (`Option<GitHubStatus>`):
-    /// repo URL, branch, the branch's PR + checks, recent commits, diff stats.
-    pub const GET_GITHUB_STATUS: &str = "GetGitHubStatus";
-    pub const OPEN_PROJECT: &str = "OpenProject";
     pub const LIST_GIT_HISTORY: &str = "ListGitHistory";
     /// Update remote-tracking refs without changing HEAD, the index, or files.
     pub const FETCH_ALL: &str = "FetchAll";
@@ -170,16 +161,6 @@ pub mod methods {
     pub const TEST_MCP_SERVER: &str = "TestMcpServer";
     pub const LIST_MCP_TOOLS: &str = "ListMcpTools";
     pub const WATCH_MCP_STATUS: &str = "WatchMcpStatus";
-    // Composio Platform sessions and connected accounts are local to the
-    // device. Project API keys are accepted only on SaveComposioApiKey and
-    // never returned by the RPC surface.
-    pub const GET_COMPOSIO_STATUS: &str = "GetComposioStatus";
-    pub const SAVE_COMPOSIO_API_KEY: &str = "SaveComposioApiKey";
-    pub const DELETE_COMPOSIO_API_KEY: &str = "DeleteComposioApiKey";
-    pub const SEARCH_COMPOSIO_INTEGRATIONS: &str = "SearchComposioIntegrations";
-    pub const LIST_COMPOSIO_ACCOUNTS: &str = "ListComposioAccounts";
-    pub const CONNECT_COMPOSIO_INTEGRATION: &str = "ConnectComposioIntegration";
-    pub const DISCONNECT_COMPOSIO_ACCOUNT: &str = "DisconnectComposioAccount";
 }
 
 #[derive(Debug, thiserror::Error)]

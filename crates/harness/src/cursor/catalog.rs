@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 
-use komet_proto::{CommandSource, Model, ModelOption, ModelOptionChoice, SlashCommand};
+use komet_proto::{Model, ModelOption, ModelOptionChoice, SlashCommand};
 use serde_json::Value;
 
 /// Longer effort tokens first so `extra-high` wins over `high`.
@@ -63,99 +63,71 @@ pub(crate) fn static_commands() -> Vec<SlashCommand> {
             name: "summarize".into(),
             description: "Summarize the conversation to reduce context".into(),
             input_hint: None,
-            source: CommandSource::Fallback,
-            ..SlashCommand::default()
         },
         SlashCommand {
             name: "compress".into(),
             description: "Summarize the conversation (alias of /summarize)".into(),
             input_hint: None,
-            source: CommandSource::Fallback,
-            ..SlashCommand::default()
         },
         SlashCommand {
             name: "plan".into(),
             description: "Switch to Plan mode or submit a prompt in Plan mode".into(),
             input_hint: Some("[prompt]".into()),
-            source: CommandSource::Fallback,
-            ..SlashCommand::default()
         },
         SlashCommand {
             name: "ask".into(),
             description: "Toggle Ask mode for read-only questions".into(),
             input_hint: None,
-            source: CommandSource::Fallback,
-            ..SlashCommand::default()
         },
         SlashCommand {
             name: "debug".into(),
             description: "Toggle Debug mode or submit a prompt in Debug mode".into(),
             input_hint: Some("[prompt]".into()),
-            source: CommandSource::Fallback,
-            ..SlashCommand::default()
         },
         SlashCommand {
             name: "goal".into(),
             description: "Give the agent a long-lived objective until complete".into(),
             input_hint: Some("[objective]".into()),
-            source: CommandSource::Fallback,
-            ..SlashCommand::default()
         },
         SlashCommand {
             name: "clear".into(),
             description: "Start a new chat session".into(),
             input_hint: None,
-            source: CommandSource::Fallback,
-            ..SlashCommand::default()
         },
         SlashCommand {
             name: "rename".into(),
             description: "Rename the current chat session".into(),
             input_hint: Some("<name>".into()),
-            source: CommandSource::Fallback,
-            ..SlashCommand::default()
         },
         SlashCommand {
             name: "rewind".into(),
             description: "Jump back to a previous message".into(),
             input_hint: None,
-            source: CommandSource::Fallback,
-            ..SlashCommand::default()
         },
         SlashCommand {
             name: "fork".into(),
             description: "Fork the current chat into a new session".into(),
             input_hint: None,
-            source: CommandSource::Fallback,
-            ..SlashCommand::default()
         },
         SlashCommand {
             name: "model".into(),
             description: "Select a model".into(),
             input_hint: Some("[filter]".into()),
-            source: CommandSource::Fallback,
-            ..SlashCommand::default()
         },
         SlashCommand {
             name: "sandbox".into(),
             description: "Configure sandbox mode and network access".into(),
             input_hint: None,
-            source: CommandSource::Fallback,
-            ..SlashCommand::default()
         },
         SlashCommand {
             name: "mcp".into(),
             description: "Manage MCP servers and list tools".into(),
             input_hint: Some("[list|list-tools] [identifier]".into()),
-            source: CommandSource::Fallback,
-            ..SlashCommand::default()
         },
         SlashCommand {
             name: "shell".into(),
             description: "Enter Shell Mode".into(),
             input_hint: Some("[command]".into()),
-            source: CommandSource::Fallback,
-            ..SlashCommand::default()
         },
     ]
 }

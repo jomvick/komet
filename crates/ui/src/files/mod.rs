@@ -650,12 +650,6 @@ impl FilesSurface {
         cx.notify();
     }
 
-    pub fn open_at_line(&mut self, line: u32, cx: &mut Context<Self>) {
-        if let Some(path) = self.editor_path.clone() {
-            self.navigate_to_line(&path, line, cx);
-        }
-    }
-
     pub fn set_show_all_files(&mut self, show_all_files: bool, cx: &mut Context<Self>) {
         self.apply_show_all_files(show_all_files, cx);
     }

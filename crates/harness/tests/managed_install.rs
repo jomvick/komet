@@ -1,8 +1,8 @@
 //! Real-world E2E for the managed adapter install: with no `pi-acp`
 //! binary anywhere, `run()` must npm-install the pinned adapter into
-//! `$KOMET_ADAPTERS_DIR`, spawn it via node, and reach SessionStarted (the
+//! `$KOMET_ADAPTERS_DIR` (fallback `$ZERON_ADAPTERS_DIR`), spawn it via node, and reach SessionStarted (the
 //! full initialize → session/new handshake) — the exact path that used to be
-//! `npx -y` at chat time.
+//! `npx -y` at chat time (kometsh/comet#95).
 //!
 //! Ignored: needs network, npm, and the pi CLI on the machine. Run with
 //! `cargo test -p komet-harness --test managed_install -- --ignored`.

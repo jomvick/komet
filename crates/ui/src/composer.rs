@@ -7,7 +7,7 @@
 //! pending-input detection) lives in free functions/structs with unit tests;
 //! the gpui element only feeds them measurements.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -26,8 +26,7 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use komet_doc::{MessagePart, MessageRole, SessionCommandPayload, SessionMessageEntry};
 use komet_proto::{
-    CommandSource, FileSearchMatch, HarnessId, RunRequest, SlashCommand, UserInputAnswer,
-    UserInputQuestion,
+    FileSearchMatch, HarnessId, RunRequest, SlashCommand, UserInputAnswer, UserInputQuestion,
 };
 use komet_rpc::{RpcError, methods};
 
@@ -369,16 +368,13 @@ pub enum SendButtonMode {
     Steer,
     /// Live run, nothing typed: red stop square.
     Stop,
-    /// Live non-steerable run with text typed: prompt goes into the local queue.
-    Queue,
 }
 
-pub fn send_button_mode(run_live: bool, has_text: bool, can_steer: bool) -> SendButtonMode {
-    match (run_live, has_text, can_steer) {
-        (false, _, _) => SendButtonMode::Send,
-        (true, true, true) => SendButtonMode::Steer,
-        (true, true, false) => SendButtonMode::Queue,
-        (true, false, _) => SendButtonMode::Stop,
+pub fn send_button_mode(run_live: bool, has_text: bool) -> SendButtonMode {
+    match (run_live, has_text) {
+        (false, _) => SendButtonMode::Send,
+        (true, true) => SendButtonMode::Steer,
+        (true, false) => SendButtonMode::Stop,
     }
 }
 
@@ -3480,130 +3476,17 @@ fn slash_token(text: &str, cursor: usize) -> Option<MentionToken> {
     })
 }
 
-/// Parse a Komet-owned command.  Native agent commands are intentionally not
-/// parsed here: if Komet does not recognize the complete command, the text is
-/// sent unchanged to the agent (the issue #42 fallback rule).
-fn parse_komet_command(text: &str) -> Option<(&str, Option<&str>)> {
-    let mut words = text.trim().splitn(2, char::is_whitespace);
-    let command = words.next()?.strip_prefix('/')?;
-    let argument = words
-        .next()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    matches!(
-        command,
-        "new" | "worktree" | "prompt" | "attach" | "model" | "sandbox"
-    )
-    .then_some((command, argument))
-}
-
-fn parse_sandbox_level(argument: Option<&str>) -> Option<komet_proto::SandboxLevel> {
-    let value = argument?.trim().to_ascii_lowercase();
-    match value.as_str() {
-        "ro" | "read-only" | "readonly" | "read" => Some(komet_proto::SandboxLevel::ReadOnly),
-        "workspace" | "workspace-write" | "write" => {
-            Some(komet_proto::SandboxLevel::WorkspaceWrite)
-        }
-        "danger" | "full" | "danger-full-access" | "yolo" => {
-            Some(komet_proto::SandboxLevel::DangerFullAccess)
-        }
-        _ => None,
-    }
-}
-
-/// What `/prompt …` asks for. `save`/`delete` manage the library; anything
-/// else is the name of a snippet to insert.
-enum PromptAction<'a> {
-    Insert(&'a str),
-    Save {
-        name: &'a str,
-        harness: Option<&'a str>,
-        body: &'a str,
-    },
-    Delete(&'a str),
-}
-
-fn parse_prompt_action(argument: &str) -> PromptAction<'_> {
-    let argument = argument.trim();
-    if let Some(rest) = argument.strip_prefix("save ")
-        && let Some((head, body)) = rest.split_once('=')
-    {
-        let mut words = head.split_whitespace();
-        if let (Some(name), Some(body)) =
-            (words.next(), Some(body.trim()).filter(|b| !b.is_empty()))
-        {
-            let harness = words.next().and_then(|word| word.strip_prefix('@'));
-            return PromptAction::Save {
-                name,
-                harness,
-                body,
-            };
-        }
-    }
-    if let Some(name) = argument.strip_prefix("delete ") {
-        return PromptAction::Delete(name.trim());
-    }
-    PromptAction::Insert(argument)
-}
-
-fn with_komet_commands(
-    mut commands: Vec<SlashCommand>,
-    prompts: impl IntoIterator<Item = (String, Option<String>)>,
-    harness: HarnessId,
-) -> Vec<SlashCommand> {
-    for (name, description, input_hint) in [
-        ("new", "Open a new chat", None),
-        ("worktree", "Choose a checkout or worktree", None),
-        ("prompt", "Insert a saved prompt", Some("[name]")),
-        ("attach", "Attach files", None),
-        ("model", "Choose the chat model", Some("[name]")),
-        ("sandbox", "Change access mode", Some("[level]")),
-    ] {
-        if !commands.iter().any(|command| command.name == name) {
-            commands.push(SlashCommand {
-                name: name.into(),
-                description: format!("Komet · {description}"),
-                input_hint: input_hint.map(str::to_owned),
-                source: CommandSource::Custom,
-                ..SlashCommand::default()
-            });
-        }
-    }
-    for (prompt_name, prompt_harness) in prompts {
-        if let Some(tag) = prompt_harness
-            && !tag.eq_ignore_ascii_case(crate::settings::harnesses::cli_name(harness))
-        {
-            continue;
-        }
-        let name = format!("prompt {prompt_name}");
-        if !commands.iter().any(|command| command.name == name) {
-            commands.push(SlashCommand {
-                name,
-                description: "Komet · Insert saved prompt".into(),
-                input_hint: None,
-                source: CommandSource::Custom,
-                ..SlashCommand::default()
-            });
-        }
-    }
-    commands
-}
-
-/// Cache key for advertised commands: harness + the chat project's cwd.
-type SlashCacheKey = (HarnessId, Option<String>);
-
 /// Slash-command completion state: like [`FileMentionState`] but the
-/// candidate list is fetched once per harness + project (`ListCommands`) and
-/// filtered locally per keystroke — no RPC, debounce, or skeleton churn while
-/// typing.
+/// candidate list is fetched once per harness (`ListCommands`) and filtered
+/// locally per keystroke — no RPC, debounce, or skeleton churn while typing.
 #[derive(Debug, Clone, Default)]
 struct SlashState {
     token: Option<MentionToken>,
     /// Indices into the cached command list, filter-ranked for the query.
     filtered: Vec<usize>,
     active: Option<usize>,
-    /// Harness + cwd the popup is showing commands for (cache key).
-    key: Option<SlashCacheKey>,
+    /// Harness the popup is showing commands for (cache key).
+    harness: Option<HarnessId>,
     request: u64,
     loading: bool,
     error: Option<SharedString>,
@@ -3659,24 +3542,13 @@ fn slash_error_message(err: &RpcError) -> SharedString {
     }
 }
 
-/// A prompt held in the local UI queue while an agent turn is live.
-/// Drained automatically when the session transitions to Completed/Aborted.
-#[derive(Clone)]
-struct QueuedPrompt {
-    text: String,
-    steer: bool,
-    staged: Vec<StagedAttachment>,
-}
-
 pub struct Composer {
     state: Entity<AppState>,
     input: Entity<ComposerInput>,
-    /// Picker controls for the selected chat; on the new-session canvas, the
-    /// shell moves draft controls above the prompt with the target selectors.
+    /// Composer actions row: repo/branch/harness-model/traits (§1.7).
+    /// Shared with the shell's new-session canvas, which renders the
+    /// device/project target selectors ([`Pickers::render_target_selectors`]).
     pickers: Entity<Pickers>,
-    /// Draft checkout controls move above the composer on the home canvas;
-    /// agent/model controls remain in the composer action row.
-    home_canvas: bool,
     /// Draft text per chat key ("" = new-chat canvas), surviving navigation.
     drafts: HashMap<String, String>,
     /// Last user prompt sent as a full turn (steers excluded): the error
@@ -3695,16 +3567,15 @@ pub struct Composer {
     preview_focus_pending: bool,
     /// In-flight file-picker prompt (paperclip).
     picker_task: Option<Task<()>>,
-    attach_menu_open: bool,
     mention_task: Option<Task<()>>,
     mention_scroll: gpui::ScrollHandle,
     mention: FileMentionState,
     slash_task: Option<Task<()>>,
     slash_scroll: gpui::ScrollHandle,
     slash: SlashState,
-    /// Advertised commands per harness + project cwd (one `ListCommands` per
-    /// key per composer lifetime; the engine caches discovery on its side).
-    slash_cache: HashMap<SlashCacheKey, Vec<SlashCommand>>,
+    /// Advertised commands per harness (one `ListCommands` per harness per
+    /// composer lifetime; the engine caches discovery on its side too).
+    slash_cache: HashMap<HarnessId, Vec<SlashCommand>>,
     current_key: String,
     sending: bool,
     failure: Option<SharedString>,
@@ -3749,10 +3620,6 @@ pub struct Composer {
     /// Clears a stale arming hint once its 3-second stop window lapses
     /// (while the run stays live the hint must not linger forever).
     escape_hint_task: Option<Task<()>>,
-    /// Local UI prompt queue: prompts captured while a session turn is live.
-    /// Drained in FIFO order as soon as the session becomes idle again.
-    /// Cleared when navigating to a different chat.
-    prompt_queue: VecDeque<QueuedPrompt>,
     _observe: Subscription,
     _pickers_observe: Subscription,
     _input_events: Subscription,
@@ -3770,14 +3637,6 @@ fn next_access(level: komet_proto::SandboxLevel) -> komet_proto::SandboxLevel {
 }
 
 impl Composer {
-    /// Keep draft checkout controls above the composer on the home canvas.
-    pub fn set_home_canvas(&mut self, visible: bool, cx: &mut Context<Self>) {
-        if self.home_canvas != visible {
-            self.home_canvas = visible;
-            cx.notify();
-        }
-    }
-
     /// Advance the access chip. In an existing chat the new level is saved to
     /// that chat, so it reopens at this level on every device. On the new-chat
     /// screen it applies to the draft only and leaves the Security default as is.
@@ -3889,7 +3748,7 @@ impl Composer {
                     .collect();
                 this.add_staged(staged, cx);
             }
-            ComposerInputEvent::PastedPaths(paths) => this.add_paths(paths.clone(), true, cx),
+            ComposerInputEvent::PastedPaths(paths) => this.add_paths(paths.clone(), cx),
             ComposerInputEvent::Cancelled => {}
         });
         let current_key = state.read(cx).selected_chat.clone().unwrap_or_default();
@@ -3897,7 +3756,6 @@ impl Composer {
             state,
             input,
             pickers,
-            home_canvas: false,
             drafts: HashMap::new(),
             last_sent: None,
             attachments: HashMap::new(),
@@ -3905,7 +3763,6 @@ impl Composer {
             preview_focus: cx.focus_handle(),
             preview_focus_pending: false,
             picker_task: None,
-            attach_menu_open: false,
             mention_task: None,
             mention_scroll: gpui::ScrollHandle::new(),
             mention: FileMentionState::default(),
@@ -3935,7 +3792,6 @@ impl Composer {
             route_snap_until: None,
             escape_stop_armed_at: None,
             escape_hint_task: None,
-            prompt_queue: VecDeque::new(),
             _observe: observe,
             _pickers_observe: pickers_observe,
             _input_events: input_events,
@@ -3960,11 +3816,10 @@ impl Composer {
                 .collect();
             if std::env::var("KOMET_ATTACH_PREVIEW").is_ok_and(|v| v == "1")
                 && let Some(first) = staged.first()
-                && let Some(image) = first.image.as_ref()
             {
                 composer.preview = Some(attachments::PreviewImage {
                     name: first.name.clone().into(),
-                    image: image.clone(),
+                    image: first.image.clone(),
                 });
                 composer.preview_focus_pending = true;
             }
@@ -4011,24 +3866,16 @@ impl Composer {
         cx.notify();
     }
 
-    /// Stage files selected by the image-only or generic-file picker.
-    pub(crate) fn add_paths(
-        &mut self,
-        paths: Vec<PathBuf>,
-        images_only: bool,
-        cx: &mut Context<Self>,
-    ) {
+    /// Stage image files (picker / drop / pasted paths). Non-images are
+    /// skipped silently (matching the original's `image/*` filter); read
+    /// failures and oversize files surface in the failure notice.
+    pub(crate) fn add_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
         let mut staged = Vec::new();
         for path in &paths {
-            if images_only && attachments::format_by_extension(path).is_none() {
+            if attachments::format_by_extension(path).is_none() {
                 continue;
             }
-            let result = if images_only {
-                attachments::stage_file(path)
-            } else {
-                attachments::stage_any_file(path)
-            };
-            match result {
+            match attachments::stage_file(path) {
                 Ok(att) => staged.push(att),
                 Err(message) => {
                     self.failure = Some(message.into());
@@ -4077,7 +3924,9 @@ impl Composer {
         self.attachments.remove(chat_id);
     }
 
-    /// Staged files share the same strip; only image entries open a preview.
+    /// The staged-thumbnail strip (attachment-ui.tsx AttachmentStrip):
+    /// `flex flex-wrap gap-2 px-4 pt-3`, 56px rounded thumbs, a remove button
+    /// revealed on hover, click opens the full-size preview.
     fn render_attachment_strip(&self, theme: &Theme, cx: &mut Context<Self>) -> Option<gpui::Div> {
         let staged = self.staged();
         if staged.is_empty() {
@@ -4092,67 +3941,45 @@ impl Composer {
             .pt(px(STRIP_PAD_TOP));
         for (ix, att) in staged.iter().enumerate() {
             let group: SharedString = format!("composer-att-{}", att.id).into();
-            let remove_id = att.id.clone();
-            let body: gpui::AnyElement = if let Some(image) = att.image.as_ref() {
-                let preview = attachments::PreviewImage {
-                    name: att.name.clone().into(),
-                    image: image.clone(),
-                };
-                div()
-                    .id(("composer-att-thumb", ix))
-                    .size(px(STRIP_THUMB))
-                    .rounded(px(8.0))
-                    .overflow_hidden()
-                    .border_1()
-                    .border_color(crate::theme::hairline(0.10))
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.preview = Some(preview.clone());
-                        this.preview_focus_pending = true;
-                        cx.notify();
-                    }))
-                    .child(
-                        img(image.clone())
-                            .w(px(STRIP_THUMB - 2.0))
-                            .h(px(STRIP_THUMB - 2.0))
-                            .rounded(px(7.0))
-                            .object_fit(ObjectFit::Cover),
-                    )
-                    .into_any_element()
-            } else {
-                div()
-                    .id(("composer-att-thumb", ix))
-                    .size(px(STRIP_THUMB))
-                    .rounded(px(8.0))
-                    .overflow_hidden()
-                    .border_1()
-                    .border_color(crate::theme::hairline(0.10))
-                    .bg(crate::theme::ink(0.035))
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .justify_center()
-                    .gap(px(4.0))
-                    .child(
-                        crate::icons::icon(crate::icons::PAPERCLIP)
-                            .size(px(18.0))
-                            .text_color(theme.text_muted),
-                    )
-                    .child(
-                        div()
-                            .px(px(4.0))
-                            .text_size(px(9.0))
-                            .text_color(theme.text_muted)
-                            .overflow_hidden()
-                            .child(SharedString::from(att.name.clone())),
-                    )
-                    .into_any_element()
+            let preview = attachments::PreviewImage {
+                name: att.name.clone().into(),
+                image: att.image.clone(),
             };
+            let remove_id = att.id.clone();
             strip = strip.child(
                 div()
                     .group(group.clone())
                     .relative()
-                    .child(body)
+                    .child(
+                        div()
+                            .id(("composer-att-thumb", ix))
+                            .size(px(STRIP_THUMB))
+                            .rounded(px(8.0))
+                            .overflow_hidden()
+                            .border_1()
+                            .border_color(crate::theme::hairline(0.10))
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.preview = Some(preview.clone());
+                                this.preview_focus_pending = true;
+                                cx.notify();
+                            }))
+                            .child(
+                                img(att.image.clone())
+                                    // EXPLICIT dims, not size_full: img layout
+                                    // honors the image's intrinsic aspect
+                                    // ratio over a percent height, so size_full let a
+                                    // tall photo grow past the frame — the
+                                    // rectangular overflow clip then squared
+                                    // the bottom corners.
+                                    .w(px(STRIP_THUMB - 2.0))
+                                    .h(px(STRIP_THUMB - 2.0))
+                                    // Own radii — the frame's rounding only
+                                    // clips rectangularly (7 = 8 - border).
+                                    .rounded(px(7.0))
+                                    .object_fit(ObjectFit::Cover),
+                            ),
+                    )
                     // Own layer: inside the frosted pill everything shares one
                     // draw order and images render last, so without it the
                     // thumbnail paints OVER this button (user report).
@@ -4190,43 +4017,19 @@ impl Composer {
         Some(strip)
     }
 
-    /// Open the native picker for images or arbitrary file attachments.
-    fn open_file_picker(&mut self, images_only: bool, cx: &mut Context<Self>) {
-        let attachment_kind = if images_only { "image" } else { "file" };
+    /// Paperclip: the native image picker (the original's hidden
+    /// `<input type=file accept=image/* multiple>`).
+    fn open_file_picker(&mut self, cx: &mut Context<Self>) {
         let rx = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
             multiple: true,
-            prompt: Some(format!("Attach {attachment_kind}").into()),
+            prompt: Some("Attach".into()),
         });
-        self.picker_task = Some(cx.spawn(async move |this, cx| match rx.await {
-            Ok(Ok(Some(paths))) => {
-                if let Err(err) =
-                    this.update(cx, |composer, cx| composer.add_paths(paths, images_only, cx))
-                {
-                    tracing::debug!(error = %err, "composer closed while attaching files");
-                }
-            }
-            Ok(Ok(None)) => {}
-            Ok(Err(err)) => {
-                let message = format!("Could not open {attachment_kind} picker: {err}");
-                tracing::warn!(error = %message, "attachment picker failed");
-                if let Err(err) = this.update(cx, |composer, cx| {
-                    composer.failure = Some(message.into());
-                    cx.notify();
-                }) {
-                    tracing::debug!(error = %err, "composer closed after attachment picker failure");
-                }
-            }
-            Err(err) => {
-                let message = format!("{attachment_kind} picker was interrupted: {err}");
-                tracing::warn!(error = %message, "attachment picker interrupted");
-                if let Err(err) = this.update(cx, |composer, cx| {
-                    composer.failure = Some(message.into());
-                    cx.notify();
-                }) {
-                    tracing::debug!(error = %err, "composer closed after attachment picker interruption");
-                }
+        self.picker_task = Some(cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = rx.await {
+                this.update(cx, |composer, cx| composer.add_paths(paths, cx))
+                    .ok();
             }
         }));
     }
@@ -4562,25 +4365,14 @@ impl Composer {
 
     // ---- slash commands ---------------------------------------------------
 
-    /// The cache key for the active project: resolved harness + selected
-    /// chat's configured cwd (None when no chat is selected).
-    fn slash_cache_key(&self, cx: &mut Context<Self>) -> Option<SlashCacheKey> {
-        let harness = self.pickers.read(cx).resolved(cx).harness?;
-        let cwd = self
-            .state
-            .read(cx)
-            .selected_chat_row()
-            .and_then(|chat| chat.cwd.clone());
-        Some((harness, cwd))
-    }
-
     /// Eagerly prefetch slash commands for the active harness so that typing `/`
     /// opens immediately without delay.
     fn prefetch_slash_commands(&mut self, cx: &mut Context<Self>) {
-        let Some(key) = self.slash_cache_key(cx) else {
+        let harness = self.pickers.read(cx).resolved(cx).harness;
+        let Some(harness) = harness else {
             return;
         };
-        if self.slash_cache.contains_key(&key) || self.slash_task.is_some() {
+        if self.slash_cache.contains_key(&harness) || self.slash_task.is_some() {
             return;
         }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
@@ -4593,31 +4385,11 @@ impl Composer {
                 .map(|chat| chat.device_id.clone())
                 .or_else(|| state.selected_space_row().map(|s| s.device_id.clone()))
         };
-        let prompts = self
-            .state
-            .read(cx)
-            .data_dir
-            .as_deref()
-            .map(crate::settings::prompts::PromptLibrary::load)
-            .map(|library| {
-                library
-                    .prompts
-                    .into_iter()
-                    .map(|prompt| (prompt.name, prompt.harness))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        let (harness, cwd) = key.clone();
         let request = self.slash.request;
         self.slash_task = Some(cx.spawn(async move |this, cx| {
             let mut params = serde_json::json!({ "harness": harness });
-            if let Some(object) = params.as_object_mut() {
-                if let Some(target) = &target {
-                    object.insert("targetDeviceId".into(), target.clone().into());
-                }
-                if let Some(cwd) = &cwd {
-                    object.insert("cwd".into(), cwd.clone().into());
-                }
+            if let (Some(target), Some(object)) = (&target, params.as_object_mut()) {
+                object.insert("targetDeviceId".into(), target.clone().into());
             }
             let result = engine.client().call(methods::LIST_COMMANDS, params).await;
             this.update(cx, |composer, cx| {
@@ -4629,26 +4401,17 @@ impl Composer {
                 match result {
                     Ok(value) => match serde_json::from_value::<Vec<SlashCommand>>(value) {
                         Ok(commands) => {
-                            composer
-                                .slash_cache
-                                .insert(key, with_komet_commands(commands, prompts, harness));
+                            composer.slash_cache.insert(harness, commands);
                         }
                         Err(err) => {
                             tracing::warn!(%err, "slash command decode failed");
-                            composer.slash_cache.entry(key).or_default();
+                            composer.slash_cache.entry(harness).or_default();
                         }
                     },
                     Err(err) => {
                         tracing::debug!(%err, "slash command discovery failed");
-                        composer.slash_cache.entry(key).or_default();
+                        composer.slash_cache.entry(harness).or_default();
                     }
-                }
-                // The user may have switched projects while this probe ran;
-                // fetch the new key instead of leaving its popup empty.
-                if composer.slash.key.is_some()
-                    && composer.slash.key != composer.slash_cache_key(cx)
-                {
-                    composer.prefetch_slash_commands(cx);
                 }
                 if composer.slash.token.is_some() {
                     composer.refilter_slash(cx);
@@ -4673,14 +4436,14 @@ impl Composer {
             return;
         }
         self.slash.dismissed = None;
-        let key = self.slash_cache_key(cx);
-        let key_changed = self.slash.key != key;
-        if token == self.slash.token && !key_changed {
+        let harness = self.pickers.read(cx).resolved(cx).harness;
+        let harness_changed = self.slash.harness != harness;
+        if token == self.slash.token && !harness_changed {
             self.refilter_slash(cx);
             return;
         }
         self.slash.token = token.clone();
-        self.slash.key = key;
+        self.slash.harness = harness;
         self.slash.error = None;
         if token.is_none() {
             self.slash.active = None;
@@ -4688,12 +4451,12 @@ impl Composer {
             return;
         }
         // No resolved harness (catalog still loading): empty popup, no fetch.
-        let Some(key) = self.slash.key.clone() else {
+        let Some(harness) = harness else {
             self.slash.loading = false;
             self.refilter_slash(cx);
             return;
         };
-        if self.slash_cache.contains_key(&key) {
+        if self.slash_cache.contains_key(&harness) {
             self.slash.loading = false;
             self.refilter_slash(cx);
             return;
@@ -4716,9 +4479,8 @@ impl Composer {
             .unwrap_or_default();
         let commands = self
             .slash
-            .key
-            .as_ref()
-            .and_then(|key| self.slash_cache.get(key))
+            .harness
+            .and_then(|h| self.slash_cache.get(&h))
             .map(Vec::as_slice)
             .unwrap_or_default();
         let names: Vec<&str> = commands.iter().map(|c| c.name.as_str()).collect();
@@ -4760,9 +4522,8 @@ impl Composer {
             .and_then(|active| self.slash.filtered.get(active))
             .and_then(|&ix| {
                 self.slash
-                    .key
-                    .as_ref()
-                    .and_then(|key| self.slash_cache.get(key))
+                    .harness
+                    .and_then(|h| self.slash_cache.get(&h))
                     .and_then(|c| c.get(ix))
             })
             .cloned()
@@ -4783,7 +4544,7 @@ impl Composer {
         self.slash = SlashState {
             request,
             dismissed,
-            key: self.slash.key.clone(),
+            harness: self.slash.harness,
             ..SlashState::default()
         };
         self.sync_mention_controls(cx);
@@ -4797,9 +4558,8 @@ impl Composer {
         let token = self.slash.token.as_ref()?;
         let commands = self
             .slash
-            .key
-            .as_ref()
-            .and_then(|key| self.slash_cache.get(key))
+            .harness
+            .and_then(|h| self.slash_cache.get(&h))
             .map(Vec::as_slice)
             .unwrap_or_default();
         let mut card = crate::popover::popover_card(theme)
@@ -4838,21 +4598,6 @@ impl Composer {
                     }),
             );
         } else {
-            let offline = commands.iter().any(|c| c.source != CommandSource::Custom)
-                && commands
-                    .iter()
-                    .filter(|c| c.source != CommandSource::Custom)
-                    .all(|c| c.source == CommandSource::Fallback);
-            if offline {
-                card = card.child(
-                    div()
-                        .px(px(12.0))
-                        .py(px(6.0))
-                        .text_size(px(11.0))
-                        .text_color(theme.text_muted)
-                        .child("Offline list · live discovery unavailable"),
-                );
-            }
             let mut list = div()
                 .id("slash-popup-scroll")
                 .size_full()
@@ -4877,50 +4622,6 @@ impl Composer {
                     }
                 }
                 let description: SharedString = description.into();
-                let mut row = div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(8.0))
-                    .child(
-                        crate::icons::icon(crate::icons::COMMAND)
-                            .size(px(14.0))
-                            .text_color(theme.text_muted),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(px(12.5))
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(theme.text)
-                            .child(name),
-                    );
-                if command.source != CommandSource::Native {
-                    let label = match command.source {
-                        CommandSource::Skill => "skill",
-                        CommandSource::Custom => "custom",
-                        CommandSource::Fallback => "offline",
-                        CommandSource::Native => unreachable!(),
-                    };
-                    row = row.child(
-                        div()
-                            .flex_none()
-                            .text_size(px(10.0))
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(theme.text_muted.opacity(0.6))
-                            .child(SharedString::from(label)),
-                    );
-                }
-                row = row.child(
-                    div()
-                        .min_w_0()
-                        .flex_1()
-                        .overflow_hidden()
-                        .truncate()
-                        .text_size(px(12.0))
-                        .text_color(theme.text_muted)
-                        .child(description),
-                );
                 list = list.child(
                     crate::popover::menu_row(theme, selected, format!("slash-result-{row_ix}"))
                         .id(("slash-result", row_ix))
@@ -4928,7 +4629,36 @@ impl Composer {
                             this.slash.active = Some(row_ix);
                             this.accept_slash(cx);
                         }))
-                        .child(row),
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(8.0))
+                                .child(
+                                    crate::icons::icon(crate::icons::COMMAND)
+                                        .size(px(14.0))
+                                        .text_color(theme.text_muted),
+                                )
+                                .child(
+                                    div()
+                                        .flex_none()
+                                        .text_size(px(12.5))
+                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                        .text_color(theme.text)
+                                        .child(name),
+                                )
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .overflow_hidden()
+                                        .truncate()
+                                        .text_size(px(12.0))
+                                        .text_color(theme.text_muted)
+                                        .child(description),
+                                ),
+                        ),
                 );
             }
             card = card.child(list);
@@ -4966,14 +4696,10 @@ impl Composer {
             self.current_key = key;
             self.failure = None;
             self.wizard = None;
-            // Discard any queued prompts for the old chat — they were meant for
-            // that session's context and would be confusing on a different chat.
-            self.prompt_queue.clear();
             // Attachments stay stashed under their chat key (the map swap IS
             // the navigation); only the transient chrome resets.
             self.preview = None;
             self.reset_mention(None, cx);
-
             // Route changes snap (round 5/6): a mode difference between the
             // old and new session's composer must not glide across
             // navigation. Killing the in-flight morph here isn't enough —
@@ -5062,12 +4788,6 @@ impl Composer {
                 }
             }
         }
-        // Prompt-queue drain: when the session becomes idle and there are
-        // queued prompts, pop and send the next one automatically.
-        if !self.run_live(cx) && !self.prompt_queue.is_empty() {
-            self.drain_prompt_queue(cx);
-            return; // drain_prompt_queue → send() → cx.notify() already called
-        }
         cx.notify();
     }
 
@@ -5095,15 +4815,7 @@ impl Composer {
         // A staged image counts as content: image-only sends are legal
         // (the prompt body becomes "See the attached image(s).").
         let has_text = !self.input.read(cx).text().trim().is_empty() || !self.staged().is_empty();
-        // `can_steer` = agent supports mid-turn injection (StepBoundary). When
-        // the agent only supports TurnBoundary steering (or no steering at all),
-        // we use the Queue mode so the prompt waits locally for the turn to finish.
-        let can_steer = self.run_live(cx)
-            && matches!(
-                self.pickers.read(cx).resolved_steering_mode(cx),
-                Some(komet_proto::SteeringMode::StepBoundary)
-            );
-        send_button_mode(self.run_live(cx), has_text, can_steer)
+        send_button_mode(self.run_live(cx), has_text)
     }
 
     fn on_submit(&mut self, cx: &mut Context<Self>) {
@@ -5117,152 +4829,12 @@ impl Composer {
             return;
         }
         let text = self.input.read(cx).text().trim().to_string();
-        if self.handle_komet_command(&text, cx) {
-            return;
-        }
         match self.button_mode(cx) {
             SendButtonMode::Stop => self.interrupt(cx),
             _ if text.is_empty() && self.staged().is_empty() => {}
             _ if self.send_blocked(cx) => {}
-            SendButtonMode::Queue => self.enqueue_prompt(text, false, cx),
             SendButtonMode::Send => self.send(text, false, cx),
             SendButtonMode::Steer => self.send(text, true, cx),
-        }
-    }
-
-    /// Execute the Komet-owned commands that have a safe local equivalent.
-    /// Commands needing a picker remain ordinary text until their picker is
-    /// wired to the surrounding shell; they never block sending.
-    fn handle_komet_command(&mut self, text: &str, cx: &mut Context<Self>) -> bool {
-        let Some((command, argument)) = parse_komet_command(text) else {
-            return false;
-        };
-        match command {
-            "new" => {
-                self.state
-                    .update(cx, |state, cx| state.select_chat(None, cx));
-                self.input.update(cx, |input, cx| input.set_text("", cx));
-                true
-            }
-            "worktree" => {
-                self.pickers
-                    .update(cx, |pickers, cx| pickers.select_new_worktree(cx));
-                self.input.update(cx, |input, cx| input.set_text("", cx));
-                true
-            }
-            "attach" => {
-                self.input.update(cx, |input, cx| input.set_text("", cx));
-                self.open_file_picker(false, cx);
-                true
-            }
-            "sandbox" => {
-                if let Some(argument) = argument {
-                    let Some(level) = parse_sandbox_level(Some(argument)) else {
-                        return false;
-                    };
-                    self.state.update(cx, |state, cx| {
-                        state.set_access_mode(level);
-                        cx.notify();
-                    });
-                } else {
-                    self.cycle_access_mode(cx);
-                }
-                self.input.update(cx, |input, cx| input.set_text("", cx));
-                true
-            }
-            "prompt" => {
-                let Some(argument) = argument else {
-                    return false;
-                };
-                let Some(data_dir) = self.state.read(cx).data_dir.clone() else {
-                    return false;
-                };
-                let mut library = crate::settings::prompts::PromptLibrary::load(&data_dir);
-                match parse_prompt_action(argument) {
-                    PromptAction::Insert(name) => {
-                        let Some(prompt) = library.find(name) else {
-                            return false;
-                        };
-                        self.input
-                            .update(cx, |input, cx| input.set_text(&prompt.body, cx));
-                    }
-                    PromptAction::Save {
-                        name,
-                        harness,
-                        body,
-                    } => {
-                        library.upsert(crate::settings::prompts::PromptSnippet {
-                            name: name.into(),
-                            body: body.into(),
-                            harness: harness.map(str::to_owned),
-                        });
-                        if let Err(err) = library.save(&data_dir) {
-                            tracing::warn!(%err, "prompt library save failed");
-                        }
-                        self.input.update(cx, |input, cx| input.set_text("", cx));
-                    }
-                    PromptAction::Delete(name) => {
-                        if library.delete(name)
-                            && let Err(err) = library.save(&data_dir)
-                        {
-                            tracing::warn!(%err, "prompt library save failed");
-                        }
-                        self.input.update(cx, |input, cx| input.set_text("", cx));
-                    }
-                }
-                true
-            }
-            "model" => {
-                let Some(query) = argument else {
-                    return false;
-                };
-                let selected = self
-                    .pickers
-                    .update(cx, |pickers, cx| pickers.select_model_query(query, cx));
-                if selected {
-                    self.input.update(cx, |input, cx| input.set_text("", cx));
-                }
-                selected
-            }
-            _ => false,
-        }
-    }
-
-    /// Push a prompt onto the local queue while a turn is live. The input and
-    /// staged attachments are cleared immediately (same as a real send), and the
-    /// bandeau « N queued » appears. The queue drains automatically when the
-    /// session becomes idle.
-    fn enqueue_prompt(&mut self, text: String, steer: bool, cx: &mut Context<Self>) {
-        // Snapshot staged attachments for this queued item.
-        let staged = self
-            .attachments
-            .remove(&self.current_key)
-            .unwrap_or_default();
-        self.preview = None;
-        self.prompt_queue.push_back(QueuedPrompt {
-            text,
-            steer,
-            staged,
-        });
-        // Clear the input right away, exactly like a real send.
-        self.input.update(cx, |input, cx| input.set_text("", cx));
-        self.drafts.remove(&self.current_key);
-        self.failure = None;
-        cx.notify();
-    }
-
-    /// Pop the front queued prompt and send it. Called from `on_state_changed`
-    /// when the session transitions to idle (no live run).
-    fn drain_prompt_queue(&mut self, cx: &mut Context<Self>) {
-        if let Some(item) = self.prompt_queue.pop_front() {
-            // Restore staged attachments for this item so `send()` picks them up.
-            if !item.staged.is_empty() {
-                self.attachments
-                    .entry(self.current_key.clone())
-                    .or_default()
-                    .extend(item.staged);
-            }
-            self.send(item.text, item.steer, cx);
         }
     }
 
@@ -5357,16 +4929,13 @@ impl Composer {
             .collect();
         let echo_text = attachments::with_attachments(&text, &echo_paths);
         for (path, att) in echo_paths.iter().zip(&staged) {
-            if let Some(image) = att.image.as_ref() {
-                attachments::seed_attachment(&device_id, path, &att.name, image.clone());
-                attachments::seed_attachment_alias(&device_id, &att.id, &att.name, image.clone());
-            }
+            attachments::seed_attachment(&device_id, path, &att.name, att.image.clone());
+            attachments::seed_attachment_alias(&device_id, &att.id, &att.name, att.image.clone());
             if let Some(local) = local_device_id.as_deref()
                 && local != device_id
-                && let Some(image) = att.image.as_ref()
             {
-                attachments::seed_attachment(local, path, &att.name, image.clone());
-                attachments::seed_attachment_alias(local, &att.id, &att.name, image.clone());
+                attachments::seed_attachment(local, path, &att.name, att.image.clone());
+                attachments::seed_attachment_alias(local, &att.id, &att.name, att.image.clone());
             }
         }
 
@@ -5475,11 +5044,9 @@ impl Composer {
                     // Attachment in the original send path).
                     let seed_device = host_device_id.clone().unwrap_or_else(|| device_id.clone());
                     for (path, att) in attachment_paths.iter().zip(&staged) {
-                        if let Some(image) = att.image.as_ref() {
-                            attachments::seed_attachment(&seed_device, path, &att.name, image.clone());
-                            if seed_device != device_id {
-                                attachments::seed_attachment(&device_id, path, &att.name, image.clone());
-                            }
+                        attachments::seed_attachment(&seed_device, path, &att.name, att.image.clone());
+                        if seed_device != device_id {
+                            attachments::seed_attachment(&device_id, path, &att.name, att.image.clone());
                         }
                     }
                     content = attachments::with_attachments(&text, &attachment_paths);
@@ -6786,7 +6353,7 @@ impl Composer {
                 .on_click(cx.listener(|this, _, _, cx| this.interrupt(cx)))
                 .child(div().size(px(11.0)).rounded(px(3.0)).bg(theme.bg))
                 .into_any_element(),
-            SendButtonMode::Send | SendButtonMode::Steer | SendButtonMode::Queue => {
+            SendButtonMode::Send | SendButtonMode::Steer => {
                 // Dimmed and inert while no project is picked (`send_blocked`
                 // also gates `on_submit`, so Enter is a no-op too).
                 let blocked = self.send_blocked(cx);
@@ -7027,7 +6594,6 @@ impl Render for Composer {
                     .child("This agent can't be steered mid-turn — your message will be queued and sent when the current turn finishes."),
             )
         });
-
         // First Escape while a run is live only arms a 3s stop window; say so
         // explicitly so the second press (which actually stops) isn't a
         // surprise — without this the first press read as a dead key.
@@ -7095,9 +6661,13 @@ impl Render for Composer {
         self.last_rendered_height = pill_height;
 
         let send_button = self.render_send_button(mode, cx);
-        // The plus button offers separate image and generic-file pickers.
-        let mut attach = div()
+        // Attach button — opens the native image picker (the original's hidden
+        // `<input type=file accept="image/*" multiple>`); paste/drop also feed
+        // the same strip. `ml-1` per the source cluster — chips→attach reads
+        // 8px (4 gap + 4 margin) in BOTH modes.
+        let attach = div()
             .id("composer-attach")
+            .ml(px(4.0))
             .size(px(28.0))
             .flex_none()
             .flex()
@@ -7112,57 +6682,12 @@ impl Render for Composer {
                 crate::theme::ink(0.10),
             ))
             .on_hover(motion::hover_listener("composer-attach"))
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.attach_menu_open = !this.attach_menu_open;
-                cx.notify();
-            }))
+            .on_click(cx.listener(|this, _, _, cx| this.open_file_picker(cx)))
             .child(
-                crate::icons::icon(crate::icons::PLUS)
+                crate::icons::icon(crate::icons::PAPERCLIP)
                     .size(px(16.0))
                     .text_color(theme.text_muted),
             );
-        if self.attach_menu_open {
-            let image_row = crate::popover::menu_row(&theme, false, "composer-attach-image")
-                .id("composer-attach-image")
-                .on_click(cx.listener(|this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.attach_menu_open = false;
-                    this.open_file_picker(true, cx);
-                    cx.notify();
-                }))
-                .child(
-                    crate::icons::icon(crate::icons::IMAGE)
-                        .size(px(16.0))
-                        .text_color(theme.text_muted),
-                )
-                .child(SharedString::from("Image"));
-            let file_row = crate::popover::menu_row(&theme, false, "composer-attach-file")
-                .id("composer-attach-file")
-                .on_click(cx.listener(|this, _, _, cx| {
-                    cx.stop_propagation();
-                    this.attach_menu_open = false;
-                    this.open_file_picker(false, cx);
-                    cx.notify();
-                }))
-                .child(
-                    crate::icons::icon(crate::icons::PAPERCLIP)
-                        .size(px(16.0))
-                        .text_color(theme.text_muted),
-                )
-                .child(SharedString::from("File"));
-            let menu = div()
-                .w(px(170.0))
-                .flex()
-                .flex_col()
-                .child(image_row)
-                .child(file_row)
-                .into_any_element();
-            attach = attach.child(crate::popover::anchored_menu_above(
-                "composer-attach-menu",
-                menu,
-                None,
-            ));
-        }
         // Staged-thumbnail strip (attachment-ui.tsx AttachmentStrip), above
         // the input inside the pill in both modes.
         let strip = self.render_attachment_strip(&theme, cx);
@@ -7233,7 +6758,7 @@ impl Render for Composer {
                         .pr(px(morph_cluster_inset(true, morph_t)))
                         .pt(px(4.0))
                         .pb(px(10.0))
-                        .child(attach)
+                        .child(div().flex_1().min_w_0().child(self.pickers.clone()))
                         .child(
                             div()
                                 .id("composer-access-mode")
@@ -7250,7 +6775,7 @@ impl Render for Composer {
                                     komet_proto::SandboxLevel::WorkspaceWrite => "Sandboxed",
                                 }),
                         )
-                        .child(div().flex_1().min_w_0().child(self.pickers.clone()))
+                        .child(attach)
                         .child(send_button),
                 )
         } else {
@@ -7291,7 +6816,6 @@ impl Render for Composer {
                         .child(
                             div()
                                 .flex_none()
-                                .when(self.home_canvas, |el| el.flex_1().min_w_0())
                                 .flex()
                                 .flex_row()
                                 .items_center()
@@ -7304,7 +6828,7 @@ impl Render for Composer {
                                 .pr(px(morph_cluster_inset(false, morph_t)))
                                 .relative()
                                 .top(px(-cluster_dy))
-                                .child(attach)
+                                .child(div().flex_none().child(self.pickers.clone()))
                                 .child(
                                     div()
                                         .id("composer-access-mode")
@@ -7325,8 +6849,7 @@ impl Render for Composer {
                                             }
                                         }),
                                 )
-                                .when(self.home_canvas, |el| el.child(div().flex_1().min_w_0()))
-                                .child(div().flex_none().child(self.pickers.clone()))
+                                .child(attach)
                                 .child(send_button),
                         ),
                 )
@@ -7336,20 +6859,17 @@ impl Render for Composer {
         // via `add_paths`.
         // Frosted: the pill backdrop-blurs the transcript scrolling under it
         // (the popover glass treatment; radius matches the pill's rounding).
-        let input_surface =
-            crate::frost::frosted(26.0, 16.0, motion::fade_quick("composer-input", body));
-        // Queueing remains an internal delivery detail. The composer itself
-        // stays focused on the current draft, without a queue panel.
-        let container = container.child(input_surface);
+        let container = container.child(crate::frost::frosted(
+            26.0,
+            16.0,
+            motion::fade_quick("composer-input", body),
+        ));
         // Branch/worktree toolbar under the pill (t3code BranchToolbar): the
         // checkout-kind selector + ref picker for new sessions, read-only
         // labels once the session exists. Git spaces only.
-        let footer = (!self.home_canvas)
-            .then(|| {
-                self.pickers
-                    .update(cx, |pickers, cx| pickers.render_footer(cx))
-            })
-            .flatten();
+        let footer = self
+            .pickers
+            .update(cx, |pickers, cx| pickers.render_footer(cx));
         let container = match footer {
             Some(footer) => container.child(footer),
             None => container,
@@ -7518,122 +7038,6 @@ mod tests {
         // Bare "/" with cursor at 0 → closed; cursor after it → open-all.
         assert!(slash_token("/", 0).is_none());
         assert_eq!(slash_token("/", 1).map(|t| t.query), Some(String::new()));
-    }
-
-    #[test]
-    fn komet_commands_are_strict_and_unknown_text_falls_through() {
-        assert_eq!(
-            parse_komet_command("/prompt review"),
-            Some(("prompt", Some("review")))
-        );
-        assert_eq!(parse_komet_command("/sandbox"), Some(("sandbox", None)));
-        assert!(parse_komet_command("/prompt review extra").is_some());
-        assert!(parse_komet_command("please /prompt review").is_none());
-        assert!(parse_komet_command("/unknown thing").is_none());
-    }
-
-    #[test]
-    fn sandbox_command_accepts_explicit_levels_only() {
-        assert_eq!(
-            parse_sandbox_level(Some("read-only")),
-            Some(komet_proto::SandboxLevel::ReadOnly)
-        );
-        assert_eq!(
-            parse_sandbox_level(Some("workspace-write")),
-            Some(komet_proto::SandboxLevel::WorkspaceWrite)
-        );
-        assert_eq!(
-            parse_sandbox_level(Some("yolo")),
-            Some(komet_proto::SandboxLevel::DangerFullAccess)
-        );
-        assert_eq!(parse_sandbox_level(Some("unknown")), None);
-        assert_eq!(parse_sandbox_level(None), None);
-    }
-
-    #[test]
-    fn komet_command_entries_are_executable_and_do_not_shadow_native() {
-        let native = vec![SlashCommand {
-            name: "model".into(),
-            description: "native".into(),
-            input_hint: None,
-            ..SlashCommand::default()
-        }];
-        let commands = with_komet_commands(
-            native,
-            [("review".to_string(), None)],
-            HarnessId::ClaudeCode,
-        );
-        assert_eq!(
-            commands
-                .iter()
-                .filter(|command| command.name == "model")
-                .count(),
-            1
-        );
-        for name in [
-            "new",
-            "worktree",
-            "prompt",
-            "attach",
-            "sandbox",
-            "prompt review",
-        ] {
-            assert!(
-                commands.iter().any(|command| command.name == name),
-                "missing {name}"
-            );
-        }
-    }
-
-    #[test]
-    fn prompt_actions_split_save_delete_and_insert() {
-        assert!(matches!(
-            parse_prompt_action("review"),
-            PromptAction::Insert("review")
-        ));
-        let PromptAction::Save {
-            name,
-            harness,
-            body,
-        } = parse_prompt_action("save review @claude = check the diff")
-        else {
-            panic!("save action expected");
-        };
-        assert_eq!(
-            (name, harness, body),
-            ("review", Some("claude"), "check the diff")
-        );
-        let PromptAction::Save { harness, .. } = parse_prompt_action("save review = body only")
-        else {
-            panic!("save action expected");
-        };
-        assert_eq!(harness, None);
-        // A malformed save falls back to insertion of the literal argument.
-        assert!(matches!(
-            parse_prompt_action("save review without equals"),
-            PromptAction::Insert(_)
-        ));
-        assert!(matches!(
-            parse_prompt_action("delete review"),
-            PromptAction::Delete("review")
-        ));
-    }
-
-    #[test]
-    fn prompt_entries_are_filtered_by_harness_tag() {
-        let commands = with_komet_commands(
-            Vec::new(),
-            [
-                ("everywhere".to_string(), None),
-                ("claude only".to_string(), Some("claude".to_string())),
-                ("codex only".to_string(), Some("codex".to_string())),
-            ],
-            HarnessId::ClaudeCode,
-        );
-        let names: Vec<&str> = commands.iter().map(|c| c.name.as_str()).collect();
-        assert!(names.contains(&"prompt everywhere"));
-        assert!(names.contains(&"prompt claude only"));
-        assert!(!names.contains(&"prompt codex only"));
     }
 
     #[test]
@@ -8091,18 +7495,10 @@ mod tests {
 
     #[test]
     fn send_button_morph() {
-        // Not live → always Send regardless of text or steer capability
-        assert_eq!(send_button_mode(false, false, false), SendButtonMode::Send);
-        assert_eq!(send_button_mode(false, false, true), SendButtonMode::Send);
-        assert_eq!(send_button_mode(false, true, false), SendButtonMode::Send);
-        assert_eq!(send_button_mode(false, true, true), SendButtonMode::Send);
-        // Live + steerable + text → Steer
-        assert_eq!(send_button_mode(true, true, true), SendButtonMode::Steer);
-        // Live + NOT steerable + text → Queue (local prompt queue)
-        assert_eq!(send_button_mode(true, true, false), SendButtonMode::Queue);
-        // Live + no text → Stop (regardless of steer capability)
-        assert_eq!(send_button_mode(true, false, true), SendButtonMode::Stop);
-        assert_eq!(send_button_mode(true, false, false), SendButtonMode::Stop);
+        assert_eq!(send_button_mode(false, false), SendButtonMode::Send);
+        assert_eq!(send_button_mode(false, true), SendButtonMode::Send);
+        assert_eq!(send_button_mode(true, true), SendButtonMode::Steer);
+        assert_eq!(send_button_mode(true, false), SendButtonMode::Stop);
     }
 
     #[test]

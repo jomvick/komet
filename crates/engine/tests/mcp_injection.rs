@@ -1,5 +1,5 @@
-//! Dispatch resolves assigned external MCP servers for harnesses with a
-//! dynamic injection path, keeping values out of durable chat state.
+//! Dispatch injects the per-run internal Komet MCP. External servers stay
+//! with the agent — `mcp_external` is left empty.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -79,7 +79,7 @@ async fn engine_with_github() -> (EngineCore, TempDir, String) {
 }
 
 #[tokio::test]
-async fn dispatch_injects_assigned_external_mcp_for_compatible_harnesses() {
+async fn dispatch_does_not_inject_external_mcp_or_refuse_the_run() {
     let (core, _dir, chat_id) = engine_with_github().await;
     core.sessions
         .dispatch(
@@ -91,11 +91,10 @@ async fn dispatch_injects_assigned_external_mcp_for_compatible_harnesses() {
         .await
         .unwrap();
     let req = core.sessions.last_request(&chat_id).expect("dispatched");
-    assert_eq!(req.mcp_external.len(), 1);
-    let server = &req.mcp_external[0];
-    assert_eq!(server.config.id, "gh");
-    assert_eq!(server.resolved_headers["Authorization"], SECRET);
-    assert!(!format!("{req:?}").contains(SECRET));
+    assert!(
+        req.mcp_external.is_empty(),
+        "external MCP is the agent's, not Komet's"
+    );
     core.shutdown().await;
 }
 

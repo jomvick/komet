@@ -1,6 +1,6 @@
 # Komet
 
-> Control your coding agents (Claude Code, Codex, Cursor, Devin, GitHub Copilot, Grok, Hermes, Muse Code, OpenCode, Pi, Cline) — **100% local by default**, optional multi-device sync.
+> Control your coding agents (Claude Code, Codex, Cursor, Grok, Hermes, OpenCode, Pi) — **100% local by default**, optional multi-device sync.
 
 Komet is a native **Rust + gpui** controller in a single binary. Each device runs a small engine that stores sessions locally. No account, no network required at install — sync only activates if you self-host it.
 
@@ -10,7 +10,7 @@ Komet is a native **Rust + gpui** controller in a single binary. Each device run
 
 - **Local-first** — works fully offline, data stays on device
 - **Single binary** — UI + engine, headed or headless mode
-- **Multiple agents** — native CLI, MSP, and ACP integrations with mid-conversation provider switching
+- **Multiple agents** — unified ACP protocol (Claude, Codex, Cursor, Grok, Hermes, OpenCode, Pi)
 - **Optional sync** — Loro CRDT via a self-hosted `komet-sync` server (SQLite + bearer token)
 
 > **Security:** komet's sandbox settings constrain the agent CLI's own permissions — they are not an OS-level boundary. See [docs/security.md](docs/security.md).
@@ -61,15 +61,9 @@ Download `komet-<version>-linux-<arch>.tar.gz` then run `./install.sh` inside th
 ```bash
 komet status                          # engine status + local/sync mode
 komet update                          # check and install latest version
-komet engine stop                     # gracefully stop the desktop app's background engine
 komet daemon start|stop|restart|status
 komet headless                        # engine only (no UI)
 ```
-
-The desktop app starts its engine as a detached background process when one is not already
-running. Closing the window or quitting Komet does not interrupt active sessions. Use
-`komet engine stop` to stop that engine explicitly; `komet daemon` remains for service-managed
-headless deployments.
 
 ---
 

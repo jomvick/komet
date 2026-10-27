@@ -2,7 +2,7 @@
 
 > Fork of [zeronsh/comet](https://github.com/zeronsh/comet) — MIT, Copyright Wing. See `LICENSE` and `THIRD_PARTY_NOTICES.md`.
 
-A native controller for coding agents (Claude Code, Codex, Cursor, Grok, Hermes, OpenCode, Pi, Cline, Devin, GitHub Copilot, Muse Code) —
+A native controller for coding agents (Claude Code, Codex, Cursor, Grok, Hermes, OpenCode, Pi, Cline) —
 Rust engine + gpui UI, single binary. **100% local by default**: no account, no login
 screen, no network calls. Multi-device sync is built (Loro CRDT docs through the self-hosted
 `komet-sync` server) but **disabled by default** — see "Multi-device sync" in the README.
@@ -38,12 +38,12 @@ gpui UI ─ in-proc/localhost RPC ─ engine A ══ device-room relay ══ e
 
 ### Headed / headless
 Single binary `komet`:
-- `komet` — headed. If an engine is already listening on the IPC port, connect to it; otherwise
-  start a detached `komet engine` child and attach over localhost IPC. It survives the window and
-  app closing, so sessions continue without a service-manager installation. `komet engine stop`
-  requests a graceful shutdown. If the child cannot start or become ready, fall back to an engine
-  **in-process** (RPC over an in-memory duplex — same protocol, zero serialization shortcuts, so
-  the boundary stays honest) and serve that engine on the IPC port. Binding remains best-effort.
+- `komet` — headed. If a local engine daemon is already listening on the IPC port, connect to it;
+  otherwise run the engine **in-process** (RPC over an in-memory duplex — same protocol, zero
+  serialization shortcuts, so the boundary stays honest) **and serve that same engine on the IPC
+  port**. The embedded engine is not private: any other viewport can attach to the running app
+  without it first being restarted as a daemon. Binding is best-effort — if the port is taken the
+  window still opens, having lost only the ability to host peers.
 - `komet headless` — engine only. A clean installation immediately serves its local profile over localhost IPC; when a saved account selects the synced profile at startup and a bearer is available, it also hosts its DeviceRoom for remote control. A VPS can run this while a laptop's UI drives it.
 
 ### Local-first workspace profiles
@@ -63,10 +63,6 @@ The engine never re-resolves an open store because `AuthState` changed. This pre
 | Explicit non-empty dev bearer | `Development` | Enabled |
 
 `komet login` and `komet logout` operate on `session.json` while the engine is stopped. Login selects `Synced` for the next start; logout selects `Local` for the next start. The UI may update live authentication status, but the active `WorkspaceScope` still changes only after restart.
-
-The headed app starts its engine as a detached process using the same binary and inherited runtime
-configuration. It does not install or enable a system service. `komet engine stop` is the explicit
-graceful stop for that engine; service-managed deployments continue to use `komet daemon`.
 
 **Current default (local-only):** no sync server ships preconfigured (`KOMET_EDGE_URL` unset →
 `None`), so every start resolves to the "Development" row —
@@ -165,7 +161,7 @@ komet/
                                   # restart, macOS app-bundle staging (macOS + Linux only)
      sync-server/  komet-sync-server # self-hosted sync server (SQLite rooms, FS blobs, bearer auth)
    apps/
-     komet/                       # the binary (headed default, `headless` and `engine` subcommands)
+     komet/                       # the binary (headed default, `headless` subcommand)
    docs/                          # this file + research reports
 ```
 
@@ -278,8 +274,6 @@ Live reference matrix (branch + mechanism):
 | Grok | 1 | native CLI flags `--sandbox` / `--permission-mode` / `--always-approve` (`grok_args_for_sandbox`) |
 | Antigravity | 1 | native CLI `--sandbox` + `--mode plan` (`crates/harness/src/antigravity/mod.rs`) |
 | Cline | 1 (partial) | native `auto_approve` boolean on Full access + native `provider` select injection; ReadOnly/WorkspaceWrite rely on branch 2 |
-| Devin / GitHub Copilot | 2 | native ACP permission requests mapped through the engine permission bridge |
-| Muse Code | 1 | native Muse Session Protocol permission requests and sandbox mode (`--disable-sandbox` only for Full access) |
 | Cursor | 1 | `sandbox` passed through the shim into SDK params (`crates/harness/src/cursor/mod.rs`) |
 | Hermes / Pi | 2 | documented "no CLI sandbox, so the ACP permission policy is their access control" (branch-2 fallback) |
 | Any | 3 | `sandbox_options` for unsupported providers → `ProviderOptionsRejected` (`crates/proto/src/agent.rs`) |

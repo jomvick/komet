@@ -388,9 +388,9 @@ fn tool_chip_content_raw(call: &crate::ToolCall) -> (&'static str, String) {
 
 /// The ToolGroup summary line — "Ran 3 commands · edited 2 files".
 ///
-/// Takes borrowed `(call, is_error)` pairs so each viewport can keep its own row
-/// model without cloning potentially large tool invocations.
-pub fn tool_group_summary(tools: &[(&crate::ToolCall, bool)]) -> String {
+/// Takes `(call, is_error)` pairs so each viewport can keep its own row model;
+/// the summary itself is one implementation for both.
+pub fn tool_group_summary(tools: &[(crate::ToolCall, bool)]) -> String {
     use crate::ToolCall;
     let mut commands = 0usize;
     let mut edited: Vec<&str> = Vec::new();

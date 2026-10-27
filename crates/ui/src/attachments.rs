@@ -1,4 +1,4 @@
-//! Attachments (feature-inventory §1.7/§1.8): the composer's staged files,
+//! Attachments (feature-inventory §1.7/§1.8): the composer's staged images,
 //! the chunked upload to the chat's host device, the plain-text attachment-ref
 //! transport that rides the prompt, the transcript read-back cache, and the
 //! full-size preview lightbox.
@@ -41,7 +41,6 @@ const MAX_READ_CHUNKS: usize = 1_000;
 
 /// The body used for image-only sends (`use-attachments.ts`).
 pub const ATTACHMENT_ONLY_TEXT: &str = "See the attached image(s).";
-pub const FILE_ATTACHMENT_ONLY_TEXT: &str = "See the attached file(s).";
 
 /// How attachments ride the prompt (use-attachments.ts `withAttachments`):
 /// plain local paths appended to the text — the files are staged on the device
@@ -52,38 +51,30 @@ pub fn with_attachments(text: &str, paths: &[String]) -> String {
         return text.to_string();
     }
     let refs: Vec<String> = paths.iter().map(|p| format!("- {p}")).collect();
-    let all_images = paths
-        .iter()
-        .all(|path| format_by_extension(Path::new(path)).is_some());
-    let body = if text.is_empty() && all_images {
+    let body = if text.is_empty() {
         ATTACHMENT_ONLY_TEXT
-    } else if text.is_empty() {
-        FILE_ATTACHMENT_ONLY_TEXT
     } else {
         text
     };
-    let header = if all_images {
-        "Attached images (local files — open them to view):"
-    } else {
-        "Attached files (local files — open them to view):"
-    };
-    format!("{body}\n\n{header}\n{}", refs.join("\n"))
+    format!(
+        "{body}\n\nAttached images (local files — open them to view):\n{}",
+        refs.join("\n")
+    )
 }
 
-/// An attachment reference parsed back out of a user message's text.
+/// An attachment ref parsed back out of a user message's text.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct UserAttachment {
+pub struct UserImageAttachment {
     pub id: String,
     pub path: String,
     pub name: String,
-    pub is_image: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ParsedUserMessage {
     /// The visible prompt (the refs trailer stripped; empty for image-only sends).
     pub text: String,
-    pub attachments: Vec<UserAttachment>,
+    pub attachments: Vec<UserImageAttachment>,
 }
 
 fn name_from_path(path: &str) -> String {
@@ -100,21 +91,14 @@ fn name_from_path(path: &str) -> String {
 }
 
 /// Find the refs trailer: a blank line, then a line starting (case-insensitive)
-/// with an attachment header and ending `):`. Returns
+/// with `Attached images (local files` and ending `):`. Returns
 /// `(body_end, refs_start)` byte offsets — the tolerant equivalent of komet's
 /// `ATTACHED_IMAGES_RE`.
 fn find_refs_marker(content: &str) -> Option<(usize, usize)> {
     let lower = content.to_ascii_lowercase();
-    let needle = [
-        "\n\nattached images (local files",
-        "\n\nattached files (local files",
-    ];
+    let needle = "\n\nattached images (local files";
     let mut from = 0usize;
-    while let Some(rel) = needle
-        .iter()
-        .filter_map(|needle| lower[from..].find(needle))
-        .min()
-    {
+    while let Some(rel) = lower[from..].find(needle) {
         let gap = from + rel;
         let line_start = gap + 2;
         let line_end = content[line_start..]
@@ -141,17 +125,16 @@ pub fn parse_user_message_images(content: &str) -> ParsedUserMessage {
         };
     };
     let body = content[..body_end].trim_end();
-    let attachments: Vec<UserAttachment> = content[refs_start..]
+    let attachments: Vec<UserImageAttachment> = content[refs_start..]
         .lines()
         .filter_map(|line| {
             let path = line.trim_start().strip_prefix("- ")?.trim();
             (!path.is_empty()).then(|| path.to_string())
         })
         .enumerate()
-        .map(|(index, path)| UserAttachment {
+        .map(|(index, path)| UserImageAttachment {
             id: format!("{index}:{path}"),
             name: name_from_path(&path),
-            is_image: format_by_extension(Path::new(&path)).is_some(),
             path,
         })
         .collect();
@@ -162,10 +145,7 @@ pub fn parse_user_message_images(content: &str) -> ParsedUserMessage {
         };
     }
     ParsedUserMessage {
-        text: if matches!(
-            body.trim(),
-            ATTACHMENT_ONLY_TEXT | FILE_ATTACHMENT_ONLY_TEXT
-        ) {
+        text: if body.trim() == ATTACHMENT_ONLY_TEXT {
             String::new()
         } else {
             body.to_string()
@@ -175,7 +155,7 @@ pub fn parse_user_message_images(content: &str) -> ParsedUserMessage {
 }
 
 /// message-attachments.ts `userMessageRailText`: what the rail/sidebar shows
-/// for a user message with attachments and no prompt text.
+/// for a user message ("Attached image" / "N attached images" when image-only).
 pub fn user_message_rail_text(content: &str) -> String {
     let parsed = parse_user_message_images(content);
     if !parsed.text.trim().is_empty() {
@@ -183,12 +163,8 @@ pub fn user_message_rail_text(content: &str) -> String {
     }
     match parsed.attachments.len() {
         0 => content.to_string(),
-        1 if parsed.attachments[0].is_image => "Attached image".to_string(),
-        1 => "Attached file".to_string(),
-        n if parsed.attachments.iter().all(|att| att.is_image) => {
-            format!("{n} attached images")
-        }
-        n => format!("{n} attached files"),
+        1 => "Attached image".to_string(),
+        n => format!("{n} attached images"),
     }
 }
 
@@ -196,21 +172,21 @@ pub fn user_message_rail_text(content: &str) -> String {
 // Staging (use-attachments.ts intake)
 // ---------------------------------------------------------------------------
 
-/// A file staged in the composer, before upload. Images keep their decoded
-/// representation for previews; all files share the raw upload bytes.
+/// An image staged in the composer, before upload. The raw bytes live inside
+/// the [`Image`] (gpui decodes them at paint; the same Arc feeds thumbnails,
+/// the lightbox, the upload, and the post-send cache seed).
 #[derive(Clone)]
 pub struct StagedAttachment {
     pub id: String,
     /// File name with a type-matching extension (use-attachments.ts
     /// `ensureExtension` — agents sniff images by extension).
     pub name: String,
-    pub bytes: Arc<[u8]>,
-    pub image: Option<Arc<Image>>,
+    pub image: Arc<Image>,
 }
 
 impl StagedAttachment {
     pub fn bytes(&self) -> &[u8] {
-        &self.bytes
+        &self.image.bytes
     }
 }
 
@@ -265,46 +241,17 @@ pub fn stage_file(path: &Path) -> Result<StagedAttachment, String> {
     Ok(StagedAttachment {
         id: uuid::Uuid::new_v4().to_string(),
         name: ensure_extension(&display_name, format),
-        image: Some(Arc::new(Image::from_bytes(format, bytes.clone()))),
-        bytes: bytes.into(),
-    })
-}
-
-/// Stage any regular file for upload. Image files also retain a decoded
-/// preview; non-image files are shown as named file cards.
-pub fn stage_any_file(path: &Path) -> Result<StagedAttachment, String> {
-    let display_name = path
-        .file_name()
-        .map(|name| name.to_string_lossy().to_string())
-        .unwrap_or_else(|| "file".to_string());
-    let metadata =
-        std::fs::metadata(path).map_err(|_| format!("{display_name} could not be read."))?;
-    if !metadata.is_file() {
-        return Err(format!("{display_name} is not a file."));
-    }
-    if metadata.len() > MAX_ATTACHMENT_BYTES {
-        return Err(format!("{display_name} is too large (24 MB max)."));
-    }
-    let bytes = std::fs::read(path).map_err(|_| format!("{display_name} could not be read."))?;
-    let image =
-        format_by_extension(path).map(|format| Arc::new(Image::from_bytes(format, bytes.clone())));
-    Ok(StagedAttachment {
-        id: uuid::Uuid::new_v4().to_string(),
-        name: display_name,
-        bytes: bytes.into(),
-        image,
+        image: Arc::new(Image::from_bytes(format, bytes)),
     })
 }
 
 /// Stage an image pasted from the clipboard.
 pub fn stage_clipboard_image(image: Image) -> StagedAttachment {
     let format = image.format;
-    let bytes: Arc<[u8]> = image.bytes.clone().into();
     StagedAttachment {
         id: uuid::Uuid::new_v4().to_string(),
         name: ensure_extension("image", format),
-        bytes,
-        image: Some(Arc::new(image)),
+        image: Arc::new(image),
     }
 }
 
@@ -829,18 +776,6 @@ mod tests {
     }
 
     #[test]
-    fn generic_file_only_send_round_trips_as_a_file() {
-        let content = with_attachments("", &["/a/report.pdf".to_string()]);
-        assert!(content.starts_with(FILE_ATTACHMENT_ONLY_TEXT));
-        let parsed = parse_user_message_images(&content);
-        assert_eq!(parsed.text, "");
-        assert_eq!(parsed.attachments.len(), 1);
-        assert_eq!(parsed.attachments[0].name, "report.pdf");
-        assert!(!parsed.attachments[0].is_image);
-        assert_eq!(user_message_rail_text(&content), "Attached file");
-    }
-
-    #[test]
     fn plain_text_passes_through_unchanged() {
         assert_eq!(with_attachments("hello", &[]), "hello");
         let parsed = parse_user_message_images("hello\n\nno images here");
@@ -871,19 +806,6 @@ mod tests {
         let with_text = with_attachments("fix this", &["/a/b.png".to_string()]);
         assert_eq!(user_message_rail_text(&with_text), "fix this");
         assert_eq!(user_message_rail_text("plain"), "plain");
-    }
-
-    #[test]
-    fn mixed_attachments_use_generic_file_transport() {
-        let content = with_attachments(
-            "review these",
-            &["/a/image.png".to_string(), "/b/notes.txt".to_string()],
-        );
-        let parsed = parse_user_message_images(&content);
-        assert_eq!(parsed.text, "review these");
-        assert!(parsed.attachments[0].is_image);
-        assert!(!parsed.attachments[1].is_image);
-        assert!(content.contains("Attached files (local files"));
     }
 
     #[test]

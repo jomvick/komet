@@ -9,11 +9,11 @@
 //! are paint-local and never move surrounding layout. Reduced motion snaps every
 //! cell to its rest state automatically (gpui `reduce_motion`).
 
+use crate::icons;
 use gpui::{
-    AnyElement, App, EntityId, Image, ImageFormat, IntoElement, ObjectFit, ParentElement,
-    PathBuilder, SharedString, Styled, StyledImage as _, canvas, div, img, point, px,
+    AnyElement, App, EntityId, IntoElement, ParentElement, PathBuilder, SharedString, Styled,
+    canvas, div, point, px,
 };
-use std::sync::{Arc, OnceLock};
 
 use crate::motion::{self, GRADIENT_SPIN, KOMET_PULSE, PULSE_STAGGER, SPLASH_OUT};
 use crate::theme::Theme;
@@ -205,17 +205,23 @@ pub fn upload_progress_ring(percent: u8, diameter: f32) -> AnyElement {
         .into_any_element()
 }
 
-/// Full-window boot splash using the monochrome hands artwork.
+/// Full-window boot splash: the Komet SVG mark centered on the frosted glass
+/// overlay with an uppercase tracked "Loading" line beneath it.
 /// While `fading` it plays `splash-out` (150ms hold, then 0.5s fade + 6px
 /// lift); the shell removes it once [`SPLASH_OUT`] has run its course.
-pub fn splash_overlay(_theme: &Theme, fading: bool) -> AnyElement {
-    let content = div().absolute().inset_0().bg(gpui::rgb(0x000000)).child(
-        img(splash_image())
-            .absolute()
-            .inset_0()
-            .size_full()
-            .object_fit(ObjectFit::Cover),
-    );
+pub fn splash_overlay(theme: &Theme, fading: bool) -> AnyElement {
+    let content = div()
+        .absolute()
+        .inset_0()
+        // Frosted glass overlay — matches the rest of the chrome chrome.
+        .bg(theme.glass())
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap(px(32.0))
+        .child(komet_splash_mark(theme))
+        .child(loading_word(theme));
     if fading {
         motion::splash_out("boot-splash-out", content).into_any_element()
     } else {
@@ -223,16 +229,24 @@ pub fn splash_overlay(_theme: &Theme, fading: bool) -> AnyElement {
     }
 }
 
-fn splash_image() -> Arc<Image> {
-    static IMAGE: OnceLock<Arc<Image>> = OnceLock::new();
-    IMAGE
-        .get_or_init(|| {
-            Arc::new(Image::from_bytes(
-                ImageFormat::Png,
-                include_bytes!("../assets/splash-hands.png").to_vec(),
-            ))
-        })
-        .clone()
+/// The Komet SVG logo mark rendered at splash size (120px), theme-coloured.
+fn komet_splash_mark(theme: &Theme) -> AnyElement {
+    icons::icon(icons::KOMET_LOGO)
+        .size(px(120.0))
+        .text_color(theme.text)
+        .into_any_element()
+}
+
+/// "L O A D I N G" — `text-[11px] uppercase tracking-[0.32em]
+/// text-muted-foreground/70`; tracking approximated with thin spaces (gpui has
+/// no letter-spacing at the pinned rev).
+pub fn loading_word(theme: &Theme) -> impl IntoElement {
+    div()
+        .text_size(px(11.0))
+        .text_color(theme.text_muted.opacity(0.7))
+        .child(SharedString::from(
+            "L\u{2009}O\u{2009}A\u{2009}D\u{2009}I\u{2009}N\u{2009}G",
+        ))
 }
 
 // Compile-time proof the specs referenced here stay wired to the catalog.

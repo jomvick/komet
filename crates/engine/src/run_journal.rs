@@ -51,7 +51,8 @@ pub struct RunJournal {
 impl RunJournal {
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, JournalError> {
         let dir = dir.as_ref().to_path_buf();
-        std::fs::create_dir_all(&dir)?;
+        // Journals carry full transcripts: only this user may read the directory.
+        crate::ensure_private_dir(&dir)?;
         Ok(Self {
             dir,
             open_files: Mutex::new(HashMap::new()),

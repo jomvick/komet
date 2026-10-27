@@ -15,7 +15,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.3.0"
+version = "1.2.4"
 edition = "2024"
 license = "MIT"
 publish = false
@@ -65,9 +65,7 @@ gpui_platform = { git = "https://github.com/jomvick/zed", rev = "e2ddcc6805f8c50
     "runtime_shaders",
 ] }
 gpui_tokio = { git = "https://github.com/jomvick/zed", rev = "e2ddcc6805f8c5088e62a60dfe517abcccd61a9a" }
-# gpui-component — jomvick/gpui-component: jsgrrchg/gpui-component with its gpui deps
-# pointed straight at the jomvick/zed fork above, so no [patch] redirect is needed.
-gpui-base = { git = "https://github.com/jomvick/gpui-component", rev = "36343256b58e3c73dd709fbd6682e06fd24855db" }
+gpui-base = { git = "https://github.com/jsgrrchg/gpui-component", rev = "edefc2fb645473f330488fbee2c421536a85c69a" }
 
 # diffs
 similar = "2"
@@ -105,14 +103,18 @@ sha2 = "0.10"
 dirs = "6"
 notify = "7"
 portable-pty = "0.8"
-keyring = { version = "3.6", default-features = false, features = ["apple-native", "windows-native", "sync-secret-service"] }
 alacritty_terminal = "0.26"
 pulldown-cmark = "0.12"
 unicode-segmentation = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
-semver = "1"
 ignore = "0.4"
 nucleo-matcher = "0.3"
+
+[patch."https://github.com/wingleeio/zed"]
+gpui = { git = "https://github.com/jomvick/zed", rev = "e2ddcc6805f8c5088e62a60dfe517abcccd61a9a" }
+gpui_platform = { git = "https://github.com/jomvick/zed", rev = "e2ddcc6805f8c5088e62a60dfe517abcccd61a9a" }
+gpui_tokio = { git = "https://github.com/jomvick/zed", rev = "e2ddcc6805f8c5088e62a60dfe517abcccd61a9a" }
+gpui_macros = { git = "https://github.com/jomvick/zed", rev = "e2ddcc6805f8c5088e62a60dfe517abcccd61a9a" }
 
 [profile.release]
 # Distribution profile (scripts/package-linux.sh): thin LTO buys most of fat

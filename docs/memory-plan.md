@@ -113,7 +113,7 @@ viewer-laptop steady state ≈ gpui baseline + selected chat ≈ 150–250MB, fl
 
 ## 7. Implementation status (2026-08-03)
 
-Phases 1–2 landed on `komet-memory-usage-investigation` (phase 3
+Phases 1–2 landed on `komet/komet-memory-usage-investigation` (phase 3
 deliberately skipped — terminals get their own pass with the terminal bug
 work). Shipped: mimalloc in both binaries; attachment-image LRU (64MB encoded
 budget) with gpui asset release on eviction + staged-attachment purge on chat

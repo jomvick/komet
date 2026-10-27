@@ -10,7 +10,6 @@ pub enum HarnessId {
     ClaudeCode,
     Codex,
     Cursor,
-    Devin,
     /// xAI's Grok Build agent, driven over ACP (`grok agent stdio`).
     Grok,
     /// Nous Research's Hermes Agent, driven over ACP (`hermes acp`).
@@ -22,68 +21,9 @@ pub enum HarnessId {
     Opencode,
     /// Cline's autonomous coding agent CLI, driven over ACP (`cline --acp`).
     Cline,
-    Antigravity,
-    Muse,
-    Copilot,
     /// Test harness; never shown in production pickers.
     Mock,
-}
-
-impl HarnessId {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            HarnessId::ClaudeCode => "claude-code",
-            HarnessId::Codex => "codex",
-            HarnessId::Cursor => "cursor",
-            HarnessId::Devin => "devin",
-            HarnessId::Grok => "grok",
-            HarnessId::Hermes => "hermes",
-            HarnessId::Pi => "pi",
-            HarnessId::Opencode => "opencode",
-            HarnessId::Cline => "cline",
-            HarnessId::Antigravity => "antigravity",
-            HarnessId::Muse => "muse",
-            HarnessId::Copilot => "copilot",
-            HarnessId::Mock => "mock",
-        }
-    }
-
-    pub fn from_slug(value: &str) -> Option<Self> {
-        match value.trim().to_ascii_lowercase().as_str() {
-            "claude-code" | "claude" => Some(HarnessId::ClaudeCode),
-            "codex" => Some(HarnessId::Codex),
-            "cursor" | "cursor-agent" => Some(HarnessId::Cursor),
-            "devin" => Some(HarnessId::Devin),
-            "grok" => Some(HarnessId::Grok),
-            "hermes" => Some(HarnessId::Hermes),
-            "pi" => Some(HarnessId::Pi),
-            "opencode" | "open-code" => Some(HarnessId::Opencode),
-            "cline" => Some(HarnessId::Cline),
-            "antigravity" | "agy" => Some(HarnessId::Antigravity),
-            "muse" => Some(HarnessId::Muse),
-            "copilot" | "github-copilot" => Some(HarnessId::Copilot),
-            "mock" => Some(HarnessId::Mock),
-            _ => None,
-        }
-    }
-
-    pub fn display_name(&self) -> &'static str {
-        match self {
-            HarnessId::ClaudeCode => "Claude Code",
-            HarnessId::Codex => "Codex",
-            HarnessId::Cursor => "Cursor",
-            HarnessId::Devin => "Devin",
-            HarnessId::Grok => "Grok",
-            HarnessId::Hermes => "Hermes",
-            HarnessId::Pi => "Pi",
-            HarnessId::Opencode => "OpenCode",
-            HarnessId::Cline => "Cline",
-            HarnessId::Antigravity => "Antigravity CLI",
-            HarnessId::Muse => "Muse",
-            HarnessId::Copilot => "GitHub Copilot",
-            HarnessId::Mock => "Mock",
-        }
-    }
+    Antigravity,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -1329,33 +1269,9 @@ pub struct TodoItem {
     pub done: bool,
 }
 
-/// Where a slash command comes from. `Native` is the running CLI's own
-/// command surface; `Skill` is a skill/command file the CLI discovered;
-/// `Custom` is a Komet-owned entry; `Fallback` is the curated catalog shown
-/// only when live discovery failed.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum CommandSource {
-    #[default]
-    Native,
-    Skill,
-    Custom,
-    Fallback,
-}
-
-/// Whether a slash command applies to the current project or the whole user
-/// profile.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum CommandScope {
-    #[default]
-    Global,
-    Project,
-}
-
 /// A slash command advertised by the agent (ACP `availableCommands`): typed as
 /// `/name` at the start of the composer, sent to the agent as prompt text.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SlashCommand {
     pub name: String,
@@ -1364,10 +1280,6 @@ pub struct SlashCommand {
     /// Placeholder hint for the command's argument, when it takes one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_hint: Option<String>,
-    #[serde(default)]
-    pub source: CommandSource,
-    #[serde(default)]
-    pub scope: CommandScope,
 }
 
 /// A category entry in context breakdown (e.g. "Skills", "Free space", "System prompt").
@@ -2170,13 +2082,13 @@ mod tests {
         // A populated spec round-trips camelCased.
         let req = RunRequest {
             worktree: Some(WorktreeSpec {
-                repo_path: "/repos/komet".into(),
+                repo_path: "/repos/comet".into(),
                 base: "main".into(),
             }),
             ..req
         };
         let json = serde_json::to_value(&req).unwrap();
-        assert_eq!(json["worktree"]["repoPath"], "/repos/komet");
+        assert_eq!(json["worktree"]["repoPath"], "/repos/comet");
         let round: RunRequest = serde_json::from_value(json).unwrap();
         assert_eq!(round.worktree, req.worktree);
     }
@@ -3058,30 +2970,5 @@ mod tests {
         };
         assert!(fs.allow_read.contains(&"/repo/.env".to_string()));
         assert!(fs.deny_write.contains(&"/repo/.env".to_string()));
-    }
-
-    #[test]
-    fn slash_command_source_and_scope_default_when_missing() {
-        let command: SlashCommand =
-            serde_json::from_str(r#"{"name":"compact"}"#).expect("old wire decodes");
-        assert_eq!(command.source, CommandSource::Native);
-        assert_eq!(command.scope, CommandScope::Global);
-    }
-
-    #[test]
-    fn slash_command_source_and_scope_round_trip() {
-        let command = SlashCommand {
-            name: "review".into(),
-            source: CommandSource::Skill,
-            scope: CommandScope::Project,
-            ..SlashCommand::default()
-        };
-        let json = serde_json::to_string(&command).unwrap();
-        assert!(json.contains(r#""source":"skill""#), "{json}");
-        assert!(json.contains(r#""scope":"project""#), "{json}");
-        assert_eq!(
-            serde_json::from_str::<SlashCommand>(&json).unwrap(),
-            command
-        );
     }
 }

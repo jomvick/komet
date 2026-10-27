@@ -25,8 +25,8 @@ use futures::StreamExt;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use komet_doc::{
-    DocError, MessagePart, MessageRole, MessageStatus, ProviderSessionMark, STREAM_COMMIT_MS,
-    SegmentWriter, SessionDoc, fold_event_into_parts, sanitize_tool_call,
+    DocError, MessagePart, MessageRole, MessageStatus, STREAM_COMMIT_MS, SegmentWriter, SessionDoc,
+    fold_event_into_parts, sanitize_tool_call,
 };
 use komet_harness::{CancellationToken, Harness, RunControls, SteerMessage};
 use komet_proto::{
@@ -34,12 +34,11 @@ use komet_proto::{
     UserInputAnswer, UserInputQuestion,
 };
 
-use crate::composio::ComposioApi;
 use crate::doc_host::{ChatDocHandle, DocHost};
 use crate::mcp::catalog::McpCatalog;
 use crate::mcp::host::EngineMcpHost;
 use crate::mcp::policy::McpPolicy;
-use crate::mcp::server::{AskDecision, AskFn, McpEndpoint, PermissionAsk, RunningEndpoint};
+use crate::mcp::server::{AskDecision, McpEndpoint, RunningEndpoint};
 use crate::mcp::{McpRegistry, McpSecretStore, ResolvedMcpServer};
 use crate::registry::HarnessRegistry;
 use crate::run_journal::RunJournal;
@@ -65,55 +64,12 @@ type PendingInputs = Arc<Mutex<HashMap<String, oneshot::Sender<Vec<UserInputAnsw
 type PendingPermissionChoices =
     Arc<Mutex<HashMap<String, oneshot::Sender<komet_proto::PermissionChoice>>>>;
 
-struct McpPermissionCancellation {
-    pending: PendingPermissionChoices,
-    engine_tx: mpsc::UnboundedSender<AgentEvent>,
-    sessions: SessionsEngine,
-    chat_id: String,
-    request_id: String,
-}
-
-impl Drop for McpPermissionCancellation {
-    fn drop(&mut self) {
-        let Some(resolver) = lock(&self.pending).remove(&self.request_id) else {
-            return;
-        };
-        drop(resolver);
-        let choice = komet_proto::PermissionChoice::Deny;
-        let _ = self.engine_tx.send(AgentEvent::PermissionResolved {
-            request_id: self.request_id.clone(),
-            choice,
-        });
-        match self.sessions.doc_handle(&self.chat_id) {
-            Ok(handle) => {
-                if let Err(error) = handle.doc().resolve_permission(&self.request_id) {
-                    tracing::warn!(
-                        chat = %self.chat_id,
-                        request = %self.request_id,
-                        error = %error,
-                        "failed to resolve cancelled MCP permission"
-                    );
-                }
-            }
-            Err(error) => {
-                tracing::warn!(
-                    chat = %self.chat_id,
-                    request = %self.request_id,
-                    error = %error,
-                    "failed to find document for cancelled MCP permission"
-                );
-            }
-        }
-    }
-}
-
 /// A harness-native session id plus the cwd it was created under. Harness
 /// session stores are cwd-scoped (claude keys conversations by project
 /// directory — komet sessions.ts:563 "harness session stores are keyed by
 /// cwd"), so resume is only injected for runs launched from the same cwd.
 #[derive(Debug, Clone)]
 struct HarnessSessionRef {
-    harness: HarnessId,
     session_id: String,
     cwd: String,
 }
@@ -322,7 +278,7 @@ impl SessionsEngine {
 
     /// Explicitly tombstone the harness session for a chat (e.g. on prompt edit).
     pub fn tombstone_harness_session(&self, chat_id: &str) {
-        self.inner.invalidate_harness_session(chat_id);
+        self.inner.remember_harness_session(chat_id, "", "");
     }
 
     /// IDs assigned to the chat for MCP servers (`ChatConfig.mcp_server_ids`).
@@ -362,61 +318,23 @@ impl SessionsEngine {
     /// Per-run localhost Komet MCP. Bind failure is visible then the run
     /// continues without internal tools — the agent's own MCP config is
     /// unaffected.
-    async fn start_internal_mcp(
-        &self,
-        chat_id: &str,
-        run_id: &str,
-        ask: AskFn,
-    ) -> Option<RunningEndpoint> {
+    async fn start_internal_mcp(&self, chat_id: &str, run_id: &str) -> Option<RunningEndpoint> {
         let Some(workspace) = self.inner.workspace() else {
             tracing::warn!(chat = %chat_id, "internal MCP skipped: workspace not wired");
             return None;
         };
-        let mut catalog =
-            McpCatalog::komet_default(Arc::new(EngineMcpHost::new(self.clone(), workspace)));
-        match self.inner.mcp_secrets.composio_platform_api_key() {
-            Ok(Some(api_key)) => {
-                let api = ComposioApi::new(api_key, self.inner.device_id.clone());
-                let session = match api {
-                    Ok(api) => {
-                        match tokio::time::timeout(std::time::Duration::from_secs(10), async {
-                            let session = api.create_session().await?;
-                            let tools = session.tools().await?;
-                            Ok::<_, anyhow::Error>((session, tools))
-                        })
-                        .await
-                        {
-                            Ok(result) => result,
-                            Err(_) => Err(anyhow::anyhow!("Composio startup timed out")),
-                        }
-                    }
-                    Err(error) => Err(error),
-                };
-                match session {
-                    Ok((session, tools)) => {
-                        catalog = catalog.with_composio(session, tools);
-                    }
-                    Err(error) => {
-                        let message = format!("Composio tools unavailable: {error}");
-                        tracing::warn!(chat = %chat_id, error = %error, "Composio session unavailable");
-                        self.inner.publish(
-                            chat_id,
-                            &AgentEvent::Error {
-                                message,
-                                kind: ErrorKind::Unknown,
-                                detail: None,
-                                retryable: true,
-                            },
-                        );
-                    }
-                }
-            }
-            Ok(None) => {}
-            Err(error) => {
-                tracing::warn!(chat = %chat_id, error = %error, "Composio credential unavailable");
-            }
-        }
-        match McpEndpoint::start(run_id, Arc::new(catalog), McpPolicy::komet_default(), ask).await {
+        let catalog = Arc::new(McpCatalog::komet_default(Arc::new(EngineMcpHost::new(
+            self.clone(),
+            workspace,
+        ))));
+        match McpEndpoint::start(
+            run_id,
+            catalog,
+            McpPolicy::komet_default(),
+            Arc::new(|_| Box::pin(async { AskDecision::Deny })),
+        )
+        .await
+        {
             Ok(endpoint) => Some(endpoint),
             Err(err) => {
                 let message = format!("Komet MCP unavailable: {err}");
@@ -519,15 +437,6 @@ impl SessionsEngine {
         mut message_id: Option<String>,
         startup_retry: bool,
     ) -> Result<String, EngineError> {
-        // External server secrets are resolved on the host immediately before
-        // launch. Composio is handled by Komet's own MCP bridge so tool calls
-        // can pass through the permission panel instead of reaching it directly.
-        request.mcp_external = self
-            .prepare_mcp_for_run(chat_id)
-            .into_iter()
-            .filter(|server| server.config.id != "composio")
-            .map(resolved_mcp_to_proto)
-            .collect();
         // Project-less chats store cwd `~` (the creating device can't know the
         // host's home); expand it here, on the host, where the run spawns.
         request.cwd = expand_home(&request.cwd);
@@ -744,44 +653,6 @@ impl SessionsEngine {
         let handle = self.doc_handle(chat_id)?;
         let user_id = message_id.unwrap_or_else(new_id);
         handle.write_user_message(&user_id, &request.prompt, now_ms())?;
-        let active_provider = handle
-            .doc()
-            .active_provider()
-            .and_then(|slug| komet_proto::HarnessId::from_slug(&slug))
-            .or_else(|| self.inner.harness_owner(chat_id));
-        let switched_from = active_provider.filter(|active| *active != harness_id);
-        if let Some(from) = switched_from {
-            handle.doc().mark_provider_switched()?;
-            let marker = MessagePart::Switch {
-                id: format!("switch-{}", new_id()),
-                from: from.display_name().into(),
-                to: harness_id.display_name().into(),
-                from_harness: Some(from.as_str().into()),
-                to_harness: Some(harness_id.as_str().into()),
-            };
-            handle.doc().append_switch_part(&user_id, &marker)?;
-            // Preserve sessions created before provider marks were introduced:
-            // the active provider's current session is still discoverable via
-            // the single-provider cache and becomes its per-provider mark.
-            if let Some(session_id) = self.inner.resume_for(chat_id, &request.cwd, from) {
-                let seen = handle
-                    .doc()
-                    .read_entries()?
-                    .iter()
-                    .rev()
-                    .find(|entry| entry.id != user_id)
-                    .map(|entry| entry.id.clone());
-                handle.doc().set_provider_session(
-                    from.as_str(),
-                    &ProviderSessionMark {
-                        session_id,
-                        cwd: request.cwd.clone(),
-                        seen,
-                    },
-                )?;
-            }
-        }
-        handle.doc().set_active_provider(harness_id.as_str())?;
 
         // Engine-owned resume (komet sessions.ts:736 — every dispatch read the
         // chat's stored harness session): callers always send `resume: None`;
@@ -792,33 +663,19 @@ impl SessionsEngine {
         // and starting the retry fresh silently dropped a good conversation.
         let mut resume_injected = false;
         if request.resume.is_none() {
-            request.resume = if handle.doc().provider_switched() {
-                handle
-                    .doc()
-                    .provider_session(harness_id.as_str())
-                    .filter(|mark| mark.cwd.is_empty() || mark.cwd == request.cwd)
-                    .map(|mark| mark.session_id)
-                    .filter(|session_id| !session_id.is_empty())
-            } else {
-                self.inner.resume_for(chat_id, &request.cwd, harness_id)
-            };
+            request.resume = self.inner.resume_for(chat_id, &request.cwd);
             resume_injected = request.resume.is_some();
         }
-        if handle.doc().provider_switched()
-            && !request.prompt.trim_start().starts_with('/')
-            && !request
-                .prompt
-                .starts_with("Previous conversation for context:")
-        {
-            let seen = handle
-                .doc()
-                .provider_session(harness_id.as_str())
-                .filter(|mark| mark.cwd.is_empty() || mark.cwd == request.cwd)
-                .and_then(|mark| mark.seen);
-            request.prompt =
-                replay_prompt(handle.doc(), seen.as_deref(), &user_id, &request.prompt)?;
-        }
         let run_id = new_id();
+        let internal_mcp = self.start_internal_mcp(chat_id, &run_id).await;
+        if let Some(endpoint) = internal_mcp.as_ref() {
+            request.mcp = Some(komet_proto::McpInjection {
+                server_name: "komet".into(),
+                url: endpoint.url().to_string(),
+                auth_token: endpoint.auth_token().to_string(),
+            });
+        }
+        lock(&self.inner.last_requests).insert(chat_id.to_string(), request.clone());
         let (steer_tx, steer_rx) = mpsc::channel::<SteerMessage>(32);
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let (engine_tx, engine_rx) = mpsc::unbounded_channel::<AgentEvent>();
@@ -845,7 +702,7 @@ impl SessionsEngine {
         // request id, park the resolver for `respond_permission`, and surface
         // `PermissionRequested` through the run pipeline (mirror of the input
         // bridge above).
-        let request_permission = Arc::new({
+        let request_permission = {
             let pending = pending_permissions.clone();
             let engine_tx = engine_tx.clone();
             let sessions = self.clone();
@@ -877,83 +734,34 @@ impl SessionsEngine {
                     if let Some(timeout) = permission_timeout {
                         let watchdog_sessions = sessions.clone();
                         let watchdog_chat = chat.clone();
-                        let watchdog_request_id = request_id.clone();
                         tokio::spawn(async move {
                             tokio::time::sleep(timeout).await;
                             if let Ok(true) = watchdog_sessions.respond_permission(
                                 &watchdog_chat,
-                                &watchdog_request_id,
+                                &request_id,
                                 komet_proto::PermissionChoice::Deny,
                             ) {
                                 // The doc part must resolve too, or a dead
                                 // approval panel would keep rendering.
                                 if let Ok(handle) = watchdog_sessions.doc_handle(&watchdog_chat) {
-                                    let _ = handle.doc().resolve_permission(&watchdog_request_id);
+                                    let _ = handle.doc().resolve_permission(&request_id.clone());
                                 }
                                 tracing::info!(
                                     chat = %watchdog_chat,
-                                    request = %watchdog_request_id,
+                                    request = %request_id,
                                     "permission auto-denied: bridge timeout"
                                 );
                             }
                         });
                     }
-                    (request_id, rx)
+                    rx
                 },
             )
-        });
-        let mcp_ask: AskFn = {
-            let request_permission = request_permission.clone();
-            let pending = pending_permissions.clone();
-            let engine_tx = engine_tx.clone();
-            let sessions = self.clone();
-            let chat = chat_id.to_string();
-            Arc::new(move |ask: PermissionAsk| {
-                let (request_id, receiver) = request_permission(
-                    komet_proto::PermissionKind::Tool {
-                        name: format!("{}: {}", ask.server, ask.tool),
-                    },
-                    ask.summary,
-                    vec![
-                        komet_proto::PermissionChoice::Allow,
-                        komet_proto::PermissionChoice::Deny,
-                    ],
-                );
-                let cancellation = McpPermissionCancellation {
-                    pending: pending.clone(),
-                    engine_tx: engine_tx.clone(),
-                    sessions: sessions.clone(),
-                    chat_id: chat.clone(),
-                    request_id,
-                };
-                Box::pin(async move {
-                    let _cancellation = cancellation;
-                    match receiver.await {
-                        Ok(komet_proto::PermissionChoice::Allow) => AskDecision::Allow,
-                        Ok(komet_proto::PermissionChoice::AllowAlways { .. }) => {
-                            AskDecision::AllowSession
-                        }
-                        Ok(komet_proto::PermissionChoice::Deny) | Err(_) => AskDecision::Deny,
-                    }
-                })
-            })
         };
-        let internal_mcp = self.start_internal_mcp(chat_id, &run_id, mcp_ask).await;
-        if let Some(endpoint) = internal_mcp.as_ref() {
-            request.mcp = Some(komet_proto::McpInjection {
-                server_name: "komet".into(),
-                url: endpoint.url().to_string(),
-                auth_token: endpoint.auth_token().to_string(),
-            });
-        }
-        lock(&self.inner.last_requests).insert(chat_id.to_string(), request.clone());
         let interrupt_token = CancellationToken::new();
         let controls = RunControls {
             request_input,
-            request_permission: Box::new({
-                let request_permission = request_permission.clone();
-                move |kind, summary, choices| request_permission(kind, summary, choices).1
-            }),
+            request_permission,
             steering: steer_rx,
             interrupt: interrupt_token.clone(),
         };
@@ -976,6 +784,15 @@ impl SessionsEngine {
         // AFTER Working (same causal-order guarantee as the steer path): the
         // lastMessageAt bump must never be observable ahead of the live run.
         self.inner.note_message(chat_id, &request.prompt);
+
+        // Name the chat NOW, off the first prompt — not after the first
+        // exchange completes ("called New session for a long time for no
+        // reason"; the titler only needs the prompt and skips titled chats;
+        // the Done-time call below stays as the retry for a failed
+        // generation).
+        if let Some(titles) = self.inner.titles.get() {
+            titles.maybe_generate(chat_id, harness_id, &request.prompt, &request.cwd);
+        }
 
         tokio::spawn(drive_run(
             self.inner.clone(),
@@ -1203,9 +1020,9 @@ impl SessionsEngine {
             // exist in the journal (the debounced workspace-row write may
             // never have landed) — remember it so the revived run resumes the
             // same harness conversation (komet recoverDraft, sessions.ts:538).
-            if let Some((session_id, cwd, harness)) = self.inner.journal_harness_session(&chat_id) {
+            if let Some((session_id, cwd)) = self.inner.journal_harness_session(&chat_id) {
                 self.inner
-                    .remember_harness_session(&chat_id, &session_id, &cwd, harness);
+                    .remember_harness_session(&chat_id, &session_id, &cwd);
             }
             // The revival prompt: the last user message (idempotent re-dispatch
             // under the SAME id — `write_user_message` dedupes by id, so the
@@ -1285,7 +1102,7 @@ impl SessionsEngine {
                     // Last resort: the journal's own cwd (komet's draft config)
                     // — a crash can predate the debounced workspace-row write.
                     .or_else(|| {
-                        let (_, cwd, _) = sessions.inner.journal_harness_session(&chat_id)?;
+                        let (_, cwd) = sessions.inner.journal_harness_session(&chat_id)?;
                         Some(RunRequest {
                             prompt: String::new(),
                             harness: None,
@@ -1353,84 +1170,7 @@ impl SessionsEngine {
     }
 }
 
-fn resolved_mcp_to_proto(server: crate::mcp::ResolvedMcpServer) -> komet_proto::ResolvedMcpServer {
-    let config = server.config;
-    komet_proto::ResolvedMcpServer {
-        config: komet_proto::McpServerConfig {
-            id: config.id,
-            name: config.name,
-            enabled: config.enabled,
-            transport: match config.transport {
-                crate::mcp::McpTransport::Stdio => komet_proto::McpTransport::Stdio,
-                crate::mcp::McpTransport::Http => komet_proto::McpTransport::Http,
-                crate::mcp::McpTransport::Sse => komet_proto::McpTransport::Sse,
-            },
-            command: config.command,
-            args: config.args,
-            url: config.url,
-            headers: config.headers,
-            env: config.env,
-            always_load: config.always_load,
-        },
-        resolved_headers: server.resolved_headers,
-        resolved_env: server.resolved_env,
-    }
-}
-
-fn replay_prompt(
-    doc: &SessionDoc,
-    seen: Option<&str>,
-    current_user_id: &str,
-    prompt: &str,
-) -> Result<String, DocError> {
-    let entries = doc.read_entries()?;
-    let start = seen
-        .and_then(|id| entries.iter().position(|entry| entry.id == id))
-        .map_or(0, |index| index + 1);
-    let mut history = Vec::new();
-    for entry in entries.iter().skip(start) {
-        if entry.id == current_user_id {
-            break;
-        }
-        let role = match entry.role {
-            MessageRole::User => "User",
-            MessageRole::Assistant => "Assistant",
-            MessageRole::System => continue,
-        };
-        let text = entry
-            .parts
-            .iter()
-            .filter_map(|part| match part {
-                MessagePart::Text { text, .. } => Some(text.as_str()),
-                _ => None,
-            })
-            .filter(|text| !text.trim().is_empty())
-            .collect::<Vec<_>>()
-            .join("\n");
-        if !text.is_empty() && !(role == "User" && text.trim_start().starts_with('/')) {
-            history.push(format!("{role}:\n{text}"));
-        }
-    }
-    if history.is_empty() {
-        return Ok(prompt.to_string());
-    }
-    Ok(format!(
-        "Previous conversation for context:\n{}\n\nCurrent user request:\n{prompt}",
-        history.join("\n\n")
-    ))
-}
-
 impl Inner {
-    fn harness_owner(&self, chat_id: &str) -> Option<HarnessId> {
-        lock(&self.harness_sessions)
-            .get(chat_id)
-            .map(|session| session.harness)
-            .or_else(|| {
-                self.journal_harness_session(chat_id)
-                    .map(|(_, _, harness)| harness)
-            })
-    }
-
     /// Journal + broadcast one event (the two unconditional legs of the pipeline).
     fn publish(&self, chat_id: &str, event: &AgentEvent) -> u64 {
         let usage_changed = match event {
@@ -1618,38 +1358,19 @@ impl Inner {
     /// Record the chat's harness-native session id (and its cwd): live-process
     /// cache plus the durable workspace chat row — the row is what survives an
     /// engine restart (komet sessions.ts:1039).
-    fn remember_harness_session(
-        &self,
-        chat_id: &str,
-        session_id: &str,
-        cwd: &str,
-        harness: HarnessId,
-    ) {
+    fn remember_harness_session(&self, chat_id: &str, session_id: &str, cwd: &str) {
         if session_id.is_empty() {
             return;
         }
         lock(&self.harness_sessions).insert(
             chat_id.to_string(),
             HarnessSessionRef {
-                harness,
                 session_id: session_id.to_string(),
                 cwd: cwd.to_string(),
             },
         );
         if let Some(ws) = self.workspace() {
             ws.set_chat_harness_session(chat_id, session_id, cwd);
-        }
-    }
-
-    /// Forget a harness session that proved unusable during a turn.  The
-    /// empty-turn guard is deliberately retryable, but resuming the same ACP
-    /// session would replay the failure forever.  Keep an explicit empty
-    /// tombstone in the workspace row so the journal fallback cannot revive
-    /// the poisoned id on the next dispatch.
-    fn invalidate_harness_session(&self, chat_id: &str) {
-        lock(&self.harness_sessions).remove(chat_id);
-        if let Some(ws) = self.workspace() {
-            ws.set_chat_harness_session(chat_id, "", "");
         }
     }
 
@@ -1668,27 +1389,28 @@ impl Inner {
     /// harness session stores are keyed by cwd, so a session created elsewhere
     /// never rides `--resume`. An empty stored id is the explicit tombstone —
     /// no resume, no falling through to staler sources.
-    fn resume_for(&self, chat_id: &str, cwd: &str, harness: HarnessId) -> Option<String> {
+    fn resume_for(&self, chat_id: &str, cwd: &str) -> Option<String> {
         let cwd_ok = |session_cwd: &str| session_cwd.is_empty() || session_cwd == cwd;
         if let Some(known) = lock(&self.harness_sessions).get(chat_id).cloned() {
-            return (known.harness == harness
-                && !known.session_id.is_empty()
-                && cwd_ok(&known.cwd))
-            .then_some(known.session_id);
+            return (!known.session_id.is_empty() && cwd_ok(&known.cwd))
+                .then_some(known.session_id);
         }
-        let (session_id, session_cwd, owner) = self.journal_harness_session(chat_id)?;
-        if owner != harness || !cwd_ok(&session_cwd) || session_id.is_empty() {
-            return None;
+        if let Some(ws) = self.workspace()
+            && let Some((session_id, session_cwd)) = ws.chat_harness_session(chat_id)
+        {
+            return (!session_id.is_empty() && cwd_ok(session_cwd.as_deref().unwrap_or("")))
+                .then_some(session_id);
         }
+        let (session_id, session_cwd) = self.journal_harness_session(chat_id)?;
         // Cache the journal hit (memory + row) so later dispatches skip the scan.
-        self.remember_harness_session(chat_id, &session_id, &session_cwd, owner);
-        Some(session_id)
+        self.remember_harness_session(chat_id, &session_id, &session_cwd);
+        cwd_ok(&session_cwd).then_some(session_id)
     }
 
     /// The last harness session id named anywhere in the chat's journal, with
     /// the cwd of the `SessionStarted` that governs it. `Done.session_id`
     /// inherits the cwd of the most recent `SessionStarted` (same run).
-    fn journal_harness_session(&self, chat_id: &str) -> Option<(String, String, HarnessId)> {
+    fn journal_harness_session(&self, chat_id: &str) -> Option<(String, String)> {
         let events = match self.journal.replay(chat_id, 0) {
             Ok(events) => events,
             Err(err) => {
@@ -1697,27 +1419,22 @@ impl Inner {
             }
         };
         let mut current_cwd = String::new();
-        let mut current_harness = None;
-        let mut found: Option<(String, String, HarnessId)> = None;
+        let mut found: Option<(String, String)> = None;
         for (_, event) in events {
             match event {
                 AgentEvent::SessionStarted {
-                    harness,
-                    session_id,
-                    cwd,
-                    ..
+                    session_id, cwd, ..
                 } => {
                     current_cwd = cwd;
-                    current_harness = Some(harness);
                     if !session_id.is_empty() {
-                        found = Some((session_id, current_cwd.clone(), harness));
+                        found = Some((session_id, current_cwd.clone()));
                     }
                 }
                 AgentEvent::Done {
                     session_id: Some(session_id),
                     ..
                 } if !session_id.is_empty() => {
-                    found = Some((session_id, current_cwd.clone(), current_harness?));
+                    found = Some((session_id, current_cwd.clone()));
                 }
                 _ => {}
             }
@@ -2410,52 +2127,18 @@ async fn drive_run(
 
         match &event {
             AgentEvent::SessionStarted {
-                harness: started_harness,
-                session_id,
-                cwd,
-                ..
+                session_id, cwd, ..
             } => {
                 saw_session_started = true;
                 // The event's own cwd (where the harness actually created the
                 // session) scopes the stored id, not the request's.
-                inner.remember_harness_session(&chat_id, session_id, cwd, *started_harness);
-                if !session_id.is_empty()
-                    && let Err(error) = doc.set_provider_session(
-                        started_harness.as_str(),
-                        &ProviderSessionMark {
-                            session_id: session_id.clone(),
-                            cwd: cwd.clone(),
-                            seen: Some(resume_state.user_message_id.clone()),
-                        },
-                    )
-                {
-                    tracing::warn!(
-                        chat = %chat_id,
-                        provider = %started_harness.as_str(),
-                        error = %error,
-                        "failed to persist provider session mark"
-                    );
-                }
+                inner.remember_harness_session(&chat_id, session_id, cwd);
             }
             AgentEvent::Done {
                 session_id: Some(session_id),
-                status,
-                error,
                 ..
             } => {
-                // OpenCode can report a successful ACP stop with no wire
-                // output.  The harness converts that into the retryable
-                // "empty turn" error; do not persist the same poisoned
-                // session or every later command will fail identically.
-                let poisoned_empty_turn = *status == DoneStatus::Errored
-                    && error
-                        .as_deref()
-                        .is_some_and(|message| message.contains("returned an empty turn"));
-                if poisoned_empty_turn {
-                    inner.invalidate_harness_session(&chat_id);
-                } else {
-                    inner.remember_harness_session(&chat_id, session_id, &run_cwd, harness_id);
-                }
+                inner.remember_harness_session(&chat_id, session_id, &run_cwd);
             }
             AgentEvent::InputRequested { .. } => {
                 // Known-id guaranteed: the unknown-id twin was dropped above,
@@ -2566,20 +2249,6 @@ async fn drive_run(
                 }
                 inner.note_message(&chat_id, &folded_text(&folded));
             }
-            if let Some(mut mark) = doc.provider_session(harness_id.as_str())
-                && let Ok(entries) = doc.read_entries()
-                && let Some(last) = entries.last()
-            {
-                mark.seen = Some(last.id.clone());
-                if let Err(error) = doc.set_provider_session(harness_id.as_str(), &mark) {
-                    tracing::warn!(
-                        chat = %chat_id,
-                        provider = %harness_id.as_str(),
-                        error = %error,
-                        "failed to update provider transcript watermark"
-                    );
-                }
-            }
             if *status == DoneStatus::Completed {
                 // A cleanly completed turn resets the auto-resume revival
                 // budget: only consecutive crash-revive-crash cycles spend it.
@@ -2679,107 +2348,6 @@ mod tests {
             dir,
             SessionsEngine::new_for_tests("dev".into(), journal, registry),
         )
-    }
-
-    #[test]
-    fn resume_session_is_never_returned_to_a_different_harness_or_cwd() {
-        let (_dir, sessions) = test_engine();
-        lock(&sessions.inner.harness_sessions).insert(
-            "chat-1".into(),
-            HarnessSessionRef {
-                harness: HarnessId::ClaudeCode,
-                session_id: "claude-session".into(),
-                cwd: "/workspace".into(),
-            },
-        );
-        assert_eq!(
-            sessions
-                .inner
-                .resume_for("chat-1", "/workspace", HarnessId::ClaudeCode)
-                .as_deref(),
-            Some("claude-session")
-        );
-        assert!(
-            sessions
-                .inner
-                .resume_for("chat-1", "/workspace", HarnessId::Devin)
-                .is_none()
-        );
-        assert!(
-            sessions
-                .inner
-                .resume_for("chat-1", "/other", HarnessId::ClaudeCode)
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn provider_replay_includes_only_entries_after_the_seen_watermark() {
-        let doc = SessionDoc::init("chat-1").unwrap();
-        let message = |id: &str, role, text: &str| komet_doc::SessionMessageEntry {
-            id: id.into(),
-            role,
-            parts: vec![MessagePart::Text {
-                id: "t0".into(),
-                text: text.into(),
-            }],
-            created_at: 0,
-            device_id: "dev".into(),
-            status: Some(MessageStatus::Complete),
-            continuation_of: None,
-        };
-        doc.push_message(&message("user-1", MessageRole::User, "first prompt"))
-            .unwrap();
-        doc.push_message(&message(
-            "assistant-1",
-            MessageRole::Assistant,
-            "first answer",
-        ))
-        .unwrap();
-        doc.push_message(&message("user-2", MessageRole::User, "second prompt"))
-            .unwrap();
-        doc.push_message(&message(
-            "assistant-2",
-            MessageRole::Assistant,
-            "second answer",
-        ))
-        .unwrap();
-        doc.push_message(&message("user-3", MessageRole::User, "third prompt"))
-            .unwrap();
-        let replay = replay_prompt(&doc, Some("assistant-1"), "user-3", "third prompt").unwrap();
-        assert!(replay.contains("second prompt"));
-        assert!(replay.contains("second answer"));
-        assert!(replay.contains("third prompt"));
-        assert!(!replay.contains("first prompt"));
-        assert!(!replay.contains("first answer"));
-    }
-
-    #[test]
-    fn dropping_mcp_permission_cleans_up_pending_request_without_interrupting() {
-        let (_dir, sessions) = test_engine();
-        let pending: PendingPermissionChoices = Arc::default();
-        let (resolver, mut receiver) = oneshot::channel();
-        let request_id = "permission-1".to_string();
-        lock(&pending).insert(request_id.clone(), resolver);
-        let (engine_tx, mut engine_rx) = mpsc::unbounded_channel();
-
-        drop(McpPermissionCancellation {
-            pending: pending.clone(),
-            engine_tx,
-            sessions,
-            chat_id: "chat-1".into(),
-            request_id: request_id.clone(),
-        });
-
-        assert!(!lock(&pending).contains_key(&request_id));
-        assert!(receiver.try_recv().is_err());
-        assert!(matches!(
-            engine_rx.try_recv(),
-            Ok(AgentEvent::PermissionResolved {
-                request_id: resolved_id,
-                choice: komet_proto::PermissionChoice::Deny,
-            }) if resolved_id == request_id
-        ));
     }
 
     fn native_window(used: u64, input: u64, output: u64) -> AgentEvent {

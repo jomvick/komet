@@ -73,7 +73,7 @@ const { Agent, Cursor, FileCredentialStore, JsonlLocalAgentStore } = sdk;
 // it. Agents created before this scheme have no marker and fall back to the
 // SDK default store, which is where they live.
 const STATE_BASE =
-  process.env.KOMET_CURSOR_STATE_DIR || path.join(os.homedir(), ".komet", "cursor-state");
+  process.env.KOMET_CURSOR_STATE_DIR || process.env.ZERON_CURSOR_STATE_DIR || path.join(os.homedir(), ".komet", "cursor-state");
 
 function agentDirMarker(agentId) {
   return path.join(STATE_BASE, "by-agent", String(agentId));

@@ -32,28 +32,6 @@ fn harness() -> AcpHarness {
     AcpHarness::grok().with_executable(fixture_path())
 }
 
-/// Grok fixture with an extra env var pinned via a per-test shim (Rust test
-/// threads share one process env, so exporting it globally would leak).
-fn harness_with_env(name: &str, key: &str, value: &str) -> AcpHarness {
-    let fixture = fixture_path();
-    let path = fixture
-        .parent()
-        .expect("fixture dir")
-        .join(format!("fake-acp-{name}.sh"));
-    let body = format!(
-        "#!/bin/sh\n{key}={value} exec \"{}\" \"$@\"\n",
-        fixture.display()
-    );
-    std::fs::write(&path, body).expect("write grok scenario shim");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod grok scenario shim");
-    }
-    AcpHarness::grok().with_executable(path)
-}
-
 fn opencode_fixture_path() -> PathBuf {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -195,21 +173,6 @@ fn dones(events: &[AgentEvent]) -> Vec<(DoneStatus, Option<String>)> {
             _ => None,
         })
         .collect()
-}
-
-#[tokio::test]
-async fn retries_session_new_when_the_agent_is_still_warming_up() {
-    // opencode cold start: first session/new fails with -32603
-    // ServiceUnavailableError, the retry a few seconds later succeeds.
-    let (controls, _steer, _token) = controls();
-    let events = run_to_end(
-        &harness_with_env("warmup", "FAKE_ACP_SESSION_NEW_FAILS", "1"),
-        request("scenario:happy"),
-        controls,
-    )
-    .await;
-
-    assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
 }
 
 #[tokio::test]
@@ -759,37 +722,60 @@ async fn failed_load_falls_back_to_a_fresh_session() {
 #[tokio::test]
 async fn commands_discovery_scans_the_initialize_response() {
     let harness = harness();
-    let commands = harness.commands(None).await.expect("discovery");
-    assert!(commands.len() >= 2, "initialize ads: {commands:?}");
+    let commands = harness.commands().await.expect("discovery");
+    assert!(
+        commands.len() >= 2,
+        "static grok builtins + initialize ads: {commands:?}"
+    );
     assert!(commands.iter().any(|c| c.name == "compact"));
     let goal = commands.iter().find(|c| c.name == "goal").expect("goal");
     assert_eq!(goal.input_hint.as_deref(), Some("the goal"));
     // Cached: a second call must not respawn (same result, instant).
-    let again = harness.commands(None).await.expect("cached");
+    let again = harness.commands().await.expect("cached");
     assert_eq!(again, commands);
 }
 
 #[tokio::test]
-async fn grok_hermes_pi_commands_are_live_only() {
-    // The initialize response is authoritative: static TUI builtins must not
-    // reappear when the running CLI advertises a shorter list (issue #27).
-    for harness in [
-        AcpHarness::grok().with_executable(fixture_path()),
-        AcpHarness::hermes().with_executable(fixture_path()),
-        AcpHarness::pi().with_executable(fixture_path()),
-    ] {
-        let commands = harness.commands(None).await.expect("discovery");
-        let names: Vec<_> = commands.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, ["compact", "goal"]);
+async fn grok_hermes_pi_commands_include_static_builtins() {
+    let cases: [(_, &[&str]); 3] = [
+        (
+            AcpHarness::grok().with_executable(fixture_path()),
+            &["compact", "plan", "rewind", "clear"],
+        ),
+        (
+            AcpHarness::hermes().with_executable(fixture_path()),
+            &["reset", "tools", "compress", "steer"],
+        ),
+        (
+            AcpHarness::pi().with_executable(fixture_path()),
+            &["compact", "tree", "fork", "clone"],
+        ),
+    ];
+    for (harness, names) in cases {
+        let commands = harness.commands().await.expect("discovery");
+        for name in names {
+            assert!(
+                commands.iter().any(|c| c.name == *name),
+                "{name} missing from {:?}",
+                commands.iter().map(|c| &c.name).collect::<Vec<_>>()
+            );
+        }
     }
 }
 
 #[tokio::test]
-async fn opencode_commands_are_live_only() {
+async fn opencode_commands_discovery_includes_static_builtins() {
     let harness = opencode_harness();
-    let commands = harness.commands(None).await.expect("discovery");
-    let names: Vec<_> = commands.iter().map(|c| c.name.as_str()).collect();
-    assert_eq!(names, ["compact"]);
+    let commands = harness.commands().await.expect("discovery");
+    assert!(
+        commands.len() >= 8,
+        "opencode builtins present: len={}",
+        commands.len()
+    );
+    assert!(commands.iter().any(|c| c.name == "compact"));
+    assert!(commands.iter().any(|c| c.name == "diff"));
+    assert!(commands.iter().any(|c| c.name == "review"));
+    assert!(commands.iter().any(|c| c.name == "undo"));
 }
 
 #[tokio::test]
@@ -840,20 +826,6 @@ fn cline_descriptor_surface_matches_registry_expectations() {
     assert!(harness.supports_steering());
     assert_eq!(harness.steering_mode(), SteeringMode::TurnBoundary);
     assert!(harness.reasoning_levels().is_empty());
-}
-
-#[test]
-fn devin_and_copilot_descriptor_surfaces_match_registry_expectations() {
-    for (harness, id, name) in [
-        (AcpHarness::devin(), HarnessId::Devin, "Devin"),
-        (AcpHarness::copilot(), HarnessId::Copilot, "GitHub Copilot"),
-    ] {
-        assert_eq!(harness.id(), id);
-        assert_eq!(harness.display_name(), name);
-        assert!(harness.supports_steering());
-        assert_eq!(harness.steering_mode(), SteeringMode::TurnBoundary);
-        assert!(harness.reasoning_levels().is_empty());
-    }
 }
 
 #[tokio::test]

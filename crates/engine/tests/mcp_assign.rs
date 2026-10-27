@@ -151,8 +151,8 @@ async fn run_does_not_store_secrets_in_journal() {
     // Register mock harness for this test's registry (already default mock)
     // Dispatch through sessions engine directly
     let harness_req = run_request("do the thing");
-    // Dispatch a run; external MCP is injected only in-memory and secrets
-    // must still stay out of the journal / last_request.
+    // Dispatch a run; external MCP is no longer injected — secrets must
+    // still stay out of the journal / last_request.
     let run_id = core
         .sessions
         .dispatch(&chat_id, HarnessId::Mock, harness_req, Some("msg-1".into()))
@@ -209,14 +209,12 @@ async fn run_does_not_store_secrets_in_journal() {
 
     // Verify RunRequest's debug repr doesn't leak
     let last_req = core.sessions.last_request(&chat_id).unwrap();
-    assert_eq!(last_req.mcp_external.len(), 1);
-    assert_eq!(
-        last_req.mcp_external[0].resolved_env["GH_TOKEN"],
-        "ghp_secret_value_123"
+    assert!(
+        last_req.mcp_external.is_empty(),
+        "external MCP stays with the agent"
     );
     let req_debug = format!("{:?}", last_req);
     assert!(!req_debug.contains("super-secret-token-xyz"));
-    assert!(!req_debug.contains("ghp_secret_value_123"));
 
     core.shutdown().await;
     let _ = run_id;

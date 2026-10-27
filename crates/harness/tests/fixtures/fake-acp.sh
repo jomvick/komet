@@ -61,20 +61,6 @@ if has "$line" '"method":"session/load"'; then
     emit "{\"id\":$(rid "$line"),\"result\":{}}"
   fi
 elif has "$line" '"method":"session/new"'; then
-  # opencode's cold start answers session/new with -32603 while its model
-  # catalog warms up (observed ~20 s in, succeeds a few seconds later).
-  # FAKE_ACP_SESSION_NEW_FAILS = how many attempts to reject that way.
-  if [ "${FAKE_ACP_SESSION_NEW_FAILS:-0}" -gt 0 ]; then
-    cfile="${TMPDIR:-/tmp}/fake-acp-new-fails.$$"
-    trap 'rm -f "$cfile"' EXIT
-    n=$(cat "$cfile" 2>/dev/null || echo 0)
-    if [ "$n" -lt "$FAKE_ACP_SESSION_NEW_FAILS" ]; then
-      echo $((n + 1)) > "$cfile"
-      emit "{\"id\":$(rid "$line"),\"error\":{\"code\":-32603,\"message\":\"Internal error\",\"data\":{\"errorName\":\"ServiceUnavailableError\"}}}"
-      read -r line || exit 1
-      has "$line" '"method":"session/new"' || exit 1
-    fi
-  fi
   has "$line" '"mcpServers":[]' || exit 1
   # Advertise config options: model (current differs from the tests' request,
   # forcing a set) and thought_level (current high). The model config option

@@ -8,11 +8,12 @@
 //! - The terminal tab glyphs (`terminal`, `plus`, `close`) and the stop square
 //!   are ports of the hand-drawn inline SVGs in komet's `terminal-panel.tsx` /
 //!   `composer-actions.tsx`.
-//! - AI harness brand marks are sourced from LobeHub's
-//!   `@lobehub/icons-static-svg` package and embedded as static SVGs because
-//!   Komet renders with gpui. Claude's mark keeps its brand-orange tint.
-//!
-//! Integration marks are sourced from Simple Icons (CC0 1.0).
+//! - The harness brand marks (`claude-mark`, `openai-mark`, `cursor-mark`) are
+//!   ports of komet's `icons.tsx`. gpui tints SVGs with the text color, so the
+//!   Claude mark's brand orange is applied at the call site ([`CLAUDE_BRAND`]).
+//! - `opencode-mark` is the official opencode brand mark, and `cline-mark` the
+//!   official Cline brand mark, both sourced from the LobeHub icons set
+//!   (lobehub.com/icons, `@lobehub/icons-static-svg`).
 //!
 //! Icons render via [`icon`]: `icon(icons::PAPERCLIP).size(px(16.)).text_color(…)`.
 
@@ -61,15 +62,9 @@ icon_assets![
     // Hand-drawn git-branch glyph in the Solar Linear style (like the
     // terminal/plus/return ports) — the set has no branch icon.
     (GIT_BRANCH, "git-branch"),
-    (GITHUB, "github"),
     (PULL_REQUEST, "pull-request"),
-    (GIT_COMMIT, "git-commit"),
-    (FILE_DIFF, "file-diff"),
     // Compact history-ref glyphs, drawn in the same linear style.
     (CLOUD, "cloud"),
-    // Custom connector glyph: integrations need a distinct semantic from the
-    // generic agent/widget mark used by harness configuration.
-    (PLUG, "plug"),
     (TAG, "tag"),
     (SIDEBAR_MINIMALISTIC, "sidebar-minimalistic"),
     // Mirrored variant (komet window-controls.tsx `-scale-x-100`): the LEFT
@@ -96,11 +91,6 @@ icon_assets![
     // terminal/plus/return ports) — the set has no expand glyph.
     (EXPAND_ARROWS, "expand-arrows"),
     (COLLAPSE_ARROWS, "collapse-arrows"),
-    (WINDOW_MINIMIZE, "window-minimize"),
-    (WINDOW_MAXIMIZE, "window-maximize"),
-    (WINDOW_RESTORE, "window-restore"),
-    (WINDOW_CLOSE, "window-close"),
-    (THINKING, "thinking"),
     // Hand-drawn fold-all chevrons, drawn as a family with EXPAND_ARROWS
     // (same stroke, caps, 90° joints) — Solar has no unfold-less either.
     (FOLD_VERTICAL, "fold-vertical"),
@@ -115,7 +105,6 @@ icon_assets![
     (TUNING, "tuning"),
     (EYE, "eye"),
     (EYE_CLOSED, "eye-closed"),
-    (IMAGE, "image"),
     (PAPERCLIP, "paperclip"),
     (PEN, "pen"),
     (PIN, "pin"),
@@ -155,14 +144,13 @@ icon_assets![
     (STAR, "star"),
     (STAR_BOLD, "star-bold"),
     (KOMET_LOGO, "komet-logo"),
-    (COMPOSIO_MARK, "composio-mark"),
     // Blobatar animated avatar layers
     (BLOBATAR_BODY, "blobatar-body"),
     (BLOBATAR_EYE, "blobatar-eye"),
     (BLOBATAR_EYE_WINK, "blobatar-eye-wink"),
     (BLOBATAR_MOUTH, "blobatar-mouth"),
     (BLOBATAR_BLUSH, "blobatar-blush"),
-    // AI harness brand marks (LobeHub Icons; static SVG).
+    // Harness brand marks (icons.tsx).
     (CLAUDE_MARK, "claude-mark"),
     (OPENAI_MARK, "openai-mark"),
     (CURSOR_MARK, "cursor-mark"),
@@ -172,44 +160,12 @@ icon_assets![
     (ANTIGRAVITY_MARK, "antigravity-mark"),
     (PI_MARK, "pi-mark"),
     (CLINE_MARK, "cline-mark"),
-    (DEVIN_MARK, "devin-mark"),
-    (MUSE_MARK, "muse-mark"),
-    (COPILOT_MARK, "copilot-mark"),
-    // Common model providers (LobeHub Icons; static SVG).
-    (ANTHROPIC_MARK, "anthropic-mark"),
-    (GEMINI_MARK, "gemini-mark"),
-    (META_MARK, "meta-mark"),
-    (MISTRAL_MARK, "mistral-mark"),
-    (QWEN_MARK, "qwen-mark"),
-    (DEEPSEEK_MARK, "deepseek-mark"),
-    (COHERE_MARK, "cohere-mark"),
-    (MICROSOFT_AI_MARK, "microsoft-ai-mark"),
-    (NVIDIA_MARK, "nvidia-mark"),
-    (PERPLEXITY_MARK, "perplexity-mark"),
-    (OPENROUTER_MARK, "openrouter-mark"),
-    (XAI_MARK, "xai-mark"),
-    (GMAIL_MARK, "gmail-mark"),
-    (GOOGLE_CALENDAR_MARK, "google-calendar-mark"),
-    (GOOGLE_DRIVE_MARK, "google-drive-mark"),
-    (SLACK_MARK, "slack-mark"),
-    (NOTION_MARK, "notion-mark"),
-    (LINEAR_MARK, "linear-mark"),
-    (POSTHOG_MARK, "posthog-mark"),
-    (SENTRY_MARK, "sentry-mark"),
-    (STRIPE_MARK, "stripe-mark"),
-    (SUPABASE_MARK, "supabase-mark"),
-    (HUBSPOT_MARK, "hubspot-mark"),
-    (MICROSOFT_OUTLOOK_MARK, "microsoft-outlook-mark"),
 ];
 
 /// The Claude mark's brand orange (`#D97757`) — komet keeps it even on the
 /// monochrome surface.
 pub fn claude_brand() -> Hsla {
     gpui::rgb(0xD97757).into()
-}
-
-pub fn muse_brand() -> Hsla {
-    gpui::rgb(0x131313).into()
 }
 
 /// An icon element for an embedded asset path. Size and colour are set by the
@@ -234,32 +190,6 @@ mod tests {
             let text = std::str::from_utf8(&bytes).expect("icon svg is utf-8");
             assert!(text.contains("<svg"), "{path} is not an svg");
             assert!(text.contains("viewBox"), "{path} lacks a viewBox");
-        }
-    }
-
-    #[test]
-    fn linux_caption_icons_render_visible_pixels() {
-        let assets = Assets;
-        let renderer = gpui::SvgRenderer::new(std::sync::Arc::new(Assets));
-        for path in [
-            WINDOW_MINIMIZE,
-            WINDOW_MAXIMIZE,
-            WINDOW_RESTORE,
-            WINDOW_CLOSE,
-        ] {
-            let bytes = assets
-                .load(path)
-                .unwrap()
-                .unwrap_or_else(|| panic!("missing asset {path}"));
-            let image = renderer
-                .render_single_frame(&bytes, 1.0)
-                .unwrap_or_else(|error| panic!("failed to render {path}: {error}"));
-            assert!(
-                image
-                    .as_bytes(0)
-                    .is_some_and(|pixels| pixels.chunks_exact(4).any(|pixel| pixel[3] > 0)),
-                "{path} rendered without visible pixels"
-            );
         }
     }
 

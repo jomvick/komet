@@ -110,8 +110,9 @@ pub enum MessageStatus {
     Aborted,
 }
 
-/// Lifecycle of a spawned subagent, carried on its spawn chip. Ported
-/// alongside the fold logic below — Komet had no equivalent before this.
+/// Lifecycle of a spawned subagent, carried on its spawn chip. Ported from
+/// Comet (zeronsh/comet) alongside the fold logic below — Komet had no
+/// equivalent before this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum SubagentStatus {
@@ -122,7 +123,7 @@ pub enum SubagentStatus {
 
 /// One rendered part of an assistant message.
 ///
-/// Kept as a struct-variant enum (not a struct) for t3/Komet serde
+/// Kept as a struct-variant enum (not a struct) for t3/Comet serde
 /// compatibility: the JSON shape is `{"kind": "tool", ...}` per variant.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
@@ -165,7 +166,7 @@ pub enum MessagePart {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         diff_stats: Option<Vec<ToolDiffStat>>,
         /// Reserved in the schema alongside `subagent_status`/`subagent_tail`
-        /// (Komet's upstream shape) — the fold below matches a spawn chip by
+        /// (Comet's upstream shape) — the fold below matches a spawn chip by
         /// its own `id == parent_tool_use_id` plus `call.is_subagent_spawn()`,
         /// so this field isn't read by that path; kept for schema parity.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -189,16 +190,6 @@ pub enum MessagePart {
         questions: Vec<UserInputQuestion>,
         #[serde(default)]
         resolved: bool,
-    },
-    #[serde(rename_all = "camelCase")]
-    Switch {
-        id: String,
-        from: String,
-        to: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        from_harness: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        to_harness: Option<String>,
     },
     Error {
         id: String,
@@ -241,7 +232,6 @@ impl MessagePart {
             MessagePart::Text { id, .. }
             | MessagePart::Tool { id, .. }
             | MessagePart::Input { id, .. }
-            | MessagePart::Switch { id, .. }
             | MessagePart::Error { id, .. }
             | MessagePart::Permission { id, .. } => id,
         }
@@ -268,18 +258,6 @@ impl MessagePart {
             }
             MessagePart::Input { questions, .. } => {
                 serde_json::to_vec(questions).map_or(0, |v| v.len())
-            }
-            MessagePart::Switch {
-                from,
-                to,
-                from_harness,
-                to_harness,
-                ..
-            } => {
-                from.len()
-                    + to.len()
-                    + from_harness.as_ref().map_or(0, String::len)
-                    + to_harness.as_ref().map_or(0, String::len)
             }
             MessagePart::Error { message, .. } => message.len(),
             MessagePart::Permission { summary, .. } => summary.len(),
@@ -461,9 +439,9 @@ pub fn fold_event_into_parts(out: &mut Vec<MessagePart>, event: &AgentEvent) {
         }
         // Subagent-attributed CONTENT belongs to the subagent's own doc (the
         // engine routes it there); the parent doc keeps only the spawn chip —
-        // which this refreshes in place: LIFECYCLE ONLY. Ported with the
-        // "subagent steers: durable across harnesses" lifecycle — Komet had a
-        // no-op here before this (the schema
+        // which this refreshes in place: LIFECYCLE ONLY. Ported from Comet
+        // (zeronsh/comet, commit 454a1dd "subagent steers: durable across
+        // harnesses") — Komet had a no-op here before this (the schema
         // fields didn't exist yet either; see `subagent_status` above).
         AgentEvent::Subagent {
             parent_tool_use_id,

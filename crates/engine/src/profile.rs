@@ -150,7 +150,7 @@ struct LegacyUploadsOwner {
 }
 
 fn load_or_create_local_profile_id(data_dir: &Path) -> Result<String, EngineError> {
-    std::fs::create_dir_all(data_dir)?;
+    crate::ensure_private_dir(data_dir)?;
     let path = data_dir.join(LOCAL_PROFILE_FILE);
     match read_local_profile_id(&path) {
         Ok(id) => return Ok(id),

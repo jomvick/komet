@@ -51,6 +51,42 @@ fn build(value: usize) -> Widget {
 }
 
 #[test]
+fn kotlin_reference_covers_expected_categories() {
+    let source = r#"package demo.app
+
+import kotlin.math.max
+
+// quiet comment
+val limit = 42
+
+data class Widget(val field: Int) {
+    fun build(value: Int): String = "item-$value"
+}"#;
+    let spans = snapshot(source, "src/Main.kt");
+    for expected in [
+        "Keyword:package",
+        "Keyword:class",
+        "Keyword:data",
+        "Keyword:fun",
+        "Comment:// quiet comment",
+        "Type:Widget",
+        "Property:limit",
+        "Parameter:field",
+        "Parameter:value",
+        "Number:42",
+    ] {
+        assert!(
+            spans.iter().any(|span| span == expected),
+            "missing {expected}: {spans:#?}"
+        );
+    }
+    assert!(
+        spans.iter().any(|span| span.starts_with("String:\"item-")),
+        "missing string span: {spans:#?}"
+    );
+}
+
+#[test]
 fn every_span_is_valid_and_non_overlapping_for_incomplete_unicode() {
     let source = "fn café(value: &str) {\n let text = r#\"héllo\nworld\"#;\n if value {";
     let document = highlight(HighlightRequest {

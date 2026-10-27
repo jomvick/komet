@@ -15,12 +15,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use komet_proto::{
     FileSearchMatch, FolderEntry, FolderListing, GitHistoryCommit, GitHistoryPage, GitHistoryRef,
-    GitHistoryRefKind, GitHubChecks, GitHubPullRequest, GitHubStatus, Repo, RepoRef, Worktree,
+    GitHistoryRefKind, Repo, RepoRef, Worktree,
 };
 
 use crate::EngineError;
@@ -37,53 +36,8 @@ const FOLDER_LIST_MAX_ENTRIES: usize = 500;
 const FILE_SEARCH_MAX_RESULTS: usize = 8;
 /// A dead network mount must not leave the composer search spinning forever.
 const FILE_SEARCH_TIMEOUT: Duration = Duration::from_secs(6);
-const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
-const GIT_WORKTREE_TIMEOUT: Duration = Duration::from_secs(120);
-const GIT_NETWORK_TIMEOUT: Duration = Duration::from_secs(600);
 pub const GIT_HISTORY_DEFAULT_LIMIT: usize = 100;
 pub const GIT_HISTORY_MAX_LIMIT: usize = 200;
-
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum ProjectOpenTarget {
-    Cursor,
-    VsCode,
-    Files,
-}
-
-fn project_open_command(linux: &str, macos: &str, windows: &str) -> std::process::Command {
-    #[cfg(target_os = "macos")]
-    {
-        let mut command = std::process::Command::new("open");
-        command.args(["-a", macos, "--args"]);
-        command
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let _ = (linux, macos);
-        std::process::Command::new(windows)
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        let _ = (macos, windows);
-        std::process::Command::new(linux)
-    }
-}
-
-fn file_manager_command() -> std::process::Command {
-    #[cfg(target_os = "macos")]
-    {
-        std::process::Command::new("open")
-    }
-    #[cfg(target_os = "windows")]
-    {
-        std::process::Command::new("explorer.exe")
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        std::process::Command::new("xdg-open")
-    }
-}
 
 const ADJECTIVES: &[&str] = &[
     "swift", "calm", "bright", "bold", "keen", "brave", "clever", "lucky", "quiet", "warm", "cool",
@@ -159,38 +113,6 @@ impl Repos {
         }
     }
 
-    pub fn open_project(
-        &self,
-        repo_path: &Path,
-        target: ProjectOpenTarget,
-    ) -> Result<(), EngineError> {
-        let path = std::fs::canonicalize(repo_path)?;
-        if !path.is_dir() {
-            return Err(EngineError::Other(format!(
-                "project path is not a directory: {}",
-                path.display()
-            )));
-        }
-
-        let mut command = match target {
-            ProjectOpenTarget::Cursor => project_open_command("cursor", "Cursor", "cursor.exe"),
-            ProjectOpenTarget::VsCode => {
-                project_open_command("code", "Visual Studio Code", "code.exe")
-            }
-            ProjectOpenTarget::Files => file_manager_command(),
-        };
-        command
-            .arg(&path)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()
-            .map_err(|error| {
-                EngineError::Other(format!("could not open project in {target:?}: {error}"))
-            })?;
-        Ok(())
-    }
-
     // ── registry (repos.json) ───────────────────────────────────────────────
 
     fn registry_path(&self) -> PathBuf {
@@ -229,25 +151,11 @@ impl Repos {
         if let Some(cwd) = cwd {
             cmd.current_dir(cwd);
         }
-        cmd.stdin(std::process::Stdio::null()).kill_on_drop(true);
-        let operation = args.first().copied().unwrap_or("unknown");
-        let timeout = match operation {
-            "clone" | "fetch" => GIT_NETWORK_TIMEOUT,
-            "worktree" => GIT_WORKTREE_TIMEOUT,
-            _ => GIT_COMMAND_TIMEOUT,
-        };
-        let output = match tokio::time::timeout(timeout, cmd.output()).await {
-            Ok(Ok(output)) => output,
-            Ok(Err(error)) => {
-                return Err(EngineError::Other(format!("git spawn failed: {error}")));
-            }
-            Err(_) => {
-                return Err(EngineError::Other(format!(
-                    "git {operation} timed out after {} seconds",
-                    timeout.as_secs()
-                )));
-            }
-        };
+        cmd.stdin(std::process::Stdio::null());
+        let output = cmd
+            .output()
+            .await
+            .map_err(|e| EngineError::Other(format!("git spawn failed: {e}")))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let message = stderr.trim();
@@ -262,34 +170,6 @@ impl Repos {
             }));
         }
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    }
-
-    async fn remote_branches_matching(
-        &self,
-        cwd: &Path,
-        branch: &str,
-    ) -> Result<Vec<String>, EngineError> {
-        let remotes = self.git(&["remote"], Some(cwd)).await?;
-        let mut matches = Vec::new();
-        for remote in remotes.lines().filter(|remote| !remote.is_empty()) {
-            let remote_branch = format!("{remote}/{branch}");
-            if self
-                .git(
-                    &[
-                        "show-ref",
-                        "--verify",
-                        "--quiet",
-                        &format!("refs/remotes/{remote_branch}"),
-                    ],
-                    Some(cwd),
-                )
-                .await
-                .is_ok()
-            {
-                matches.push(remote_branch);
-            }
-        }
-        Ok(matches)
     }
 
     /// Async existence probe with a timeout: a wedged network mount just reads
@@ -418,14 +298,18 @@ impl Repos {
     /// `git clone <url>` under `{data_dir}/repos`. (Named `clone_repo` to keep
     /// `Clone::clone` unambiguous on the service handle.)
     pub async fn clone_repo(&self, url: &str) -> Result<Repo, EngineError> {
+        // The URL is an argument to `git clone`, so a leading `-` would turn it
+        // into a flag (`--upload-pack=<cmd>` executes a command). RPC callers
+        // must never be able to smuggle options into git's argv.
+        reject_option_like(url, "repository URL")?;
         let trimmed = url.trim().trim_end_matches('/');
-        let name = trimmed
+        let raw_name = trimmed
             .trim_end_matches(".git")
             .rsplit(['/', ':'])
             .next()
             .filter(|s| !s.is_empty())
-            .unwrap_or("repo")
-            .to_string();
+            .unwrap_or("repo");
+        let name = sanitize_repo_name(raw_name)?;
         let repos_dir = self.inner.data_dir.join("repos");
         let target = repos_dir.join(&name);
         if target.exists() {
@@ -443,20 +327,7 @@ impl Repos {
 
     /// `git init -b main` a fresh repository under `{data_dir}/repos`.
     pub async fn create(&self, name: &str) -> Result<Repo, EngineError> {
-        let clean: String = name
-            .trim()
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
-                    c
-                } else {
-                    '-'
-                }
-            })
-            .collect();
-        if clean.is_empty() || clean.chars().all(|c| c == '-' || c == '.') {
-            return Err(EngineError::Other("Invalid repository name".into()));
-        }
+        let clean = sanitize_repo_name(name)?;
         let target = self.inner.data_dir.join("repos").join(&clean);
         if target.exists() {
             return Err(EngineError::Other(format!(
@@ -526,203 +397,40 @@ impl Repos {
         Ok(names)
     }
 
-    /// Resolve the first configured GitHub remote to a credential-free HTTPS
-    /// repository URL. `origin` wins when several remotes point to GitHub.
-    pub async fn github_repo_url(&self, repo_path: &Path) -> Result<Option<String>, EngineError> {
-        let remotes = self.git(&["remote"], Some(repo_path)).await?;
-        let mut names: Vec<&str> = remotes.lines().filter(|name| !name.is_empty()).collect();
-        names.sort_by_key(|name| (*name != "origin", *name));
-        for name in names {
-            let Ok(remote_url) = self
-                .git(&["remote", "get-url", name], Some(repo_path))
-                .await
-            else {
-                continue;
-            };
-            if let Some(url) = github_url_from_remote(&remote_url) {
-                return Ok(Some(url));
-            }
-        }
-        Ok(None)
-    }
-
-    /// Everything the titlebar GitHub control shows for a checkout, or `None`
-    /// when no remote points at GitHub. The pull request comes from the
-    /// user's own `gh` CLI (its auth, never a Komet-held token) and is simply
-    /// absent when `gh` is missing, signed out, offline, or knows no PR.
-    pub async fn github_status(
-        &self,
-        repo_path: &Path,
-    ) -> Result<Option<GitHubStatus>, EngineError> {
-        self.github_status_for_branch(repo_path, None).await
-    }
-
-    /// GitHub panel data for the checked-out branch or a branch selected for
-    /// read-only browsing. The requested ref is validated and resolved before
-    /// it is passed to Git or `gh`.
-    pub async fn github_status_for_branch(
-        &self,
-        repo_path: &Path,
-        branch: Option<&str>,
-    ) -> Result<Option<GitHubStatus>, EngineError> {
-        let Some(repo_url) = self.github_repo_url(repo_path).await? else {
-            return Ok(None);
-        };
-        let checkout_branch = self.current_branch(repo_path).await?;
-        let branch = match branch {
-            Some(branch) => {
-                if !self
-                    .branches(repo_path)
-                    .await?
-                    .iter()
-                    .any(|available| available == branch)
-                {
-                    return Err(EngineError::Other(
-                        "Branch is not available in this repository".into(),
-                    ));
-                }
-                self.git(&["check-ref-format", "--branch", branch], Some(repo_path))
-                    .await
-                    .map_err(|_| EngineError::Other("Invalid branch name".into()))?;
-                let revision = format!("{branch}^{{commit}}");
-                self.git(
-                    &["rev-parse", "--verify", "--quiet", &revision],
-                    Some(repo_path),
-                )
-                .await
-                .map_err(|_| EngineError::Other("Branch is not available locally".into()))?;
-                branch.to_string()
-            }
-            None => checkout_branch.clone(),
-        };
-        let detached = branch == "HEAD";
-        let read_only_branch = branch != checkout_branch;
-        let (pull_request, recent_commits) = tokio::join!(
-            async {
-                if detached {
-                    None
-                } else {
-                    github_pull_request(repo_path, Some(&branch)).await
-                }
-            },
-            self.recent_commits(repo_path, GITHUB_RECENT_COMMITS, &branch),
-        );
-        let base = self
-            .changes_base(
-                repo_path,
-                &branch,
-                pull_request.as_ref().map(|pr| pr.base_ref.as_str()),
-            )
-            .await;
-        let diff_args = if read_only_branch {
-            vec!["diff", "--shortstat", base.as_str(), branch.as_str()]
-        } else {
-            vec!["diff", "--shortstat", base.as_str()]
-        };
-        let (insertions, deletions) = self
-            .git(&diff_args, Some(repo_path))
-            .await
-            .map(|out| parse_shortstat(&out))
-            .unwrap_or_default();
-        Ok(Some(GitHubStatus {
-            repo_url,
-            branch,
-            pull_request,
-            recent_commits,
-            insertions,
-            deletions,
-        }))
-    }
-
-    /// Latest `limit` commits reachable from `revision`.
-    async fn recent_commits(
-        &self,
-        repo_path: &Path,
-        limit: usize,
-        revision: &str,
-    ) -> Vec<GitHistoryCommit> {
-        let count = format!("-n{limit}");
-        self.git(
-            &[
-                "log",
-                "--no-color",
-                "--no-show-signature",
-                &count,
-                "--format=%H%x00%P%x00%s%x00%an%x00%ae%x00%aI%x00",
-                revision,
-            ],
-            Some(repo_path),
-        )
-        .await
-        .map(|out| parse_history_log(&out, &HashMap::new()))
-        .unwrap_or_default()
-    }
-
-    /// The commit the branch's changes are measured from: the merge base with
-    /// the PR base, else with `origin/HEAD`, else the current checkout HEAD.
-    async fn changes_base(
-        &self,
-        repo_path: &Path,
-        revision: &str,
-        pr_base: Option<&str>,
-    ) -> String {
-        let mut candidates = Vec::new();
-        if let Some(base) = pr_base.filter(|base| !base.is_empty()) {
-            candidates.push(format!("origin/{base}"));
-        }
-        if let Ok(default) = self
-            .git(
-                &["rev-parse", "--abbrev-ref", "origin/HEAD"],
-                Some(repo_path),
-            )
-            .await
-        {
-            candidates.push(default);
-        }
-        for candidate in candidates {
-            if let Ok(base) = self
-                .git(&["merge-base", revision, &candidate], Some(repo_path))
-                .await
-                && !base.is_empty()
-            {
-                return base;
-            }
-        }
-        "HEAD".to_string()
-    }
-
     /// [`Self::branches`] enriched with checkout state: which branch the MAIN
     /// folder has checked out (`current`) and which branches are materialized
     /// as linked worktrees (`worktree_path`). Feeds the composer's ref picker
     /// and its checkout-kind selector.
     pub async fn refs(&self, repo_path: &Path) -> Result<Vec<RepoRef>, EngineError> {
         let names = self.branches(repo_path).await?;
-        let current = self.current_branch(repo_path).await?;
+        let current = self.current_branch(repo_path).await.ok();
         // `git worktree list --porcelain`: stanzas of `worktree <path>` /
         // `HEAD <sha>` / `branch refs/heads/<name>`. The first stanza is the
         // main checkout — excluded (it's `current`, not a linked worktree).
         let mut worktrees: std::collections::HashMap<String, String> =
             std::collections::HashMap::new();
-        let out = self
+        if let Ok(out) = self
             .git(&["worktree", "list", "--porcelain"], Some(repo_path))
-            .await?;
-        let mut stanza = 0usize;
-        let mut path: Option<String> = None;
-        for line in out.lines().map(str::trim) {
-            if let Some(p) = line.strip_prefix("worktree ") {
-                stanza += 1;
-                // The first stanza is the main checkout, not a linked tree.
-                path = (stanza > 1).then(|| p.to_string());
-            } else if let Some(branch) = line.strip_prefix("branch refs/heads/")
-                && let Some(path) = path.take()
-            {
-                worktrees.insert(branch.to_string(), path);
+            .await
+        {
+            let mut stanza = 0usize;
+            let mut path: Option<String> = None;
+            for line in out.lines().map(str::trim) {
+                if let Some(p) = line.strip_prefix("worktree ") {
+                    stanza += 1;
+                    // The first stanza is the main checkout, not a linked tree.
+                    path = (stanza > 1).then(|| p.to_string());
+                } else if let Some(branch) = line.strip_prefix("branch refs/heads/")
+                    && let Some(path) = path.take()
+                {
+                    worktrees.insert(branch.to_string(), path);
+                }
             }
         }
         Ok(names
             .into_iter()
             .map(|name| RepoRef {
-                current: current == name,
+                current: current.as_deref() == Some(name.as_str()),
                 worktree_path: worktrees.get(&name).cloned(),
                 name,
             })
@@ -854,14 +562,9 @@ impl Repos {
     /// already checked out in another worktree fails with git's own message.
     /// Returns the resulting current branch.
     pub async fn switch_ref(&self, cwd: &Path, ref_name: &str) -> Result<String, EngineError> {
-        if ref_name == "HEAD" {
-            return Err(EngineError::Other(
-                "Detached HEAD is not a selectable branch".into(),
-            ));
-        }
-        self.git(&["check-ref-format", "--branch", ref_name], Some(cwd))
-            .await
-            .map_err(|_| EngineError::Other("Invalid branch name".into()))?;
+        // A ref is passed to `git checkout`; `-b`/`--orphan`-style values would
+        // be parsed as flags instead.
+        reject_option_like(ref_name, "ref")?;
         let local = self
             .git(
                 &[
@@ -877,18 +580,25 @@ impl Repos {
         if local {
             self.git(&["checkout", ref_name], Some(cwd)).await?;
         } else {
-            let matches = self.remote_branches_matching(cwd, ref_name).await?;
-            match matches.as_slice() {
-                [remote_branch] => {
-                    self.git(&["checkout", "--track", remote_branch], Some(cwd))
-                        .await?;
-                }
-                [] => return Err(EngineError::Other(format!("Branch not found: {ref_name}"))),
-                _ => {
-                    return Err(EngineError::Other(format!(
-                        "Branch '{ref_name}' exists on multiple remotes; create a local branch or remove the ambiguity first"
-                    )));
-                }
+            let remote = format!("origin/{ref_name}");
+            let has_remote = self
+                .git(
+                    &[
+                        "show-ref",
+                        "--verify",
+                        "--quiet",
+                        &format!("refs/remotes/{remote}"),
+                    ],
+                    Some(cwd),
+                )
+                .await
+                .is_ok();
+            if has_remote {
+                self.git(&["checkout", "--track", &remote], Some(cwd))
+                    .await?;
+            } else {
+                // Unknown ref: let git produce the authoritative error.
+                self.git(&["checkout", ref_name], Some(cwd)).await?;
             }
         }
         let out = self.git(&["branch", "--show-current"], Some(cwd)).await?;
@@ -905,43 +615,7 @@ impl Repos {
         repo_path: &Path,
         branch: &str,
     ) -> Result<Worktree, EngineError> {
-        if branch == "HEAD" {
-            return Err(EngineError::Other(
-                "Detached HEAD is not a selectable worktree base".into(),
-            ));
-        }
-        self.git(&["check-ref-format", "--branch", branch], Some(repo_path))
-            .await
-            .map_err(|_| EngineError::Other("Invalid branch name".into()))?;
-        let local_branch = self
-            .git(
-                &[
-                    "show-ref",
-                    "--verify",
-                    "--quiet",
-                    &format!("refs/heads/{branch}"),
-                ],
-                Some(repo_path),
-            )
-            .await
-            .is_ok();
-        let base_ref = if local_branch {
-            branch.to_string()
-        } else {
-            match self
-                .remote_branches_matching(repo_path, branch)
-                .await?
-                .as_slice()
-            {
-                [remote_branch] => remote_branch.clone(),
-                [] => return Err(EngineError::Other(format!("Branch not found: {branch}"))),
-                _ => {
-                    return Err(EngineError::Other(format!(
-                        "Branch '{branch}' exists on multiple remotes; create a local branch or remove the ambiguity first"
-                    )));
-                }
-            }
-        };
+        reject_option_like(branch, "branch")?;
         let repo_name = repo_path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -949,7 +623,12 @@ impl Repos {
         let base = self.inner.worktrees_root.join(&repo_name);
         std::fs::create_dir_all(&base)?;
         // Auto-generate a name colliding with neither an existing dir nor branch.
-        let existing: HashSet<String> = self.branches(repo_path).await?.into_iter().collect();
+        let existing: HashSet<String> = self
+            .branches(repo_path)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
         let mut name = None;
         for attempt in 0..50u64 {
             let seed = std::time::SystemTime::now()
@@ -979,7 +658,7 @@ impl Repos {
                 "-b",
                 &branch_name,
                 &path.to_string_lossy(),
-                &base_ref,
+                branch,
             ],
             Some(repo_path),
         )
@@ -1056,6 +735,49 @@ impl Repos {
         self.current_branch(worktree_path).await
     }
 
+    /// Resolve a worktree path that is safe to delete: it must exist, live under
+    /// the configured worktrees root, and be registered by `repo_path`. Anything
+    /// else is rejected — the caller-supplied path comes straight from RPC, so
+    /// an unvalidated fallback to `remove_dir_all` would delete an arbitrary
+    /// directory.
+    async fn authorize_worktree_delete(
+        &self,
+        repo_path: &Path,
+        worktree_path: &Path,
+    ) -> Result<PathBuf, EngineError> {
+        let root = std::fs::canonicalize(&self.inner.worktrees_root)
+            .unwrap_or_else(|_| self.inner.worktrees_root.clone());
+        let target = std::fs::canonicalize(worktree_path).map_err(|_| {
+            EngineError::Other(format!(
+                "worktree does not exist: {}",
+                worktree_path.display()
+            ))
+        })?;
+        if !target.starts_with(&root) {
+            return Err(EngineError::Other(format!(
+                "refusing to delete {}: outside the worktrees root {}",
+                target.display(),
+                root.display()
+            )));
+        }
+        let listed = self
+            .git(&["worktree", "list", "--porcelain"], Some(repo_path))
+            .await?;
+        let registered = listed
+            .lines()
+            .filter_map(|line| line.strip_prefix("worktree "))
+            .filter_map(|path| std::fs::canonicalize(path).ok())
+            .any(|path| path == target);
+        if !registered {
+            return Err(EngineError::Other(format!(
+                "refusing to delete {}: not a worktree of {}",
+                target.display(),
+                repo_path.display()
+            )));
+        }
+        Ok(target)
+    }
+
     /// Best-effort worktree removal (if it still exists), then prune stale refs.
     /// Deletes the worktree's branch ONLY when komet created it (`komet/…`) — the
     /// user may have checked out their own branch inside the worktree.
@@ -1065,47 +787,31 @@ impl Repos {
         worktree_path: &Path,
     ) -> Result<(), EngineError> {
         if !worktree_path.exists() {
-            self.git(&["worktree", "prune"], Some(repo_path)).await?;
+            // Nothing to remove: just drop stale refs.
+            let _ = self.git(&["worktree", "prune"], Some(repo_path)).await;
             return Ok(());
         }
-
-        let requested = std::fs::canonicalize(worktree_path)?;
-        let worktrees = self
-            .git(&["worktree", "list", "--porcelain"], Some(repo_path))
+        // Validate BEFORE touching anything: `repo_path` and `worktree_path` are
+        // RPC inputs, and the fallback below removes a whole directory tree.
+        let target = self
+            .authorize_worktree_delete(repo_path, worktree_path)
             .await?;
-        let mut stanza = 0usize;
-        let mut is_linked_worktree = false;
-        for line in worktrees.lines() {
-            if let Some(path) = line.strip_prefix("worktree ") {
-                stanza += 1;
-                if stanza > 1 && std::fs::canonicalize(path).ok().as_ref() == Some(&requested) {
-                    is_linked_worktree = true;
-                    break;
-                }
-            }
+        let branch = self.current_branch(&target).await.unwrap_or_default();
+        let removed = self
+            .git(
+                &["worktree", "remove", "--force", &target.to_string_lossy()],
+                Some(repo_path),
+            )
+            .await;
+        if removed.is_err() {
+            // git refused (or the dir is half-gone) — delete the folder directly.
+            // `target` is already canonical, under the worktrees root, and known
+            // to this repository.
+            let _ = std::fs::remove_dir_all(&target);
         }
-        if !is_linked_worktree {
-            return Err(EngineError::Other(format!(
-                "Not a linked worktree: {}",
-                requested.display()
-            )));
-        }
-
-        let branch = self.current_branch(&requested).await?;
-        self.git(
-            &[
-                "worktree",
-                "remove",
-                "--force",
-                &requested.to_string_lossy(),
-            ],
-            Some(repo_path),
-        )
-        .await?;
-        self.git(&["worktree", "prune"], Some(repo_path)).await?;
-        if branch.starts_with("komet/") && self.branch_exists(repo_path, &branch).await {
-            self.git(&["branch", "-D", "--", &branch], Some(repo_path))
-                .await?;
+        let _ = self.git(&["worktree", "prune"], Some(repo_path)).await;
+        if branch.starts_with("komet/") {
+            let _ = self.git(&["branch", "-D", &branch], Some(repo_path)).await;
         }
         Ok(())
     }
@@ -1445,139 +1151,6 @@ fn bounded_field(value: &str, max_chars: usize) -> String {
     value.chars().take(max_chars).collect()
 }
 
-fn github_url_from_remote(remote: &str) -> Option<String> {
-    let remote = remote.trim();
-    if remote.is_empty() || remote.contains(['?', '#']) {
-        return None;
-    }
-
-    let (host, path) = if let Some((scheme, rest)) = remote.split_once("://") {
-        if !matches!(scheme.to_ascii_lowercase().as_str(), "https" | "ssh") {
-            return None;
-        }
-        let (authority, path) = rest.split_once('/')?;
-        let host_port = authority.rsplit('@').next()?;
-        // `ssh://git@github.com:22/…` — only the hostname is compared.
-        let host = match host_port.rsplit_once(':') {
-            Some((host, port)) if port.bytes().all(|b| b.is_ascii_digit()) => host,
-            _ => host_port,
-        };
-        (host, path)
-    } else {
-        let (authority, path) = remote.split_once(':')?;
-        let host = authority.rsplit('@').next()?;
-        (host, path)
-    };
-    if !host.eq_ignore_ascii_case("github.com") {
-        return None;
-    }
-
-    let path = path.trim_matches('/');
-    let path = path.strip_suffix(".git").unwrap_or(path);
-    let mut parts = path.split('/');
-    let owner = parts.next()?;
-    let repo = parts.next()?;
-    let valid_segment = |segment: &str| {
-        !segment.is_empty()
-            && segment != "."
-            && segment != ".."
-            && segment
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
-    };
-    if parts.next().is_some() || !valid_segment(owner) || !valid_segment(repo) {
-        return None;
-    }
-
-    Some(format!("https://github.com/{owner}/{repo}"))
-}
-
-const GITHUB_RECENT_COMMITS: usize = 5;
-const GH_TIMEOUT: Duration = Duration::from_secs(8);
-
-/// `gh pr view` for the checked-out branch. Every failure (no `gh`, signed
-/// out, offline, no PR, timeout) reads as "no pull request".
-async fn github_pull_request(repo_path: &Path, branch: Option<&str>) -> Option<GitHubPullRequest> {
-    let mut cmd = tokio::process::Command::new("gh");
-    cmd.args(["pr", "view"]);
-    if let Some(branch) = branch {
-        cmd.arg(branch);
-    }
-    cmd.args([
-        "--json",
-        "number,title,url,state,isDraft,baseRefName,statusCheckRollup,reviewDecision",
-    ])
-    .current_dir(repo_path)
-    .env("GH_PROMPT_DISABLED", "1")
-    .env("GH_NO_UPDATE_NOTIFIER", "1")
-    .stdin(std::process::Stdio::null())
-    .kill_on_drop(true);
-    let output = tokio::time::timeout(GH_TIMEOUT, cmd.output())
-        .await
-        .ok()?
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    parse_gh_pull_request(&output.stdout)
-}
-
-fn parse_gh_pull_request(json: &[u8]) -> Option<GitHubPullRequest> {
-    let value: serde_json::Value = serde_json::from_slice(json).ok()?;
-    let mut checks = GitHubChecks::default();
-    for check in value["statusCheckRollup"].as_array().into_iter().flatten() {
-        // CheckRun carries `status` + `conclusion`; StatusContext only `state`.
-        let finished = check["status"]
-            .as_str()
-            .is_none_or(|status| status.eq_ignore_ascii_case("COMPLETED"));
-        let outcome = check["conclusion"]
-            .as_str()
-            .filter(|c| !c.is_empty())
-            .or_else(|| check["state"].as_str())
-            .unwrap_or("")
-            .to_ascii_uppercase();
-        match outcome.as_str() {
-            _ if !finished => checks.pending += 1,
-            "SUCCESS" | "NEUTRAL" | "SKIPPED" => checks.passed += 1,
-            "" | "PENDING" | "EXPECTED" => checks.pending += 1,
-            _ => checks.failed += 1,
-        }
-    }
-    Some(GitHubPullRequest {
-        number: value["number"].as_u64()?,
-        title: value["title"].as_str()?.to_string(),
-        url: value["url"].as_str()?.to_string(),
-        state: value["state"].as_str().unwrap_or("OPEN").to_string(),
-        is_draft: value["isDraft"].as_bool().unwrap_or(false),
-        base_ref: value["baseRefName"].as_str().unwrap_or("").to_string(),
-        checks,
-        review_decision: value["reviewDecision"]
-            .as_str()
-            .filter(|decision| !decision.is_empty())
-            .map(str::to_string),
-    })
-}
-
-/// `(insertions, deletions)` from `git diff --shortstat` output.
-fn parse_shortstat(out: &str) -> (u64, u64) {
-    let mut stats = (0, 0);
-    for part in out.split(',') {
-        let mut words = part.split_whitespace();
-        let (Some(count), Some(kind)) = (words.next(), words.next()) else {
-            continue;
-        };
-        let Ok(count) = count.parse::<u64>() else {
-            continue;
-        };
-        if kind.starts_with("insertion") {
-            stats.0 = count;
-        } else if kind.starts_with("deletion") {
-            stats.1 = count;
-        }
-    }
-    stats
-}
-
 fn parse_history_log(
     output: &str,
     refs_by_sha: &HashMap<String, Vec<GitHistoryRef>>,
@@ -1677,6 +1250,44 @@ fn absolutize(path: &Path) -> PathBuf {
     }
 }
 
+/// Reject a value that a CLI would parse as an option. URLs, refs and branch
+/// names arrive over RPC and are passed as argv entries to `git`; a leading
+/// `-` would silently turn them into flags (`--upload-pack=<cmd>` runs a
+/// command, `-b` rewrites the checkout).
+fn reject_option_like(value: &str, what: &str) -> Result<(), EngineError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(EngineError::Other(format!("{what} must not be empty")));
+    }
+    if trimmed.starts_with('-') {
+        return Err(EngineError::Other(format!(
+            "invalid {what}: {trimmed} (must not start with '-')"
+        )));
+    }
+    Ok(())
+}
+
+/// Turn an arbitrary repository name (or the tail of a clone URL) into a
+/// single safe path component: alphanumerics plus `.`, `_`, `-`, with at least
+/// one alphanumeric so `.`, `..` and `...` can never name a directory.
+fn sanitize_repo_name(raw: &str) -> Result<String, EngineError> {
+    let clean: String = raw
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if clean.is_empty() || !clean.chars().any(|c| c.is_ascii_alphanumeric()) {
+        return Err(EngineError::Other("Invalid repository name".into()));
+    }
+    Ok(clean)
+}
+
 pub(crate) fn hex(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
@@ -1690,233 +1301,86 @@ mod tests {
     use super::*;
 
     #[test]
-    fn project_open_targets_use_the_rpc_names() {
-        assert!(matches!(
-            serde_json::from_str::<ProjectOpenTarget>("\"vsCode\""),
-            Ok(ProjectOpenTarget::VsCode)
-        ));
-        assert!(matches!(
-            serde_json::from_str::<ProjectOpenTarget>("\"files\""),
-            Ok(ProjectOpenTarget::Files)
-        ));
+    fn repo_names_are_single_safe_components() {
+        assert_eq!(sanitize_repo_name("komet").unwrap(), "komet");
+        assert_eq!(sanitize_repo_name("my repo").unwrap(), "my-repo");
+        assert_eq!(sanitize_repo_name("..\\..\\evil").unwrap(), "..-..-evil");
+        assert!(sanitize_repo_name("..").is_err());
+        assert!(sanitize_repo_name("/").is_err());
     }
 
     #[test]
-    fn opening_a_missing_project_returns_an_error() {
-        let data = tempfile::tempdir().unwrap();
-        let repos = Repos::new(data.path(), "device");
-        let missing = data.path().join("missing-project");
-
-        assert!(
-            repos
-                .open_project(&missing, ProjectOpenTarget::Cursor)
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn github_remote_urls_normalize_https_and_ssh_forms() {
-        for remote in [
-            "https://github.com/owner/repo",
-            "https://github.com/owner/repo.git",
-            "ssh://git@github.com/owner/repo.git",
-            "git@github.com:owner/repo.git",
-            "ssh://git@github.com:22/owner/repo.git",
-            "https://github.com:443/owner/repo.git",
-        ] {
-            assert_eq!(
-                github_url_from_remote(remote).as_deref(),
-                Some("https://github.com/owner/repo"),
-                "{remote}"
-            );
-        }
-    }
-
-    #[test]
-    fn github_remote_urls_strip_credentials_and_reject_other_hosts() {
-        assert_eq!(
-            github_url_from_remote("https://local-user@github.com/owner/repo.git").as_deref(),
-            Some("https://github.com/owner/repo")
-        );
-        for remote in [
-            "https://gitlab.com/owner/repo.git",
-            "https://github.com.evil.test/owner/repo.git",
-            "ssh://git@github.com:abc/owner/repo.git",
-            "https://github.com/owner",
-            "https://github.com/owner/repo/tree/main",
-            "https://github.com/owner/repo?token=secret",
-            "file:///owner/repo",
-        ] {
-            assert_eq!(github_url_from_remote(remote), None, "{remote}");
-        }
+    fn rpc_supplied_arguments_cannot_become_git_flags() {
+        assert!(reject_option_like("https://example.com/r.git", "url").is_ok());
+        assert!(reject_option_like("--upload-pack=/bin/sh", "url").is_err());
+        assert!(reject_option_like(" -b", "branch").is_err());
+        assert!(reject_option_like("   ", "ref").is_err());
     }
 
     #[tokio::test]
-    async fn github_repo_url_prefers_origin_and_returns_none_without_a_github_remote() {
+    async fn clone_repo_rejects_option_shaped_urls_before_spawning_git() {
         let data = tempfile::tempdir().unwrap();
-        let root = tempfile::tempdir().unwrap();
-        let repos =
-            Repos::with_worktrees_root(data.path(), "device", data.path().join("worktrees"));
-        repos
-            .git(&["init", "--quiet"], Some(root.path()))
+        let repos = Repos::new(data.path(), "dev");
+        let err = repos
+            .clone_repo("--upload-pack=touch /tmp/komet-pwned")
             .await
-            .unwrap();
-
-        assert_eq!(repos.github_repo_url(root.path()).await.unwrap(), None);
-
-        repos
-            .git(
-                &["remote", "add", "origin", "git@github.com:owner/origin.git"],
-                Some(root.path()),
-            )
-            .await
-            .unwrap();
-        repos
-            .git(
-                &[
-                    "remote",
-                    "add",
-                    "upstream",
-                    "https://github.com/owner/upstream.git",
-                ],
-                Some(root.path()),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            repos.github_repo_url(root.path()).await.unwrap().as_deref(),
-            Some("https://github.com/owner/origin")
-        );
-    }
-
-    #[test]
-    fn gh_pull_request_json_counts_check_outcomes() {
-        let json = br#"{
-            "number": 52, "title": "feat(ui): add GitHub", "url": "https://github.com/o/r/pull/52",
-            "state": "OPEN", "isDraft": false, "baseRefName": "main",
-            "reviewDecision": "REVIEW_REQUIRED",
-            "statusCheckRollup": [
-                {"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS"},
-                {"__typename": "CheckRun", "status": "IN_PROGRESS", "conclusion": ""},
-                {"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "FAILURE"},
-                {"__typename": "StatusContext", "state": "PENDING"},
-                {"__typename": "StatusContext", "state": "SUCCESS"}
-            ]
-        }"#;
-        let pr = parse_gh_pull_request(json).unwrap();
-        assert_eq!(pr.number, 52);
-        assert_eq!(pr.base_ref, "main");
-        assert_eq!(pr.review_decision.as_deref(), Some("REVIEW_REQUIRED"));
-        assert_eq!(
-            pr.checks,
-            GitHubChecks {
-                passed: 2,
-                failed: 1,
-                pending: 2
-            }
-        );
-        assert_eq!(parse_gh_pull_request(b"not json"), None);
-    }
-
-    #[test]
-    fn shortstat_parses_insertions_and_deletions() {
-        assert_eq!(
-            parse_shortstat(" 3 files changed, 280 insertions(+), 6 deletions(-)"),
-            (280, 6)
-        );
-        assert_eq!(parse_shortstat(" 1 file changed, 1 insertion(+)"), (1, 0));
-        assert_eq!(parse_shortstat(""), (0, 0));
+            .expect_err("option-shaped URL must be refused");
+        assert!(err.to_string().contains("must not start with '-'"));
+        assert!(!Path::new("/tmp/komet-pwned").exists());
     }
 
     #[tokio::test]
-    async fn github_status_reports_branch_commits_and_uncommitted_changes() {
+    async fn delete_worktree_refuses_a_directory_outside_the_worktrees_root() {
         let data = tempfile::tempdir().unwrap();
-        let root = tempfile::tempdir().unwrap();
-        let repos =
-            Repos::with_worktrees_root(data.path(), "device", data.path().join("worktrees"));
-        repos
-            .git(&["init", "--quiet", "-b", "feature"], Some(root.path()))
-            .await
-            .unwrap();
-        assert_eq!(repos.github_status(root.path()).await.unwrap(), None);
-
-        repos
-            .git(
-                &["remote", "add", "origin", "git@github.com:owner/repo.git"],
-                Some(root.path()),
-            )
-            .await
-            .unwrap();
-        std::fs::write(root.path().join("a.txt"), "one\n").unwrap();
-        repos
-            .git(&["add", "a.txt"], Some(root.path()))
-            .await
-            .unwrap();
-        repos
-            .git(
-                &[
-                    "-c",
-                    "user.name=T",
-                    "-c",
-                    "user.email=t@example.com",
-                    "commit",
-                    "--quiet",
-                    "-m",
-                    "first commit",
-                ],
-                Some(root.path()),
-            )
-            .await
-            .unwrap();
-        repos
-            .git(&["branch", "review"], Some(root.path()))
-            .await
-            .unwrap();
-        std::fs::write(root.path().join("a.txt"), "branch version\n").unwrap();
-        repos
-            .git(&["add", "a.txt"], Some(root.path()))
-            .await
-            .unwrap();
-        repos
-            .git(
-                &[
-                    "-c",
-                    "user.name=T",
-                    "-c",
-                    "user.email=t@example.com",
-                    "commit",
-                    "--quiet",
-                    "-m",
-                    "second commit",
-                ],
-                Some(root.path()),
-            )
-            .await
-            .unwrap();
-        std::fs::write(root.path().join("a.txt"), "two\nthree\n").unwrap();
-
-        let status = repos.github_status(root.path()).await.unwrap().unwrap();
-        assert_eq!(status.repo_url, "https://github.com/owner/repo");
-        assert_eq!(status.branch, "feature");
-        assert_eq!(status.recent_commits.len(), 2);
-        assert_eq!(status.recent_commits[0].subject, "second commit");
-        assert_eq!((status.insertions, status.deletions), (2, 1));
-
-        let review = repos
-            .github_status_for_branch(root.path(), Some("review"))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(review.branch, "review");
-        assert_eq!(review.recent_commits.len(), 1);
-        assert_eq!(review.recent_commits[0].subject, "first commit");
-        assert_eq!(repos.current_branch(root.path()).await.unwrap(), "feature");
+        let worktrees = data.path().join("worktrees");
+        std::fs::create_dir_all(&worktrees).unwrap();
+        let repo = tempfile::tempdir().unwrap();
         assert!(
-            repos
-                .github_status_for_branch(root.path(), Some("not-a-branch"))
-                .await
-                .is_err()
+            std::process::Command::new("git")
+                .arg("init")
+                .arg(repo.path())
+                .status()
+                .unwrap()
+                .success()
         );
+        // A directory unrelated to the repository, outside the worktrees root.
+        let victim = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(victim.path().join("keep")).unwrap();
+        std::fs::write(victim.path().join("keep/file.txt"), b"keep").unwrap();
+
+        let repos = Repos::with_worktrees_root(data.path(), "dev", worktrees.clone());
+        let err = repos
+            .delete_worktree(repo.path(), victim.path())
+            .await
+            .expect_err("arbitrary directory must be refused");
+        assert!(err.to_string().contains("outside the worktrees root"));
+        assert!(victim.path().join("keep/file.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn delete_worktree_refuses_an_unregistered_directory_under_the_root() {
+        let data = tempfile::tempdir().unwrap();
+        let worktrees = data.path().join("worktrees");
+        let stray = worktrees.join("stray");
+        std::fs::create_dir_all(&stray).unwrap();
+        std::fs::write(stray.join("file.txt"), b"keep").unwrap();
+        let repo = tempfile::tempdir().unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .arg("init")
+                .arg(repo.path())
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let repos = Repos::with_worktrees_root(data.path(), "dev", worktrees.clone());
+        let err = repos
+            .delete_worktree(repo.path(), &stray)
+            .await
+            .expect_err("unregistered directory must be refused");
+        assert!(err.to_string().contains("not a worktree of"));
+        assert!(stray.join("file.txt").exists());
     }
 
     #[test]

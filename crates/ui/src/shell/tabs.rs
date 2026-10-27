@@ -9,8 +9,9 @@ use super::*;
 use crate::settings::RememberedNavigation;
 
 impl Shell {
-    /// Apply remembered/most-recent chat fallback only when no destination has
-    /// already been chosen; normal startup marks the new-session canvas chosen.
+    /// Boot landing: remembered navigation per device (waku parity) takes
+    /// priority when the referenced session/project still exists; otherwise
+    /// falls back to the most recently active visible chat.
     pub(super) fn boot_select_chat(&mut self, cx: &mut Context<Self>) {
         let should_run = {
             let state = self.state.read(cx);
@@ -103,6 +104,7 @@ impl Shell {
     /// onto that project; under "All" the current pick (the last selected
     /// project, restored from composer defaults) stands.
     pub(super) fn open_new_session(&mut self, cx: &mut Context<Self>) {
+        self.route = Route::Chat;
         let target = {
             let state = self.state.read(cx);
             self.settings
@@ -110,17 +112,9 @@ impl Shell {
                 .clone()
                 .filter(|id| state.space_row(id).is_some())
         };
-        self.open_new_session_in(target, cx);
-    }
-
-    /// Open the new-session canvas hosted in `space` (or keep the current pick
-    /// when `None`). A folder `+` in the grouped view passes the folder id and
-    /// leaves `space_filter` alone, so the sidebar stays on "All projects".
-    pub(super) fn open_new_session_in(&mut self, space: Option<String>, cx: &mut Context<Self>) {
-        self.route = Route::Chat;
         self.state.update(cx, |s, cx| {
-            if space.is_some() {
-                s.select_space(space, cx);
+            if target.is_some() {
+                s.select_space(target, cx);
             }
             s.select_chat(None, cx);
         });
@@ -131,13 +125,7 @@ impl Shell {
     /// `[fading +] [harness icon + session title] … [toggle-changes]`.
     /// Replaces the tab strip; inherits its titlebar duties (drag region,
     /// animated left inset, the toggle-changes button on git projects).
-    pub(super) fn render_session_title_bar(
-        &mut self,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let (linux_left_controls, linux_right_controls) =
-            self.linux_titlebar_controls_width(window, cx);
+    pub(super) fn render_session_title_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         // The canvas titles as NOTHING (user request — a "New session"
         // header over the empty canvas was noise); the bar keeps its height,
@@ -185,8 +173,8 @@ impl Shell {
         // Same glide as the old strip: content starts at the inset card's
         // left edge while the sidebar is open, and slides toward the control
         // cluster as it collapses.
-        let content_left = (sidebar_now + Theme::SPACE_LG)
-            .max(self.title_bar_content_start(linux_left_controls) + plus_inset);
+        let content_left =
+            (sidebar_now + Theme::SPACE_LG).max(self.title_bar_content_start() + plus_inset);
 
         // Trailing titlebar section. With the changes pane open this is the
         // PANE'S HEADER — a strip exactly as wide as the pane carrying its
@@ -215,24 +203,14 @@ impl Shell {
             // own 8px pad lands the first chip on the pane gutter. The
             // window-control cluster still wins while the sidebar is
             // collapsed (the chips clear it instead of underlapping).
-            let cluster_end =
-                self.title_bar_content_start(linux_left_controls) - 10.0 + plus_inset - 14.0;
+            let cluster_end = self.title_bar_content_start() - 10.0 + plus_inset - 14.0;
             (sidebar_now - 8.0).max(cluster_end)
         } else {
             content_left
         };
-        // GitHub control (issue #50): left of the pane strip / toggle.
-        let (github, github_slot) = match self.render_github_button(&theme, cx) {
-            Some((button, width)) => (Some(button), width + 8.0),
-            None => (None, 0.0),
-        };
         let trailing: Option<gpui::AnyElement> = if self.right_pane_open(cx) {
             let right_now = self.eval_tween(self.right_tween, self.right_target(cx));
-            let pr = titlebar_right_padding(
-                cfg!(target_os = "windows"),
-                linux_right_controls,
-                Theme::SPACE_LG,
-            );
+            let pr = titlebar_right_padding(cfg!(target_os = "windows"), Theme::SPACE_LG);
             // The row's own left padding is part of its content box: a strip
             // wider than what's left after it overflows and clips at the right
             // edge (flex_none never shrinks) — cap to the available width. The
@@ -240,7 +218,7 @@ impl Shell {
             // the strip in takeover, two with the title row present): without
             // budgeting them the capped strip overflows by exactly one gap and
             // the buttons slide right on expand (user report).
-            let gap_budget = if takeover { 8.0 } else { 16.0 } + github_slot;
+            let gap_budget = if takeover { 8.0 } else { 16.0 };
             let avail = self.viewport_width - row_left - pr - gap_budget;
             // The right pane's SURFACE TABS (t3 RightPanelTabs) — the diff
             // options that used to live here moved into the pane's own
@@ -308,7 +286,6 @@ impl Shell {
             .pl(px(row_left))
             .pr(px(titlebar_right_padding(
                 cfg!(target_os = "windows"),
-                linux_right_controls,
                 Theme::SPACE_LG,
             )))
             // In panel takeover the header strip spans the whole band — the
@@ -358,7 +335,6 @@ impl Shell {
                 )
             })
             .child(div().flex_1())
-            .children(github)
             .children(trailing);
 
         // The unified window titlebar: full-width on the glass shell, ABOVE

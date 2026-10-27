@@ -24,6 +24,15 @@ uuid.workspace = true
 # infrastructure for this crate's tests and komet-engine's integration tests.
 mock-server = []
 
+# Uses `registry::mock_server` (feature `mock-server`), so it must not be built
+# without the feature: integration tests are separate crates, `cfg(test)` is not
+# set on the library they link, and the import used to fail `cargo test -p
+# komet-sync` with E0432. `cargo test --workspace` still runs it, because
+# komet-engine's dev-dependency enables the feature.
+[[test]]
+name = "registry_client"
+required-features = ["mock-server"]
+
 [dev-dependencies]
 chrono.workspace = true
 # chat2_live example only (live checkpoint fetch against a deployed worker).
