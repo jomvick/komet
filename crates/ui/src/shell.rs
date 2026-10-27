@@ -18,8 +18,8 @@ use chrono::Utc;
 use gpui::{
     AnyElement, App, Context, Decorations, Empty, Entity, Focusable as _, IntoElement, KeyBinding,
     Keystroke, MouseButton, MouseDownEvent, MouseUpEvent, ObjectFit, Pixels, Point, Render,
-    ResizeEdge, SharedString, Size, StyledImage, Subscription, Task, Tiling, Window, WindowButton,
-    WindowButtonLayout, WindowControlArea, actions, div, img, prelude::*, px,
+    ResizeEdge, SharedString, Size, StyleRefinement, StyledImage, Subscription, Task, Tiling,
+    Window, WindowButton, WindowButtonLayout, WindowControlArea, actions, div, img, prelude::*, px,
 };
 
 use gpui_tokio::Tokio;
@@ -5907,8 +5907,18 @@ impl Shell {
 
         // Content outlet: selected chat → transcript; nothing selected → the
         // centered new-session canvas; no spaces at all → the onboarding card.
+        //
+        // The transcript is a cached gpui view: it re-renders only when its
+        // entity — or one of its embedded views — is notified (gpui dirties
+        // the ancestors of a notified view). It observes AppState, its list
+        // notifies on scroll, the in-place editor notifies on caret blink, and
+        // `motion::hover_frame` notifies the fade owners. A shell repaint —
+        // hover, spinner, sync overlay — no longer rebuilds it.
         let outlet: AnyElement = if has_selection {
-            self.transcript.clone().into_any_element()
+            self.transcript
+                .clone()
+                .cached(StyleRefinement::default().size_full())
+                .into_any_element()
         } else if !has_spaces && !no_project {
             // Onboarding (first boot / after the destructive wipe): no folders
             // to work in yet — one clear affordance.
@@ -6499,7 +6509,17 @@ impl Shell {
                                 .border_color(theme.border)
                                 .child(controls),
                         )
-                        .child(div().flex_1().min_h_0().child(changes))
+                        // Cached boundary: the diff surface observes AppState
+                        // and its own list state, and gpui dirties this view
+                        // when an embedded view (history, fetch button, ref
+                        // search) is notified. Resizes invalidate via the
+                        // cached bounds.
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_h_0()
+                                .child(changes.cached(StyleRefinement::default().size_full())),
+                        )
                         .into_any_element()
                 }
                 RightSurface::Terminal(tab) => {
@@ -7904,8 +7924,10 @@ impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // `KOMET_WINDOW_STATS=1`: this is the window's only root render, so it
         // runs exactly once per frame — the place to measure the frame budget
-        // (interval between passes and tree-build time, see `crate::perf`).
-        let _frame = crate::perf::frame();
+        // (interval between passes, tree build and child renders; see
+        // `crate::perf`). Inactive windows are throttled to ~30 fps by gpui, so
+        // their intervals are excluded rather than scored as missed.
+        let _frame = crate::perf::frame(window.is_window_active());
         if let Some((path, line)) = self.pending_workspace_file.take() {
             if !self.right_pane_open(cx) {
                 self.toggle_right_pane(cx);

@@ -2,8 +2,10 @@
 # One-command demo: boots a seeded engine daemon + the headed app, offline.
 # Made for judging look & feel with real input — no edge, no auth needed.
 #
-#   scripts/dev-demo.sh            # build, seed demo data, open the app
-#   scripts/dev-demo.sh --slow     # pace mock streams (~10s) to watch streaming
+#   scripts/dev-demo.sh              # build, seed demo data, open the app
+#   scripts/dev-demo.sh --slow       # pace mock streams (~10s) to watch streaming
+#   scripts/dev-demo.sh --daemon-only  # seeded daemon only, for release captures
+#                                      # (scripts/frame-budget.sh in another shell)
 #
 # Everything lives under /tmp/komet-demo-*; re-runs reuse it. Ctrl-C cleans up.
 set -euo pipefail
@@ -13,7 +15,14 @@ DAEMON_DIR=/tmp/komet-demo-daemon
 UI_DIR=/tmp/komet-demo-ui
 IPC=27921
 DELAY=""
-[[ "${1:-}" == "--slow" ]] && DELAY=350
+MODE=gui
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --slow) DELAY=350; shift ;;
+    --daemon-only) MODE=daemon; shift ;;
+    *) echo "unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
 
 echo "▸ building (first run takes a few minutes)…"
 cargo build -p komet -q
@@ -64,5 +73,11 @@ if [[ ! -f "$DAEMON_DIR/.demo-seeded" ]]; then
   touch "$DAEMON_DIR/.demo-seeded"
 fi
 
-echo "▸ opening komet (composer is live — type into it; --slow shows streaming)"
-KOMET_DATA_DIR="$UI_DIR" KOMET_IPC_PORT=$IPC RUST_LOG=warn ./target/debug/komet
+if [[ "$MODE" == daemon ]]; then
+  echo "▸ daemon ready on :$IPC (data: $DAEMON_DIR) — Ctrl-C to stop"
+  echo "  run scripts/frame-budget.sh in another terminal for a release capture"
+  wait "$DAEMON_PID"
+else
+  echo "▸ opening komet (composer is live — type into it; --slow shows streaming)"
+  KOMET_DATA_DIR="$UI_DIR" KOMET_IPC_PORT=$IPC RUST_LOG=warn ./target/debug/komet
+fi

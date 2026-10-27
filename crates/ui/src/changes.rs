@@ -2899,6 +2899,7 @@ fn render_file_body_upto(
 
 impl Render for Changes {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let _child = crate::perf::child_frame(crate::perf::ChildView::Changes);
         if self.scope == DiffScope::History {
             let history = self.history_pane(cx);
             history.update(cx, |history, cx| history.ensure_loaded(cx));
