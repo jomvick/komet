@@ -61,11 +61,6 @@ async fn wait_until(mut check: impl FnMut() -> bool, what: &str) {
     }
 }
 
-// Blocked by a gap *below* environments: `komet-sync-server` relays room frames but
-// never answers the registry protocol's `hello` with `state`, so no engine can join a
-// registry room on it (`registry handshake failed`). The test is the acceptance
-// criterion for that fix, not for this branch.
-#[ignore = "komet-sync-server has no registry protocol yet (see docs/superpowers/plans)"]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn environment_rows_never_reach_the_local_workspace() {
     let dirs = tempfile::tempdir().expect("tempdir");
@@ -124,6 +119,31 @@ async fn environment_rows_never_reach_the_local_workspace() {
         first.to_string().contains("chat-b"),
         "the environment connection must read that environment's registry: {first}"
     );
+
+    // A second controller (another machine's engine) gets that row from the
+    // server's `state`, not from any local write: the room persisted it.
+    let other = assemble(&dirs.path().join("other"), "device-other");
+    let seen = other
+        .envs
+        .add(&link(&url_b, TOKEN, "VPS B"))
+        .await
+        .expect("second controller pairs");
+    let other_runtime = other.envs.runtime(&seen.id).expect("second runtime");
+    wait_until(
+        || other_runtime.workspace.connected(),
+        "second registry join",
+    )
+    .await;
+    wait_until(
+        || {
+            other_runtime
+                .workspace
+                .read_chats()
+                .is_ok_and(|chats| chats.iter().any(|chat| chat.id == "chat-b"))
+        },
+        "chat-b to arrive from the server state",
+    )
+    .await;
 
     // Machine-level surfaces are refused on an environment connection.
     let err = client

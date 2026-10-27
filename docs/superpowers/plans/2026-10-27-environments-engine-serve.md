@@ -245,6 +245,36 @@ Use `tempfile::tempdir()` (already a dev-dep of `komet-engine`; verify in `crate
 
 ---
 
+### Task 6b: Registry room protocol in `komet-sync-server`
+
+Discovered while running Task 5's integration test: the Rust sync server only
+**relayed** bytes. It never answered `hello` with `state`, so no engine could join
+a registry room (`protocol: registry handshake failed`) and an environment would
+show an empty sidebar — the feature's whole point. Ported the Durable Object's
+protocol into the server before building `komet serve` on top of it.
+
+**Files:**
+- Create: `crates/sync-server/src/registry.rs`
+- Modify: `crates/sync-server/src/lib.rs` (room state, `/registry` handler)
+- Test: `crates/sync-server/src/registry.rs` `#[cfg(test)]` + the engine test in Task 5
+
+**Interfaces:**
+- `RegistryRoom::open(db_path)`, `state_frame(cursor)`, `push(batch, ops) -> (ack, Option<rows>)`,
+  `presence(device, at)`, `probe_ok()`; rows and `seq` in `registry_rows`/`registry_meta`
+  so a restart neither resets the sequence nor loses the sidebar.
+- `/registry/{org}/ws` is stateful (JSON text: `hello`→`state`, `push`→merge+`ack`,
+  `presence`, `probe`, raw `ping`→`pong`); session/chat2/device rooms stay byte relays.
+- Room sockets also accept `?token=` (the bearer form every sync client sends).
+
+- [x] Step 1: Unit tests for state/restart/delta/LWW/tombstone/presence.
+- [x] Step 2: `cargo test -p komet-sync-server` — PASS.
+- [x] Step 3: Wire the room map + two socket paths; rows before ack ordering.
+- [x] Step 4: Un-ignore `environment_rows_never_reach_the_local_workspace`; it now
+  also proves a second controller receives the row from the server's `state`.
+- [x] Step 5: Commit `feat(sync-server): registry room protocol`
+
+---
+
 ### Task 7: `komet serve`
 
 **Files:**

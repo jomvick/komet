@@ -13,6 +13,10 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use tokio::sync::{RwLock, broadcast};
 use tracing::info;
 
+mod registry;
+
+pub use registry::RegistryRoom;
+
 #[derive(Clone)]
 pub struct AppState {
     pub data_dir: PathBuf,
@@ -107,6 +111,24 @@ fn write_identity(path: &std::path::Path, identity: &ServerIdentity) -> anyhow::
 pub struct Room {
     pub tx: broadcast::Sender<Vec<u8>>,
     pub db_path: PathBuf,
+    /// Registry-protocol state, opened lazily by the first `/registry/…` socket.
+    /// `None` for relay-only rooms (session, chat2, device).
+    pub registry: Option<Arc<std::sync::Mutex<RegistryRoom>>>,
+    /// Registry text frames, broadcast to every registry socket in the room.
+    pub registry_tx: broadcast::Sender<String>,
+}
+
+fn new_room(data_dir: &std::path::Path, room: &str) -> Room {
+    let path = room_db_path(data_dir, room);
+    open_room_db(&path);
+    let (tx, _) = broadcast::channel(1024);
+    let (registry_tx, _) = broadcast::channel(1024);
+    Room {
+        tx,
+        db_path: path,
+        registry: None,
+        registry_tx,
+    }
 }
 
 fn room_db_path(data_dir: &std::path::Path, room: &str) -> PathBuf {
@@ -232,6 +254,9 @@ async fn env_descriptor(
     })))
 }
 
+/// Relay rooms (session, chat2, device): opaque binary frames, replayed and
+/// broadcast. The registry has its own handler because it speaks a stateful
+/// JSON protocol rather than relaying bytes.
 async fn ws_handler(
     State(state): State<AppState>,
     ws: WebSocketUpgrade,
@@ -248,6 +273,19 @@ async fn ws_handler(
     Ok(ws.on_upgrade(move |socket| handle_socket(state, room, socket)))
 }
 
+async fn registry_ws_handler(
+    State(state): State<AppState>,
+    ws: WebSocketUpgrade,
+    headers: HeaderMap,
+    Path(room): Path<String>,
+    query: axum::extract::RawQuery,
+) -> impl IntoResponse {
+    if !check_auth(&state, &headers) && !check_query_token(&state, query.0.as_deref()) {
+        return Err((StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    Ok(ws.on_upgrade(move |socket| handle_registry_socket(state, room, socket)))
+}
+
 /// `?token=…` on a WebSocket upgrade. Note for operators: a URL token lands in
 /// reverse-proxy access logs, so keep the proxy's log level off for `/`.
 fn check_query_token(state: &AppState, query: Option<&str>) -> bool {
@@ -262,12 +300,9 @@ fn check_query_token(state: &AppState, query: Option<&str>) -> bool {
 async fn handle_socket(state: AppState, room: String, socket: WebSocket) {
     let (tx, history) = {
         let mut rooms = state.rooms.write().await;
-        let entry = rooms.entry(room.clone()).or_insert_with(|| {
-            let path = room_db_path(&state.data_dir, &room);
-            open_room_db(&path);
-            let (tx, _) = broadcast::channel(1024);
-            Room { tx, db_path: path }
-        });
+        let entry = rooms
+            .entry(room.clone())
+            .or_insert_with(|| new_room(&state.data_dir, &room));
         let conn = rusqlite::Connection::open(&entry.db_path).unwrap();
         let mut stmt = conn.prepare("SELECT data FROM frames ORDER BY id").unwrap();
         let rows = stmt.query_map([], |r| r.get::<_, Vec<u8>>(0)).unwrap();
@@ -317,6 +352,147 @@ async fn handle_socket(state: AppState, room: String, socket: WebSocket) {
         _ = &mut send_task => recv_task.abort(),
     }
     info!(room=%room, "client disconnected");
+}
+
+/// A registry socket: JSON text frames on a stateful room instead of a byte relay.
+/// The `hello` → `state` handshake (with the `seq` cursor) is what lets a client
+/// resync after a lag or a reconnect; `push` merges ops under the server's LWW and
+/// answers with `ack`, broadcasting the winning rows to every client in the room.
+async fn handle_registry_socket(state: AppState, room: String, socket: WebSocket) {
+    let (registry, registry_tx) = {
+        let mut rooms = state.rooms.write().await;
+        let entry = rooms
+            .entry(room.clone())
+            .or_insert_with(|| new_room(&state.data_dir, &room));
+        if entry.registry.is_none() {
+            match RegistryRoom::open(&entry.db_path) {
+                Ok(opened) => entry.registry = Some(Arc::new(std::sync::Mutex::new(opened))),
+                Err(err) => {
+                    tracing::error!(room = %room, error = %err, "registry room open failed");
+                    return;
+                }
+            }
+        }
+        (
+            entry.registry.clone().expect("opened above"),
+            entry.registry_tx.clone(),
+        )
+    };
+    let mut rx = registry_tx.subscribe();
+    let (mut sender, mut receiver) = socket.split();
+    // Our own replies (state, ack, probe-ok) go straight out; a single broadcast
+    // would echo them to every socket and let a peer's `rows` overtake our `state`.
+    let (direct_tx, mut direct_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let mut device = String::new();
+    let mut ready = false;
+
+    loop {
+        tokio::select! {
+            biased;
+            Some(text) = direct_rx.recv() => {
+                if sender.send(Message::Text(text)).await.is_err() {
+                    break;
+                }
+            }
+            frame = rx.recv() => match frame {
+                Ok(text) => {
+                    if sender.send(Message::Text(text)).await.is_err() {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    // Missed frames cannot be replayed selectively; a full state
+                    // is both cheaper and safer than a silently stale client.
+                    tracing::warn!(room = %room, skipped, "registry socket lagged; resending state");
+                    let state = lock_registry(&registry).state_frame(None);
+                    let _ = direct_tx.send(state);
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
+            msg = receiver.next() => match msg {
+                Some(Ok(Message::Text(text))) => {
+                    if let Some(reply) = registry_frame(
+                        &registry,
+                        &registry_tx,
+                        &mut device,
+                        &mut ready,
+                        &text,
+                    ) {
+                        let _ = direct_tx.send(reply);
+                    }
+                }
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                // Relay frames have no meaning here; a registry client never sends them.
+                Some(Ok(_)) => {}
+            },
+        }
+    }
+    info!(room=%room, "registry client disconnected");
+}
+
+fn lock_registry(
+    registry: &std::sync::Mutex<RegistryRoom>,
+) -> std::sync::MutexGuard<'_, RegistryRoom> {
+    registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Apply one client frame. Returns the reply for this socket, if any; shared
+/// frames go out through `registry_tx`.
+fn registry_frame(
+    registry: &std::sync::Mutex<RegistryRoom>,
+    registry_tx: &broadcast::Sender<String>,
+    device: &mut String,
+    ready: &mut bool,
+    text: &str,
+) -> Option<String> {
+    if text == "ping" {
+        return Some("pong".to_string());
+    }
+    let Ok(frame) = serde_json::from_str::<serde_json::Value>(text) else {
+        return Some(registry::error_frame("bad_frame", "expected a JSON frame"));
+    };
+    let tag = frame.get("t").and_then(|v| v.as_str()).unwrap_or_default();
+    match tag {
+        "hello" => {
+            *device = frame
+                .get("device")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            *ready = true;
+            let cursor = frame.get("cursor").and_then(|v| v.as_u64());
+            Some(lock_registry(registry).state_frame(cursor))
+        }
+        "push" | "presence" if !*ready => {
+            Some(registry::error_frame("bad_frame", "hello before push"))
+        }
+        "push" => {
+            let batch = frame
+                .get("batch")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let ops = match registry::parse_ops(&frame) {
+                Ok(ops) => ops,
+                Err(message) => return Some(registry::error_frame("invalid_op", &message)),
+            };
+            let (ack, rows) = lock_registry(registry).push(&batch, &ops);
+            if let Some(rows) = rows {
+                let _ = registry_tx.send(rows);
+            }
+            Some(ack)
+        }
+        "presence" => {
+            let at = frame.get("at").and_then(|v| v.as_i64()).unwrap_or_default();
+            let frame = lock_registry(registry).presence(device, at);
+            let _ = registry_tx.send(frame);
+            None
+        }
+        "probe" => Some(lock_registry(registry).probe_ok()),
+        other => Some(registry::error_frame("bad_frame", other)),
+    }
 }
 
 /// The file for a blob, or `None` when either segment could leave
@@ -390,7 +566,7 @@ pub fn router(state: AppState) -> Router {
         .route("/env", get(env_descriptor))
         .route("/session/:room/ws", get(ws_handler))
         .route("/chat2/:room/ws", get(ws_handler))
-        .route("/registry/:room/ws", get(ws_handler))
+        .route("/registry/:room/ws", get(registry_ws_handler))
         .route("/device/:room/ws", get(ws_handler))
         .route("/blob/:chat/:part", get(get_blob).put(put_blob))
         .with_state(state)
