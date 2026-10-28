@@ -6,6 +6,15 @@
 # Installs the CLI into ~/.komet/app/<ver> with a `current` symlink (the layout
 # `komet update` manages), links the binary into ~/.local/bin, and drops the
 # .desktop entry + icon into ~/.local/share.
+#
+# On another machine (a VM, a VPS) that should become a Komet *environment* —
+# no UI, just the sync server plus the engine that runs its sessions — add
+# --serve. It installs, registers `komet serve` as the user service so it
+# survives logout and reboot, and prints the pairing link to paste in
+# Komet → Settings → Sync → Add device:
+#
+#   sh install.sh --serve --lan
+#   sh install.sh --serve --public-url https://sync.example.com
 set -eu
 
 REPO="${KOMET_RELEASE_REPO:-jomvick/komet}"
@@ -16,6 +25,19 @@ BIN_DIR="$HOME/.local/bin"
 # docs/release-signing.md). Only files listed in a manifest signed by this key
 # are installed. Not affected by KOMET_RELEASE_REPO.
 RELEASE_PUBLIC_KEY="44590602bb4f311d5c80b19f20486470a7115b52d38f2d337d61f7ab685dd330"
+
+usage() {
+  cat <<'EOF'
+install.sh — install Komet from GitHub Releases (no root needed)
+
+  sh install.sh                          # the desktop app + CLI
+  sh install.sh --serve --lan            # this machine becomes an environment,
+                                         # served over plain HTTP on its LAN
+  sh install.sh --serve --public-url URL # ...behind TLS at URL
+    --port N      sync server port (default 8787)
+    --label NAME  name shown in the desktop device switcher
+EOF
+}
 
 say() { printf '%s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -93,6 +115,54 @@ verify_download() {
   [ "$(sha256_of "$1")" = "$2" ]
 }
 
+# --- options -----------------------------------------------------------------
+# --serve turns this machine into an environment; --public-url / --lan say how
+# other devices reach it. Unknown options fail here rather than halfway through
+# an install.
+SERVE=false
+PUBLIC_URL=""
+LAN=false
+PORT=""
+LABEL=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --serve) SERVE=true ;;
+    --lan) LAN=true ;;
+    --public-url)
+      [ $# -ge 2 ] && [ -n "$2" ] || die "--public-url needs a value"
+      PUBLIC_URL="$2"; shift ;;
+    --public-url=*) PUBLIC_URL="${1#*=}" ;;
+    --port)
+      [ $# -ge 2 ] || die "--port needs a value"
+      PORT="$2"; shift ;;
+    --port=*) PORT="${1#*=}" ;;
+    --label)
+      [ $# -ge 2 ] || die "--label needs a value"
+      LABEL="$2"; shift ;;
+    --label=*) LABEL="${1#*=}" ;;
+    -h|--help|help) usage; exit 0 ;;
+    *) die "unknown option $1 (see --help)" ;;
+  esac
+  shift
+done
+
+if $SERVE; then
+  if [ -n "$PORT" ]; then
+    case "$PORT" in
+      *[!0-9]*) die "--port must be a number" ;;
+    esac
+  fi
+  if $LAN && [ -n "$PUBLIC_URL" ]; then
+    say "note: --public-url wins over --lan, using $PUBLIC_URL"
+    LAN=false
+  fi
+  if ! $LAN && [ -z "$PUBLIC_URL" ]; then
+    # Reachability is what makes an environment pairable; guessing a default
+    # would install a service no other device can connect to.
+    die "--serve needs --lan (plain HTTP on the LAN address of this machine) or --public-url https://YOUR_HOST"
+  fi
+fi
+
 # Tests load the functions above without installing anything.
 [ "${KOMET_INSTALL_SOURCE_ONLY:-}" = 1 ] && return 0
 
@@ -158,6 +228,11 @@ mkdir -p "$TMP/unpacked"
 tar -xzf "$TMP/$TARBALL" -C "$TMP/unpacked"
 
 if $IS_MACOS; then
+  if $SERVE; then
+    # The macOS package is Komet.app; --serve needs a CLI on PATH to register a
+    # headless service, and the app bundle is not that.
+    die "--serve is for a Linux VM or VPS — on macOS run komet serve from the app bundle"
+  fi
   APP_SRC="$TMP/unpacked/Komet.app"
   [ -d "$APP_SRC" ] || die "tarball did not contain Komet.app"
   say "installing Komet.app into /Applications…"
@@ -234,7 +309,39 @@ esac
 
 say ""
 say "installed komet $VERSION → $DEST"
-say "next steps:"
-say "  komet              # launch the app"
-say "  komet daemon install   # run the engine as a service"
-say "  komet sync-init        # set up self-hosted sync"
+
+if ! $SERVE; then
+  say "next steps:"
+  say "  komet                  # launch the app"
+  say "  komet daemon install   # run the engine as a service"
+  say "  komet sync-init        # set up self-hosted sync"
+  exit 0
+fi
+
+# --- become an environment ----------------------------------------------------
+# `komet serve --install-service` writes the pairing link, registers the sync
+# server + engine as the user service (so it survives logout and reboot) and
+# starts it. serve.json holds the token, so the unit needs no environment
+# variable. Komet here runs without a UI by design: this machine is the device
+# other devices pair to.
+set -- serve --install-service
+if [ -n "$PUBLIC_URL" ]; then
+  set -- "$@" --public-url "$PUBLIC_URL"
+else
+  set -- "$@" --lan
+fi
+if [ -n "$PORT" ]; then
+  set -- "$@" --port "$PORT"
+fi
+if [ -n "$LABEL" ]; then
+  set -- "$@" --label "$LABEL"
+fi
+
+say ""
+say "setting this machine up as a komet environment…"
+if ! "$BIN_DIR/komet" "$@"; then
+  die "komet serve --install-service failed — run it by hand to see why"
+fi
+say ""
+say "this machine is now an environment. Paste the pairing link above into"
+say "Komet → Settings → Sync → Add device on the machine you drive it from."

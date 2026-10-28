@@ -4,12 +4,12 @@
 //! Each environment is a real `komet-sync-server` on loopback with its own data dir,
 //! token and identity — the same shape `komet serve` produces on a VPS.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use komet_engine::{EngineCore, EnvAddError, EnvHosts, HarnessRegistry, Namespace};
-use komet_proto::{HarnessId, PairPayload, encode_pair_link};
+use komet_proto::{Environment, HarnessId, PairPayload, decode_pair_link, encode_pair_link};
 use komet_rpc::{memory_client, methods};
 
 fn assemble(dir: &Path, device_id: &str) -> EngineCore {
@@ -212,6 +212,215 @@ async fn add_refuses_a_bad_token_and_the_server_already_synced_to() {
         .await
         .expect_err("a non-link must be refused");
     assert!(matches!(err, EnvAddError::Link(_)), "{err:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn watch_environments_streams_the_paired_list() {
+    let dirs = tempfile::tempdir().expect("tempdir");
+    let url_b = start_server(&dirs.path().join("server-b"), "org-b", "user-b", "VPS B").await;
+    let core = assemble(&dirs.path().join("a"), "device-a");
+
+    // Environment management is this machine's surface, so the switcher's stream
+    // lives on the local connection — an environment connection would refuse it.
+    let client = memory_client(core.rpc_service());
+    let mut frames = client
+        .subscribe(methods::WATCH_ENVIRONMENTS, serde_json::Value::Null)
+        .await
+        .expect("watch environments");
+
+    let frame = tokio::time::timeout(Duration::from_secs(10), frames.recv())
+        .await
+        .expect("first listing before timeout")
+        .expect("stream alive");
+    let listed: Vec<Environment> = serde_json::from_value(frame).expect("environments array");
+    assert_eq!(listed.len(), 1, "only this computer before any pairing");
+    assert_eq!(listed[0].id, komet_engine::environments::LOCAL_ENV_ID);
+
+    core.envs
+        .add(&link(&url_b, TOKEN, "VPS B"))
+        .await
+        .expect("add environment");
+
+    let frame = tokio::time::timeout(Duration::from_secs(10), frames.recv())
+        .await
+        .expect("a frame after the pairing")
+        .expect("stream alive");
+    let listed: Vec<Environment> = serde_json::from_value(frame).expect("environments array");
+    let paired = listed
+        .iter()
+        .find(|env| env.id != komet_engine::environments::LOCAL_ENV_ID)
+        .expect("the paired device reaches the stream");
+    assert_eq!(paired.label, "VPS B");
+    assert_eq!(paired.url, url_b, "the host is known to the switcher");
+    assert!(
+        paired.token.is_empty() && !frame_text_has_token(&listed),
+        "no listing frame ever carries the bearer"
+    );
+}
+
+/// The bearer is a shell grant on the host: it must not appear in any listing,
+/// even serialized.
+fn frame_text_has_token(envs: &[Environment]) -> bool {
+    envs.iter().any(|env| env.token == TOKEN)
+}
+
+/// "Copy link" is re-encoded by the engine: every other reply is redacted, so a
+/// link the UI built from its own rows would silently carry no bearer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn environment_link_re_encodes_a_working_link_for_the_local_connection() {
+    let dirs = tempfile::tempdir().expect("tempdir");
+    let url_b = start_server(&dirs.path().join("server-b"), "org-b", "user-b", "VPS B").await;
+    let core = assemble(&dirs.path().join("a"), "device-a");
+    let env = core
+        .envs
+        .add(&link(&url_b, TOKEN, "VPS B"))
+        .await
+        .expect("add environment");
+
+    let local = memory_client(core.rpc_service());
+    let answer = local
+        .call(
+            methods::ENVIRONMENT_LINK,
+            serde_json::json!({ "id": env.id }),
+        )
+        .await
+        .expect("a paired environment has a link");
+    let raw = answer
+        .get("link")
+        .and_then(|v| v.as_str())
+        .expect("link field");
+    let payload = decode_pair_link(raw).expect("the copied link decodes");
+    assert_eq!(payload.token, TOKEN, "the copy pastes as a working link");
+    assert_eq!(payload.url, url_b);
+    assert_eq!(payload.label, "VPS B");
+
+    // The rows the page renders from stay redacted — this method is the one
+    // deliberate carry of the secret.
+    let listed = local
+        .call(methods::LIST_ENVIRONMENTS, serde_json::Value::Null)
+        .await
+        .expect("list environments");
+    assert!(
+        !listed.to_string().contains(TOKEN),
+        "a listing reply must never carry the bearer"
+    );
+
+    // No link for a host we don't have, and none for this computer: the local
+    // row is a switcher entry, not an environment store record.
+    for id in ["nope", komet_engine::environments::LOCAL_ENV_ID] {
+        let err = local
+            .call(methods::ENVIRONMENT_LINK, serde_json::json!({ "id": id }))
+            .await
+            .expect_err("neither id is a pairable environment");
+        assert!(err.to_string().contains("unknown_environment"), "{err}");
+    }
+
+    let inside = memory_client(core.env_service(Some(&env.id)).expect("env service"));
+    let err = inside
+        .call(
+            methods::ENVIRONMENT_LINK,
+            serde_json::json!({ "id": env.id }),
+        )
+        .await
+        .expect_err("a remote workspace does not hand out machine secrets");
+    assert!(err.to_string().contains("local_only"), "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn preview_environment_previews_without_pairing() {
+    let dirs = tempfile::tempdir().expect("tempdir");
+    let url_b = start_server(&dirs.path().join("server-b"), "org-b", "user-b", "VPS B").await;
+    let core = assemble(&dirs.path().join("a"), "device-a");
+    let client = memory_client(core.rpc_service());
+
+    // The wizard's first step: answer from the link alone, store nothing.
+    let preview = client
+        .call(
+            methods::PREVIEW_ENVIRONMENT,
+            serde_json::json!({ "link": link(&url_b, TOKEN, "VPS B") }),
+        )
+        .await
+        .expect("preview the link");
+    assert_eq!(preview["label"], "VPS B");
+    assert_eq!(preview["url"], url_b);
+    assert!(
+        !preview.to_string().contains(TOKEN),
+        "a preview reply never echoes the bearer"
+    );
+    assert_eq!(
+        core.envs.list().len(),
+        1,
+        "a preview must not pair anything"
+    );
+
+    // A malformed link gets the typed code the settings page branches on — and
+    // the reply must not quote back what was pasted.
+    let err = client
+        .call(
+            methods::PREVIEW_ENVIRONMENT,
+            serde_json::json!({ "link": "komet://pair/not-base64" }),
+        )
+        .await
+        .expect_err("a bad link is refused");
+    assert!(err.to_string().contains("invalid_link"), "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remove_keeps_the_mirror_unless_the_purge_is_asked_for() {
+    // Two hosts, same stored entry: the mirror survives a plain removal (it is
+    // the last copy when the server itself goes away) and only a purge deletes it.
+    let kept = tempfile::tempdir().expect("tempdir");
+    let purged = tempfile::tempdir().expect("tempdir");
+
+    /// Open the stored environment and seed its mirror with a file, so `purge`
+    /// has something to take whatever the docs store wrote on its own.
+    fn boot_and_seed(root: &Path) -> (EnvHosts, PathBuf) {
+        std::fs::write(
+            root.join("environments.json"),
+            serde_json::json!({
+                "v": 1,
+                "environments": [{
+                    "id": "env-x", "label": "VPS X", "url": "http://127.0.0.1:1",
+                    "token": "env-token",
+                    "namespace": { "org_id": "org-x", "user_id": "user-x" },
+                    "added_at_ms": 1
+                }]
+            })
+            .to_string(),
+        )
+        .expect("environments file");
+        let hosts = EnvHosts::boot(
+            root,
+            "device-a",
+            "laptop".into(),
+            HarnessId::Mock,
+            Namespace {
+                org_id: "org-a".into(),
+                user_id: "user-a".into(),
+            },
+        )
+        .expect("boot with the environment open");
+        assert_eq!(hosts.list().len(), 2, "local + the stored environment");
+        let mirror = root.join("environments").join("env-x");
+        std::fs::create_dir_all(&mirror).expect("mirror dir");
+        std::fs::write(mirror.join("docs.db"), "rows").expect("mirror file");
+        (hosts, mirror)
+    }
+
+    let (hosts, mirror) = boot_and_seed(kept.path());
+    hosts.remove("env-x", false).await.expect("remove");
+    assert_eq!(hosts.list().len(), 1, "the entry is gone from the listing");
+    assert!(
+        mirror.join("docs.db").exists(),
+        "without the purge the mirror stays readable — and re-pairable"
+    );
+
+    let (hosts, mirror) = boot_and_seed(purged.path());
+    hosts.remove("env-x", true).await.expect("purge");
+    assert!(
+        !mirror.exists(),
+        "an explicit purge deletes {mirror:?} with the entry"
+    );
 }
 
 #[test]

@@ -64,10 +64,21 @@ const CAPTURED_ENV: &[&str] = &[
     "KOMET_CALLBACK_PORT",
     "KOMET_HARNESS",
     "KOMET_DEVICE_NAME",
+    // Captured, not defaulted: a daemon pointed at a plain-HTTP LAN server warns
+    // on every start, and the operator who set this to silence that warning meant
+    // it for the service too, not only for the shell it was exported in.
+    "KOMET_SYNC_ALLOW_INSECURE_HTTP",
     "RUST_LOG",
 ];
 
 pub fn install(data_dir: &Path) -> anyhow::Result<()> {
+    install_with_args(data_dir, &["headless"])
+}
+
+/// [`install`] with an explicit subcommand (`komet serve` installs itself so one
+/// machine runs the sync server + engine for that environment, not the desktop
+/// daemon's headless mode).
+pub fn install_with_args(data_dir: &Path, args: &[&str]) -> anyhow::Result<()> {
     let exe = std::env::current_exe().context("resolving the komet executable path")?;
     let env = captured_env();
     if cfg!(target_os = "macos") {
@@ -78,7 +89,7 @@ pub fn install(data_dir: &Path) -> anyhow::Result<()> {
         let _ = run_quiet("launchctl", &["bootout", &launchd_service_target()?]);
         std::fs::write(
             &plist,
-            render_launchd_plist(&exe, &env, &data_dir.join("daemon.log")),
+            render_launchd_plist(&exe, &env, &data_dir.join("daemon.log"), args),
         )?;
         run(
             "launchctl",
@@ -91,7 +102,7 @@ pub fn install(data_dir: &Path) -> anyhow::Result<()> {
     } else if cfg!(target_os = "linux") {
         let unit = systemd_unit_path()?;
         std::fs::create_dir_all(unit.parent().expect("systemd user dir"))?;
-        std::fs::write(&unit, render_systemd_unit(&exe, &env))?;
+        std::fs::write(&unit, render_systemd_unit(&exe, &env, args))?;
         run("systemctl", &["--user", "daemon-reload"])?;
         run("systemctl", &["--user", "enable", "--now", SYSTEMD_UNIT])?;
         println!("Installed and started {SYSTEMD_UNIT} ({}).", unit.display());
@@ -278,7 +289,7 @@ fn captured_env() -> Vec<(String, String)> {
         .collect()
 }
 
-fn render_systemd_unit(exe: &Path, env: &[(String, String)]) -> String {
+fn render_systemd_unit(exe: &Path, env: &[(String, String)], args: &[&str]) -> String {
     let mut unit = String::from(
         "[Unit]\nDescription=Komet headless engine\nAfter=network-online.target\nStartLimitIntervalSec=60\nStartLimitBurst=5\n\n[Service]\n",
     );
@@ -288,8 +299,9 @@ fn render_systemd_unit(exe: &Path, env: &[(String, String)]) -> String {
         unit.push_str(&format!("Environment=\"{key}={value}\"\n"));
     }
     unit.push_str(&format!(
-        "ExecStart={} headless\nRestart=on-failure\nRestartSec=5\nEnvironmentFile=-%h/.komet/env\n\n[Install]\nWantedBy=default.target\n",
-        systemd_exec_path(exe)
+        "ExecStart={} {}\nRestart=on-failure\nRestartSec=5\nEnvironmentFile=-%h/.komet/env\n\n[Install]\nWantedBy=default.target\n",
+        systemd_exec_path(exe),
+        args.join(" ")
     ));
     unit
 }
@@ -313,7 +325,7 @@ fn exec_path_for(exe: &Path, home: Option<&Path>) -> String {
     }
 }
 
-fn render_launchd_plist(exe: &Path, env: &[(String, String)], log: &Path) -> String {
+fn render_launchd_plist(exe: &Path, env: &[(String, String)], log: &Path, args: &[&str]) -> String {
     let mut env_dict = String::new();
     for (key, value) in env {
         env_dict.push_str(&format!(
@@ -321,6 +333,13 @@ fn render_launchd_plist(exe: &Path, env: &[(String, String)], log: &Path) -> Str
             xml_escape(key),
             xml_escape(value)
         ));
+    }
+    let mut arguments = format!(
+        "      <string>{}</string>\n",
+        xml_escape(&exe.to_string_lossy())
+    );
+    for arg in args {
+        arguments.push_str(&format!("      <string>{}</string>\n", xml_escape(arg)));
     }
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -330,9 +349,7 @@ fn render_launchd_plist(exe: &Path, env: &[(String, String)], log: &Path) -> Str
     <key>Label</key><string>{label}</string>
     <key>ProgramArguments</key>
     <array>
-      <string>{exe}</string>
-      <string>headless</string>
-    </array>
+{arguments}    </array>
     <key>EnvironmentVariables</key>
     <dict>
 {env_dict}    </dict>
@@ -348,7 +365,7 @@ fn render_launchd_plist(exe: &Path, env: &[(String, String)], log: &Path) -> Str
 </plist>
 "#,
         label = LAUNCHD_LABEL,
-        exe = xml_escape(&exe.to_string_lossy()),
+        arguments = arguments,
         env_dict = env_dict,
         log = xml_escape(&log.to_string_lossy()),
     )
@@ -440,6 +457,7 @@ mod tests {
                 ("KOMET_EDGE_URL".into(), "https://edge.example".into()),
                 ("RUST_LOG".into(), "info,komet=\"debug\"".into()),
             ],
+            &["headless"],
         );
         assert!(unit.contains("ExecStart=/usr/local/bin/komet headless\n"));
         assert!(unit.contains("Environment=\"PATH=/usr/bin:/bin\"\n"));
@@ -453,6 +471,21 @@ mod tests {
         assert!(!unit.contains("ConditionPathExists"));
         assert!(unit.contains("EnvironmentFile=-%h/.komet/env"));
         assert!(unit.contains("WantedBy=default.target"));
+    }
+
+    #[test]
+    fn serve_service_runs_the_serve_subcommand() {
+        let unit = render_systemd_unit(Path::new("/opt/komet"), &[], &["serve"]);
+        assert!(unit.contains("ExecStart=/opt/komet serve\n"));
+        assert!(!unit.contains("ExecStart=/opt/komet headless"));
+
+        let plist = render_launchd_plist(
+            Path::new("/opt/komet"),
+            &[],
+            Path::new("/tmp/komet.log"),
+            &["serve"],
+        );
+        assert!(plist.contains("<string>serve</string>"));
     }
 
     // The curl|sh installer (edge/src/install.sh) shipped a duplicate unit
@@ -489,6 +522,7 @@ mod tests {
             Path::new("/Users/x/komet & co/komet"),
             &[("KOMET_EDGE_URL".into(), "https://e?a=1&b=2".into())],
             Path::new("/Users/x/.komet/daemon.log"),
+            &["headless"],
         );
         assert!(plist.contains("<key>Label</key><string>sh.komet.app</string>"));
         // XML-escaped exe path and env value.

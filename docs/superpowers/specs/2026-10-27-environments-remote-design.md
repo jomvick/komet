@@ -151,6 +151,13 @@ Local-only methods (`EngineInfo`, `LocalDevice`, `ProbeSync`, updates, harness
 management, `AddEnvironment`) are rejected on non-local connections: they describe the
 machine, not the workspace.
 
+> Implemented deviation: harness management (`ListHarnesses`, `GetHarnessCliStatus`,
+> `ManageHarnessCli`, `SetHarnessEnabled`) is *not* local-only — pairing a remote
+> machine is worth little if its agents cannot be enabled from here. On an environment
+> connection these four demand a `targetDeviceId` (`environment_target_required`) and
+> are forwarded to that device over the environment's own relay, so the answer always
+> describes the machine that runs the agents and never the controller.
+
 The transport choice must not become a special case: the in-process fallback creates one
 in-memory connection per environment (`memory_client` already supports it), so `?env=`
 works with or without an IPC port.
@@ -239,6 +246,19 @@ One process runs both halves (`tokio::try_join!`): the sync server bound to
 your reverse proxy (Caddy) exposes; without it the command prints the token and the
 exact Caddy snippet instead of a link, because a wrong URL in a link fails confusingly
 later.
+
+> Implemented deviations from this section:
+> - `komet serve --lan` exists and *does* print a plain-HTTP link, on this machine's
+>   private address. That was the actual ask (pair a VM on the home/office network
+>   without first standing up TLS), so the rule became "TLS required on the internet,
+>   opt-in on a network you control": `--lan` prints the warning next to the link, the
+>   link format is unchanged, and the desktop refuses to pair a non-loopback `http://`
+>   URL until the operator ticks the trusted-LAN box.
+> - `install.sh --serve [--lan | --public-url URL]` is the one-command path for a
+>   machine with no Komet yet: install, register the service, print the link.
+> - The surface shipped as **Settings → Sync → Add device**, and the workspace picker
+>   is the **Devices** menu at the top of the sidebar — the vocabulary the flow is
+>   described in, not "Environments".
 
 First run creates `{data_dir}/serve.json` (0600) with a generated token, a stable
 `orgId`/`userId`, the port and the public URL, and exports them to the engine

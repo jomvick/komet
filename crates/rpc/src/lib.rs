@@ -193,6 +193,10 @@ pub mod methods {
     pub const REMOVE_ENVIRONMENT: &str = "RemoveEnvironment";
     /// `{link}` — decode only, for the paste preview: `{label, url}`.
     pub const PREVIEW_ENVIRONMENT: &str = "PreviewEnvironment";
+    /// `{id}` — re-encode the pairing link for one environment: `{link}`. Only
+    /// the engine holds the bearer (every other reply is redacted), so copying a
+    /// link has to go through it.
+    pub const ENVIRONMENT_LINK: &str = "EnvironmentLink";
 }
 
 #[derive(Debug, thiserror::Error)]

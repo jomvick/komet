@@ -1523,18 +1523,34 @@ impl RpcService for EngineRpc {
             methods::UPDATE_STATUS,
             methods::CHECK_UPDATE,
             methods::APPLY_UPDATE,
-            methods::LIST_HARNESSES,
-            methods::GET_HARNESS_CLI_STATUS,
-            methods::MANAGE_HARNESS_CLI,
-            methods::SET_HARNESS_ENABLED,
             methods::LIST_ENVIRONMENTS,
             methods::WATCH_ENVIRONMENTS,
             methods::ADD_ENVIRONMENT,
             methods::REMOVE_ENVIRONMENT,
             methods::PREVIEW_ENVIRONMENT,
+            methods::ENVIRONMENT_LINK,
         ];
         if self.environment.is_some() && LOCAL_ONLY.contains(&method) {
             return Err(RpcError::Failed(format!("local_only: {method}")));
+        }
+        // Harness surfaces are per-machine: inside an environment they only mean
+        // the device that runs the agents, so the caller has to name it. Without a
+        // target the answer would be the controller's own machine — a plausible
+        // but wrong list, which is worse than an error.
+        const ENV_TARGETED: &[&str] = &[
+            methods::LIST_HARNESSES,
+            methods::GET_HARNESS_CLI_STATUS,
+            methods::MANAGE_HARNESS_CLI,
+            methods::SET_HARNESS_ENABLED,
+        ];
+        if self.environment.is_some()
+            && ENV_TARGETED.contains(&method)
+            && params
+                .get("targetDeviceId")
+                .and_then(|v| v.as_str())
+                .is_none_or(|id| id.is_empty())
+        {
+            return Err(RpcError::Failed("environment_target_required".to_string()));
         }
         // Device-addressed routing: forward calls that target another device over its
         // relay. The target compares the id to its own, so forwards cannot loop.
@@ -1798,6 +1814,18 @@ impl RpcService for EngineRpc {
                     .await
                     .map_err(|err| RpcError::Failed(err.to_string()))?;
                 RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::ENVIRONMENT_LINK => {
+                #[derive(serde::Deserialize)]
+                struct Link {
+                    id: String,
+                }
+                let ask: Link = crate::rpc::parse_params(params)?;
+                let link = self
+                    .envs()?
+                    .pair_link(&ask.id)
+                    .ok_or_else(|| RpcError::Failed("unknown_environment".to_string()))?;
+                RpcReply::value(&serde_json::json!({ "link": link }))
             }
             methods::LOCAL_DEVICE => {
                 RpcReply::value(&serde_json::json!({ "deviceId": self.doc_host.device_id() }))

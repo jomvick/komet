@@ -588,10 +588,22 @@ pub async fn serve_listener(
     data_dir: PathBuf,
     token: String,
 ) -> anyhow::Result<()> {
+    let identity = load_or_create_identity(&data_dir)?;
+    serve_listener_with_identity(listener, data_dir, token, identity).await
+}
+
+/// [`serve_listener`] with the identity already resolved — `komet serve` keeps
+/// the org/user in `serve.json` and must not depend on process env or a second
+/// identity file to pass them through.
+pub async fn serve_listener_with_identity(
+    listener: tokio::net::TcpListener,
+    data_dir: PathBuf,
+    token: String,
+    identity: ServerIdentity,
+) -> anyhow::Result<()> {
     let token = require_token(Some(token))?;
     tokio::fs::create_dir_all(data_dir.join("rooms")).await.ok();
     tokio::fs::create_dir_all(data_dir.join("blobs")).await.ok();
-    let identity = load_or_create_identity(&data_dir)?;
     let state = AppState {
         data_dir,
         token,

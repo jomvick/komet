@@ -697,6 +697,12 @@ impl Pickers {
     /// anywhere" from a Mac without codex).
     fn space_target(&self, cx: &App) -> Option<String> {
         let state = self.state.read(cx);
+        if !state.is_local_workspace() {
+            // Every install catalog inside a paired device belongs to that device;
+            // naming it is what makes the call forward instead of describing the
+            // controller's own machine.
+            return state.harness_target_device();
+        }
         let device = state.selected_space_row()?.device_id.clone();
         (state.local_device_id.as_deref() != Some(device.as_str())).then_some(device)
     }

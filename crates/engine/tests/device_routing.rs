@@ -486,3 +486,106 @@ async fn remote_target_without_links_fails_clearly() {
     );
     core.shutdown().await;
 }
+
+/// Inside an environment the harness surfaces describe the machine that runs the
+/// agents, never the controller: an untargeted call would answer with this
+/// laptop's installs, so the engine demands a target and forwards over the
+/// environment's own relay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn harness_calls_inside_an_environment_need_a_target_and_reach_the_device() {
+    let (relay_url, _relay) = fake_device_room().await;
+    let dirs = tempfile::tempdir().expect("tempdir");
+
+    // Device B lives in the environment: it hosts its device room on the relay
+    // and owns the harness catalog the settings page reads.
+    let core_b = assemble(&dirs.path().join("b"), "device-b");
+    let _host = core_b.start_host_relay(&relay_url);
+
+    // A is the controller whose environment points at that same relay. Its own
+    // registry stays empty so B's catalog cannot be confused with A's.
+    let dir_a = dirs.path().join("a");
+    std::fs::create_dir_all(&dir_a).expect("create data dir");
+    std::fs::write(dir_a.join("device-id"), "device-a").expect("write device id");
+    std::fs::write(
+        dir_a.join("environments.json"),
+        serde_json::json!({
+            "v": 1,
+            "environments": [{
+                "id": "env-b", "label": "VPS B", "url": relay_url, "token": "test-user",
+                "namespace": { "org_id": "org-b", "user_id": "user-b" },
+                "added_at_ms": 1
+            }]
+        })
+        .to_string(),
+    )
+    .expect("environment store");
+    let core_a = EngineCore::assemble(
+        &dir_a,
+        Arc::new(HarnessRegistry::new()),
+        HarnessId::Mock,
+        None,
+    )
+    .expect("controller boots with its environment");
+    let env = komet_rpc::memory_client(
+        core_a
+            .env_service(Some("env-b"))
+            .expect("environment connection"),
+    );
+
+    for method in [
+        methods::LIST_HARNESSES,
+        methods::GET_HARNESS_CLI_STATUS,
+        methods::MANAGE_HARNESS_CLI,
+        methods::SET_HARNESS_ENABLED,
+    ] {
+        let err = env
+            .call(method, serde_json::json!({}))
+            .await
+            .expect_err(&format!("{method} must name a device"));
+        assert!(
+            err.to_string().contains("environment_target_required"),
+            "{method}: {err}"
+        );
+    }
+
+    // Naming this machine is answered locally — and cannot report B's catalog.
+    let own = env
+        .call(
+            methods::LIST_HARNESSES,
+            serde_json::json!({ "targetDeviceId": "device-a" }),
+        )
+        .await
+        .expect("own target is local");
+    assert!(
+        !own.to_string().contains("Instant"),
+        "the controller has no Instant harness: {own}"
+    );
+
+    // Naming B forwards through the environment's link cache to B's engine.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let remote = loop {
+        match env
+            .call(
+                methods::LIST_HARNESSES,
+                serde_json::json!({ "targetDeviceId": "device-b" }),
+            )
+            .await
+        {
+            Ok(value) => break value,
+            Err(err) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "relay never came up: {err}"
+                );
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+    };
+    assert!(
+        remote.to_string().contains("Instant"),
+        "the harness list must come from B: {remote}"
+    );
+
+    core_a.shutdown().await;
+    core_b.shutdown().await;
+}

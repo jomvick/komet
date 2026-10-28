@@ -102,6 +102,10 @@ pub struct UiSettings {
     /// Sidebar session filter: a space id, or `None` for the Project tree.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub space_filter: Option<String>,
+    /// The workspace the sidebar was showing (device id), restored once that
+    /// device is paired and reachable again. `None`/`"local"` = this computer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub active_workspace: Option<String>,
     /// Legacy: per-space tab order, from when tabs were the selected space's
     /// non-archived sessions. Kept for file compatibility; no longer read.
     #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
@@ -165,6 +169,7 @@ impl Default for UiSettings {
             last_session_by_device: HashMap::new(),
             open_tabs: None,
             space_filter: None,
+            active_workspace: None,
             tab_order: std::collections::HashMap::new(),
             space_order: Vec::new(),
             expanded_spaces: std::collections::HashSet::new(),
@@ -460,6 +465,7 @@ mod tests {
             sidebar_collapsed: true,
             sidebar_grouped: true,
             last_space_id: Some("space-1".into()),
+            active_workspace: Some("env-1".into()),
             last_session_by_device: HashMap::from([
                 (
                     "device-1".to_string(),

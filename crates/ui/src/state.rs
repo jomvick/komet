@@ -30,11 +30,18 @@ use gpui_tokio::Tokio;
 use serde::de::DeserializeOwned;
 
 use komet_doc::{SessionMessageEntry, TranscriptDesync, TranscriptFrame};
-use komet_engine::{Engine, EngineConfig, EngineRuntime, InstanceLock, rpc::AuthRpc};
-use komet_proto::{
-    AuthState, Chat, ChatIndicator, Device, EngineInfo, HarnessId, Session, Space, WorkspaceScope,
+use komet_engine::{
+    Engine, EngineConfig, EngineCore, EngineRuntime, InstanceLock, environments::LOCAL_ENV_ID,
+    rpc::AuthRpc,
 };
-use komet_rpc::{RpcClient, RpcError, RpcReply, RpcService, connect_ws, memory_client, methods};
+use komet_proto::{
+    AuthState, Chat, ChatIndicator, Device, EngineInfo, Environment, HarnessId, Session, Space,
+    WorkspaceScope,
+};
+use komet_rpc::{
+    RpcClient, RpcError, RpcReply, RpcService, ServiceRouter, connect_ws, connect_ws_for,
+    memory_client, methods,
+};
 
 // ---------------------------------------------------------------------------
 // Engine handle
@@ -71,13 +78,90 @@ pub enum EngineMode {
     Remote { url: String },
 }
 
+/// Which connection a watch pump reads, and what a lost connection means for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum WatchOwner {
+    /// This app's engine: a closed connection is a daemon that died, so the whole
+    /// viewport re-probes and re-embeds.
+    Engine,
+    /// A paired device's environment: a closed connection is that device going
+    /// away. The pump retries and the switcher shows the truth — it never touches
+    /// the local workspace.
+    Workspace(String),
+}
+
+/// Reachability of one workspace, as the switcher dot reads it. Driven by the
+/// device stream: first frame online, a lost connection offline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceStatus {
+    Connecting,
+    Online,
+    Offline,
+}
+
+/// One row of the sidebar switcher: the local machine plus every paired device.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkspaceEntry {
+    pub id: String,
+    pub label: String,
+    /// Host of that device's sync server; empty for the local machine.
+    pub host: String,
+    pub status: WorkspaceStatus,
+    /// Devices registered in that workspace (its own machine, plus any other
+    /// machine sharing that sync server).
+    pub device_count: usize,
+    /// Engine version of the machine that workspace runs on, as its own registry
+    /// row reports it — `None` until that row has been seen.
+    pub version: Option<String>,
+}
+
+/// Where the user was inside a paired device, restored when they come back.
+#[derive(Debug, Clone, Default)]
+struct WorkspaceMemory {
+    selected_space: Option<String>,
+    selected_device: Option<String>,
+    selected_chat: Option<String>,
+    no_project: bool,
+}
+
+/// Host part of a sync server URL, for the switcher's sub-label.
+pub fn url_host(url: &str) -> String {
+    let Some(rest) = url.split_once("://").map(|(_, rest)| rest) else {
+        return String::new();
+    };
+    let host = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    host.rsplit('@').next().unwrap_or(host).to_string()
+}
+
+/// The machine a paired workspace runs on: its own registry row, never the
+/// controller's — this app is not a device inside that environment.
+fn workspace_home_device(devices: &[Device], home: Option<&str>) -> Option<String> {
+    devices
+        .iter()
+        .find(|device| Some(device.id.as_str()) != home)
+        .or_else(|| devices.first())
+        .map(|device| device.id.clone())
+}
+
+/// The engine version of the machine a workspace runs on, from its own registry
+/// row — `None` while no row has landed.
+fn workspace_version(devices: &[Device], own_id: Option<&str>) -> Option<String> {
+    own_id
+        .and_then(|id| devices.iter().find(|device| device.id == id))
+        .or_else(|| devices.first())
+        .and_then(|device| device.version.clone())
+}
+
 /// One of the two ways to own an engine connection. Both end at an [`RpcClient`]
 /// speaking the identical protocol — the trait only differs in provenance and
 /// teardown.
 #[async_trait]
 trait EngineBackend: Send + Sync {
-    fn client(&self) -> &RpcClient;
+    fn client(&self) -> &Arc<RpcClient>;
     fn mode(&self) -> EngineMode;
+    /// A connection scoped to one environment (`?env=`), for the paired-device
+    /// workspace. The local workspace keeps using [`EngineBackend::client`].
+    async fn env_client(&self, env_id: &str) -> Result<Arc<RpcClient>, String>;
     /// Graceful teardown (drains runs / flushes docs for the in-process engine).
     async fn shutdown(&self);
 }
@@ -85,21 +169,30 @@ trait EngineBackend: Send + Sync {
 /// Embedded engine: owns the [`EngineCore`] and an in-memory RPC loop.
 struct InProcessEngine {
     runtime: Arc<tokio::sync::Mutex<Option<EngineRuntime>>>,
+    /// The assembled core, published by the boot task. Environment connections
+    /// are built from it, so an unset cell means "still assembling".
+    core: Arc<tokio::sync::OnceCell<Arc<EngineCore>>>,
     boot_task: tokio::task::JoinHandle<()>,
     refresh_task: tokio::task::JoinHandle<()>,
     /// Serves this engine to other viewports over the IPC port. `None` when the
     /// port was already taken — the window still works over its own transport.
     ipc_task: Option<tokio::task::JoinHandle<()>>,
-    client: RpcClient,
+    client: Arc<RpcClient>,
 }
 
 #[async_trait]
 impl EngineBackend for InProcessEngine {
-    fn client(&self) -> &RpcClient {
+    fn client(&self) -> &Arc<RpcClient> {
         &self.client
     }
     fn mode(&self) -> EngineMode {
         EngineMode::InProcess
+    }
+    async fn env_client(&self, env_id: &str) -> Result<Arc<RpcClient>, String> {
+        let Some(core) = self.core.get() else {
+            return Err("engine is still assembling; no environments yet".into());
+        };
+        Ok(Arc::new(memory_client(core.env_service(Some(env_id))?)))
     }
     async fn shutdown(&self) {
         self.boot_task.abort();
@@ -186,16 +279,45 @@ async fn wait_for_deferred_engine(
     }
 }
 
+/// Routes the embedded engine's IPC connections per `?env=`. The local workspace
+/// keeps answering from the deferred service — a viewport that connects during
+/// cloud onboarding still gets EngineInfo and auth immediately — while an
+/// environment connection waits for assembly and gets that environment's service.
+struct DeferredEngineRouter {
+    state: tokio::sync::watch::Receiver<DeferredEngineState>,
+    deferred: Arc<dyn RpcService>,
+    core: Arc<tokio::sync::OnceCell<Arc<EngineCore>>>,
+}
+
+#[async_trait]
+impl ServiceRouter for DeferredEngineRouter {
+    async fn service_for(&self, env: Option<String>) -> Result<Arc<dyn RpcService>, String> {
+        let Some(id) = env.filter(|id| *id != LOCAL_ENV_ID) else {
+            return Ok(self.deferred.clone());
+        };
+        let mut state = self.state.clone();
+        wait_for_deferred_engine(&mut state).await?;
+        let core = self
+            .core
+            .get()
+            .ok_or("embedded engine assembly ended without a core")?;
+        core.env_service(Some(&id))
+    }
+}
+
 /// External daemon over `ws://127.0.0.1:{port}`.
 struct RemoteEngine {
     client: Arc<RpcClient>,
     url: String,
+    /// IPC bearer, kept so environment connections can dial `?env=` on the same
+    /// daemon the viewport attached to.
+    token: Arc<str>,
     lifecycle_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 #[async_trait]
 impl EngineBackend for RemoteEngine {
-    fn client(&self) -> &RpcClient {
+    fn client(&self) -> &Arc<RpcClient> {
         &self.client
     }
     fn mode(&self) -> EngineMode {
@@ -203,11 +325,43 @@ impl EngineBackend for RemoteEngine {
             url: self.url.clone(),
         }
     }
+    async fn env_client(&self, env_id: &str) -> Result<Arc<RpcClient>, String> {
+        connect_ws_for(&self.url, &self.token, Some(env_id))
+            .await
+            .map(Arc::new)
+            .map_err(|err| err.to_string())
+    }
     async fn shutdown(&self) {
         // The daemon outlives this viewport; only stop our readiness probe.
         if let Some(task) = self.lifecycle_task.lock().await.take() {
             task.abort();
         }
+    }
+}
+
+/// One workspace of the local engine, reached through its own `?env=` connection.
+/// It borrows the engine's transport and lifecycle: dropping this handle drops
+/// the connection, never the process.
+struct WorkspaceEngine {
+    client: Arc<RpcClient>,
+    /// The engine this workspace rides — `InProcess` or `Remote` alike.
+    mode: EngineMode,
+}
+
+#[async_trait]
+impl EngineBackend for WorkspaceEngine {
+    fn client(&self) -> &Arc<RpcClient> {
+        &self.client
+    }
+    fn mode(&self) -> EngineMode {
+        self.mode.clone()
+    }
+    async fn env_client(&self, _env_id: &str) -> Result<Arc<RpcClient>, String> {
+        Err("already inside a device workspace".into())
+    }
+    async fn shutdown(&self) {
+        // The pumps hold their own client clones; the connection closes once the
+        // last one is dropped. There is nothing here to drain.
     }
 }
 
@@ -282,13 +436,15 @@ impl EngineHandle {
         let refresh_task = auth.spawn_refresh_loop();
         let (state_tx, mut state_rx) = tokio::sync::watch::channel(DeferredEngineState::Waiting);
         let assembled_service = Arc::new(tokio::sync::OnceCell::new());
+        let assembled_core: Arc<tokio::sync::OnceCell<Arc<EngineCore>>> =
+            Arc::new(tokio::sync::OnceCell::new());
         let service: Arc<dyn RpcService> = Arc::new(DeferredEngineRpc {
             auth: AuthRpc::new(auth.clone()),
             engine_info: engine_info.clone(),
             state: state_rx.clone(),
             service: assembled_service.clone(),
         });
-        let client = memory_client(service.clone());
+        let client = Arc::new(memory_client(service.clone()));
 
         // Serve the same service on the IPC port so a terminal viewport can
         // attach to this window's engine with no setup. Deliberately the
@@ -298,7 +454,16 @@ impl EngineHandle {
         //
         // Best-effort — losing the bind race with another engine costs other
         // viewports, not this one.
-        let ipc_task = match komet_engine::serve_ipc(engine_config.ipc_port, service).await {
+        let ipc_task = match komet_engine::serve_ipc_with_router(
+            engine_config.ipc_port,
+            Arc::new(DeferredEngineRouter {
+                state: state_rx.clone(),
+                deferred: service,
+                core: assembled_core.clone(),
+            }),
+        )
+        .await
+        {
             Ok(task) => Some(task),
             Err(err) => {
                 tracing::warn!(
@@ -312,6 +477,7 @@ impl EngineHandle {
         let runtime = Arc::new(tokio::sync::Mutex::new(None));
         let runtime_for_boot = runtime.clone();
         let service_for_boot = assembled_service.clone();
+        let core_for_boot = assembled_core.clone();
         // The instance lock rides into the boot task and is consumed by
         // assembly — held through sign-in onboarding too, because this process
         // owns the data dir from the moment it decided to embed.
@@ -347,6 +513,9 @@ impl EngineHandle {
             match Engine::assemble_runtime_with_lock(&engine_config, auth, profile, lock).await {
                 Ok(engine_runtime) => {
                     let service: Arc<dyn RpcService> = engine_runtime.core().rpc_service();
+                    // Published before Ready: an environment connection that sees
+                    // Ready must find a core.
+                    let _ = core_for_boot.set(engine_runtime.core_arc());
                     *runtime_for_boot.lock().await = Some(engine_runtime);
                     if service_for_boot.set(service).is_err() {
                         state_tx.send_replace(DeferredEngineState::Failed(
@@ -365,6 +534,7 @@ impl EngineHandle {
         let handle = EngineHandle {
             inner: Arc::new(InProcessEngine {
                 runtime,
+                core: assembled_core,
                 boot_task,
                 refresh_task,
                 ipc_task,
@@ -540,6 +710,7 @@ impl EngineHandle {
                         inner: Arc::new(RemoteEngine {
                             client,
                             url,
+                            token: token.as_str().into(),
                             lifecycle_task: tokio::sync::Mutex::new(Some(lifecycle_task)),
                         }),
                         engine_info,
@@ -565,12 +736,36 @@ impl EngineHandle {
         }
     }
 
-    pub fn client(&self) -> &RpcClient {
+    pub fn client(&self) -> &Arc<RpcClient> {
         self.inner.client()
+    }
+
+    /// Shared handle for a watch pump that must outlive the `EngineHandle` borrow.
+    pub fn client_arc(&self) -> Arc<RpcClient> {
+        self.inner.client().clone()
+    }
+
+    /// One connection scoped to a paired device's environment. Callers keep the
+    /// handle: a connection per environment, not per call.
+    pub async fn env_client(&self, env_id: &str) -> Result<Arc<RpcClient>, String> {
+        if let Some(mut state) = self.deferred_state() {
+            wait_for_deferred_engine(&mut state).await?;
+        }
+        self.inner.env_client(env_id).await
     }
 
     pub fn mode(&self) -> EngineMode {
         self.inner.mode()
+    }
+
+    /// Wrap one environment connection so the shell's existing `state.engine()`
+    /// call sites speak to the workspace being displayed.
+    fn for_workspace(client: Arc<RpcClient>, engine_info: EngineInfo, mode: EngineMode) -> Self {
+        EngineHandle {
+            inner: Arc::new(WorkspaceEngine { client, mode }),
+            engine_info,
+            deferred_state: None,
+        }
     }
 
     pub fn engine_info(&self) -> &EngineInfo {
@@ -749,8 +944,43 @@ pub struct AppState {
     /// The in-flight send's attachment upload, when it has one.
     upload_progress: Option<UploadProgress>,
     /// This engine's device id (best-effort `LocalDevice` probe; `None` until
-    /// the engine serves it — views degrade gracefully).
+    /// the engine serves it — views degrade gracefully). Follows the active
+    /// workspace: in a paired device it is that device, so every
+    /// `targetDeviceId` decision reads correctly.
     pub local_device_id: Option<String>,
+    /// The machine this app's own engine runs on — never changes, and says which
+    /// registry row is "me" in the local workspace.
+    pub home_device_id: Option<String>,
+    /// Active workspace: [`LOCAL_ENV_ID`] or a paired device's environment id.
+    pub active_workspace: String,
+    /// The switcher's paired-device rows (the local machine is implied, first).
+    pub workspaces: Vec<WorkspaceEntry>,
+    /// Raw registry rows of the paired devices (the local row excluded). Kept for
+    /// Settings → Sync: the host, the added-at, and the link re-encode.
+    pub paired_envs: Vec<Environment>,
+    /// First `WatchEnvironments` frame has landed — an empty list is only
+    /// "nothing paired" once this is true.
+    pub env_list_synced: bool,
+    /// Device rows of the local workspace, kept while a paired device is
+    /// displayed so the switcher's local row keeps its real hostname.
+    local_devices: Vec<Device>,
+    /// Connection of the workspace being displayed; `None` while a paired device
+    /// is being dialed — the local engine is never a fallback for a remote
+    /// workspace, or its rows would land under the wrong label.
+    display_engine: Option<EngineHandle>,
+    /// One multiplexed connection per paired device, alive while it is paired.
+    env_clients: HashMap<String, Arc<RpcClient>>,
+    /// Watches of the active paired device (empty while the local workspace is).
+    env_watches: Vec<Task<()>>,
+    /// A standing device stream per paired device: it carries the switcher's
+    /// online dot, the workspace's device rows, and its connection.
+    env_presence: HashMap<String, Task<()>>,
+    /// Device rows of the paired devices, kept warm for status and switching.
+    env_devices: HashMap<String, Vec<Device>>,
+    /// Per-device navigation memory (space/device/chat selection).
+    env_memory: HashMap<String, WorkspaceMemory>,
+    /// The `WatchEnvironments` stream of the local engine.
+    workspaces_task: Option<Task<()>>,
     /// Latest `UpdateStatus` frame — drives the sidebar update strip.
     pub update: Option<komet_update::UpdateStatus>,
     /// Cumulative context & token usage metrics per chat id.
@@ -782,7 +1012,12 @@ pub struct AppState {
     pending_chat_config: Option<(String, komet_proto::ChatConfig)>,
     engine: Option<EngineHandle>,
     boot_config: Option<EngineBootConfig>,
+    /// Watches that follow the engine, not the displayed workspace: assembly
+    /// result, auth, updates, this machine's device id.
     watch_tasks: Vec<Task<()>>,
+    /// The local workspace's row watches — stopped while a paired device is
+    /// displayed, so its frames can't repaint another workspace's lists.
+    data_tasks: Vec<Task<()>>,
     transcript_task: Option<Task<()>>,
 }
 
@@ -811,6 +1046,19 @@ impl AppState {
             pending_sends: HashMap::new(),
             upload_progress: None,
             local_device_id: None,
+            home_device_id: None,
+            active_workspace: LOCAL_ENV_ID.to_string(),
+            workspaces: Vec::new(),
+            paired_envs: Vec::new(),
+            env_list_synced: false,
+            local_devices: Vec::new(),
+            display_engine: None,
+            env_clients: HashMap::new(),
+            env_watches: Vec::new(),
+            env_presence: HashMap::new(),
+            env_devices: HashMap::new(),
+            env_memory: HashMap::new(),
+            workspaces_task: None,
             update: None,
             context_usage: HashMap::new(),
             review_comments: HashMap::new(),
@@ -824,6 +1072,7 @@ impl AppState {
             engine: None,
             boot_config: None,
             watch_tasks: Vec::new(),
+            data_tasks: Vec::new(),
             transcript_task: None,
             auto_selected: false,
             chats_synced: false,
@@ -1037,6 +1286,9 @@ impl AppState {
     }
 
     pub fn apply_devices(&mut self, mut devices: Vec<Device>) {
+        if self.is_local_workspace() {
+            self.local_devices = devices.clone();
+        }
         // A local-only workspace has no remote device identity to distinguish.
         // Keep the engine's legacy sentinel out of the UI while preserving real
         // hostnames and user-assigned device names.
@@ -1330,6 +1582,17 @@ impl AppState {
             .or_else(|| self.local_device_id.clone())
     }
 
+    /// The device a per-machine RPC must name. On this computer the engine
+    /// answers for itself and needs no target; inside a paired device the
+    /// environment runtime has no agent installs of its own (the controller is a
+    /// viewer there), so an untargeted call would describe the wrong machine.
+    pub fn harness_target_device(&self) -> Option<String> {
+        if self.is_local_workspace() {
+            return None;
+        }
+        self.effective_device_id()
+    }
+
     /// Pick the composer's target device. Keeps the project pick consistent:
     /// a project on another device can't survive the switch — fall back to
     /// the first project on the new device, else "no project".
@@ -1350,6 +1613,17 @@ impl AppState {
         }
         self.selected_device = Some(device_id);
         cx.notify();
+    }
+
+    /// Record the id this machine answers with for `LocalDevice`. It is always
+    /// the home row; it only becomes the *displayed* workspace's device while
+    /// the local workspace is up, because the probe can land after a switch and
+    /// would otherwise aim a paired device's chats at the controller.
+    fn note_home_device(&mut self, id: String) {
+        self.home_device_id = Some(id.clone());
+        if self.active_workspace == LOCAL_ENV_ID {
+            self.local_device_id = Some(id);
+        }
     }
 
     pub fn space_row(&self, space_id: &str) -> Option<&Space> {
@@ -1389,10 +1663,10 @@ impl AppState {
 
     /// Host-presence check: is this device's 15s presence heartbeat fresh?
     /// Distinguishes "host offline" (its queued work syncs when it returns)
-    /// from slow sync. The local device is trivially online; unknown devices
-    /// get the benefit of the doubt (no evidence — don't cry wolf).
+    /// from slow sync. The machine this app runs on is trivially online; unknown
+    /// devices get the benefit of the doubt (no evidence — don't cry wolf).
     pub fn device_online(&self, device_id: &str, now: DateTime<Utc>) -> bool {
-        if self.local_device_id.as_deref() == Some(device_id) {
+        if self.home_device_id.as_deref() == Some(device_id) {
             return true;
         }
         match self.devices.iter().find(|d| d.id == device_id) {
@@ -1468,8 +1742,89 @@ impl AppState {
         gate_phase(&self.connection, self.workspace_scope, self.auth.as_ref())
     }
 
+    /// The connection the views must use: the displayed workspace's, which is the
+    /// engine's own for the local workspace. `None` while a paired device is
+    /// being dialed — a remote workspace never falls back to local rows.
     pub fn engine(&self) -> Option<&EngineHandle> {
+        if self.active_workspace != LOCAL_ENV_ID {
+            // A paired device that is not connected has no connection to borrow.
+            // Falling back to the local engine would write the next chat into the
+            // wrong workspace.
+            return self.display_engine.as_ref();
+        }
         self.engine.as_ref()
+    }
+
+    /// This machine's engine: lifecycle (mode, shutdown, reconnect) and the
+    /// environment RPC surface, which is local-only by protocol.
+    pub fn local_engine(&self) -> Option<&EngineHandle> {
+        self.engine.as_ref()
+    }
+
+    pub fn is_local_workspace(&self) -> bool {
+        self.active_workspace == LOCAL_ENV_ID
+    }
+
+    /// Which connection the watches of the displayed workspace belong to.
+    fn watch_owner(&self) -> WatchOwner {
+        if self.is_local_workspace() {
+            WatchOwner::Engine
+        } else {
+            WatchOwner::Workspace(self.active_workspace.clone())
+        }
+    }
+
+    /// A paired device's switcher row (`None` for the local workspace).
+    pub fn workspace_row(&self, env_id: &str) -> Option<&WorkspaceEntry> {
+        self.workspaces.iter().find(|row| row.id == env_id)
+    }
+
+    /// The switcher's list as the sidebar renders it: this machine first, then
+    /// every paired device.
+    pub fn workspace_switcher(&self) -> Vec<WorkspaceEntry> {
+        let mut rows = vec![WorkspaceEntry {
+            id: LOCAL_ENV_ID.to_string(),
+            label: self.local_workspace_label(),
+            host: String::new(),
+            status: WorkspaceStatus::Online,
+            device_count: self.local_devices.len().max(1),
+            version: workspace_version(&self.local_devices, self.home_device_id.as_deref()),
+        }];
+        rows.extend(self.workspaces.iter().cloned());
+        rows
+    }
+
+    /// "This computer · fedora" once the registry row carries a hostname.
+    pub fn local_workspace_label(&self) -> String {
+        let name = self
+            .home_device_id
+            .as_deref()
+            .and_then(|id| self.local_devices.iter().find(|d| d.id == id))
+            .map(|d| d.name.clone());
+        match name {
+            Some(name) => format!("This computer · {name}"),
+            None => "This computer".to_string(),
+        }
+    }
+
+    /// The switcher trigger's label: the workspace being displayed.
+    pub fn active_workspace_label(&self) -> String {
+        if self.is_local_workspace() {
+            return self.local_workspace_label();
+        }
+        self.workspace_row(&self.active_workspace)
+            .map(|row| row.label.clone())
+            .unwrap_or_else(|| "Device".to_string())
+    }
+
+    /// Reachability of the displayed workspace, for the trigger's dot.
+    pub fn active_workspace_status(&self) -> WorkspaceStatus {
+        if self.is_local_workspace() {
+            return WorkspaceStatus::Online;
+        }
+        self.workspace_row(&self.active_workspace)
+            .map(|row| row.status)
+            .unwrap_or(WorkspaceStatus::Connecting)
     }
 
     /// Drop every account-scoped view and subscription after its runtime has
@@ -1478,7 +1833,9 @@ impl AppState {
     pub fn prepare_runtime_replacement(&mut self, cx: &mut Context<Self>) {
         self.engine = None;
         self.watch_tasks.clear();
+        self.data_tasks.clear();
         self.transcript_task = None;
+        self.clear_workspaces();
         self.connection = ConnectionStatus::Connecting;
         self.workspace_scope = None;
         self.auth = None;
@@ -1500,6 +1857,7 @@ impl AppState {
         self.echoes.clear();
         self.pending_sends.clear();
         self.local_device_id = None;
+        self.home_device_id = None;
         self.update = None;
         cx.notify();
     }
@@ -1517,8 +1875,11 @@ impl AppState {
             return;
         };
         // Tear down stale remote watches before re-probing; `attach_engine`
-        // will recreate them.
+        // will recreate them. Paired-device connections ride the same daemon, so
+        // they go too and re-attach from the next environment frame.
         self.watch_tasks.clear();
+        self.data_tasks.clear();
+        self.clear_workspaces();
         self.transcript_task = None;
         // Keep transcript etc. until new engine attaches — avoid flash.
         self.connection = ConnectionStatus::Connecting;
@@ -1603,55 +1964,460 @@ impl AppState {
         let engine_info = handle.engine_info();
         self.workspace_scope = Some(engine_info.workspace_scope);
         self.local_device_id = Some(engine_info.device_id.clone());
+        self.home_device_id = Some(engine_info.device_id.clone());
         self.engine = Some(handle.clone());
+        // A daemon restart takes its `?env=` connections with it: the viewport
+        // lands back on the local workspace and the environment list re-attaches
+        // its own pumps below.
+        self.clear_workspaces();
         let mut watch_tasks = Vec::with_capacity(8);
         if let Some(task) = spawn_deferred_engine_watch(cx, handle.clone()) {
             watch_tasks.push(task);
         }
         watch_tasks.extend([
-            spawn_watch(
-                cx,
-                handle.clone(),
-                methods::WATCH_SESSIONS,
-                AppState::apply_sessions,
-            ),
-            spawn_chats_watch(cx, handle.clone()),
-            spawn_watch(
-                cx,
-                handle.clone(),
-                methods::WATCH_DEVICES,
-                AppState::apply_devices,
-            ),
-            spawn_watch(
-                cx,
-                handle.clone(),
-                methods::WATCH_SPACES,
-                AppState::apply_spaces,
-            ),
             // Auth frames parse tolerantly — engine and proto tags differ today.
             spawn_watch(
                 cx,
-                handle.clone(),
+                handle.client_arc(),
+                WatchOwner::Engine,
                 methods::AUTH_STATUS,
                 AppState::apply_auth_value,
             ),
             spawn_watch(
                 cx,
-                handle.clone(),
+                handle.client_arc(),
+                WatchOwner::Engine,
                 methods::UPDATE_STATUS,
                 AppState::apply_update,
             ),
             spawn_local_device_probe(cx, handle.clone()),
         ]);
         self.watch_tasks = watch_tasks;
+        self.start_local_data_watches(cx);
+        // Paired devices live on this engine: (re)attach their list and their
+        // background streams once the handle is in place.
+        self.watch_workspaces(cx);
         // EngineInfo is part of the attachment boundary: views must know which
         // data profile they reached before they are allowed to render Ready.
         self.connection = ConnectionStatus::Ready;
         // Re-subscribe the transcript if a chat was already selected (reconnect path).
         if let Some(chat_id) = self.selected_chat.clone() {
-            self.transcript_task = Some(spawn_transcript_watch(cx, handle, chat_id));
+            self.transcript_task = Some(spawn_transcript_watch(
+                cx,
+                handle.client_arc(),
+                WatchOwner::Engine,
+                chat_id,
+            ));
         }
         cx.notify();
+    }
+
+    /// The local workspace's row watches. Kept separate from [`Self::watch_tasks`]
+    /// because they stop while a paired device is displayed.
+    fn start_local_data_watches(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.engine.as_ref().map(|handle| handle.client_arc()) else {
+            return;
+        };
+        self.data_tasks = vec![
+            spawn_watch(
+                cx,
+                client.clone(),
+                WatchOwner::Engine,
+                methods::WATCH_SESSIONS,
+                AppState::apply_sessions,
+            ),
+            spawn_chats_watch(cx, client.clone(), WatchOwner::Engine),
+            spawn_watch(
+                cx,
+                client.clone(),
+                WatchOwner::Engine,
+                methods::WATCH_DEVICES,
+                AppState::apply_devices,
+            ),
+            spawn_watch(
+                cx,
+                client,
+                WatchOwner::Engine,
+                methods::WATCH_SPACES,
+                AppState::apply_spaces,
+            ),
+        ];
+    }
+
+    // ---- paired-device workspaces ----
+
+    /// Follow the engine's environment list: the switcher's rows, one standing
+    /// device stream per paired device, and the cleanup when one is removed.
+    fn watch_workspaces(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.engine.as_ref().map(|handle| handle.client_arc()) else {
+            return;
+        };
+        self.workspaces_task = Some(cx.spawn(async move |this, cx| {
+            const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+            loop {
+                let mut rx = match client
+                    .subscribe(methods::WATCH_ENVIRONMENTS, serde_json::json!({}))
+                    .await
+                {
+                    Ok(rx) => rx,
+                    Err(err) => {
+                        tracing::debug!(error = %err, "environment list unavailable; retrying");
+                        if this.update(cx, |_, _| {}).is_err() {
+                            return;
+                        }
+                        cx.background_executor().timer(RETRY_DELAY).await;
+                        continue;
+                    }
+                };
+                while let Some(value) = rx.recv().await {
+                    match serde_json::from_value::<Vec<Environment>>(value) {
+                        Ok(envs) => {
+                            let _ = this.update(cx, |state, cx| state.apply_environments(envs, cx));
+                        }
+                        Err(err) => {
+                            tracing::warn!(error = %err, "dropping malformed environments frame");
+                        }
+                    }
+                }
+                if this.update(cx, |_, _| {}).is_err() {
+                    return;
+                }
+                cx.background_executor().timer(RETRY_DELAY).await;
+            }
+        }));
+    }
+
+    /// Rebuild the switcher's rows from the engine's list, keep a presence pump
+    /// per row, and drop everything a removed device owned.
+    fn apply_environments(&mut self, envs: Vec<Environment>, cx: &mut Context<Self>) {
+        self.paired_envs = envs
+            .iter()
+            .filter(|env| env.id != LOCAL_ENV_ID)
+            .cloned()
+            .collect();
+        let mut rows = Vec::new();
+        for env in envs {
+            if env.id == LOCAL_ENV_ID {
+                continue;
+            }
+            if env.namespace.is_none() {
+                // No namespace means the runtime never opened; there is nothing
+                // to connect to until the device is paired again.
+                continue;
+            }
+            let status = self
+                .workspace_row(&env.id)
+                .map(|row| row.status)
+                .unwrap_or(WorkspaceStatus::Connecting);
+            let devices: &[Device] = self
+                .env_devices
+                .get(&env.id)
+                .map_or(&[] as &[Device], Vec::as_slice);
+            let own = workspace_home_device(devices, self.home_device_id.as_deref());
+            let version = workspace_version(devices, own.as_deref());
+            rows.push(WorkspaceEntry {
+                id: env.id,
+                label: env.label,
+                host: url_host(&env.url),
+                status,
+                device_count: devices.len(),
+                version,
+            });
+        }
+        let listed: HashSet<String> = rows.iter().map(|row| row.id.clone()).collect();
+        let vanished: Vec<String> = self
+            .workspaces
+            .iter()
+            .map(|row| row.id.clone())
+            .filter(|id| !listed.contains(id))
+            .collect();
+        self.workspaces = rows;
+        self.env_list_synced = true;
+        for id in &vanished {
+            self.forget_workspace(id);
+        }
+        let ids: Vec<String> = self.workspaces.iter().map(|row| row.id.clone()).collect();
+        for id in ids {
+            self.ensure_presence(cx, &id);
+        }
+        if vanished.contains(&self.active_workspace) {
+            // The displayed device is unpaired: its rows are nothing now.
+            self.switch_workspace(LOCAL_ENV_ID.to_string(), cx);
+        }
+        cx.notify();
+    }
+
+    /// Drop a removed device's connection, pumps, rows and navigation memory.
+    fn forget_workspace(&mut self, env_id: &str) {
+        self.env_presence.remove(env_id);
+        self.env_clients.remove(env_id);
+        self.env_devices.remove(env_id);
+        self.env_memory.remove(env_id);
+        if self.active_workspace == env_id {
+            self.stop_workspace_watches();
+            self.transcript_task = None;
+        }
+    }
+
+    /// Forget every paired device. The engine that served them is gone (runtime
+    /// replacement or daemon restart); the next environment frame re-attaches.
+    fn clear_workspaces(&mut self) {
+        let was_remote = self.active_workspace != LOCAL_ENV_ID;
+        self.env_presence.clear();
+        self.env_clients.clear();
+        self.env_devices.clear();
+        self.env_memory.clear();
+        self.workspaces.clear();
+        self.paired_envs.clear();
+        self.env_list_synced = false;
+        self.workspaces_task = None;
+        self.stop_workspace_watches();
+        if was_remote {
+            self.active_workspace = LOCAL_ENV_ID.to_string();
+            self.clear_lists();
+        }
+    }
+
+    /// One standing device stream per paired device, created on demand. It owns
+    /// that environment's connection: the switcher's dot, the workspace's device
+    /// rows, and the client its other watches ride all come from this one dial,
+    /// and it is the only thing that re-dials a device that went away.
+    fn ensure_presence(&mut self, cx: &mut Context<Self>, env_id: &str) {
+        if self.env_presence.contains_key(env_id) {
+            return;
+        }
+        let Some(engine) = self.engine.clone() else {
+            return;
+        };
+        let env_id = env_id.to_string();
+        let task_env_id = env_id.clone();
+        let task = cx.spawn(async move |this, cx| {
+            const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+            loop {
+                let client = match engine.env_client(&env_id).await {
+                    Ok(client) => client,
+                    Err(err) => {
+                        tracing::debug!(%env_id, error = %err, "device workspace unreachable");
+                        if this
+                            .update(cx, |state, cx| state.handle_workspace_lost(&env_id, cx))
+                            .is_err()
+                        {
+                            return;
+                        }
+                        cx.background_executor().timer(RETRY_DELAY).await;
+                        continue;
+                    }
+                };
+                match client
+                    .subscribe(methods::WATCH_DEVICES, serde_json::json!({}))
+                    .await
+                {
+                    Err(err) => {
+                        tracing::debug!(%env_id, error = %err, "device stream unavailable");
+                        if this
+                            .update(cx, |state, cx| state.handle_workspace_lost(&env_id, cx))
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Ok(mut rx) => {
+                        while let Some(value) = rx.recv().await {
+                            match serde_json::from_value::<Vec<Device>>(value) {
+                                Ok(devices) => {
+                                    let client = client.clone();
+                                    let alive = this.update(cx, |state, cx| {
+                                        state.env_clients.insert(env_id.clone(), client);
+                                        state.record_workspace_devices(&env_id, devices, cx);
+                                    });
+                                    if alive.is_err() {
+                                        return;
+                                    }
+                                }
+                                Err(err) => {
+                                    tracing::warn!(%env_id, error = %err, "dropping malformed device frame");
+                                }
+                            }
+                        }
+                        tracing::debug!(%env_id, "device stream ended; re-dialing");
+                        if this
+                            .update(cx, |state, cx| state.handle_workspace_lost(&env_id, cx))
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+                cx.background_executor().timer(RETRY_DELAY).await;
+            }
+        });
+        self.env_presence.insert(task_env_id, task);
+    }
+
+    /// Device rows of one paired workspace. This machine is a controller there,
+    /// never a device — so the workspace's own machine becomes the composer's
+    /// pick, and [`AppState::local_device_id`] follows it.
+    fn record_workspace_devices(
+        &mut self,
+        env_id: &str,
+        devices: Vec<Device>,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_workspace_status(env_id, WorkspaceStatus::Online);
+        let own = workspace_home_device(&devices, self.home_device_id.as_deref());
+        if let Some(row) = self.workspaces.iter_mut().find(|row| row.id == env_id) {
+            row.device_count = devices.len();
+            row.version = workspace_version(&devices, own.as_deref());
+        }
+        self.env_devices.insert(env_id.to_string(), devices.clone());
+        if self.active_workspace == env_id {
+            let home = own;
+            self.apply_devices(devices);
+            if self.selected_device.is_none() {
+                self.selected_device = home.clone();
+            }
+            self.local_device_id = home;
+            self.attach_workspace_client(env_id, cx);
+        }
+        cx.notify();
+    }
+
+    fn set_workspace_status(&mut self, env_id: &str, status: WorkspaceStatus) {
+        if let Some(row) = self.workspaces.iter_mut().find(|row| row.id == env_id) {
+            row.status = status;
+        }
+    }
+
+    /// The device stream said the connection is gone: show it in the switcher and
+    /// stop speaking through it. The rows stay as a read-only mirror — the
+    /// presence pump re-dials, the local workspace is untouched.
+    fn handle_workspace_lost(&mut self, env_id: &str, cx: &mut Context<Self>) {
+        self.env_clients.remove(env_id);
+        self.set_workspace_status(env_id, WorkspaceStatus::Offline);
+        if self.active_workspace == env_id {
+            self.stop_workspace_watches();
+            self.transcript_task = None;
+        }
+        cx.notify();
+    }
+
+    /// Display another workspace. Every row list is cleared first: not one line
+    /// of the outgoing workspace may render under the incoming device's label.
+    pub fn switch_workspace(&mut self, env_id: String, cx: &mut Context<Self>) {
+        let is_local = env_id == LOCAL_ENV_ID;
+        if self.active_workspace == env_id && (is_local || self.display_engine.is_some()) {
+            return;
+        }
+        let outgoing = self.active_workspace.clone();
+        if outgoing != LOCAL_ENV_ID {
+            self.env_memory.insert(
+                outgoing,
+                WorkspaceMemory {
+                    selected_space: self.selected_space.clone(),
+                    selected_device: self.selected_device.clone(),
+                    selected_chat: self.selected_chat.clone(),
+                    no_project: self.no_project,
+                },
+            );
+        }
+        self.stop_workspace_watches();
+        self.data_tasks.clear();
+        self.transcript_task = None;
+        self.active_workspace = env_id.clone();
+        self.clear_lists();
+        if is_local {
+            self.local_device_id = self.home_device_id.clone();
+            self.start_local_data_watches(cx);
+        } else {
+            // Warm rows mean the composer can target that machine before its
+            // first frame lands; the watches start with the connection.
+            let devices = self.env_devices.get(&env_id).cloned().unwrap_or_default();
+            self.local_device_id = workspace_home_device(&devices, self.home_device_id.as_deref());
+            self.selected_device = self.local_device_id.clone();
+            if let Some(memory) = self.env_memory.get(&env_id) {
+                self.selected_space = memory.selected_space.clone();
+                self.selected_device = memory
+                    .selected_device
+                    .clone()
+                    .or_else(|| self.local_device_id.clone());
+                self.selected_chat = memory.selected_chat.clone();
+                self.no_project = memory.no_project;
+            }
+            self.attach_workspace_client(&env_id, cx);
+        }
+        cx.notify();
+    }
+
+    fn clear_lists(&mut self) {
+        self.chats.clear();
+        self.spaces.clear();
+        self.devices.clear();
+        self.sessions.clear();
+        self.transcript.clear();
+        self.context_usage.clear();
+        self.echoes.clear();
+        self.pending_sends.clear();
+        self.review_comments.clear();
+        self.upload_progress = None;
+        self.workspace_state = None;
+        self.selected_chat = None;
+        self.selected_space = None;
+        self.selected_device = None;
+        self.no_project = false;
+        self.auto_selected = false;
+        self.chats_synced = false;
+        self.spaces_synced = false;
+        self.pending_access = None;
+        self.pending_chat_config = None;
+        self.sync_access_mode();
+    }
+
+    /// Aim the display at a paired device's connection, once it exists.
+    fn attach_workspace_client(&mut self, env_id: &str, cx: &mut Context<Self>) {
+        if self.active_workspace != env_id || self.display_engine.is_some() {
+            return;
+        }
+        let Some(client) = self.env_clients.get(env_id).cloned() else {
+            return;
+        };
+        let Some(engine) = self.engine.as_ref() else {
+            return;
+        };
+        let engine_info = EngineInfo {
+            device_id: self.local_device_id.clone().unwrap_or_default(),
+            workspace_scope: engine.engine_info().workspace_scope,
+        };
+        let owner = WatchOwner::Workspace(env_id.to_string());
+        self.display_engine = Some(EngineHandle::for_workspace(
+            client.clone(),
+            engine_info,
+            engine.mode(),
+        ));
+        self.env_watches = vec![
+            spawn_watch(
+                cx,
+                client.clone(),
+                owner.clone(),
+                methods::WATCH_SESSIONS,
+                AppState::apply_sessions,
+            ),
+            spawn_chats_watch(cx, client.clone(), owner.clone()),
+            spawn_watch(
+                cx,
+                client.clone(),
+                owner.clone(),
+                methods::WATCH_SPACES,
+                AppState::apply_spaces,
+            ),
+        ];
+        if let Some(chat_id) = self.selected_chat.clone() {
+            self.transcript_task = Some(spawn_transcript_watch(cx, client, owner, chat_id));
+        }
+    }
+
+    fn stop_workspace_watches(&mut self) {
+        self.env_watches.clear();
+        self.display_engine = None;
     }
 
     /// Select a chat (or clear). Swaps the per-chat doc-transcript subscription:
@@ -1691,8 +2457,15 @@ impl AppState {
             }
             self.mark_chat_seen(id, cx);
         }
-        if let (Some(chat_id), Some(handle)) = (chat_id, self.engine.clone()) {
-            self.transcript_task = Some(spawn_transcript_watch(cx, handle, chat_id));
+        if let Some(chat_id) = chat_id
+            && let Some(client) = self.engine().map(|handle| handle.client_arc())
+        {
+            self.transcript_task = Some(spawn_transcript_watch(
+                cx,
+                client,
+                self.watch_owner(),
+                chat_id,
+            ));
         }
         cx.notify();
     }
@@ -1727,7 +2500,7 @@ impl AppState {
     /// (workspace + chat docs). Fire-and-forget; each room ignores the hint
     /// unless it has been broadcast-quiet ≥30s, so spamming is harmless.
     pub fn probe_sync(&mut self, cx: &mut Context<Self>) {
-        let Some(handle) = self.engine.clone() else {
+        let Some(handle) = self.local_engine().cloned() else {
             return;
         };
         cx.spawn(async move |_, _| {
@@ -1748,7 +2521,7 @@ impl AppState {
         }
         chat.last_seen_at = Some(Utc::now());
         cx.notify();
-        let Some(handle) = self.engine.clone() else {
+        let Some(handle) = self.engine().cloned() else {
             return;
         };
         let chat_id = chat_id.to_string();
@@ -1830,7 +2603,11 @@ pub fn access_for_selection(
 /// Chats watch. Boot selection is the shell's job (it lands on the first
 /// restored open tab, device-local state this entity can't see); this task
 /// only pumps frames.
-fn spawn_chats_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<()> {
+fn spawn_chats_watch(
+    cx: &mut Context<AppState>,
+    client: Arc<RpcClient>,
+    owner: WatchOwner,
+) -> Task<()> {
     cx.spawn(async move |this, cx| {
         // Resubscribe loop (same contract as the transcript watch): a daemon
         // restart or RPC drop ends the stream, and a bare return here froze
@@ -1838,20 +2615,15 @@ fn spawn_chats_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<(
         // from every device silently stopped arriving.
         const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
         loop {
-            let mut rx = match handle
-                .client()
+            let mut rx = match client
                 .subscribe(methods::WATCH_CHATS, serde_json::json!({}))
                 .await
             {
                 Ok(rx) => rx,
                 Err(err) => {
-                    let is_conn = is_connection_error(&err);
                     tracing::debug!(error = %err, "chats watch unavailable; retrying");
-                    if is_conn {
-                        let _ = this.update(cx, |state, cx| {
-                            tracing::warn!("engine connection lost (chats watch); reconnecting");
-                            state.schedule_reconnect(cx);
-                        });
+                    if is_connection_error(&err) {
+                        pump_lost(&this, &owner, cx);
                         return;
                     }
                     if this.update(cx, |_, _| {}).is_err() {
@@ -1886,9 +2658,31 @@ fn spawn_chats_watch(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<(
     })
 }
 
+/// Report a dropped connection for the watch's owner and stop this pump: whoever
+/// re-dials re-attaches it. A workspace pump must never reconnect through the
+/// local engine — its rows would arrive under the wrong device.
+fn pump_lost(this: &gpui::WeakEntity<AppState>, owner: &WatchOwner, cx: &mut gpui::AsyncApp) {
+    match owner {
+        WatchOwner::Engine => {
+            let _ = this.update(cx, |state, cx| {
+                tracing::warn!("engine connection lost; reconnecting");
+                state.schedule_reconnect(cx);
+            });
+        }
+        WatchOwner::Workspace(env_id) => {
+            let env_id = env_id.clone();
+            let _ = this.update(cx, |state, cx| {
+                tracing::warn!(%env_id, "device workspace connection lost");
+                state.handle_workspace_lost(&env_id, cx);
+            });
+        }
+    }
+}
+
 fn spawn_watch<T: DeserializeOwned + 'static>(
     cx: &mut Context<AppState>,
-    handle: EngineHandle,
+    client: Arc<RpcClient>,
+    owner: WatchOwner,
     method: &'static str,
     apply: fn(&mut AppState, T),
 ) -> Task<()> {
@@ -1900,20 +2694,12 @@ fn spawn_watch<T: DeserializeOwned + 'static>(
         // devices never arrived again — "the session never completes").
         const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
         loop {
-            let mut rx = match handle
-                .client()
-                .subscribe(method, serde_json::json!({}))
-                .await
-            {
+            let mut rx = match client.subscribe(method, serde_json::json!({})).await {
                 Ok(rx) => rx,
                 Err(err) => {
-                    let is_conn = is_connection_error(&err);
                     tracing::debug!(method, error = %err, "watch unavailable; retrying");
-                    if is_conn {
-                        let _ = this.update(cx, |state, cx| {
-                            tracing::warn!(method, "engine connection lost; reconnecting");
-                            state.schedule_reconnect(cx);
-                        });
+                    if is_connection_error(&err) {
+                        pump_lost(&this, &owner, cx);
                         return;
                     }
                     if this.update(cx, |_, _| {}).is_err() {
@@ -1948,8 +2734,8 @@ fn spawn_watch<T: DeserializeOwned + 'static>(
     })
 }
 
-/// Best-effort `LocalDevice` probe: fills `local_device_id` for the "This
-/// device" badge. Engines that don't serve the method leave it `None`.
+/// Best-effort `LocalDevice` probe: names the registry row that is "This
+/// device". Engines that don't serve the method leave it `None`.
 fn spawn_local_device_probe(cx: &mut Context<AppState>, handle: EngineHandle) -> Task<()> {
     cx.spawn(async move |this, cx| {
         let Ok(value) = handle
@@ -1967,7 +2753,7 @@ fn spawn_local_device_probe(cx: &mut Context<AppState>, handle: EngineHandle) ->
             .map(str::to_string);
         if let Some(id) = id {
             this.update(cx, |state, cx| {
-                state.local_device_id = Some(id);
+                state.note_home_device(id);
                 cx.notify();
             })
             .ok();
@@ -1977,7 +2763,8 @@ fn spawn_local_device_probe(cx: &mut Context<AppState>, handle: EngineHandle) ->
 
 fn spawn_transcript_watch(
     cx: &mut Context<AppState>,
-    handle: EngineHandle,
+    client: Arc<RpcClient>,
+    owner: WatchOwner,
     chat_id: String,
 ) -> Task<()> {
     cx.spawn(async move |this, cx| {
@@ -1992,20 +2779,12 @@ fn spawn_transcript_watch(
         const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
         'resubscribe: loop {
             let params = serde_json::json!({ "chatId": chat_id });
-            let mut rx = match handle
-                .client()
-                .subscribe(methods::WATCH_DOC_MESSAGES, params)
-                .await
-            {
+            let mut rx = match client.subscribe(methods::WATCH_DOC_MESSAGES, params).await {
                 Ok(rx) => rx,
                 Err(err) => {
-                    let is_conn = is_connection_error(&err);
                     tracing::warn!(%chat_id, error = %err, "transcript watch failed; retrying");
-                    if is_conn {
-                        let _ = this.update(cx, |state, cx| {
-                            tracing::warn!(%chat_id, "engine connection lost (transcript); reconnecting");
-                            state.schedule_reconnect(cx);
-                        });
+                    if is_connection_error(&err) {
+                        pump_lost(&this, &owner, cx);
                         return;
                     }
                     if this.update(cx, |_, _| {}).is_err() {
@@ -2651,6 +3430,82 @@ mod tests {
 
         state.apply_devices(vec![device("local", "José's MacBook Pro")]);
         assert_eq!(state.device_name("local"), Some("José's MacBook Pro"));
+    }
+
+    #[test]
+    fn workspace_host_is_what_the_switcher_shows() {
+        assert_eq!(
+            url_host("https://vm1.example.com:8443/"),
+            "vm1.example.com:8443"
+        );
+        assert_eq!(url_host("http://192.168.1.20:8787"), "192.168.1.20:8787");
+        assert_eq!(url_host("not a url"), "");
+    }
+
+    #[test]
+    fn a_paired_workspace_targets_its_own_machine_not_the_controller() {
+        let devices = vec![device("vm1", "vm1"), device("other", "other")];
+        assert_eq!(
+            workspace_home_device(&devices, Some("fedora")).as_deref(),
+            Some("vm1")
+        );
+        // The controller's row is not in this workspace: fall back to any device.
+        assert_eq!(
+            workspace_home_device(&[device("vm1", "vm1")], Some("vm1")).as_deref(),
+            Some("vm1")
+        );
+        assert_eq!(workspace_home_device(&[], Some("vm1")), None);
+    }
+
+    #[test]
+    fn only_the_machine_under_the_app_is_trivially_online() {
+        let now = Utc::now();
+        let mut state = AppState::new();
+        state.home_device_id = Some("fedora".into());
+        // `local_device_id` follows the displayed workspace, so it must not be
+        // the trivially-online answer: vm1's staleness is real information.
+        state.local_device_id = Some("vm1".into());
+        state.devices = vec![device("vm1", "vm1")];
+        assert!(state.device_online("fedora", now));
+        assert!(!state.device_online("vm1", now));
+    }
+
+    #[test]
+    fn a_late_local_device_answer_never_retargets_a_paired_workspace() {
+        let mut state = AppState::new();
+        state.active_workspace = "env-1".into();
+        state.local_device_id = Some("vm1".into());
+        state.note_home_device("fedora".into());
+        assert_eq!(state.home_device_id.as_deref(), Some("fedora"));
+        assert_eq!(
+            state.local_device_id.as_deref(),
+            Some("vm1"),
+            "the controller's id must not become the displayed device's target"
+        );
+
+        state.active_workspace = LOCAL_ENV_ID.into();
+        state.note_home_device("fedora".into());
+        assert_eq!(state.local_device_id.as_deref(), Some("fedora"));
+    }
+
+    #[test]
+    fn a_row_reports_the_version_of_the_machine_under_it() {
+        let mut vm1 = device("vm1", "vm1");
+        vm1.version = Some("1.4.0".into());
+        let mut laptop = device("fedora", "fedora");
+        laptop.version = Some("1.3.0".into());
+
+        // Inside a paired workspace the controller has no registry row, so the
+        // row's version is that machine's — never the app's own.
+        assert_eq!(
+            workspace_version(&[vm1.clone()], Some("fedora")).as_deref(),
+            Some("1.4.0")
+        );
+        assert_eq!(
+            workspace_version(&[laptop, vm1], Some("fedora")).as_deref(),
+            Some("1.3.0")
+        );
+        assert_eq!(workspace_version(&[], Some("fedora")), None);
     }
 
     #[test]

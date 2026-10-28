@@ -9,7 +9,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-use komet_proto::{Environment, HarnessId, Namespace, decode_pair_link};
+use komet_proto::{
+    Environment, HarnessId, Namespace, PAIR_VERSION, PairPayload, decode_pair_link,
+    encode_pair_link,
+};
 use komet_rpc::{LinkCache, LinkCacheConfig, StaticToken};
 use tokio::sync::watch;
 
@@ -171,6 +174,25 @@ impl EnvHosts {
 
     pub fn watch(&self) -> watch::Receiver<Vec<Environment>> {
         self.listing.subscribe()
+    }
+
+    /// Re-encode one environment's pairing link, bearer included, so the user can
+    /// paste it on another controller. Every other reply is redacted — this is the
+    /// one that is deliberately not, so it stays on the local connection and is
+    /// never logged or embedded in an error message.
+    pub fn pair_link(&self, id: &str) -> Option<String> {
+        let env = self
+            .store
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id)
+            .cloned()?;
+        Some(encode_pair_link(&PairPayload {
+            v: PAIR_VERSION,
+            label: env.label,
+            url: env.url,
+            token: env.token,
+        }))
     }
 
     /// The live runtime for `id`, or `None` when it is unknown or failed to open.

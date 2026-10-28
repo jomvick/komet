@@ -3653,6 +3653,7 @@ dependencies = [
  "komet-update",
  "libc",
  "mimalloc",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",

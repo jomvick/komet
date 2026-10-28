@@ -16,8 +16,8 @@
 use std::collections::{HashMap, HashSet};
 
 use gpui::{
-    AnyElement, Context, Entity, EventEmitter, IntoElement, Render, SharedString, Task, Window,
-    div, prelude::*, px,
+    AnyElement, App, Context, Entity, EventEmitter, IntoElement, Render, SharedString, Task,
+    Window, div, prelude::*, px,
 };
 
 use komet_engine::harness_cli::HarnessCliStatus;
@@ -194,9 +194,15 @@ impl HarnessesPage {
         page
     }
 
-    /// Params with the `targetDeviceId` passthrough merged in.
-    fn with_target(&self, mut value: serde_json::Value) -> serde_json::Value {
-        if let (Some(target), Some(object)) = (&self.target_device, value.as_object_mut()) {
+    /// Params with the `targetDeviceId` passthrough merged in. Inside a paired
+    /// device the pick starts from that machine, not from an empty pick — an
+    /// untargeted harness call there would describe the controller.
+    fn with_target(&self, mut value: serde_json::Value, cx: &App) -> serde_json::Value {
+        let target = self
+            .target_device
+            .clone()
+            .or_else(|| self.state.read(cx).harness_target_device());
+        if let (Some(target), Some(object)) = (target, value.as_object_mut()) {
             object.insert("targetDeviceId".into(), serde_json::json!(target));
         }
         value
@@ -230,7 +236,7 @@ impl HarnessesPage {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
-        let params = self.with_target(serde_json::json!({}));
+        let params = self.with_target(serde_json::json!({}), cx);
         let generation = self.target_generation;
         self.harnesses = Loadable::Loading;
         self.load_task = Some(cx.spawn(async move |this, cx| {
@@ -260,7 +266,7 @@ impl HarnessesPage {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
-        let params = self.with_target(serde_json::json!({ "usageMode": "none" }));
+        let params = self.with_target(serde_json::json!({ "usageMode": "none" }), cx);
         let generation = self.target_generation;
         self.connection_status = None;
         cx.spawn(async move |this, cx| {
@@ -297,7 +303,7 @@ impl HarnessesPage {
             self.checking_updates = false;
             return;
         };
-        let params = self.with_target(serde_json::json!({ "checkLatest": check_latest }));
+        let params = self.with_target(serde_json::json!({ "checkLatest": check_latest }), cx);
         let generation = self.target_generation;
         self.checking_updates = check_latest;
         self.cli_status_task = Some(cx.spawn(async move |this, cx| {
@@ -411,10 +417,13 @@ impl HarnessesPage {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
-        let params = self.with_target(serde_json::json!({
-            "harness": harness,
-            "enabled": enabled,
-        }));
+        let params = self.with_target(
+            serde_json::json!({
+                "harness": harness,
+                "enabled": enabled,
+            }),
+            cx,
+        );
         self.error = None;
         self.toggle_task = Some(cx.spawn(async move |this, cx| {
             let result = engine
@@ -444,7 +453,7 @@ impl HarnessesPage {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
-        let params = self.with_target(serde_json::json!({ "harness": harness }));
+        let params = self.with_target(serde_json::json!({ "harness": harness }), cx);
         let generation = self.target_generation;
         self.error = None;
         self.managing_cli = Some(harness);

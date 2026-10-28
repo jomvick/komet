@@ -24,6 +24,7 @@ use gpui::{
 
 use gpui_tokio::Tokio;
 use komet_engine::InstanceLock;
+use komet_engine::environments::LOCAL_ENV_ID;
 use komet_engine::harness_cli::HarnessCliStatus;
 use komet_proto::{AuthState, HarnessId, WorkspaceScope};
 use komet_rpc::methods;
@@ -46,6 +47,7 @@ use crate::settings::integrations::IntegrationsPage;
 use crate::settings::notifications::{NotificationsEvent, NotificationsPage};
 use crate::settings::security::{SecurityDefaults, SecurityEvent, SecurityPage};
 use crate::settings::shortcuts::{ShortcutsEvent, ShortcutsPage};
+use crate::settings::sync::{SyncEvent, SyncPage};
 use crate::settings::wallpaper;
 use crate::settings::{
     KeymapConfig, RIGHT_PANE_DEFAULT, RIGHT_PANE_MAX, RIGHT_PANE_MIN, RememberedNavigation,
@@ -54,7 +56,7 @@ use crate::settings::{
 };
 use crate::state::{
     AppState, ConnectionStatus, EngineBootConfig, EngineMode, GatePhase, Indicator, OrgRow,
-    format_time_ago, org_name_valid, parse_orgs, sort_memberships,
+    WorkspaceEntry, WorkspaceStatus, format_time_ago, org_name_valid, parse_orgs, sort_memberships,
 };
 use crate::terminal::panel::{TerminalPanel, ToggleTerminal, clamp_terminal_height};
 use crate::theme::Theme;
@@ -957,10 +959,12 @@ pub struct Shell {
     accounts_page: Option<Entity<AccountsPage>>,
     harnesses_page: Option<Entity<HarnessesPage>>,
     security_page: Option<Entity<SecurityPage>>,
+    sync_page: Option<Entity<SyncPage>>,
     integrations_page: Option<Entity<IntegrationsPage>>,
     shortcuts_sub: Option<Subscription>,
     notifications_sub: Option<Subscription>,
     security_sub: Option<Subscription>,
+    sync_sub: Option<Subscription>,
     harnesses_sub: Option<Subscription>,
     pending_account_harness: Option<HarnessId>,
     /// Session-row context menu: (chat id, window position).
@@ -986,6 +990,8 @@ pub struct Shell {
     add_space: Option<AddSpaceFlow>,
     /// The sidebar's space-filter dropdown.
     spaces_menu: popover::Popup<spaces::SpacesMenu>,
+    /// The sidebar's workspace (device) switcher dropdown.
+    devices_menu: popover::Popup<()>,
     /// Chat id whose STATUS CORNER is under the pointer — just that corner
     /// swaps to the archive button (t3code's settle-on-hover); hovering the
     /// row body leaves the status readable.
@@ -994,6 +1000,8 @@ pub struct Shell {
     sidebar_scroll: gpui::ScrollHandle,
     /// `settings.last_space_id` applied once after the first spaces frame.
     space_boot_applied: bool,
+    /// The remembered device workspace has been reopened once (paired list landed).
+    workspace_boot_applied: bool,
     /// Last seen session status per chat — the chime trigger compares against
     /// it (a row's FIRST appearance never chimes, so boot stays silent).
     sound_prev: std::collections::HashMap<String, komet_proto::SessionStatus>,
@@ -1253,10 +1261,12 @@ impl Shell {
             accounts_page: None,
             harnesses_page: None,
             security_page: None,
+            sync_page: None,
             integrations_page: None,
             shortcuts_sub: None,
             notifications_sub: None,
             security_sub: None,
+            sync_sub: None,
             harnesses_sub: None,
             pending_account_harness: None,
             chat_menu: popover::Popup::default(),
@@ -1274,9 +1284,11 @@ impl Shell {
             space_delete_focus_pending: false,
             add_space: None,
             spaces_menu: popover::Popup::default(),
+            devices_menu: popover::Popup::default(),
             chat_status_hover: None,
             sidebar_scroll: gpui::ScrollHandle::new(),
             space_boot_applied: false,
+            workspace_boot_applied: false,
             sound_prev: std::collections::HashMap::new(),
             user_menu: popover::Popup::default(),
             sidebar_notice: None,
@@ -1488,6 +1500,29 @@ impl Shell {
                         crate::notify::post(&title, body);
                     }
                 }
+            }
+        }
+        // Boot: reopen on the device the sidebar was showing last time, once the
+        // paired-device list has actually arrived (before that frame every
+        // remote row is unknown, and switching to a vanished device would be a
+        // silent drop to an empty workspace).
+        if !self.workspace_boot_applied && state.read(cx).env_list_synced {
+            self.workspace_boot_applied = true;
+            let target = self.settings.active_workspace.clone();
+            let (current, exists) = {
+                let state = state.read(cx);
+                (
+                    state.active_workspace.clone(),
+                    target
+                        .as_deref()
+                        .is_some_and(|id| state.workspace_row(id).is_some()),
+                )
+            };
+            if exists
+                && Some(current.as_str()) != target.as_deref()
+                && let Some(target) = target
+            {
+                self.select_workspace(&target, cx);
             }
         }
         // Boot: restore the last selected space once the first spaces frame
@@ -2751,7 +2786,26 @@ impl Shell {
                     None => Empty.into_any_element(),
                 }
             }
-            SettingsSection::Sync => crate::settings::sync::render_sync_settings(cx),
+            SettingsSection::Sync => {
+                if self.sync_page.is_none() {
+                    let state = self.state.clone();
+                    let page = cx.new(|cx| SyncPage::new(state, cx));
+                    self.sync_sub = Some(cx.subscribe(
+                        &page,
+                        |this: &mut Shell, _, event: &SyncEvent, cx| {
+                            let SyncEvent::OpenWorkspace(env_id) = event;
+                            let env_id = env_id.clone();
+                            this.close_settings(cx);
+                            this.select_workspace(&env_id, cx);
+                        },
+                    ));
+                    self.sync_page = Some(page);
+                }
+                match &self.sync_page {
+                    Some(page) => page.clone().into_any_element(),
+                    None => Empty.into_any_element(),
+                }
+            }
             SettingsSection::Security => {
                 if self.security_page.is_none() {
                     let level = self
@@ -2977,6 +3031,7 @@ impl Shell {
                         shell.org = None;
                         shell.route = Route::Chat;
                         shell.space_boot_applied = false;
+                        shell.workspace_boot_applied = false;
                         state.update(cx, |state, cx| state.prepare_runtime_replacement(cx));
                         AppState::bootstrap(state.clone(), boot, cx);
                     }
@@ -3111,6 +3166,7 @@ impl Shell {
                         shell.org = None;
                         shell.route = Route::Chat;
                         shell.space_boot_applied = false;
+                        shell.workspace_boot_applied = false;
                         state.update(cx, |state, cx| state.prepare_runtime_replacement(cx));
                         AppState::bootstrap(state.clone(), boot, cx);
                     }
@@ -3275,7 +3331,7 @@ impl Shell {
     }
 
     fn quit_for_runtime_change(&mut self, cx: &mut Context<Self>) {
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
+        let Some(engine) = self.state.read(cx).local_engine().cloned() else {
             self.runtime_change_error = Some("Engine not connected".into());
             cx.notify();
             return;
@@ -4329,6 +4385,217 @@ impl Shell {
             .into_any_element()
     }
 
+    /// The workspace switcher: which machine the sidebar's lists below belong to,
+    /// and the one click that moves the whole column onto another device. Rows
+    /// carry their reachability dot; pairing a new device happens in Settings →
+    /// Sync, which the menu's footer opens.
+    fn render_workspace_switcher(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+        let (label, status, rows, active_id) = {
+            let state = self.state.read(cx);
+            (
+                state.active_workspace_label(),
+                state.active_workspace_status(),
+                state.workspace_switcher(),
+                state.active_workspace.clone(),
+            )
+        };
+        let open = self.devices_menu.is_open();
+        let trigger = div()
+            .id("workspace-switcher")
+            .w_full()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(Theme::SPACE_SM))
+            .h(px(28.0))
+            .px(px(Theme::SPACE_SM))
+            .rounded(px(8.0))
+            .cursor_pointer()
+            .text_size(px(12.0))
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(motion::hover_blend(
+                "workspace-switcher",
+                theme.text.opacity(0.8),
+                theme.text,
+            ))
+            .bg(if open {
+                theme.glass_hover()
+            } else {
+                motion::hover_blend(
+                    "workspace-switcher",
+                    theme.glass_hover().opacity(0.0),
+                    theme.glass_hover(),
+                )
+            })
+            .on_hover(motion::hover_listener("workspace-switcher"))
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_devices_menu(cx)))
+            .child(self.workspace_dot(status, theme))
+            .child(div().flex_1().min_w_0().truncate().child(label))
+            .child(
+                icon(icons::ALT_ARROW_DOWN)
+                    .size(px(12.0))
+                    .flex_none()
+                    .text_color(theme.text_muted.opacity(0.6)),
+            );
+        let strip = |inner: AnyElement| {
+            div()
+                .flex_none()
+                .px(px(Theme::SPACE_SM))
+                .pt(px(8.0))
+                .pb(px(2.0))
+                .child(inner)
+                .into_any_element()
+        };
+        if self.devices_menu.get().is_some() {
+            let closing = self.devices_menu.closing_since();
+            let menu = self.render_devices_menu(rows, active_id, theme, cx);
+            return strip(
+                trigger
+                    .relative()
+                    .child(popover::anchored_menu_below_unfrosted(
+                        "workspace-switcher-menu",
+                        menu,
+                        closing,
+                    ))
+                    .into_any_element(),
+            );
+        }
+        strip(trigger.into_any_element())
+    }
+
+    fn render_devices_menu(
+        &mut self,
+        rows: Vec<WorkspaceEntry>,
+        active_id: String,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let mut menu = popover::popover_card(theme)
+            .w(px(self.settings.sidebar_width - 2.0 * Theme::SPACE_SM))
+            .on_mouse_down_out(cx.listener(|this, _, _, cx| this.close_devices_menu(cx)))
+            .flex()
+            .flex_col()
+            .gap(px(2.0))
+            .child(popover::menu_heading(theme, "Devices"));
+        for row in rows {
+            let active = row.id == active_id;
+            let key: SharedString = format!("workspace-row-{}", row.id).into();
+            let target = row.id.clone();
+            let glyph = if row.id == LOCAL_ENV_ID {
+                icons::MONITOR
+            } else {
+                icons::CLOUD
+            };
+            let subline = if row.host.is_empty() {
+                format!(
+                    "{} device{}",
+                    row.device_count,
+                    if row.device_count == 1 { "" } else { "s" }
+                )
+            } else {
+                row.host.clone()
+            };
+            menu = menu.child(
+                popover::menu_row(theme, active, key.clone())
+                    .id(key)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.select_workspace(&target, cx);
+                    }))
+                    .child(
+                        icon(glyph)
+                            .size(px(15.0))
+                            .flex_none()
+                            .text_color(theme.text_muted),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .text_size(px(13.0))
+                                    .truncate()
+                                    .child(row.label.clone()),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(theme.text_muted)
+                                    .truncate()
+                                    .child(subline),
+                            ),
+                    )
+                    .child(self.workspace_dot(row.status, theme)),
+            );
+        }
+        menu = menu.child(popover::menu_separator()).child(
+            popover::menu_row(theme, false, "workspace-pair-device")
+                .id("workspace-pair-device")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.close_devices_menu(cx);
+                    this.open_settings(SettingsSection::Sync, cx);
+                }))
+                .child(
+                    icon(icons::PLUS)
+                        .size(px(15.0))
+                        .flex_none()
+                        .text_color(theme.text_muted),
+                )
+                .child(SharedString::from("Pair a device…")),
+        );
+        menu.into_any_element()
+    }
+
+    /// Reachability of one workspace: emerald live, amber still dialing, faint gone.
+    fn workspace_dot(&self, status: WorkspaceStatus, theme: &Theme) -> AnyElement {
+        let color = match status {
+            WorkspaceStatus::Online => theme.success,
+            WorkspaceStatus::Connecting => theme.warning,
+            WorkspaceStatus::Offline => theme.text_faint,
+        };
+        div()
+            .size(px(7.0))
+            .flex_none()
+            .rounded_full()
+            .bg(color)
+            .into_any_element()
+    }
+
+    fn toggle_devices_menu(&mut self, cx: &mut Context<Self>) {
+        if self.devices_menu.is_open() {
+            self.close_devices_menu(cx);
+            return;
+        }
+        self.devices_menu.open(());
+        cx.notify();
+    }
+
+    fn close_devices_menu(&mut self, cx: &mut Context<Self>) {
+        if self.devices_menu.begin_close() {
+            popover::reap_popup(cx, |shell: &mut Self| &mut shell.devices_menu);
+            cx.notify();
+        }
+    }
+
+    /// Show another device's workspace. The sidebar's lists, the composer's
+    /// pickers and the transcript follow it; the project filter is a pick inside
+    /// one workspace, so it resets.
+    fn select_workspace(&mut self, env_id: &str, cx: &mut Context<Self>) {
+        self.close_devices_menu(cx);
+        if self.state.read(cx).active_workspace == env_id {
+            return;
+        }
+        self.settings.space_filter = None;
+        self.settings.active_workspace = Some(env_id.to_string());
+        let env_id = env_id.to_string();
+        let state = self.state.clone();
+        state.update(cx, |state, cx| state.switch_workspace(env_id, cx));
+        self.schedule_save(cx);
+        cx.notify();
+    }
+
     /// Chat-mode sidebar (spaces overhaul): window-control strip, the Spaces
     /// section (folder + device rows, add-space), the global Active sessions
     /// list, the notice strip, and the UserMenu (§1.6).
@@ -4466,6 +4733,9 @@ impl Shell {
         let pickers = self.composer.read(cx).pickers().clone();
         let device_selector = pickers.update(cx, |pickers, cx| pickers.render_device_selector(cx));
 
+        // The device switcher sits above the filter and outside the scroll
+        // region: it says which machine everything below belongs to.
+        let device_row = self.render_workspace_switcher(theme, cx);
         // The space filter lives ABOVE the scroll region (fixed) so its
         // dropdown can float without being clipped by the list's overflow.
         let filter_row = self.render_spaces_filter(theme, cx);
@@ -4477,6 +4747,7 @@ impl Shell {
             .flex_col()
             // (No titlebar strip: the unified window titlebar spans the whole
             // window above this column.)
+            .child(device_row)
             .child(filter_row)
             // The (filtered) Sessions list scrolls inside an EdgeFade scope —
             // a true per-glyph gradient at active overflow edges. Glass-safe
@@ -4561,14 +4832,16 @@ impl Shell {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
+        let target = self.state.read(cx).harness_target_device();
         self.cli_check_started = true;
         cx.spawn(async move |this, cx| {
+            let mut params = serde_json::json!({ "checkLatest": true });
+            if let (Some(target), Some(object)) = (target.as_ref(), params.as_object_mut()) {
+                object.insert("targetDeviceId".into(), serde_json::json!(target));
+            }
             let result = engine
                 .client()
-                .call(
-                    methods::GET_HARNESS_CLI_STATUS,
-                    serde_json::json!({ "checkLatest": true }),
-                )
+                .call(methods::GET_HARNESS_CLI_STATUS, params)
                 .await;
             let updates = match result {
                 Ok(value) => match serde_json::from_value::<Vec<HarnessCliStatus>>(value) {
@@ -4607,13 +4880,15 @@ impl Shell {
         self.cli_updating = Some(harness);
         self.cli_update_error = None;
         cx.notify();
+        let target = self.state.read(cx).harness_target_device();
         cx.spawn(async move |this, cx| {
+            let mut params = serde_json::json!({ "harness": harness });
+            if let (Some(target), Some(object)) = (target.as_ref(), params.as_object_mut()) {
+                object.insert("targetDeviceId".into(), serde_json::json!(target));
+            }
             let result = engine
                 .client()
-                .call(
-                    methods::MANAGE_HARNESS_CLI,
-                    serde_json::json!({ "harness": harness }),
-                )
+                .call(methods::MANAGE_HARNESS_CLI, params)
                 .await;
             this.update(cx, |shell, cx| {
                 shell.cli_updating = None;
@@ -5223,7 +5498,7 @@ impl Shell {
         let remote_engine = self
             .state
             .read(cx)
-            .engine()
+            .local_engine()
             .is_some_and(|engine| matches!(engine.mode(), EngineMode::Remote { .. }));
         let runtime_change_label = if self.runtime_change_task.is_some() {
             "Stopping engine…"
