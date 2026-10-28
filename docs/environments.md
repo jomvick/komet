@@ -108,6 +108,15 @@ komet daemon uninstall       # stop and remove the unit
 Data lives in `KOMET_DATA_DIR` (default `~/.komet`). Removing the desktop-side
 environment forgets it by default and can delete its local mirror on request.
 
+To retire the machine entirely — the service, its bearer, and every document it
+served (this is the only copy of this environment's sessions, so remove the
+desktop side first if you want to keep the mirror):
+
+```bash
+systemctl --user disable --now komet.service
+rm -rf ~/.komet ~/.local/bin/komet
+```
+
 ## Troubleshooting
 
 ```bash

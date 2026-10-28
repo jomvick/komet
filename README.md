@@ -127,7 +127,9 @@ komet
 ### Remote devices (a VM or VPS with its own workspace)
 
 An environment is a workspace backed by its own sync server: its sessions run on
-that machine and its sidebar stays separate from your local one. On the remote
+that machine and its sidebar stays separate from your local one. Install the
+agent CLIs you want to use there first (`opencode`, `hermes`, `codex`, …) — the
+environment offers exactly the agents its own machine has. On the remote
 machine:
 
 ```bash
@@ -138,10 +140,15 @@ curl -fsSL https://raw.githubusercontent.com/jomvick/komet/main/install.sh \
 It installs a UI-less Komet, registers it as a service, and prints a
 `komet://pair/…` link. Paste that link in **Komet → Settings → Sync → Add
 device**, then pick the machine from the **Devices** menu at the top of the
-sidebar to chat on it and manage its agents. Behind TLS, use
+sidebar to chat on it and manage its agents. `--lan` serves plain HTTP, so the
+dialog asks you to confirm you are on a network you control; behind TLS, use
 `komet serve --public-url https://sync.example.com --install-service` instead.
 The token and namespace are generated once and saved in `~/.komet/serve.json`
-(0600); the link is a secret.
+(0600); the link is a secret — it grants the bearer a shell on that machine.
+
+To stop being an environment: **Settings → Sync → Remove** on the desktop (tick
+*purge* to delete its local mirror too), then `systemctl --user disable --now
+komet.service && rm -rf ~/.komet ~/.local/bin/komet` on the remote machine.
 
 > Full details: [`docs/environments.md`](docs/environments.md)
 
