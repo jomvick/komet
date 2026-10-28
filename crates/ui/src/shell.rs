@@ -5024,10 +5024,12 @@ impl Shell {
                             .anchor(gpui::Anchor::TopRight)
                             .snap_to_window_with_margin(px(12.0))
                             .child(
+                                // Only the card occludes: the padding that
+                                // pushes it below the titlebar must not swallow
+                                // clicks on the window controls up there.
                                 div()
-                                    .occlude()
                                     .pt(px(Theme::TITLEBAR_HEIGHT + 4.0))
-                                    .child(card),
+                                    .child(card.occlude()),
                             ),
                     )
                     .priority(1)
