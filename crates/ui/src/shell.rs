@@ -11,6 +11,7 @@
 //! ghost view + `on_drag_move::<Marker>` on the root), the same idiom as Zed's
 //! dock. Double-clicking a handle resets that pane to its default width.
 
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -25,6 +26,7 @@ use gpui::{
 use gpui_tokio::Tokio;
 use komet_engine::InstanceLock;
 use komet_engine::harness_cli::HarnessCliStatus;
+use komet_engine::registry::{HarnessDescriptor, descriptor_enabled};
 use komet_proto::{AuthState, HarnessId, WorkspaceScope};
 use komet_rpc::methods;
 
@@ -53,8 +55,8 @@ use crate::settings::{
     UiSettings, platform_combo,
 };
 use crate::state::{
-    AppState, ConnectionStatus, EngineBootConfig, EngineMode, GatePhase, Indicator, OrgRow,
-    format_time_ago, org_name_valid, parse_orgs, sort_memberships,
+    AppState, ConnectionStatus, EngineBootConfig, EngineHandle, EngineMode, GatePhase, Indicator,
+    OrgRow, format_time_ago, org_name_valid, parse_orgs, sort_memberships,
 };
 use crate::terminal::panel::{TerminalPanel, ToggleTerminal, clamp_terminal_height};
 use crate::theme::Theme;
@@ -597,11 +599,19 @@ fn update_modal_should_show(
 }
 
 /// Launch-check results → the rows the home card shows. A CLI that is already
-/// current never gets a row (the card is an upsell, not a status report).
-fn harness_updates(statuses: Vec<HarnessCliStatus>) -> Vec<HarnessCliStatus> {
+/// current, disabled on this device, or unmanaged never gets a row (the card
+/// is an upsell, not a status report).
+fn harness_updates(
+    statuses: Vec<HarnessCliStatus>,
+    enabled: Option<&HashSet<HarnessId>>,
+) -> Vec<HarnessCliStatus> {
     statuses
         .into_iter()
-        .filter(|status| status.managed && status.update_available)
+        .filter(|status| {
+            status.managed
+                && status.update_available
+                && enabled.is_none_or(|enabled| enabled.contains(&status.harness))
+        })
         .collect()
 }
 
@@ -611,10 +621,91 @@ fn harness_check_needs_retry(statuses: &[HarnessCliStatus]) -> bool {
     statuses.iter().any(|status| status.check_error.is_some())
 }
 
-/// Shell-side poll cadence while a lookup is failing: 5 min doubling to 6 h,
-/// mirroring the engine checker's retry schedule.
-const HARNESS_RETRY_FIRST: Duration = Duration::from_secs(5 * 60);
-const HARNESS_RETRY_MAX: Duration = Duration::from_secs(6 * 60 * 60);
+/// Shell-side poll cadence while a lookup is failing: 2 min doubling to 10 min.
+const HARNESS_RETRY_FIRST: Duration = Duration::from_secs(2 * 60);
+const HARNESS_RETRY_MAX: Duration = Duration::from_secs(10 * 60);
+
+/// Per-row lifecycle in the home card. A finished row stays visible until the
+/// user dismisses the card or a later check drops its harness.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CliUpdateRow {
+    Idle,
+    Updating,
+    Updated(Option<String>),
+    Failed(SharedString),
+}
+
+/// Whether the row still waits for an update: never started, or failed and
+/// retryable. An unseen harness is idle.
+fn cli_row_pending(rows: &HashMap<HarnessId, CliUpdateRow>, harness: HarnessId) -> bool {
+    !matches!(
+        rows.get(&harness),
+        Some(CliUpdateRow::Updating | CliUpdateRow::Updated(_))
+    )
+}
+
+/// Enabled harnesses on this device. `None` (registry unavailable) means
+/// "don't filter" rather than hiding every row.
+async fn enabled_harness_ids(engine: &EngineHandle) -> Option<HashSet<HarnessId>> {
+    let value = engine
+        .client()
+        .call(methods::LIST_HARNESSES, serde_json::json!({}))
+        .await
+        .ok()?;
+    let descriptors = serde_json::from_value::<Vec<HarnessDescriptor>>(value).ok()?;
+    Some(
+        descriptors
+            .into_iter()
+            .filter(descriptor_enabled)
+            .map(|descriptor| descriptor.id)
+            .collect(),
+    )
+}
+
+/// Update one CLI, then re-read the engine's just-refreshed status. A clean
+/// updater exit is not success: the version must actually have moved.
+async fn run_harness_update(
+    engine: &EngineHandle,
+    harness: HarnessId,
+) -> Result<Option<String>, String> {
+    engine
+        .client()
+        .call(
+            methods::MANAGE_HARNESS_CLI,
+            serde_json::json!({ "harness": harness }),
+        )
+        .await
+        .map_err(|error| format!("Could not update: {error}"))?;
+    let value = engine
+        .client()
+        .call(
+            methods::GET_HARNESS_CLI_STATUS,
+            serde_json::json!({ "checkLatest": false }),
+        )
+        .await
+        .map_err(|error| format!("Could not verify the update: {error}"))?;
+    let statuses: Vec<HarnessCliStatus> = serde_json::from_value(value)
+        .map_err(|error| format!("Could not read the update result: {error}"))?;
+    let status = statuses
+        .into_iter()
+        .find(|status| status.harness == harness)
+        .ok_or_else(|| "The update finished but the CLI status is unavailable.".to_string())?;
+    if status.update_available {
+        return Err(format!(
+            "Still on {} after updating to {}.",
+            status
+                .installed_version
+                .as_deref()
+                .map(version_token)
+                .unwrap_or("an unknown version"),
+            status
+                .latest_version
+                .as_deref()
+                .unwrap_or("the latest version"),
+        ));
+    }
+    Ok(status.installed_version)
+}
 
 /// Row copy: `2.1.309 → 2.1.310`, or only the target when the installed
 /// version could not be read. Only the token the check actually compared is
@@ -1029,9 +1120,8 @@ pub struct Shell {
     cli_check_started: bool,
     /// The card's × — session-scoped: a relaunch surfaces the same updates.
     cli_updates_dismissed: bool,
-    /// Harness whose installer is running right now (its row says so).
-    cli_updating: Option<HarnessId>,
-    cli_update_error: Option<SharedString>,
+    /// Per-harness row lifecycle in the home card (idle/updating/updated/failed).
+    cli_update_rows: HashMap<HarnessId, CliUpdateRow>,
     /// How this binary was installed — decides the strip's click behavior.
     /// Cached: `detect_install` stats `current_exe` and this renders per frame.
     install: komet_update::InstallKind,
@@ -1299,8 +1389,7 @@ impl Shell {
             cli_updates: Vec::new(),
             cli_check_started: false,
             cli_updates_dismissed: false,
-            cli_updating: None,
-            cli_update_error: None,
+            cli_update_rows: HashMap::new(),
             install: komet_update::detect_install(),
             org: None,
             sync_flow: SyncFlow::Idle,
@@ -4577,9 +4666,8 @@ impl Shell {
 
     /// One pass over every agent CLI (`checkLatest` hits the npm registry /
     /// Cursor installer). Background: `<cli> --version` alone can cost 6s per
-    /// harness, so the canvas must not wait for it. A check that reports
-    /// `check_error` is polled again with backoff instead of being dropped
-    /// for the rest of the session.
+    /// harness, so the canvas must not wait for it. A failed check is polled
+    /// again with backoff instead of being dropped for the rest of the session.
     fn check_harness_updates(&mut self, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
@@ -4596,80 +4684,140 @@ impl Shell {
                         serde_json::json!({ "checkLatest": check_latest }),
                     )
                     .await;
-                // Only the first call does the network work; retries read the
-                // engine's cache, which its own background checker refreshes.
-                let (updates, retry) = match result {
+                let mut retry = true;
+                let mut updates = None;
+                match result {
                     Ok(value) => match serde_json::from_value::<Vec<HarnessCliStatus>>(value) {
                         Ok(statuses) => {
-                            let retry = harness_check_needs_retry(&statuses);
-                            (Some(harness_updates(statuses)), retry)
+                            retry = harness_check_needs_retry(&statuses);
+                            let enabled = enabled_harness_ids(&engine).await;
+                            updates = Some(harness_updates(statuses, enabled.as_ref()));
+                            // A response landed; later polls read the engine
+                            // cache, which its own checker refreshes.
+                            check_latest = false;
                         }
                         Err(error) => {
                             tracing::warn!(
                                 %error,
                                 "harness CLI update status response was invalid"
                             );
-                            (None, false)
+                            check_latest = true;
                         }
                     },
                     Err(error) => {
                         tracing::warn!(%error, "could not check harness CLI updates");
-                        (None, true)
+                        check_latest = true;
                     }
-                };
-                if let Err(error) = this.update(cx, |shell, cx| {
-                    if let Some(updates) = updates {
-                        shell.cli_updates = updates;
-                        cx.notify();
-                    }
-                }) {
-                    tracing::debug!(%error, "harness CLI update check completed after shell closed");
-                    break;
+                }
+                let closed = this
+                    .update(cx, |shell, cx| {
+                        if let Some(updates) = updates {
+                            let present: HashSet<HarnessId> =
+                                updates.iter().map(|status| status.harness).collect();
+                            shell
+                                .cli_update_rows
+                                .retain(|harness, _| present.contains(harness));
+                            shell.cli_updates = updates;
+                            cx.notify();
+                        }
+                    })
+                    .is_err();
+                if closed {
+                    tracing::debug!("harness CLI update check completed after shell closed");
+                    return;
                 }
                 if !retry {
-                    break;
+                    return;
                 }
                 cx.background_executor().timer(retry_in).await;
                 retry_in = (retry_in * 2).min(HARNESS_RETRY_MAX);
-                check_latest = false;
             }
         })
         .detach();
     }
 
-    /// Run the CLI's own installer, then drop its row. npm failures land in the
-    /// card footer instead of a modal.
+    /// Run the CLI's own updater, then verify the version the binary reports.
+    /// Failures stay on the row instead of a modal.
     fn update_harness_cli(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
-        if self.cli_updating.is_some() {
+        if matches!(
+            self.cli_update_rows.get(&harness),
+            Some(CliUpdateRow::Updating)
+        ) {
             return;
         }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
-        self.cli_updating = Some(harness);
-        self.cli_update_error = None;
+        self.cli_update_rows.insert(harness, CliUpdateRow::Updating);
         cx.notify();
         cx.spawn(async move |this, cx| {
-            let result = engine
-                .client()
-                .call(
-                    methods::MANAGE_HARNESS_CLI,
-                    serde_json::json!({ "harness": harness }),
-                )
-                .await;
+            let outcome = run_harness_update(&engine, harness).await;
             this.update(cx, |shell, cx| {
-                shell.cli_updating = None;
-                match result {
-                    Ok(_) => shell.cli_updates.retain(|status| status.harness != harness),
-                    Err(error) => {
-                        shell.cli_update_error = Some(format!("Could not update: {error}").into())
-                    }
-                }
+                shell.finish_harness_update(harness, outcome, cx);
                 cx.notify();
             })
             .ok();
         })
         .detach();
+    }
+
+    /// Sequential on purpose: concurrent npm installs fight over the same
+    /// global lock.
+    fn update_all_harness_clis(&mut self, cx: &mut Context<Self>) {
+        let targets: Vec<HarnessId> = self
+            .cli_updates
+            .iter()
+            .map(|status| status.harness)
+            .filter(|harness| cli_row_pending(&self.cli_update_rows, *harness))
+            .collect();
+        if targets.len() < 2 {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            for harness in targets {
+                let marked = this.update(cx, |shell, cx| {
+                    shell
+                        .cli_update_rows
+                        .insert(harness, CliUpdateRow::Updating);
+                    cx.notify();
+                });
+                if marked.is_err() {
+                    return;
+                }
+                let outcome = run_harness_update(&engine, harness).await;
+                let done = this.update(cx, |shell, cx| {
+                    shell.finish_harness_update(harness, outcome, cx);
+                    cx.notify();
+                });
+                if done.is_err() {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn finish_harness_update(
+        &mut self,
+        harness: HarnessId,
+        outcome: Result<Option<String>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        match outcome {
+            Ok(version) => {
+                self.cli_update_rows
+                    .insert(harness, CliUpdateRow::Updated(version));
+                // The new version may ship new models; every picker refetches.
+                crate::pickers::bump_harness_catalog(cx);
+            }
+            Err(error) => {
+                self.cli_update_rows
+                    .insert(harness, CliUpdateRow::Failed(error.into()));
+            }
+        }
     }
 
     /// Floating notification for agent CLI updates. It remains visible across
@@ -4679,94 +4827,179 @@ impl Shell {
             return None;
         }
         let theme = Theme::of(cx).clone();
-        let mut card = popover::popover_card_flush(&theme).w(px(340.0)).child(
+        let busy = self.cli_updates.iter().any(|status| {
+            matches!(
+                self.cli_update_rows.get(&status.harness),
+                Some(CliUpdateRow::Updating)
+            )
+        });
+        let pending = self
+            .cli_updates
+            .iter()
+            .filter(|status| cli_row_pending(&self.cli_update_rows, status.harness))
+            .count();
+        let any_updated = self.cli_updates.iter().any(|status| {
+            matches!(
+                self.cli_update_rows.get(&status.harness),
+                Some(CliUpdateRow::Updated(_))
+            )
+        });
+        let title = if self.cli_updates.len() == 1 {
+            "Harness update available"
+        } else {
+            "Harness updates available"
+        };
+
+        let mut header = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .px(px(12.0))
+            .py(px(10.0))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(px(13.0))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme.text)
+                    .child(SharedString::from(title)),
+            );
+        if pending > 1 {
+            header = header.child(
+                div()
+                    .id("harness-updates-update-all")
+                    .flex_none()
+                    .px(px(8.0))
+                    .py(px(4.0))
+                    .rounded(px(6.0))
+                    .text_size(px(12.0))
+                    .text_color(theme.text_muted)
+                    .cursor_pointer()
+                    .hover(|style| style.opacity(0.7))
+                    .child(SharedString::from("Update all"))
+                    .on_click(cx.listener(|this, _, _, cx| this.update_all_harness_clis(cx))),
+            );
+        }
+        header = header.child(
             div()
+                .id("harness-updates-dismiss")
                 .flex()
-                .flex_row()
                 .items_center()
-                .justify_between()
-                .px(px(12.0))
-                .py(px(10.0))
-                .child(
-                    div()
-                        .text_size(px(13.0))
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(theme.text)
-                        .child(SharedString::from("Harness update available")),
-                )
-                .child(
-                    div()
-                        .id("harness-updates-dismiss")
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .size(px(20.0))
-                        .rounded(px(6.0))
-                        .cursor_pointer()
+                .justify_center()
+                .size(px(20.0))
+                .rounded(px(6.0))
+                .when(busy, |el| el.opacity(0.4).cursor_default())
+                .when(!busy, |el| {
+                    el.cursor_pointer()
                         .hover(|style| style.opacity(0.7))
-                        .child(
-                            icon(icons::CLOSE)
-                                .size(px(13.0))
-                                .text_color(theme.text_muted),
-                        )
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.cli_updates_dismissed = true;
                             cx.notify();
-                        })),
+                        }))
+                })
+                .child(
+                    icon(icons::CLOSE)
+                        .size(px(13.0))
+                        .text_color(theme.text_muted),
                 ),
         );
+
+        let mut card = popover::popover_card_flush(&theme)
+            .w(px(340.0))
+            .child(header);
         card = card.child(div().h(px(1.0)).bg(theme.border));
         for status in &self.cli_updates {
             let harness = status.harness;
             let (brand, tint) = crate::pickers::harness_brand_icon(harness);
-            let updating = self.cli_updating == Some(harness);
-            let install_running = self.cli_updating.is_some();
-            card = card.child(
-                div()
+            let state = self
+                .cli_update_rows
+                .get(&harness)
+                .cloned()
+                .unwrap_or(CliUpdateRow::Idle);
+            let info: AnyElement = match &state {
+                CliUpdateRow::Updated(version) => div()
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(10.0))
-                    .px(px(12.0))
-                    .py(px(8.0))
-                    .child(
-                        icon(brand)
-                            .size(px(16.0))
-                            .text_color(tint.unwrap_or(theme.text_muted)),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_size(px(13.0))
-                            .text_color(theme.text)
-                            .child(SharedString::from(harness.display_name())),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(12.0))
-                            .text_color(theme.text_muted)
-                            .child(SharedString::from(cli_update_versions(status))),
-                    )
-                    .child(if updating {
-                        div()
-                            .text_size(px(12.0))
-                            .text_color(theme.text_muted)
-                            .child(SharedString::from("Updating…"))
-                            .into_any_element()
-                    } else if install_running {
-                        popover::btn_primary(&theme, "Update")
-                            .opacity(0.5)
-                            .cursor_default()
-                            .into_any_element()
+                    .gap(px(4.0))
+                    .text_size(px(12.0))
+                    .text_color(theme.success)
+                    .child(icon(icons::CHECK).size(px(12.0)).text_color(theme.success))
+                    .child(SharedString::from(match version {
+                        Some(version) => format!("Updated to {version}"),
+                        None => "Updated".to_string(),
+                    }))
+                    .into_any_element(),
+                _ => div()
+                    .text_size(px(12.0))
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from(cli_update_versions(status)))
+                    .into_any_element(),
+            };
+            let action = match &state {
+                CliUpdateRow::Updating => Some(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from("Updating…"))
+                        .into_any_element(),
+                ),
+                CliUpdateRow::Updated(_) => None,
+                CliUpdateRow::Idle | CliUpdateRow::Failed(_) => {
+                    let label = if matches!(&state, CliUpdateRow::Failed(_)) {
+                        "Retry"
                     } else {
-                        popover::btn_primary(&theme, "Update")
+                        "Update"
+                    };
+                    Some(
+                        popover::btn_primary(&theme, label)
                             .id(format!("harness-update-{}", harness.display_name()))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.update_harness_cli(harness, cx)
                             }))
-                            .into_any_element()
-                    }),
-            );
+                            .into_any_element(),
+                    )
+                }
+            };
+            let mut row = div()
+                .flex()
+                .flex_col()
+                .gap(px(4.0))
+                .px(px(12.0))
+                .py(px(8.0))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(10.0))
+                        .child(
+                            icon(brand)
+                                .size(px(16.0))
+                                .text_color(tint.unwrap_or(theme.text_muted)),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_size(px(13.0))
+                                .text_color(theme.text)
+                                .child(SharedString::from(harness.display_name())),
+                        )
+                        .child(info)
+                        .when_some(action, |el, action| el.child(action)),
+                );
+            if let CliUpdateRow::Failed(error) = &state {
+                row = row.child(
+                    div()
+                        .pl(px(26.0))
+                        .text_size(px(11.0))
+                        .text_color(theme.danger)
+                        .child(error.clone()),
+                );
+            }
+            card = card.child(row);
         }
         card = card.child(div().h(px(1.0)).bg(theme.border));
         card = card.child(
@@ -4775,20 +5008,12 @@ impl Shell {
                 .py(px(8.0))
                 .text_size(px(12.0))
                 .text_color(theme.text_muted.opacity(0.75))
-                .child(SharedString::from(
-                    "New models often need the latest version.",
-                )),
+                .child(SharedString::from(if any_updated {
+                    "Model picker refreshed with the new version’s models."
+                } else {
+                    "New models often need the latest version."
+                })),
         );
-        if let Some(error) = &self.cli_update_error {
-            card = card.child(
-                div()
-                    .px(px(12.0))
-                    .pb(px(8.0))
-                    .text_size(px(12.0))
-                    .text_color(theme.danger)
-                    .child(error.clone()),
-            );
-        }
         Some(
             div()
                 .absolute()
@@ -9071,21 +9296,24 @@ mod tests {
 
     #[test]
     fn home_card_lists_only_clis_with_a_newer_release() {
-        let updates = harness_updates(vec![
-            // `claude --version` reports "2.1.309 (Claude Code)": the row keeps
-            // the comparison token, not the product suffix.
-            cli_status(
-                HarnessId::ClaudeCode,
-                "2.1.309 (Claude Code)",
-                "2.1.310",
-                true,
-            ),
-            cli_status(HarnessId::Codex, "0.9.0", "0.9.0", false),
-            HarnessCliStatus {
-                managed: false,
-                ..cli_status(HarnessId::Cursor, "1.0.0", "1.1.0", true)
-            },
-        ]);
+        let updates = harness_updates(
+            vec![
+                // `claude --version` reports "2.1.309 (Claude Code)": the row keeps
+                // the comparison token, not the product suffix.
+                cli_status(
+                    HarnessId::ClaudeCode,
+                    "2.1.309 (Claude Code)",
+                    "2.1.310",
+                    true,
+                ),
+                cli_status(HarnessId::Codex, "0.9.0", "0.9.0", false),
+                HarnessCliStatus {
+                    managed: false,
+                    ..cli_status(HarnessId::Cursor, "1.0.0", "1.1.0", true)
+                },
+            ],
+            None,
+        );
         assert_eq!(
             updates.len(),
             1,
@@ -9093,6 +9321,20 @@ mod tests {
         );
         assert_eq!(updates[0].harness, HarnessId::ClaudeCode);
         assert_eq!(cli_update_versions(&updates[0]), "2.1.309 → 2.1.310");
+    }
+
+    #[test]
+    fn home_card_skips_harnesses_disabled_on_this_device() {
+        let enabled = HashSet::from([HarnessId::ClaudeCode]);
+        let updates = harness_updates(
+            vec![
+                cli_status(HarnessId::ClaudeCode, "2.1.309", "2.1.310", true),
+                cli_status(HarnessId::Codex, "0.9.0", "0.9.1", true),
+            ],
+            Some(&enabled),
+        );
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].harness, HarnessId::ClaudeCode);
     }
 
     #[test]
@@ -9107,5 +9349,21 @@ mod tests {
         offline.latest_version = None;
         offline.check_error = Some("registry offline".into());
         assert!(harness_check_needs_retry(&[offline]));
+    }
+
+    #[test]
+    fn only_idle_or_failed_rows_are_updated_again() {
+        let rows = HashMap::from([
+            (HarnessId::ClaudeCode, CliUpdateRow::Idle),
+            (HarnessId::Codex, CliUpdateRow::Updating),
+            (HarnessId::Opencode, CliUpdateRow::Updated(None)),
+            (HarnessId::Pi, CliUpdateRow::Failed("boom".into())),
+        ]);
+        assert!(cli_row_pending(&rows, HarnessId::ClaudeCode));
+        assert!(!cli_row_pending(&rows, HarnessId::Codex));
+        assert!(!cli_row_pending(&rows, HarnessId::Opencode));
+        assert!(cli_row_pending(&rows, HarnessId::Pi));
+        // A harness with no row yet is idle.
+        assert!(cli_row_pending(&rows, HarnessId::Grok));
     }
 }

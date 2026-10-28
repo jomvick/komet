@@ -1505,7 +1505,7 @@ impl RpcService for EngineRpc {
             methods::GET_HARNESS_CLI_STATUS => {
                 let params: crate::harness_cli::HarnessCliStatusParams = parse_params(params)?;
                 let statuses = match &self.harness_cli_checker {
-                    Some(checker) => checker.statuses(params.check_latest).await,
+                    Some(checker) => checker.statuses(params.check_latest, params.force).await,
                     None => {
                         let harnesses = self
                             .registry
@@ -1525,7 +1525,9 @@ impl RpcService for EngineRpc {
                     .await
                     .map_err(RpcError::Failed)?;
                 if let Some(checker) = &self.harness_cli_checker {
-                    checker.statuses(true).await;
+                    // Forced: the freshness window must not answer with the
+                    // pre-update cache the caller is verifying against.
+                    checker.statuses(true, true).await;
                 }
                 RpcReply::value(&self.registry.descriptors())
             }
