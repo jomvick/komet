@@ -16,7 +16,6 @@ use komet_proto::{
 use komet_rpc::{LinkCache, LinkCacheConfig, StaticToken};
 use tokio::sync::watch;
 
-use crate::EngineError;
 use crate::doc_host::EdgeConfig;
 use crate::environments::{EnvStoreError, EnvironmentStore, LOCAL_ENV_ID};
 use crate::workspace_runtime::WorkspaceRuntime;
@@ -98,22 +97,39 @@ pub struct EnvHosts {
     /// Namespace of the profile this engine serves; adding it is refused.
     own: Namespace,
     store: RwLock<EnvironmentStore>,
+    /// The stored file could not be read: serve "no environments" and refuse
+    /// every write, so repairing the file is the only way to change the list.
+    read_only: bool,
     entries: RwLock<Vec<EnvHandle>>,
     listing: watch::Sender<Vec<Environment>>,
 }
 
+/// A store whose file cannot be written back until the user repairs it.
+const STORE_UNREADABLE: &str =
+    "environments.json is unreadable; repair or delete it, then restart Komet";
+
 impl EnvHosts {
     /// Load `{data_dir}/environments.json` and open every stored environment.
-    /// A dead or broken environment is logged and skipped: boot never depends on
-    /// a remote host, and its token stays stored for the next boot.
+    /// An unreadable file boots with no environments (never blocking the local
+    /// workspace) and stays read-only, because saving would erase its tokens.
     pub fn boot(
         data_dir: &Path,
         device_id: &str,
         device_name: String,
         default_harness: HarnessId,
         own: Namespace,
-    ) -> Result<Self, EngineError> {
-        let store = EnvironmentStore::load(data_dir)?;
+    ) -> Self {
+        let (store, read_only) = match EnvironmentStore::load(data_dir) {
+            Ok(store) => (store, false),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "environments file unreadable; remote environments are disabled until it is \
+                     repaired"
+                );
+                (EnvironmentStore::empty(data_dir), true)
+            }
+        };
         let hosts = Self {
             data_dir: data_dir.to_path_buf(),
             device_id: device_id.to_string(),
@@ -121,6 +137,7 @@ impl EnvHosts {
             default_harness,
             own,
             store: RwLock::new(store),
+            read_only,
             entries: RwLock::new(Vec::new()),
             listing: watch::channel(Vec::new()).0,
         };
@@ -147,7 +164,7 @@ impl EnvHosts {
             }
         }
         hosts.publish();
-        Ok(hosts)
+        hosts
     }
 
     /// The switcher's list: the local workspace first, then every environment.
@@ -218,6 +235,11 @@ impl EnvHosts {
     /// Decode a link, verify the server answers with that token, and start using
     /// it. Idempotent on `(url, token)`: pairing twice returns the same id.
     pub async fn add(&self, link: &str) -> Result<Environment, EnvAddError> {
+        if self.read_only {
+            return Err(EnvAddError::Store(EnvStoreError::Io(
+                STORE_UNREADABLE.into(),
+            )));
+        }
         let payload = decode_pair_link(link)?;
         let probe = probe_server(&payload.url, &payload.token).await?;
         if probe.org_id == self.own.org_id && probe.user_id == self.own.user_id {
@@ -269,6 +291,9 @@ impl EnvHosts {
     /// mirror: the mirror is the last copy when the server is gone, so deleting it
     /// is always explicit.
     pub async fn remove(&self, id: &str, purge: bool) -> Result<(), EnvStoreError> {
+        if self.read_only {
+            return Err(EnvStoreError::Io(STORE_UNREADABLE.into()));
+        }
         let handle = {
             let mut store = self.store.write().unwrap_or_else(|e| e.into_inner());
             let mut next = store.clone();
@@ -284,8 +309,7 @@ impl EnvHosts {
         };
         self.publish();
         if let Some(handle) = handle {
-            handle.runtime.doc_host.shutdown_workers().await;
-            handle.runtime.workspace.shutdown();
+            teardown(&handle).await;
         }
         if purge {
             let root = self.data_dir.join("environments").join(id);
@@ -296,6 +320,17 @@ impl EnvHosts {
             }
         }
         Ok(())
+    }
+
+    /// Engine shutdown: stop every environment's transports without touching the
+    /// store. Live environment connections hold clones of these handles, so
+    /// unreferencing them alone would leave sockets and rows open.
+    pub async fn shutdown_all(&self) {
+        let handles: Vec<EnvHandle> =
+            std::mem::take(&mut *self.entries.write().unwrap_or_else(|e| e.into_inner()));
+        for handle in handles {
+            teardown(&handle).await;
+        }
     }
 
     fn open_runtime(&self, env: &Environment) -> Result<EnvHandle, EnvAddError> {
@@ -331,6 +366,18 @@ impl EnvHosts {
     fn publish(&self) {
         self.listing.send_replace(self.list());
     }
+}
+
+/// Revoke an environment's transports before draining: live environment
+/// connections hold clones of the runtime and links, so unreferencing alone
+/// leaves the sockets open. `flush` (not `shutdown`) persists the snapshot
+/// without stamping this controller as a device in that environment.
+async fn teardown(handle: &EnvHandle) {
+    handle.links.disconnect_all();
+    handle.runtime.workspace.disconnect_edge();
+    handle.runtime.doc_host.shutdown_workers().await;
+    handle.runtime.doc_host.flush_all();
+    handle.runtime.workspace.flush();
 }
 
 fn redacted(env: &Environment) -> Environment {

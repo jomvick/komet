@@ -57,6 +57,15 @@ pub struct EnvironmentStore {
 }
 
 impl EnvironmentStore {
+    /// An empty store for a data dir whose file could not be read. Callers must
+    /// keep it read-only: saving over the unreadable file would drop its tokens.
+    pub fn empty(data_dir: &Path) -> Self {
+        Self {
+            path: data_dir.join(FILE_NAME),
+            envs: Vec::new(),
+        }
+    }
+
     pub fn load(data_dir: &Path) -> Result<Self, std::io::Error> {
         let path = data_dir.join(FILE_NAME);
         let envs = match std::fs::read(&path) {

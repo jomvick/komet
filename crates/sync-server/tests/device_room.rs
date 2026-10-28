@@ -89,12 +89,25 @@ async fn rpc_round_trips_from_controller_to_hosted_engine() {
 
     let mut config = LinkCacheConfig::new(server.edge_url.clone(), host_token());
     config.probe_timeout = Duration::from_secs(5);
+    // The relay accepts the client socket before the host has registered, so a
+    // dial can bounce `host_offline`; keep the retry cheap and bounded.
+    config.cooldown_base = Duration::from_millis(50);
+    config.cooldown_max = Duration::from_millis(100);
     let cache = LinkCache::new(config);
 
-    let client = cache
-        .client(DEVICE)
-        .await
-        .expect("controller dials the device room");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let client = loop {
+        match cache.client(DEVICE).await {
+            Ok(client) => break client,
+            Err(err) => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "controller never reached the hosted engine: {err}"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+    };
     let reply = client
         .call("whereAmI", serde_json::json!({}))
         .await

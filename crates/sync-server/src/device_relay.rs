@@ -159,6 +159,22 @@ impl DeviceRelay {
         let Some(entry) = rooms.get(room) else {
             return true;
         };
+        // Only the current registration may speak for its role: a socket that a
+        // reconnect superseded must not route through the live one.
+        let owns_registration = if is_host {
+            entry
+                .host
+                .as_ref()
+                .is_some_and(|host| host.same_channel(from))
+        } else {
+            entry
+                .clients
+                .get(conn_id)
+                .is_some_and(|client| client.same_channel(from))
+        };
+        if !owns_registration {
+            return false;
+        }
         if !is_host {
             match &entry.host {
                 Some(host) => {
@@ -272,6 +288,42 @@ mod tests {
         assert_eq!(query.get("role").map(String::as_str), Some("client"));
         assert_eq!(query.get("connId").map(String::as_str), Some("c1"));
         assert!(query_pairs(None).is_empty());
+    }
+
+    #[test]
+    fn a_superseded_registration_cannot_route() {
+        let relay = DeviceRelay::new();
+        let (old_host, mut old_host_rx) = unbounded_channel();
+        let (host, _host_rx) = unbounded_channel();
+        relay.join("dev", true, "host", &old_host);
+        relay.join("dev", true, "host", &host);
+        assert!(
+            matches!(old_host_rx.try_recv(), Ok(Out::Close)),
+            "the superseded host is told to close"
+        );
+
+        let (client, mut client_rx) = unbounded_channel();
+        relay.join("dev", false, "c1", &client);
+
+        let frame = encode_device_frame(&DeviceFrameHeader::new("s", "k").with_to("c1"), b"hi")
+            .expect("encode");
+        assert!(
+            !relay.route("dev", true, "host", &old_host, frame.clone()),
+            "a superseded host socket must not speak for the room"
+        );
+        assert!(relay.route("dev", true, "host", &host, frame));
+        assert!(
+            matches!(client_rx.try_recv(), Ok(Out::Frame(_))),
+            "the current host reaches the client"
+        );
+
+        let (old_client, _old_client_rx) = unbounded_channel();
+        let client_frame =
+            encode_device_frame(&DeviceFrameHeader::new("s", "k"), b"hi").expect("encode");
+        assert!(
+            !relay.route("dev", false, "c1", &old_client, client_frame),
+            "a superseded client socket must not speak for its connId"
+        );
     }
 
     #[test]

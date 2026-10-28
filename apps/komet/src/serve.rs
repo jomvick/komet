@@ -163,18 +163,30 @@ pub fn should_print_link(print_link_flag: bool, link_is_new: bool) -> bool {
     print_link_flag || link_is_new
 }
 
-/// Sync server on `0.0.0.0:{port}` + the engine that runs this environment's
-/// sessions. The engine reaches its own server over loopback, so the token never
-/// leaves the process to reach the local registry.
+/// Loopback by default: the engine reaches its own server over 127.0.0.1, and
+/// a bearer must not cross an interface in clear text unless the operator asked
+/// for a plain-HTTP LAN link.
+fn bind_host(public_url: Option<&str>) -> &'static str {
+    match public_url {
+        Some(url) if komet_sync_server::sync_url_is_insecure(url) => "0.0.0.0",
+        _ => "127.0.0.1",
+    }
+}
+
+/// Sync server on loopback (all interfaces for a plain-HTTP LAN link) + the
+/// engine that runs this environment's sessions. The engine reaches its own
+/// server over loopback, so the token never leaves the process to reach the
+/// local registry.
 pub async fn run(
     config: ServeConfig,
     data_dir: PathBuf,
     ipc_port: u16,
     harness: komet_engine::HarnessId,
 ) -> anyhow::Result<()> {
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", config.port))
+    let host = bind_host(config.public_url.as_deref());
+    let listener = tokio::net::TcpListener::bind((host, config.port))
         .await
-        .with_context(|| format!("binding the sync server on 0.0.0.0:{}", config.port))?;
+        .with_context(|| format!("binding the sync server on {host}:{}", config.port))?;
     tracing::info!(port = config.port, label = %config.label, "komet serve starting");
 
     let identity = config.identity();
@@ -465,5 +477,13 @@ mod tests {
         )
         .unwrap();
         assert!(moved, "a new address makes a new link, so it must be shown");
+    }
+
+    #[test]
+    fn a_bearer_only_crosses_all_interfaces_on_a_plain_http_lan_link() {
+        assert_eq!(bind_host(None), "127.0.0.1");
+        assert_eq!(bind_host(Some("https://sync.example.com")), "127.0.0.1");
+        assert_eq!(bind_host(Some("http://127.0.0.1:8787")), "127.0.0.1");
+        assert_eq!(bind_host(Some("http://192.168.1.10:8787")), "0.0.0.0");
     }
 }

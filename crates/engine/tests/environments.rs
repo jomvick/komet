@@ -398,8 +398,7 @@ async fn remove_keeps_the_mirror_unless_the_purge_is_asked_for() {
                 org_id: "org-a".into(),
                 user_id: "user-a".into(),
             },
-        )
-        .expect("boot with the environment open");
+        );
         assert_eq!(hosts.list().len(), 2, "local + the stored environment");
         let mirror = root.join("environments").join("env-x");
         std::fs::create_dir_all(&mirror).expect("mirror dir");
@@ -449,8 +448,64 @@ fn boot_skips_an_environment_that_cannot_open() {
             org_id: "org-a".into(),
             user_id: "user-a".into(),
         },
-    )
-    .expect("boot tolerates a broken environment");
+    );
     assert_eq!(hosts.list().len(), 2);
     assert!(hosts.runtime("env-x").is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remove_stops_the_room_a_live_connection_still_holds() {
+    let dirs = tempfile::tempdir().expect("tempdir");
+    let url = start_server(&dirs.path().join("server-b"), "org-b", "user-b", "VPS B").await;
+    let core = assemble(&dirs.path().join("a"), "device-a");
+    let env = core
+        .envs
+        .add(&link(&url, TOKEN, "VPS B"))
+        .await
+        .expect("add environment");
+
+    let runtime = core.envs.runtime(&env.id).expect("live runtime");
+    wait_until(
+        || runtime.workspace.connected(),
+        "environment registry join",
+    )
+    .await;
+
+    // A served environment connection keeps its own clones of this runtime.
+    let _client = memory_client(core.env_service(Some(&env.id)).expect("env service"));
+
+    core.envs.remove(&env.id, false).await.expect("remove");
+    wait_until(
+        || !runtime.workspace.connected(),
+        "environment room teardown",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn an_unreadable_environments_file_boots_read_only() {
+    let dirs = tempfile::tempdir().expect("tempdir");
+    let file = dirs.path().join("environments.json");
+    let broken = r#"{"v":1,"environments":[{"id":"env-x"#;
+    std::fs::write(&file, broken).expect("broken environments file");
+    let hosts = EnvHosts::boot(
+        dirs.path(),
+        "device-a",
+        "laptop".into(),
+        HarnessId::Mock,
+        Namespace {
+            org_id: "org-a".into(),
+            user_id: "user-a".into(),
+        },
+    );
+    assert_eq!(hosts.list().len(), 1, "local only: the file is unreadable");
+    assert!(
+        hosts.remove("env-x", false).await.is_err(),
+        "a booted read-only host refuses writes"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&file).expect("file survives"),
+        broken,
+        "the unreadable file is never overwritten, so its tokens stay put"
+    );
 }

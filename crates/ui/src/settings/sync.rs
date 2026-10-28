@@ -294,6 +294,12 @@ impl SyncPage {
             self.fail(Step::Decode, "invalid_link".to_string(), cx);
             return;
         };
+        // The consent control only renders while a preview is set, so the
+        // preview must exist before that branch can ask for it.
+        self.preview = Some(Preview {
+            label: payload.label.clone(),
+            url: payload.url.clone(),
+        });
         if needs_insecure_consent(&payload.url) && !self.insecure_ok {
             self.steps = Self::rest();
             self.fail(Step::Decode, "insecure_http".to_string(), cx);
@@ -304,10 +310,6 @@ impl SyncPage {
             (Step::Verify, Mark::Running),
             (Step::Pair, Mark::Waiting),
         ];
-        self.preview = Some(Preview {
-            label: payload.label.clone(),
-            url: payload.url.clone(),
-        });
         cx.notify();
 
         let Some(engine) = self.state.read(cx).local_engine().cloned() else {

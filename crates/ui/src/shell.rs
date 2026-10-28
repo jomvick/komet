@@ -3105,7 +3105,7 @@ impl Shell {
         if self.runtime_change_task.is_some() {
             return;
         }
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
+        let Some(engine) = self.state.read(cx).local_engine().cloned() else {
             self.runtime_change_error = Some("Engine not connected".into());
             self.sync_flow = SyncFlow::SignedOutRestartRequired;
             cx.notify();
@@ -3160,7 +3160,7 @@ impl Shell {
 
     fn cancel_auth_setup(&mut self, cx: &mut Context<Self>) {
         let local = self.state.read(cx).workspace_scope == Some(WorkspaceScope::Local);
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
+        let Some(engine) = self.state.read(cx).local_engine().cloned() else {
             return;
         };
         let pending_auth = self.auth_task.take();
@@ -3246,7 +3246,7 @@ impl Shell {
         if self.runtime_change_task.is_some() {
             return;
         }
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
+        let Some(engine) = self.state.read(cx).local_engine().cloned() else {
             self.runtime_change_error = Some("Engine not connected".into());
             self.sync_flow = SyncFlow::RestartPending { notice_open: true };
             cx.notify();
@@ -3344,7 +3344,7 @@ impl Shell {
         if self.import_task.is_some() {
             return;
         }
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
+        let Some(engine) = self.state.read(cx).local_engine().cloned() else {
             self.sync_flow = SyncFlow::RestartPending { notice_open: true };
             self.runtime_change_error = Some("Engine not connected".into());
             cx.notify();
@@ -3497,7 +3497,7 @@ impl Shell {
         if scope == Some(WorkspaceScope::Local) {
             self.sync_flow = SyncFlow::Enabling;
         }
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
+        let Some(engine) = self.state.read(cx).local_engine().cloned() else {
             return;
         };
         self.auth_task = Some(cx.spawn(async move |this, cx| {
@@ -3550,7 +3550,7 @@ impl Shell {
     }
 
     fn load_orgs(&mut self, cx: &mut Context<Self>) {
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
+        let Some(engine) = self.state.read(cx).local_engine().cloned() else {
             return;
         };
         let Some(org) = self.org.as_mut() else { return };
@@ -3575,7 +3575,7 @@ impl Shell {
     }
 
     fn create_org(&mut self, cx: &mut Context<Self>) {
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
+        let Some(engine) = self.state.read(cx).local_engine().cloned() else {
             return;
         };
         let Some(org) = self.org.as_mut() else { return };
@@ -3612,7 +3612,7 @@ impl Shell {
     }
 
     fn select_org(&mut self, organization_id: String, cx: &mut Context<Self>) {
-        let Some(engine) = self.state.read(cx).engine().cloned() else {
+        let Some(engine) = self.state.read(cx).local_engine().cloned() else {
             return;
         };
         let Some(org) = self.org.as_mut() else { return };

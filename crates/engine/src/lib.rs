@@ -363,7 +363,7 @@ impl EngineCore {
                     org_id: profile.org_id().to_string(),
                     user_id: profile.user_id().to_string(),
                 },
-            )?),
+            )),
             device_id,
             harness_cli_checker,
             local_import,
@@ -592,6 +592,7 @@ impl EngineCore {
         self.doc_host.shutdown_workers().await;
         self.doc_host.flush_all();
         self.workspace.shutdown();
+        self.envs.shutdown_all().await;
         // Break the sessions ⇄ doc-host retain cycle so the replaced graph can
         // actually be freed once the last handle drops.
         self.sessions.clear_doc_host();
