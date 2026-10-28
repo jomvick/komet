@@ -178,6 +178,10 @@ struct InProcessEngine {
     /// port was already taken — the window still works over its own transport.
     ipc_task: Option<tokio::task::JoinHandle<()>>,
     client: Arc<RpcClient>,
+    /// The runtime this engine was built on. Environment connections are made
+    /// from gpui's main thread, which has no reactor: the transport tasks have
+    /// to land here, not on the thread that happened to ask for a device.
+    runtime_handle: tokio::runtime::Handle,
 }
 
 #[async_trait]
@@ -192,7 +196,9 @@ impl EngineBackend for InProcessEngine {
         let Some(core) = self.core.get() else {
             return Err("engine is still assembling; no environments yet".into());
         };
-        Ok(Arc::new(memory_client(core.env_service(Some(env_id))?)))
+        let service = core.env_service(Some(env_id))?;
+        let _entered = self.runtime_handle.enter();
+        Ok(Arc::new(memory_client(service)))
     }
     async fn shutdown(&self) {
         self.boot_task.abort();
@@ -313,6 +319,9 @@ struct RemoteEngine {
     /// daemon the viewport attached to.
     token: Arc<str>,
     lifecycle_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// See [`InProcessEngine::runtime_handle`] — dialing a device needs the
+    /// reactor, so the handshake runs there and only its result crosses back.
+    runtime_handle: tokio::runtime::Handle,
 }
 
 #[async_trait]
@@ -326,10 +335,17 @@ impl EngineBackend for RemoteEngine {
         }
     }
     async fn env_client(&self, env_id: &str) -> Result<Arc<RpcClient>, String> {
-        connect_ws_for(&self.url, &self.token, Some(env_id))
-            .await
-            .map(Arc::new)
-            .map_err(|err| err.to_string())
+        let url = self.url.clone();
+        let token = self.token.clone();
+        let env_id = env_id.to_string();
+        let dialed = self
+            .runtime_handle
+            .spawn(async move { connect_ws_for(&url, &token, Some(&env_id)).await });
+        match dialed.await {
+            Ok(Ok(client)) => Ok(Arc::new(client)),
+            Ok(Err(err)) => Err(err.to_string()),
+            Err(_) => Err("environment dial was cancelled".into()),
+        }
     }
     async fn shutdown(&self) {
         // The daemon outlives this viewport; only stop our readiness probe.
@@ -539,6 +555,7 @@ impl EngineHandle {
                 refresh_task,
                 ipc_task,
                 client,
+                runtime_handle: tokio::runtime::Handle::current(),
             }),
             engine_info,
             deferred_state: Some(state_rx.clone()),
@@ -712,6 +729,7 @@ impl EngineHandle {
                             url,
                             token: token.as_str().into(),
                             lifecycle_task: tokio::sync::Mutex::new(Some(lifecycle_task)),
+                            runtime_handle: tokio::runtime::Handle::current(),
                         }),
                         engine_info,
                         deferred_state: Some(state_rx),
@@ -2988,6 +3006,47 @@ mod tests {
             .call(methods::LIST_HARNESSES, serde_json::json!({}))
             .await
             .unwrap();
+        assert!(harnesses.as_array().is_some_and(|h| !h.is_empty()));
+        handle.shutdown().await;
+    }
+
+    /// A device connection is built from gpui's main thread, which has no tokio
+    /// reactor. The transport has to land on the engine's runtime anyway — the
+    /// thread that asks for a device is not the thread that runs it.
+    #[tokio::test]
+    async fn env_client_builds_a_connection_without_an_ambient_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = EngineHandle::bootstrap(EngineBootConfig {
+            data_dir: dir.path().to_path_buf(),
+            ipc_port: free_port().await,
+            edge_url: "http://127.0.0.1:1".into(),
+            edge_token: None,
+            org_id: None,
+            sync_token: None,
+            default_harness: HarnessId::Mock,
+            managed_engine: false,
+        })
+        .await
+        .unwrap();
+
+        let dialer = {
+            let handle = handle.clone();
+            std::thread::spawn(move || futures::executor::block_on(handle.env_client(LOCAL_ENV_ID)))
+        };
+        let client = match dialer.join() {
+            Ok(Ok(client)) => client,
+            Ok(Err(err)) => panic!("device dial from a runtime-free thread failed: {err}"),
+            Err(_) => panic!("the device dial panicked on a thread without a reactor"),
+        };
+        // The answer travels back through the test runtime; the server task the
+        // dial spawned lives on the engine's runtime the whole time.
+        let harnesses = client
+            .call(methods::LIST_HARNESSES, serde_json::json!({}))
+            .await;
+        let harnesses = match harnesses {
+            Ok(harnesses) => harnesses,
+            Err(err) => panic!("environment connection built without a reactor: {err}"),
+        };
         assert!(harnesses.as_array().is_some_and(|h| !h.is_empty()));
         handle.shutdown().await;
     }
