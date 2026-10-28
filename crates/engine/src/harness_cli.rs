@@ -528,20 +528,26 @@ pub async fn manage(harness: HarnessId) -> Result<(), String> {
         }
     }
     let installed_after = version(harness).await;
+    // Only a harness with a release feed can prove an unchanged version is stale.
+    let has_feed = npm_package(harness).is_some() || harness == HarnessId::Cursor;
     verify_update(
         installed_before.as_deref(),
         installed_after.as_deref(),
         latest.as_deref(),
+        has_feed,
     )
 }
 
 /// Some updaters exit cleanly without replacing anything, so success is the
 /// version the CLI reports afterwards. The feed is authoritative when it is
-/// reachable; otherwise the version must at least have moved.
+/// reachable; for a harness with a feed but no reachable feed, the version must
+/// at least have moved. A feedless harness can legitimately reinstall the same
+/// version, so reporting one is enough.
 fn verify_update(
     installed_before: Option<&str>,
     installed_after: Option<&str>,
     latest: Option<&str>,
+    has_feed: bool,
 ) -> Result<(), String> {
     let Some(after) = installed_after else {
         return Err(if installed_before.is_some() {
@@ -557,7 +563,7 @@ fn verify_update(
                 version_token(after)
             ));
         }
-    } else if installed_before == Some(after) {
+    } else if has_feed && installed_before == Some(after) {
         return Err(format!("Still on {} after updating.", version_token(after)));
     }
     Ok(())
@@ -877,21 +883,23 @@ mod tests {
 
     #[test]
     fn verifies_the_reported_version_after_an_update() {
-        assert!(verify_update(Some("2.0.0"), Some("2.0.1"), Some("2.0.1")).is_ok());
+        assert!(verify_update(Some("2.0.0"), Some("2.0.1"), Some("2.0.1"), true).is_ok());
         assert_eq!(
-            verify_update(Some("2.0.0"), Some("2.0.0"), Some("2.0.1")).unwrap_err(),
+            verify_update(Some("2.0.0"), Some("2.0.0"), Some("2.0.1"), true).unwrap_err(),
             "Still on 2.0.0 after updating to 2.0.1."
         );
-        // Without a feed, the version must at least have moved.
-        assert!(verify_update(Some("2.0.0"), Some("2.0.1"), None).is_ok());
+        // A harness with a feed but no reachable feed must at least move.
+        assert!(verify_update(Some("2.0.0"), Some("2.0.1"), None, true).is_ok());
         assert_eq!(
-            verify_update(Some("2.0.0"), Some("2.0.0"), None).unwrap_err(),
+            verify_update(Some("2.0.0"), Some("2.0.0"), None, true).unwrap_err(),
             "Still on 2.0.0 after updating."
         );
+        // A feedless harness may reinstall the same version.
+        assert!(verify_update(Some("2.0.0"), Some("2.0.0"), None, false).is_ok());
         // A fresh install only needs to report a version.
-        assert!(verify_update(None, Some("1.0.0"), None).is_ok());
+        assert!(verify_update(None, Some("1.0.0"), None, false).is_ok());
         assert_eq!(
-            verify_update(None, None, None).unwrap_err(),
+            verify_update(None, None, None, false).unwrap_err(),
             "The CLI did not report a version after installation."
         );
     }

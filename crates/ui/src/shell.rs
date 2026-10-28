@@ -4692,9 +4692,9 @@ impl Shell {
                             retry = harness_check_needs_retry(&statuses);
                             let enabled = enabled_harness_ids(&engine).await;
                             updates = Some(harness_updates(statuses, enabled.as_ref()));
-                            // A response landed; later polls read the engine
-                            // cache, which its own checker refreshes.
-                            check_latest = false;
+                            // Retry with a fresh feed check so a cached feed
+                            // error does not repeat; otherwise read the cache.
+                            check_latest = retry;
                         }
                         Err(error) => {
                             tracing::warn!(
@@ -4776,17 +4776,15 @@ impl Shell {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
+        // Mark every target before spawning so none can be started again from
+        // its row while the queue is still working through earlier harnesses.
+        for harness in &targets {
+            self.cli_update_rows
+                .insert(*harness, CliUpdateRow::Updating);
+        }
+        cx.notify();
         cx.spawn(async move |this, cx| {
             for harness in targets {
-                let marked = this.update(cx, |shell, cx| {
-                    shell
-                        .cli_update_rows
-                        .insert(harness, CliUpdateRow::Updating);
-                    cx.notify();
-                });
-                if marked.is_err() {
-                    return;
-                }
                 let outcome = run_harness_update(&engine, harness).await;
                 let done = this.update(cx, |shell, cx| {
                     shell.finish_harness_update(harness, outcome, cx);
