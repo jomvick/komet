@@ -5,6 +5,7 @@
 mod auth_cli;
 mod daemon;
 mod models_cli;
+mod serve;
 mod update_cli;
 
 use clap::{Parser, Subcommand};
@@ -29,6 +30,30 @@ enum Command {
     },
     /// Generate a sync token for self-hosting
     SyncInit,
+    /// Turn this machine into a Komet environment: sync server + engine, and
+    /// print the pairing link on first run.
+    Serve {
+        /// Public HTTPS URL of this server (what your TLS proxy serves).
+        #[arg(long)]
+        public_url: Option<String>,
+        /// Sync server port (saved on first run; default 8787).
+        #[arg(long)]
+        port: Option<u16>,
+        /// Name shown in the desktop environment switcher.
+        #[arg(long)]
+        label: Option<String>,
+        /// Serve over plain HTTP on this machine's LAN address instead of a
+        /// `--public-url`: for a network you already trust, and the pairing link
+        /// then carries its bearer unencrypted.
+        #[arg(long)]
+        lan: bool,
+        /// Install and start the user service, then exit.
+        #[arg(long)]
+        install_service: bool,
+        /// Print the pairing link and exit.
+        #[arg(long)]
+        print_link: bool,
+    },
     /// Run the engine without a UI (local-only unless a saved session enables sync).
     Headless,
     /// Manage the detached engine started by the desktop app.
@@ -138,7 +163,9 @@ fn main() -> anyhow::Result<()> {
     let long_running = cli.service
         || matches!(
             &cli.command,
-            None | Some(Command::Headless | Command::Engine { command: None })
+            None | Some(
+                Command::Headless | Command::Engine { command: None } | Command::Serve { .. }
+            )
         );
     let default_filter = if long_running {
         "info,loro_internal=warn,loro=warn"
@@ -187,11 +214,7 @@ fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Some(Command::SyncInit) => {
-            use std::fmt::Write;
-            let mut token = String::new();
-            for b in uuid::Uuid::new_v4().as_bytes() {
-                let _ = write!(token, "{b:02x}");
-            }
+            let token = serve::fresh_token();
             println!("KOMET_SYNC_TOKEN={token}");
             println!("KOMET_EDGE_URL=https://YOUR_VPS_HOST:8787");
             println!(
@@ -209,6 +232,42 @@ fn main() -> anyhow::Result<()> {
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(dirs_data_dir);
             runtime.block_on(komet_sync_server::serve(data_dir, token, port))
+        }
+        Some(Command::Serve {
+            public_url,
+            port,
+            label,
+            lan,
+            install_service,
+            print_link,
+        }) => {
+            let engine_config = engine_config_from_env();
+            let (config, link_is_new) = serve::ServeConfig::load_or_create(
+                &engine_config.data_dir,
+                public_url,
+                port,
+                label,
+                lan,
+            )?;
+            if print_link {
+                serve::print_pairing(&config);
+                return Ok(());
+            }
+            if install_service {
+                serve::print_pairing(&config);
+                serve::install_service(&engine_config.data_dir)?;
+                return Ok(());
+            }
+            if serve::should_print_link(false, link_is_new) {
+                serve::print_pairing(&config);
+            }
+            let runtime = tokio::runtime::Runtime::new()?;
+            runtime.block_on(serve::run(
+                config,
+                engine_config.data_dir,
+                engine_config.ipc_port,
+                engine_config.default_harness,
+            ))
         }
         Some(Command::Headless) => {
             let runtime = tokio::runtime::Runtime::new()?;

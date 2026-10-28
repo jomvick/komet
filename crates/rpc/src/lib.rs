@@ -23,13 +23,15 @@ pub mod device_room;
 pub mod ipc_token;
 mod server;
 
-pub use client::{RpcClient, connect_ws};
+pub use client::{RpcClient, connect_ws, connect_ws_for};
 pub use device_room::{
     DeviceFrameHeader, DeviceLink, HostRelay, HostRelayConfig, LinkCache, LinkCacheConfig,
     NudgeHandler, StaticToken, TokenSource, decode_device_frame, device_room_ws_url,
     encode_device_frame,
 };
-pub use server::{serve_connection, serve_ws_listener};
+pub use server::{
+    SingleService, serve_connection, serve_ws_listener, serve_ws_listener_with_router,
+};
 
 /// RPC method names — single source of truth for both ends.
 /// Full surface: docs/research/feature-inventory.md §2.
@@ -180,6 +182,21 @@ pub mod methods {
     pub const LIST_COMPOSIO_ACCOUNTS: &str = "ListComposioAccounts";
     pub const CONNECT_COMPOSIO_INTEGRATION: &str = "ConnectComposioIntegration";
     pub const DISCONNECT_COMPOSIO_ACCOUNT: &str = "DisconnectComposioAccount";
+    // Environments — remote workspaces backed by their own sync server. All are
+    // local-connection only: an environment connection cannot manage the list.
+    pub const LIST_ENVIRONMENTS: &str = "ListEnvironments";
+    /// Stream of `Vec<Environment>`: current list, then every add/remove.
+    pub const WATCH_ENVIRONMENTS: &str = "WatchEnvironments";
+    /// `{link}` — decode + probe + persist + start the runtime.
+    pub const ADD_ENVIRONMENT: &str = "AddEnvironment";
+    /// `{id, purge}` — forget one (optionally delete its docs mirror).
+    pub const REMOVE_ENVIRONMENT: &str = "RemoveEnvironment";
+    /// `{link}` — decode only, for the paste preview: `{label, url}`.
+    pub const PREVIEW_ENVIRONMENT: &str = "PreviewEnvironment";
+    /// `{id}` — re-encode the pairing link for one environment: `{link}`. Only
+    /// the engine holds the bearer (every other reply is redacted), so copying a
+    /// link has to go through it.
+    pub const ENVIRONMENT_LINK: &str = "EnvironmentLink";
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -243,6 +260,16 @@ impl RpcReply {
 #[async_trait]
 pub trait RpcService: Send + Sync + 'static {
     async fn handle(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError>;
+}
+
+/// Server-side selection of the service that answers one connection.
+///
+/// The UI keeps a single IPC port for every environment: the environment id rides the
+/// WebSocket query (`?env=`) and the router resolves it once per connection. An
+/// unresolvable id closes the connection — it never falls back to the local workspace.
+#[async_trait]
+pub trait ServiceRouter: Send + Sync {
+    async fn service_for(&self, env: Option<String>) -> Result<Arc<dyn RpcService>, String>;
 }
 
 /// Deserialize typed params out of the envelope's `params` value.

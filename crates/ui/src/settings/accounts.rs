@@ -344,9 +344,10 @@ impl AccountsPage {
                 this.submit_code(cx);
             }
         });
+        let target_device = state.read(cx).harness_target_device();
         let mut page = Self {
             state,
-            target_device: None,
+            target_device,
             device_menu: popover::Popup::default(),
             snapshot: Loadable::Idle,
             refreshing: false,

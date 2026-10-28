@@ -148,10 +148,75 @@ pub fn mini_gradient_spinner(
     ThinkingOrb::new(OrbState::Working, size).driven(view, window, cx)
 }
 
-/// Stroke width of [`upload_progress_ring`].
+/// Stroke width of [`upload_progress_ring`] and [`spinning_ring`].
 const RING_STROKE: f32 = 2.5;
 /// Polyline segments for a full circle — plenty for a ≤40px ring.
 const RING_SEGMENTS: f32 = 64.0;
+
+/// Paint one ring arc: `from..to` in fractions of a turn, clockwise from 12
+/// o'clock. Shared by the progress and indeterminate rings.
+fn paint_ring_arc(
+    window: &mut gpui::Window,
+    center: gpui::Point<gpui::Pixels>,
+    radius: f32,
+    from: f32,
+    to: f32,
+    color: gpui::Hsla,
+) {
+    if to - from <= 0.0 {
+        return;
+    }
+    let steps = ((RING_SEGMENTS * (to - from)).ceil() as usize).max(2);
+    let at = |i: usize| {
+        let theta = -std::f32::consts::FRAC_PI_2
+            + std::f32::consts::TAU * (from + (to - from) * (i as f32 / steps as f32));
+        point(
+            center.x + px(radius * theta.cos()),
+            center.y + px(radius * theta.sin()),
+        )
+    };
+    let mut builder = PathBuilder::stroke(px(RING_STROKE));
+    builder.move_to(at(0));
+    for i in 1..=steps {
+        builder.line_to(at(i));
+    }
+    if let Ok(path) = builder.build() {
+        window.paint_path(path, color);
+    }
+}
+
+/// Indeterminate ring: a dim track plus a bright arc sweeping clockwise on the
+/// shared pulse clock, so every mounted ring stays phase-locked. Reduced motion
+/// parks the arc at 12 o'clock — a still ring still reads as "working".
+pub fn spinning_ring(
+    diameter: f32,
+    color: gpui::Hsla,
+    view: EntityId,
+    window: &mut Window,
+    cx: &mut App,
+) -> AnyElement {
+    const SWEEP: f32 = 0.32;
+    let phase = motion::pulse_delta(&KOMET_PULSE, view, window, cx);
+    let track = color.opacity(0.18);
+    div()
+        .relative()
+        .size(px(diameter))
+        .flex_none()
+        .child(
+            canvas(
+                |_, _, _| (),
+                move |bounds, _, window, _| {
+                    let center = bounds.center();
+                    let radius = diameter / 2.0 - RING_STROKE;
+                    paint_ring_arc(window, center, radius, 0.0, 1.0, track);
+                    paint_ring_arc(window, center, radius, phase, phase + SWEEP, color);
+                },
+            )
+            .absolute()
+            .inset_0(),
+        )
+        .into_any_element()
+}
 
 /// Radial upload-progress ring with the percent centered — overlaid on a
 /// sending echo's attachment thumbnail while its bytes cross the relay.
@@ -163,31 +228,22 @@ pub fn upload_progress_ring(percent: u8, diameter: f32) -> AnyElement {
         move |bounds, _, window, _| {
             let center = bounds.center();
             let radius = diameter / 2.0 - RING_STROKE;
-            let mut paint_arc = |sweep: f32, color: gpui::Hsla| {
-                if sweep <= 0.0 {
-                    return;
-                }
-                let steps = ((RING_SEGMENTS * sweep).ceil() as usize).max(2);
-                let at = |i: usize| {
-                    // Clockwise from 12 o'clock.
-                    let theta = -std::f32::consts::FRAC_PI_2
-                        + std::f32::consts::TAU * sweep * (i as f32 / steps as f32);
-                    point(
-                        center.x + px(radius * theta.cos()),
-                        center.y + px(radius * theta.sin()),
-                    )
-                };
-                let mut builder = PathBuilder::stroke(px(RING_STROKE));
-                builder.move_to(at(0));
-                for i in 1..=steps {
-                    builder.line_to(at(i));
-                }
-                if let Ok(path) = builder.build() {
-                    window.paint_path(path, color);
-                }
-            };
-            paint_arc(1.0, gpui::hsla(0.0, 0.0, 1.0, 0.22));
-            paint_arc(frac, gpui::hsla(0.0, 0.0, 1.0, 0.95));
+            paint_ring_arc(
+                window,
+                center,
+                radius,
+                0.0,
+                1.0,
+                gpui::hsla(0.0, 0.0, 1.0, 0.22),
+            );
+            paint_ring_arc(
+                window,
+                center,
+                radius,
+                0.0,
+                frac,
+                gpui::hsla(0.0, 0.0, 1.0, 0.95),
+            );
         },
     )
     .absolute()

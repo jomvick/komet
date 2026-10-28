@@ -10,10 +10,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-pub use komet_proto::{EngineInfo, HarnessId, WorkspaceScope};
+pub use komet_proto::{EngineInfo, HarnessId, Namespace, WorkspaceScope};
 use komet_rpc::{RpcError, RpcReply, RpcService, methods};
-
-use komet_sync::DocsStore;
 
 pub mod agent_accounts;
 pub mod auth;
@@ -22,6 +20,8 @@ pub mod composio;
 pub mod crash_shield;
 pub mod diff_sync;
 pub mod doc_host;
+pub mod env_hosts;
+pub mod environments;
 pub mod harness_cli;
 pub mod instance_lock;
 pub mod local_import;
@@ -38,6 +38,7 @@ pub mod titles;
 pub mod uploads;
 pub mod workspace_files;
 pub mod workspace_host;
+pub mod workspace_runtime;
 
 pub use agent_accounts::{AgentAccounts, AgentAccountsConfig, UsageMode};
 pub use auth::{Auth, AuthConfig, AuthState, AuthUser, OrgMembership};
@@ -47,6 +48,8 @@ pub use diff_sync::{
     read_diff_file_text, snapshot_tree, working_diff_base,
 };
 pub use doc_host::{ChatDocHandle, DocHost, DocHostConfig, EdgeConfig};
+pub use env_hosts::{EnvAddError, EnvHosts};
+pub use environments::{AddOutcome, EnvStoreError, EnvironmentStore};
 pub use instance_lock::InstanceLock;
 pub use profile::EngineProfile;
 pub use registry::{HarnessDescriptor, HarnessRegistry, default_registry};
@@ -125,6 +128,8 @@ pub struct EngineCore {
     pub spaces_sync: SpacesSync,
     pub uploads: Uploads,
     pub agent_accounts: AgentAccounts,
+    /// Remote environments: their own docs stores, registry rooms and tokens.
+    pub envs: Arc<EnvHosts>,
     pub device_id: String,
     harness_cli_checker: harness_cli::HarnessCliChecker,
     /// Local→synced profile import (account-scoped runtimes only).
@@ -246,8 +251,6 @@ impl EngineCore {
                 }
             }
         }
-        let store = Arc::new(DocsStore::open(profile.store_root())?);
-        let store_for_import = store.clone();
         let journal = Arc::new(RunJournal::open(profile.store_root().join("journals"))?);
         let mcp_registry = Arc::new(crate::mcp::McpRegistry::load(data_dir).unwrap_or_else(|e| {
             tracing::warn!(error = %e, "mcp registry load failed, starting empty");
@@ -263,26 +266,21 @@ impl EngineCore {
             mcp_registry.clone(),
             mcp_secrets.clone(),
         );
-        let doc_host = DocHost::new(
-            store.clone(),
-            DocHostConfig {
-                device_id: device_id.clone(),
-                default_harness,
-                edge: edge.clone(),
-            },
-        );
-        let workspace = WorkspaceHost::open(
-            store,
-            WorkspaceHostConfig {
-                device_id: device_id.clone(),
-                device_name: local_device_name(&device_id),
-                platform: std::env::consts::OS.to_string(),
-                org_id: profile.org_id().to_string(),
-                user_id: profile.user_id().to_string(),
-                edge: edge.clone(),
-            },
+        let device_name = local_device_name(&device_id);
+        let runtime = crate::workspace_runtime::WorkspaceRuntime::open(
+            profile.store_root(),
+            &device_id,
+            device_name.clone(),
+            profile.org_id(),
+            profile.user_id(),
+            default_harness,
+            edge.clone(),
+            true,
         )?;
-        doc_host.set_workspace(workspace.clone());
+        let store = runtime.store.clone();
+        let store_for_import = store.clone();
+        let doc_host = runtime.doc_host;
+        let workspace = runtime.workspace;
         doc_host.set_sessions(sessions.clone());
         sessions.set_doc_host(doc_host.clone());
         match sessions.recover_stale() {
@@ -356,6 +354,16 @@ impl EngineCore {
             spaces_sync,
             uploads,
             agent_accounts,
+            envs: Arc::new(EnvHosts::boot(
+                data_dir,
+                &device_id,
+                device_name,
+                default_harness,
+                Namespace {
+                    org_id: profile.org_id().to_string(),
+                    user_id: profile.user_id().to_string(),
+                },
+            )),
             device_id,
             harness_cli_checker,
             local_import,
@@ -491,7 +499,8 @@ impl EngineCore {
             self.workspace_scope,
         )
         .with_auth(self.auth())
-        .with_mcp(self.mcp_registry.clone(), self.mcp_secrets.clone());
+        .with_mcp(self.mcp_registry.clone(), self.mcp_secrets.clone())
+        .with_environments(self.envs.clone());
         if let Some(links) = self.links() {
             rpc = rpc.with_links(links);
         }
@@ -503,6 +512,40 @@ impl EngineCore {
             rpc = rpc.with_local_import(importer);
         }
         Arc::new(rpc)
+    }
+
+    /// The RPC surface behind one `?env=` connection. `None`/`"local"` is this
+    /// machine's workspace; a remote environment gets its own doc host and
+    /// workspace host, and an unknown id is an error — never a fallback to local.
+    pub fn env_service(&self, env: Option<&str>) -> Result<Arc<dyn RpcService>, String> {
+        let Some(id) = env.filter(|id| *id != crate::environments::LOCAL_ENV_ID) else {
+            return Ok(self.rpc_service());
+        };
+        let runtime = self
+            .envs
+            .runtime(id)
+            .ok_or_else(|| format!("unknown environment: {id}"))?;
+        // Device-scoped services stay this machine's: a remote environment has no
+        // execution role here, and its own device (the VPS) owns the rows.
+        let mut rpc = EngineRpc::new(
+            self.sessions.clone(),
+            runtime.doc_host.clone(),
+            runtime.workspace.clone(),
+            self.registry.clone(),
+            self.repos.clone(),
+            self.workspace_files.clone(),
+            self.terminals.clone(),
+            self.diff_sync.clone(),
+            self.uploads.clone(),
+            self.agent_accounts.clone(),
+            self.workspace_scope,
+        )
+        .with_mcp(self.mcp_registry.clone(), self.mcp_secrets.clone())
+        .with_environment(id);
+        if let Some(links) = self.envs.links(id) {
+            rpc = rpc.with_links(links);
+        }
+        Ok(Arc::new(rpc))
     }
 
     /// Revoke every account-scoped transport before any slower graceful
@@ -549,6 +592,7 @@ impl EngineCore {
         self.doc_host.shutdown_workers().await;
         self.doc_host.flush_all();
         self.workspace.shutdown();
+        self.envs.shutdown_all().await;
         // Break the sessions ⇄ doc-host retain cycle so the replaced graph can
         // actually be freed once the last handle drops.
         self.sessions.clear_doc_host();
@@ -563,8 +607,30 @@ pub struct Engine {
 /// keeps this device reachable. Used by both the headless server and the headed
 /// in-process engine so their production authentication paths cannot diverge.
 pub struct EngineRuntime {
-    core: EngineCore,
+    core: Arc<EngineCore>,
     host_relay: std::sync::Mutex<Option<komet_rpc::HostRelay>>,
+}
+
+/// Routes each IPC connection to the service for its `?env=`, and keeps the
+/// headless `StopEngine` control on the local connection only.
+pub struct CoreRouter {
+    pub core: Arc<EngineCore>,
+    /// `Some` for the headless daemon: lets its own viewport drain the process.
+    pub stop: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+}
+
+#[async_trait]
+impl komet_rpc::ServiceRouter for CoreRouter {
+    async fn service_for(&self, env: Option<String>) -> Result<Arc<dyn RpcService>, String> {
+        let service = self.core.env_service(env.as_deref())?;
+        Ok(match &self.stop {
+            Some(stop_tx) => Arc::new(HeadlessRpc {
+                inner: service,
+                stop_tx: stop_tx.clone(),
+            }),
+            None => service,
+        })
+    }
 }
 
 /// IPC-only lifecycle control owned by `komet headless`. The regular
@@ -596,6 +662,11 @@ impl RpcService for HeadlessRpc {
 impl EngineRuntime {
     pub fn core(&self) -> &EngineCore {
         &self.core
+    }
+
+    /// The same core, shared: what the IPC router dispatches into.
+    pub fn core_arc(&self) -> Arc<EngineCore> {
+        self.core.clone()
     }
 
     pub fn workspace_scope(&self) -> WorkspaceScope {
@@ -829,7 +900,7 @@ impl Engine {
         });
 
         Ok(EngineRuntime {
-            core,
+            core: Arc::new(core),
             host_relay: std::sync::Mutex::new(host_relay),
         })
     }
@@ -864,11 +935,11 @@ impl Engine {
         // unlike the headed app, which can still work over its in-process
         // transport (see `serve_ipc`).
         let (stop_tx, mut stop_rx) = tokio::sync::mpsc::unbounded_channel();
-        let service: Arc<dyn RpcService> = Arc::new(HeadlessRpc {
-            inner: runtime.core().rpc_service(),
-            stop_tx,
+        let router = Arc::new(CoreRouter {
+            core: runtime.core_arc(),
+            stop: Some(stop_tx),
         });
-        let server = serve_ipc(config.ipc_port, service).await?;
+        let server = serve_ipc_with_router(config.ipc_port, router).await?;
 
         tokio::select! {
             result = shutdown_signal() => result?,
@@ -937,6 +1008,15 @@ pub async fn serve_ipc(
     port: u16,
     service: std::sync::Arc<dyn komet_rpc::RpcService>,
 ) -> std::io::Result<tokio::task::JoinHandle<()>> {
+    serve_ipc_with_router(port, std::sync::Arc::new(komet_rpc::SingleService(service))).await
+}
+
+/// [`serve_ipc`] for an engine that serves several environments: the connection's
+/// `?env=` picks its service, one connection per environment.
+pub async fn serve_ipc_with_router(
+    port: u16,
+    router: std::sync::Arc<dyn komet_rpc::ServiceRouter>,
+) -> std::io::Result<tokio::task::JoinHandle<()>> {
     let socket = tokio::net::TcpSocket::new_v4()?;
     // SO_REUSEADDR lets a restarted engine bind while old connections are in
     // TIME_WAIT. SO_REUSEPORT is deliberately not set: it would let a second
@@ -952,7 +1032,7 @@ pub async fn serve_ipc(
     Ok(tokio::spawn(async move {
         // Held for the server's lifetime; dropping it removes the token file.
         let _published = published;
-        komet_rpc::serve_ws_listener(listener, service, token).await;
+        komet_rpc::serve_ws_listener_with_router(listener, router, token).await;
     }))
 }
 

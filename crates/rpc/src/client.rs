@@ -258,3 +258,25 @@ pub async fn connect_ws(url: &str, token: &str) -> Result<RpcClient, RpcError> {
     });
     Ok(RpcClient::new(out_tx, in_rx))
 }
+
+/// Dial the engine for one environment. The id rides the WebSocket query
+/// (`?env=…`), which the server resolves to that environment's service; `None` keeps
+/// the local workspace.
+pub async fn connect_ws_for(
+    url: &str,
+    token: &str,
+    env: Option<&str>,
+) -> Result<RpcClient, RpcError> {
+    match env {
+        None => connect_ws(url, token).await,
+        Some(env) => {
+            // An empty path with a query (`ws://host:port?env=a`) is an invalid request
+            // target; keep the `/` so the dial reaches the server.
+            let url = match url.split_once('?') {
+                Some(_) => format!("{url}&env={env}"),
+                None => format!("{}/?env={env}", url.trim_end_matches('/')),
+            };
+            connect_ws(&url, token).await
+        }
+    }
+}

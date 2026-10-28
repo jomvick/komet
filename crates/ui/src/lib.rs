@@ -170,7 +170,7 @@ pub fn run_app(config: UiConfig) {
         let quit_state = state.clone();
         cx.on_app_quit(move |cx| {
             let shutdown =
-                quit_state.read(cx).engine().cloned().map(|handle| {
+                quit_state.read(cx).local_engine().cloned().map(|handle| {
                     gpui_tokio::Tokio::spawn(cx, async move { handle.shutdown().await })
                 });
             async move {

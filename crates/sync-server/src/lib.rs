@@ -13,17 +13,127 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use tokio::sync::{RwLock, broadcast};
 use tracing::info;
 
+mod device_relay;
+mod registry;
+
+pub use device_relay::DeviceRelay;
+pub use registry::RegistryRoom;
+
 #[derive(Clone)]
 pub struct AppState {
     pub data_dir: PathBuf,
     /// Shared bearer token; never empty (see [`require_token`]).
     pub token: String,
     pub rooms: Arc<RwLock<HashMap<String, Room>>>,
+    /// Live device rooms (`/device/{deviceId}/ws`) — routed socket to socket, never
+    /// stored in [`Self::rooms`], which is the byte-relay log for document rooms.
+    pub device: DeviceRelay,
+    /// This server's workspace namespace; served by `GET /env` so a client can
+    /// name its rooms without duplicating identity into a pairing link.
+    pub identity: ServerIdentity,
+}
+
+/// Who this server is: the `reg1/{org_id}/{user_id}` room namespace plus a
+/// display label. Generated once and persisted, so an existing deployment
+/// (Docker, compose) pairs without new configuration.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ServerIdentity {
+    pub org_id: String,
+    pub user_id: String,
+    pub label: String,
+}
+
+const IDENTITY_FILE: &str = "server-identity.json";
+
+/// Environment variables win (they are how `komet serve` hands its persisted
+/// identity to an embedded server); otherwise the file; otherwise fresh ids.
+pub fn load_or_create_identity(data_dir: &std::path::Path) -> anyhow::Result<ServerIdentity> {
+    let override_of = |key: &str| {
+        std::env::var(key)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    };
+    load_or_create_identity_with(
+        data_dir,
+        override_of("KOMET_ORG_ID"),
+        override_of("KOMET_USER_ID"),
+        override_of("KOMET_ENV_LABEL"),
+    )
+}
+
+fn load_or_create_identity_with(
+    data_dir: &std::path::Path,
+    org_id: Option<String>,
+    user_id: Option<String>,
+    label: Option<String>,
+) -> anyhow::Result<ServerIdentity> {
+    let path = data_dir.join(IDENTITY_FILE);
+    let stored = match std::fs::read(&path) {
+        Ok(bytes) => Some(
+            serde_json::from_slice::<ServerIdentity>(&bytes)
+                .map_err(|err| anyhow::anyhow!("{}: {err}", path.display()))?,
+        ),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => return Err(err.into()),
+    };
+    let identity = ServerIdentity {
+        org_id: org_id
+            .or_else(|| stored.as_ref().map(|id| id.org_id.clone()))
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+        user_id: user_id
+            .or_else(|| stored.as_ref().map(|id| id.user_id.clone()))
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+        label: label
+            .or_else(|| stored.as_ref().map(|id| id.label.clone()))
+            .unwrap_or_else(|| "komet".to_string()),
+    };
+    if stored.as_ref() != Some(&identity) {
+        write_identity(&path, &identity)?;
+    }
+    Ok(identity)
+}
+
+fn write_identity(path: &std::path::Path, identity: &ServerIdentity) -> anyhow::Result<()> {
+    let bytes = serde_json::to_vec_pretty(identity)?;
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        file.write_all(&bytes)?;
+    }
+    #[cfg(not(unix))]
+    std::fs::write(path, &bytes)?;
+    Ok(())
 }
 
 pub struct Room {
     pub tx: broadcast::Sender<Vec<u8>>,
     pub db_path: PathBuf,
+    /// Registry-protocol state, opened lazily by the first `/registry/…` socket.
+    /// `None` for relay-only rooms (session, chat2, device).
+    pub registry: Option<Arc<std::sync::Mutex<RegistryRoom>>>,
+    /// Registry text frames, broadcast to every registry socket in the room.
+    pub registry_tx: broadcast::Sender<String>,
+}
+
+fn new_room(data_dir: &std::path::Path, room: &str) -> Room {
+    let path = room_db_path(data_dir, room);
+    open_room_db(&path);
+    let (tx, _) = broadcast::channel(1024);
+    let (registry_tx, _) = broadcast::channel(1024);
+    Room {
+        tx,
+        db_path: path,
+        registry: None,
+        registry_tx,
+    }
 }
 
 fn room_db_path(data_dir: &std::path::Path, room: &str) -> PathBuf {
@@ -130,27 +240,90 @@ async fn health() -> impl IntoResponse {
     Json(serde_json::json!({"ok":true}))
 }
 
+/// The environment descriptor: enough for a client to build the room namespace
+/// and refuse a duplicate of a server it is already synced to. Same bearer as
+/// every other route.
+async fn env_descriptor(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, &'static str)> {
+    if !check_auth(&state, &headers) {
+        return Err((StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    Ok(Json(serde_json::json!({
+        "v": 1,
+        "label": state.identity.label,
+        "orgId": state.identity.org_id,
+        "userId": state.identity.user_id,
+        "version": env!("CARGO_PKG_VERSION"),
+    })))
+}
+
+/// Relay rooms (session, chat2, device): opaque binary frames, replayed and
+/// broadcast. The registry has its own handler because it speaks a stateful
+/// JSON protocol rather than relaying bytes.
 async fn ws_handler(
     State(state): State<AppState>,
     ws: WebSocketUpgrade,
     headers: HeaderMap,
     Path(room): Path<String>,
+    query: axum::extract::RawQuery,
 ) -> impl IntoResponse {
-    if !check_auth(&state, &headers) {
+    // Room clients carry the bearer as `?token=` (the protocol the engine's
+    // `RoomClient`/`RegistryClient` speak, and what the old Durable Object
+    // accepted); HTTP routes use the header. Either one authorizes the socket.
+    if !check_auth(&state, &headers) && !check_query_token(&state, query.0.as_deref()) {
         return Err((StatusCode::UNAUTHORIZED, "unauthorized"));
     }
     Ok(ws.on_upgrade(move |socket| handle_socket(state, room, socket)))
 }
 
+async fn registry_ws_handler(
+    State(state): State<AppState>,
+    ws: WebSocketUpgrade,
+    headers: HeaderMap,
+    Path(room): Path<String>,
+    query: axum::extract::RawQuery,
+) -> impl IntoResponse {
+    if !check_auth(&state, &headers) && !check_query_token(&state, query.0.as_deref()) {
+        return Err((StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    Ok(ws.on_upgrade(move |socket| handle_registry_socket(state, room, socket)))
+}
+
+/// A device-room socket (`/device/{deviceId}/ws`): a routed transport, not a document
+/// relay, so it does not share the room log — see [`device_relay`].
+async fn device_ws_handler(
+    State(state): State<AppState>,
+    ws: WebSocketUpgrade,
+    headers: HeaderMap,
+    Path(room): Path<String>,
+    query: axum::extract::RawQuery,
+) -> impl IntoResponse {
+    if !check_auth(&state, &headers) && !check_query_token(&state, query.0.as_deref()) {
+        return Err((StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    let relay = state.device.clone();
+    Ok(ws.on_upgrade(move |socket| relay.serve(room, socket, query.0.map(|raw| raw.to_string()))))
+}
+
+/// `?token=…` on a WebSocket upgrade. Note for operators: a URL token lands in
+/// reverse-proxy access logs, so keep the proxy's log level off for `/`.
+fn check_query_token(state: &AppState, query: Option<&str>) -> bool {
+    query.is_some_and(|query| {
+        query
+            .split('&')
+            .find_map(|pair| pair.strip_prefix("token="))
+            .is_some_and(|got| constant_time_eq(got.as_bytes(), state.token.as_bytes()))
+    })
+}
+
 async fn handle_socket(state: AppState, room: String, socket: WebSocket) {
     let (tx, history) = {
         let mut rooms = state.rooms.write().await;
-        let entry = rooms.entry(room.clone()).or_insert_with(|| {
-            let path = room_db_path(&state.data_dir, &room);
-            open_room_db(&path);
-            let (tx, _) = broadcast::channel(1024);
-            Room { tx, db_path: path }
-        });
+        let entry = rooms
+            .entry(room.clone())
+            .or_insert_with(|| new_room(&state.data_dir, &room));
         let conn = rusqlite::Connection::open(&entry.db_path).unwrap();
         let mut stmt = conn.prepare("SELECT data FROM frames ORDER BY id").unwrap();
         let rows = stmt.query_map([], |r| r.get::<_, Vec<u8>>(0)).unwrap();
@@ -200,6 +373,147 @@ async fn handle_socket(state: AppState, room: String, socket: WebSocket) {
         _ = &mut send_task => recv_task.abort(),
     }
     info!(room=%room, "client disconnected");
+}
+
+/// A registry socket: JSON text frames on a stateful room instead of a byte relay.
+/// The `hello` → `state` handshake (with the `seq` cursor) is what lets a client
+/// resync after a lag or a reconnect; `push` merges ops under the server's LWW and
+/// answers with `ack`, broadcasting the winning rows to every client in the room.
+async fn handle_registry_socket(state: AppState, room: String, socket: WebSocket) {
+    let (registry, registry_tx) = {
+        let mut rooms = state.rooms.write().await;
+        let entry = rooms
+            .entry(room.clone())
+            .or_insert_with(|| new_room(&state.data_dir, &room));
+        if entry.registry.is_none() {
+            match RegistryRoom::open(&entry.db_path) {
+                Ok(opened) => entry.registry = Some(Arc::new(std::sync::Mutex::new(opened))),
+                Err(err) => {
+                    tracing::error!(room = %room, error = %err, "registry room open failed");
+                    return;
+                }
+            }
+        }
+        (
+            entry.registry.clone().expect("opened above"),
+            entry.registry_tx.clone(),
+        )
+    };
+    let mut rx = registry_tx.subscribe();
+    let (mut sender, mut receiver) = socket.split();
+    // Our own replies (state, ack, probe-ok) go straight out; a single broadcast
+    // would echo them to every socket and let a peer's `rows` overtake our `state`.
+    let (direct_tx, mut direct_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let mut device = String::new();
+    let mut ready = false;
+
+    loop {
+        tokio::select! {
+            biased;
+            Some(text) = direct_rx.recv() => {
+                if sender.send(Message::Text(text)).await.is_err() {
+                    break;
+                }
+            }
+            frame = rx.recv() => match frame {
+                Ok(text) => {
+                    if sender.send(Message::Text(text)).await.is_err() {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    // Missed frames cannot be replayed selectively; a full state
+                    // is both cheaper and safer than a silently stale client.
+                    tracing::warn!(room = %room, skipped, "registry socket lagged; resending state");
+                    let state = lock_registry(&registry).state_frame(None);
+                    let _ = direct_tx.send(state);
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
+            msg = receiver.next() => match msg {
+                Some(Ok(Message::Text(text))) => {
+                    if let Some(reply) = registry_frame(
+                        &registry,
+                        &registry_tx,
+                        &mut device,
+                        &mut ready,
+                        &text,
+                    ) {
+                        let _ = direct_tx.send(reply);
+                    }
+                }
+                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                // Relay frames have no meaning here; a registry client never sends them.
+                Some(Ok(_)) => {}
+            },
+        }
+    }
+    info!(room=%room, "registry client disconnected");
+}
+
+fn lock_registry(
+    registry: &std::sync::Mutex<RegistryRoom>,
+) -> std::sync::MutexGuard<'_, RegistryRoom> {
+    registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Apply one client frame. Returns the reply for this socket, if any; shared
+/// frames go out through `registry_tx`.
+fn registry_frame(
+    registry: &std::sync::Mutex<RegistryRoom>,
+    registry_tx: &broadcast::Sender<String>,
+    device: &mut String,
+    ready: &mut bool,
+    text: &str,
+) -> Option<String> {
+    if text == "ping" {
+        return Some("pong".to_string());
+    }
+    let Ok(frame) = serde_json::from_str::<serde_json::Value>(text) else {
+        return Some(registry::error_frame("bad_frame", "expected a JSON frame"));
+    };
+    let tag = frame.get("t").and_then(|v| v.as_str()).unwrap_or_default();
+    match tag {
+        "hello" => {
+            *device = frame
+                .get("device")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            *ready = true;
+            let cursor = frame.get("cursor").and_then(|v| v.as_u64());
+            Some(lock_registry(registry).state_frame(cursor))
+        }
+        "push" | "presence" if !*ready => {
+            Some(registry::error_frame("bad_frame", "hello before push"))
+        }
+        "push" => {
+            let batch = frame
+                .get("batch")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let ops = match registry::parse_ops(&frame) {
+                Ok(ops) => ops,
+                Err(message) => return Some(registry::error_frame("invalid_op", &message)),
+            };
+            let (ack, rows) = lock_registry(registry).push(&batch, &ops);
+            if let Some(rows) = rows {
+                let _ = registry_tx.send(rows);
+            }
+            Some(ack)
+        }
+        "presence" => {
+            let at = frame.get("at").and_then(|v| v.as_i64()).unwrap_or_default();
+            let frame = lock_registry(registry).presence(device, at);
+            let _ = registry_tx.send(frame);
+            None
+        }
+        "probe" => Some(lock_registry(registry).probe_ok()),
+        other => Some(registry::error_frame("bad_frame", other)),
+    }
 }
 
 /// The file for a blob, or `None` when either segment could leave
@@ -270,10 +584,11 @@ async fn put_blob(
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/env", get(env_descriptor))
         .route("/session/:room/ws", get(ws_handler))
         .route("/chat2/:room/ws", get(ws_handler))
-        .route("/registry/:room/ws", get(ws_handler))
-        .route("/device/:room/ws", get(ws_handler))
+        .route("/registry/:room/ws", get(registry_ws_handler))
+        .route("/device/:room/ws", get(device_ws_handler))
         .route("/blob/:chat/:part", get(get_blob).put(put_blob))
         .with_state(state)
 }
@@ -281,6 +596,32 @@ pub fn router(state: AppState) -> Router {
 /// Run the sync server. A blank `token` is refused here as well as in
 /// [`require_token`], so no caller can start a server without authentication.
 pub async fn serve(data_dir: PathBuf, token: String, port: u16) -> anyhow::Result<()> {
+    let addr = format!("0.0.0.0:{port}");
+    info!("komet-sync listening on {addr}");
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    serve_listener(listener, data_dir, token).await
+}
+
+/// [`serve`] against a listener the caller already bound (ephemeral ports in
+/// tests, `komet serve` binding loopback before it has an identity to print).
+pub async fn serve_listener(
+    listener: tokio::net::TcpListener,
+    data_dir: PathBuf,
+    token: String,
+) -> anyhow::Result<()> {
+    let identity = load_or_create_identity(&data_dir)?;
+    serve_listener_with_identity(listener, data_dir, token, identity).await
+}
+
+/// [`serve_listener`] with the identity already resolved — `komet serve` keeps
+/// the org/user in `serve.json` and must not depend on process env or a second
+/// identity file to pass them through.
+pub async fn serve_listener_with_identity(
+    listener: tokio::net::TcpListener,
+    data_dir: PathBuf,
+    token: String,
+    identity: ServerIdentity,
+) -> anyhow::Result<()> {
     let token = require_token(Some(token))?;
     tokio::fs::create_dir_all(data_dir.join("rooms")).await.ok();
     tokio::fs::create_dir_all(data_dir.join("blobs")).await.ok();
@@ -288,12 +629,10 @@ pub async fn serve(data_dir: PathBuf, token: String, port: u16) -> anyhow::Resul
         data_dir,
         token,
         rooms: Arc::new(RwLock::new(HashMap::new())),
+        device: DeviceRelay::new(),
+        identity,
     };
-    let app = router(state);
-    let addr = format!("0.0.0.0:{port}");
-    info!("komet-sync listening on {addr}");
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, router(state)).await?;
     Ok(())
 }
 
@@ -312,6 +651,12 @@ mod tests {
             data_dir: data_dir.to_path_buf(),
             token: TOKEN.to_string(),
             rooms: Arc::new(RwLock::new(HashMap::new())),
+            device: DeviceRelay::new(),
+            identity: ServerIdentity {
+                org_id: "org-1".into(),
+                user_id: "user-1".into(),
+                label: "komet VPS".into(),
+            },
         }
     }
 
@@ -454,5 +799,90 @@ mod tests {
         assert!(!sync_url_is_insecure("http://[::1]:8787"));
         assert!(sync_url_is_insecure("http://192.168.1.10:8787"));
         assert!(sync_url_is_insecure("http://vps.example.com:8787"));
+    }
+
+    #[tokio::test]
+    async fn room_upgrade_accepts_the_query_token_the_engine_sends() {
+        // axum's WebSocketUpgrade extractor needs a real hyper upgrade to run, so the
+        // auth gate is tested directly: the engine's room clients send only `?token=`.
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        assert!(check_query_token(
+            &state,
+            Some(&format!("token={TOKEN}&device=d"))
+        ));
+        assert!(!check_query_token(&state, Some("token=wrong&device=d")));
+        assert!(!check_query_token(&state, Some("device=d")));
+        assert!(!check_query_token(&state, None));
+        // A query token never authorizes an HTTP route (only the upgrade does).
+        let app = router(state);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/env?token={TOKEN}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn env_descriptor_requires_the_bearer_and_reports_the_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let app = router(test_state(root.path()));
+        let unauthenticated = Request::builder().uri("/env").body(Body::empty()).unwrap();
+        let response = app.clone().oneshot(unauthenticated).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app.oneshot(request(Method::GET, "/env", "")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["v"], 1);
+        assert_eq!(body["label"], "komet VPS");
+        assert_eq!(body["orgId"], "org-1");
+        assert_eq!(body["userId"], "user-1");
+        assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+    }
+
+    #[test]
+    fn identity_is_created_once_and_stays_stable() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = load_or_create_identity_with(dir.path(), None, None, None).unwrap();
+        let second = load_or_create_identity_with(dir.path(), None, None, None).unwrap();
+        assert_eq!(first, second);
+        assert!(!first.org_id.is_empty() && !first.user_id.is_empty());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.path().join(IDENTITY_FILE))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    #[test]
+    fn identity_env_overrides_win_over_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        load_or_create_identity_with(dir.path(), None, None, None).unwrap();
+        let overridden = load_or_create_identity_with(
+            dir.path(),
+            Some("org-2".into()),
+            Some("user-2".into()),
+            Some("VPS ovh".into()),
+        )
+        .unwrap();
+        assert_eq!(overridden.org_id, "org-2");
+        assert_eq!(overridden.user_id, "user-2");
+        assert_eq!(overridden.label, "VPS ovh");
+        // The override is persisted, so the next boot without it keeps the identity.
+        let reloaded = load_or_create_identity_with(dir.path(), None, None, None).unwrap();
+        assert_eq!(reloaded, overridden);
     }
 }

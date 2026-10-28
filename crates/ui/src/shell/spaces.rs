@@ -1412,7 +1412,7 @@ impl Shell {
             .into_any_element()
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)] // row render seam: call sites pass what they have
     fn render_grouped_session_row(
         &mut self,
         status: ChatIndicator,

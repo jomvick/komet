@@ -517,6 +517,10 @@ pub struct EngineRpc {
     mcp_registry: Option<std::sync::Arc<McpRegistry>>,
     /// MCP secret store (shared with `SessionsEngine`); write-only via RPC.
     mcp_secrets: Option<std::sync::Arc<McpSecretStore>>,
+    /// The environment this connection serves (`None` = this machine's workspace).
+    environment: Option<String>,
+    /// Environment management, attached on local connections only.
+    envs: Option<std::sync::Arc<crate::EnvHosts>>,
 }
 
 impl EngineRpc {
@@ -557,6 +561,8 @@ impl EngineRpc {
             engine_info,
             mcp_registry: None,
             mcp_secrets: None,
+            environment: None,
+            envs: None,
         }
     }
 
@@ -617,6 +623,26 @@ impl EngineRpc {
     pub fn with_local_import(mut self, importer: crate::local_import::LocalImporter) -> Self {
         self.local_import = Some(importer);
         self
+    }
+
+    /// Serve one environment instead of this machine's workspace. Scopes session
+    /// state to that environment and rejects machine-level methods.
+    pub fn with_environment(mut self, id: impl Into<String>) -> Self {
+        self.environment = Some(id.into());
+        self
+    }
+
+    /// Attach environment management (local connections only).
+    pub fn with_environments(mut self, envs: std::sync::Arc<crate::EnvHosts>) -> Self {
+        self.envs = Some(envs);
+        self
+    }
+
+    /// The environment store, or `local_only` on an environment connection.
+    fn envs(&self) -> Result<std::sync::Arc<crate::EnvHosts>, RpcError> {
+        self.envs
+            .clone()
+            .ok_or_else(|| RpcError::Failed("local_only: environment management".into()))
     }
 
     fn auth(&self) -> Result<&Auth, RpcError> {
@@ -1293,6 +1319,45 @@ fn tool_detail_reply(events: &[AgentEvent]) -> serde_json::Value {
 }
 
 /// A watch receiver as a stream: current value first, then every change.
+/// Narrow the device-wide session stream to chats that exist in `chats` (one
+/// environment's registry). The registry is the authority for "which chats exist
+/// here", so a local session never surfaces inside a remote environment.
+fn sessions_in_registry(
+    sessions: watch::Receiver<Vec<komet_proto::Session>>,
+    chats: watch::Receiver<Vec<komet_proto::Chat>>,
+) -> watch::Receiver<Vec<komet_proto::Session>> {
+    let filter = |sessions: &[komet_proto::Session], chats: &[komet_proto::Chat]| {
+        sessions
+            .iter()
+            .filter(|session| chats.iter().any(|chat| chat.id == session.chat_id))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let (tx, rx) = watch::channel(filter(&sessions.borrow(), &chats.borrow()));
+    let mut sessions = sessions;
+    let mut chats = chats;
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                changed = sessions.changed() => if changed.is_err() { break },
+                changed = chats.changed() => if changed.is_err() { break },
+            }
+            // One change may land while the other stream is still stale; the next
+            // change re-filters, so this converges on both edges.
+            if tx
+                .send(filter(
+                    &sessions.borrow_and_update(),
+                    &chats.borrow_and_update(),
+                ))
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    rx
+}
+
 fn watch_stream<T>(rx: watch::Receiver<T>) -> BoxStream<'static, serde_json::Value>
 where
     T: serde::Serialize + Clone + Send + Sync + 'static,
@@ -1446,6 +1511,47 @@ impl RpcService for AuthRpc {
 #[async_trait]
 impl RpcService for EngineRpc {
     async fn handle(&self, method: &str, params: serde_json::Value) -> Result<RpcReply, RpcError> {
+        // Machine-level surfaces have no meaning inside a remote environment: the
+        // laptop is a controller there, not a device. Rejected before forwarding so
+        // they can never be bounced onto another device either.
+        const LOCAL_ONLY: &[&str] = &[
+            methods::ENGINE_INFO,
+            methods::LOCAL_DEVICE,
+            methods::ENGINE_READY,
+            methods::PROBE_SYNC,
+            methods::STOP_ENGINE,
+            methods::UPDATE_STATUS,
+            methods::CHECK_UPDATE,
+            methods::APPLY_UPDATE,
+            methods::LIST_ENVIRONMENTS,
+            methods::WATCH_ENVIRONMENTS,
+            methods::ADD_ENVIRONMENT,
+            methods::REMOVE_ENVIRONMENT,
+            methods::PREVIEW_ENVIRONMENT,
+            methods::ENVIRONMENT_LINK,
+        ];
+        if self.environment.is_some() && LOCAL_ONLY.contains(&method) {
+            return Err(RpcError::Failed(format!("local_only: {method}")));
+        }
+        // Harness surfaces are per-machine: inside an environment they only mean
+        // the device that runs the agents, so the caller has to name it. Without a
+        // target the answer would be the controller's own machine — a plausible
+        // but wrong list, which is worse than an error.
+        const ENV_TARGETED: &[&str] = &[
+            methods::LIST_HARNESSES,
+            methods::GET_HARNESS_CLI_STATUS,
+            methods::MANAGE_HARNESS_CLI,
+            methods::SET_HARNESS_ENABLED,
+        ];
+        if self.environment.is_some()
+            && ENV_TARGETED.contains(&method)
+            && params
+                .get("targetDeviceId")
+                .and_then(|v| v.as_str())
+                .is_none_or(|id| id.is_empty())
+        {
+            return Err(RpcError::Failed("environment_target_required".to_string()));
+        }
         // Device-addressed routing: forward calls that target another device over its
         // relay. The target compares the id to its own, so forwards cannot loop.
         if forwardable(method)
@@ -1660,7 +1766,68 @@ impl RpcService for EngineRpc {
                 let merged = self
                     .workspace
                     .merged_sessions_watch(self.sessions.watch_sessions());
+                // Inside an environment, only chats that exist in *that* environment
+                // may surface: a local session must never appear in a remote sidebar
+                // (and fire its notifications there).
+                let merged = match &self.environment {
+                    None => merged,
+                    Some(_) => sessions_in_registry(merged, self.workspace.watch_chats()),
+                };
                 Ok(RpcReply::Stream(watch_stream(merged)))
+            }
+            methods::LIST_ENVIRONMENTS => RpcReply::value(&self.envs()?.list()),
+            methods::WATCH_ENVIRONMENTS => Ok(RpcReply::Stream(watch_stream(self.envs()?.watch()))),
+            methods::PREVIEW_ENVIRONMENT => {
+                #[derive(serde::Deserialize)]
+                struct Preview {
+                    link: String,
+                }
+                let preview: Preview = crate::rpc::parse_params(params)?;
+                let payload = komet_proto::decode_pair_link(&preview.link)
+                    .map_err(|err| RpcError::Failed(format!("invalid_link: {err}")))?;
+                RpcReply::value(&serde_json::json!({
+                    "label": payload.label,
+                    "url": payload.url,
+                }))
+            }
+            methods::ADD_ENVIRONMENT => {
+                #[derive(serde::Deserialize)]
+                struct Add {
+                    link: String,
+                }
+                let add: Add = crate::rpc::parse_params(params)?;
+                let env = self
+                    .envs()?
+                    .add(&add.link)
+                    .await
+                    .map_err(|err| RpcError::Failed(err.code()))?;
+                RpcReply::value(&env)
+            }
+            methods::REMOVE_ENVIRONMENT => {
+                #[derive(serde::Deserialize)]
+                struct Remove {
+                    id: String,
+                    #[serde(default)]
+                    purge: bool,
+                }
+                let remove: Remove = crate::rpc::parse_params(params)?;
+                self.envs()?
+                    .remove(&remove.id, remove.purge)
+                    .await
+                    .map_err(|err| RpcError::Failed(err.to_string()))?;
+                RpcReply::value(&serde_json::json!({ "ok": true }))
+            }
+            methods::ENVIRONMENT_LINK => {
+                #[derive(serde::Deserialize)]
+                struct Link {
+                    id: String,
+                }
+                let ask: Link = crate::rpc::parse_params(params)?;
+                let link = self
+                    .envs()?
+                    .pair_link(&ask.id)
+                    .ok_or_else(|| RpcError::Failed("unknown_environment".to_string()))?;
+                RpcReply::value(&serde_json::json!({ "link": link }))
             }
             methods::LOCAL_DEVICE => {
                 RpcReply::value(&serde_json::json!({ "deviceId": self.doc_host.device_id() }))
@@ -2356,6 +2523,60 @@ impl RpcService for EngineRpc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An environment's `WATCH_SESSIONS` must never surface a local session: the
+    /// registry is the authority for which chats exist there.
+    #[tokio::test]
+    async fn environment_sessions_are_limited_to_its_registry() {
+        let (sessions_tx, sessions_rx) = watch::channel(Vec::new());
+        let (chats_tx, chats_rx) = watch::channel(Vec::new());
+        let mut scoped = sessions_in_registry(sessions_rx, chats_rx);
+
+        let session = |chat: &str| komet_proto::Session {
+            chat_id: chat.into(),
+            device_id: "device-a".into(),
+            status: komet_proto::SessionStatus::Idle,
+            started_at: None,
+            updated_at: chrono::Utc::now(),
+            context_usage: None,
+        };
+        let chat = |id: &str| komet_proto::Chat {
+            id: id.into(),
+            device_id: "device-vps".into(),
+            title: None,
+            archived: false,
+            pinned: false,
+            cwd: None,
+            branch: None,
+            checkout_id: None,
+            config: None,
+            last_message_preview: None,
+            last_message_at: None,
+            created_at: chrono::Utc::now(),
+            harness_session_id: None,
+            room_gen: None,
+            harness_session_cwd: None,
+            space_id: None,
+            last_seen_at: None,
+        };
+
+        sessions_tx.send_replace(vec![session("chat-local"), session("chat-b")]);
+        chats_tx.send_replace(vec![chat("chat-b")]);
+        tokio::time::timeout(std::time::Duration::from_secs(5), scoped.changed())
+            .await
+            .expect("filter reacts to a change")
+            .expect("stream alive");
+        let visible: Vec<String> = scoped
+            .borrow_and_update()
+            .iter()
+            .map(|s| s.chat_id.clone())
+            .collect();
+        assert_eq!(
+            visible,
+            vec!["chat-b"],
+            "a local session must not leak into an environment"
+        );
+    }
 
     /// The UI's Switch/Forget calls send `{id, accountId, harness}` (+ optional
     /// `targetDeviceId`); the extra fields must be tolerated, `accountId` wins.
