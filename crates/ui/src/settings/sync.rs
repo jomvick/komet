@@ -563,7 +563,7 @@ impl SyncPage {
                     .justify_end()
                     .gap(px(8.0))
                     .child(
-                        popover::btn_ghost(&theme, "Cancel", "unpair-cancel")
+                        popover::btn_ghost(&theme, "Cancel", "unpair-cancel", cx.entity_id())
                             .id("unpair-cancel")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.remove = None;
@@ -585,6 +585,7 @@ impl SyncPage {
         mark: Mark,
         theme: &Theme,
         view_id: EntityId,
+        window: &mut Window,
         cx: &mut App,
     ) -> AnyElement {
         let glyph = match mark {
@@ -597,7 +598,7 @@ impl SyncPage {
                 .border_1()
                 .border_color(theme.border)
                 .into_any_element(),
-            Mark::Running => loaders::spinning_ring(16.0, theme.busy, view_id, cx),
+            Mark::Running => loaders::spinning_ring(16.0, theme.busy, view_id, window, cx),
             Mark::Done => div()
                 .size(px(16.0))
                 .flex()
@@ -642,7 +643,12 @@ impl SyncPage {
             .into_any_element()
     }
 
-    fn render_wizard(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    fn render_wizard(
+        &mut self,
+        theme: &Theme,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let view_id = cx.entity_id();
         let busy = self.busy();
         let steps = self.steps;
@@ -714,13 +720,11 @@ impl SyncPage {
                             ),
                     )
                 })
-                .child(
-                    div().w_full().flex().flex_col().gap(px(6.0)).children(
-                        steps
-                            .iter()
-                            .map(|(step, mark)| Self::step_row(*step, *mark, theme, view_id, cx)),
-                    ),
-                )
+                .child(div().w_full().flex().flex_col().gap(px(6.0)).children(
+                    steps.iter().map(|(step, mark)| {
+                        Self::step_row(*step, *mark, theme, view_id, window, cx)
+                    }),
+                ))
                 .when_some(self.failure.clone(), |el, message| {
                     el.child(
                         div()
@@ -783,7 +787,7 @@ impl SyncPage {
                                 }),
                         )
                         .child(
-                            popover::btn_ghost(theme, "Cancel", "pair-cancel")
+                            popover::btn_ghost(theme, "Cancel", "pair-cancel", cx.entity_id())
                                 .id("pair-cancel")
                                 .on_click(cx.listener(|this, _, _, cx| this.cancel_wizard(cx))),
                         ),
@@ -1064,7 +1068,7 @@ impl Render for SyncPage {
                                 )
                             }),
                     )
-                    .when(adding, |el| el.child(self.render_wizard(theme, cx)))
+                    .when(adding, |el| el.child(self.render_wizard(theme, window, cx)))
                     .when(!adding, |el| el.child(devices_card))
                     .when(!engine_up, |el| {
                         el.child(
@@ -1076,7 +1080,7 @@ impl Render for SyncPage {
                                 .gap(px(8.0))
                                 .text_size(px(11.5))
                                 .text_color(theme.text_muted.opacity(0.7))
-                                .child(loaders::spinning_ring(14.0, theme.busy, view_id, cx))
+                                .child(loaders::spinning_ring(14.0, theme.busy, view_id, window, cx))
                                 .child(SharedString::from(
                                     "Komet is still starting — pairing unlocks in a moment.",
                                 )),

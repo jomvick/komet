@@ -278,6 +278,7 @@ impl Shell {
                         "expand-changes",
                         icons::EXPAND_ARROWS,
                         &theme,
+                        cx.entity_id(),
                         cx.listener(|this, _, _, cx| this.toggle_right_pane_expand(cx)),
                     ))
                     .into_any_element(),
@@ -289,6 +290,7 @@ impl Shell {
             "toggle-changes",
             icons::SIDEBAR_MINIMALISTIC,
             &theme,
+            cx.entity_id(),
             cx.listener(|this, _, _, cx| this.toggle_right_pane(cx)),
         );
 

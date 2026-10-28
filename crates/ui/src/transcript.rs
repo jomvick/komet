@@ -3208,6 +3208,7 @@ impl Transcript {
         &mut self,
         row_id: &SharedString,
         atts: &[crate::attachments::UserAttachment],
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         use crate::attachments::AttachmentSnapshot;
@@ -3297,6 +3298,7 @@ impl Transcript {
                                 let pulse = motion::pulse_wave(motion::pulse_delta(
                                     &motion::KOMET_PULSE,
                                     cx.entity_id(),
+                                    window,
                                     cx,
                                 ));
                                 let indicator: AnyElement = match uploading {
@@ -3305,6 +3307,7 @@ impl Transcript {
                                         format!("att-sending-{row_id}-{aix}"),
                                         3.0,
                                         cx.entity_id(),
+                                        window,
                                         cx,
                                     )
                                     .into_any_element(),
@@ -3339,6 +3342,7 @@ impl Transcript {
                                 * motion::pulse_wave(motion::pulse_delta(
                                     &motion::KOMET_PULSE,
                                     cx.entity_id(),
+                                    window,
                                     cx,
                                 )),
                         )
@@ -3357,7 +3361,11 @@ impl Transcript {
     /// — user request), so it reads as part of the streaming reply and
     /// scrolls away with it. The spinner drives this entity's frames, which
     /// keeps the elapsed timer ticking through delta-quiet tool runs.
-    fn render_working_trailer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    fn render_working_trailer(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let chat_id = self.chat_id.clone()?;
         let now = chrono::Utc::now();
         let (sending, elapsed_secs) = {
@@ -3399,7 +3407,7 @@ impl Transcript {
                 .child(
                     crate::thinking_orbs::ThinkingOrb::new(orb_state, 20.0)
                         .speed(1.25)
-                        .driven(cx.entity_id(), cx),
+                        .driven(cx.entity_id(), window, cx),
                 )
                 .child(
                     div()
@@ -3520,7 +3528,7 @@ impl Transcript {
         // Live-run loader rides under the LAST row's content (above its
         // clearance pad), so it sits right beneath the working reply.
         let trailer = (ix + 1 == self.rows.len())
-            .then(|| self.render_working_trailer(cx))
+            .then(|| self.render_working_trailer(window, cx))
             .flatten();
         // Live reasoning (issue #31) rides just above the loader: muted,
         // italic, gone at Done. Render-local state — never doc-derived.
@@ -3545,7 +3553,12 @@ impl Transcript {
                 // HStack); image-only sends show no bubble at all.
                 let mut column = div().w_full().flex().flex_col();
                 if !attachments.is_empty() {
-                    column = column.child(self.render_user_attachments(&row.id, &attachments, cx));
+                    column = column.child(self.render_user_attachments(
+                        &row.id,
+                        &attachments,
+                        window,
+                        cx,
+                    ));
                 }
                 if !text.is_empty() {
                     // `min_w_0` is load-bearing: gpui text answers min/max-content
@@ -3587,6 +3600,7 @@ impl Transcript {
             RowKind::Markdown { tree, block_ix } => {
                 let opts = RenderOptions {
                     row_key: row.id.clone(),
+                    hover_owner: Some(cx.entity_id()),
                     veil: None,
                     cache: (!render_cache_disabled()).then(|| self.render_cache.clone()),
                     now: Instant::now(),
@@ -3630,6 +3644,7 @@ impl Transcript {
                 });
                 let opts = RenderOptions {
                     row_key: row.id.clone(),
+                    hover_owner: Some(cx.entity_id()),
                     veil: veil.clone(),
                     cache: (!render_cache_disabled()).then(|| self.render_cache.clone()),
                     now: Instant::now(),
@@ -3835,17 +3850,22 @@ impl Transcript {
                             .items_center()
                             .gap(px(8.0))
                             .child(
-                                crate::popover::btn_ghost(theme, "Cancel", "prompt-edit-cancel")
-                                    .id("prompt-edit-cancel")
-                                    .occlude()
-                                    .on_mouse_down(MouseButton::Left, |_, window, _| {
-                                        window.prevent_default()
-                                    })
-                                    .on_click(move |_, _, cx| {
-                                        cancel_entity
-                                            .update(cx, |this, cx| this.cancel_prompt_edit(cx))
-                                            .ok();
-                                    }),
+                                crate::popover::btn_ghost(
+                                    theme,
+                                    "Cancel",
+                                    "prompt-edit-cancel",
+                                    cx.entity_id(),
+                                )
+                                .id("prompt-edit-cancel")
+                                .occlude()
+                                .on_mouse_down(MouseButton::Left, |_, window, _| {
+                                    window.prevent_default()
+                                })
+                                .on_click(move |_, _, cx| {
+                                    cancel_entity
+                                        .update(cx, |this, cx| this.cancel_prompt_edit(cx))
+                                        .ok();
+                                }),
                             )
                             .child(
                                 crate::popover::btn_primary(theme, "Send")
@@ -5087,6 +5107,7 @@ fn entry_fingerprint(entry: &SessionMessageEntry, pending: bool) -> u64 {
 
 impl Render for Transcript {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let _child = crate::perf::child_frame(crate::perf::ChildView::Transcript);
         // Release gpui-side decoded copies of any images the attachment LRU
         // evicted since the last frame (no-op when nothing was evicted).
         crate::attachments::flush_evicted(Some(window), cx);

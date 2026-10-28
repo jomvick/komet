@@ -31,6 +31,7 @@ pub mod loaders;
 pub mod markdown;
 pub mod motion;
 pub mod notify;
+pub mod perf;
 pub mod pickers;
 pub mod popover;
 pub mod rail;

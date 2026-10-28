@@ -11,6 +11,7 @@
 //! ghost view + `on_drag_move::<Marker>` on the root), the same idiom as Zed's
 //! dock. Double-clicking a handle resets that pane to its default width.
 
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -18,14 +19,15 @@ use chrono::Utc;
 use gpui::{
     AnyElement, App, Context, Decorations, Empty, Entity, Focusable as _, IntoElement, KeyBinding,
     Keystroke, MouseButton, MouseDownEvent, MouseUpEvent, ObjectFit, Pixels, Point, Render,
-    ResizeEdge, SharedString, Size, StyledImage, Subscription, Task, Tiling, Window, WindowButton,
-    WindowButtonLayout, WindowControlArea, actions, div, img, prelude::*, px,
+    ResizeEdge, SharedString, Size, StyleRefinement, StyledImage, Subscription, Task, Tiling,
+    Window, WindowButton, WindowButtonLayout, WindowControlArea, actions, div, img, prelude::*, px,
 };
 
 use gpui_tokio::Tokio;
 use komet_engine::InstanceLock;
 use komet_engine::environments::LOCAL_ENV_ID;
 use komet_engine::harness_cli::HarnessCliStatus;
+use komet_engine::registry::{HarnessDescriptor, descriptor_enabled};
 use komet_proto::{AuthState, HarnessId, WorkspaceScope};
 use komet_rpc::methods;
 
@@ -55,8 +57,9 @@ use crate::settings::{
     UiSettings, platform_combo,
 };
 use crate::state::{
-    AppState, ConnectionStatus, EngineBootConfig, EngineMode, GatePhase, Indicator, OrgRow,
-    WorkspaceEntry, WorkspaceStatus, format_time_ago, org_name_valid, parse_orgs, sort_memberships,
+    AppState, ConnectionStatus, EngineBootConfig, EngineHandle, EngineMode, GatePhase, Indicator,
+    OrgRow, WorkspaceEntry, WorkspaceStatus, format_time_ago, org_name_valid, parse_orgs,
+    sort_memberships,
 };
 use crate::terminal::panel::{TerminalPanel, ToggleTerminal, clamp_terminal_height};
 use crate::theme::Theme;
@@ -599,12 +602,122 @@ fn update_modal_should_show(
 }
 
 /// Launch-check results → the rows the home card shows. A CLI that is already
-/// current never gets a row (the card is an upsell, not a status report).
-fn harness_updates(statuses: Vec<HarnessCliStatus>) -> Vec<HarnessCliStatus> {
+/// current, disabled on this device, or unmanaged never gets a row (the card
+/// is an upsell, not a status report).
+fn harness_updates(
+    statuses: Vec<HarnessCliStatus>,
+    enabled: Option<&HashSet<HarnessId>>,
+) -> Vec<HarnessCliStatus> {
     statuses
         .into_iter()
-        .filter(|status| status.managed && status.update_available)
+        .filter(|status| {
+            status.managed
+                && status.update_available
+                && enabled.is_none_or(|enabled| enabled.contains(&status.harness))
+        })
         .collect()
+}
+
+/// A failed version lookup yields no update row; the engine retries it on its
+/// own cadence, and the shell must poll again for that later result to show.
+fn harness_check_needs_retry(statuses: &[HarnessCliStatus]) -> bool {
+    statuses.iter().any(|status| status.check_error.is_some())
+}
+
+/// Shell-side poll cadence while a lookup is failing: 2 min doubling to 10 min.
+const HARNESS_RETRY_FIRST: Duration = Duration::from_secs(2 * 60);
+const HARNESS_RETRY_MAX: Duration = Duration::from_secs(10 * 60);
+
+/// Per-row lifecycle in the home card. A finished row stays visible until the
+/// user dismisses the card or a later check drops its harness.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CliUpdateRow {
+    Idle,
+    Updating,
+    Updated(Option<String>),
+    Failed(SharedString),
+}
+
+/// Whether the row still waits for an update: never started, or failed and
+/// retryable. An unseen harness is idle.
+fn cli_row_pending(rows: &HashMap<HarnessId, CliUpdateRow>, harness: HarnessId) -> bool {
+    !matches!(
+        rows.get(&harness),
+        Some(CliUpdateRow::Updating | CliUpdateRow::Updated(_))
+    )
+}
+
+/// Enabled harnesses on this device. `None` (registry unavailable) means
+/// "don't filter" rather than hiding every row.
+async fn enabled_harness_ids(
+    engine: &EngineHandle,
+    target: Option<&str>,
+) -> Option<HashSet<HarnessId>> {
+    let mut params = serde_json::json!({});
+    if let (Some(target), Some(object)) = (target, params.as_object_mut()) {
+        object.insert("targetDeviceId".into(), serde_json::json!(target));
+    }
+    let value = engine
+        .client()
+        .call(methods::LIST_HARNESSES, params)
+        .await
+        .ok()?;
+    let descriptors = serde_json::from_value::<Vec<HarnessDescriptor>>(value).ok()?;
+    Some(
+        descriptors
+            .into_iter()
+            .filter(descriptor_enabled)
+            .map(|descriptor| descriptor.id)
+            .collect(),
+    )
+}
+
+/// Update one CLI, then re-read the engine's just-refreshed status. A clean
+/// updater exit is not success: the version must actually have moved.
+async fn run_harness_update(
+    engine: &EngineHandle,
+    harness: HarnessId,
+    target: Option<&str>,
+) -> Result<Option<String>, String> {
+    let mut params = serde_json::json!({ "harness": harness });
+    if let (Some(target), Some(object)) = (target, params.as_object_mut()) {
+        object.insert("targetDeviceId".into(), serde_json::json!(target));
+    }
+    engine
+        .client()
+        .call(methods::MANAGE_HARNESS_CLI, params)
+        .await
+        .map_err(|error| format!("Could not update: {error}"))?;
+    let mut params = serde_json::json!({ "checkLatest": false });
+    if let (Some(target), Some(object)) = (target, params.as_object_mut()) {
+        object.insert("targetDeviceId".into(), serde_json::json!(target));
+    }
+    let value = engine
+        .client()
+        .call(methods::GET_HARNESS_CLI_STATUS, params)
+        .await
+        .map_err(|error| format!("Could not verify the update: {error}"))?;
+    let statuses: Vec<HarnessCliStatus> = serde_json::from_value(value)
+        .map_err(|error| format!("Could not read the update result: {error}"))?;
+    let status = statuses
+        .into_iter()
+        .find(|status| status.harness == harness)
+        .ok_or_else(|| "The update finished but the CLI status is unavailable.".to_string())?;
+    if status.update_available {
+        return Err(format!(
+            "Still on {} after updating to {}.",
+            status
+                .installed_version
+                .as_deref()
+                .map(version_token)
+                .unwrap_or("an unknown version"),
+            status
+                .latest_version
+                .as_deref()
+                .unwrap_or("the latest version"),
+        ));
+    }
+    Ok(status.installed_version)
 }
 
 /// Row copy: `2.1.309 → 2.1.310`, or only the target when the installed
@@ -1026,9 +1139,8 @@ pub struct Shell {
     cli_check_started: bool,
     /// The card's × — session-scoped: a relaunch surfaces the same updates.
     cli_updates_dismissed: bool,
-    /// Harness whose installer is running right now (its row says so).
-    cli_updating: Option<HarnessId>,
-    cli_update_error: Option<SharedString>,
+    /// Per-harness row lifecycle in the home card (idle/updating/updated/failed).
+    cli_update_rows: HashMap<HarnessId, CliUpdateRow>,
     /// How this binary was installed — decides the strip's click behavior.
     /// Cached: `detect_install` stats `current_exe` and this renders per frame.
     install: komet_update::InstallKind,
@@ -1300,8 +1412,7 @@ impl Shell {
             cli_updates: Vec::new(),
             cli_check_started: false,
             cli_updates_dismissed: false,
-            cli_updating: None,
-            cli_update_error: None,
+            cli_update_rows: HashMap::new(),
             install: komet_update::detect_install(),
             org: None,
             sync_flow: SyncFlow::Idle,
@@ -3725,6 +3836,7 @@ impl Shell {
                     icons::SIDEBAR_MINIMALISTIC_LEFT
                 },
                 &theme,
+                cx.entity_id(),
                 cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)),
             ))
             .child(nav_history_button(
@@ -3732,6 +3844,7 @@ impl Shell {
                 icons::ARROW_LEFT,
                 can_back,
                 &theme,
+                cx.entity_id(),
                 cx.listener(|this, _, _, cx| this.navigate_back(cx)),
             ))
             .child(nav_history_button(
@@ -3739,6 +3852,7 @@ impl Shell {
                 icons::ARROW_RIGHT,
                 can_forward,
                 &theme,
+                cx.entity_id(),
                 cx.listener(|this, _, _, cx| this.navigate_forward(cx)),
             ))
             .children(show_plus.then(|| {
@@ -3749,6 +3863,7 @@ impl Shell {
                         "titlebar-new-session",
                         icons::PLUS,
                         &theme,
+                        cx.entity_id(),
                         cx.listener(|this, _, _, cx| this.open_new_session(cx)),
                     ))
             }))
@@ -3951,11 +4066,11 @@ impl Shell {
             .into_any_element()
     }
 
-    fn render_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let inner: AnyElement = match self.route {
             Route::Settings(section) => self.render_settings_nav(section, &theme, cx),
-            Route::Chat => self.render_chat_sidebar(&theme, cx),
+            Route::Chat => self.render_chat_sidebar(&theme, window, cx),
         };
         let target = self.sidebar_target();
         // Transparent — the sidebar sits directly on the shell surface; the
@@ -4105,6 +4220,7 @@ impl Shell {
         archived: bool,
         pinned: bool,
         theme: &Theme,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         // Activity, not position (t3code Sidebar): status is a small colored
@@ -4269,7 +4385,7 @@ impl Shell {
             // status→Archive swap (one listener — gpui allows a single
             // hover listener per element).
             .on_hover({
-                let fade_hover = motion::hover_listener(fade_key.clone());
+                let fade_hover = motion::hover_listener(fade_key.clone(), cx.entity_id());
                 let hover_id = id.clone();
                 cx.listener(move |this, hovered: &bool, window, cx| {
                     fade_hover(hovered, window, cx);
@@ -4378,7 +4494,7 @@ impl Shell {
                                 14.0,
                             )
                             .speed(1.25)
-                            .driven(cx.entity_id(), cx),
+                            .driven(cx.entity_id(), window, cx),
                         )
                     }),
             )
@@ -4427,7 +4543,7 @@ impl Shell {
                     theme.glass_hover(),
                 )
             })
-            .on_hover(motion::hover_listener("workspace-switcher"))
+            .on_hover(motion::hover_listener("workspace-switcher", cx.entity_id()))
             .on_click(cx.listener(|this, _, _, cx| this.toggle_devices_menu(cx)))
             .child(self.workspace_dot(status, theme))
             .child(div().flex_1().min_w_0().truncate().child(label))
@@ -4496,7 +4612,7 @@ impl Shell {
                 row.host.clone()
             };
             menu = menu.child(
-                popover::menu_row(theme, active, key.clone())
+                popover::menu_row(theme, active, key.clone(), cx.entity_id())
                     .id(key)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.select_workspace(&target, cx);
@@ -4531,7 +4647,7 @@ impl Shell {
             );
         }
         menu = menu.child(popover::menu_separator()).child(
-            popover::menu_row(theme, false, "workspace-pair-device")
+            popover::menu_row(theme, false, "workspace-pair-device", cx.entity_id())
                 .id("workspace-pair-device")
                 .on_click(cx.listener(|this, _, _, cx| {
                     this.close_devices_menu(cx);
@@ -4599,7 +4715,12 @@ impl Shell {
     /// Chat-mode sidebar (spaces overhaul): window-control strip, the Spaces
     /// section (folder + device rows, add-space), the global Active sessions
     /// list, the notice strip, and the UserMenu (§1.6).
-    fn render_chat_sidebar(&mut self, theme: &Theme, cx: &mut Context<Self>) -> AnyElement {
+    fn render_chat_sidebar(
+        &mut self,
+        theme: &Theme,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let (user, workspace_scope) = {
             let state = self.state.read(cx);
             (state.auth_user().cloned(), state.workspace_scope)
@@ -4608,12 +4729,12 @@ impl Shell {
         // When "All projects" (filter = None) → grouped by project folder.
         // When a specific project is selected → flat list with FLIP resort.
         let list_items: Vec<AnyElement> = if self.settings.space_filter.is_none() {
-            self.render_grouped_rows(theme, cx)
+            self.render_grouped_rows(theme, window, cx)
         } else {
             // Keyed rows: (stable key, estimated height, element) — the key + height
             // list drives the §1.6 resort FLIP diff below (attention-bucket
             // promotions glide; cleared rows just go).
-            let keyed: Vec<(String, f32, AnyElement)> = self.render_active_rows(theme, cx);
+            let keyed: Vec<(String, f32, AnyElement)> = self.render_active_rows(theme, window, cx);
 
             // Resort glide (§1.6 View Transitions parity): when the ORDER of a live
             // list changes (new activity resort, grouping flip), surviving rows
@@ -4705,7 +4826,7 @@ impl Shell {
         let is_dev = matches!(workspace_scope, Some(WorkspaceScope::Development));
         let bottom_bar: AnyElement = if is_dev {
             let open = matches!(self.route, Route::Settings(_));
-            popover::menu_row(theme, open, "sidebar-settings-btn")
+            popover::menu_row(theme, open, "sidebar-settings-btn", cx.entity_id())
                 .id("sidebar-settings-btn")
                 .px(px(Theme::SPACE_SM))
                 .py(px(Theme::SPACE_SM))
@@ -4827,7 +4948,8 @@ impl Shell {
 
     /// One pass over every agent CLI (`checkLatest` hits the npm registry /
     /// Cursor installer). Background: `<cli> --version` alone can cost 6s per
-    /// harness, so the canvas must not wait for it.
+    /// harness, so the canvas must not wait for it. A failed check is polled
+    /// again with backoff instead of being dropped for the rest of the session.
     fn check_harness_updates(&mut self, cx: &mut Context<Self>) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
@@ -4835,74 +4957,151 @@ impl Shell {
         let target = self.state.read(cx).harness_target_device();
         self.cli_check_started = true;
         cx.spawn(async move |this, cx| {
-            let mut params = serde_json::json!({ "checkLatest": true });
-            if let (Some(target), Some(object)) = (target.as_ref(), params.as_object_mut()) {
-                object.insert("targetDeviceId".into(), serde_json::json!(target));
-            }
-            let result = engine
-                .client()
-                .call(methods::GET_HARNESS_CLI_STATUS, params)
-                .await;
-            let updates = match result {
-                Ok(value) => match serde_json::from_value::<Vec<HarnessCliStatus>>(value) {
-                    Ok(statuses) => Some(harness_updates(statuses)),
+            let mut check_latest = true;
+            let mut retry_in = HARNESS_RETRY_FIRST;
+            loop {
+                let mut params = serde_json::json!({ "checkLatest": check_latest });
+                if let (Some(target), Some(object)) = (target.as_ref(), params.as_object_mut()) {
+                    object.insert("targetDeviceId".into(), serde_json::json!(target));
+                }
+                let result = engine
+                    .client()
+                    .call(methods::GET_HARNESS_CLI_STATUS, params)
+                    .await;
+                let mut retry = true;
+                let mut updates = None;
+                match result {
+                    Ok(value) => match serde_json::from_value::<Vec<HarnessCliStatus>>(value) {
+                        Ok(statuses) => {
+                            retry = harness_check_needs_retry(&statuses);
+                            let enabled = enabled_harness_ids(&engine, target.as_deref()).await;
+                            updates = Some(harness_updates(statuses, enabled.as_ref()));
+                            // Retry with a fresh feed check so a cached feed
+                            // error does not repeat; otherwise read the cache.
+                            check_latest = retry;
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                %error,
+                                "harness CLI update status response was invalid"
+                            );
+                            check_latest = true;
+                        }
+                    },
                     Err(error) => {
-                        tracing::warn!(%error, "harness CLI update status response was invalid");
-                        None
+                        tracing::warn!(%error, "could not check harness CLI updates");
+                        check_latest = true;
                     }
-                },
-                Err(error) => {
-                    tracing::warn!(%error, "could not check harness CLI updates");
-                    None
                 }
-            };
-            if let Err(error) = this.update(cx, |shell, cx| {
-                if let Some(updates) = updates {
-                    shell.cli_updates = updates;
-                    cx.notify();
+                let closed = this
+                    .update(cx, |shell, cx| {
+                        if let Some(updates) = updates {
+                            let present: HashSet<HarnessId> =
+                                updates.iter().map(|status| status.harness).collect();
+                            shell
+                                .cli_update_rows
+                                .retain(|harness, _| present.contains(harness));
+                            shell.cli_updates = updates;
+                            cx.notify();
+                        }
+                    })
+                    .is_err();
+                if closed {
+                    tracing::debug!("harness CLI update check completed after shell closed");
+                    return;
                 }
-            }) {
-                tracing::debug!(%error, "harness CLI update check completed after shell closed");
+                if !retry {
+                    return;
+                }
+                cx.background_executor().timer(retry_in).await;
+                retry_in = (retry_in * 2).min(HARNESS_RETRY_MAX);
             }
         })
         .detach();
     }
 
-    /// Run the CLI's own installer, then drop its row. npm failures land in the
-    /// card footer instead of a modal.
+    /// Run the CLI's own updater, then verify the version the binary reports.
+    /// Failures stay on the row instead of a modal.
     fn update_harness_cli(&mut self, harness: HarnessId, cx: &mut Context<Self>) {
-        if self.cli_updating.is_some() {
+        if matches!(
+            self.cli_update_rows.get(&harness),
+            Some(CliUpdateRow::Updating)
+        ) {
             return;
         }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
-        self.cli_updating = Some(harness);
-        self.cli_update_error = None;
+        self.cli_update_rows.insert(harness, CliUpdateRow::Updating);
         cx.notify();
         let target = self.state.read(cx).harness_target_device();
         cx.spawn(async move |this, cx| {
-            let mut params = serde_json::json!({ "harness": harness });
-            if let (Some(target), Some(object)) = (target.as_ref(), params.as_object_mut()) {
-                object.insert("targetDeviceId".into(), serde_json::json!(target));
-            }
-            let result = engine
-                .client()
-                .call(methods::MANAGE_HARNESS_CLI, params)
-                .await;
+            let outcome = run_harness_update(&engine, harness, target.as_deref()).await;
             this.update(cx, |shell, cx| {
-                shell.cli_updating = None;
-                match result {
-                    Ok(_) => shell.cli_updates.retain(|status| status.harness != harness),
-                    Err(error) => {
-                        shell.cli_update_error = Some(format!("Could not update: {error}").into())
-                    }
-                }
+                shell.finish_harness_update(harness, outcome, cx);
                 cx.notify();
             })
             .ok();
         })
         .detach();
+    }
+
+    /// Sequential on purpose: concurrent npm installs fight over the same
+    /// global lock.
+    fn update_all_harness_clis(&mut self, cx: &mut Context<Self>) {
+        let targets: Vec<HarnessId> = self
+            .cli_updates
+            .iter()
+            .map(|status| status.harness)
+            .filter(|harness| cli_row_pending(&self.cli_update_rows, *harness))
+            .collect();
+        if targets.len() < 2 {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let target = self.state.read(cx).harness_target_device();
+        // Mark every target before spawning so none can be started again from
+        // its row while the queue is still working through earlier harnesses.
+        for harness in &targets {
+            self.cli_update_rows
+                .insert(*harness, CliUpdateRow::Updating);
+        }
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            for harness in targets {
+                let outcome = run_harness_update(&engine, harness, target.as_deref()).await;
+                let done = this.update(cx, |shell, cx| {
+                    shell.finish_harness_update(harness, outcome, cx);
+                    cx.notify();
+                });
+                if done.is_err() {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn finish_harness_update(
+        &mut self,
+        harness: HarnessId,
+        outcome: Result<Option<String>, String>,
+        cx: &mut Context<Self>,
+    ) {
+        match outcome {
+            Ok(version) => {
+                self.cli_update_rows
+                    .insert(harness, CliUpdateRow::Updated(version));
+                // The new version may ship new models; every picker refetches.
+                crate::pickers::bump_harness_catalog(cx);
+            }
+            Err(error) => {
+                self.cli_update_rows
+                    .insert(harness, CliUpdateRow::Failed(error.into()));
+            }
+        }
     }
 
     /// Floating notification for agent CLI updates. It remains visible across
@@ -4912,94 +5111,179 @@ impl Shell {
             return None;
         }
         let theme = Theme::of(cx).clone();
-        let mut card = popover::popover_card_flush(&theme).w(px(340.0)).child(
+        let busy = self.cli_updates.iter().any(|status| {
+            matches!(
+                self.cli_update_rows.get(&status.harness),
+                Some(CliUpdateRow::Updating)
+            )
+        });
+        let pending = self
+            .cli_updates
+            .iter()
+            .filter(|status| cli_row_pending(&self.cli_update_rows, status.harness))
+            .count();
+        let any_updated = self.cli_updates.iter().any(|status| {
+            matches!(
+                self.cli_update_rows.get(&status.harness),
+                Some(CliUpdateRow::Updated(_))
+            )
+        });
+        let title = if self.cli_updates.len() == 1 {
+            "Harness update available"
+        } else {
+            "Harness updates available"
+        };
+
+        let mut header = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .px(px(12.0))
+            .py(px(10.0))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(px(13.0))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme.text)
+                    .child(SharedString::from(title)),
+            );
+        if pending > 1 {
+            header = header.child(
+                div()
+                    .id("harness-updates-update-all")
+                    .flex_none()
+                    .px(px(8.0))
+                    .py(px(4.0))
+                    .rounded(px(6.0))
+                    .text_size(px(12.0))
+                    .text_color(theme.text_muted)
+                    .cursor_pointer()
+                    .hover(|style| style.opacity(0.7))
+                    .child(SharedString::from("Update all"))
+                    .on_click(cx.listener(|this, _, _, cx| this.update_all_harness_clis(cx))),
+            );
+        }
+        header = header.child(
             div()
+                .id("harness-updates-dismiss")
                 .flex()
-                .flex_row()
                 .items_center()
-                .justify_between()
-                .px(px(12.0))
-                .py(px(10.0))
-                .child(
-                    div()
-                        .text_size(px(13.0))
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(theme.text)
-                        .child(SharedString::from("Harness update available")),
-                )
-                .child(
-                    div()
-                        .id("harness-updates-dismiss")
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .size(px(20.0))
-                        .rounded(px(6.0))
-                        .cursor_pointer()
+                .justify_center()
+                .size(px(20.0))
+                .rounded(px(6.0))
+                .when(busy, |el| el.opacity(0.4).cursor_default())
+                .when(!busy, |el| {
+                    el.cursor_pointer()
                         .hover(|style| style.opacity(0.7))
-                        .child(
-                            icon(icons::CLOSE)
-                                .size(px(13.0))
-                                .text_color(theme.text_muted),
-                        )
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.cli_updates_dismissed = true;
                             cx.notify();
-                        })),
+                        }))
+                })
+                .child(
+                    icon(icons::CLOSE)
+                        .size(px(13.0))
+                        .text_color(theme.text_muted),
                 ),
         );
+
+        let mut card = popover::popover_card_flush(&theme)
+            .w(px(340.0))
+            .child(header);
         card = card.child(div().h(px(1.0)).bg(theme.border));
         for status in &self.cli_updates {
             let harness = status.harness;
             let (brand, tint) = crate::pickers::harness_brand_icon(harness);
-            let updating = self.cli_updating == Some(harness);
-            let install_running = self.cli_updating.is_some();
-            card = card.child(
-                div()
+            let state = self
+                .cli_update_rows
+                .get(&harness)
+                .cloned()
+                .unwrap_or(CliUpdateRow::Idle);
+            let info: AnyElement = match &state {
+                CliUpdateRow::Updated(version) => div()
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap(px(10.0))
-                    .px(px(12.0))
-                    .py(px(8.0))
-                    .child(
-                        icon(brand)
-                            .size(px(16.0))
-                            .text_color(tint.unwrap_or(theme.text_muted)),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_size(px(13.0))
-                            .text_color(theme.text)
-                            .child(SharedString::from(harness.display_name())),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(12.0))
-                            .text_color(theme.text_muted)
-                            .child(SharedString::from(cli_update_versions(status))),
-                    )
-                    .child(if updating {
-                        div()
-                            .text_size(px(12.0))
-                            .text_color(theme.text_muted)
-                            .child(SharedString::from("Updating…"))
-                            .into_any_element()
-                    } else if install_running {
-                        popover::btn_primary(&theme, "Update")
-                            .opacity(0.5)
-                            .cursor_default()
-                            .into_any_element()
+                    .gap(px(4.0))
+                    .text_size(px(12.0))
+                    .text_color(theme.success)
+                    .child(icon(icons::CHECK).size(px(12.0)).text_color(theme.success))
+                    .child(SharedString::from(match version {
+                        Some(version) => format!("Updated to {version}"),
+                        None => "Updated".to_string(),
+                    }))
+                    .into_any_element(),
+                _ => div()
+                    .text_size(px(12.0))
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from(cli_update_versions(status)))
+                    .into_any_element(),
+            };
+            let action = match &state {
+                CliUpdateRow::Updating => Some(
+                    div()
+                        .text_size(px(12.0))
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from("Updating…"))
+                        .into_any_element(),
+                ),
+                CliUpdateRow::Updated(_) => None,
+                CliUpdateRow::Idle | CliUpdateRow::Failed(_) => {
+                    let label = if matches!(&state, CliUpdateRow::Failed(_)) {
+                        "Retry"
                     } else {
-                        popover::btn_primary(&theme, "Update")
+                        "Update"
+                    };
+                    Some(
+                        popover::btn_primary(&theme, label)
                             .id(format!("harness-update-{}", harness.display_name()))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.update_harness_cli(harness, cx)
                             }))
-                            .into_any_element()
-                    }),
-            );
+                            .into_any_element(),
+                    )
+                }
+            };
+            let mut row = div()
+                .flex()
+                .flex_col()
+                .gap(px(4.0))
+                .px(px(12.0))
+                .py(px(8.0))
+                .child(
+                    div()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(10.0))
+                        .child(
+                            icon(brand)
+                                .size(px(16.0))
+                                .text_color(tint.unwrap_or(theme.text_muted)),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_size(px(13.0))
+                                .text_color(theme.text)
+                                .child(SharedString::from(harness.display_name())),
+                        )
+                        .child(info)
+                        .when_some(action, |el, action| el.child(action)),
+                );
+            if let CliUpdateRow::Failed(error) = &state {
+                row = row.child(
+                    div()
+                        .pl(px(26.0))
+                        .text_size(px(11.0))
+                        .text_color(theme.danger)
+                        .child(error.clone()),
+                );
+            }
+            card = card.child(row);
         }
         card = card.child(div().h(px(1.0)).bg(theme.border));
         card = card.child(
@@ -5008,20 +5292,12 @@ impl Shell {
                 .py(px(8.0))
                 .text_size(px(12.0))
                 .text_color(theme.text_muted.opacity(0.75))
-                .child(SharedString::from(
-                    "New models often need the latest version.",
-                )),
+                .child(SharedString::from(if any_updated {
+                    "Model picker refreshed with the new version’s models."
+                } else {
+                    "New models often need the latest version."
+                })),
         );
-        if let Some(error) = &self.cli_update_error {
-            card = card.child(
-                div()
-                    .px(px(12.0))
-                    .pb(px(8.0))
-                    .text_size(px(12.0))
-                    .text_color(theme.danger)
-                    .child(error.clone()),
-            );
-        }
         Some(
             div()
                 .absolute()
@@ -5034,10 +5310,12 @@ impl Shell {
                             .anchor(gpui::Anchor::TopRight)
                             .snap_to_window_with_margin(px(12.0))
                             .child(
+                                // Only the card occludes: the padding that
+                                // pushes it below the titlebar must not swallow
+                                // clicks on the window controls up there.
                                 div()
-                                    .occlude()
                                     .pt(px(Theme::TITLEBAR_HEIGHT + 4.0))
-                                    .child(card),
+                                    .child(card.occlude()),
                             ),
                     )
                     .priority(1)
@@ -5211,7 +5489,7 @@ impl Shell {
                 .justify_end()
                 .gap(px(8.0))
                 .child(
-                    popover::btn_ghost(theme, "Later", "update-modal-later")
+                    popover::btn_ghost(theme, "Later", "update-modal-later", cx.entity_id())
                         .id("update-modal-later")
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.update_modal_version = None;
@@ -5340,7 +5618,7 @@ impl Shell {
                     theme.glass_hover().opacity(0.8),
                 )
             })
-            .on_hover(motion::hover_listener("user-menu-trigger"))
+            .on_hover(motion::hover_listener("user-menu-trigger", cx.entity_id()))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, _| this.user_menu.note_trigger_press()),
@@ -5423,32 +5701,38 @@ impl Shell {
                 )
                 .when_some(action, |menu, action| {
                     let row = match action {
-                        AccountMenuAction::SyncInProgress => {
-                            popover::menu_row(theme, false, "user-menu-sync-progress")
-                                .id("user-menu-sync-progress")
-                                .opacity(0.6)
-                                .child(
-                                    icon(icons::GLOBAL)
-                                        .size(px(16.0))
-                                        .text_color(theme.text_muted),
-                                )
-                                .child(SharedString::from("Sync setup in progress"))
-                                .into_any_element()
-                        }
-                        AccountMenuAction::RestartPending => {
-                            popover::menu_row(theme, false, "user-menu-sync-restart")
-                                .id("user-menu-sync-restart")
-                                .on_click(cx.listener(|this, _, _, cx| this.reopen_sync_notice(cx)))
-                                .child(
-                                    icon(icons::RESTART)
-                                        .size(px(16.0))
-                                        .text_color(theme.text_muted),
-                                )
-                                .child(SharedString::from("Finish sync setup"))
-                                .into_any_element()
-                        }
+                        AccountMenuAction::SyncInProgress => popover::menu_row(
+                            theme,
+                            false,
+                            "user-menu-sync-progress",
+                            cx.entity_id(),
+                        )
+                        .id("user-menu-sync-progress")
+                        .opacity(0.6)
+                        .child(
+                            icon(icons::GLOBAL)
+                                .size(px(16.0))
+                                .text_color(theme.text_muted),
+                        )
+                        .child(SharedString::from("Sync setup in progress"))
+                        .into_any_element(),
+                        AccountMenuAction::RestartPending => popover::menu_row(
+                            theme,
+                            false,
+                            "user-menu-sync-restart",
+                            cx.entity_id(),
+                        )
+                        .id("user-menu-sync-restart")
+                        .on_click(cx.listener(|this, _, _, cx| this.reopen_sync_notice(cx)))
+                        .child(
+                            icon(icons::RESTART)
+                                .size(px(16.0))
+                                .text_color(theme.text_muted),
+                        )
+                        .child(SharedString::from("Finish sync setup"))
+                        .into_any_element(),
                         AccountMenuAction::SignOut => {
-                            popover::menu_row(theme, false, "user-menu-signout")
+                            popover::menu_row(theme, false, "user-menu-signout", cx.entity_id())
                                 .id("user-menu-signout")
                                 .on_click(cx.listener(|this, _, _, cx| this.request_sign_out(cx)))
                                 .child(
@@ -5463,7 +5747,7 @@ impl Shell {
                     menu.child(row).child(popover::menu_separator())
                 })
                 .child(
-                    popover::menu_row(theme, false, "user-menu-settings")
+                    popover::menu_row(theme, false, "user-menu-settings", cx.entity_id())
                         .id("user-menu-settings")
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.open_settings(SettingsSection::Devices, cx)
@@ -5488,6 +5772,7 @@ impl Shell {
     fn render_sync_overlay(
         &mut self,
         viewport: gpui::Size<Pixels>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let theme = Theme::of(cx).clone();
@@ -5509,7 +5794,7 @@ impl Shell {
         };
 
         if self.sync_flow == SyncFlow::Enabling && needs_org {
-            return Some(self.render_org_gate(cx));
+            return Some(self.render_org_gate(window, cx));
         }
 
         let signed_in_email: Option<SharedString> = match self.state.read(cx).auth.as_ref() {
@@ -5559,7 +5844,7 @@ impl Shell {
                     .justify_end()
                     .gap(px(8.0))
                     .child(
-                        popover::btn_ghost(&theme, "Later", "sync-switch-later")
+                        popover::btn_ghost(&theme, "Later", "sync-switch-later", cx.entity_id())
                             .id("sync-switch-later")
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.postpone_sync_restart(cx)
@@ -5568,7 +5853,7 @@ impl Shell {
                 if has_local_work {
                     actions = actions
                         .child(
-                            popover::btn_ghost(&theme, "Start fresh", "sync-switch-fresh")
+                            popover::btn_ghost(&theme, "Start fresh", "sync-switch-fresh", cx.entity_id())
                                 .id("sync-switch-fresh")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.start_synced_switch(false, cx)
@@ -5715,7 +6000,7 @@ impl Shell {
                         .justify_end()
                         .gap(px(8.0))
                         .child(
-                            popover::btn_ghost(&theme, "Later", "import-failed-dismiss")
+                            popover::btn_ghost(&theme, "Later", "import-failed-dismiss", cx.entity_id())
                                 .id("import-failed-dismiss")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.postpone_sync_restart(cx)
@@ -5763,7 +6048,7 @@ impl Shell {
                         .justify_end()
                         .gap(px(8.0))
                         .child(
-                            popover::btn_ghost(&theme, "Later", "sync-restart-later")
+                            popover::btn_ghost(&theme, "Later", "sync-restart-later", cx.entity_id())
                                 .id("sync-restart-later")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.postpone_sync_restart(cx)
@@ -5797,7 +6082,7 @@ impl Shell {
                         .justify_end()
                         .gap(px(8.0))
                         .child(
-                            popover::btn_ghost(&theme, "Cancel", "signout-cancel")
+                            popover::btn_ghost(&theme, "Cancel", "signout-cancel", cx.entity_id())
                                 .id("signout-cancel")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.sync_flow = SyncFlow::Idle;
@@ -5860,33 +6145,49 @@ impl Shell {
                     .is_some_and(|c| c.pinned);
                 if pinned { "Unpin" } else { "Pin" }
             };
-            let menu = popover::popover_card(&theme)
-                .w(px(170.0))
-                .on_mouse_down_out(cx.listener(|this, _, _, cx| {
-                    this.close_chat_menu(cx);
-                }))
-                .flex()
-                .flex_col()
-                .child(
-                    popover::menu_row(&theme, false, format!("chat-menu-rename-{chat_id}"))
+            let menu =
+                popover::popover_card(&theme)
+                    .w(px(170.0))
+                    .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+                        this.close_chat_menu(cx);
+                    }))
+                    .flex()
+                    .flex_col()
+                    .child(
+                        popover::menu_row(
+                            &theme,
+                            false,
+                            format!("chat-menu-rename-{chat_id}"),
+                            cx.entity_id(),
+                        )
                         .id("chat-menu-rename")
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.open_rename_chat(rename_id.clone(), cx)
                         }))
                         .child(icon(icons::PEN).size(px(16.0)).text_color(theme.text_muted))
                         .child(SharedString::from("Rename…")),
-                )
-                .child(
-                    popover::menu_row(&theme, false, format!("chat-menu-pin-{chat_id}"))
+                    )
+                    .child(
+                        popover::menu_row(
+                            &theme,
+                            false,
+                            format!("chat-menu-pin-{chat_id}"),
+                            cx.entity_id(),
+                        )
                         .id("chat-menu-pin")
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.toggle_chat_pinned(pin_id.clone(), cx)
                         }))
                         .child(icon(icons::PIN).size(px(16.0)).text_color(theme.text_muted))
                         .child(SharedString::from(pin_label)),
-                )
-                .child(
-                    popover::menu_row(&theme, false, format!("chat-menu-archive-{chat_id}"))
+                    )
+                    .child(
+                        popover::menu_row(
+                            &theme,
+                            false,
+                            format!("chat-menu-archive-{chat_id}"),
+                            cx.entity_id(),
+                        )
                         .id("chat-menu-archive")
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.archive_chat(archive_id.clone(), cx)
@@ -5897,10 +6198,15 @@ impl Shell {
                                 .text_color(theme.text_muted),
                         )
                         .child(SharedString::from("Archive")),
-                )
-                .child(popover::menu_separator())
-                .child(
-                    popover::menu_row(&theme, false, format!("chat-menu-delete-{chat_id}"))
+                    )
+                    .child(popover::menu_separator())
+                    .child(
+                        popover::menu_row(
+                            &theme,
+                            false,
+                            format!("chat-menu-delete-{chat_id}"),
+                            cx.entity_id(),
+                        )
                         .id("chat-menu-delete")
                         .text_color(theme.danger)
                         .on_click(cx.listener(move |this, _, _, cx| {
@@ -5915,8 +6221,8 @@ impl Shell {
                                 .text_color(theme.danger),
                         )
                         .child(SharedString::from("Delete…")),
-                )
-                .into_any_element();
+                    )
+                    .into_any_element();
             overlays.push(popover::menu_at(
                 "chat-context-menu",
                 position,
@@ -5951,12 +6257,17 @@ impl Shell {
                         .justify_end()
                         .gap(px(8.0))
                         .child(
-                            popover::btn_ghost(&theme, "Cancel", "rename-chat-cancel")
-                                .id("rename-chat-cancel")
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.rename_dialog = None;
-                                    cx.notify();
-                                })),
+                            popover::btn_ghost(
+                                &theme,
+                                "Cancel",
+                                "rename-chat-cancel",
+                                cx.entity_id(),
+                            )
+                            .id("rename-chat-cancel")
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.rename_dialog = None;
+                                cx.notify();
+                            })),
                         )
                         .child(
                             popover::btn_primary(&theme, "Rename")
@@ -6010,7 +6321,7 @@ impl Shell {
                         .justify_end()
                         .gap(px(8.0))
                         .child(
-                            popover::btn_ghost(&theme, "Cancel", "delete-chat-cancel")
+                            popover::btn_ghost(&theme, "Cancel", "delete-chat-cancel", cx.entity_id())
                                 .id("delete-chat-cancel")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.delete_confirm = None;
@@ -6029,7 +6340,7 @@ impl Shell {
             overlays.push(popover::modal("delete-chat-dialog", viewport, card));
         }
 
-        if let Some(sync) = self.render_sync_overlay(viewport, cx) {
+        if let Some(sync) = self.render_sync_overlay(viewport, window, cx) {
             overlays.push(sync);
         }
         if let Some(update) = self.render_update_modal(viewport, &theme, cx) {
@@ -6076,7 +6387,7 @@ impl Shell {
             )
     }
 
-    fn render_main(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_main(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let theme_owned = Theme::of(cx).clone();
         let theme = &theme_owned;
         let (border, text, faint) = (theme.border, theme.text, theme.text_faint);
@@ -6107,8 +6418,18 @@ impl Shell {
 
         // Content outlet: selected chat → transcript; nothing selected → the
         // centered new-session canvas; no spaces at all → the onboarding card.
+        //
+        // The transcript is a cached gpui view: it re-renders only when its
+        // entity — or one of its embedded views — is notified (gpui dirties
+        // the ancestors of a notified view). It observes AppState, its list
+        // notifies on scroll, the in-place editor notifies on caret blink, and
+        // `motion::hover_frame` notifies the fade owners. A shell repaint —
+        // hover, spinner, sync overlay — no longer rebuilds it.
         let outlet: AnyElement = if has_selection {
-            self.transcript.clone().into_any_element()
+            self.transcript
+                .clone()
+                .cached(StyleRefinement::default().size_full())
+                .into_any_element()
         } else if !has_spaces && !no_project {
             // Onboarding (first boot / after the destructive wipe): no folders
             // to work in yet — one clear affordance.
@@ -6165,7 +6486,7 @@ impl Shell {
             // selection stays in the composer's action bar.
             let pickers = self.composer.read(cx).pickers().clone();
             let (target_selectors, checkout_selectors) = pickers.update(cx, |p, cx| {
-                (p.render_target_selectors(cx), p.render_footer(cx))
+                (p.render_target_selectors(cx), p.render_footer(window, cx))
             });
             div()
                 .size_full()
@@ -6207,7 +6528,7 @@ impl Shell {
                 ))
                 .into_any_element()
         };
-        let status = self.render_status_strip(cx);
+        let status = self.render_status_strip(window, cx);
         // File dropzone over the ENTIRE conversation column (transcript +
         // composer, not just the pill): dragging OS files anywhere across the
         // chat area shows the "Drop files or images to attach" veil; a drop
@@ -6476,7 +6797,7 @@ impl Shell {
                             theme.surface_raised,
                             theme.surface_raised_hover,
                         ))
-                        .on_hover(motion::hover_listener("jump-pill"))
+                        .on_hover(motion::hover_listener("jump-pill", cx.entity_id()))
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.transcript
                                 .update(cx, |transcript, cx| transcript.jump_to_bottom(cx));
@@ -6576,7 +6897,7 @@ impl Shell {
     /// Working indicator strip: gradient spinner + rotating flavour word (7s,
     /// seeded per chat) + elapsed, staleness-gated via [`Indicator`]; falls back
     /// to a "Sending…" bridge and then the engine mode line.
-    fn render_status_strip(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_status_strip(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = Theme::of(cx).clone();
         let now = Utc::now();
         let state = self.state.read(cx);
@@ -6636,7 +6957,7 @@ impl Shell {
                         20.0,
                     )
                     .speed(1.25)
-                    .driven(cx.entity_id(), cx),
+                    .driven(cx.entity_id(), window, cx),
                 )
                 .child(
                     div()
@@ -6699,7 +7020,17 @@ impl Shell {
                                 .border_color(theme.border)
                                 .child(controls),
                         )
-                        .child(div().flex_1().min_h_0().child(changes))
+                        // Cached boundary: the diff surface observes AppState
+                        // and its own list state, and gpui dirties this view
+                        // when an embedded view (history, fetch button, ref
+                        // search) is notified. Resizes invalidate via the
+                        // cached bounds.
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_h_0()
+                                .child(changes.cached(StyleRefinement::default().size_full())),
+                        )
                         .into_any_element()
                 }
                 RightSurface::Terminal(tab) => {
@@ -7240,7 +7571,7 @@ impl Shell {
                 crate::theme::wash(0.0),
                 crate::theme::wash(0.11),
             ))
-            .on_hover(motion::hover_listener(plus_fade))
+            .on_hover(motion::hover_listener(plus_fade, cx.entity_id()))
             .block_mouse_except_scroll()
             .on_mouse_down(
                 gpui::MouseButton::Left,
@@ -7274,7 +7605,7 @@ impl Shell {
                         .flex_col()
                         .gap(px(2.0))
                         .child(
-                            popover::menu_row(&theme, false, "right-plus-terminal")
+                            popover::menu_row(&theme, false, "right-plus-terminal", cx.entity_id())
                                 .id("right-plus-terminal-row")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.add_terminal_surface(cx);
@@ -7288,7 +7619,7 @@ impl Shell {
                                 .child(SharedString::from("Terminal")),
                         )
                         .child(
-                            popover::menu_row(&theme, false, "right-plus-files")
+                            popover::menu_row(&theme, false, "right-plus-files", cx.entity_id())
                                 .id("right-plus-files-row")
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.add_files_surface(window, cx);
@@ -7302,7 +7633,7 @@ impl Shell {
                                 .child(SharedString::from("Files")),
                         )
                         .child(
-                            popover::menu_row(&theme, false, "right-plus-diff")
+                            popover::menu_row(&theme, false, "right-plus-diff", cx.entity_id())
                                 .id("right-plus-diff-row")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.add_diff_surface(cx);
@@ -7510,7 +7841,7 @@ impl Shell {
 
     /// Organization onboarding used by the synced gate and, for a local
     /// runtime, only after the user explicitly starts the sync opt-in.
-    fn render_org_gate(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_org_gate(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         self.ensure_org_ui(cx);
         let theme = Theme::of(cx).clone();
         let local_setup = self.state.read(cx).workspace_scope == Some(WorkspaceScope::Local);
@@ -7537,6 +7868,7 @@ impl Shell {
                         &theme,
                         2,
                         cx.entity_id(),
+                        window,
                         cx,
                     ))
                     .into_any_element(),
@@ -7830,6 +8162,7 @@ fn window_control_button(
     id: &'static str,
     icon_path: &'static str,
     theme: &Theme,
+    owner: gpui::EntityId,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let muted = theme.text_muted;
@@ -7849,7 +8182,7 @@ fn window_control_button(
             theme.glass_hover().opacity(0.0),
             theme.glass_hover(),
         ))
-        .on_hover(motion::hover_listener(fade_key))
+        .on_hover(motion::hover_listener(fade_key, owner))
         // Buttons in/over a titlebar drag strip must be EXCLUDED from the
         // strip's event surface entirely. `.occlude()` (gpui
         // `HitboxBehavior::BlockMouse`) makes the window hit-test STOP at the
@@ -8036,6 +8369,7 @@ fn nav_history_button(
     icon_path: &'static str,
     enabled: bool,
     theme: &Theme,
+    owner: gpui::EntityId,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
     if !enabled {
@@ -8055,7 +8389,7 @@ fn nav_history_button(
             )
             .into_any_element();
     }
-    window_control_button(id, icon_path, theme, on_click).into_any_element()
+    window_control_button(id, icon_path, theme, owner, on_click).into_any_element()
 }
 
 /// A size-7 icon button for the main-panel header (komet __root.tsx:
@@ -8064,6 +8398,7 @@ fn header_icon_button(
     id: &'static str,
     icon_path: &'static str,
     theme: &Theme,
+    owner: gpui::EntityId,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let muted = theme.text_muted;
@@ -8083,7 +8418,7 @@ fn header_icon_button(
             crate::theme::wash(0.0),
             crate::theme::wash(0.11),
         ))
-        .on_hover(motion::hover_listener(fade_key))
+        .on_hover(motion::hover_listener(fade_key, owner))
         // Same occlusion + click-swallowing as [`window_control_button`]: this
         // button sits inside the chat header's titlebar drag region, so its
         // rect must be carved out of the strip's drag/double-click surface.
@@ -8098,6 +8433,12 @@ fn header_icon_button(
 
 impl Render for Shell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // `KOMET_WINDOW_STATS=1`: this is the window's only root render, so it
+        // runs exactly once per frame — the place to measure the frame budget
+        // (interval between passes, tree build and child renders; see
+        // `crate::perf`). Inactive windows are throttled to ~30 fps by gpui, so
+        // their intervals are excluded rather than scored as missed.
+        let _frame = crate::perf::frame(window.is_window_active());
         if let Some((path, line)) = self.pending_workspace_file.take() {
             if !self.right_pane_open(cx) {
                 self.toggle_right_pane(cx);
@@ -8299,14 +8640,14 @@ impl Render for Shell {
                     t.set_bottom_clearance(stack_h, cx);
                 });
 
-                let sidebar = self.render_sidebar(cx);
+                let sidebar = self.render_sidebar(window, cx);
                 let sidebar_handle = self.resize_handle(
                     "sidebar-resize",
                     || SidebarResize,
                     |shell, _| shell.settings.sidebar_width = SIDEBAR_DEFAULT,
                     cx,
                 );
-                let main = self.render_main(cx);
+                let main = self.render_main(window, cx);
                 // The Changes pane is chat-scoped chrome: the Settings route
                 // never renders it (komet __root.tsx `!isSettings && activeChat`
                 // around the diff column) — the per-session open flags stay
@@ -8401,7 +8742,7 @@ impl Render for Shell {
             }
             GatePhase::Loading => root, // splash overlay covers boot
             GatePhase::OrgGate => {
-                let card = self.render_org_gate(cx);
+                let card = self.render_org_gate(window, cx);
                 root.child(card)
             }
             phase @ (GatePhase::Failed(_) | GatePhase::SignIn) => {
@@ -8416,11 +8757,10 @@ impl Render for Shell {
             root
         };
 
-        // A manually-driven tween is mid-flight: keep frames coming (the same
-        // scheduling `with_animation` would have requested). Hover color fades
-        // ride the same clock; their once-per-frame tick lives here (this is
-        // the window's root render — it runs exactly once per frame).
-        if self.motion_active.get() | motion::hover_fades_active() {
+        // Manual tweens, hover fades, and leased pulse animations share this
+        // root's vsync cadence; nothing polls while all three are idle.
+        let pulses_active = motion::pulse_frame(cx.entity_id(), cx);
+        if self.motion_active.get() | motion::hover_frame(cx.entity_id(), cx) | pulses_active {
             window.request_animation_frame();
         }
 
@@ -9242,21 +9582,24 @@ mod tests {
 
     #[test]
     fn home_card_lists_only_clis_with_a_newer_release() {
-        let updates = harness_updates(vec![
-            // `claude --version` reports "2.1.309 (Claude Code)": the row keeps
-            // the comparison token, not the product suffix.
-            cli_status(
-                HarnessId::ClaudeCode,
-                "2.1.309 (Claude Code)",
-                "2.1.310",
-                true,
-            ),
-            cli_status(HarnessId::Codex, "0.9.0", "0.9.0", false),
-            HarnessCliStatus {
-                managed: false,
-                ..cli_status(HarnessId::Cursor, "1.0.0", "1.1.0", true)
-            },
-        ]);
+        let updates = harness_updates(
+            vec![
+                // `claude --version` reports "2.1.309 (Claude Code)": the row keeps
+                // the comparison token, not the product suffix.
+                cli_status(
+                    HarnessId::ClaudeCode,
+                    "2.1.309 (Claude Code)",
+                    "2.1.310",
+                    true,
+                ),
+                cli_status(HarnessId::Codex, "0.9.0", "0.9.0", false),
+                HarnessCliStatus {
+                    managed: false,
+                    ..cli_status(HarnessId::Cursor, "1.0.0", "1.1.0", true)
+                },
+            ],
+            None,
+        );
         assert_eq!(
             updates.len(),
             1,
@@ -9264,5 +9607,49 @@ mod tests {
         );
         assert_eq!(updates[0].harness, HarnessId::ClaudeCode);
         assert_eq!(cli_update_versions(&updates[0]), "2.1.309 → 2.1.310");
+    }
+
+    #[test]
+    fn home_card_skips_harnesses_disabled_on_this_device() {
+        let enabled = HashSet::from([HarnessId::ClaudeCode]);
+        let updates = harness_updates(
+            vec![
+                cli_status(HarnessId::ClaudeCode, "2.1.309", "2.1.310", true),
+                cli_status(HarnessId::Codex, "0.9.0", "0.9.1", true),
+            ],
+            Some(&enabled),
+        );
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].harness, HarnessId::ClaudeCode);
+    }
+
+    #[test]
+    fn failed_cli_checks_are_polled_again_until_they_succeed() {
+        assert!(!harness_check_needs_retry(&[cli_status(
+            HarnessId::Codex,
+            "0.9.0",
+            "0.9.0",
+            false
+        )]));
+        let mut offline = cli_status(HarnessId::ClaudeCode, "2.1.309", "2.1.309", false);
+        offline.latest_version = None;
+        offline.check_error = Some("registry offline".into());
+        assert!(harness_check_needs_retry(&[offline]));
+    }
+
+    #[test]
+    fn only_idle_or_failed_rows_are_updated_again() {
+        let rows = HashMap::from([
+            (HarnessId::ClaudeCode, CliUpdateRow::Idle),
+            (HarnessId::Codex, CliUpdateRow::Updating),
+            (HarnessId::Opencode, CliUpdateRow::Updated(None)),
+            (HarnessId::Pi, CliUpdateRow::Failed("boom".into())),
+        ]);
+        assert!(cli_row_pending(&rows, HarnessId::ClaudeCode));
+        assert!(!cli_row_pending(&rows, HarnessId::Codex));
+        assert!(!cli_row_pending(&rows, HarnessId::Opencode));
+        assert!(cli_row_pending(&rows, HarnessId::Pi));
+        // A harness with no row yet is idle.
+        assert!(cli_row_pending(&rows, HarnessId::Grok));
     }
 }

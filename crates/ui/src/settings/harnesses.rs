@@ -109,11 +109,13 @@ fn show_connect_button(harness: HarnessId, status: Option<&AgentConnectionStatus
 fn newly_available_cli_update(
     statuses: &[HarnessCliStatus],
     announced: &HashSet<(HarnessId, String)>,
+    enabled: &HashSet<HarnessId>,
 ) -> Option<HarnessCliStatus> {
     statuses
         .iter()
         .find(|status| {
-            status.update_available
+            enabled.contains(&status.harness)
+                && status.update_available
                 && status
                     .latest_version
                     .as_ref()
@@ -253,7 +255,7 @@ impl HarnessesPage {
                     Err(err) => Loadable::Error(err.to_string()),
                 };
                 if matches!(page.harnesses, Loadable::Ready(_)) {
-                    page.load_cli_status(cx, true);
+                    page.load_cli_status(cx, true, false);
                     page.load_connection_status(cx);
                 }
                 cx.notify();
@@ -298,12 +300,15 @@ impl HarnessesPage {
         .detach();
     }
 
-    fn load_cli_status(&mut self, cx: &mut Context<Self>, check_latest: bool) {
+    fn load_cli_status(&mut self, cx: &mut Context<Self>, check_latest: bool, force: bool) {
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.checking_updates = false;
             return;
         };
-        let params = self.with_target(serde_json::json!({ "checkLatest": check_latest }), cx);
+        let params = self.with_target(
+            serde_json::json!({ "checkLatest": check_latest, "force": force }),
+            cx,
+        );
         let generation = self.target_generation;
         self.checking_updates = check_latest;
         self.cli_status_task = Some(cx.spawn(async move |this, cx| {
@@ -324,6 +329,7 @@ impl HarnessesPage {
                                 && let Some(status) = newly_available_cli_update(
                                     &statuses,
                                     &page.announced_cli_updates,
+                                    &page.enabled_harness_ids(&statuses),
                                 )
                             {
                                 if let Some(version) = status.latest_version.clone() {
@@ -348,7 +354,20 @@ impl HarnessesPage {
 
     fn check_updates(&mut self, cx: &mut Context<Self>) {
         self.error = None;
-        self.load_cli_status(cx, true);
+        self.load_cli_status(cx, true, true);
+    }
+
+    /// Enabled harnesses for prompt filtering; falls back to every status when
+    /// the descriptor list has not landed yet (never suppress a real update).
+    fn enabled_harness_ids(&self, statuses: &[HarnessCliStatus]) -> HashSet<HarnessId> {
+        match &self.harnesses {
+            Loadable::Ready(list) => list
+                .iter()
+                .filter(|descriptor| descriptor_enabled(descriptor))
+                .map(|descriptor| descriptor.id)
+                .collect(),
+            _ => statuses.iter().map(|status| status.harness).collect(),
+        }
     }
 
     fn render_cli_update_dialog(
@@ -386,6 +405,7 @@ impl HarnessesPage {
                             &Theme::of(cx).clone(),
                             "Later",
                             "cli-update-later",
+                            cx.entity_id(),
                         )
                         .id("cli-update-later")
                         .on_click(cx.listener(|this, _, _, cx| {
@@ -471,7 +491,7 @@ impl HarnessesPage {
                     Ok(value) => match serde_json::from_value::<Vec<HarnessDescriptor>>(value) {
                         Ok(list) => {
                             page.harnesses = Loadable::Ready(list);
-                            page.load_cli_status(cx, false);
+                            page.load_cli_status(cx, false, false);
                             crate::pickers::bump_harness_catalog(cx);
                         }
                         Err(err) => page.error = Some(err.to_string()),
@@ -599,40 +619,45 @@ impl HarnessesPage {
                     let name: SharedString = d.name.clone().into();
                     let pick_local = is_local;
                     let pick_id = d.id.clone();
-                    popover::menu_row(theme, is_active, format!("harnesses-device-row-{ix}"))
-                        .id(("harnesses-device-row", ix))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            // Local device = no passthrough (calls stay direct).
-                            let target = (!pick_local).then(|| pick_id.clone());
-                            this.set_target_device(target, cx);
-                        }))
-                        .child(
-                            icon(glyph)
-                                .size(px(16.0))
-                                .flex_none()
-                                .text_color(theme.text_muted),
-                        )
-                        .child(div().flex_1().min_w_0().truncate().child(name))
-                        .when(is_local, |el| {
-                            el.child(
-                                div()
-                                    .flex_none()
-                                    .text_size(px(10.5))
-                                    .text_color(theme.text_muted.opacity(0.35))
-                                    .child(SharedString::from("You")),
-                            )
-                        })
-                        .child(
+                    popover::menu_row(
+                        theme,
+                        is_active,
+                        format!("harnesses-device-row-{ix}"),
+                        cx.entity_id(),
+                    )
+                    .id(("harnesses-device-row", ix))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        // Local device = no passthrough (calls stay direct).
+                        let target = (!pick_local).then(|| pick_id.clone());
+                        this.set_target_device(target, cx);
+                    }))
+                    .child(
+                        icon(glyph)
+                            .size(px(16.0))
+                            .flex_none()
+                            .text_color(theme.text_muted),
+                    )
+                    .child(div().flex_1().min_w_0().truncate().child(name))
+                    .when(is_local, |el| {
+                        el.child(
                             div()
-                                .size(px(6.0))
-                                .rounded_full()
                                 .flex_none()
-                                .bg(if is_local {
-                                    emerald
-                                } else {
-                                    crate::theme::ink(0.2)
-                                }),
+                                .text_size(px(10.5))
+                                .text_color(theme.text_muted.opacity(0.35))
+                                .child(SharedString::from("You")),
                         )
+                    })
+                    .child(
+                        div()
+                            .size(px(6.0))
+                            .rounded_full()
+                            .flex_none()
+                            .bg(if is_local {
+                                emerald
+                            } else {
+                                crate::theme::ink(0.2)
+                            }),
+                    )
                 }))
                 .into_any_element();
             trigger = trigger.child(popover::anchored_menu("harnesses-device-menu", menu, None));
@@ -870,6 +895,7 @@ impl Render for HarnessesPage {
                     &theme,
                     4,
                     cx.entity_id(),
+                    window,
                     cx,
                 ))
                 .into_any_element(),
@@ -980,12 +1006,18 @@ mod tests {
             check_error: None,
         };
 
+        let enabled = HashSet::from([HarnessId::ClaudeCode]);
         assert_eq!(
-            newly_available_cli_update(std::slice::from_ref(&status), &HashSet::new())
+            newly_available_cli_update(std::slice::from_ref(&status), &HashSet::new(), &enabled)
                 .map(|status| status.harness),
             Some(HarnessId::ClaudeCode)
         );
         let announced = HashSet::from([(HarnessId::ClaudeCode, "2.2.209".to_string())]);
-        assert!(newly_available_cli_update(&[status], &announced).is_none());
+        assert!(
+            newly_available_cli_update(std::slice::from_ref(&status), &announced, &enabled)
+                .is_none()
+        );
+        // A disabled harness never prompts, even with a newer release.
+        assert!(newly_available_cli_update(&[status], &HashSet::new(), &HashSet::new()).is_none());
     }
 }
