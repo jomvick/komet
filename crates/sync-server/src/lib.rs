@@ -13,8 +13,10 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use tokio::sync::{RwLock, broadcast};
 use tracing::info;
 
+mod device_relay;
 mod registry;
 
+pub use device_relay::DeviceRelay;
 pub use registry::RegistryRoom;
 
 #[derive(Clone)]
@@ -23,6 +25,9 @@ pub struct AppState {
     /// Shared bearer token; never empty (see [`require_token`]).
     pub token: String,
     pub rooms: Arc<RwLock<HashMap<String, Room>>>,
+    /// Live device rooms (`/device/{deviceId}/ws`) — routed socket to socket, never
+    /// stored in [`Self::rooms`], which is the byte-relay log for document rooms.
+    pub device: DeviceRelay,
     /// This server's workspace namespace; served by `GET /env` so a client can
     /// name its rooms without duplicating identity into a pairing link.
     pub identity: ServerIdentity,
@@ -284,6 +289,22 @@ async fn registry_ws_handler(
         return Err((StatusCode::UNAUTHORIZED, "unauthorized"));
     }
     Ok(ws.on_upgrade(move |socket| handle_registry_socket(state, room, socket)))
+}
+
+/// A device-room socket (`/device/{deviceId}/ws`): a routed transport, not a document
+/// relay, so it does not share the room log — see [`device_relay`].
+async fn device_ws_handler(
+    State(state): State<AppState>,
+    ws: WebSocketUpgrade,
+    headers: HeaderMap,
+    Path(room): Path<String>,
+    query: axum::extract::RawQuery,
+) -> impl IntoResponse {
+    if !check_auth(&state, &headers) && !check_query_token(&state, query.0.as_deref()) {
+        return Err((StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    let relay = state.device.clone();
+    Ok(ws.on_upgrade(move |socket| relay.serve(room, socket, query.0.map(|raw| raw.to_string()))))
 }
 
 /// `?token=…` on a WebSocket upgrade. Note for operators: a URL token lands in
@@ -567,7 +588,7 @@ pub fn router(state: AppState) -> Router {
         .route("/session/:room/ws", get(ws_handler))
         .route("/chat2/:room/ws", get(ws_handler))
         .route("/registry/:room/ws", get(registry_ws_handler))
-        .route("/device/:room/ws", get(ws_handler))
+        .route("/device/:room/ws", get(device_ws_handler))
         .route("/blob/:chat/:part", get(get_blob).put(put_blob))
         .with_state(state)
 }
@@ -608,6 +629,7 @@ pub async fn serve_listener_with_identity(
         data_dir,
         token,
         rooms: Arc::new(RwLock::new(HashMap::new())),
+        device: DeviceRelay::new(),
         identity,
     };
     axum::serve(listener, router(state)).await?;
@@ -629,6 +651,7 @@ mod tests {
             data_dir: data_dir.to_path_buf(),
             token: TOKEN.to_string(),
             rooms: Arc::new(RwLock::new(HashMap::new())),
+            device: DeviceRelay::new(),
             identity: ServerIdentity {
                 org_id: "org-1".into(),
                 user_id: "user-1".into(),
