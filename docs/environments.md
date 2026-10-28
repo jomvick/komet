@@ -55,8 +55,9 @@ printed: expose the server behind TLS first, then run
 | `--print-link` | Print the pairing link and exit (reads the saved config). |
 
 Everything is persisted, so `komet daemon restart` needs no environment variable.
-`--public-url` wins over `--lan`, and a URL already saved in `serve.json` wins over
-both — re-running with `--lan` never rewrites an address you chose.
+`--public-url` wins over `--lan` and replaces a saved URL. A URL already saved in
+`serve.json` wins over `--lan` — re-running with `--lan` never rewrites an address
+you chose (a `--lan` address does follow `--port`).
 
 ## TLS (required for a link)
 

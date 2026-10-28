@@ -215,6 +215,24 @@ async fn add_refuses_a_bad_token_and_the_server_already_synced_to() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_adds_of_the_same_link_keep_one_runtime() {
+    let dirs = tempfile::tempdir().expect("tempdir");
+    let url = start_server(&dirs.path().join("server-b"), "org-b", "user-b", "VPS B").await;
+    let core = assemble(&dirs.path().join("a"), "device-a");
+    let link = link(&url, TOKEN, "VPS B");
+
+    let (first, second) = tokio::join!(core.envs.add(&link), core.envs.add(&link));
+    let first = first.expect("first add");
+    let second = second.expect("second add");
+    assert_eq!(first.id, second.id, "the same link pairs once");
+    assert_eq!(core.envs.list().len(), 2, "local + one environment");
+    assert!(
+        core.envs.runtime(&first.id).is_some(),
+        "the surviving environment still has its runtime"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn watch_environments_streams_the_paired_list() {
     let dirs = tempfile::tempdir().expect("tempdir");
     let url_b = start_server(&dirs.path().join("server-b"), "org-b", "user-b", "VPS B").await;

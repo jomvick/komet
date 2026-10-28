@@ -59,7 +59,16 @@ impl ServeConfig {
             .unwrap_or(DEFAULT_PORT);
         let configured = public_url
             .map(|url| url.trim().trim_end_matches('/').to_string())
-            .or_else(|| stored.as_ref().and_then(|c| c.public_url.clone()));
+            .or_else(|| {
+                stored
+                    .as_ref()
+                    .and_then(|c| c.public_url.clone())
+                    .map(|url| {
+                        // A stored `--lan` address follows the bound port: keeping the
+                        // old one would print a link nothing listens on.
+                        lan_url_on_port(&url, effective_port).unwrap_or(url)
+                    })
+            });
         let public_url = match configured {
             Some(url) => Some(url),
             None if lan => Some(lan_url(effective_port)?),
@@ -242,12 +251,31 @@ fn lan_url(port: u16) -> anyhow::Result<String> {
         "--lan found no private address on this machine's default route. On a VPS with a public \
          IP only, put the server behind TLS and pass --public-url https://YOUR_HOST"
     ))?;
+    Ok(lan_url_on(addr, port))
+}
+
+fn lan_url_on(addr: std::net::IpAddr, port: u16) -> String {
     let host = if addr.is_ipv6() {
         format!("[{addr}]")
     } else {
         addr.to_string()
     };
-    Ok(format!("http://{host}:{port}"))
+    format!("http://{host}:{port}")
+}
+
+/// Re-point a stored `--lan` URL at `port`; `None` when it is not one (its host
+/// is public, or the port already matches), so an operator's address survives.
+fn lan_url_on_port(url: &str, port: u16) -> Option<String> {
+    let authority = url.strip_prefix("http://")?.split(['/', '?', '#']).next()?;
+    let (host, stored) = match authority.strip_prefix('[') {
+        Some(rest) => rest.split_once("]:")?,
+        None => authority.rsplit_once(':')?,
+    };
+    let addr: std::net::IpAddr = host.parse().ok()?;
+    if !is_lan_address(&addr) || stored.parse::<u16>().ok()? == port {
+        return None;
+    }
+    Some(lan_url_on(addr, port))
 }
 
 /// The source address the kernel would use to reach the network — read off the
@@ -477,6 +505,29 @@ mod tests {
         )
         .unwrap();
         assert!(moved, "a new address makes a new link, so it must be shown");
+    }
+
+    #[test]
+    fn a_saved_lan_url_follows_the_new_port() {
+        let dir = tempfile::tempdir().unwrap();
+        let seeded = ServeConfig {
+            public_url: Some("http://192.168.1.10:8787".into()),
+            ..config(None)
+        };
+        std::fs::write(
+            dir.path().join(SERVE_FILE),
+            serde_json::to_vec(&seeded).unwrap(),
+        )
+        .unwrap();
+
+        let (changed, link_is_new) =
+            ServeConfig::load_or_create(dir.path(), None, Some(9000), None, false).unwrap();
+        assert_eq!(
+            changed.public_url.as_deref(),
+            Some("http://192.168.1.10:9000"),
+            "the stored --lan address moves to the port this run binds"
+        );
+        assert!(link_is_new, "a moved port changes the printed link");
     }
 
     #[test]

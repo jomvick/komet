@@ -253,6 +253,7 @@ impl SyncPage {
     fn open_wizard(&mut self, cx: &mut Context<Self>) {
         self.adding = true;
         self.steps = Self::rest();
+        self.insecure_ok = false;
         self.failure = None;
         self.failure_hint = None;
         self.preview = None;
@@ -266,6 +267,7 @@ impl SyncPage {
         self.attempt += 1;
         self.adding = false;
         self.steps = Self::rest();
+        self.insecure_ok = false;
         self.preview = None;
         self.failure = None;
         self.failure_hint = None;

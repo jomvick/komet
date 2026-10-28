@@ -17,7 +17,7 @@ use komet_rpc::{LinkCache, LinkCacheConfig, StaticToken};
 use tokio::sync::watch;
 
 use crate::doc_host::EdgeConfig;
-use crate::environments::{EnvStoreError, EnvironmentStore, LOCAL_ENV_ID};
+use crate::environments::{AddOutcome, EnvStoreError, EnvironmentStore, LOCAL_ENV_ID};
 use crate::workspace_runtime::WorkspaceRuntime;
 
 /// Label of the machine's own workspace in the switcher. The UI may translate it.
@@ -268,17 +268,37 @@ impl EnvHosts {
             added_at_ms: chrono::Utc::now().timestamp_millis(),
         };
         let handle = self.open_runtime(&env)?;
-        let mut store = self.store.write().unwrap_or_else(|e| e.into_inner());
-        let mut next = store.clone();
-        next.upsert(env.clone());
-        next.save().map_err(|err| {
-            EnvAddError::Store(EnvStoreError::Io(format!(
-                "{}: {err}",
-                self.data_dir.join("environments.json").display()
-            )))
-        })?;
-        *store = next;
-        drop(store);
+        // Scoped: the write guard must not live across the teardown await below.
+        let outcome: Result<Option<Environment>, EnvAddError> = {
+            let mut store = self.store.write().unwrap_or_else(|e| e.into_inner());
+            let mut next = store.clone();
+            match next.upsert(env.clone()) {
+                // A concurrent add stored the same link first: keep its runtime,
+                // drop ours instead of leaving a second room nobody can remove.
+                AddOutcome::Existing(id) => Ok(Some(Environment { id, ..env.clone() })),
+                AddOutcome::Added => match next.save() {
+                    Ok(()) => {
+                        *store = next;
+                        Ok(None)
+                    }
+                    Err(err) => Err(EnvAddError::Store(EnvStoreError::Io(format!(
+                        "{}: {err}",
+                        self.data_dir.join("environments.json").display()
+                    )))),
+                },
+            }
+        };
+        match outcome {
+            Ok(None) => {}
+            Ok(Some(existing)) => {
+                teardown(&handle).await;
+                return Ok(redacted(&existing));
+            }
+            Err(err) => {
+                teardown(&handle).await;
+                return Err(err);
+            }
+        }
         self.entries
             .write()
             .unwrap_or_else(|e| e.into_inner())
