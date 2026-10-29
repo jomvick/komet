@@ -48,3 +48,123 @@ Explicit `sandbox_options` are validated by the engine (`validate_run_request`) 
 - Composio's connected-account credentials remain hosted by Composio and are scoped to that device ID; removing the local API key does not delete those remote accounts. OAuth authorization happens in the user's browser through a Composio Connect Link.
 - Agent tool calls are exposed through Komet's per-run local MCP endpoint and Composio session execution API, not injected as a direct hosted Composio MCP connection. Komet disables Composio's connection manager, workbench, proxy execution, and Instant usage for these sessions. Known read-only action slugs can run without a prompt; mutating and unrecognized actions require Komet's permission panel for each call. A multi-execute batch is classified as read-only only when every discovered tool slug is read-only; otherwise the entire batch requires approval.
 - Other external MCP actions are not mediated by Komet's permission bridge, so per-action confirmation is not enforced for those servers. Review their tool calls and only connect accounts whose actions are appropriate for the selected agent.
+
+## Remote environments (paired machines)
+
+An environment is a workspace backed by another machine: `komet serve` runs a sync
+server and an engine there, and a `komet://pair/…` link adds it to this desktop's
+sidebar. The desktop is only a controller in that workspace, never a device of it
+(`docs/environments.md`). The sandbox rules above apply unchanged on the remote host:
+they constrain the agent CLI, not the machine.
+
+### The pairing link is a shell grant
+
+- The link is `komet://pair/` followed by unpadded base64url JSON
+  `{"v":1,"label","url","token"}`. It is neither encrypted nor signed, so anyone who
+  sees it can decode the token. Decoding validates only the version, non-empty fields,
+  and an `http(s)` URL — there is no identity, scope, or expiry in the payload.
+- Holding the link is equivalent to shell on that host: adding the environment opens
+  its RPC surface through the relay — sessions, terminals, workspace file reads and
+  writes, repo and harness management — as the user running `komet serve`.
+- Treat it as a password. Do not paste it into chat, tickets, screenshots, or shared
+  terminals; Komet does not log the link or its token, but clipboard managers and shell
+  scrollback are outside Komet's control.
+- `komet serve` prints it only on the run that creates or changes it, with
+  `--print-link`, or with `--install-service`; a plain restart stays silent.
+  **Copy link** in Settings re-encodes the stored record with the same token, so it
+  produces the same secret, not a fresh one.
+- There is no revoke or rotate command, endpoint, or per-link expiry, and removing an
+  environment deletes only this controller's copy: the remote token stays valid and
+  anyone still holding the link can keep pairing. To invalidate a leaked token you
+  must replace `token` in `~/.komet/serve.json`, restart the service
+  (`komet daemon restart`), and re-pair every controller with the reprinted link —
+  the server then accepts only the new value, but all existing pairings break at once.
+
+### One shared bearer per server
+
+- Each environment has exactly one static bearer, generated into `serve.json` (0600)
+  or supplied as `KOMET_SYNC_TOKEN`. Every client of that server uses the same value;
+  there are no per-device or per-environment tokens, scopes, or revocation. That is a
+  named non-goal of the environments design (per-environment tokens are deferred).
+- The server compares that one value in constant time, from
+  `Authorization: Bearer …`, `x-komet-token`, or `?token=` on WebSocket upgrades.
+  A valid token authorizes any room and the device relay; there is no per-room ACL.
+- On the controller, the token lives in `{data_dir}/environments.json` (0600, written
+  temp-file + rename). Listings and every environment reply are redacted to an empty
+  token; the one deliberate exception is the local-only `EnvironmentLink` call that
+  backs **Copy link**, which is never logged or embedded in an error message.
+- Rotating the token means editing `serve.json` and restarting: it affects every
+  client of that server. If `environments.json` cannot be read, Komet boots with no
+  environments and refuses writes rather than overwriting the stored tokens.
+
+### Transport
+
+- Plain HTTP is accepted without a prompt only for loopback (`localhost`, `127.0.0.1`,
+  `::1`). A non-loopback `http://` link is refused by the pairing wizard until the
+  plain-HTTP acknowledgement toggle is on (`needs_insecure_consent`); that consent
+  gate lives in the UI, and the engine stores whatever URL the link carries.
+- `komet serve --lan` fills in this machine's private address, binds the server on
+  `0.0.0.0` (every interface, not just that address), and prints a plain-HTTP warning
+  next to the link. Anything else is expected to sit behind a TLS reverse proxy; the
+  controller opens every room and relay connection against that URL, presenting the
+  token.
+- `warn_if_insecure_sync_url` is informational: it logs one warning when the client
+  resolves its sync URL at startup, and `KOMET_SYNC_ALLOW_INSECURE_HTTP=1` only
+  changes the wording. It does not block a connection. The environment pairing path
+  is gated by the UI consent above, not by that warning.
+- TLS protects the transit only. Certificate validation is the HTTP client's default;
+  Komet does not pin the server certificate. The token rides in the WebSocket query
+  string, so it lands in reverse-proxy access logs unless logging for `/` is off; the
+  proxy and the server operator also see traffic after TLS termination. Nothing here
+  protects a token pasted into the wrong place.
+
+### The device relay
+
+- Controllers drive an environment's engine over `/device/{deviceId}/ws`: the remote
+  engine claims the host role, each controller connects as a client with a connection
+  id, and the server routes frames between them. Device rooms live in memory only —
+  nothing is persisted or replayed. (Document rooms — `/session`, `/chat2`,
+  `/registry` — are the durable ones, by design.)
+- The relay decodes only the frame header to route; payloads are opaque bytes. There
+  is no end-to-end encryption: TLS ends at the reverse proxy in front of the sync
+  server, which receives plaintext frames, so the hub process can read every RPC
+  frame, and sees device ids, connection ids, frame sizes and timing.
+- One host per room. A new `role=host` socket supersedes the previous one, which is
+  closed; the real engine reconnects and supersedes back. Combined with the shared
+  bearer and the absent per-room ACL, any token holder can claim a room's host role
+  and receive what controllers send to it.
+- Disconnects fail fast instead of hanging: a client frame with no host gets
+  `host_offline`, a host frame addressed to a departed client gets `client_gone`, and
+  open peers get `host_closed` / `client_closed`. Keepalive `ping`/`pong` are answered
+  by the server and never forwarded.
+
+### Trust boundary on the remote machine
+
+- `komet serve` runs an engine on that host as the user running it (for example a
+  systemd `--user` or launchd service). Sessions, terminals, and the agent CLIs they
+  spawn execute there with that user's privileges, on that user's files and network.
+  There is no container, VM, or OS-level confinement from Komet — see
+  [Sandbox is not a host boundary](#sandbox-is-not-a-host-boundary).
+- The pairing grants the same RPC surface a local UI has, with no read-only mode.
+  Anyone with the link can start work on that machine, not just watch it; run it under
+  an account and data set you accept exposing to whoever holds the link.
+- The controller is not a device inside the environment: its runtime is opened with
+  `register_device = false`, so it registers no device row and appears in no device
+  list there. It does keep a local mirror under `{data_dir}/environments/{id}`.
+- Environments are isolated by the network boundary: each has its own server, token,
+  registry and docs store, and adding the server this profile is already synced to is
+  rejected, so two environments' rows cannot meet in one list.
+
+### Unpairing and data
+
+- **Remove** forgets the environment: its entry and token are deleted from
+  `environments.json` and its sockets are torn down. The mirror under
+  `{data_dir}/environments/{id}` is kept unless the purge checkbox is ticked; purge
+  deletes that directory.
+- The mirror can be the only copy of a remote chat — the server holds the live copy,
+  and the remote machine may be gone. Export or copy it before purging.
+- Removing on the controller does not stop the remote service, rotate its token, or
+  delete its data. Anyone with the link can still pair; the remote keeps executing
+  as before. To retire a machine, follow the teardown in `docs/environments.md`
+  (disable the service, remove its data directory), and remove the desktop side
+  first if you want to keep the mirror.
