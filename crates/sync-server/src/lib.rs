@@ -1,21 +1,24 @@
 use axum::{
     Json, Router,
     extract::{
-        Path, State, WebSocketUpgrade,
+        DefaultBodyLimit, Path, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
-    routing::get,
+    routing::{get, post},
 };
 use futures_util::{SinkExt, StreamExt};
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use tokio::sync::{RwLock, broadcast};
 use tracing::info;
 
+mod chat_log;
+mod chat_room;
 mod device_relay;
 mod registry;
 
+pub use chat_room::ChatHub;
 pub use device_relay::DeviceRelay;
 pub use registry::RegistryRoom;
 
@@ -28,6 +31,9 @@ pub struct AppState {
     /// Live device rooms (`/device/{deviceId}/ws`) — routed socket to socket, never
     /// stored in [`Self::rooms`], which is the byte-relay log for document rooms.
     pub device: DeviceRelay,
+    /// chat2 rooms (`/chat2/{chatId}/ws` + checkpoint/tail sidecars): a sequenced
+    /// opaque-update log per chat, isolated from the byte-relay rooms above.
+    pub chat: ChatHub,
     /// This server's workspace namespace; served by `GET /env` so a client can
     /// name its rooms without duplicating identity into a pairing link.
     pub identity: ServerIdentity,
@@ -117,7 +123,7 @@ pub struct Room {
     pub tx: broadcast::Sender<Vec<u8>>,
     pub db_path: PathBuf,
     /// Registry-protocol state, opened lazily by the first `/registry/…` socket.
-    /// `None` for relay-only rooms (session, chat2, device).
+    /// `None` for relay-only rooms (session, device).
     pub registry: Option<Arc<std::sync::Mutex<RegistryRoom>>>,
     /// Registry text frames, broadcast to every registry socket in the room.
     pub registry_tx: broadcast::Sender<String>,
@@ -582,13 +588,38 @@ async fn put_blob(
 }
 
 pub fn router(state: AppState) -> Router {
+    // Checkpoint and sidecar uploads are MB-scale by design; axum's 2 MB
+    // default would reject them before the handlers can answer `too_large`.
+    let upload_limit = DefaultBodyLimit::max(32 * 1024 * 1024);
     Router::new()
         .route("/health", get(health))
         .route("/env", get(env_descriptor))
         .route("/session/:room/ws", get(ws_handler))
-        .route("/chat2/:room/ws", get(ws_handler))
+        // chat2 is a sequenced opaque-update log, not the byte relay above:
+        // a chat id is also a `/session/{id}` room name, so the two protocols
+        // never share a handler.
+        .route("/chat2/:room/ws", get(chat_room::ws_handler))
+        .route(
+            "/chat2/:room/checkpoint",
+            get(chat_room::checkpoint_get)
+                .post(chat_room::checkpoint_post)
+                .layer(upload_limit),
+        )
+        .route(
+            "/chat2/:room/tail",
+            get(chat_room::tail_get)
+                .put(chat_room::tail_put)
+                .layer(upload_limit),
+        )
+        .route(
+            "/chat2/:room/diff",
+            get(chat_room::diff_get)
+                .put(chat_room::diff_put)
+                .layer(upload_limit),
+        )
         .route("/registry/:room/ws", get(registry_ws_handler))
         .route("/device/:room/ws", get(device_ws_handler))
+        .route("/device/:room/nudge", post(device_relay::nudge_handler))
         .route("/blob/:chat/:part", get(get_blob).put(put_blob))
         .with_state(state)
 }
@@ -626,10 +657,11 @@ pub async fn serve_listener_with_identity(
     tokio::fs::create_dir_all(data_dir.join("rooms")).await.ok();
     tokio::fs::create_dir_all(data_dir.join("blobs")).await.ok();
     let state = AppState {
-        data_dir,
+        data_dir: data_dir.clone(),
         token,
         rooms: Arc::new(RwLock::new(HashMap::new())),
         device: DeviceRelay::new(),
+        chat: ChatHub::new(data_dir),
         identity,
     };
     axum::serve(listener, router(state)).await?;
@@ -652,6 +684,7 @@ mod tests {
             token: TOKEN.to_string(),
             rooms: Arc::new(RwLock::new(HashMap::new())),
             device: DeviceRelay::new(),
+            chat: ChatHub::new(data_dir.to_path_buf()),
             identity: ServerIdentity {
                 org_id: "org-1".into(),
                 user_id: "user-1".into(),

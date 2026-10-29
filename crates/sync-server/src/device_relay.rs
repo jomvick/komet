@@ -14,20 +14,33 @@
 //! `host_offline` (a client sent with no host), `client_gone` (the host routed to a client
 //! that left), `host_closed` (the host socket went away), `client_closed` (a client left).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use axum::Json;
+use axum::body::Bytes;
 use axum::extract::ws::{Message, WebSocket};
+use axum::extract::{Path, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use futures_util::stream::SplitSink;
 use futures_util::{SinkExt, StreamExt};
-use komet_rpc::device_room::{CLIENT_CLOSED, CLIENT_GONE, HOST_CLOSED, HOST_OFFLINE, RELAY_KIND};
+use komet_rpc::device_room::{
+    CLIENT_CLOSED, CLIENT_GONE, HOST_CLOSED, HOST_OFFLINE, NUDGE_KIND, RELAY_KIND,
+};
 use komet_rpc::{DeviceFrameHeader, decode_device_frame, encode_device_frame};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+
+use crate::AppState;
 
 /// Keepalive pair every device socket speaks. It is answered by this server alone —
 /// forwarding a keepalive is what makes a peer read it as a malformed frame.
 const PING: &str = "ping";
 const PONG: &str = "pong";
+
+/// Pending nudges kept per device while its host is offline; overflow drops the
+/// oldest (recency wins, like the DO's `pending_nudges` bound).
+const NUDGE_MAX_PENDING: usize = 256;
 
 enum Out {
     Frame(Vec<u8>),
@@ -42,6 +55,10 @@ enum Out {
 struct DeviceRoom {
     host: Option<UnboundedSender<Out>>,
     clients: HashMap<String, UnboundedSender<Out>>,
+    /// Chat ids nudged while no host was connected, replayed in order on the
+    /// next host join. Memory-only (the DO persisted them; a sync-server
+    /// restart loses a nudge, and the command itself stays durable in the doc).
+    pending_nudges: VecDeque<String>,
 }
 
 /// Live device rooms, keyed by the URL's room (the host's device id).
@@ -78,6 +95,35 @@ fn query_pairs(query: Option<&str>) -> HashMap<String, String> {
 impl DeviceRelay {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Deliver a nudge frame to the device's live host, or queue it for the
+    /// next host join. True = delivered now.
+    ///
+    /// Unlike the edge DO there is no persisted `pending_nudges` table: this
+    /// queue lives in memory, so a queue for a device that was never seen is
+    /// harmless (it replays to the first host that claims the room and dies
+    /// with the process). The edge answered 404 only for an owner mismatch,
+    /// which a single-token server has no way to express.
+    pub fn nudge(&self, room: &str, chat_id: &str) -> bool {
+        let mut rooms = lock(&self.rooms);
+        let entry = rooms.entry(room.to_string()).or_default();
+        match &entry.host {
+            Some(host) if !host.is_closed() => {
+                send_nudge(host, chat_id);
+                true
+            }
+            _ => {
+                // Dedupe by chat (one open covers any number of pending
+                // commands), bounded so a runaway sender cannot grow it.
+                entry.pending_nudges.retain(|pending| pending != chat_id);
+                if entry.pending_nudges.len() >= NUDGE_MAX_PENDING {
+                    entry.pending_nudges.pop_front();
+                }
+                entry.pending_nudges.push_back(chat_id.to_string());
+                false
+            }
+        }
     }
 
     /// Serve one device-room socket until it closes. `role=host` claims the room; any
@@ -136,6 +182,12 @@ impl DeviceRelay {
             // rather than splitting its RPC surface across two sockets.
             if let Some(previous) = entry.host.replace(tx.clone()) {
                 let _ = previous.send(Out::Close);
+            }
+            // Cold-chat delivery: nudges that arrived while no host was live
+            // are replayed now, in order, and then cleared.
+            let pending: Vec<String> = entry.pending_nudges.drain(..).collect();
+            for chat_id in pending {
+                send_nudge(tx, &chat_id);
             }
         } else {
             entry.clients.insert(conn_id.to_string(), tx.clone());
@@ -251,6 +303,66 @@ impl DeviceRelay {
 fn send_frame(socket: &UnboundedSender<Out>, header: &DeviceFrameHeader, payload: &[u8]) {
     if let Ok(frame) = encode_device_frame(header, payload) {
         let _ = socket.send(Out::Frame(frame));
+    }
+}
+
+/// A nudge frame carries the chat id as its stream id and `{chatId}` as the
+/// payload — the shape `host_session`'s `on_nudge` path expects.
+fn send_nudge(socket: &UnboundedSender<Out>, chat_id: &str) {
+    let payload = serde_json::json!({ "chatId": chat_id }).to_string();
+    send_frame(
+        socket,
+        &DeviceFrameHeader::new(chat_id, NUDGE_KIND),
+        payload.as_bytes(),
+    );
+}
+
+/// `POST /device/{deviceId}/nudge` — "chat X has pending commands: open its
+/// doc and drain". Delivered live when the host is connected, queued and
+/// replayed otherwise.
+///
+/// Auth is the Bearer header only: this is what the engine's
+/// `nudge_remote_host` sends, and unlike the sync routes the edge never
+/// accepted a query token here.
+pub(crate) async fn nudge_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(device): Path<String>,
+    body: Bytes,
+) -> Response {
+    let authorized = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .is_some_and(|got| crate::constant_time_eq(got.as_bytes(), state.token.as_bytes()));
+    if !authorized {
+        return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
+    }
+    let bad_chat_id = || {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "bad_chat_id"})),
+        )
+            .into_response()
+    };
+    let Ok(body) = serde_json::from_slice::<serde_json::Value>(&body) else {
+        return bad_chat_id();
+    };
+    let Some(chat_id) = body.get("chatId").and_then(|value| value.as_str()) else {
+        return bad_chat_id();
+    };
+    // Same rule as the DO's CHAT_ID_RE (64, not the 128 a room id allows).
+    if !(1..=64).contains(&chat_id.len())
+        || !chat_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return bad_chat_id();
+    }
+    if state.device.nudge(&device, chat_id) {
+        Json(serde_json::json!({"delivered": true})).into_response()
+    } else {
+        Json(serde_json::json!({"delivered": false, "queued": true})).into_response()
     }
 }
 

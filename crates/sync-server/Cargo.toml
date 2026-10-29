@@ -7,9 +7,13 @@ publish.workspace = true
 
 [dependencies]
 komet-doc.workspace = true
+# The chat2 wire codec is the client's: one implementation, so the server's
+# relay and an engine's ChatClient cannot drift apart.
+komet-sync.workspace = true
 # The device-room frame codec is the client's: one implementation, so the server's
 # relay and a controller's link cannot drift apart.
 komet-rpc.workspace = true
+base64 = "0.22"
 tokio.workspace = true
 axum = { version = "0.7", features = ["ws"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
@@ -28,3 +32,4 @@ tempfile.workspace = true
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 async-trait.workspace = true
+tokio-tungstenite.workspace = true
