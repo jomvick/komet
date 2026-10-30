@@ -15,8 +15,10 @@ pub struct MockHarness {
     pub script: Vec<AgentEvent>,
 }
 
-/// The scripted question set for the `KOMET_MOCK_QUESTION` variant (exercises
-/// the QuestionPanel end-to-end: single-select page, multi-select page).
+/// The scripted `question_multi` scenario (`KOMET_MOCK_QUESTION=multi`, also
+/// accepted as `1`): two paged questions — a single-select and a multi-select —
+/// each with a free-text ("Autre") field, so the wizard's pagination, checks
+/// and free-text path all appear in one demo run.
 fn question_script() -> Vec<UserInputQuestion> {
     vec![
         UserInputQuestion {
@@ -29,6 +31,10 @@ fn question_script() -> Vec<UserInputQuestion> {
                 "Hybrid: event-driven with a polling fallback".into(),
             ],
             multi_select: false,
+            option_descriptions: Vec::new(),
+            allow_free_text: true,
+            secret: false,
+            default: None,
         },
         UserInputQuestion {
             id: "q-gates".into(),
@@ -40,6 +46,10 @@ fn question_script() -> Vec<UserInputQuestion> {
                 "Golden screenshots".into(),
             ],
             multi_select: true,
+            option_descriptions: Vec::new(),
+            allow_free_text: true,
+            secret: false,
+            default: None,
         },
     ]
 }
@@ -102,11 +112,12 @@ impl Harness for MockHarness {
             .unwrap_or(0);
         let delay = std::time::Duration::from_millis(delay_ms);
 
-        // Dev/testing knob: `KOMET_MOCK_QUESTION=1` swaps in a run that asks
-        // the user questions mid-stream via `controls.request_input` (the
-        // engine mints the request id, emits `InputRequested`, and resolves it
-        // from the `RespondInput` doc command) — the only data-side way to put
-        // the QuestionPanel on screen.
+        // Dev/testing knob: `KOMET_MOCK_QUESTION=multi` (or any non-empty,
+        // non-`0` value) swaps in a run that asks the `question_multi`
+        // scenario mid-stream via `controls.request_input` (the engine mints
+        // the request id, emits `InputRequested`, and resolves it from the
+        // `RespondInput` doc command) — the only data-side way to put the
+        // question dock on screen. `scripts/dev-demo.sh --questions` sets it.
         let question_mode = std::env::var("KOMET_MOCK_QUESTION")
             .ok()
             .is_some_and(|v| !v.is_empty() && v != "0");
@@ -126,7 +137,9 @@ impl Harness for MockHarness {
                             .into(),
                 });
                 tokio::time::sleep(pause).await;
-                let answers = request_input(question_script()).await.unwrap_or_default();
+                let answers = request_input(question_script(), komet_proto::QuestionSource::Native)
+                    .await
+                    .unwrap_or_default();
                 let picked: Vec<String> = answers
                     .iter()
                     .flat_map(|a| a.labels.iter().cloned())
@@ -523,5 +536,354 @@ reason: None,
                 event
             })
             .boxed())
+    }
+}
+
+/// Scripted compaction scenario (`KOMET_MOCK_SCENARIO=compaction`): two cycles
+/// in one run — one that finishes with a recap, one that fails — so the thread
+/// row, the recap fetch and the `Failed` state are all reachable without a live
+/// agent. Ids are FIXED: the fold refines a cycle by id, so a scenario that
+/// rotated its id per call would not replay as one row.
+pub fn compaction_script() -> Vec<AgentEvent> {
+    let compaction = |id: &str,
+                      status: komet_proto::CompactionStatus,
+                      trigger: Option<&str>,
+                      tokens_before: Option<u64>,
+                      summary: Option<&str>,
+                      error: Option<&str>| AgentEvent::ContextCompaction {
+        id: id.into(),
+        status,
+        trigger: trigger.map(str::to_owned),
+        tokens_before,
+        tokens_after: None,
+        summary: summary.map(str::to_owned),
+        summary_delta: None,
+        error: error.map(str::to_owned),
+    };
+    use komet_proto::CompactionStatus;
+    vec![
+        AgentEvent::TextDelta {
+            text: "Reconciling the ledger across the last forty turns…\n\n".into(),
+        },
+        compaction(
+            "mock-cmp-1",
+            CompactionStatus::InProgress,
+            None,
+            None,
+            None,
+            None,
+        ),
+        compaction(
+            "mock-cmp-1",
+            CompactionStatus::Completed,
+            Some("auto"),
+            Some(165_000),
+            Some(
+                "User asked for the reconciliation path. Four files were read, the sync design was \
+                 agreed, and the failing suite was identified.",
+            ),
+            None,
+        ),
+        AgentEvent::TextDelta {
+            text: "Context rebuilt — continuing from the recap.\n\n".into(),
+        },
+        compaction(
+            "mock-cmp-2",
+            CompactionStatus::InProgress,
+            Some("manual"),
+            None,
+            None,
+            None,
+        ),
+        compaction(
+            "mock-cmp-2",
+            CompactionStatus::Failed,
+            Some("manual"),
+            None,
+            None,
+            Some("The summarizer timed out; the conversation is unchanged."),
+        ),
+        AgentEvent::Done {
+            status: DoneStatus::Completed,
+            result: None,
+            error: None,
+            session_id: None,
+            reason: None,
+        },
+    ]
+}
+
+/// Scripted nested-subagent scenario (`KOMET_MOCK_SCENARIO=subagent_nested`):
+/// A spawns B, and both stream tools and text. Each child event is wrapped in
+/// its DIRECT parent's `Subagent` — the wire's own shape (a sub-subagent tags
+/// its spawner, not the root) — so the tree is something Task 4 derives from the
+/// spawn records rather than something the mock pre-bakes.
+pub fn subagent_nested_script() -> Vec<AgentEvent> {
+    let child = |parent: &str, event: AgentEvent| AgentEvent::Subagent {
+        parent_tool_use_id: parent.into(),
+        event: Box::new(event),
+    };
+    let agent = |id: &str, label: &str| AgentEvent::ToolCall {
+        id: id.into(),
+        call: komet_proto::ToolCall::Unknown {
+            name: format!("Agent: {label}"),
+            input: None,
+        },
+    };
+    vec![
+        AgentEvent::TextDelta {
+            text: "Two levels of delegation: an investigator, and a reader under it.\n\n".into(),
+        },
+        agent("mock-spawn-a", "investigate the fold"),
+        child(
+            "mock-spawn-a",
+            AgentEvent::TextDelta {
+                text: "I'll delegate the file read.\n\n".into(),
+            },
+        ),
+        child("mock-spawn-a", agent("mock-spawn-b", "read sessions.rs")),
+        child(
+            "mock-spawn-b",
+            AgentEvent::ToolCall {
+                id: "mock-bash-b".into(),
+                call: komet_proto::ToolCall::Exec {
+                    command: "sed -n 1,120p crates/engine/src/sessions.rs".into(),
+                },
+            },
+        ),
+        child(
+            "mock-spawn-b",
+            AgentEvent::ToolResult {
+                id: "mock-bash-b".into(),
+                is_error: false,
+                output: None,
+                diff: None,
+            },
+        ),
+        child(
+            "mock-spawn-b",
+            AgentEvent::TextDelta {
+                text: "The fold keys each part by id, so a cycle refines in place.\n\n".into(),
+            },
+        ),
+        child(
+            "mock-spawn-b",
+            AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: None,
+                error: None,
+                session_id: None,
+                reason: None,
+            },
+        ),
+        child(
+            "mock-spawn-a",
+            AgentEvent::ToolResult {
+                id: "mock-spawn-b".into(),
+                is_error: false,
+                output: Some("The fold keys each part by id.".into()),
+                diff: None,
+            },
+        ),
+        child(
+            "mock-spawn-a",
+            AgentEvent::TextDelta {
+                text: "Root cause: the row fingerprint missed the new fields.\n\n".into(),
+            },
+        ),
+        child(
+            "mock-spawn-a",
+            AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: None,
+                error: None,
+                session_id: None,
+                reason: None,
+            },
+        ),
+        AgentEvent::ToolResult {
+            id: "mock-spawn-a".into(),
+            is_error: false,
+            output: Some("Root cause: the row fingerprint missed the new fields.".into()),
+            diff: None,
+        },
+        AgentEvent::TextDelta {
+            text: "Both levels reported in.".into(),
+        },
+        AgentEvent::Done {
+            status: DoneStatus::Completed,
+            result: None,
+            error: None,
+            session_id: None,
+            reason: None,
+        },
+    ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use komet_proto::CompactionStatus;
+
+    /// The `question_multi` demo scenario is what `dev-demo.sh --questions`
+    /// and the UI tests drive: two pages, one multi-select, free text on both.
+    #[test]
+    fn mock_question_multi_scenario_has_pages_checks_and_free_text() {
+        let questions = question_script();
+        assert_eq!(questions.len(), 2, "two questions, one per page");
+        assert!(
+            !questions[0].multi_select,
+            "the first page is a single pick"
+        );
+        assert!(
+            questions[1].multi_select,
+            "the second page takes several answers"
+        );
+        assert!(
+            questions.iter().all(|q| q.allow_free_text),
+            "each page offers the free-text ('Autre') field"
+        );
+        assert!(questions.iter().all(|q| !q.options.is_empty()));
+    }
+
+    /// A scripted scenario must replay identically: the fold refines a
+    /// compaction by id, so a rotating id (or a clock) would turn one boundary
+    /// into two rows — and make every test that reads the script flaky.
+    #[test]
+    fn mock_compaction_scenario_is_deterministic() {
+        assert_eq!(compaction_script(), compaction_script());
+        let cycles: Vec<_> = compaction_script()
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::ContextCompaction { id, status, .. } => Some((id.clone(), *status)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            cycles,
+            vec![
+                ("mock-cmp-1".to_owned(), CompactionStatus::InProgress),
+                ("mock-cmp-1".to_owned(), CompactionStatus::Completed),
+                ("mock-cmp-2".to_owned(), CompactionStatus::InProgress),
+                ("mock-cmp-2".to_owned(), CompactionStatus::Failed),
+            ]
+        );
+        // The recap belongs to the settled cycle and the failure carries its
+        // reason: without them the row has nothing honest to expand to.
+        let settled = compaction_script().into_iter().find_map(|e| match e {
+            AgentEvent::ContextCompaction {
+                id,
+                summary: Some(text),
+                ..
+            } if id == "mock-cmp-1" => Some(text),
+            _ => None,
+        });
+        assert!(settled.is_some_and(|text| !text.trim().is_empty()));
+        let failed = compaction_script().into_iter().find_map(|e| match e {
+            AgentEvent::ContextCompaction {
+                id,
+                error: Some(text),
+                ..
+            } if id == "mock-cmp-2" => Some(text),
+            _ => None,
+        });
+        assert!(failed.is_some_and(|text| !text.trim().is_empty()));
+        assert!(
+            compaction_script().iter().any(|e| matches!(
+                e,
+                AgentEvent::ContextCompaction {
+                    tokens_before: Some(165_000),
+                    ..
+                }
+            )),
+            "the row needs a before-size to render its arrow"
+        );
+        assert_eq!(
+            compaction_script()
+                .iter()
+                .filter(|e| matches!(e, AgentEvent::Done { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn mock_subagent_nested_scenario_is_deterministic() {
+        assert_eq!(subagent_nested_script(), subagent_nested_script());
+        let parents: Vec<String> = ["mock-spawn-a", "mock-spawn-b"]
+            .iter()
+            .map(|id| id.to_string())
+            .collect();
+        for event in &subagent_nested_script() {
+            if let AgentEvent::Subagent {
+                parent_tool_use_id,
+                event,
+            } = event
+            {
+                assert!(parents.contains(parent_tool_use_id), "unknown parent");
+                // Exactly one hop per event: the tree is derived from the spawn
+                // records, not pre-baked as double-wrapped traffic.
+                assert!(!matches!(**event, AgentEvent::Subagent { .. }));
+            }
+        }
+        // Both levels stream tools AND text on their own feed, and each settles
+        // with its own Done under its direct parent.
+        for parent in &parents {
+            let stream = subagent_nested_script();
+            let mine = stream.iter().filter(|e| {
+                matches!(
+                    e,
+                    AgentEvent::Subagent { parent_tool_use_id, .. } if parent_tool_use_id == parent
+                )
+            });
+            let text = mine
+                .clone()
+                .filter(|e| {
+                    matches!(
+                        e,
+                        AgentEvent::Subagent { event, .. } if matches!(**event, AgentEvent::TextDelta { .. })
+                    )
+                })
+                .count();
+            let tools = mine
+                .clone()
+                .filter(|e| {
+                    matches!(
+                        e,
+                        AgentEvent::Subagent { event, .. } if matches!(**event, AgentEvent::ToolCall { .. })
+                    )
+                })
+                .count();
+            let settled = mine
+                .filter(|e| {
+                    matches!(
+                        e,
+                        AgentEvent::Subagent { event, .. } if matches!(**event, AgentEvent::Done { .. })
+                    )
+                })
+                .count();
+            assert!(
+                text >= 1 && tools >= 1 && settled == 1,
+                "{parent}: {text} text, {tools} tools, {settled} done"
+            );
+        }
+        // The spawn chips themselves ride the feed that created them: A on the
+        // parent's, B on A's.
+        let spawn_b_on_a_feed = subagent_nested_script().into_iter().any(|e| {
+            let AgentEvent::Subagent {
+                parent_tool_use_id,
+                event,
+            } = e
+            else {
+                return false;
+            };
+            parent_tool_use_id == "mock-spawn-a"
+                && matches!(&*event, AgentEvent::ToolCall { id, .. }
+                    if id == "mock-spawn-b")
+        });
+        assert!(
+            spawn_b_on_a_feed,
+            "B must be spawned from A's feed, not the root's"
+        );
     }
 }

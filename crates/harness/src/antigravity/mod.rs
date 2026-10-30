@@ -19,7 +19,7 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 
 use komet_proto::{
-    AgentEvent, CommandSource, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest,
+    AgentEvent, CommandSource, DoneStatus, ErrorKind, HarnessId, Model, ReasoningLevel, RunRequest,
     SlashCommand, SteeringMode,
 };
 
@@ -410,14 +410,32 @@ impl Harness for AntigravityHarness {
 
                                         // Emit ToolCall only once per tool id
                                         if seen_tools.insert(id.clone()) {
-                                            // Bridge interactive questions if present
+                                            // `ask_question` reaches us as a step,
+                                            // but `agy -p` is a one-shot stream:
+                                            // there is no channel to hand an
+                                            // answer back into the running turn.
+                                            // The old bridge put an unanswerable
+                                            // panel on screen and dropped the
+                                            // awaiting receiver (`let _ = rx.await`).
+                                            // Say so visibly instead, and keep the
+                                            // capability table honest (`None`).
                                             if tool_name == "ask_question"
                                                 && let Some(params) = params
                                                 && let Some(questions) = normalize::extract_questions(params) {
-                                                    let rx = (controls.request_input)(questions);
-                                                    tokio::spawn(async move {
-                                                        let _ = rx.await;
-                                                    });
+                                                    let asked = questions
+                                                        .iter()
+                                                        .map(|q| q.question.as_str())
+                                                        .collect::<Vec<_>>()
+                                                        .join(" · ");
+                                                    let _ = tx.send(Ok(AgentEvent::Error {
+                                                        message: format!(
+                                                            "Antigravity asked a question this harness cannot answer in-run: \
+                                                             {asked}. Its stream is one-shot — put the answer in your next prompt."
+                                                        ),
+                                                        kind: ErrorKind::Unknown,
+                                                        detail: None,
+                                                        retryable: false,
+                                                    })).await;
                                                 }
 
                                             let call = normalize::normalize_tool_call(tool_name, params);

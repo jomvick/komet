@@ -35,7 +35,7 @@ async fn silent_agent_errors_via_the_prompt_stall_watchdog() {
     let (_steer_tx, steer_rx) = mpsc::channel(8);
     let token = CancellationToken::new();
     let controls = RunControls {
-        request_input: Box::new(move |_| {
+        request_input: Box::new(move |_, _| {
             let (tx, rx) = oneshot::channel();
             let _ = tx.send(Vec::new());
             rx
@@ -105,7 +105,7 @@ async fn opencode_stall_hint_names_the_provider() {
     let (_steer_tx, steer_rx) = mpsc::channel(8);
     let token = CancellationToken::new();
     let controls = RunControls {
-        request_input: Box::new(move |_| {
+        request_input: Box::new(move |_, _| {
             let (tx, rx) = oneshot::channel();
             let _ = tx.send(Vec::new());
             rx

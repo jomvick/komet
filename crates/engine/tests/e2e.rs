@@ -17,8 +17,8 @@ use komet_engine::{EngineCore, HarnessRegistry, RunJournal};
 use komet_harness::mock::MockHarness;
 use komet_harness::{Harness, HarnessError, RunControls};
 use komet_proto::{
-    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
-    SessionStatus, SteeringMode, ToolCall,
+    AgentEvent, CompactionStatus, ContextUsageSource, DoneStatus, HarnessId, Model, ReasoningLevel,
+    RunRequest, SandboxLevel, SessionStatus, SteeringMode, ToolCall,
 };
 use komet_sync::DocsStore;
 
@@ -155,6 +155,11 @@ fn assemble(dir: &std::path::Path, harness: Arc<dyn Harness>) -> EngineCore {
 /// Queue a command into the chat doc the way a REMOTE viewer device would: an immutable
 /// pending entry appended under the viewer's device id (ledger rule 1).
 fn queue_as_viewer(doc: &SessionDoc, id: &str, payload: SessionCommandPayload) {
+    queue_as(doc, id, VIEWER, payload);
+}
+
+/// Same, with an explicit issuing device — what a second device's answer looks like.
+fn queue_as(doc: &SessionDoc, id: &str, device: &str, payload: SessionCommandPayload) {
     let now = chrono::Utc::now().timestamp_millis();
     let based_on =
         doc.read_entries()
@@ -167,7 +172,7 @@ fn queue_as_viewer(doc: &SessionDoc, id: &str, payload: SessionCommandPayload) {
     doc.queue_command(&SessionCommandEntry {
         id: id.into(),
         payload,
-        issued_by: VIEWER.into(),
+        issued_by: device.into(),
         issued_at: now,
         based_on,
         expires_at: None,
@@ -322,7 +327,11 @@ async fn queued_run_command_executes_end_to_end() {
     // The live broadcast delivered the same events.
     let mut broadcast_count = 0usize;
     while let Ok(event) = live.try_recv() {
-        assert!(event.seq >= 1);
+        // `RunPhase` frames are ephemeral: they ride the live feed with seq 0
+        // and never enter the journal, so they have no replay counterpart.
+        if event.seq == 0 {
+            continue;
+        }
         broadcast_count += 1;
     }
     assert_eq!(broadcast_count, mock_script().len());
@@ -914,64 +923,72 @@ async fn rpc_surface_over_in_memory_transport() {
     }
 }
 
-#[tokio::test]
-async fn respond_input_resolves_pending_question() {
-    // Harness that asks a question through RunControls and echoes the answer.
-    struct AskingHarness;
-    #[async_trait]
-    impl Harness for AskingHarness {
-        fn id(&self) -> HarnessId {
-            HarnessId::Mock
-        }
-        fn display_name(&self) -> &str {
-            "Asking"
-        }
-        fn supports_steering(&self) -> bool {
-            false
-        }
-        fn steering_mode(&self) -> SteeringMode {
-            SteeringMode::TurnBoundary
-        }
-        fn reasoning_levels(&self) -> &[ReasoningLevel] {
-            &[]
-        }
-        async fn models(&self) -> Result<Vec<Model>, HarnessError> {
-            Ok(vec![])
-        }
-        async fn run(
-            &self,
-            _request: RunRequest,
-            controls: RunControls,
-        ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
-            let (tx, rx) = tokio::sync::mpsc::channel::<Result<AgentEvent, HarnessError>>(16);
-            tokio::spawn(async move {
-                let answers = (controls.request_input)(vec![komet_proto::UserInputQuestion {
+/// A harness that asks one question through the input bridge, echoes the picked
+/// label and finishes. Shared by the answer-durability tests below.
+struct AskingHarness;
+#[async_trait]
+impl Harness for AskingHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Mock
+    }
+    fn display_name(&self) -> &str {
+        "Asking"
+    }
+    fn supports_steering(&self) -> bool {
+        false
+    }
+    fn steering_mode(&self) -> SteeringMode {
+        SteeringMode::TurnBoundary
+    }
+    fn reasoning_levels(&self) -> &[ReasoningLevel] {
+        &[]
+    }
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        Ok(vec![])
+    }
+    async fn run(
+        &self,
+        _request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<AgentEvent, HarnessError>>(16);
+        tokio::spawn(async move {
+            let answers = (controls.request_input)(
+                vec![komet_proto::UserInputQuestion {
                     id: "q1".into(),
                     header: "Pick".into(),
                     question: "Which one?".into(),
                     options: vec!["a".into(), "b".into()],
                     multi_select: false,
-                }])
-                .await
-                .unwrap_or_default();
-                let picked = answers
-                    .first()
-                    .and_then(|a| a.labels.first().cloned())
-                    .unwrap_or_else(|| "none".into());
-                let _ = tx
-                    .send(Ok(AgentEvent::TextDelta {
-                        text: format!("picked {picked}"),
-                    }))
-                    .await;
-                let _ = tx.send(Ok(done(DoneStatus::Completed))).await;
-            });
-            Ok(futures::stream::unfold(rx, |mut rx| async move {
-                rx.recv().await.map(|event| (event, rx))
-            })
-            .boxed())
-        }
+                    option_descriptions: vec![],
+                    allow_free_text: false,
+                    secret: false,
+                    default: None,
+                }],
+                komet_proto::QuestionSource::Native,
+            )
+            .await
+            .unwrap_or_default();
+            let picked = answers
+                .first()
+                .and_then(|a| a.labels.first().cloned())
+                .unwrap_or_else(|| "none".into());
+            let _ = tx
+                .send(Ok(AgentEvent::TextDelta {
+                    text: format!("picked {picked}"),
+                }))
+                .await;
+            let _ = tx.send(Ok(done(DoneStatus::Completed))).await;
+        });
+        Ok(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|event| (event, rx))
+        })
+        .boxed())
     }
+}
 
+#[tokio::test]
+async fn respond_input_resolves_pending_question() {
     let dir = tempfile::tempdir().unwrap();
     let core = assemble(dir.path(), Arc::new(AskingHarness));
     let handle = core.doc_host.open(CHAT).unwrap();
@@ -1029,6 +1046,7 @@ async fn respond_input_resolves_pending_question() {
             answers: vec![komet_proto::UserInputAnswer {
                 question_id: "q1".into(),
                 labels: vec!["b".into()],
+                free_text: None,
             }],
         },
     );
@@ -1062,6 +1080,155 @@ async fn respond_input_resolves_pending_question() {
         "session to settle idle",
     )
     .await;
+}
+
+/// Task 1: an answer outlives the run. The live path writes it into the doc
+/// with the answering device, and a second device answering the same question
+/// is kept as a visible conflict — never silently dropped, never re-dispatched.
+#[tokio::test(flavor = "multi_thread")]
+async fn answered_question_is_durable_and_a_second_answer_is_a_conflict() {
+    fn responses_of(core: &EngineCore, request_id: &str) -> Vec<komet_doc::InputResponse> {
+        entries_now(core)
+            .iter()
+            .find_map(|e| {
+                e.parts.iter().find_map(|p| match p {
+                    MessagePart::Input {
+                        request_id: rid,
+                        responses,
+                        ..
+                    } if rid == request_id => Some(responses.clone()),
+                    _ => None,
+                })
+            })
+            .unwrap_or_default()
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let core = assemble(dir.path(), Arc::new(AskingHarness));
+    let handle = core.doc_host.open(CHAT).unwrap();
+    queue_as_viewer(
+        handle.doc(),
+        "cmd-run-ask",
+        SessionCommandPayload::Run {
+            request: run_request("ask me"),
+            message_id: "m-1".into(),
+        },
+    );
+    wait_for(
+        || {
+            core.sessions.session_status(CHAT).map(|s| s.status)
+                == Some(SessionStatus::AwaitingInput)
+        },
+        "awaiting input",
+    )
+    .await;
+    wait_for(
+        || {
+            entries_now(&core).iter().any(|e| {
+                e.parts.iter().any(|p| {
+                    matches!(
+                        p,
+                        MessagePart::Input {
+                            resolved: false,
+                            ..
+                        }
+                    )
+                })
+            })
+        },
+        "input part in doc",
+    )
+    .await;
+    let request_id = entries(&core)
+        .iter()
+        .find_map(|e| {
+            e.parts.iter().find_map(|p| match p {
+                MessagePart::Input { request_id, .. } => Some(request_id.clone()),
+                _ => None,
+            })
+        })
+        .expect("input part");
+
+    queue_as(
+        handle.doc(),
+        "cmd-answer-1",
+        VIEWER,
+        SessionCommandPayload::RespondInput {
+            request_id: request_id.clone(),
+            answers: vec![komet_proto::UserInputAnswer {
+                question_id: "q1".into(),
+                labels: vec!["b".into()],
+                free_text: None,
+            }],
+        },
+    );
+    wait_for(
+        || {
+            responses_of(&core, &request_id)
+                .iter()
+                .any(|r| r.applied && r.device == VIEWER)
+        },
+        "the delivered answer in the doc",
+    )
+    .await;
+
+    // A second device answers the question the first one already answered.
+    queue_as(
+        handle.doc(),
+        "cmd-answer-2",
+        "dev-other",
+        SessionCommandPayload::RespondInput {
+            request_id: request_id.clone(),
+            answers: vec![komet_proto::UserInputAnswer {
+                question_id: "q1".into(),
+                labels: vec!["a".into()],
+                free_text: Some("typed elsewhere".into()),
+            }],
+        },
+    );
+    wait_for(
+        || {
+            command_status(&core, "cmd-answer-2")
+                .is_some_and(|(s, _)| s != SessionCommandStatus::Pending)
+        },
+        "the second answer to settle",
+    )
+    .await;
+    let (status, resolution) = command_status(&core, "cmd-answer-2").expect("settled");
+    assert_eq!(status, SessionCommandStatus::Rejected, "{resolution:?}");
+
+    let responses = responses_of(&core, &request_id);
+    assert_eq!(
+        responses.len(),
+        2,
+        "neither answer is dropped: {responses:?}"
+    );
+    let applied: Vec<&str> = responses
+        .iter()
+        .filter(|r| r.applied)
+        .map(|r| r.device.as_str())
+        .collect();
+    assert_eq!(applied, vec![VIEWER], "only the delivered answer is marked");
+    assert!(
+        responses.iter().all(|r| r.decided_at > 0),
+        "every answer carries when it was decided: {responses:?}"
+    );
+
+    // The conflict resumed nothing: the run answered once and finished.
+    let picked: Vec<String> = entries(&core)
+        .iter()
+        .flat_map(|e| {
+            e.parts.iter().filter_map(|p| match p {
+                MessagePart::Text { text, .. } if text.starts_with("picked ") => Some(text.clone()),
+                _ => None,
+            })
+        })
+        .collect();
+    assert_eq!(
+        picked,
+        vec!["picked b".to_string()],
+        "no second turn: {picked:?}"
+    );
 }
 
 /// Resilience: a RespondInput whose id matches no pending request is REJECTED
@@ -1098,13 +1265,20 @@ async fn wrong_id_respond_is_rejected_and_correct_answer_still_resumes() {
         ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
             let (tx, rx) = tokio::sync::mpsc::channel::<Result<AgentEvent, HarnessError>>(16);
             tokio::spawn(async move {
-                let answers = (controls.request_input)(vec![komet_proto::UserInputQuestion {
-                    id: "q1".into(),
-                    header: "Pick".into(),
-                    question: "Which one?".into(),
-                    options: vec!["a".into(), "b".into()],
-                    multi_select: false,
-                }])
+                let answers = (controls.request_input)(
+                    vec![komet_proto::UserInputQuestion {
+                        id: "q1".into(),
+                        header: "Pick".into(),
+                        question: "Which one?".into(),
+                        options: vec!["a".into(), "b".into()],
+                        multi_select: false,
+                        option_descriptions: vec![],
+                        allow_free_text: false,
+                        secret: false,
+                        default: None,
+                    }],
+                    komet_proto::QuestionSource::Native,
+                )
                 .await
                 .unwrap_or_default();
                 let picked = answers
@@ -1171,6 +1345,7 @@ async fn wrong_id_respond_is_rejected_and_correct_answer_still_resumes() {
             answers: vec![komet_proto::UserInputAnswer {
                 question_id: "q1".into(),
                 labels: vec!["a".into()],
+                free_text: None,
             }],
         },
     );
@@ -1218,6 +1393,7 @@ async fn wrong_id_respond_is_rejected_and_correct_answer_still_resumes() {
             answers: vec![komet_proto::UserInputAnswer {
                 question_id: "q1".into(),
                 labels: vec!["b".into()],
+                free_text: None,
             }],
         },
     );
@@ -1289,13 +1465,20 @@ async fn interrupt_unblocks_a_run_awaiting_input() {
                     // Blocks on the question; an interrupt fails the resolver
                     // (empty answers) and cancels the token — like a real CLI
                     // being torn down, the stream then ends WITHOUT a Done.
-                    let _ = (controls.request_input)(vec![komet_proto::UserInputQuestion {
-                        id: "q1".into(),
-                        header: "Pick".into(),
-                        question: "Which one?".into(),
-                        options: vec!["a".into(), "b".into()],
-                        multi_select: false,
-                    }])
+                    let _ = (controls.request_input)(
+                        vec![komet_proto::UserInputQuestion {
+                            id: "q1".into(),
+                            header: "Pick".into(),
+                            question: "Which one?".into(),
+                            options: vec!["a".into(), "b".into()],
+                            multi_select: false,
+                            option_descriptions: vec![],
+                            allow_free_text: false,
+                            secret: false,
+                            default: None,
+                        }],
+                        komet_proto::QuestionSource::Native,
+                    )
                     .await;
                     interrupt.cancelled().await;
                     drop(tx);
@@ -1442,6 +1625,10 @@ async fn harness_emitted_input_twin_is_dropped_and_answer_resumes() {
                     question: "Which one?".into(),
                     options: vec!["a".into(), "b".into()],
                     multi_select: false,
+                    option_descriptions: vec![],
+                    allow_free_text: false,
+                    secret: false,
+                    default: None,
                 };
                 // The pre-fix Claude/Codex shape: surface the question under
                 // the harness's own id BEFORE asking through the bridge.
@@ -1449,11 +1636,13 @@ async fn harness_emitted_input_twin_is_dropped_and_answer_resumes() {
                     .send(Ok(AgentEvent::InputRequested {
                         request_id: "claude-ctrl-1".into(),
                         questions: vec![question.clone()],
+                        source: komet_proto::QuestionSource::Native,
                     }))
                     .await;
-                let answers = (controls.request_input)(vec![question])
-                    .await
-                    .unwrap_or_default();
+                let answers =
+                    (controls.request_input)(vec![question], komet_proto::QuestionSource::Native)
+                        .await
+                        .unwrap_or_default();
                 let picked = answers
                     .first()
                     .and_then(|a| a.labels.first().cloned())
@@ -1546,6 +1735,7 @@ async fn harness_emitted_input_twin_is_dropped_and_answer_resumes() {
             answers: vec![komet_proto::UserInputAnswer {
                 question_id: "q1".into(),
                 labels: vec!["a".into()],
+                free_text: None,
             }],
         },
     );
@@ -1910,11 +2100,11 @@ async fn empty_reasoning_deltas_are_heartbeats_not_journal_noise() {
     );
     wait_for(
         || {
-            entries(&core)
-                .iter()
-                .any(|e| e.status == Some(MessageStatus::Complete))
+            entries(&core).iter().any(|e| {
+                e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Complete)
+            })
         },
-        "run completes",
+        "assistant run completes",
     )
     .await;
     // Journal replay: the 40 empties were filtered; real content survived.
@@ -2293,4 +2483,265 @@ async fn run_with_model_missing_from_live_catalog_is_rejected_with_rescan() {
         "offered-model run to dispatch",
     )
     .await;
+}
+
+/// A harness whose stream stays OPEN after its turn ends, the way a persistent
+/// session's does — so a test can push the events that arrive while the session
+/// is PARKED (an auto-compaction between two prompts) and watch where the engine
+/// puts them.
+struct ParkedHarness {
+    feed: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<AgentEvent>>>,
+}
+
+impl ParkedHarness {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            feed: std::sync::Mutex::new(None),
+        })
+    }
+
+    /// The live stream's feed — `None` until the engine has called `run`.
+    fn sender(&self) -> Option<tokio::sync::mpsc::UnboundedSender<AgentEvent>> {
+        self.feed.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl Harness for ParkedHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Mock
+    }
+    fn display_name(&self) -> &str {
+        "Parked"
+    }
+    fn supports_steering(&self) -> bool {
+        true
+    }
+    fn steering_mode(&self) -> SteeringMode {
+        SteeringMode::StepBoundary
+    }
+    fn reasoning_levels(&self) -> &[ReasoningLevel] {
+        &[ReasoningLevel::Medium]
+    }
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        Ok(vec![])
+    }
+    async fn run(
+        &self,
+        _request: RunRequest,
+        _controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        *self.feed.lock().unwrap() = Some(tx);
+        Ok(futures::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|event| (Ok(event), rx))
+        })
+        .boxed())
+    }
+}
+
+fn compaction_frame(id: &str, status: CompactionStatus, summary: Option<&str>) -> AgentEvent {
+    AgentEvent::ContextCompaction {
+        id: id.into(),
+        status,
+        trigger: if matches!(status, CompactionStatus::InProgress) {
+            Some("auto".into())
+        } else {
+            None
+        },
+        tokens_before: if matches!(status, CompactionStatus::InProgress) {
+            Some(165_000)
+        } else {
+            None
+        },
+        tokens_after: None,
+        summary: summary.map(str::to_owned),
+        summary_delta: None,
+        error: None,
+    }
+}
+
+fn native_window(used: u64, limit: u64) -> AgentEvent {
+    AgentEvent::ContextWindow {
+        stats: komet_proto::ContextUsageStats {
+            context_limit: limit,
+            used_tokens: used,
+            source: ContextUsageSource::Native,
+            ..Default::default()
+        },
+    }
+}
+
+#[tokio::test]
+async fn inter_turn_compaction_gets_a_system_entry_and_a_journal_summary() {
+    let dir = tempfile::tempdir().unwrap();
+    let harness = ParkedHarness::new();
+    let core = assemble(dir.path(), harness.clone());
+    let handle = core.doc_host.open(CHAT).unwrap();
+    let (_replayed, mut live) = core.sessions.subscribe(CHAT, 0).unwrap();
+
+    queue_as(
+        handle.doc(),
+        "cmd-run-1",
+        "dev-e2e",
+        SessionCommandPayload::Run {
+            request: run_request("first"),
+            message_id: "msg-user-1".into(),
+        },
+    );
+    wait_for(
+        || harness.sender().is_some(),
+        "the parked-session harness stream to open",
+    )
+    .await;
+    let feed = harness.sender().unwrap();
+    feed.send(AgentEvent::SessionStarted {
+        harness: HarnessId::Mock,
+        model: "mock-1".into(),
+        tools: vec![],
+        cwd: "/tmp".into(),
+        session_id: "hs-1".into(),
+        assistant_message_id: "a-1".into(),
+    })
+    .unwrap();
+    feed.send(AgentEvent::TextDelta {
+        text: "done thinking".into(),
+    })
+    .unwrap();
+    feed.send(done(DoneStatus::Completed)).unwrap();
+    wait_for(
+        || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Idle),
+        "the persistent session to park",
+    )
+    .await;
+
+    // The squeeze fires BETWEEN turns: no assistant segment owns it, so it gets
+    // its own System entry — and must not wake the session into Working with no
+    // Done behind it.
+    feed.send(compaction_frame("c1", CompactionStatus::InProgress, None))
+        .unwrap();
+    feed.send(compaction_frame(
+        "c1",
+        CompactionStatus::Completed,
+        Some("the recap"),
+    ))
+    .unwrap();
+    wait_for(
+        || {
+            entries_now(&core)
+                .iter()
+                .any(|e| e.role == MessageRole::System && e.id == "sys-cmp-c1")
+        },
+        "the inter-turn compaction System entry",
+    )
+    .await;
+    assert_eq!(
+        core.sessions.session_status(CHAT).map(|s| s.status),
+        Some(SessionStatus::Idle),
+        "a compaction is a fact, not a turn"
+    );
+
+    let system = entries(&core)
+        .into_iter()
+        .find(|e| e.role == MessageRole::System)
+        .expect("inter-turn compaction entry");
+    assert_eq!(system.status, Some(MessageStatus::Complete));
+    assert_eq!(system.parts.len(), 1, "one cycle, one part");
+    let MessagePart::Compaction {
+        status,
+        trigger,
+        tokens_before,
+        tokens_after,
+        summary,
+        summary_bytes,
+        summary_in_journal,
+        ..
+    } = &system.parts[0]
+    else {
+        panic!("compaction part expected, got {:?}", system.parts[0]);
+    };
+    assert_eq!(*status, CompactionStatus::Completed);
+    assert_eq!(
+        (trigger.as_deref(), *tokens_before),
+        (Some("auto"), Some(165_000))
+    );
+    assert_eq!(
+        *tokens_after, None,
+        "unknown until a window reading answers it"
+    );
+    assert_eq!(*summary, None, "journal-only policy: no prose in the doc");
+    assert_eq!(*summary_bytes, Some(9));
+    assert!(*summary_in_journal);
+
+    // The recap itself is readable from the host's journal (GetCompactionSummary).
+    assert_eq!(
+        core.sessions.compaction_summary(CHAT, "c1").as_deref(),
+        Some("the recap")
+    );
+    // The live feed carried the cycle WITHOUT the prose; the journal kept it.
+    let mut saw_broadcast_compaction = false;
+    while let Ok(journaled) = live.try_recv() {
+        if let AgentEvent::ContextCompaction {
+            summary,
+            summary_delta,
+            ..
+        } = &journaled.event
+        {
+            saw_broadcast_compaction = true;
+            assert!(
+                summary.is_none() && summary_delta.is_none(),
+                "stripped on broadcast"
+            );
+        }
+    }
+    assert!(
+        saw_broadcast_compaction,
+        "the cycle reached subscribers at all"
+    );
+    let replay = core.sessions.subscribe(CHAT, 0).unwrap().0;
+    assert!(
+        replay.iter().any(|j| matches!(&j.event, AgentEvent::ContextCompaction { summary: Some(text), .. } if text == "the recap")),
+        "the journal replay is what a summary fetch reads"
+    );
+
+    // The next turn's native window reading is the post-compaction count.
+    feed.send(AgentEvent::Steered {
+        assistant_message_id: None,
+        next_assistant_message_id: None,
+    })
+    .unwrap();
+    feed.send(native_window(12_000, 200_000)).unwrap();
+    wait_for(
+        || {
+            entries_now(&core)
+                .iter()
+                .find(|e| e.id == "sys-cmp-c1")
+                .is_some_and(|e| {
+                    matches!(
+                        &e.parts[0],
+                        MessagePart::Compaction {
+                            tokens_after: Some(12_000),
+                            ..
+                        }
+                    )
+                })
+        },
+        "the compaction line to learn its after-count",
+    )
+    .await;
+
+    feed.send(done(DoneStatus::Completed)).unwrap();
+    wait_for(
+        || core.sessions.session_status(CHAT).map(|s| s.status) == Some(SessionStatus::Idle),
+        "the turn to settle",
+    )
+    .await;
+    // Still one part for the cycle, and no duplicate line appeared in the
+    // second turn's segment.
+    let compaction_parts = entries(&core)
+        .iter()
+        .flat_map(|e| e.parts.iter())
+        .filter(|p| matches!(p, MessagePart::Compaction { .. }))
+        .count();
+    assert_eq!(compaction_parts, 1, "one compaction, one part, one line");
 }

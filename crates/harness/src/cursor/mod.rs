@@ -889,14 +889,36 @@ fn map_shim_frame(frame: &Value, interrupted: bool, model: &str) -> Vec<AgentEve
             }
             events
         }
-        "compact" => vec![AgentEvent::ContextWindow {
-            stats: komet_proto::ContextUsageStats::compaction(
-                frame
-                    .get("reason")
-                    .and_then(Value::as_str)
-                    .unwrap_or("summarized"),
-            ),
-        }],
+        // Cursor auto-summarizes so the session can continue past the raw
+        // window. The SDK reports it only once it is DONE (`summary-completed`
+        // → `ev:"compact"`), so this is a boundary, not a lifecycle: the gauge
+        // and the thread row are emitted together, and no `inProgress` state is
+        // invented — `map_shim_frame` is stateless, so a start notice could
+        // never be settled by its completion. That is what
+        // `CompactionSurface::BoundaryOnly` declares for this harness.
+        "compact" => {
+            let reason = frame
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("summarized");
+            vec![
+                AgentEvent::ContextWindow {
+                    stats: komet_proto::ContextUsageStats::compaction(reason),
+                },
+                AgentEvent::ContextCompaction {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    status: komet_proto::CompactionStatus::Completed,
+                    // "summarized" is the shim's own wording for what the SDK
+                    // did — a trigger label, not an invented `auto`/`manual`.
+                    trigger: Some(reason.to_owned()),
+                    tokens_before: None,
+                    tokens_after: None,
+                    summary: None,
+                    summary_delta: None,
+                    error: None,
+                },
+            ]
+        }
         "turn" => {
             let status = frame.get("status").and_then(Value::as_str).unwrap_or("");
             let error = frame
@@ -1068,6 +1090,8 @@ mod tests {
         assert_eq!(stats.input_tokens, 11);
     }
 
+    /// Cursor reports a summarize only once it is over: the frame carries the
+    /// gauge AND the thread row, with no lifecycle invented around it.
     #[test]
     fn compact_frame_records_a_summarize() {
         let events = map_shim_frame(
@@ -1075,12 +1099,41 @@ mod tests {
             false,
             "auto",
         );
+        assert_eq!(events.len(), 2, "{events:?}");
         let Some(AgentEvent::ContextWindow { stats }) = events.first() else {
             panic!("expected ContextWindow: {events:?}");
         };
         assert_eq!(stats.compactions_count, 1);
         assert_eq!(stats.compactions_reason.as_deref(), Some("summarized"));
         assert_eq!(stats.used_tokens, 0);
+        assert!(
+            matches!(
+                &events[1],
+                AgentEvent::ContextCompaction {
+                    status: komet_proto::CompactionStatus::Completed,
+                    trigger: Some(trigger),
+                    tokens_before: None,
+                    tokens_after: None,
+                    ..
+                } if trigger == "summarized"
+            ),
+            "a summarize must land in the thread, not only on the gauge: {:?}",
+            events[1]
+        );
+
+        // Two summarizes are two rows: the id is per compaction, never per run.
+        let again = map_shim_frame(&json!({"ev":"compact"}), false, "auto");
+        match (&events[1], &again[1]) {
+            (
+                AgentEvent::ContextCompaction { id: a, .. },
+                AgentEvent::ContextCompaction { id: b, trigger, .. },
+            ) => {
+                assert_ne!(a, b);
+                // No reason on the frame: the shim's own default still labels it.
+                assert_eq!(trigger.as_deref(), Some("summarized"));
+            }
+            other => panic!("expected compaction events: {other:?}"),
+        }
     }
 
     #[test]

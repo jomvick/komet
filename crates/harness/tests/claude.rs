@@ -61,13 +61,14 @@ fn controls(
     let (steer_tx, steer_rx) = mpsc::channel(8);
     let token = CancellationToken::new();
     let controls = RunControls {
-        request_input: Box::new(move |questions| {
+        request_input: Box::new(move |questions, _source| {
             let (tx, rx) = oneshot::channel();
             let answers: Vec<UserInputAnswer> = questions
                 .iter()
                 .map(|q| UserInputAnswer {
                     question_id: q.id.clone(),
                     labels: vec![answer_label.into()],
+                    free_text: None,
                 })
                 .collect();
             let _ = tx.send(answers);
@@ -322,7 +323,7 @@ async fn ask_user_question_round_trips_through_the_control_channel() {
     let token = CancellationToken::new();
     let seen = asked.clone();
     let controls = RunControls {
-        request_input: Box::new(move |questions| {
+        request_input: Box::new(move |questions, _source| {
             seen.lock().unwrap().extend(questions.iter().cloned());
             let (tx, rx) = oneshot::channel();
             let answers: Vec<UserInputAnswer> = questions
@@ -330,6 +331,7 @@ async fn ask_user_question_round_trips_through_the_control_channel() {
                 .map(|q| UserInputAnswer {
                     question_id: q.id.clone(),
                     labels: vec!["B".into()],
+                    free_text: None,
                 })
                 .collect();
             let _ = tx.send(answers);

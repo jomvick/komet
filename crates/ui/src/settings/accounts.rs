@@ -135,7 +135,7 @@ pub fn format_reset(resets_at: Option<DateTime<Utc>>, now: DateTime<Utc>) -> Opt
 /// Agents whose CLI login or provider credentials are required before runs.
 /// The first four have native account management; the rest authenticate in
 /// their own CLI and are listed here with the corresponding hand-off command.
-pub const PROVIDERS: [(HarnessId, &str, &str); 12] = [
+pub const PROVIDERS: [(HarnessId, &str, &str); 13] = [
     (HarnessId::ClaudeCode, "Claude Code", "claude"),
     (HarnessId::Codex, "Codex", "codex"),
     (HarnessId::Antigravity, "Antigravity", "agy"),
@@ -148,6 +148,7 @@ pub const PROVIDERS: [(HarnessId, &str, &str); 12] = [
     (HarnessId::Muse, "Muse", "muse"),
     (HarnessId::Copilot, "GitHub Copilot", "copilot"),
     (HarnessId::Cline, "Cline", "cline"),
+    (HarnessId::Qoder, "Qoder", "qoder"),
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,6 +174,7 @@ pub fn cli_login_command(harness: HarnessId) -> Option<&'static str> {
         HarnessId::Muse => Some("muse"),
         HarnessId::Copilot => None,
         HarnessId::Cline => Some("cline"),
+        HarnessId::Qoder => Some("qoder login"),
         HarnessId::ClaudeCode | HarnessId::Codex | HarnessId::Cursor | HarnessId::Antigravity => {
             None
         }
@@ -192,6 +194,7 @@ pub fn login_instructions(harness: HarnessId) -> &'static str {
         HarnessId::Muse => "Run `muse` and use `/login` to connect your account.",
         HarnessId::Copilot => "Use GitHub's device sign-in to connect and switch Copilot accounts.",
         HarnessId::Cline => "Run `cline` and choose a provider in its sign-in flow.",
+        HarnessId::Qoder => "Run `qoder login` and complete the browser sign-in.",
         _ => "Use the Add account flow to sign in.",
     }
 }
@@ -1557,6 +1560,7 @@ impl Render for AccountsPage {
             HarnessId::Muse => (crate::icons::MUSE_MARK, Some(crate::icons::muse_brand())),
             HarnessId::Copilot => (crate::icons::COPILOT_MARK, None),
             HarnessId::Cline => (crate::icons::CLINE_MARK, None),
+            HarnessId::Qoder => (crate::icons::QODER_MARK, None),
             _ => (
                 crate::icons::CLAUDE_MARK,
                 Some(crate::icons::claude_brand()),
@@ -1940,6 +1944,7 @@ mod tests {
             HarnessId::Muse,
             HarnessId::Copilot,
             HarnessId::Cline,
+            HarnessId::Qoder,
         ];
         for agent in agents {
             assert!(

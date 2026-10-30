@@ -4,7 +4,11 @@
 //! Pragmatic port of komet's `sessions.ts` (spec: feature-inventory §3.2):
 //! - every `AgentEvent` is (a) appended to the on-disk run journal, (b) broadcast to
 //!   in-process subscribers, (c) folded via `fold_event_into_parts` and diffed into the
-//!   chat's `SessionDoc` through `SegmentWriter` on a coalesced `STREAM_COMMIT_MS` timer;
+//!   chat's `SessionDoc` through `SegmentWriter` on a coalesced `STREAM_COMMIT_MS` timer
+//!   — except the broadcast-only frames ([`AgentEvent::ToolProgress`], a tool's
+//!   live output tail, and [`AgentEvent::RunPhase`], the working phase the
+//!   trailer names): neither has durable meaning, so neither is ever journaled
+//!   and neither is ever folded;
 //! - the user message entry is pushed to the doc immediately on dispatch (id = the
 //!   command's client-minted message id, so optimistic echoes never flicker);
 //! - a `Steered` event splits the assistant entry at the exact boundary;
@@ -18,6 +22,7 @@
 //! spawn failure, stream error, engine-restart recovery).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 
 use chrono::Utc;
@@ -25,13 +30,14 @@ use futures::StreamExt;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use komet_doc::{
-    DocError, MessagePart, MessageRole, MessageStatus, ProviderSessionMark, STREAM_COMMIT_MS,
-    SegmentWriter, SessionDoc, fold_event_into_parts, sanitize_tool_call,
+    CompactionSummaryPolicy, DocError, InputResponse, MessagePart, MessageRole, MessageStatus,
+    ProviderSessionMark, STREAM_COMMIT_MS, SegmentWriter, SessionDoc, SubagentStatus,
+    fold_event_into_parts_with, sanitize_tool_call,
 };
 use komet_harness::{CancellationToken, Harness, RunControls, SteerMessage};
 use komet_proto::{
-    AgentEvent, DoneReason, DoneStatus, ErrorKind, HarnessId, RunRequest, Session, SessionStatus,
-    UserInputAnswer, UserInputQuestion,
+    AgentEvent, CompactionStatus, ContextUsageSource, DoneReason, DoneStatus, ErrorKind, HarnessId,
+    RunPhase, RunRequest, Session, SessionStatus, UserInputAnswer, UserInputQuestion,
 };
 
 use crate::agent_accounts::AgentAccounts;
@@ -62,7 +68,297 @@ pub enum SteerOutcome {
     NotSteerable,
 }
 
-type PendingInputs = Arc<Mutex<HashMap<String, oneshot::Sender<Vec<UserInputAnswer>>>>>;
+/// Coalescing window for ephemeral tool output: at most one broadcast per
+/// window per chat, however many chunks the harness streamed inside it.
+const TOOL_PROGRESS_FLUSH: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Tail retained per tool id: the open chip shows the END of a stream, and an
+/// unbounded buffer would grow with `cat` of a huge file.
+const TOOL_PROGRESS_CAP: usize = 4096;
+
+/// Frames that exist only while a subscriber is looking: a tool's live output
+/// tail, and the run's working phase. They are broadcast, never journaled and
+/// never folded — the durable facts around them (`ToolCall`, the settled
+/// `ToolResult`, the doc's own `Working` row status) say everything the
+/// transcript needs. Descends `Subagent` wrappers because a child prints the
+/// same kind of frame, and a long subagent run would otherwise fill the journal
+/// with text nobody will ever replay.
+fn is_ephemeral(event: &AgentEvent) -> bool {
+    match event {
+        AgentEvent::ToolProgress { .. } | AgentEvent::RunPhase { .. } => true,
+        AgentEvent::Subagent { event, .. } => is_ephemeral(event),
+        _ => false,
+    }
+}
+
+/// The phase the live run is in after this harness event, `Some` only when the
+/// event CHANGES it — so a streamed turn broadcasts one frame, not one per
+/// delta. `None` on `Done`: the row settles, so there is no wait left to name.
+/// A harness that never signals stays on the phase it was dispatched with.
+fn phase_change(event: &AgentEvent, current: Option<RunPhase>) -> Option<RunPhase> {
+    let next = match event {
+        AgentEvent::SessionStarted { .. } => RunPhase::WaitingModel,
+        AgentEvent::TextDelta { text } | AgentEvent::ReasoningDelta { text }
+            if !text.is_empty() =>
+        {
+            RunPhase::Streaming
+        }
+        AgentEvent::ToolCall { .. } => RunPhase::Tool,
+        _ => return None,
+    };
+    (current != Some(next)).then_some(next)
+}
+
+/// Live counters of one subagent feed, held in the host's memory for the length
+/// of the run. Neither the doc nor the journal carries them: the spawn chip
+/// reads them ONCE at the child's terminal event, and `WatchActivity` snapshots
+/// them per frame — so "3 tools · 12 s" is visible while the child runs without
+/// the parent doc being rewritten for every one of those tools.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubagentFeed {
+    /// Tools this feed ran — its own `ToolCall`s, never a nested child's.
+    pub tool_count: u64,
+    /// Host clock at the feed's first frame. A cycle's length is the difference
+    /// of two readings of this same clock, so a viewer never has to trust one.
+    pub started_at_ms: i64,
+    /// Lifecycle the engine last read off this feed's own wrappers.
+    pub status: SubagentStatus,
+    /// Chip label of the last tool this feed started ("Read", "Run", …) — the
+    /// spawn chip's one-line answer to "what is the child doing now". The LABEL
+    /// only, never its arguments: a command line can carry a secret, and the
+    /// arguments a viewer wants are one click away, in the transcript tab.
+    pub last_tool: Option<&'static str>,
+}
+
+/// What one hub event did to a feed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FeedHit {
+    /// The feed started a tool; the payload is its chip label.
+    Tool(&'static str),
+    Status(SubagentStatus),
+    /// The parent's spawn chip: opens the feed once, never restarts it.
+    Opened,
+}
+
+/// The feeds one hub event touched, keyed by the parent they belong to. Same
+/// attribution rule as [`crate::run_journal::project_feed`]: an event counts for
+/// the feed its DIRECT wrapper names, so a sub-subagent's tools land on the
+/// child that ran them and never inflate the root's chip.
+pub(crate) fn touched_feeds(event: &AgentEvent) -> Vec<(String, FeedHit)> {
+    let mut hits = Vec::new();
+    if let AgentEvent::ToolCall { call, id, .. } = event
+        && call.is_subagent_spawn()
+    {
+        // The spawn itself opens the feed: from here the chip is live, and the
+        // clock starts before the child's first frame arrives. A re-emitted
+        // spawn (title/rawInput refresh) must not reset a settled feed, so this
+        // is an open-only hit, not a `Running` transition.
+        hits.push((id.clone(), FeedHit::Opened));
+    }
+    if let AgentEvent::Subagent {
+        parent_tool_use_id,
+        event,
+    } = event
+    {
+        let hit = match &**event {
+            AgentEvent::ToolCall { call, .. } => {
+                Some(FeedHit::Tool(komet_proto::view::tool_chip_content(call).0))
+            }
+            AgentEvent::Done { status, .. } => Some(FeedHit::Status(match status {
+                DoneStatus::Errored => SubagentStatus::Failed,
+                _ => SubagentStatus::Done,
+            })),
+            // A steer resurrects: the child works again, and the numbers the
+            // chip will carry are the new cycle's, not the settled one's.
+            AgentEvent::UserMessage { .. } => Some(FeedHit::Status(SubagentStatus::Running)),
+            _ => None,
+        };
+        if let Some(hit) = hit {
+            hits.push((parent_tool_use_id.clone(), hit));
+        }
+        hits.extend(touched_feeds(event));
+    }
+    hits
+}
+
+/// Read-only handle on the host's live counters, so the RPC layer can snapshot a
+/// feed while streaming it without reaching into engine state.
+#[derive(Clone, Default)]
+pub struct SubagentFeeds {
+    by_chat: Arc<Mutex<HashMap<String, HashMap<String, SubagentFeed>>>>,
+}
+
+impl SubagentFeeds {
+    fn lock(&self) -> MutexGuard<'_, HashMap<String, HashMap<String, SubagentFeed>>> {
+        self.by_chat.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Apply the feeds an event touched. A feed unknown to this run opens at
+    /// `seen_at` — a harness that streams child frames without announcing the
+    /// spawn still gets counted, from the first frame it sent.
+    pub(crate) fn record(&self, chat_id: &str, hits: &[(String, FeedHit)], seen_at: i64) {
+        if hits.is_empty() {
+            return;
+        }
+        let mut by_chat = self.lock();
+        let feeds = by_chat.entry(chat_id.to_owned()).or_default();
+        for (parent, hit) in hits {
+            let feed = feeds.entry(parent.clone()).or_insert(SubagentFeed {
+                tool_count: 0,
+                started_at_ms: seen_at,
+                status: SubagentStatus::Running,
+                last_tool: None,
+            });
+            match *hit {
+                // `or_insert` above already opened an absent feed at
+                // `seen_at`; an existing one keeps its counters and status.
+                FeedHit::Opened => {}
+                FeedHit::Tool(name) => {
+                    feed.tool_count += 1;
+                    feed.last_tool = Some(name);
+                }
+                FeedHit::Status(status) => {
+                    if status == SubagentStatus::Running && feed.status != SubagentStatus::Running {
+                        feed.tool_count = 0;
+                        feed.started_at_ms = seen_at;
+                        // The new cycle has not run a tool yet; the settled
+                        // cycle's last one is not an answer to "what now".
+                        feed.last_tool = None;
+                    }
+                    feed.status = status;
+                }
+            }
+        }
+    }
+
+    /// The counters of one live feed, as this host measured them. `None` is "no
+    /// run here counted this feed" — an old chat, another device, or a feed that
+    /// settled and was retired with its run — which the activity frame reports
+    /// by simply carrying no numbers rather than zeros.
+    pub fn get(&self, chat_id: &str, parent: &str) -> Option<SubagentFeed> {
+        self.lock().get(chat_id)?.get(parent).copied()
+    }
+
+    /// Retire a run's counters: they describe a turn that is over, and a doc
+    /// chip already carries whatever survived of them.
+    fn clear(&self, chat_id: &str) {
+        self.lock().remove(chat_id);
+    }
+}
+
+/// The chip's single terminal write: the host stamps the child's measured
+/// numbers on its spawn chip when the child settles, and nothing else in the
+/// run touches the doc. An absent chip (a spawn this fold never saw) is left
+/// absent — the numbers have nothing to describe.
+fn stamp_subagent_terminal(
+    folded: &mut [MessagePart],
+    parent: &str,
+    feed: SubagentFeed,
+    settled_at: i64,
+) {
+    for part in folded.iter_mut() {
+        if let MessagePart::Tool {
+            id,
+            call,
+            subagent_duration_ms,
+            subagent_tool_count,
+            ..
+        } = part
+            && id == parent
+            && call.is_subagent_spawn()
+        {
+            *subagent_tool_count = Some(feed.tool_count);
+            *subagent_duration_ms = Some(settled_at.saturating_sub(feed.started_at_ms) as u64);
+        }
+    }
+}
+
+/// Per-tool ephemeral output buffer for one run ([`AgentEvent::ToolProgress`]).
+/// Entries keep their arrival order so a coalesced flush broadcasts the tools
+/// in the sequence the user would have seen them print.
+#[derive(Default)]
+struct ToolProgressBuffer {
+    order: Vec<String>,
+    pending: HashMap<String, String>,
+}
+
+impl ToolProgressBuffer {
+    /// Fold one chunk in. `append` extends the stream (a delta wire); anything
+    /// else is the content so far and replaces it.
+    fn push(&mut self, id: &str, text: &str, append: bool) {
+        if !self.pending.contains_key(id) {
+            self.order.push(id.to_owned());
+        }
+        let tail = self.pending.entry(id.to_owned()).or_default();
+        if append {
+            tail.push_str(text);
+        } else {
+            *tail = text.to_owned();
+        }
+        trim_tail(tail, TOOL_PROGRESS_CAP);
+    }
+
+    /// Drain every buffered tail, in arrival order.
+    fn take(&mut self) -> Vec<(String, String)> {
+        let mut out = Vec::with_capacity(self.order.len());
+        for id in std::mem::take(&mut self.order) {
+            if let Some(text) = self.pending.remove(&id) {
+                out.push((id, text));
+            }
+        }
+        out
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+}
+
+/// Drop the front of `s` until it fits in `cap` bytes, on a char boundary.
+fn trim_tail(s: &mut String, cap: usize) {
+    if s.len() <= cap {
+        return;
+    }
+    let mut cut = s.len() - cap;
+    while !s.is_char_boundary(cut) {
+        cut += 1;
+    }
+    s.drain(..cut);
+}
+
+/// A question set the harness is parked on. `secret_ids` names the questions
+/// whose answer must never leave the host's memory (doc, journal, broadcast);
+/// the harness itself still receives the real answers through `resolver`.
+struct PendingInput {
+    resolver: oneshot::Sender<Vec<UserInputAnswer>>,
+    secret_ids: Vec<String>,
+}
+
+type PendingInputs = Arc<Mutex<HashMap<String, PendingInput>>>;
+
+/// The durable/broadcast copy of an answer set: a secret field's content is
+/// replaced with the withheld marker, never carrying what the user typed.
+fn redact_secret_answers(
+    answers: Vec<UserInputAnswer>,
+    secret_ids: &[String],
+) -> Vec<UserInputAnswer> {
+    if secret_ids.is_empty() {
+        return answers;
+    }
+    answers
+        .into_iter()
+        .map(|mut answer| {
+            let secret = secret_ids.iter().any(|id| id == &answer.question_id);
+            let answered = !answer.labels.is_empty() || answer.free_text.is_some();
+            if secret && answered {
+                answer.labels.clear();
+                answer.free_text = Some(komet_proto::WITHHELD_SECRET_ANSWER.to_owned());
+            }
+            answer
+        })
+        .collect()
+}
+
 type PendingPermissionChoices =
     Arc<Mutex<HashMap<String, oneshot::Sender<komet_proto::PermissionChoice>>>>;
 
@@ -184,6 +480,16 @@ struct Inner {
     /// unanswered this long is auto-DENIED (Deny also interrupts the run) and
     /// its doc part resolved. `None` disables the guard entirely.
     permission_timeout: Mutex<Option<std::time::Duration>>,
+    /// Opt-in: copy a compaction summary's TEXT into the synchronized doc
+    /// instead of leaving it in the host's run journal only. Off by default —
+    /// the summary is model prose about the whole conversation, so writing it
+    /// into the oplog replicates it to every device forever, and a recap that
+    /// quotes what the user asked to have compacted travels further than the
+    /// transcript it came from.
+    compaction_summary_in_doc: AtomicBool,
+    /// Live per-subagent counters (see [`SubagentFeeds`]) — the host's only
+    /// record of a child's tool count and elapsed time while it runs.
+    subagent_feeds: SubagentFeeds,
 }
 
 /// Turn-start hook: called with `(chat_id, cwd)`.
@@ -226,8 +532,26 @@ impl SessionsEngine {
                 titles: OnceLock::new(),
                 turn_listener: OnceLock::new(),
                 permission_timeout: Mutex::new(Some(std::time::Duration::from_secs(10 * 60))),
+                compaction_summary_in_doc: AtomicBool::new(matches!(
+                    std::env::var("KOMET_COMPACTION_SUMMARY_IN_DOC")
+                        .ok()
+                        .as_deref()
+                        .unwrap_or("0")
+                        .trim(),
+                    "1" | "true" | "yes" | "on"
+                )),
+                subagent_feeds: SubagentFeeds::default(),
             }),
         }
+    }
+
+    /// Whether compaction summary text is written into the doc (see the
+    /// `compaction_summary_in_doc` field). Device-local, like the permission
+    /// guard above: it decides what THIS host puts in its own doc.
+    pub fn set_compaction_summary_in_doc(&self, enabled: bool) {
+        self.inner
+            .compaction_summary_in_doc
+            .store(enabled, Ordering::Relaxed);
     }
 
     pub fn set_agent_accounts(&self, accounts: AgentAccounts) {
@@ -452,12 +776,7 @@ impl SessionsEngine {
         chat_id: &str,
         after_seq: u64,
     ) -> Result<(Vec<JournaledEvent>, broadcast::Receiver<JournaledEvent>), EngineError> {
-        let rx = {
-            let mut hubs = lock(&self.inner.hubs);
-            hubs.entry(chat_id.to_string())
-                .or_insert_with(|| broadcast::channel(1024).0)
-                .subscribe()
-        };
+        let rx = self.hub_receiver(chat_id);
         let replay = self
             .inner
             .journal
@@ -466,6 +785,15 @@ impl SessionsEngine {
             .map(|(seq, event)| JournaledEvent { seq, event })
             .collect();
         Ok((replay, rx))
+    }
+
+    /// The chat's live receiver, subscribed before any journal projection so a
+    /// frame appended in between lands in the stream (dedupe by `seq`).
+    fn hub_receiver(&self, chat_id: &str) -> broadcast::Receiver<JournaledEvent> {
+        let mut hubs = lock(&self.inner.hubs);
+        hubs.entry(chat_id.to_string())
+            .or_insert_with(|| broadcast::channel(1024).0)
+            .subscribe()
     }
 
     /// Latest journal seq for a chat (0 when the journal is missing/empty).
@@ -485,6 +813,91 @@ impl SessionsEngine {
     /// journal is missing, rotated, or simply has no such id — never an error.
     pub fn tool_events(&self, chat_id: &str, part_id: &str) -> Vec<AgentEvent> {
         self.inner.journal.events_for_part(chat_id, part_id)
+    }
+
+    /// The compaction recap this host's run journal kept for one cycle. `None`
+    /// is "there is nothing here" (the agent compacted without writing one, the
+    /// file rotated, or this device never had the journal) — the caller answers
+    /// `unavailable` rather than showing an empty summary as if the agent had
+    /// said nothing.
+    pub fn compaction_summary(&self, chat_id: &str, compaction_id: &str) -> Option<String> {
+        self.inner
+            .journal
+            .compaction_summary(chat_id, compaction_id)
+    }
+
+    /// One subagent's feed, projected from this host's run journal — the only
+    /// copy of a child's content that exists (there is no child doc, and the
+    /// parent's doc holds nothing but its spawn chip). `None` means "this host
+    /// has nothing to show": a viewer on another device, a chat whose journal
+    /// died with it, or a rotated-away file. The RPC renders that as an explicit
+    /// `Unavailable`, never as an empty transcript.
+    pub fn subagent_events(
+        &self,
+        chat_id: &str,
+        parent_tool_use_id: &str,
+    ) -> Option<Vec<(u64, AgentEvent)>> {
+        self.inner
+            .journal
+            .subagent_events(chat_id, parent_tool_use_id)
+    }
+
+    /// Live view of one subagent's feed: **subscribe first, then project**, so a
+    /// nested event appended in between shows up in the live stream and the
+    /// replay overlaps (dedupe by `seq`) instead of leaving a hole — the same
+    /// ordering rule [`SessionsEngine::subscribe`] applies to a whole chat.
+    ///
+    /// The replay is `None` when this host holds no journal for the chat: an
+    /// honest "nothing to show here", distinct from `Some(vec![])` = "the
+    /// journal is here, this feed is empty (yet)".
+    ///
+    /// The live receiver is the CHAT's stream, unfiltered: it also carries the
+    /// parent's traffic. Consumers keep the frames whose wrapper tags their own
+    /// `parent_tool_use_id` (one hop: a nested wrapper belongs to its own feed).
+    pub fn subscribe_subagent(
+        &self,
+        chat_id: &str,
+        parent_tool_use_id: &str,
+        after_seq: u64,
+    ) -> Result<
+        (
+            Option<Vec<JournaledEvent>>,
+            broadcast::Receiver<JournaledEvent>,
+        ),
+        EngineError,
+    > {
+        // Subscribe to the hub directly: `subscribe` would parse the whole
+        // chat journal into a replay that this call discards (the feed's own
+        // projection below reads the file again).
+        let live = self.hub_receiver(chat_id);
+        let Some(journal) = self.subagent_events(chat_id, parent_tool_use_id) else {
+            return Ok((None, live));
+        };
+        let mut replay: Vec<_> = journal
+            .into_iter()
+            .map(|(seq, event)| JournaledEvent { seq, event })
+            .collect();
+        // Same cursor rule as the chat's replay: a cursor ahead of this feed's
+        // last event belongs to an earlier era (the file was replaced), so it
+        // gets the whole feed rather than nothing.
+        let last = replay.last().map(|event| event.seq).unwrap_or(0);
+        if after_seq != 0 && after_seq <= last {
+            replay.retain(|event| event.seq > after_seq);
+        }
+        Ok((Some(replay), live))
+    }
+
+    /// Whether a run is live on this host for `chat_id` — the one case where a
+    /// missing journal is "not yet" rather than "not here".
+    pub fn is_running(&self, chat_id: &str) -> bool {
+        lock(&self.inner.runs).contains_key(chat_id)
+    }
+
+    /// The host's live per-subagent counters, for a stream that wants to say
+    /// "3 tools · 12 s" while the child runs. Cloneable and read-only: holding
+    /// one is not holding the engine.
+    pub fn subagent_feeds(&self) -> SubagentFeeds {
+        self.inner.subagent_feeds.clone()
     }
 
     /// Start (or route) a run for `chat_id`.
@@ -587,6 +1000,7 @@ impl SessionsEngine {
                     | komet_proto::HarnessId::Pi
                     | komet_proto::HarnessId::Antigravity
                     | komet_proto::HarnessId::Cline
+                    | komet_proto::HarnessId::Qoder
             )
         {
             let validation = komet_proto::ValidationError::ProviderOptionsRejected {
@@ -839,16 +1253,33 @@ impl SessionsEngine {
         let request_input = {
             let pending = pending_inputs.clone();
             let engine_tx = engine_tx.clone();
-            Box::new(move |questions: Vec<UserInputQuestion>| {
-                let (tx, rx) = oneshot::channel();
-                let request_id = new_id();
-                lock(&pending).insert(request_id.clone(), tx);
-                let _ = engine_tx.send(AgentEvent::InputRequested {
-                    request_id,
-                    questions,
-                });
-                rx
-            })
+            Box::new(
+                move |questions: Vec<UserInputQuestion>, source: komet_proto::QuestionSource| {
+                    let (tx, rx) = oneshot::channel();
+                    let request_id = new_id();
+                    let secret_ids = questions
+                        .iter()
+                        .filter(|q| q.secret)
+                        .map(|q| q.id.clone())
+                        .collect();
+                    lock(&pending).insert(
+                        request_id.clone(),
+                        PendingInput {
+                            resolver: tx,
+                            secret_ids,
+                        },
+                    );
+                    let _ = engine_tx.send(AgentEvent::InputRequested {
+                        request_id,
+                        questions,
+                        // Which wire asked, as reported by the harness: the
+                        // doc part carries it so the transcript says where an
+                        // answer was going (native tool vs permission-shaped).
+                        source,
+                    });
+                    rx
+                },
+            )
         };
         // Permission bridge: the harness asks "may I run X"; we mint the
         // request id, park the resolver for `respond_permission`, and surface
@@ -866,10 +1297,15 @@ impl SessionsEngine {
             Box::new(
                 move |kind: komet_proto::PermissionKind,
                       summary: String,
-                      choices: Vec<komet_proto::PermissionChoice>| {
+                      choices: Vec<komet_proto::PermissionChoice>,
+                      tool_call_id: Option<String>| {
                     let (tx, rx) = oneshot::channel();
                     let request_id = new_id();
                     lock(&pending).insert(request_id.clone(), tx);
+                    let expires_at = permission_timeout.map(|timeout| {
+                        crate::now_ms()
+                            .saturating_add(timeout.as_millis().min(i64::MAX as u128) as i64)
+                    });
                     let _ = engine_tx.send(AgentEvent::PermissionRequested {
                         request_id: request_id.clone(),
                         kind,
@@ -877,6 +1313,8 @@ impl SessionsEngine {
                         choices,
                         actions: Vec::new(),
                         provider: None,
+                        tool_call_id,
+                        expires_at,
                     });
                     // D4 — hang guard: an unanswered request auto-denies after
                     // the configured window. `respond_permission` is a no-op
@@ -927,6 +1365,9 @@ impl SessionsEngine {
                         komet_proto::PermissionChoice::Allow,
                         komet_proto::PermissionChoice::Deny,
                     ],
+                    // An MCP approval arrives on the server's own channel, which
+                    // has no agent tool-call id to link the decision to.
+                    None,
                 );
                 let cancellation = McpPermissionCancellation {
                     pending: pending.clone(),
@@ -973,7 +1414,9 @@ impl SessionsEngine {
             request_input,
             request_permission: Box::new({
                 let request_permission = request_permission.clone();
-                move |kind, summary, choices| request_permission(kind, summary, choices).1
+                move |kind, summary, choices, tool_call_id| {
+                    request_permission(kind, summary, choices, tool_call_id).1
+                }
             }),
             steering: steer_rx,
             interrupt: interrupt_token.clone(),
@@ -1111,9 +1554,12 @@ impl SessionsEngine {
         let _ = cancel.send(true);
         // Unpark any blocked question (mirrors komet: harness teardown can await a
         // parked question callback — a run stuck on a question would deadlock the stop).
-        let parked: Vec<_> = lock(&pending).drain().map(|(_, tx)| tx).collect();
-        for tx in parked {
-            let _ = tx.send(Vec::new());
+        let parked: Vec<_> = lock(&pending)
+            .drain()
+            .map(|(_, pending_input)| pending_input.resolver)
+            .collect();
+        for resolver in parked {
+            let _ = resolver.send(Vec::new());
         }
         // Unpark any blocked permissions (mirrors the question drain above) AND
         // publish each denial into the doc pipeline: without the synthetic
@@ -1140,6 +1586,51 @@ impl SessionsEngine {
         Ok(true)
     }
 
+    /// Write the durable answer through the same path for live and orphaned
+    /// questions. `device`/`decided_at` come from the command entry — the
+    /// answering device, which is not necessarily this host — so a peer can see
+    /// whose answer the agent got. Loro list position, never clock order,
+    /// selects the merged winner.
+    pub fn record_input_response(
+        &self,
+        chat_id: &str,
+        request_id: &str,
+        answers: &[UserInputAnswer],
+        applied: bool,
+        device: &str,
+        decided_at: i64,
+    ) -> Result<bool, EngineError> {
+        let handle = self.doc_handle(chat_id)?;
+        Ok(handle.doc().record_input_response(
+            request_id,
+            &InputResponse {
+                answers: answers.to_vec(),
+                decided_at,
+                device: device.to_string(),
+                applied,
+            },
+        )?)
+    }
+
+    /// The single writer for a permission outcome, including the device and
+    /// timestamp. Called for live decisions and dead-run fallbacks alike.
+    pub fn record_permission_decision(
+        &self,
+        chat_id: &str,
+        request_id: &str,
+        choice: &komet_proto::PermissionChoice,
+        device: &str,
+        decided_at: i64,
+    ) -> Result<bool, EngineError> {
+        let handle = self.doc_handle(chat_id)?;
+        Ok(handle.doc().decide_permission(
+            request_id,
+            Some(choice),
+            Some(device),
+            Some(decided_at),
+        )?)
+    }
+
     /// Resolve a pending `request_input` question set. Returns `false` when no such
     /// request is pending (unknown id, or the run already settled).
     pub fn respond_input(
@@ -1154,12 +1645,18 @@ impl SessionsEngine {
         let Some((pending, engine_tx)) = target else {
             return Ok(false);
         };
-        let Some(resolver) = lock(&pending).remove(request_id) else {
+        let Some(pending_input) = lock(&pending).remove(request_id) else {
             return Ok(false);
         };
-        let _ = resolver.send(answers);
+        if pending_input.resolver.send(answers.clone()).is_err() {
+            return Ok(false);
+        }
+        // The harness has the real answers; everything that outlives this run
+        // (journal, live broadcast) gets the secret-free copy.
+        let answers = redact_secret_answers(answers, &pending_input.secret_ids);
         let _ = engine_tx.send(AgentEvent::InputResolved {
             request_id: request_id.to_string(),
+            answers,
         });
         Ok(true)
     }
@@ -1183,7 +1680,9 @@ impl SessionsEngine {
             return Ok(false);
         };
         let is_deny = choice == komet_proto::PermissionChoice::Deny;
-        let _ = resolver.send(choice.clone());
+        if resolver.send(choice.clone()).is_err() {
+            return Ok(false);
+        }
         let _ = engine_tx.send(AgentEvent::PermissionResolved {
             request_id: request_id.to_string(),
             choice,
@@ -1455,6 +1954,19 @@ impl Inner {
 
     /// Journal + broadcast one event (the two unconditional legs of the pipeline).
     fn publish(&self, chat_id: &str, event: &AgentEvent) -> u64 {
+        // Belt on top of the drive_run gate: a progress frame must never reach
+        // the journal, whatever path delivered it — including one nested in a
+        // subagent wrapper, whose child's live output is the biggest such frame.
+        if is_ephemeral(event) {
+            self.broadcast_ephemeral(chat_id, event.clone());
+            return 0;
+        }
+        // The summary text is journal-only unless this host opted into the doc:
+        // the live feed is not where a recap belongs either, so the broadcast
+        // copy carries the cycle's size and availability, not its prose.
+        if matches!(event, AgentEvent::ContextCompaction { .. }) {
+            return self.publish_compaction(chat_id, event);
+        }
         let usage_changed = match event {
             AgentEvent::SessionStarted { model, .. } => {
                 let mut usage_stats = lock(&self.usage_stats);
@@ -1515,6 +2027,60 @@ impl Inner {
             });
         }
         seq
+    }
+
+    /// One compaction frame: the WHOLE event goes to the journal (summary text
+    /// included — that is what `GetCompactionSummary` reads back), while the
+    /// live feed gets the same frame with the prose removed. The recap is model
+    /// text about the entire conversation; a broadcast copy would put it on
+    /// every subscriber's heap and in every reconnect replay for a chip that
+    /// only needs to say "compacted, N bytes available".
+    fn publish_compaction(&self, chat_id: &str, event: &AgentEvent) -> u64 {
+        let seq = match self.journal.append(chat_id, event) {
+            Ok(seq) => seq,
+            Err(err) => {
+                tracing::error!(chat = %chat_id, error = %err, "journal append failed");
+                0
+            }
+        };
+        let mut stripped = event.clone();
+        if let AgentEvent::ContextCompaction {
+            summary,
+            summary_delta,
+            ..
+        } = &mut stripped
+        {
+            *summary = None;
+            *summary_delta = None;
+        }
+        if let Some(hub) = lock(&self.hubs).get(chat_id) {
+            let _ = hub.send(JournaledEvent {
+                seq,
+                event: stripped,
+            });
+        }
+        seq
+    }
+
+    /// The summary policy the fold writes the doc with — this host's own choice
+    /// (see [`SessionsEngine::set_compaction_summary_in_doc`]).
+    fn compaction_summary_policy(&self) -> CompactionSummaryPolicy {
+        if self.compaction_summary_in_doc.load(Ordering::Relaxed) {
+            CompactionSummaryPolicy::SummaryInDoc
+        } else {
+            CompactionSummaryPolicy::JournalOnly
+        }
+    }
+
+    /// Broadcast one event WITHOUT journaling it (ephemeral streams: tool
+    /// output progress). A journaled progress frame would rewrite the run
+    /// journal thousands of times per turn for text that has no durable
+    /// meaning, and replaying it on reconnect would splice stale output into
+    /// chips that already resolved. `seq` 0 says "no durable position".
+    fn broadcast_ephemeral(&self, chat_id: &str, event: AgentEvent) {
+        if let Some(hub) = lock(&self.hubs).get(chat_id) {
+            let _ = hub.send(JournaledEvent { seq: 0, event });
+        }
     }
 
     /// Bump the session's freshness on stream activity WITHOUT a status
@@ -1751,6 +2317,9 @@ impl Inner {
         let mut runs = lock(&self.runs);
         if runs.get(chat_id).is_some_and(|h| h.run_id == run_id) {
             runs.remove(chat_id);
+            // The live counters describe a turn that is over: whatever the
+            // chips kept at their terminal write is the doc's record now.
+            self.subagent_feeds.clear(chat_id);
         }
     }
 }
@@ -1777,6 +2346,8 @@ fn render_parts(parts: &[MessagePart]) -> Vec<MessagePart> {
                 subagent_ref,
                 subagent_status,
                 subagent_tail,
+                subagent_duration_ms,
+                subagent_tool_count,
             } => MessagePart::Tool {
                 id: id.clone(),
                 call: sanitize_tool_call(call),
@@ -1795,6 +2366,10 @@ fn render_parts(parts: &[MessagePart]) -> Vec<MessagePart> {
                 subagent_ref: subagent_ref.clone(),
                 subagent_status: *subagent_status,
                 subagent_tail: subagent_tail.clone(),
+                // Two numbers about the child's own work — no content, nothing
+                // to strip, and the chip's only record of the cycle.
+                subagent_duration_ms: *subagent_duration_ms,
+                subagent_tool_count: *subagent_tool_count,
             },
             other => other.clone(),
         })
@@ -1853,6 +2428,95 @@ fn finish_segment<'a>(
     }
 }
 
+/// Fold one compaction frame into its durable home — exactly one part per
+/// cycle, wherever that cycle first landed:
+/// - the live segment already holds it: refine in place, like any other part;
+/// - no segment is open (the boundary arrived between two turns): fold the
+///   frame into the run's own accumulator and write a `System` entry for it, so
+///   the fact keeps its position at the tail and its chunk sizes keep
+///   accumulating across frames;
+/// - the doc already carries the cycle elsewhere (it began parked and a steer
+///   re-opened the session): refine THAT part, never mint a twin in the new
+///   assistant entry;
+/// - otherwise: fold into the segment (a mid-turn boundary).
+///
+/// Returns the part id of a `Completed` cycle still missing its post-compaction
+/// count, for [`fill_compaction_tokens_after`] to answer later.
+#[allow(clippy::too_many_arguments)]
+fn route_compaction(
+    doc: &SessionDoc,
+    folded: &mut Vec<MessagePart>,
+    stray: &mut Vec<MessagePart>,
+    has_segment: bool,
+    event: &AgentEvent,
+    device_id: &str,
+    policy: CompactionSummaryPolicy,
+) -> Option<String> {
+    let AgentEvent::ContextCompaction { id, .. } = event else {
+        return None;
+    };
+    let part_id = format!("cmp-{id}");
+    let outside_segment = !folded.iter().any(|part| part.id() == part_id)
+        && (!has_segment || doc.has_compaction_part(&part_id));
+    if !outside_segment {
+        fold_event_into_parts_with(folded, event, policy);
+        return None;
+    }
+    fold_event_into_parts_with(stray, event, policy);
+    let index = stray.iter().position(|part| part.id() == part_id)?;
+    let pending_count = matches!(
+        stray[index],
+        MessagePart::Compaction {
+            status: CompactionStatus::Completed,
+            tokens_after: None,
+            ..
+        }
+    );
+    if let Err(err) = doc.record_compaction_part(&stray[index], device_id, now_ms()) {
+        tracing::warn!(error = %err, "failed to persist an inter-turn compaction");
+        return None;
+    }
+    pending_count.then_some(part_id)
+}
+
+/// Stamp the post-compaction count the boundary frame itself did not carry onto
+/// the one cycle still waiting for it. The newest unfilled compaction in the
+/// live segment wins — a reading answers the most recent squeeze, never an older
+/// one — and a cycle that was still waiting by then stays unknown rather than
+/// borrowing somebody else's number. A part whose agent reported its own count
+/// is never overwritten.
+fn fill_compaction_tokens_after(
+    folded: &mut [MessagePart],
+    pending: &mut Option<String>,
+    doc: &SessionDoc,
+    tokens_after: u64,
+) {
+    if let Some(MessagePart::Compaction {
+        tokens_after: slot, ..
+    }) = folded.iter_mut().rev().find(|part| {
+        matches!(
+            part,
+            MessagePart::Compaction {
+                status: CompactionStatus::Completed,
+                tokens_after: None,
+                ..
+            }
+        )
+    }) {
+        *slot = Some(tokens_after);
+        // The pending inter-turn cycle is older than this one, so this reading
+        // is not its answer either; drop the claim instead of mislabelling.
+        *pending = None;
+        return;
+    }
+    let Some(part_id) = pending.take() else {
+        return;
+    };
+    if let Err(err) = doc.apply_compaction_tokens_after(&part_id, tokens_after) {
+        tracing::warn!(error = %err, "failed to stamp a compaction's post-window count");
+    }
+}
+
 /// `~` / `~/…` → this host's home directory. Anything else passes through.
 fn expand_home(cwd: &str) -> String {
     match cwd.strip_prefix("~") {
@@ -1874,6 +2538,28 @@ struct RunResumeState {
     user_message_id: String,
     resume_injected: bool,
     startup_retry: bool,
+}
+
+/// Broadcast every buffered tool-output tail as one snapshot per tool, and
+/// disarm the flush window. Ephemeral by construction: no journal write, no
+/// fold, no doc commit — a reconnect simply starts with nothing streamed.
+fn flush_tool_progress(
+    inner: &Inner,
+    chat_id: &str,
+    progress: &mut ToolProgressBuffer,
+    flush_at: &mut Option<tokio::time::Instant>,
+) {
+    for (id, text) in progress.take() {
+        inner.broadcast_ephemeral(
+            chat_id,
+            AgentEvent::ToolProgress {
+                id,
+                text,
+                append: false,
+            },
+        );
+    }
+    *flush_at = None;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1902,6 +2588,16 @@ async fn drive_run(
         resume: None,
         ..request.clone()
     });
+    // The run is dispatched and the CLI is being spawned: name that wait from
+    // the first frame, before the harness has anything to say. Ephemeral, so a
+    // viewer that connects mid-run simply reads the row's `Working` status.
+    let mut run_phase = Some(RunPhase::Starting);
+    inner.broadcast_ephemeral(
+        &chat_id,
+        AgentEvent::RunPhase {
+            phase: RunPhase::Starting,
+        },
+    );
     let mut stream = match harness.run(request, controls).await {
         Ok(stream) => stream,
         Err(err) => {
@@ -1933,6 +2629,11 @@ async fn drive_run(
 
     let doc_ref: &SessionDoc = &doc;
     let mut folded: Vec<MessagePart> = Vec::new();
+    // Ephemeral tool output, buffered per tool id and broadcast on a coalesced
+    // window (see [`ToolProgressBuffer`]). Nothing here reaches the doc or the
+    // journal.
+    let mut progress = ToolProgressBuffer::default();
+    let mut progress_flush_at: Option<tokio::time::Instant> = None;
     // Every tool id this run has folded, across segment resets. Adapters
     // re-emit shape-bearing `tool_call_update`s (title/rawInput refreshes,
     // long-running completions) as full ToolCall events; once the fold has
@@ -1943,6 +2644,14 @@ async fn drive_run(
     let mut entry_id = new_id();
     let mut segment_started = now_ms();
     let mut writer: Option<SegmentWriter<'_>> = None;
+    // Compaction cycles with no home in the streaming segment: a boundary that
+    // arrived between two turns (it got its own `System` entry) and any later
+    // frame of that cycle. The fold keeps accumulating them, so a cycle's chunk
+    // sizes add up across frames whatever entry its part ended up in.
+    let mut stray_compactions: Vec<MessagePart> = Vec::new();
+    // A `Completed` inter-turn cycle whose post-compaction count the agent did
+    // not report — waiting for the next native window reading, and only for it.
+    let mut pending_tokens_after: Option<String> = None;
     let mut dirty = false;
     let mut flush_at = tokio::time::Instant::now();
     // Set when the engine interrupts the run: the harness gets this long to end its own
@@ -2102,6 +2811,16 @@ async fn drive_run(
                     tracing::warn!(chat = %chat_id, error = %err, "segment sync failed");
                 }
                 dirty = false;
+                continue;
+            }
+            _ = tokio::time::sleep_until(
+                progress_flush_at.unwrap_or_else(tokio::time::Instant::now)
+            ), if progress_flush_at.is_some() => {
+                // Coalesced live-output tick: broadcast, nothing else. Not
+                // stream activity — it must not push the quiesce window.
+                flush_tool_progress(
+                    &inner, &chat_id, &mut progress, &mut progress_flush_at,
+                );
                 continue;
             }
             // Turn-quiesce watchdog (see the knob above). Armed only when the
@@ -2267,11 +2986,11 @@ async fn drive_run(
                     // AwaitingInput would disarm the idle reaper with no Done
                     // ever coming — stranded status, leaked warm child.
                     AgentEvent::InputRequested { request_id, .. } => {
-                        let resolver = lock(&inner.runs)
+                        let pending_input = lock(&inner.runs)
                             .get(&chat_id)
                             .and_then(|h| lock(&h.pending_inputs).remove(request_id));
-                        if let Some(tx) = resolver {
-                            let _ = tx.send(Vec::new());
+                        if let Some(pending_input) = pending_input {
+                            let _ = pending_input.resolver.send(Vec::new());
                         }
                         tracing::debug!(chat = %chat_id, "parked session: post-turn input request auto-declined");
                         continue;
@@ -2291,10 +3010,47 @@ async fn drive_run(
                         continue;
                     }
                     AgentEvent::PermissionResolved { .. } => continue,
+                    // A compaction that fires between two turns is a durable
+                    // FACT, not a turn: journal it and give it its own `System`
+                    // entry, but stay PARKED — un-parking into Working would
+                    // arm the row with no Done behind it (the wedge this gate
+                    // exists to prevent). The UI reads the liveliness off the
+                    // part's own `inProgress` status.
+                    AgentEvent::ContextCompaction { .. } => {
+                        inner.publish(&chat_id, &event);
+                        if let Some(part_id) = route_compaction(
+                            doc_ref,
+                            &mut folded,
+                            &mut stray_compactions,
+                            false,
+                            &event,
+                            &device_id,
+                            inner.compaction_summary_policy(),
+                        ) {
+                            pending_tokens_after = Some(part_id);
+                        }
+                        continue;
+                    }
                     _ => continue,
                 }
             }
         }
+        // Live tool output: buffered and broadcast on the coalesced tick
+        // above. It is NOT folded, NOT journaled, and never marks the segment
+        // dirty — the doc's record of a tool's output stays the one result.
+        if let AgentEvent::ToolProgress { id, text, append } = &event {
+            progress.push(id, text, *append);
+            if progress_flush_at.is_none() {
+                progress_flush_at = Some(tokio::time::Instant::now() + TOOL_PROGRESS_FLUSH);
+            }
+            continue;
+        }
+        // Anything durable flushes the pending burst first, so a chip's live
+        // stream can never arrive after the result that closed it.
+        if !progress.is_empty() {
+            flush_tool_progress(&inner, &chat_id, &mut progress, &mut progress_flush_at);
+        }
+
         // Empty reasoning deltas are PURE heartbeats: redacted thinking and
         // tool-input-generation windows stream them with no text. They fold
         // to nothing, so journaling/publishing them is only noise (hundreds
@@ -2490,19 +3246,87 @@ async fn drive_run(
             _ => {}
         }
 
+        // Live subagent counters FIRST: a viewer that snapshots a feed when it
+        // receives this frame must see what this frame says, not what preceded
+        // it.
+        let feed_hits = touched_feeds(&event);
+        inner.subagent_feeds.record(&chat_id, &feed_hits, now_ms());
+
         inner.publish(&chat_id, &event);
+
+        // Then the trailer's phase: a viewer that receives this frame sees the
+        // phase the event it just folded put the run in. Broadcast-only — see
+        // [`phase_change`] and [`AgentEvent::RunPhase`].
+        if let Some(next) = phase_change(&event, run_phase) {
+            run_phase = Some(next);
+            inner.broadcast_ephemeral(&chat_id, AgentEvent::RunPhase { phase: next });
+        } else if matches!(&event, AgentEvent::Done { .. }) {
+            run_phase = None;
+        }
 
         // Defensive rule from komet: a mid-run SessionStarted re-emission (Claude SDK
         // background re-invocations) must not wipe the segment being written.
         let skip_fold = matches!(&event, AgentEvent::SessionStarted { .. }) && !folded.is_empty();
         if !skip_fold {
-            fold_event_into_parts(&mut folded, &event);
+            let summary_policy = inner.compaction_summary_policy();
+            let has_segment = !folded.is_empty() || writer.is_some();
+            let pending = if matches!(&event, AgentEvent::ContextCompaction { .. }) {
+                route_compaction(
+                    doc_ref,
+                    &mut folded,
+                    &mut stray_compactions,
+                    has_segment,
+                    &event,
+                    &device_id,
+                    summary_policy,
+                )
+            } else {
+                fold_event_into_parts_with(&mut folded, &event, summary_policy);
+                None
+            };
+            if pending.is_some() {
+                pending_tokens_after = pending;
+            }
             // R2 sidecar PARKED (2026-08-10, product call): the fold's
             // summary/stats ARE the doc's whole record — no refs stamped, no
             // uploads. Full outputs survive only in the host's local run
             // journal. To reintroduce: `komet_doc::sidecar_payload(&event)`
             // → `apply_sidecar_refs` → `doc_host.upload_tool_sidecar`, all
             // still in place and tested.
+        }
+
+        // The spawn chip's ONE terminal write, and the only moment this run
+        // touches the doc for a subagent's numbers: the fold has already
+        // settled the chip's lifecycle for this event, so stamping after it
+        // means the status and its numbers land in the same coalesced commit.
+        for (parent, hit) in &feed_hits {
+            let FeedHit::Status(status) = *hit else {
+                continue;
+            };
+            if status == SubagentStatus::Running {
+                continue;
+            }
+            if let Some(feed) = inner.subagent_feeds.get(&chat_id, parent) {
+                stamp_subagent_terminal(&mut folded, parent, feed, now_ms());
+            }
+        }
+
+        if let AgentEvent::ContextWindow { stats } = &event
+            && stats.source == ContextUsageSource::Native
+            && stats.used() > 0
+        {
+            // The boundary frame rarely carries the post-compaction count; the
+            // next native window reading IS that number. A parked session never
+            // gets here (its usage frames are post-turn noise that can predate
+            // the boundary) and an approximate/estimated reading is a guess, so
+            // both leave the count unknown: the line draws no arrow rather than
+            // a wrong one.
+            fill_compaction_tokens_after(
+                &mut folded,
+                &mut pending_tokens_after,
+                doc_ref,
+                stats.used(),
+            );
         }
 
         if let AgentEvent::Done { status, .. } = &event {
@@ -2517,8 +3341,8 @@ async fn drive_run(
                 .filter(|h| h.run_id == run_id)
                 .map(|h| h.pending_inputs.clone());
             if let Some(pending) = pending {
-                for (_, tx) in lock(&pending).drain() {
-                    let _ = tx.send(Vec::new());
+                for (_, pending_input) in lock(&pending).drain() {
+                    let _ = pending_input.resolver.send(Vec::new());
                 }
             }
             // Mirror of the input drain above, for the same reason: a
@@ -2691,7 +3515,234 @@ async fn drive_run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use komet_proto::{ContextUsageSource, ContextUsageStats};
+    use komet_proto::{ContextUsageSource, ContextUsageStats, ToolCall};
+
+    #[test]
+    fn secret_answers_are_redacted_only_in_the_persisted_copy() {
+        let answers = vec![
+            UserInputAnswer {
+                question_id: "token".into(),
+                labels: vec!["ghp_x".into()],
+                free_text: Some("ghp_x".into()),
+            },
+            UserInputAnswer {
+                question_id: "env".into(),
+                labels: vec!["prod".into()],
+                free_text: None,
+            },
+            UserInputAnswer {
+                question_id: "token2".into(),
+                labels: vec![],
+                free_text: None,
+            },
+        ];
+        let redacted = redact_secret_answers(answers.clone(), &["token".into(), "token2".into()]);
+        // The harness already received `answers`; only the journal/broadcast
+        // copy is redacted.
+        assert_eq!(answers[0].free_text.as_deref(), Some("ghp_x"));
+        assert!(redacted[0].labels.is_empty());
+        assert_eq!(
+            redacted[0].free_text.as_deref(),
+            Some(komet_proto::WITHHELD_SECRET_ANSWER)
+        );
+        assert_eq!(redacted[1], answers[1], "non-secret answers travel intact");
+        assert_eq!(
+            redacted[2], answers[2],
+            "a secret question the user skipped stays empty, not marked"
+        );
+
+        assert_eq!(redact_secret_answers(answers.clone(), &[]), answers);
+    }
+
+    #[test]
+    fn tool_progress_buffer_coalesces_per_tool_and_caps_the_tail() {
+        let mut buf = ToolProgressBuffer::default();
+        buf.push("a", "one ", true);
+        buf.push("a", "two", true);
+        buf.push("b", "second tool", false);
+        assert_eq!(
+            buf.take(),
+            vec![
+                ("a".to_string(), "one two".to_string()),
+                ("b".to_string(), "second tool".to_string()),
+            ],
+            "one frame per tool, in arrival order"
+        );
+        // A snapshot replaces what the same window accumulated for that tool.
+        buf.push("a", "stale", true);
+        buf.push("a", "fresh", false);
+        assert_eq!(buf.take(), vec![("a".to_string(), "fresh".to_string())]);
+        // The TAIL survives the cap, cut on a char boundary.
+        buf.push("c", &"é".repeat(TOOL_PROGRESS_CAP), true);
+        buf.push("c", "tail", true);
+        let (id, text) = buf.take().into_iter().next().unwrap();
+        assert_eq!(id, "c");
+        assert!(text.len() <= TOOL_PROGRESS_CAP);
+        assert!(text.ends_with("tail"));
+    }
+
+    #[tokio::test]
+    async fn tool_progress_is_broadcast_but_never_journaled() {
+        let (_dir, sessions) = test_engine();
+        let chat = "chat-ephemeral";
+        let (_replay, mut rx) = sessions.subscribe(chat, 0).unwrap();
+        sessions.inner.publish(
+            chat,
+            &AgentEvent::ToolProgress {
+                id: "call-1".into(),
+                text: "compiling".into(),
+                append: true,
+            },
+        );
+        sessions.inner.publish(
+            chat,
+            &AgentEvent::TextDelta {
+                text: "durable".into(),
+            },
+        );
+        // Live frames reach subscribers with no durable position…
+        let frame = rx.recv().await.unwrap();
+        assert!(matches!(frame.event, AgentEvent::ToolProgress { .. }));
+        assert_eq!(frame.seq, 0);
+        // …and the journal holds only the durable event.
+        assert!(matches!(
+            rx.recv().await.unwrap().event,
+            AgentEvent::TextDelta { .. }
+        ));
+        assert_eq!(
+            sessions.latest_seq(chat),
+            1,
+            "a progress frame must never add a journal line"
+        );
+    }
+
+    #[test]
+    fn phase_change_names_only_what_changed() {
+        // The four waits a user can be in, in the order a run actually visits
+        // them, and the rule that a streamed turn yields ONE frame per change.
+        assert_eq!(
+            phase_change(
+                &AgentEvent::SessionStarted {
+                    harness: HarnessId::ClaudeCode,
+                    model: "m".into(),
+                    tools: vec![],
+                    cwd: "/w".into(),
+                    session_id: "s".into(),
+                    assistant_message_id: "a".into(),
+                },
+                Some(RunPhase::Starting),
+            ),
+            Some(RunPhase::WaitingModel),
+            "a harness that started is no longer a harness that is starting"
+        );
+        let started = Some(RunPhase::WaitingModel);
+        assert_eq!(
+            phase_change(&AgentEvent::TextDelta { text: "hi".into() }, started),
+            Some(RunPhase::Streaming)
+        );
+        assert_eq!(
+            phase_change(
+                &AgentEvent::TextDelta {
+                    text: " there".into()
+                },
+                Some(RunPhase::Streaming)
+            ),
+            None,
+            "one frame per phase change, not one per token"
+        );
+        assert_eq!(
+            phase_change(
+                &AgentEvent::ReasoningDelta {
+                    text: String::new()
+                },
+                Some(RunPhase::Streaming),
+            ),
+            None,
+            "an empty delta changes nothing"
+        );
+        assert_eq!(
+            phase_change(
+                &AgentEvent::ToolCall {
+                    id: "t1".into(),
+                    call: ToolCall::ReadFile {
+                        path: "/w/x".into()
+                    },
+                },
+                Some(RunPhase::Streaming),
+            ),
+            Some(RunPhase::Tool)
+        );
+        // Nothing invents a phase for a signal the harness never sent.
+        assert_eq!(
+            phase_change(
+                &AgentEvent::Usage {
+                    input_tokens: 1,
+                    cached_input_tokens: 0,
+                    output_tokens: 1,
+                    reasoning_tokens: 0,
+                    context_limit: None,
+                },
+                Some(RunPhase::Starting),
+            ),
+            None,
+            "a silent harness stays on the phase it was dispatched with"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_phase_frames_are_broadcast_but_never_journaled() {
+        let (_dir, sessions) = test_engine();
+        let chat = "chat-phase";
+        let (_replay, mut rx) = sessions.subscribe(chat, 0).unwrap();
+        let mut phase = Some(RunPhase::Starting);
+        // Exactly what `drive_run` does per harness event, in order.
+        let events = [
+            AgentEvent::SessionStarted {
+                harness: HarnessId::ClaudeCode,
+                model: "m".into(),
+                tools: vec![],
+                cwd: "/w".into(),
+                session_id: "s".into(),
+                assistant_message_id: "a".into(),
+            },
+            AgentEvent::TextDelta { text: "hi".into() },
+            AgentEvent::TextDelta {
+                text: " there".into(),
+            },
+            AgentEvent::ToolCall {
+                id: "t1".into(),
+                call: ToolCall::ReadFile {
+                    path: "/w/x".into(),
+                },
+            },
+        ];
+        for event in events {
+            sessions.inner.publish(&chat, &event);
+            if let Some(next) = phase_change(&event, phase) {
+                phase = Some(next);
+                sessions
+                    .inner
+                    .broadcast_ephemeral(&chat, AgentEvent::RunPhase { phase: next });
+            }
+        }
+        let mut seen = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            if let AgentEvent::RunPhase { phase } = frame.event {
+                assert_eq!(frame.seq, 0, "a phase frame has no durable position");
+                seen.push(phase);
+            }
+        }
+        assert_eq!(
+            seen,
+            vec![RunPhase::WaitingModel, RunPhase::Streaming, RunPhase::Tool],
+            "the trailer's phases, one frame per change"
+        );
+        assert_eq!(
+            sessions.latest_seq(chat),
+            4,
+            "three durable events plus… exactly those four: no phase row in the journal"
+        );
+    }
 
     fn test_engine() -> (tempfile::TempDir, SessionsEngine) {
         let dir = tempfile::tempdir().unwrap();

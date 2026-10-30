@@ -245,12 +245,12 @@ async fn collect_text(
 ) -> Result<String, EngineError> {
     let (steer_tx, steer_rx) = tokio::sync::mpsc::channel::<SteerMessage>(1);
     let controls = RunControls {
-        request_input: Box::new(|_questions: Vec<UserInputQuestion>| {
+        request_input: Box::new(|_questions: Vec<UserInputQuestion>, _source| {
             let (tx, rx) = tokio::sync::oneshot::channel::<Vec<UserInputAnswer>>();
             let _ = tx.send(Vec::new());
             rx
         }),
-        request_permission: Box::new(|_kind, _summary, _choices| {
+        request_permission: Box::new(|_kind, _summary, _choices, _tool_call_id| {
             let (tx, rx) = tokio::sync::oneshot::channel::<komet_proto::PermissionChoice>();
             let _ = tx.send(komet_proto::PermissionChoice::Deny);
             rx

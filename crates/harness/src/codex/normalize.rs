@@ -177,10 +177,44 @@ pub(crate) fn usage_events(params: &Value) -> Vec<AgentEvent> {
     events
 }
 
-pub(crate) fn compacted_event() -> AgentEvent {
-    AgentEvent::ContextWindow {
-        stats: komet_proto::ContextUsageStats::compaction("thread compacted"),
-    }
+/// `thread/compacted` is Codex's only compaction notice: it arrives AFTER the
+/// fact, with no id and no recap. It produces two events — the gauge (a counter
+/// the Context popover can read) and the boundary itself (the line in the
+/// thread). Without the second one, a Codex compaction is a number and nothing
+/// else. Fresh id per call: two compactions in one run are two rows, not one
+/// row rewritten.
+pub(crate) fn compacted_events(params: &Value) -> Vec<AgentEvent> {
+    let trigger = field(params, &["trigger", "reason", "compactionReason"])
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .filter(|trigger| !trigger.trim().is_empty());
+    let tokens_before = field(
+        params,
+        &["preTokens", "pre_tokens", "tokensBefore", "tokens_before"],
+    )
+    .and_then(Value::as_u64);
+    // The gauge keeps a human-readable reason even when the payload has none —
+    // it used to show "thread compacted", and that stays the honest label.
+    let stats = komet_proto::ContextUsageStats::compaction(
+        trigger
+            .clone()
+            .unwrap_or_else(|| "thread compacted".to_owned()),
+    );
+    vec![
+        AgentEvent::ContextWindow { stats },
+        AgentEvent::ContextCompaction {
+            id: uuid::Uuid::new_v4().to_string(),
+            status: komet_proto::CompactionStatus::Completed,
+            trigger,
+            tokens_before,
+            // Codex reports no post-compaction size: the engine fills this from
+            // the next native window, and the UI shows no arrow until then.
+            tokens_after: None,
+            summary: None,
+            summary_delta: None,
+            error: None,
+        },
+    ]
 }
 
 /// Tool-shaped Codex items must always close the lifecycle they open: started
@@ -354,6 +388,61 @@ pub(crate) fn map_item(phase: Phase, item: &Value) -> Vec<AgentEvent> {
     }
 }
 
+/// `item/commandExecution/outputDelta` / `item/fileChange/outputDelta` → an
+/// ephemeral [`AgentEvent::ToolProgress`] for the open chip. Silent without
+/// both an item id and a non-empty chunk: a delta we cannot attribute to a
+/// tool would render as an orphan stream.
+pub(crate) fn progress_events(params: &Value) -> Vec<AgentEvent> {
+    let id = item_id(params);
+    if id.is_empty() {
+        return Vec::new();
+    }
+    let Some(text) = field(params, &["delta", "textDelta"])
+        .and_then(Value::as_str)
+        .filter(|t| !t.is_empty())
+        .map(str::to_owned)
+    else {
+        return Vec::new();
+    };
+    vec![AgentEvent::ToolProgress {
+        id,
+        text,
+        append: true,
+    }]
+}
+
+/// `turn/plan/updated` → a full plan snapshot on the stable live-plan id.
+///
+/// Wire shape: `{ "plan": [{ "step": "...", "status": "pending" |
+/// "inProgress" | "completed" }] }`; older builds spell the array `items` and
+/// the text `text`/`content`. Snapshots are authoritative, so
+/// `item/plan/delta` is deliberately unmapped: accumulating deltas on top of
+/// the next snapshot would duplicate rows.
+pub(crate) fn plan_events(params: &Value) -> Vec<AgentEvent> {
+    let Some(plan) = field(params, &["plan", "items", "entries"]).and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let items = plan
+        .iter()
+        .map(|entry| TodoItem {
+            text: str_field(entry, &["step", "text", "content"]),
+            done: matches!(str_field(entry, &["status"]).as_str(), "completed" | "done"),
+        })
+        .collect();
+    vec![
+        AgentEvent::ToolCall {
+            id: komet_proto::LIVE_PLAN_TOOL_ID.into(),
+            call: ToolCall::Todo { items },
+        },
+        AgentEvent::ToolResult {
+            id: komet_proto::LIVE_PLAN_TOOL_ID.into(),
+            is_error: false,
+            output: None,
+            diff: None,
+        },
+    ]
+}
+
 /// The text of a `userMessage` thread item. Codex builds have carried both
 /// shapes: a plain `text` field and a `content` array of text blocks.
 pub(crate) fn user_message_text(item: &Value) -> Option<String> {
@@ -437,12 +526,15 @@ pub(crate) fn route_child_notification(method: &str) -> ChildRoute {
         "turn/started"
         | "thread/status/changed"
         | "thread/tokenUsage/updated"
-        // Child chatter with no consumer on this wire.
+        // Child chatter with no consumer on this wire. Plan deltas are not
+        // accumulated anywhere (the parent's snapshots are authoritative).
         | "item/reasoning/summaryPartAdded"
         | "item/commandExecution/outputDelta"
         | "item/fileChange/outputDelta"
         | "item/fileChange/patchUpdated"
         | "item/plan/delta"
+        // A child's plan snapshot must never overwrite the ROOT plan card;
+        // the parent thread's own snapshots are mapped in the parent path.
         | "turn/plan/updated"
         | "turn/diff/updated"
         | "thread/name/updated"
@@ -715,6 +807,103 @@ mod tests {
     }
 
     #[test]
+    fn output_delta_maps_to_ephemeral_tool_progress() {
+        assert_eq!(
+            progress_events(&json!({"itemId": "c1", "delta": "building…"})),
+            vec![AgentEvent::ToolProgress {
+                id: "c1".into(),
+                text: "building…".into(),
+                append: true,
+            }]
+        );
+        // Nothing to attribute the stream to: no id, or an empty chunk.
+        assert!(progress_events(&json!({"delta": "x"})).is_empty());
+        assert!(progress_events(&json!({"itemId": "c1", "delta": ""})).is_empty());
+    }
+
+    #[test]
+    fn codex_plan_update_maps_to_live_todo() {
+        let events = plan_events(&json!({
+            "threadId": "th-1",
+            "turnId": "t-1",
+            "plan": [
+                {"step": "Inspect repo", "status": "completed"},
+                {"step": "Fix bug", "status": "inProgress"},
+                {"step": "Run tests", "status": "pending"},
+            ]
+        }));
+        assert_eq!(
+            events,
+            vec![
+                AgentEvent::ToolCall {
+                    id: komet_proto::LIVE_PLAN_TOOL_ID.into(),
+                    call: ToolCall::Todo {
+                        items: vec![
+                            TodoItem {
+                                text: "Inspect repo".into(),
+                                done: true
+                            },
+                            TodoItem {
+                                text: "Fix bug".into(),
+                                done: false
+                            },
+                            TodoItem {
+                                text: "Run tests".into(),
+                                done: false
+                            },
+                        ],
+                    },
+                },
+                AgentEvent::ToolResult {
+                    id: komet_proto::LIVE_PLAN_TOOL_ID.into(),
+                    is_error: false,
+                    output: None,
+                    diff: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_update_accepts_alternate_spellings_and_clears() {
+        // Older builds: `items`, `text`/`content`, `done`.
+        let events = plan_events(&json!({
+            "items": [
+                {"text": "a", "status": "done"},
+                {"content": "b", "status": "pending"},
+            ]
+        }));
+        assert!(matches!(
+            &events[0],
+            AgentEvent::ToolCall { call: ToolCall::Todo { items }, .. }
+                if items == &vec![
+                    TodoItem { text: "a".into(), done: true },
+                    TodoItem { text: "b".into(), done: false },
+                ]
+        ));
+        // An empty snapshot is meaningful: it clears the card.
+        let cleared = plan_events(&json!({"plan": []}));
+        assert!(matches!(
+            &cleared[0],
+            AgentEvent::ToolCall { call: ToolCall::Todo { items }, .. } if items.is_empty()
+        ));
+        // No plan key at all: nothing to say.
+        assert!(plan_events(&json!({"threadId": "th-1"})).is_empty());
+    }
+
+    #[test]
+    fn child_plan_updates_never_reach_the_root_card() {
+        assert_eq!(
+            route_child_notification("turn/plan/updated"),
+            ChildRoute::Consumed
+        );
+        assert_eq!(
+            route_child_notification("item/plan/delta"),
+            ChildRoute::Consumed
+        );
+    }
+
+    #[test]
     fn child_routing_table_fails_open_to_parent() {
         // Child content/lifecycle → the subagent path, deltas included
         // (live-verified: child threads stream them on this wire).
@@ -780,5 +969,77 @@ mod tests {
         );
         assert_eq!(turn_error_message(&json!({"turn": {"id": "t"}})), None);
         assert_eq!(turn_error_message(&json!({"turn": {"error": null}})), None);
+    }
+
+    /// A Codex compaction is a number AND a line in the thread: the gauge alone
+    /// left the thread silent while the popover counted.
+    #[test]
+    fn thread_compacted_emits_boundary_and_stats() {
+        let events = compacted_events(&json!({"trigger": "auto", "preTokens": 190_000}));
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(
+            matches!(
+                &events[0],
+                AgentEvent::ContextWindow { stats }
+                    if stats.compactions_count == 1 && stats.compactions_reason.as_deref() == Some("auto")
+            ),
+            "{:?}",
+            events[0]
+        );
+        assert!(
+            matches!(
+                &events[1],
+                AgentEvent::ContextCompaction {
+                    status: komet_proto::CompactionStatus::Completed,
+                    trigger: Some(trigger),
+                    tokens_before: Some(190_000),
+                    tokens_after: None,
+                    ..
+                } if trigger == "auto"
+            ),
+            "{:?}",
+            events[1]
+        );
+    }
+
+    /// The notification usually carries nothing. That is still a compaction
+    /// that happened — but the unknown fields stay unknown.
+    #[test]
+    fn compaction_without_params_still_completes() {
+        let events = compacted_events(&json!({}));
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(
+            matches!(
+                &events[1],
+                AgentEvent::ContextCompaction {
+                    status: komet_proto::CompactionStatus::Completed,
+                    trigger: None,
+                    tokens_before: None,
+                    tokens_after: None,
+                    summary: None,
+                    ..
+                }
+            ),
+            "{:?}",
+            events[1]
+        );
+        assert!(
+            matches!(
+                &events[0],
+                AgentEvent::ContextWindow { stats }
+                    if stats.compactions_reason.as_deref() == Some("thread compacted")
+            ),
+            "the gauge keeps a readable reason"
+        );
+        // Two compactions in one run must not share a doc part.
+        let first = compacted_events(&json!({}));
+        let second = compacted_events(&json!({}));
+        match (&first[1], &second[1]) {
+            (
+                AgentEvent::ContextCompaction { id: a, .. },
+                AgentEvent::ContextCompaction { id: b, .. },
+            ) => assert_ne!(a, b, "each compaction gets its own id"),
+            other => panic!("expected compaction events: {other:?}"),
+        }
     }
 }

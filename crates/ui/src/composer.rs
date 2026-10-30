@@ -35,7 +35,7 @@ use crate::attachments::{self, StagedAttachment};
 use crate::icons::{self, icon};
 use crate::motion;
 use crate::pickers::Pickers;
-use crate::state::{AppState, Indicator};
+use crate::state::{AppState, Indicator, QueuedSend};
 use crate::theme::Theme;
 
 // ---------------------------------------------------------------------------
@@ -382,75 +382,331 @@ pub fn send_button_mode(run_live: bool, has_text: bool, can_steer: bool) -> Send
     }
 }
 
-/// Find the unresolved input request the panel should serve, if any: an
-/// unresolved input part on the LAST assistant entry — regardless of the
-/// entry's run status. The question stays answerable until the user actually
-/// answers it (user requirement): a run that died under its question (engine
-/// restart reaping it) leaves an aborted entry whose answer the engine
-/// delivers as a resumed turn (`RespondInput`'s dead-run fallback). A newer
-/// assistant entry supersedes an unanswered question. Assistant-entry-scoped,
-/// not last-entry: a steer prompt sent while the agent waits appends a USER
-/// entry after the streaming assistant entry, and a last-entry-only read made
-/// the QuestionPanel vanish exactly when the user typed (earlier forensics;
-/// matches the original composer.tsx, which reads the live-assistant fold —
-/// rebuilt from replay even after the run died).
+/// Start a state reason with a capital: the block reasons are lowercase status
+/// vocabulary (`reconnecting (2, 2.5s)`), the notice that quotes one is prose.
+fn capitalized(reason: &str) -> String {
+    let mut chars = reason.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+/// Notices that report a link you can wait out rather than an action that
+/// failed — those wash amber, not red. The strings come from
+/// `AppState::send_block_reason` plus the composer's held-send lines.
+fn is_link_hold_notice(message: &str) -> bool {
+    if message == "Engine not connected" {
+        return true;
+    }
+    let lower = message.to_ascii_lowercase();
+    [
+        "connecting",
+        "reconnecting",
+        "engine unreachable",
+        "link degraded",
+        "queued",
+    ]
+    .iter()
+    .any(|prefix| lower.starts_with(prefix))
+}
+
+/// The tinted `Notice` row (komet composer.tsx): `flex items-start gap-2
+/// rounded-xl border px-3 py-2 text-[12px] leading-snug` with a 14px
+/// DangerTriangle — a subtle tinted wash, not a bare red stroke. Shared by the
+/// dismissible failure line and the (non-dismissible) outbox hint.
+fn notice_row(message: SharedString, offline: bool, theme: &Theme) -> gpui::Div {
+    let accent = if offline { theme.warning } else { theme.danger };
+    let text_c = if offline {
+        theme.warning_muted
+    } else {
+        theme.danger_muted
+    };
+    let text_c = text_c.opacity(0.9);
+    div()
+        .mx(px(4.0))
+        .mt(px(6.0))
+        .flex()
+        .items_start()
+        .gap(px(8.0))
+        .rounded(px(12.0))
+        .border_1()
+        .border_color(accent.opacity(0.16))
+        .bg(accent.opacity(0.05))
+        .px(px(12.0))
+        .py(px(8.0))
+        .text_size(px(12.0))
+        .line_height(px(16.0))
+        .text_color(text_c)
+        .child(
+            icon(icons::DANGER_TRIANGLE)
+                .size(px(14.0))
+                .mt(px(2.0))
+                .text_color(text_c),
+        )
+        .child(div().min_w_0().child(message))
+}
+
+/// The outbox line: how many messages are parked, plus why the newest one is
+/// waiting — the reason stored with the entry, so the hint tracks the link.
+/// Pure, so the composer's contract is testable without a window.
+fn queued_sends_notice<'a>(
+    queued: impl IntoIterator<Item = &'a QueuedSend>,
+) -> Option<SharedString> {
+    let mut count = 0;
+    let mut last = None;
+    for entry in queued {
+        count += 1;
+        last = Some(entry);
+    }
+    let last = last?;
+    let reason = if last.reason.trim().is_empty() {
+        "engine unreachable"
+    } else {
+        last.reason.as_str()
+    };
+    Some(SharedString::from(format!("Queued {count} — {reason}")))
+}
+
+/// Whether the composer can still act on a request left on `status` in the
+/// assistant entry at `entry_order`. A streaming entry is live; a turn that
+/// finished with the request unanswered is history. A run reaped under its
+/// request (aborted, or no stamped status at all) stays answerable — the
+/// engine delivers the answer as a resumed turn — unless a newer assistant
+/// entry already moved on, exactly as the last-entry read did before.
+fn request_actionable(
+    status: Option<komet_doc::MessageStatus>,
+    entry_order: usize,
+    last_assistant: Option<usize>,
+) -> bool {
+    match status {
+        Some(komet_doc::MessageStatus::Streaming) => true,
+        Some(komet_doc::MessageStatus::Complete) => false,
+        _ => Some(entry_order) == last_assistant,
+    }
+}
+
+/// Every unanswered input, in document order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingInputRequest {
+    pub entry_id: String,
+    pub order: usize,
+    pub request_id: String,
+    pub questions: Vec<UserInputQuestion>,
+    pub actionable: bool,
+}
+
+pub fn pending_input_requests(transcript: &[SessionMessageEntry]) -> Vec<PendingInputRequest> {
+    let last_assistant = transcript
+        .iter()
+        .rposition(|entry| entry.role == MessageRole::Assistant);
+    transcript
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.role == MessageRole::Assistant)
+        .flat_map(move |(entry_order, entry)| {
+            entry
+                .parts
+                .iter()
+                .enumerate()
+                .filter_map(move |(part_order, part)| match part {
+                    MessagePart::Input {
+                        request_id,
+                        questions,
+                        resolved: false,
+                        ..
+                    } => Some(PendingInputRequest {
+                        entry_id: entry.id.clone(),
+                        order: entry_order.saturating_mul(1_000_000) + part_order,
+                        request_id: request_id.clone(),
+                        questions: questions.clone(),
+                        actionable: request_actionable(entry.status, entry_order, last_assistant),
+                    }),
+                    _ => None,
+                })
+        })
+        .collect()
+}
+
+/// The oldest currently actionable question gets the composer dock. Later
+/// questions remain queued and become active after this one is answered.
 pub fn pending_input_request(
     transcript: &[SessionMessageEntry],
 ) -> Option<(String, Vec<UserInputQuestion>)> {
-    transcript
-        .iter()
-        .rev()
-        .find(|entry| entry.role == MessageRole::Assistant)
-        .and_then(|entry| {
-            entry.parts.iter().find_map(|part| match part {
-                MessagePart::Input {
-                    request_id,
-                    questions,
-                    resolved: false,
-                    ..
-                } => Some((request_id.clone(), questions.clone())),
-                _ => None,
-            })
-        })
+    pending_input_request_excluding(transcript, &HashSet::new())
 }
 
-/// A pending interactive permission request: `(request id, kind, tool title,
-/// offered choices, actions)` — destructured positionally at the call sites.
-pub type PendingPermissionRequest = (
-    String,
-    komet_proto::PermissionKind,
-    String,
-    Vec<komet_proto::PermissionChoice>,
-    Vec<komet_proto::AgentPermissionAction>,
-);
+/// Like [`pending_input_request`], but skips requests already answered on this
+/// device: an optimistic answer must not hold the queue behind it while the
+/// doc frame catches up. Once the frame marks it resolved the request drops out
+/// of [`pending_input_requests`] on its own.
+pub fn pending_input_request_excluding(
+    transcript: &[SessionMessageEntry],
+    answered: &HashSet<String>,
+) -> Option<(String, Vec<UserInputQuestion>)> {
+    pending_input_requests(transcript)
+        .into_iter()
+        .find(|request| request.actionable && !answered.contains(&request.request_id))
+        .map(|request| (request.request_id, request.questions))
+}
 
+/// An unanswered permission, with its owning entry and deterministic doc order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingPermissionRequest {
+    pub entry_id: String,
+    pub order: usize,
+    pub request_id: String,
+    pub kind: komet_proto::PermissionKind,
+    pub summary: String,
+    pub choices: Vec<komet_proto::PermissionChoice>,
+    pub actions: Vec<komet_proto::AgentPermissionAction>,
+    /// Epoch-ms deadline of the engine watchdog that auto-denies this request
+    /// when unanswered; `None` when no watchdog is armed (or the doc predates
+    /// the field).
+    pub expires_at: Option<i64>,
+    pub actionable: bool,
+}
+
+pub fn pending_permission_requests(
+    transcript: &[SessionMessageEntry],
+) -> Vec<PendingPermissionRequest> {
+    let last_assistant = transcript
+        .iter()
+        .rposition(|entry| entry.role == MessageRole::Assistant);
+    transcript
+        .iter()
+        .enumerate()
+        .filter(|(_, entry)| entry.role == MessageRole::Assistant)
+        .flat_map(move |(entry_order, entry)| {
+            entry
+                .parts
+                .iter()
+                .enumerate()
+                .filter_map(move |(part_order, part)| match part {
+                    MessagePart::Permission {
+                        request_id,
+                        permission_kind,
+                        summary,
+                        choices,
+                        actions,
+                        resolved: false,
+                        expires_at,
+                        ..
+                    } => Some(PendingPermissionRequest {
+                        entry_id: entry.id.clone(),
+                        order: entry_order.saturating_mul(1_000_000) + part_order,
+                        request_id: request_id.clone(),
+                        kind: permission_kind.clone(),
+                        summary: summary.clone(),
+                        choices: choices.clone(),
+                        actions: actions.clone(),
+                        expires_at: *expires_at,
+                        actionable: request_actionable(entry.status, entry_order, last_assistant),
+                    }),
+                    _ => None,
+                })
+        })
+        .collect()
+}
+
+/// The oldest currently actionable permission is served by the composer gate.
 pub fn pending_permission_request(
     transcript: &[SessionMessageEntry],
 ) -> Option<PendingPermissionRequest> {
-    transcript
+    pending_permission_requests(transcript)
+        .into_iter()
+        .find(|request| request.actionable)
+}
+
+/// Which control a global "jump to the next request" should focus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestTarget {
+    Question,
+    Permission,
+}
+
+/// The oldest actionable request across questions and permissions, in doc
+/// order. `mod-shift-q` targets this: the keyboard must reach a pending
+/// question or approval without hunting for it, and answered-on-this-device
+/// requests must not hold the jump.
+pub fn next_actionable_request(
+    transcript: &[SessionMessageEntry],
+    answered: &HashSet<String>,
+) -> Option<(String, RequestTarget)> {
+    let questions = pending_input_requests(transcript)
+        .into_iter()
+        .filter(|request| request.actionable && !answered.contains(&request.request_id))
+        .map(|request| (request.order, request.entry_id, RequestTarget::Question));
+    let permissions = pending_permission_requests(transcript)
+        .into_iter()
+        .filter(|request| request.actionable && !answered.contains(&request.request_id))
+        .map(|request| (request.order, request.entry_id, RequestTarget::Permission));
+    questions
+        .chain(permissions)
+        .min_by_key(|(order, _, _)| *order)
+        .map(|(_, entry_id, target)| (entry_id, target))
+}
+
+/// What a keypress means on the approval card. Pure so the contract is
+/// testable: Escape never decides, and Enter never implies an always-allow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionKey {
+    /// 1-9, index into the rendered actions.
+    Choose(usize),
+    /// Tab / Shift-Tab move the highlighted action.
+    Next,
+    Prev,
+    /// Enter: the plain Allow (or the highlighted action), never an
+    /// `AllowAlways` the user did not pick.
+    Primary,
+    /// Escape hands the keyboard back to the stop window; it never decides.
+    ArmStop,
+    Ignore,
+}
+
+pub fn permission_key(key: &str) -> PermissionKey {
+    if let Ok(digit) = key.parse::<usize>() {
+        return if (1..=9).contains(&digit) {
+            PermissionKey::Choose(digit - 1)
+        } else {
+            PermissionKey::Ignore
+        };
+    }
+    match key {
+        "enter" => PermissionKey::Primary,
+        "tab" => PermissionKey::Next,
+        "shift-tab" | "backtab" => PermissionKey::Prev,
+        "escape" => PermissionKey::ArmStop,
+        _ => PermissionKey::Ignore,
+    }
+}
+
+/// Index of the plain `Allow` among the card's actions. `None` when the only
+/// allow is `AllowAlways`: Enter must not widen a permission, so that choice
+/// stays an explicit click or digit.
+pub fn primary_permission_index(choices: &[komet_proto::PermissionChoice]) -> Option<usize> {
+    choices
         .iter()
-        .rev()
-        .find(|e| e.role == MessageRole::Assistant)
-        .and_then(|entry| {
-            entry.parts.iter().find_map(|part| match part {
-                MessagePart::Permission {
-                    request_id,
-                    permission_kind,
-                    summary,
-                    choices,
-                    actions,
-                    resolved: false,
-                    ..
-                } => Some((
-                    request_id.clone(),
-                    permission_kind.clone(),
-                    summary.clone(),
-                    choices.clone(),
-                    actions.clone(),
-                )),
-                _ => None,
-            })
-        })
+        .position(|choice| matches!(choice, komet_proto::PermissionChoice::Allow))
+}
+
+/// Remove one queued prompt. `false` when the index is gone (the queue drained
+/// between paint and click), so a stale click never drops someone else's prompt.
+fn cancel_queued<T>(queue: &mut VecDeque<T>, index: usize) -> bool {
+    if index >= queue.len() {
+        return false;
+    }
+    queue.remove(index);
+    true
+}
+
+/// The queue banner's label. `None` (no banner) when nothing is queued.
+fn prompt_queue_summary(len: usize) -> Option<SharedString> {
+    match len {
+        0 => None,
+        1 => Some(SharedString::from("1 prompt queued")),
+        n => Some(SharedString::from(format!("{n} prompts queued"))),
+    }
 }
 
 /// How many command / path lines the permission card keeps visible. A
@@ -472,6 +728,23 @@ fn permission_detail_lines(detail: &str) -> (Vec<SharedString>, usize) {
     let truncated_by = lines.len().saturating_sub(PERMISSION_DETAIL_MAX_LINES);
     lines.truncate(PERMISSION_DETAIL_MAX_LINES);
     (lines, truncated_by)
+}
+
+/// Human countdown to the host watchdog's auto-deny, e.g. `Auto-denies in
+/// 9:58`. `None` when no watchdog is armed for this request; once the
+/// deadline has passed it says `Auto-denying…` while the engine's Deny is
+/// already in flight — the card must never look like it will wait forever.
+pub fn permission_countdown_label(now_ms: i64, expires_at: Option<i64>) -> Option<SharedString> {
+    let remaining_ms = expires_at?.saturating_sub(now_ms);
+    if remaining_ms <= 0 {
+        return Some(SharedString::from("Auto-denying…"));
+    }
+    let seconds = (remaining_ms + 999) / 1_000;
+    Some(SharedString::from(format!(
+        "Auto-denies in {}:{:02}",
+        seconds / 60,
+        seconds % 60
+    )))
 }
 
 pub fn permission_request_resolved(transcript: &[SessionMessageEntry], request_id: &str) -> bool {
@@ -615,13 +888,31 @@ impl Wizard {
         }
     }
 
-    /// Answers per question: free text overrides picked labels.
+    /// The typed override held for the visible page — the dock's free-text
+    /// field is re-bound to it whenever the page changes.
+    pub fn typed(&self) -> &str {
+        self.typed.get(self.page).map(String::as_str).unwrap_or("")
+    }
+
+    /// Whether the visible question takes an answer the host did not offer
+    /// (the "Other" field). A question that only allows its own options never
+    /// shows — nor accepts — free text.
+    pub fn allows_free_text(&self) -> bool {
+        self.current().is_some_and(|q| q.allow_free_text)
+    }
+
+    /// Answers per question: free text overrides picked labels, but only where
+    /// the host allows free text in the first place.
     pub fn answers(&self) -> Vec<UserInputAnswer> {
         self.questions
             .iter()
             .enumerate()
             .map(|(ix, q)| {
-                let typed = self.typed.get(ix).map(|s| s.trim()).unwrap_or("");
+                let typed = if q.allow_free_text {
+                    self.typed.get(ix).map(|s| s.trim()).unwrap_or("")
+                } else {
+                    ""
+                };
                 let labels = if !typed.is_empty() {
                     vec![typed.to_string()]
                 } else {
@@ -638,6 +929,7 @@ impl Wizard {
                 UserInputAnswer {
                     question_id: q.id.clone(),
                     labels,
+                    free_text: (!typed.is_empty()).then(|| typed.to_string()),
                 }
             })
             .collect()
@@ -3710,12 +4002,30 @@ pub struct Composer {
     failure: Option<SharedString>,
     wizard: Option<Wizard>,
     wizard_focus: FocusHandle,
+    /// The dock's own "Other" field. The prompt input stays the prompt: a
+    /// pending question never borrows it, so steering and typing keep working.
+    wizard_input: Entity<ComposerInput>,
     permission_focus: FocusHandle,
+    /// Highlighted action on the approval card (Tab/Shift-Tab). `None` = no
+    /// explicit pick, so Enter takes the plain Allow.
+    permission_cursor: Option<usize>,
+    /// The request `permission_cursor` belongs to. A request resolved elsewhere
+    /// (watchdog auto-deny, another device) never runs `answer_permission`, so
+    /// the cursor is dropped when the pending id changes — a stale highlight
+    /// must not make the next card's Enter deny.
+    permission_cursor_for: Option<String>,
+    /// Set by send/answer/decision so the next paint hands the keyboard back to
+    /// the prompt (no action can leave focus on a retired surface).
+    refocus_input_pending: bool,
     /// Requests already answered locally (suppresses the panel until the doc
     /// frame marks them resolved).
     answered_requests: HashSet<String>,
     advance_task: Option<Task<()>>,
     send_task: Option<Task<()>>,
+    /// Countdown ticker for the permission watchdog, tagged with the deadline
+    /// it serves: a new deadline replaces it, and no pending permission (or
+    /// the same deadline already running) leaves it alone.
+    permission_tick: Option<(i64, Task<()>)>,
     // -- compact/expanded flip state (hysteresis; see `composer_flip`) --
     /// Current layout mode (persisted across frames — never derived fresh).
     expanded_mode: bool,
@@ -3756,6 +4066,7 @@ pub struct Composer {
     _observe: Subscription,
     _pickers_observe: Subscription,
     _input_events: Subscription,
+    _wizard_input_events: Subscription,
 }
 
 impl EventEmitter<ComposerEvent> for Composer {}
@@ -3804,13 +4115,17 @@ impl Composer {
     /// Queue a prompt as a new turn (in-place prompt Edit → Send).
     pub fn submit_text(&mut self, text: impl Into<String>, cx: &mut Context<Self>) {
         let text = text.into().trim().to_string();
-        if text.is_empty() || self.sending || self.send_blocked(cx) || self.wizard.is_some() {
+        // A pending question no longer blocks the composer: steering (or
+        // queueing) while the agent waits is exactly what the dock is for.
+        if text.is_empty() || self.sending || self.send_blocked(cx) {
             return;
         }
         if self.run_live(cx) {
             self.interrupt(cx);
         }
-        self.send(text, false, cx);
+        // The text was handed in, not typed: a draft in the input is not its
+        // owner, so the send must leave the input and its files alone.
+        self.send(text, false, false, cx);
     }
 
     /// Resubmit the last full-turn prompt verbatim (the error chip's
@@ -3831,7 +4146,7 @@ impl Composer {
         cx: &mut Context<Self>,
     ) {
         let text = text.into().trim().to_string();
-        if text.is_empty() || self.sending || self.send_blocked(cx) || self.wizard.is_some() {
+        if text.is_empty() || self.sending || self.send_blocked(cx) {
             return;
         }
         self.send_edit(target_message_id, text, cx);
@@ -3893,6 +4208,22 @@ impl Composer {
             ComposerInputEvent::Cancelled => {}
         });
         let current_key = state.read(cx).selected_chat.clone().unwrap_or_default();
+        // The question dock's "Other" field. Escape here is the question's
+        // cancel (never the prompt's stop window), so it is wired at the input.
+        let wizard_input = cx.new(|cx| {
+            let mut input = ComposerInput::new("Type your own answer…", cx);
+            input.enable_escape_cancel();
+            input
+        });
+        let wizard_input_events =
+            cx.subscribe(&wizard_input, |this: &mut Self, _, event, cx| match event {
+                ComposerInputEvent::Edited | ComposerInputEvent::CursorMoved => {
+                    this.on_wizard_edited(cx)
+                }
+                ComposerInputEvent::Submitted => this.on_wizard_submit(cx),
+                ComposerInputEvent::Cancelled => this.wizard_cancel(cx),
+                _ => {}
+            });
         let mut composer = Self {
             state,
             input,
@@ -3918,10 +4249,15 @@ impl Composer {
             failure: None,
             wizard: None,
             wizard_focus: cx.focus_handle(),
+            wizard_input,
             permission_focus: cx.focus_handle(),
+            permission_cursor: None,
+            permission_cursor_for: None,
+            refocus_input_pending: false,
             answered_requests: HashSet::new(),
             advance_task: None,
             send_task: None,
+            permission_tick: None,
             expanded_mode: false,
             flip_epoch: 0,
             compact_capacity: 0.0,
@@ -3939,6 +4275,7 @@ impl Composer {
             _observe: observe,
             _pickers_observe: pickers_observe,
             _input_events: input_events,
+            _wizard_input_events: wizard_input_events,
         };
         composer.prefetch_slash_commands(cx);
         // Dev knob: pre-stage attachments (drop/paste can't be synthesized on
@@ -4258,15 +4595,6 @@ impl Composer {
     }
 
     fn on_input_edited(&mut self, cx: &mut Context<Self>) {
-        if self.wizard.is_some() {
-            if self.mention.token.is_some() || self.mention_task.is_some() {
-                self.reset_mention(None, cx);
-            }
-            if self.slash.token.is_some() || self.slash_task.is_some() {
-                self.reset_slash(None, cx);
-            }
-            return;
-        }
         let (text, cursor) = {
             let input = self.input.read(cx);
             (input.text().to_string(), input.cursor_offset())
@@ -4964,12 +5292,41 @@ impl Composer {
         ))
     }
 
+    /// Shell-driven `mod-shift-q`: focus the oldest actionable request's first
+    /// control and return its entry so the transcript can bring it into view.
+    /// Returns `None` when nothing is waiting (the caller keeps the prompt).
+    pub fn focus_next_request(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let (entry_id, target) = {
+            let state = self.state.read(cx);
+            next_actionable_request(&state.transcript, &self.answered_requests)
+        }?;
+        match target {
+            RequestTarget::Permission => window.focus(&self.permission_focus, cx),
+            RequestTarget::Question => {
+                // An options-only question mounts no input; the dock's own
+                // focus handle is what carries digits/Enter/Escape.
+                let free_text = self.wizard.as_ref().is_some_and(Wizard::allows_free_text);
+                let focus = if free_text {
+                    self.wizard_input.read(cx).focus_handle.clone()
+                } else {
+                    self.wizard_focus.clone()
+                };
+                window.focus(&focus, cx);
+            }
+        }
+        Some(entry_id)
+    }
+
     fn on_state_changed(&mut self, cx: &mut Context<Self>) {
         let (key, pending) = {
             let s = self.state.read(cx);
             (
                 s.selected_chat.clone().unwrap_or_default(),
-                pending_input_request(&s.transcript),
+                pending_input_request_excluding(&s.transcript, &self.answered_requests),
             )
         };
 
@@ -5003,11 +5360,17 @@ impl Composer {
             self.last_rendered_height = 0.0;
             self.route_snap_until = Some(Instant::now() + Duration::from_millis(ROUTE_SNAP_MS));
             self.input.update(cx, |input, cx| input.set_text(draft, cx));
+            // Reopening the chat a held send was typed in is the moment it can
+            // leave; the link-flip drain in the shell sees whichever chat is
+            // selected then, so entries for other chats stay parked.
+            if self.send_block(cx).is_none() {
+                self.drain_queued_sends(cx);
+            }
         }
 
-        // Question panel lifecycle (wizard state cached per request id).
+        // Question dock lifecycle (wizard state cached per request id).
         match pending {
-            Some((request_id, questions)) if !self.answered_requests.contains(&request_id) => {
+            Some((request_id, questions)) => {
                 let same = self
                     .wizard
                     .as_ref()
@@ -5016,10 +5379,10 @@ impl Composer {
                     self.reset_mention(None, cx);
                     self.wizard = Some(Wizard::new(request_id, questions));
                     self.advance_task = None;
-                    // The shared input becomes the panel's free-text override.
-                    self.input.update(cx, |input, cx| {
-                        input.set_placeholder("Type your own answer, or pick an option above", cx)
-                    });
+                    // The dock owns its own field; the prompt input keeps the
+                    // user's draft untouched.
+                    self.wizard_input
+                        .update(cx, |input, cx| input.set_text("", cx));
                 }
             }
             _ => {
@@ -5032,8 +5395,8 @@ impl Composer {
                     if released {
                         self.wizard = None;
                         self.advance_task = None;
-                        self.input
-                            .update(cx, |input, cx| input.set_placeholder("Do anything…", cx));
+                        self.wizard_input
+                            .update(cx, |input, cx| input.set_text("", cx));
                     }
                 }
             }
@@ -5055,10 +5418,17 @@ impl Composer {
             // If a permission was answered but transcript now shows no pending
             // permission yet still not marked resolved (e.g. older doc), allow
             // re-render to fall through to wizard/composer instead of stale gate.
-            if let Some((pending_rid, _, _, _, _)) = pending_permission_request(&transcript) {
-                // pending exists — keep answered gate; nothing to do
-                let _ = pending_rid;
+            if let Some(pending) = pending_permission_request(&transcript) {
+                let pending_rid = pending.request_id;
+                // A different request means the highlight was chosen for one
+                // that is now gone (auto-denied, resolved elsewhere): reset it
+                // so Enter on the new card takes the plain Allow.
+                if self.permission_cursor_for.as_deref() != Some(pending_rid.as_str()) {
+                    self.permission_cursor = None;
+                    self.permission_cursor_for = Some(pending_rid);
+                }
             } else {
+                self.permission_cursor_for = None;
                 // No pending permission — any permission-origin answered id that
                 // isn't an input can be cleared if transcript is non-empty (superseded)
                 let stale: Vec<String> = self
@@ -5081,6 +5451,9 @@ impl Composer {
                 }
             }
         }
+        // Watchdog countdown: keeps the approval card's remaining-time label
+        // moving without a doc frame. The engine still owns the auto-deny.
+        self.sync_permission_countdown(cx);
         // Prompt-queue drain: when the session becomes idle and there are
         // queued prompts, pop and send the next one automatically.
         if !self.run_live(cx) && !self.prompt_queue.is_empty() {
@@ -5126,15 +5499,6 @@ impl Composer {
     }
 
     fn on_submit(&mut self, cx: &mut Context<Self>) {
-        if self.wizard.is_some() {
-            // Enter inside the panel's free-text input submits the page.
-            let typed = self.input.read(cx).text().trim().to_string();
-            if let Some(w) = self.wizard.as_mut() {
-                w.set_typed(typed);
-            }
-            self.wizard_advance(cx);
-            return;
-        }
         let text = self.input.read(cx).text().trim().to_string();
         if self.handle_komet_command(&text, cx) {
             return;
@@ -5144,9 +5508,12 @@ impl Composer {
             _ if text.is_empty() && self.staged().is_empty() => {}
             _ if self.send_blocked(cx) => {}
             SendButtonMode::Queue => self.enqueue_prompt(text, false, cx),
-            SendButtonMode::Send => self.send(text, false, cx),
-            SendButtonMode::Steer => self.send(text, true, cx),
+            SendButtonMode::Send => self.send(text, false, true, cx),
+            SendButtonMode::Steer => self.send(text, true, true, cx),
         }
+        // Send is a hand-off, not an exit: the keyboard stays on the prompt.
+        self.refocus_input_pending = true;
+        cx.notify();
     }
 
     /// Execute the Komet-owned commands that have a safe local equivalent.
@@ -5267,6 +5634,7 @@ impl Composer {
         self.input.update(cx, |input, cx| input.set_text("", cx));
         self.drafts.remove(&self.current_key);
         self.failure = None;
+        self.refocus_input_pending = true;
         cx.notify();
     }
 
@@ -5281,17 +5649,134 @@ impl Composer {
                     .or_default()
                     .extend(item.staged);
             }
-            self.send(item.text, item.steer, cx);
+            self.send(item.text, item.steer, false, cx);
         }
+    }
+
+    /// Hand the offline outbox back to the send path (transparency plan
+    /// Task 10). The shell calls this when the link flips to `Ready`, and the
+    /// chat-key swap calls it when the user reopens the chat a held send
+    /// belongs to. Only entries parked under the current chat are taken —
+    /// another chat's text would otherwise run in this chat's project and
+    /// sandbox. Taking before sending is the dedupe guarantee: the texts are
+    /// out of the state before the first send runs, so a link that dies
+    /// mid-drain has `send()` re-park that one text once — nothing replays,
+    /// nothing is lost.
+    pub fn drain_queued_sends(&mut self, cx: &mut Context<Self>) {
+        let chat_key = self.current_key.clone();
+        let queued = self
+            .state
+            .update(cx, |state, _| state.take_queued_sends_for(&chat_key));
+        if queued.is_empty() {
+            return;
+        }
+        for text in queued {
+            // The first send puts the composer back into `sending`, so the rest
+            // normally ride the local prompt queue, which drains itself at the
+            // next idle turn. Either route keeps the text alive exactly once.
+            let sendable = !self.sending
+                && !self.send_blocked(cx)
+                && self.state.read(cx).send_block_reason().is_none();
+            if sendable {
+                self.submit_text(text, cx);
+            } else {
+                // Re-park without the input-clearing path: the text already
+                // left the input when it was queued, and the draft staged
+                // since then is not this message's to take.
+                self.prompt_queue.push_back(QueuedPrompt {
+                    text,
+                    steer: false,
+                    staged: Vec::new(),
+                });
+            }
+        }
+        cx.notify();
+    }
+
+    /// Why a send cannot leave right now (`None` = it can). The state narrates
+    /// the link; a vanished engine handle is blocked even while that narration
+    /// still says `Ready`, because teardown clears the handle without a frame.
+    fn send_block(&self, cx: &App) -> Option<String> {
+        let state = self.state.read(cx);
+        if let Some(reason) = state.send_block_reason() {
+            return Some(reason);
+        }
+        if state.engine().is_none() {
+            return Some("engine unreachable — press Retry".to_string());
+        }
+        None
+    }
+
+    /// Park a send the link cannot carry and show its named reason. The input
+    /// clears the way a successful send does — the text now lives in the outbox,
+    /// so leaving it here would deliver it twice. That only holds when the text
+    /// came from the input: a replayed text (outbox drain, prompt queue) has to
+    /// be put back rather than overwrite or clear an unrelated draft. Files are
+    /// the exception: the outbox is text-only, and a text-only copy would
+    /// silently drop them, so a send with staged attachments stays exactly
+    /// where it is.
+    fn hold_send(
+        &mut self,
+        text: String,
+        reason: String,
+        from_input: bool,
+        cx: &mut Context<Self>,
+    ) {
+        // The outbox is text-only: a text-only copy would silently drop the
+        // files, so a send with staged attachments stays where it is. Only a
+        // text that was typed here is already there; a replayed text (prompt
+        // queue, outbox drain) is put back into an empty input instead of
+        // being lost.
+        if !self.staged().is_empty() {
+            if !from_input && self.input.read(cx).text().trim().is_empty() {
+                self.input
+                    .update(cx, |input, cx| input.set_text(text.clone(), cx));
+            }
+            self.failure = Some(
+                format!(
+                    "{} — send blocked; your files stay in the composer",
+                    capitalized(reason.as_str())
+                )
+                .into(),
+            );
+            cx.notify();
+            return;
+        }
+        if text.trim().is_empty() {
+            self.failure = Some(format!("{} — send blocked", capitalized(&reason)).into());
+            cx.notify();
+            return;
+        }
+        let chat_key = self.current_key.clone();
+        self.state.update(cx, |state, _| {
+            state.queue_send(chat_key, text);
+        });
+        if from_input {
+            self.input.update(cx, |input, cx| input.set_text("", cx));
+            self.drafts.remove(&self.current_key);
+        }
+        self.failure = None;
+        cx.notify();
     }
 
     /// Queue a Run (or Steer) doc command with an optimistic echo. New chats
     /// thread the picked config in: worktree creation (when the isolated toggle
     /// is on), `Mutate createChat` with the `ChatConfig` + cwd, and the model /
     /// reasoning / options on the Run request itself (§1.7).
-    fn send(&mut self, text: String, steer: bool, cx: &mut Context<Self>) {
+    /// `from_input` says the text was composed in the prompt field right now:
+    /// only then do the input, the draft cache and the staged files follow it
+    /// out. A replayed text (outbox drain, prompt queue) must leave the draft
+    /// the user prepared in the meantime alone.
+    fn send(&mut self, text: String, steer: bool, from_input: bool, cx: &mut Context<Self>) {
         if !steer && !text.trim().is_empty() {
             self.last_sent = Some(text.clone());
+        }
+        // A downed link is not a dead button: park the text in the state outbox
+        // and say why (transparency plan Task 10). `send_block` also covers a
+        // vanished engine handle, which the status frame reports late.
+        if let Some(reason) = self.send_block(cx) {
+            self.hold_send(text, reason, from_input, cx);
+            return;
         }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.failure = Some("Engine not connected".into());
@@ -5354,12 +5839,16 @@ impl Composer {
             .is_some_and(|s| local_device_id.as_deref() != Some(s.device_id.as_str()));
         // Snapshot-and-clear NOW (use-attachments.ts takeAttachments): the
         // strip empties the instant you hit send; a failure hands the files
-        // back into the chat's stash.
-        let staged = self
-            .attachments
-            .remove(&self.current_key)
-            .unwrap_or_default();
-        self.preview = None;
+        // back into the chat's stash. A replayed text has no files of its own,
+        // so the current draft's stash is left alone.
+        let staged = if from_input {
+            self.preview = None;
+            self.attachments
+                .remove(&self.current_key)
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let message_id = uuid::Uuid::new_v4().to_string();
         let created_at = chrono::Utc::now().timestamp_millis();
 
@@ -5420,8 +5909,10 @@ impl Composer {
             cx.notify();
         });
 
-        self.input.update(cx, |input, cx| input.set_text("", cx));
-        self.drafts.remove(&self.current_key);
+        if from_input {
+            self.input.update(cx, |input, cx| input.set_text("", cx));
+            self.drafts.remove(&self.current_key);
+        }
         self.failure = None;
         self.sending = true;
         cx.emit(ComposerEvent::Sent {
@@ -5439,8 +5930,8 @@ impl Composer {
         // drive native CLI sandbox flags, Cursor passes `sandbox` through the
         // shim into SDK params, Cline maps Full access natively via
         // `auto_approve` while ReadOnly/WorkspaceWrite ride the Komet-side
-        // ACP permission bridge, and Hermes/Pi have no native sandbox so the
-        // bridge IS their access control.
+        // ACP permission bridge, and Hermes/Pi/Qoder have no native sandbox
+        // so the bridge IS their access control.
         let harness_supports_sandbox = resolved.harness.as_ref().is_none_or(|h| {
             !matches!(
                 h,
@@ -5450,6 +5941,7 @@ impl Composer {
                     | komet_proto::HarnessId::Pi
                     | komet_proto::HarnessId::Antigravity
                     | komet_proto::HarnessId::Cline
+                    | komet_proto::HarnessId::Qoder
             )
         });
         let sandbox_options = if harness_supports_sandbox {
@@ -5751,6 +6243,20 @@ impl Composer {
     }
 
     fn send_edit(&mut self, target_message_id: String, text: String, cx: &mut Context<Self>) {
+        // An edit rewrites the transcript in place, so it cannot ride the text
+        // outbox (a drained copy would land as a new turn). Name why it is
+        // held instead of failing generically — the edited text stays put.
+        if let Some(reason) = self.send_block(cx) {
+            self.failure = Some(
+                format!(
+                    "{} — edit not sent; it stays in the transcript until the link is back",
+                    capitalized(reason.as_str())
+                )
+                .into(),
+            );
+            cx.notify();
+            return;
+        }
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             self.failure = Some("Engine not connected".into());
             cx.notify();
@@ -5777,6 +6283,7 @@ impl Composer {
                     | komet_proto::HarnessId::Pi
                     | komet_proto::HarnessId::Antigravity
                     | komet_proto::HarnessId::Cline
+                    | komet_proto::HarnessId::Qoder
             )
         });
         let sandbox_options = if harness_supports_sandbox {
@@ -5943,28 +6450,82 @@ impl Composer {
 
     // ---- wizard glue ----
 
+    /// Repaint twice a second while the approval card counts down; stops when
+    /// the request resolves or a different deadline takes over. The engine
+    /// owns the auto-deny — this only keeps the visible label honest.
+    fn sync_permission_countdown(&mut self, cx: &mut Context<Self>) {
+        let expires_at = {
+            let state = self.state.read(cx);
+            pending_permission_request(&state.transcript).and_then(|request| request.expires_at)
+        };
+        let Some(deadline) = expires_at else {
+            self.permission_tick = None;
+            return;
+        };
+        if self
+            .permission_tick
+            .as_ref()
+            .is_some_and(|(served, _)| *served == deadline)
+        {
+            return;
+        }
+        self.permission_tick = Some((
+            deadline,
+            cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(500))
+                        .await;
+                    let Some(next) = this
+                        .update(cx, |composer, cx| {
+                            let state = composer.state.read(cx);
+                            let pending = pending_permission_request(&state.transcript)
+                                .and_then(|request| request.expires_at);
+                            cx.notify();
+                            pending
+                        })
+                        .ok()
+                    else {
+                        break;
+                    };
+                    if next != Some(deadline) {
+                        break;
+                    }
+                }
+            }),
+        ));
+    }
+
     fn wizard_select(&mut self, option_ix: usize, cx: &mut Context<Self>) {
         let Some(wizard) = self.wizard.as_mut() else {
             return;
         };
         let step = wizard.select(option_ix);
-        let has_pick = wizard.page_has_pick();
-        self.input.update(cx, |input, cx| {
-            input.set_placeholder(
-                if has_pick {
-                    "Type your own answer, or leave this blank to use the selected option"
-                } else {
-                    "Type your own answer, or pick an option above"
-                },
-                cx,
-            )
-        });
         match step {
             WizardStep::AutoAdvance => self.schedule_auto_advance(cx),
             WizardStep::Done(answers) => self.wizard_finish(answers, cx),
             WizardStep::Stay => {}
         }
         cx.notify();
+    }
+
+    /// The dock's "Other" field mirrored into the reducer.
+    fn on_wizard_edited(&mut self, cx: &mut Context<Self>) {
+        if self.wizard.is_none() {
+            return;
+        }
+        let text = self.wizard_input.read(cx).text().to_string();
+        if let Some(wizard) = self.wizard.as_mut() {
+            wizard.set_typed(text);
+        }
+        cx.notify();
+    }
+
+    /// Enter in the dock's field submits the page (Shift-Enter stays a
+    /// newline, owned by the input itself).
+    fn on_wizard_submit(&mut self, cx: &mut Context<Self>) {
+        self.on_wizard_edited(cx);
+        self.wizard_advance(cx);
     }
 
     fn schedule_auto_advance(&mut self, cx: &mut Context<Self>) {
@@ -5981,21 +6542,36 @@ impl Composer {
         let Some(wizard) = self.wizard.as_mut() else {
             return;
         };
-        match wizard.advance() {
+        let step = wizard.advance();
+        let typed = wizard.typed().to_string();
+        match step {
             WizardStep::Done(answers) => self.wizard_finish(answers, cx),
             _ => {
-                // Moving on: clear the shared free-text input for the next page.
-                self.input.update(cx, |input, cx| input.set_text("", cx));
+                // Re-bind the dock field to the page's own typed answer.
+                self.wizard_input
+                    .update(cx, |input, cx| input.set_text(typed, cx));
                 cx.notify();
             }
         }
     }
 
     fn wizard_back(&mut self, cx: &mut Context<Self>) {
-        if let Some(wizard) = self.wizard.as_mut() {
-            wizard.back();
+        let Some(wizard) = self.wizard.as_mut() else {
+            return;
+        };
+        if wizard.back() {
+            let typed = wizard.typed().to_string();
+            self.wizard_input
+                .update(cx, |input, cx| input.set_text(typed, cx));
             cx.notify();
         }
+    }
+
+    /// Escape (or the Cancel button): resolve the question with no answers.
+    /// Every harness maps an empty answer set to decline/cancel — never to an
+    /// implicit allow.
+    fn wizard_cancel(&mut self, cx: &mut Context<Self>) {
+        self.wizard_finish(Vec::new(), cx);
     }
 
     /// Submit RespondInput and retire the panel.
@@ -6005,11 +6581,10 @@ impl Composer {
         };
         self.advance_task = None;
         self.answered_requests.insert(wizard.request_id.clone());
-        self.input.update(cx, |input, cx| {
-            input.set_text("", cx);
-            // The panel borrowed the composer input; hand back its identity.
-            input.set_placeholder("Do anything…", cx);
-        });
+        // Only the dock field is cleared; a draft in the prompt input is the
+        // user's and survives the answer.
+        self.wizard_input
+            .update(cx, |input, cx| input.set_text("", cx));
         let Some(engine) = self.state.read(cx).engine().cloned() else {
             return;
         };
@@ -6046,23 +6621,25 @@ impl Composer {
             cx.background_executor().timer(Duration::from_secs(2)).await;
             this.update(cx, |composer, cx| {
                 let transcript = composer.state.read(cx).transcript.clone();
-                let still_pending = pending_input_request(&transcript)
-                    .is_some_and(|(pending_id, _)| pending_id == request_id);
+                let still_pending = pending_input_requests(&transcript)
+                    .iter()
+                    .any(|request| request.request_id == request_id && request.actionable);
                 if still_pending && composer.answered_requests.remove(&request_id) {
                     cx.notify();
                 }
             })
             .ok();
         }));
+        self.refocus_input_pending = true;
         cx.notify();
     }
 
     fn on_wizard_key(&mut self, event: &KeyDownEvent, window: &Window, cx: &mut Context<Self>) {
-        // Keys bubbling out of the free-text input must not double-handle:
-        // digits select options only while the input is empty, and Enter is the
-        // input's own Submit action when it has focus.
-        let input_focused = self.input.read(cx).focus_handle.is_focused(window);
-        let input_empty = self.input.read(cx).is_empty();
+        // Keys bubbling out of the dock's field must not double-handle: digits
+        // select options only while that field is empty, and Enter is the
+        // field's own Submit action when it has focus.
+        let input_focused = self.wizard_input.read(cx).focus_handle.is_focused(window);
+        let input_empty = self.wizard_input.read(cx).is_empty();
         let key = event.keystroke.key.as_str();
         if let Ok(digit) = key.parse::<usize>()
             && (1..=9).contains(&digit)
@@ -6070,7 +6647,7 @@ impl Composer {
             if !input_focused || input_empty {
                 self.wizard_select(digit - 1, cx);
                 // Consumed as a selection: stop the platform from also
-                // inserting the digit into the focused free-text input.
+                // inserting the digit into the focused field.
                 cx.stop_propagation();
             }
         } else if key == "enter" {
@@ -6078,8 +6655,11 @@ impl Composer {
                 self.wizard_advance(cx);
                 cx.stop_propagation();
             }
-        } else if key == "escape" && (!input_focused || input_empty) {
-            self.wizard_back(cx);
+        } else if key == "escape" {
+            // Escape is the question's cancel — never the prompt's stop
+            // window. When the field has focus its own binding already
+            // emitted `Cancelled`; this covers focus on the dock chrome.
+            self.wizard_cancel(cx);
             cx.stop_propagation();
         }
     }
@@ -6092,7 +6672,14 @@ impl Composer {
         actions: Vec<komet_proto::AgentPermissionAction>,
         cx: &mut Context<Self>,
     ) {
-        let key = event.keystroke.key.as_str();
+        // `keystroke.key` is the unmodified name, so Shift-Tab arrives as
+        // "tab" with the shift flag — spell it the way `permission_key`
+        // matches, or the Prev arm can never fire.
+        let key = if event.keystroke.key == "tab" && event.keystroke.modifiers.shift {
+            "shift-tab"
+        } else {
+            event.keystroke.key.as_str()
+        };
 
         // Build resolved actions (mirroring render_permission_panel logic)
         let mut resolved_actions: Vec<komet_proto::PermissionChoice> = Vec::new();
@@ -6109,78 +6696,89 @@ impl Composer {
         }
 
         // Digit keys select actions by index (1-9)
-        if let Ok(digit) = key.parse::<usize>() {
-            if (1..=9).contains(&digit) && digit <= resolved_actions.len() {
-                let decision = resolved_actions[digit - 1].clone();
-                let updated =
-                    if matches!(decision, komet_proto::PermissionChoice::AllowAlways { .. }) {
-                        let mut opts = komet_proto::SandboxOptions::from_level(
-                            self.state.read(cx).access_mode,
-                        );
-                        if let Some(perms) = &mut opts.opencode {
-                            // Update the existing "*" pattern to Allow (replacing, not prepending)
-                            if let Some(pos) =
-                                perms.bash.patterns.iter().position(|(p, _)| p == "*")
-                            {
-                                perms.bash.patterns[pos] = ("*".into(), komet_proto::Perm::Allow);
-                            } else {
-                                perms
-                                    .bash
-                                    .patterns
-                                    .push(("*".into(), komet_proto::Perm::Allow));
-                            }
-                        }
-                        Some(opts)
-                    } else {
-                        None
-                    };
-                self.send_permission_decision(request_id, decision, updated, cx);
+        let len = resolved_actions.len();
+        match permission_key(key) {
+            PermissionKey::Choose(index) => {
+                if let Some(decision) = resolved_actions.get(index).cloned() {
+                    self.answer_permission(request_id, decision, cx);
+                    cx.stop_propagation();
+                }
+            }
+            PermissionKey::Primary => {
+                // Tab pick first; otherwise the plain Allow — never an
+                // AllowAlways the user did not choose.
+                let index = self
+                    .permission_cursor
+                    .or_else(|| primary_permission_index(&resolved_actions));
+                if let Some(decision) = index.and_then(|i| resolved_actions.get(i)).cloned() {
+                    self.answer_permission(request_id, decision, cx);
+                    cx.stop_propagation();
+                }
+            }
+            PermissionKey::Next => {
+                if len > 0 {
+                    self.permission_cursor = Some(
+                        self.permission_cursor
+                            .map_or(0, |current| (current + 1) % len),
+                    );
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+            }
+            PermissionKey::Prev => {
+                if len > 0 {
+                    self.permission_cursor = Some(
+                        self.permission_cursor
+                            .map_or(len - 1, |current| (current + len - 1) % len),
+                    );
+                    cx.notify();
+                    cx.stop_propagation();
+                }
+            }
+            PermissionKey::ArmStop => {
+                // Escape must never approve or deny: it closes the card and
+                // arms the composer's stop window, in that order.
+                self.permission_cursor = None;
+                self.press_escape_stop(cx);
                 cx.stop_propagation();
             }
-        } else if key == "enter" {
-            // Enter approves (first allow action)
-            if let Some(decision) = resolved_actions.iter().find(|c| {
-                matches!(
-                    c,
-                    komet_proto::PermissionChoice::Allow
-                        | komet_proto::PermissionChoice::AllowAlways { .. }
-                )
-            }) {
-                let updated =
-                    if matches!(decision, komet_proto::PermissionChoice::AllowAlways { .. }) {
-                        let mut opts = komet_proto::SandboxOptions::from_level(
-                            self.state.read(cx).access_mode,
-                        );
-                        if let Some(perms) = &mut opts.opencode {
-                            // Update the existing "*" pattern to Allow (replacing, not prepending)
-                            if let Some(pos) =
-                                perms.bash.patterns.iter().position(|(p, _)| p == "*")
-                            {
-                                perms.bash.patterns[pos] = ("*".into(), komet_proto::Perm::Allow);
-                            } else {
-                                perms
-                                    .bash
-                                    .patterns
-                                    .push(("*".into(), komet_proto::Perm::Allow));
-                            }
-                        }
-                        Some(opts)
-                    } else {
-                        None
-                    };
-                self.send_permission_decision(request_id, decision.clone(), updated, cx);
-                cx.stop_propagation();
-            }
-        } else if key == "escape" {
-            // Escape denies
-            self.send_permission_decision(
-                request_id,
-                komet_proto::PermissionChoice::Deny,
-                None,
-                cx,
-            );
-            cx.stop_propagation();
+            PermissionKey::Ignore => {}
         }
+    }
+
+    /// Send one permission decision, with the sandbox mutation `AllowAlways`
+    /// implies. Digits, Tab+Enter and the card's buttons all converge here.
+    fn answer_permission(
+        &mut self,
+        request_id: String,
+        decision: komet_proto::PermissionChoice,
+        cx: &mut Context<Self>,
+    ) {
+        // AllowAlways(Pattern/Chat) must MUTATE the sandbox table (Paseo
+        // updatedPermissions), not just answer once: chat-scope always-allow
+        // lifts the session's bash fallback for OpenCode and auto-approves
+        // Codex.
+        let updated = match &decision {
+            komet_proto::PermissionChoice::AllowAlways { .. } => {
+                let mut opts =
+                    komet_proto::SandboxOptions::from_level(self.state.read(cx).access_mode);
+                if let Some(perms) = &mut opts.opencode {
+                    if let Some(pos) = perms.bash.patterns.iter().position(|(p, _)| p == "*") {
+                        perms.bash.patterns[pos] = ("*".into(), komet_proto::Perm::Allow);
+                    } else {
+                        perms
+                            .bash
+                            .patterns
+                            .push(("*".into(), komet_proto::Perm::Allow));
+                    }
+                }
+                Some(opts)
+            }
+            _ => None,
+        };
+        self.permission_cursor = None;
+        self.refocus_input_pending = true;
+        self.send_permission_decision(request_id, decision, updated, cx);
     }
 
     fn send_permission_decision(
@@ -6214,7 +6812,7 @@ impl Composer {
                 this.update(cx, |composer, cx| {
                     let transcript = composer.state.read(cx).transcript.clone();
                     let still_pending = pending_permission_request(&transcript)
-                        .is_some_and(|(pid, _, _, _, _)| pid == request_id);
+                        .is_some_and(|pending| pending.request_id == request_id);
                     let resolved = permission_request_resolved(&transcript, &request_id);
                     if still_pending && !resolved {
                         // Retry allowed
@@ -6228,16 +6826,18 @@ impl Composer {
             })
             .detach();
         }
+        self.refocus_input_pending = true;
         cx.notify();
     }
 
     // ---- render pieces ----
 
-    /// The agent-asked-a-question panel (komet question-panel.tsx), rendered in
-    /// place of the composer: the same floating-pill chrome (`rounded-[26px]
-    /// border-white/[0.08] bg-white/[0.03] shadow-xl`), uppercase header +
-    /// "1/3" counter chip, option rows with number kbd chips, a free-text
-    /// override over a hairline, and Back / Next-Submit footer.
+    /// The agent-asked-a-question dock, rendered ABOVE the still-usable
+    /// composer (komet question-panel.tsx chrome: the same floating pill,
+    /// uppercase header + "1/3" counter chip, option rows with number kbd
+    /// chips, an "Other" field when the host allows free text, and a
+    /// Back / Cancel / Next-Submit footer). The passive history card lives in
+    /// the thread; this is the one active affordance.
     fn render_wizard(&mut self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let theme = Theme::of(cx).clone();
         let Some(wizard) = self.wizard.clone() else {
@@ -6249,13 +6849,25 @@ impl Composer {
         };
         let page = wizard.page;
         let last = page + 1 >= wizard.questions.len();
-        let typed_empty = self.input.read(cx).is_empty();
-        let can_advance = wizard.page_has_pick() || !typed_empty;
+        let typed_empty = self.wizard_input.read(cx).is_empty();
+        let allows_free_text = question.allow_free_text;
+        let can_advance = wizard.page_has_pick() || (allows_free_text && !typed_empty);
+        // Questions queued behind this one stay in the thread; say so here so
+        // the dock never looks like the only thing the agent is waiting on.
+        let queued = pending_input_requests(&self.state.read(cx).transcript)
+            .into_iter()
+            .filter(|request| request.actionable && request.request_id != wizard.request_id)
+            .count();
 
         let options = question.options.iter().enumerate().map(|(ix, label)| {
             // Selection reads on the row only while no typed override exists
             // (typed answers win — komet question-panel.tsx `isSel`).
-            let picked = wizard.is_picked(ix) && typed_empty;
+            let picked = wizard.is_picked(ix) && !(allows_free_text && !typed_empty);
+            let description = question
+                .option_descriptions
+                .get(ix)
+                .filter(|description| !description.is_empty())
+                .cloned();
             div()
                 .id(("wizard-option", ix))
                 .flex()
@@ -6291,15 +6903,57 @@ impl Composer {
                     div()
                         .flex_1()
                         .min_w_0()
-                        .text_size(px(13.5))
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(if picked {
-                            theme.text
-                        } else {
-                            theme.text.opacity(0.9)
-                        })
-                        .child(SharedString::from(label.clone())),
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .child(
+                            div()
+                                .text_size(px(13.5))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(if picked {
+                                    theme.text
+                                } else {
+                                    theme.text.opacity(0.9)
+                                })
+                                .child(SharedString::from(label.clone())),
+                        )
+                        .when_some(description, |el, description| {
+                            el.child(
+                                div()
+                                    .text_size(px(12.0))
+                                    .line_height(px(16.0))
+                                    .text_color(theme.text_muted.opacity(0.75))
+                                    .child(SharedString::from(description)),
+                            )
+                        }),
                 )
+                // A checked box makes multi-select state readable at a
+                // glance (the row wash alone is too subtle while several
+                // rows carry it).
+                .when(question.multi_select, |el| {
+                    el.child(
+                        div()
+                            .flex_none()
+                            .size(px(18.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(5.0))
+                            .border_1()
+                            .border_color(if picked {
+                                theme.text_muted
+                            } else {
+                                crate::theme::ink(0.2)
+                            })
+                            .when(picked, |el| {
+                                el.child(
+                                    crate::icons::icon(crate::icons::CHECK)
+                                        .size(px(12.0))
+                                        .text_color(theme.text),
+                                )
+                            }),
+                    )
+                })
                 .when(ix < 9, |el| {
                     el.child(
                         // Number kbd chip: `size-[22px] rounded-md text-[11px]`.
@@ -6327,11 +6981,14 @@ impl Composer {
         });
 
         div()
-            .id("question-panel")
+            .id("question-dock")
             .track_focus(&self.wizard_focus)
+            .on_action(cx.listener(|this, _: &MentionEscape, _, cx| this.wizard_cancel(cx)))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 this.on_wizard_key(event, window, cx)
             }))
+            .w_full()
+            .min_w_0()
             .rounded(px(26.0))
             .border_1()
             .border_color(theme.border)
@@ -6345,7 +7002,8 @@ impl Composer {
                     .pt(px(16.0))
                     .flex()
                     .flex_col()
-                    // Header: tracked uppercase + counter chip when paged.
+                    // Header: tracked uppercase + counter chip when paged,
+                    // plus how many questions wait behind this one.
                     .child(
                         div()
                             .flex()
@@ -6375,6 +7033,24 @@ impl Composer {
                                         .text_color(theme.text_muted.opacity(0.6))
                                         .child(SharedString::from(counter)),
                                 )
+                            })
+                            .when(queued > 0, |el| {
+                                el.child(
+                                    div()
+                                        .h(px(20.0))
+                                        .px(px(6.0))
+                                        .flex()
+                                        .items_center()
+                                        .rounded(px(6.0))
+                                        .bg(crate::theme::ink(0.06))
+                                        .text_size(px(10.0))
+                                        .text_color(theme.text_muted.opacity(0.6))
+                                        .child(SharedString::from(if queued == 1 {
+                                            "+1 queued".to_owned()
+                                        } else {
+                                            format!("+{queued} queued")
+                                        })),
+                                )
                             }),
                     )
                     .child(
@@ -6395,6 +7071,19 @@ impl Composer {
                                 .child(SharedString::from("Select one or more options.")),
                         )
                     })
+                    // A secret answer is never written to the transcript or
+                    // exported — say it before the field, not after.
+                    .when(question.secret, |el| {
+                        el.child(
+                            div()
+                                .mt(px(4.0))
+                                .text_size(px(12.0))
+                                .text_color(theme.text_muted.opacity(0.65))
+                                .child(SharedString::from(
+                                    "Sensitive: this answer is not kept in the transcript.",
+                                )),
+                        )
+                    })
                     .child(
                         div()
                             .mt(px(12.0))
@@ -6403,18 +7092,32 @@ impl Composer {
                             .gap(px(4.0))
                             .children(options),
                     )
-                    // Free-text override over a hairline (shares the composer
-                    // input entity).
-                    .child(
-                        div()
-                            .mt(px(12.0))
-                            .border_t_1()
-                            .border_color(crate::theme::hairline(0.06))
-                            .pt(px(12.0))
-                            .pb(px(4.0))
-                            .px(px(4.0))
-                            .child(self.input.clone()),
-                    ),
+                    // "Other" over a hairline — only when the host takes a
+                    // free-text answer.
+                    .when(allows_free_text, |el| {
+                        el.child(
+                            div()
+                                .mt(px(12.0))
+                                .border_t_1()
+                                .border_color(crate::theme::hairline(0.06))
+                                .pt(px(10.0))
+                                .pb(px(4.0))
+                                .px(px(4.0))
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.0))
+                                .child(
+                                    div()
+                                        .text_size(px(10.5))
+                                        .font_weight(gpui::FontWeight::MEDIUM)
+                                        .text_color(theme.text_muted.opacity(0.6))
+                                        .child(SharedString::from(crate::popover::tracked_upper(
+                                            "Other",
+                                        ))),
+                                )
+                                .child(self.wizard_input.clone()),
+                        )
+                    }),
             )
             .child(
                 div()
@@ -6425,14 +7128,36 @@ impl Composer {
                     .px(px(16.0))
                     .pb(px(16.0))
                     .pt(px(4.0))
-                    .child(if page > 0 {
-                        crate::popover::btn_ghost(&theme, "Back", "wizard-back", cx.entity_id())
-                            .id("wizard-back")
-                            .on_click(cx.listener(|this, _, _, cx| this.wizard_back(cx)))
-                            .into_any_element()
-                    } else {
-                        gpui::Empty.into_any_element()
-                    })
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(4.0))
+                            .child(if page > 0 {
+                                crate::popover::btn_ghost(
+                                    &theme,
+                                    "Back",
+                                    "wizard-back",
+                                    cx.entity_id(),
+                                )
+                                .id("wizard-back")
+                                .on_click(cx.listener(|this, _, _, cx| this.wizard_back(cx)))
+                                .into_any_element()
+                            } else {
+                                gpui::Empty.into_any_element()
+                            })
+                            .child(
+                                crate::popover::btn_ghost(
+                                    &theme,
+                                    "Cancel",
+                                    "wizard-cancel",
+                                    cx.entity_id(),
+                                )
+                                .id("wizard-cancel")
+                                .on_click(cx.listener(|this, _, _, cx| this.wizard_cancel(cx))),
+                            ),
+                    )
                     .child(
                         crate::popover::btn_primary(&theme, if last { "Submit" } else { "Next" })
                             .id("wizard-submit")
@@ -6450,14 +7175,21 @@ impl Composer {
     /// an extra secondary action and persists via `updated_permissions`.
     fn render_permission_panel(
         &mut self,
-        request_id: String,
-        kind: komet_proto::PermissionKind,
-        summary: String,
-        choices: Vec<komet_proto::PermissionChoice>,
-        actions: Vec<komet_proto::AgentPermissionAction>,
+        pending: PendingPermissionRequest,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        let PendingPermissionRequest {
+            request_id,
+            kind,
+            summary,
+            choices,
+            actions,
+            expires_at,
+            ..
+        } = pending;
         let theme = Theme::of(cx).clone();
+        let countdown =
+            permission_countdown_label(chrono::Utc::now().timestamp_millis(), expires_at);
 
         // Title / description split, Paseo-style: the kind names WHAT runs,
         // the summary stays the one-line ask.
@@ -6537,7 +7269,7 @@ impl Composer {
                         this.update(cx, |composer, cx| {
                             let transcript = composer.state.read(cx).transcript.clone();
                             let still_pending = pending_permission_request(&transcript)
-                                .is_some_and(|(pid, _, _, _, _)| pid == request_id_for_revert);
+                                .is_some_and(|pending| pending.request_id == request_id_for_revert);
                             let resolved =
                                 permission_request_resolved(&transcript, &request_id_for_revert);
                             if still_pending && !resolved {
@@ -6552,7 +7284,7 @@ impl Composer {
                                         // the request is still actionable.
                                         if permission_request_resolved(&t, &rid2)
                                             || pending_permission_request(&t)
-                                                .is_some_and(|(p, _, _, _, _)| p == rid2)
+                                                .is_some_and(|pending| pending.request_id == rid2)
                                                 && composer.run_live(cx)
                                         {
                                             composer.answered_requests.remove(&rid2);
@@ -6699,11 +7431,20 @@ impl Composer {
                             .child("This agent wants to proceed"),
                     ),
             )
-            .child(
+            .when_some(countdown, |card, label| {
+                card.child(
+                    div()
+                        .text_size(px(10.5))
+                        .text_color(theme.text_faint)
+                        .child(label),
+                )
+            })
+            .child({
+                // Tab/Shift-Tab highlight: the same list Enter applies to.
+                let cursor = self.permission_cursor;
                 div().flex().flex_row().flex_wrap().gap(px(8.0)).children(
-                    resolved_actions
-                        .into_iter()
-                        .map(|(action_id, label, is_allow)| {
+                    resolved_actions.into_iter().enumerate().map(
+                        |(index, (action_id, label, is_allow))| {
                             let req = request_id.clone();
                             let decision: komet_proto::PermissionChoice =
                                 if action_id == "allow-always" || label == "Allow always" {
@@ -6779,9 +7520,11 @@ impl Composer {
                                 }))
                                 .child(icon)
                                 .child(label)
-                        }),
-                ),
-            );
+                                .when(cursor == Some(index), |el| el.border_color(theme.text))
+                        },
+                    ),
+                )
+            });
         card.into_any_element()
     }
 
@@ -6850,15 +7593,17 @@ impl Render for Composer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let _child = crate::perf::child_frame(crate::perf::ChildView::Composer);
         let theme = Theme::of(cx).clone();
+        // Send/answer/decision hand the keyboard back here on the next paint;
+        // the surface that had focus may already be gone.
+        if std::mem::take(&mut self.refocus_input_pending) {
+            let focus = self.input.read(cx).focus_handle.clone();
+            window.focus(&focus, cx);
+        }
         let wizard_active = self.wizard.is_some();
-        if self.mention.token.is_some()
-            && (wizard_active || !self.input.focus_handle(cx).is_focused(window))
-        {
+        if self.mention.token.is_some() && !self.input.focus_handle(cx).is_focused(window) {
             self.reset_mention(None, cx);
         }
-        if self.slash.token.is_some()
-            && (wizard_active || !self.input.focus_handle(cx).is_focused(window))
-        {
+        if self.slash.token.is_some() && !self.input.focus_handle(cx).is_focused(window) {
             self.reset_slash(None, cx);
         }
         let mode = self.button_mode(cx);
@@ -6975,61 +7720,97 @@ impl Render for Composer {
             .pb(px(Theme::SPACE_LG))
             .on_action(cx.listener(Self::mention_escape))
             .when_some(failure, |el, message| {
-                // komet composer.tsx `Notice` (matches the transcript
-                // ErrorChip palette): `flex items-start gap-2 rounded-xl
-                // border px-3 py-2 text-[12px] leading-snug` with a 14px
-                // DangerTriangle — a subtle tinted wash, not a bare red
-                // stroke. Amber for the offline-ish case (engine not
-                // connected), red for send/run failures. Click dismisses.
-                let offline = message.as_ref() == "Engine not connected";
-                let (border_c, wash, text_c) = if offline {
-                    let amber = theme.warning; // amber-400
-                    let amber_200 = theme.warning_muted;
-                    (
-                        amber.opacity(0.16),
-                        amber.opacity(0.05),
-                        amber_200.opacity(0.9),
-                    )
-                } else {
-                    let danger = theme.danger; // red-400
-                    let red_300 = theme.danger_muted;
-                    (
-                        danger.opacity(0.16),
-                        danger.opacity(0.05),
-                        red_300.opacity(0.9),
-                    )
-                };
+                // komet composer.tsx `Notice` palette: amber for a link hold
+                // you can wait out, red for send/run failures. Click dismisses.
                 el.child(
-                    div()
-                        .id("composer-failure")
-                        .mx(px(4.0))
-                        .mt(px(6.0))
-                        .flex()
-                        .items_start()
-                        .gap(px(8.0))
-                        .rounded(px(12.0))
-                        .border_1()
-                        .border_color(border_c)
-                        .bg(wash)
-                        .px(px(12.0))
-                        .py(px(8.0))
-                        .text_size(px(12.0))
-                        .line_height(px(16.0))
-                        .text_color(text_c)
-                        .cursor_pointer()
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.failure = None;
-                            cx.notify();
-                        }))
-                        .child(
-                            crate::icons::icon(crate::icons::DANGER_TRIANGLE)
-                                .size(px(14.0))
-                                .mt(px(2.0))
-                                .text_color(text_c),
-                        )
-                        .child(div().min_w_0().child(message)),
+                    notice_row(
+                        message.clone(),
+                        is_link_hold_notice(message.as_ref()),
+                        &theme,
+                    )
+                    .id("composer-failure")
+                    .cursor_pointer()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.failure = None;
+                        cx.notify();
+                    })),
                 )
             });
+
+        // The offline outbox announces itself (transparency plan Task 10): the
+        // parked count plus the reason stored with the newest entry, so a held
+        // Return reads as a deliberate hold instead of a dead button. Only this
+        // chat's entries — another chat's text is not waiting on this composer.
+        // Not dismissible — clicking it must never drop a queued message.
+        let queued = {
+            let key = self.current_key.as_str();
+            let state = self.state.read(cx);
+            queued_sends_notice(
+                state
+                    .queued_sends()
+                    .iter()
+                    .filter(|entry| entry.chat_key == key),
+            )
+        };
+        let container = container.when_some(queued, |el, notice| {
+            el.child(notice_row(notice, true, &theme))
+        });
+
+        // The local prompt queue is a surface, not a counter (transparency
+        // plan Task 11): every held prompt is listed and can be dropped before
+        // it is ever sent. Cancelling the front item lets the next drain.
+        let mut queue_rows = div().flex().flex_col();
+        for (ix, item) in self.prompt_queue.iter().enumerate() {
+            queue_rows = queue_rows.child(
+                div()
+                    .id(("composer-queue-item", ix))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(8.0))
+                    .px(px(12.0))
+                    .py(px(3.0))
+                    .text_size(px(11.0))
+                    .line_height(px(15.0))
+                    .text_color(theme.text_muted)
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .truncate()
+                            .child(SharedString::from(item.text.clone())),
+                    )
+                    .child(
+                        div()
+                            .id(("composer-queue-cancel", ix))
+                            .flex_none()
+                            .cursor_pointer()
+                            .text_color(theme.text_faint)
+                            .hover(|s| s.text_color(theme.danger))
+                            .child("Cancel")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cancel_queued(&mut this.prompt_queue, ix);
+                                cx.notify();
+                            })),
+                    ),
+            );
+        }
+        let queue_len = self.prompt_queue.len();
+        let container = container.when_some(prompt_queue_summary(queue_len), |el, label| {
+            el.child(
+                div()
+                    .mt(px(6.0))
+                    .child(
+                        div()
+                            .px(px(12.0))
+                            .text_size(px(11.0))
+                            .line_height(px(15.0))
+                            .text_color(theme.text_muted)
+                            .child(label),
+                    )
+                    .child(queue_rows),
+            )
+        });
 
         // Turn-boundary steering notice: for agents without mid-turn
         // injection (Grok over ACP today), a "steer" is queued and applies
@@ -7067,22 +7848,27 @@ impl Render for Composer {
             )
         });
 
-        if let Some((rid, kind, summary, choices, actions)) =
-            pending_permission_request(&self.state.read(cx).transcript)
-        {
+        if let Some(pending) = pending_permission_request(&self.state.read(cx).transcript) {
             // Optimistic gate: hide panel immediately after click until doc syncs
-            if !self.answered_requests.contains(&rid) {
-                let panel = self.render_permission_panel(rid, kind, summary, choices, actions, cx);
+            if !self.answered_requests.contains(&pending.request_id) {
+                let panel = self.render_permission_panel(pending, cx);
                 return container.child(motion::fade_quick(
                     "composer-permission",
                     div().w_full().min_w_0().overflow_hidden().child(panel),
                 ));
             }
         }
-        if wizard_active {
-            let wizard = self.render_wizard(cx);
-            return container.child(motion::fade_quick("composer-wizard", div().child(wizard)));
-        }
+        // The question dock sits ABOVE a live composer: the prompt keeps its
+        // focus, draft, steering and send button while the agent waits.
+        let container = if wizard_active {
+            let dock = self.render_wizard(cx);
+            container.child(motion::fade_quick(
+                "composer-wizard",
+                div().w_full().min_w_0().child(dock),
+            ))
+        } else {
+            container
+        };
 
         // New chats always use the expanded layout: the repo/branch pickers
         // need the full-width actions row (komet composer-actions.tsx
@@ -7812,6 +8598,10 @@ mod tests {
             question: format!("Question {id}"),
             options: options.iter().map(|s| s.to_string()).collect(),
             multi_select: multi,
+            option_descriptions: Vec::new(),
+            allow_free_text: true,
+            secret: false,
+            default: None,
         }
     }
 
@@ -8208,6 +8998,240 @@ mod tests {
     }
 
     #[test]
+    fn approval_timeout_shows_a_countdown_then_auto_denied() {
+        // The watchdog label: minutes:seconds, rounded up to the next second.
+        assert_eq!(permission_countdown_label(0, None), None);
+        assert_eq!(
+            permission_countdown_label(0, Some(659_000)).map(String::from),
+            Some("Auto-denies in 10:59".to_string())
+        );
+        assert_eq!(
+            permission_countdown_label(0, Some(1)).map(String::from),
+            Some("Auto-denies in 0:01".to_string())
+        );
+        assert_eq!(
+            permission_countdown_label(0, Some(0)).map(String::from),
+            Some("Auto-denying…".to_string())
+        );
+        assert_eq!(
+            permission_countdown_label(1_000_000, Some(500_000)).map(String::from),
+            Some("Auto-denying…".to_string())
+        );
+
+        // The deadline rides the doc part into the pending request — the card
+        // shows it without knowing the engine's settings.
+        use komet_doc::MessageStatus;
+        let deadline = 1_700_000_600_000;
+        let entry = |parts: Vec<MessagePart>| SessionMessageEntry {
+            id: "m1".into(),
+            role: MessageRole::Assistant,
+            parts,
+            created_at: 0,
+            device_id: "d".into(),
+            status: Some(MessageStatus::Streaming),
+            continuation_of: None,
+        };
+        let mut part = MessagePart::Permission {
+            id: "perm-r1".into(),
+            request_id: "r1".into(),
+            permission_kind: komet_proto::PermissionKind::Command {
+                cmdline: "rm -rf dist".into(),
+            },
+            summary: "Run `rm -rf dist`".into(),
+            choices: vec![
+                komet_proto::PermissionChoice::Allow,
+                komet_proto::PermissionChoice::Deny,
+            ],
+            actions: vec![],
+            resolved: false,
+            decision: None,
+            tool_call_id: None,
+            decided_by: None,
+            decided_at: None,
+            expires_at: Some(deadline),
+        };
+        let t = vec![entry(vec![part.clone()])];
+        let pending = pending_permission_request(&t).expect("pending permission");
+        assert_eq!(pending.expires_at, Some(deadline));
+        // Watchdog fires: the engine resolves with Deny; the part carries the
+        // decision, the queue is empty and the label would say "Auto-denying…"
+        // only while the frame is still open.
+        if let MessagePart::Permission {
+            resolved, decision, ..
+        } = &mut part
+        {
+            *resolved = true;
+            *decision = Some(komet_proto::PermissionChoice::Deny);
+        }
+        let t = vec![entry(vec![part])];
+        assert!(pending_permission_request(&t).is_none());
+        assert!(permission_request_resolved(&t, "r1"));
+    }
+
+    #[test]
+    fn wizard_free_text_only_where_the_host_allows_it() {
+        let mut no_free = question("q", &["a", "b"], false);
+        no_free.allow_free_text = false;
+        let mut w = Wizard::new("req".into(), vec![no_free]);
+        assert!(
+            !w.allows_free_text(),
+            "no Other field for an options-only question"
+        );
+        w.set_typed("typed anyway".into());
+        assert_eq!(w.select(1), WizardStep::AutoAdvance);
+        let WizardStep::Done(answers) = w.advance() else {
+            panic!("expected Done")
+        };
+        assert_eq!(
+            answers[0].labels,
+            vec!["b"],
+            "a typed override is ignored where the host only takes its options"
+        );
+        assert_eq!(answers[0].free_text, None);
+    }
+
+    #[test]
+    fn wizard_keeps_a_typed_answer_per_page() {
+        let mut w = Wizard::new(
+            "req".into(),
+            vec![question("q1", &["a"], false), question("q2", &["x"], false)],
+        );
+        w.set_typed("first".into());
+        assert_eq!(w.advance(), WizardStep::Stay);
+        assert_eq!(w.typed(), "", "a fresh page starts empty");
+        w.set_typed("second".into());
+        assert!(w.back());
+        assert_eq!(
+            w.typed(),
+            "first",
+            "paging back restores that page's own answer"
+        );
+        assert_eq!(w.advance(), WizardStep::Stay);
+        assert_eq!(w.typed(), "second");
+        let WizardStep::Done(answers) = w.advance() else {
+            panic!("expected Done")
+        };
+        assert_eq!(answers[0].labels, vec!["first"]);
+        assert_eq!(answers[0].free_text.as_deref(), Some("first"));
+        assert_eq!(answers[1].labels, vec!["second"]);
+    }
+
+    #[test]
+    fn two_pending_requests_are_ordered_and_keyboard_navigable() {
+        use komet_doc::MessageStatus;
+        let input = |rid: &str| MessagePart::Input {
+            id: format!("in-{rid}"),
+            request_id: rid.into(),
+            questions: vec![question("q", &["a", "b"], false)],
+            resolved: false,
+            responses: vec![],
+            source: komet_proto::QuestionSource::Native,
+        };
+        let entry = |id: &str, parts: Vec<MessagePart>| SessionMessageEntry {
+            id: id.into(),
+            role: MessageRole::Assistant,
+            parts,
+            created_at: 0,
+            device_id: "d".into(),
+            status: Some(MessageStatus::Streaming),
+            continuation_of: None,
+        };
+        let t = vec![
+            entry("m1", vec![input("r1")]),
+            entry("m2", vec![input("r2")]),
+        ];
+        // Two requests: doc order decides which is active and which queues.
+        assert_eq!(
+            pending_input_request(&t).map(|(id, _)| id),
+            Some("r1".into())
+        );
+        let requests = pending_input_requests(&t);
+        assert_eq!(requests.len(), 2);
+        // Keyboard path on the active one: digits pick, a pick on a
+        // single-select is an auto-advance hint, a dead key does not.
+        let mut w = Wizard::new("r1".into(), requests[0].questions.clone());
+        assert_eq!(w.press_number(1), WizardStep::AutoAdvance);
+        assert_eq!(w.press_number(0), WizardStep::Stay, "0 is not an option");
+        assert_eq!(w.press_number(9), WizardStep::Stay, "no such option");
+        // The dock's auto-advance timer lands on the next page; with one
+        // question the wizard is Done, which releases the queued r2.
+        let WizardStep::Done(answers) = w.advance() else {
+            panic!("expected Done")
+        };
+        assert_eq!(answers[0].labels, vec!["a"]);
+        // The queued request answers the same way, typed or picked.
+        let mut w2 = Wizard::new("r2".into(), requests[1].questions.clone());
+        w2.set_typed("later".into());
+        let WizardStep::Done(answers) = w2.advance() else {
+            panic!("expected Done")
+        };
+        assert_eq!(answers[0].labels, vec!["later"]);
+        assert_eq!(answers[0].free_text.as_deref(), Some("later"));
+    }
+
+    #[test]
+    fn optimistic_answer_releases_the_queue_before_the_doc_frame() {
+        use komet_doc::MessageStatus;
+        let input = |rid: &str, resolved: bool| MessagePart::Input {
+            id: format!("in-{rid}"),
+            request_id: rid.into(),
+            questions: vec![question("q", &["a"], false)],
+            resolved,
+            responses: vec![],
+            source: komet_proto::QuestionSource::Native,
+        };
+        let entry = |id: &str, parts: Vec<MessagePart>| SessionMessageEntry {
+            id: id.into(),
+            role: MessageRole::Assistant,
+            parts,
+            created_at: 0,
+            device_id: "d".into(),
+            status: Some(MessageStatus::Streaming),
+            continuation_of: None,
+        };
+        let t = vec![
+            entry("m1", vec![input("r1", false)]),
+            entry("m2", vec![input("r2", false)]),
+        ];
+        assert_eq!(
+            pending_input_requests(&t)
+                .iter()
+                .map(|r| r.request_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["r1", "r2"],
+            "two pending questions display in doc order"
+        );
+        assert_eq!(
+            pending_input_request(&t).map(|(id, _)| id),
+            Some("r1".into())
+        );
+        // Answering r1 here hides it at once — and does not hold r2 behind it
+        // while the doc frame catches up.
+        let answered: HashSet<String> = ["r1".to_string()].into_iter().collect();
+        assert_eq!(
+            pending_input_request_excluding(&t, &answered).map(|(id, _)| id),
+            Some("r2".into())
+        );
+        // The frame lands: r1 resolved, r2 still open. The optimistic set is
+        // now redundant (and is pruned by the latch), the queue is unchanged.
+        let t = vec![
+            entry("m1", vec![input("r1", true)]),
+            entry("m2", vec![input("r2", false)]),
+        ];
+        assert!(input_request_resolved(&t, "r1"));
+        assert_eq!(
+            pending_input_request_excluding(&t, &answered).map(|(id, _)| id),
+            Some("r2".into())
+        );
+        // Both resolved → no dock.
+        let t = vec![
+            entry("m1", vec![input("r1", true)]),
+            entry("m2", vec![input("r2", true)]),
+        ];
+        assert!(pending_input_request_excluding(&t, &answered).is_none());
+    }
+
+    #[test]
     fn pending_input_detection() {
         use komet_doc::MessageStatus;
         let input_part = MessagePart::Input {
@@ -8215,6 +9239,8 @@ mod tests {
             request_id: "r1".into(),
             questions: vec![question("q", &["a"], false)],
             resolved: false,
+            responses: vec![],
+            source: komet_proto::QuestionSource::Native,
         };
         let entry = |status: Option<MessageStatus>, parts: Vec<MessagePart>| SessionMessageEntry {
             id: "m".into(),
@@ -8269,6 +9295,8 @@ mod tests {
             request_id: "r1".into(),
             questions: vec![],
             resolved: true,
+            responses: vec![],
+            source: komet_proto::QuestionSource::Native,
         };
         let t = vec![entry(
             Some(MessageStatus::Streaming),
@@ -8311,6 +9339,112 @@ mod tests {
     }
 
     #[test]
+    fn every_open_request_is_enumerated_in_doc_order() {
+        use komet_doc::MessageStatus;
+        let input = |rid: &str| MessagePart::Input {
+            id: format!("in-{rid}"),
+            request_id: rid.into(),
+            questions: vec![question("q", &["a"], false)],
+            resolved: false,
+            responses: vec![],
+            source: komet_proto::QuestionSource::Native,
+        };
+        let permission = |rid: &str| MessagePart::Permission {
+            id: format!("perm-{rid}"),
+            request_id: rid.into(),
+            permission_kind: komet_proto::PermissionKind::Command {
+                cmdline: "ls".into(),
+            },
+            summary: "Run `ls`".into(),
+            choices: vec![
+                komet_proto::PermissionChoice::Allow,
+                komet_proto::PermissionChoice::Deny,
+            ],
+            actions: vec![],
+            resolved: false,
+            decision: None,
+            tool_call_id: None,
+            decided_by: None,
+            decided_at: None,
+            expires_at: None,
+        };
+        let entry = |id: &str, status: Option<MessageStatus>, parts: Vec<MessagePart>| {
+            SessionMessageEntry {
+                id: id.into(),
+                role: MessageRole::Assistant,
+                parts,
+                created_at: 0,
+                device_id: "d".into(),
+                status,
+                continuation_of: None,
+            }
+        };
+
+        // Two questions and one approval, all open, on one streaming turn.
+        let t = vec![entry(
+            "m1",
+            Some(MessageStatus::Streaming),
+            vec![input("r1"), permission("p1"), input("r2")],
+        )];
+        let requests = pending_input_requests(&t);
+        assert_eq!(
+            requests
+                .iter()
+                .map(|r| (r.request_id.as_str(), r.entry_id.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("r1", "m1"), ("r2", "m1")],
+            "the queue keeps every open question, in doc order"
+        );
+        assert!(requests.iter().all(|r| r.actionable));
+        assert_eq!(
+            requests.iter().map(|r| r.order).collect::<Vec<_>>(),
+            vec![0, 2],
+            "the order is the doc position, so a peer renders the same queue"
+        );
+        assert_eq!(
+            pending_permission_requests(&t)
+                .iter()
+                .map(|r| r.request_id.clone())
+                .collect::<Vec<_>>(),
+            vec!["p1".to_string()]
+        );
+        // The wizard serves the oldest one; the rest stay queued behind it.
+        assert_eq!(
+            pending_input_request(&t).map(|(id, _)| id),
+            Some("r1".into())
+        );
+
+        // A turn that finished with the question unanswered is history: it
+        // stays in the transcript, it is never a live form.
+        let t = vec![entry(
+            "m1",
+            Some(MessageStatus::Complete),
+            vec![input("r1")],
+        )];
+        assert_eq!(pending_input_requests(&t).len(), 1);
+        assert!(!pending_input_requests(&t)[0].actionable);
+        assert!(pending_input_request(&t).is_none());
+
+        // A run reaped under its question stays answerable — the engine
+        // delivers the answer as a resumed turn — until a newer assistant
+        // entry moves on.
+        let t = vec![entry("m1", Some(MessageStatus::Aborted), vec![input("r1")])];
+        assert!(pending_input_requests(&t)[0].actionable);
+        let t = vec![
+            entry("m1", Some(MessageStatus::Aborted), vec![input("r1")]),
+            entry(
+                "m2",
+                Some(MessageStatus::Complete),
+                vec![MessagePart::Text {
+                    id: "t2".into(),
+                    text: "moved on".into(),
+                }],
+            ),
+        ];
+        assert!(!pending_input_requests(&t)[0].actionable);
+    }
+
+    #[test]
     fn permission_detail_caps_multiline_commands() {
         let (lines, rest) = permission_detail_lines("one\n\n");
         assert_eq!(lines.len(), 1);
@@ -8343,6 +9477,10 @@ mod tests {
             actions: vec![],
             resolved: false,
             decision: None,
+            tool_call_id: None,
+            decided_by: None,
+            decided_at: None,
+            expires_at: None,
         };
         let entry = |status: Option<MessageStatus>, parts: Vec<MessagePart>| SessionMessageEntry {
             id: "m1".into(),
@@ -8360,14 +9498,14 @@ mod tests {
             vec![perm_part.clone()],
         )];
         assert_eq!(
-            pending_permission_request(&t).map(|(id, ..)| id),
+            pending_permission_request(&t).map(|request| request.request_id),
             Some("p1".into())
         );
 
         // 2. Dead/Aborted entry with unresolved permission keeps panel.
         let t = vec![entry(Some(MessageStatus::Aborted), vec![perm_part.clone()])];
         assert_eq!(
-            pending_permission_request(&t).map(|(id, ..)| id),
+            pending_permission_request(&t).map(|request| request.request_id),
             Some("p1".into())
         );
 
@@ -8407,7 +9545,7 @@ mod tests {
             user_echo,
         ];
         assert_eq!(
-            pending_permission_request(&t).map(|(id, ..)| id),
+            pending_permission_request(&t).map(|request| request.request_id),
             Some("p1".into())
         );
 
@@ -8423,10 +9561,77 @@ mod tests {
             actions: vec![],
             resolved: true,
             decision: Some(komet_proto::PermissionChoice::Allow),
+            tool_call_id: None,
+            decided_by: None,
+            decided_at: None,
+            expires_at: None,
         };
         assert!(!permission_request_resolved(&t, "p1"));
         let t = vec![entry(Some(MessageStatus::Streaming), vec![resolved])];
         assert!(permission_request_resolved(&t, "p1"));
         assert!(!permission_request_resolved(&t, "other"));
+    }
+
+    /// The composer's offline contract (transparency plan Task 10): a send that
+    /// cannot leave during a link drop is parked with a named reason, and the
+    /// outbox hands its texts over exactly once, so the return of the link can
+    /// neither lose a paragraph nor replay one.
+    #[test]
+    fn queued_send_survives_and_drains_once() {
+        use komet_proto::view::ConnectionStatus;
+
+        let mut state = AppState::new();
+        state.connection = ConnectionStatus::Reconnecting {
+            attempt: 2,
+            retry_in_ms: 2500,
+            reason: "engine connection lost".into(),
+        };
+
+        let reason = state
+            .send_block_reason()
+            .expect("a reconnecting link blocks a send");
+        assert!(
+            reason.contains("reconnecting"),
+            "the reason must name the link state: {reason}"
+        );
+
+        let shown = state.queue_send("chat-a".into(), "fix the test".into());
+        assert_eq!(shown, reason, "the row shows the reason it stored");
+        state.queue_send("chat-a".into(), "fix the test".into());
+        assert_eq!(
+            state.queued_sends().len(),
+            1,
+            "mashing Return must not park the same paragraph twice"
+        );
+
+        assert_eq!(
+            queued_sends_notice(state.queued_sends()),
+            Some(SharedString::from("Queued 1 — reconnecting (2, 2.5s)"))
+        );
+
+        // Another chat's text is not this chat's to send.
+        state.queue_send("chat-b".into(), "elsewhere".into());
+        assert_eq!(
+            state.take_queued_sends_for("chat-a"),
+            vec!["fix the test".to_string()]
+        );
+        assert_eq!(
+            state.queued_sends().len(),
+            1,
+            "draining one chat leaves the other chat's entry parked"
+        );
+        assert!(
+            state.take_queued_sends_for("chat-a").is_empty(),
+            "a second drain cannot replay the text"
+        );
+        assert_eq!(
+            state.take_queued_sends_for("chat-b"),
+            vec!["elsewhere".to_string()]
+        );
+        assert!(
+            state.queued_sends().is_empty(),
+            "taking empties the outbox — the only way out"
+        );
+        assert_eq!(queued_sends_notice(state.queued_sends()), None);
     }
 }

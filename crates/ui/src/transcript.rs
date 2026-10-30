@@ -49,6 +49,7 @@ use crate::markdown::render::{self, RenderCache, RenderOptions};
 use crate::markdown::veil::RowVeil;
 use crate::motion::{self, AnimationExt as _, RESIZE};
 use crate::state::AppState;
+use crate::subagent::{self, SubagentLive, subagent_badge};
 use crate::syntax_cache::{DocumentHighlightKey, SyntaxHighlightCache};
 use crate::theme::Theme;
 use komet_syntax::LanguageId as Lang;
@@ -226,6 +227,17 @@ pub struct ToolItem {
     pub call: ToolCall,
     pub is_error: bool,
     pub resolved: bool,
+    /// Lifecycle of a spawned subagent, carried by the doc's spawn chip. The
+    /// spawn tool call itself resolves early; this is what keeps the chip
+    /// honest while the child keeps working.
+    pub subagent_status: Option<komet_doc::SubagentStatus>,
+    /// The child's cycle length, from the chip's single terminal write. `None`
+    /// is "not measured on the host" (still running, or its run died before
+    /// settling) — the chip shows no duration rather than a zero.
+    pub subagent_duration_ms: Option<u64>,
+    /// Tools the child ran, from the same terminal write. The live count rides
+    /// `WatchActivity`, not the doc, so this arrives once — at the end.
+    pub subagent_tool_count: Option<u64>,
     /// Journal part id (`MessagePart::Tool.id`, the tool call id): key for
     /// the on-demand `GetToolDetail` fetch (issue #10). Additive — existing
     /// rendering paths ignore it.
@@ -494,6 +506,16 @@ pub fn diff_to_file(diff: &komet_proto::ToolDiff) -> crate::changes::FileDiff {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum QuestionStatus {
+    /// Every answer the transcript carries, live or not.
+    Answered,
+    /// Unanswered, and the run that asked is over — history, not a form.
+    RunEnded,
+    /// Unanswered, and the run is still waiting on it.
+    Awaiting,
+}
+
 #[derive(Clone)]
 pub enum RowKind {
     User {
@@ -534,14 +556,21 @@ pub enum RowKind {
         /// Whether this activity group belongs to the currently streaming turn.
         auto_open: bool,
     },
-    InputChip {
-        /// First question's header (chat-view.tsx `InputChip`: the resolved
-        /// chip shows it; unresolved shows "Awaiting your answer…" — which
-        /// stays TRUE even across a run death: the composer keeps the panel
-        /// up until the user answers, and the engine delivers a dead run's
-        /// answer as a resumed turn).
+    QuestionRow {
         header: SharedString,
+        question: SharedString,
+        source: komet_proto::QuestionSource,
+        status: QuestionStatus,
+        responses: Arc<Vec<komet_doc::InputResponse>>,
+        secret_question_ids: Arc<Vec<String>>,
+    },
+    PermissionRow {
+        summary: SharedString,
         resolved: bool,
+        decision: Option<komet_proto::PermissionChoice>,
+        decided_by: Option<String>,
+        decided_at: Option<i64>,
+        tool_call_id: Option<String>,
     },
     ErrorChip {
         message: SharedString,
@@ -549,13 +578,58 @@ pub enum RowKind {
         detail: Option<String>,
         retryable: bool,
     },
+    /// One context-compaction boundary. Its own row kind, outside the tool
+    /// grouping, because it is a fact about the *history* rather than an
+    /// action the agent took — and its recap is fetched per cycle, not per
+    /// tool call.
+    Compaction {
+        /// The agent's identity for this cycle (`GetCompactionSummary` key).
+        compaction_id: SharedString,
+        status: komet_proto::CompactionStatus,
+        trigger: Option<SharedString>,
+        tokens_before: Option<u64>,
+        tokens_after: Option<u64>,
+        /// Why it failed — including the engine's verdict when the run died
+        /// mid-compaction. Rendered, never swallowed.
+        error: Option<SharedString>,
+        /// Recap text already in the doc (`SummaryInDoc` policy). Otherwise
+        /// the text lives in the host's run journal and is fetched on expand.
+        summary: Option<SharedString>,
+        summary_bytes: Option<u64>,
+        summary_in_journal: bool,
+        /// Epoch-ms of the entry, for the `14:32` in the line.
+        created_at: i64,
+        /// The cycle is in flight on the streaming turn (drives the pulse).
+        live: bool,
+    },
+}
+
+/// Small stable tag for `perf`'s per-row counters. `RowKind` is not `Hash`
+/// (it carries `Arc`s and `SharedString`s), and the tag is what the window
+/// log prints — so it must not change with row content.
+fn row_kind_tag(kind: &RowKind) -> &'static str {
+    match kind {
+        RowKind::User { .. } => "user",
+        RowKind::Markdown { .. } => "markdown",
+        RowKind::LiveMarkdown { .. } => "live_markdown",
+        RowKind::ToolGroup { .. } => "tools",
+        RowKind::QuestionRow { .. } => "question",
+        RowKind::PermissionRow { .. } => "permission",
+        RowKind::ErrorChip { .. } => "error",
+        RowKind::Compaction { .. } => "compaction",
+    }
 }
 
 // Window actions dispatched by an error chip's action button; handled by
 // the shell (it owns the settings outlet, the composer, and the pickers).
 actions!(
     transcript,
-    [ErrorOpenAccounts, ErrorOpenModelPicker, ErrorRetryTurn]
+    [
+        ErrorOpenAccounts,
+        ErrorOpenModelPicker,
+        ErrorRetryTurn,
+        RevealLastCompaction
+    ]
 );
 
 /// A transcript row: stable id + content version (diff key) + block payload.
@@ -660,6 +734,17 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     hash
 }
 
+/// Stable one-byte code for the spawn chip's subagent lifecycle, so both the
+/// entry fingerprint and the row fingerprint re-splice when it flips.
+fn subagent_status_code(status: Option<komet_doc::SubagentStatus>) -> u8 {
+    match status {
+        None => 0,
+        Some(komet_doc::SubagentStatus::Running) => 1,
+        Some(komet_doc::SubagentStatus::Done) => 2,
+        Some(komet_doc::SubagentStatus::Failed) => 3,
+    }
+}
+
 fn tool_fingerprint(tools: &[ToolItem], auto_open: bool) -> u64 {
     let mut acc = Vec::with_capacity(tools.len() * 8 + 1);
     for t in tools {
@@ -667,6 +752,9 @@ fn tool_fingerprint(tools: &[ToolItem], auto_open: bool) -> u64 {
         acc.extend_from_slice(t.chip_detail.as_bytes());
         acc.push(0);
         acc.push(t.is_error as u8 | (t.resolved as u8) << 1);
+        acc.push(subagent_status_code(t.subagent_status));
+        acc.extend_from_slice(&t.subagent_duration_ms.unwrap_or(u64::MAX).to_le_bytes());
+        acc.extend_from_slice(&t.subagent_tool_count.unwrap_or(u64::MAX).to_le_bytes());
         // Detail payload arriving (or growing) must re-splice the row even
         // when the resolved bit didn't change.
         match t.detail.as_deref() {
@@ -841,6 +929,9 @@ pub fn rows_for_entry(
                 call,
                 is_error,
                 resolved,
+                subagent_status,
+                subagent_duration_ms,
+                subagent_tool_count,
                 output,
                 diff,
                 output_ref,
@@ -857,6 +948,9 @@ pub fn rows_for_entry(
                     call: call.clone(),
                     is_error: *is_error,
                     resolved: *resolved,
+                    subagent_status: *subagent_status,
+                    subagent_duration_ms: *subagent_duration_ms,
+                    subagent_tool_count: *subagent_tool_count,
                     detail: tool_detail(output.as_deref(), diff.as_ref(), diff_stats.as_deref())
                         .map(Arc::new),
                     invocation: call_block(call).map(Arc::new),
@@ -919,23 +1013,75 @@ pub fn rows_for_entry(
                         id: part_id,
                         questions,
                         resolved,
+                        responses,
+                        source,
                         ..
                     } => {
-                        // Model-generated header onto the one-line chip.
-                        let header: SharedString = single_line(
-                            &questions
-                                .first()
-                                .map(|q| q.header.clone())
-                                .unwrap_or_else(|| "Question".to_string()),
-                        )
-                        .into();
+                        let header = questions
+                            .first()
+                            .map(|q| q.header.clone())
+                            .unwrap_or_else(|| "Question".to_string());
+                        let question = questions
+                            .iter()
+                            .map(|q| q.question.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" · ");
+                        let status = if *resolved {
+                            QuestionStatus::Answered
+                        } else if streaming {
+                            QuestionStatus::Awaiting
+                        } else {
+                            QuestionStatus::RunEnded
+                        };
+                        let mut fingerprint =
+                            format!("{header}\0{question}\0{source:?}\0{status:?}");
+                        fingerprint.push_str(&format!("\0{responses:?}"));
                         rows.push(Row {
                             id: format!("{}#{}", entry.id, part_id).into(),
-                            version: fnv1a(header.as_bytes()) << 1 | *resolved as u64,
+                            version: fnv1a(fingerprint.as_bytes()),
                             turn_start: false,
-                            kind: RowKind::InputChip {
-                                header,
+                            kind: RowKind::QuestionRow {
+                                header: single_line(&header).into(),
+                                question: question.into(),
+                                source: *source,
+                                status,
+                                responses: Arc::new(responses.clone()),
+                                secret_question_ids: Arc::new(
+                                    questions
+                                        .iter()
+                                        .filter(|q| q.secret)
+                                        .map(|q| q.id.clone())
+                                        .collect(),
+                                ),
+                            },
+                            entry_id: entry_id.clone(),
+                            timestamp: None,
+                        });
+                    }
+                    MessagePart::Permission {
+                        id: part_id,
+                        summary,
+                        resolved,
+                        decision,
+                        decided_by,
+                        decided_at,
+                        tool_call_id,
+                        ..
+                    } => {
+                        let fingerprint = format!(
+                            "{summary}\0{resolved}\0{decision:?}\0{decided_by:?}\0{decided_at:?}\0{tool_call_id:?}"
+                        );
+                        rows.push(Row {
+                            id: format!("{}#{}", entry.id, part_id).into(),
+                            version: fnv1a(fingerprint.as_bytes()),
+                            turn_start: false,
+                            kind: RowKind::PermissionRow {
+                                summary: single_line(summary).into(),
                                 resolved: *resolved,
+                                decision: decision.clone(),
+                                decided_by: decided_by.clone(),
+                                decided_at: *decided_at,
+                                tool_call_id: tool_call_id.clone(),
                             },
                             entry_id: entry_id.clone(),
                             timestamp: None,
@@ -970,11 +1116,54 @@ pub fn rows_for_entry(
                             timestamp: None,
                         });
                     }
+                    MessagePart::Compaction {
+                        id: part_id,
+                        compaction_id,
+                        status,
+                        trigger,
+                        tokens_before,
+                        tokens_after,
+                        error,
+                        summary,
+                        summary_bytes,
+                        summary_in_journal,
+                    } => {
+                        // One row per cycle, refined in place — and every
+                        // visible field is in the fingerprint, because the
+                        // agent's frames trickle in (`inProgress`, then the
+                        // boundary, then tokens/recap late). A version that
+                        // missed them would keep the stale line cached.
+                        let mut fingerprint = format!(
+                            "{compaction_id}\0{status:?}\0{trigger:?}\0{tokens_before:?}\0{tokens_after:?}\0{error:?}\0{summary_bytes:?}\0{summary_in_journal}\0{}",
+                            entry.created_at
+                        );
+                        if let Some(summary) = summary {
+                            fingerprint.push_str(summary);
+                        }
+                        rows.push(Row {
+                            id: format!("{}#{}", entry.id, part_id).into(),
+                            version: fnv1a(fingerprint.as_bytes()),
+                            turn_start: false,
+                            kind: RowKind::Compaction {
+                                compaction_id: compaction_id.clone().into(),
+                                status: *status,
+                                trigger: trigger.as_deref().map(single_line).map(Into::into),
+                                tokens_before: *tokens_before,
+                                tokens_after: *tokens_after,
+                                error: error.as_deref().map(single_line).map(Into::into),
+                                summary: summary.clone().map(Into::into),
+                                summary_bytes: *summary_bytes,
+                                summary_in_journal: *summary_in_journal,
+                                created_at: entry.created_at,
+                                live: matches!(status, komet_proto::CompactionStatus::InProgress),
+                            },
+                            entry_id: entry_id.clone(),
+                            timestamp: None,
+                        });
+                    }
                     // Tools are grouped by the outer arm; switch markers are
                     // metadata-only and do not render as transcript rows.
-                    MessagePart::Tool { .. }
-                    | MessagePart::Permission { .. }
-                    | MessagePart::Switch { .. } => {}
+                    MessagePart::Tool { .. } | MessagePart::Switch { .. } => {}
                 }
             }
         }
@@ -1216,7 +1405,7 @@ fn detail_section_height(detail: &ToolDetail) -> f32 {
 }
 
 /// Labeled Input/Output panel attached to an action row.
-fn detail_section(label: &str, body: AnyElement, theme: &Theme) -> AnyElement {
+pub(crate) fn detail_section(label: &str, body: AnyElement, theme: &Theme) -> AnyElement {
     div()
         .mt(px(DETAIL_PANEL_GAP))
         .w_full()
@@ -1279,6 +1468,34 @@ fn blob_detail(text: &str, is_diff: bool) -> Option<ToolDetail> {
         lines,
         truncated_by,
     })
+}
+
+/// Line cap for a live (still-streaming) output: the tail is what changes, and
+/// the analytic fold height must stay bounded no matter how much the tool prints.
+const LIVE_OUTPUT_MAX_LINES: usize = 12;
+
+/// Build the open-chip view of a tool's live output. The engine already caps the
+/// buffer to a byte tail, so what arrives is the interesting end; the earlier
+/// lines that scrolled off the cap are noted in place rather than dropped
+/// silently. `truncated_by` stays 0: the marker renders as a first line, since
+/// the elided part is above the visible tail, not below it.
+fn live_output_detail(text: &str) -> ToolDetail {
+    let mut lines: Vec<SharedString> = text
+        .lines()
+        .map(|l| SharedString::from(l.to_owned()))
+        .collect();
+    while lines.last().is_some_and(|l| l.trim().is_empty()) {
+        lines.pop();
+    }
+    let hidden = lines.len().saturating_sub(LIVE_OUTPUT_MAX_LINES);
+    if hidden > 0 {
+        lines.drain(..hidden);
+        lines.insert(0, SharedString::from(format!("… {hidden} earlier lines")));
+    }
+    ToolDetail::Output {
+        lines,
+        truncated_by: 0,
+    }
 }
 
 /// One diff line's glyph: checked green-ish completed, filled in-progress
@@ -1391,6 +1608,31 @@ pub fn sending_bridge(
         (Some(send), Some(turn)) => turn <= send,
         (Some(_), None) => true,
         (None, _) => false,
+    }
+}
+
+/// What the working trailer says while the run is live: the engine's phase
+/// frame names the wait, and the flavour word is the fallback — an older
+/// engine, or a viewer that subscribed after the frame flew by, must degrade
+/// to today's rotating word, never to a blank. `sending` outranks a phase:
+/// the frames on the wire still belong to the previous turn until this turn's
+/// row arrives, so the "Sending…" bridge stays until the timer takes over.
+/// No new orb animation here — phases map onto the existing orb states.
+pub fn phase_trailer(
+    phase: Option<komet_proto::RunPhase>,
+    sending: bool,
+    word: &'static str,
+) -> (&'static str, crate::thinking_orbs::OrbState) {
+    use crate::thinking_orbs::OrbState;
+    if sending {
+        return ("Sending", OrbState::Listening);
+    }
+    match phase {
+        Some(komet_proto::RunPhase::Starting) => ("Starting the harness", OrbState::Connecting),
+        Some(komet_proto::RunPhase::WaitingModel) => ("Waiting for the model", OrbState::Working),
+        Some(komet_proto::RunPhase::Streaming) => ("Answering", OrbState::Working),
+        Some(komet_proto::RunPhase::Tool) => ("Running a tool", OrbState::Searching),
+        None => (word, OrbState::from_flavour_word(word)),
     }
 }
 
@@ -1601,6 +1843,9 @@ pub struct Transcript {
     /// Expanded « Détails » bodies on error chips, keyed by row id.
     /// Render-local like `folds` — never part of the row fingerprint.
     error_details: std::collections::HashSet<SharedString>,
+    /// Expanded recap bodies on compaction markers, keyed by row id — same
+    /// render-local rule as `error_details`.
+    recaps_open: std::collections::HashSet<SharedString>,
     /// Streaming fade veils, one per live markdown row (dropped on completion).
     veils: HashMap<SharedString, Rc<RefCell<RowVeil>>>,
     /// Live rows present in the transcript's REPLAY after (re)attaching to a
@@ -1695,6 +1940,27 @@ pub struct Transcript {
     /// for the selected chat, shown while the turn is Working. Local only —
     /// never written to the doc, cleared on Done / chat switch / unmount.
     reasoning_text: String,
+    /// Ephemeral tool output per running tool (`WatchActivity`), keyed by the
+    /// doc part id. The engine already coalesced it into one tail per tool, so
+    /// a frame REPLACES the previous value. Rendered only inside an open chip
+    /// of an unresolved tool; never journaled, never replayed, cleared when the
+    /// turn ends or the chat changes.
+    tool_progress: HashMap<SharedString, SharedString>,
+    /// Live subagent counters (`WatchActivity` `subagentStatus` frames), keyed by
+    /// the SPAWN chip's doc part id. The host measured them; this map only
+    /// carries them to the chip. Same lifetime rule as `tool_progress`: nothing
+    /// journaled, nothing written to the doc, gone when the turn ends — a
+    /// settled child's numbers arrive through the doc's terminal write instead.
+    subagent_live: HashMap<SharedString, SubagentLive>,
+    /// The live run's phase (`WatchActivity` `runPhase` frames), shown by the
+    /// working trailer. Ephemeral like the frames themselves: no replay on
+    /// (re)subscribe, nothing journaled, nothing carried to the next chat —
+    /// `None` is the ordinary state, and the trailer then reads its flavour
+    /// word as it did before the frames existed.
+    run_phase: Option<komet_proto::RunPhase>,
+    /// The chat the live-output watch belongs to (`None` = no watch running).
+    activity_chat: Option<String>,
+    activity_task: Option<Task<()>>,
     /// Live reasoning starts compact so a verbose provider stream never
     /// displaces the answer the user is waiting for. The user can expand it
     /// for the current run; it resets when the stream ends or the chat moves.
@@ -1709,6 +1975,11 @@ pub struct Transcript {
     /// via `GetToolDetail`. `Unavailable` renders nothing — the chip falls
     /// back to the summary already displayed.
     journal_details: HashMap<SharedString, JournalDetail>,
+    /// Per-compaction recap, keyed `{chatId}/recap/{compactionId}`: the doc
+    /// carries the fact, the host's run journal carries the text
+    /// (`GetCompactionSummary`). Same lifecycle as `journal_details` —
+    /// chat-qualified keys, so a fetched recap stays valid across switches.
+    compaction_recaps: HashMap<SharedString, CompactionRecap>,
     /// Last `Todo` list seen while building rows (top-to-bottom): Todo items
     /// ship complete in the doc, so each chip renders the diff against the
     /// previous call instead of the full dump. Reset at the start of every
@@ -1725,7 +1996,19 @@ pub struct Transcript {
 /// Actions from an agent response that require shell-level navigation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TranscriptEvent {
-    OpenWorkspaceFile { path: String, line: Option<u32> },
+    OpenWorkspaceFile {
+        path: String,
+        line: Option<u32>,
+    },
+    /// A spawn chip's badge was clicked: open that subagent's transcript in the
+    /// right pane. The chat and host device ride along because a tab is bound to
+    /// the journal of the device that ran the agent, not to whichever device is
+    /// displayed later.
+    OpenSubagent {
+        chat_id: SharedString,
+        target_device_id: Option<SharedString>,
+        spawn: subagent::SubagentSpawn,
+    },
 }
 
 impl EventEmitter<TranscriptEvent> for Transcript {}
@@ -1736,6 +2019,16 @@ enum BlobFetch {
     /// Failed with the affordance re-armed as a retry.
     Failed,
     Ready(Arc<ToolDetail>),
+}
+
+/// One compaction recap's lifecycle (the doc carries the fact; only the
+/// host's run journal carries the text).
+enum CompactionRecap {
+    Loading(#[allow(dead_code)] Task<()>),
+    /// This device cannot read that journal (a remote host, or a cycle that
+    /// predates the journal). The row says so instead of showing nothing.
+    Unavailable,
+    Ready(Arc<String>),
 }
 
 /// One journal-detail fetch's lifecycle (issue #10). Unlike blobs there is
@@ -1813,6 +2106,7 @@ impl Transcript {
             folds: HashMap::new(),
             tool_details: HashMap::new(),
             error_details: std::collections::HashSet::new(),
+            recaps_open: std::collections::HashSet::new(),
             veils: HashMap::new(),
             veil_baseline: std::collections::HashSet::new(),
             veil_attach_pending: true,
@@ -1847,10 +2141,16 @@ impl Transcript {
             attachment_retries: HashMap::new(),
             blob_details: HashMap::new(),
             reasoning_text: String::new(),
+            tool_progress: HashMap::new(),
+            subagent_live: HashMap::new(),
+            run_phase: None,
+            activity_chat: None,
+            activity_task: None,
             reasoning_expanded: false,
             reasoning_chat: None,
             reasoning_task: None,
             journal_details: HashMap::new(),
+            compaction_recaps: HashMap::new(),
             todo_cursor: None,
             blob_fetch_order: HashMap::new(),
             blob_fetch_counter: 0,
@@ -1958,6 +2258,35 @@ impl Transcript {
 
     pub(crate) fn rail_hover(&self) -> Option<usize> {
         self.rail_hover
+    }
+
+    /// Scroll the newest compaction marker into view — the Context popover's
+    /// « see in thread » link. The bottom pin is released first: jumping into
+    /// history means the user left the tail on purpose.
+    pub fn reveal_last_compaction(&mut self, cx: &mut Context<Self>) {
+        let Some(ix) = self
+            .rows
+            .iter()
+            .rposition(|row| matches!(row.kind, RowKind::Compaction { .. }))
+        else {
+            return;
+        };
+        self.pinned = false;
+        // Same idiom the in-thread search jump uses: land the marker at the
+        // viewport top (an unmeasured item has no center to compute).
+        if let Some(bounds) = self.list.bounds_for_item(ix) {
+            let vp_top = f32::from(self.list.viewport_bounds().top());
+            self.list.scroll_to(ListOffset {
+                item_ix: ix,
+                offset_in_item: px(vp_top - f32::from(bounds.top())),
+            });
+        } else {
+            self.list.scroll_to(ListOffset {
+                item_ix: ix,
+                offset_in_item: px(0.0),
+            });
+        }
+        cx.notify();
     }
 
     pub(crate) fn set_rail_hover(&mut self, hover: Option<usize>) {
@@ -2612,6 +2941,9 @@ impl Transcript {
             // belongs to the previous chat (same rule as every watch here —
             // dropping the task cancels the subscription).
             self.stop_reasoning();
+            // …and the live tool-output watch with it: its frames are keyed by
+            // the previous chat's tool ids.
+            self.stop_activity();
             self.veils.clear();
             self.render_cache.borrow_mut().clear();
             self.highlights.entries.clear();
@@ -2705,6 +3037,46 @@ impl Transcript {
             }
         }
         self.rows = new_rows;
+        // Live output is keyed by tool part id: a tool that resolved (or left
+        // the transcript with a segment reset) must not keep its stream alive
+        // in the map — the chip that would show it is gone.
+        if !self.tool_progress.is_empty() {
+            let running: std::collections::HashSet<SharedString> = self
+                .rows
+                .iter()
+                .filter_map(|row| match &row.kind {
+                    RowKind::ToolGroup { tools, .. } => Some(
+                        tools
+                            .iter()
+                            .filter(|tool| !tool.resolved)
+                            .map(|tool| tool.part_id.clone()),
+                    ),
+                    _ => None,
+                })
+                .flatten()
+                .collect();
+            self.tool_progress.retain(|id, _| running.contains(id));
+        }
+        // A spawn chip is the exception: its own tool call resolves while the
+        // child keeps working, so its live counters are keyed on the lifecycle
+        // the doc carries, not on `resolved`.
+        if !self.subagent_live.is_empty() {
+            let spawning: std::collections::HashSet<SharedString> = self
+                .rows
+                .iter()
+                .filter_map(|row| match &row.kind {
+                    RowKind::ToolGroup { tools, .. } => Some(
+                        tools
+                            .iter()
+                            .filter(|tool| tool.subagent_status.is_some())
+                            .map(|tool| tool.part_id.clone()),
+                    ),
+                    _ => None,
+                })
+                .flatten()
+                .collect();
+            self.subagent_live.retain(|id, _| spawning.contains(id));
+        }
         self.refresh_protected_attachments(cx);
         if self.own_turn.is_some() {
             // Appending a reply moves the runway from the previous last row to
@@ -2733,6 +3105,8 @@ impl Transcript {
         // Live reasoning watch follows the selected chat's Working state:
         // starts it mid-turn, clears it at Done, never subscribes otherwise.
         self.maybe_start_reasoning(cx);
+        // Same lifecycle for the live tool-output watch (Task 7).
+        self.maybe_start_activity(cx);
         cx.notify();
     }
 
@@ -2940,6 +3314,89 @@ impl Transcript {
             .insert(key, JournalDetail::Loading(task));
     }
 
+    /// Fetch one compaction's recap from the run journal
+    /// (`GetCompactionSummary`). The doc deliberately carries the fact —
+    /// byte size, journal presence — and not the text, so the host's journal
+    /// is the only source, and a viewer that cannot reach it gets the typed
+    /// `Unavailable` rather than an empty summary. Re-entry while
+    /// Loading/Ready/Unavailable is a no-op; a transport error is not cached,
+    /// so the next expand retries.
+    fn spawn_recap_fetch(
+        &mut self,
+        chat_id: String,
+        compaction_id: String,
+        cx: &mut Context<Self>,
+    ) {
+        let key = Self::recap_key(&chat_id, &compaction_id);
+        if self.compaction_recaps.contains_key(&key) {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let target = self
+            .state
+            .read(cx)
+            .selected_chat_row()
+            .map(|chat| chat.device_id.clone())
+            .filter(|device_id| {
+                self.state.read(cx).local_device_id.as_deref() != Some(device_id.as_str())
+            });
+        let fetch_key = key.clone();
+        let task = cx.spawn(async move |this, cx| {
+            let mut payload =
+                serde_json::json!({ "chatId": chat_id, "compactionId": compaction_id });
+            if let Some(target) = target
+                && let Some(obj) = payload.as_object_mut()
+            {
+                obj.insert(
+                    "targetDeviceId".to_string(),
+                    serde_json::Value::String(target),
+                );
+            }
+            let reply = crate::attachments::call_with_timeout(
+                &engine,
+                cx.background_executor(),
+                komet_rpc::methods::GET_COMPACTION_SUMMARY,
+                payload,
+                Duration::from_secs(20),
+            )
+            .await;
+            let fetched = match reply {
+                Ok(value) if value.get("status").and_then(|s| s.as_str()) == Some("ok") => {
+                    let text = value
+                        .get("text")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or_default();
+                    Some(CompactionRecap::Ready(Arc::new(text.to_owned())))
+                }
+                // The host answered "nothing here": terminal, no retry.
+                Ok(_) => Some(CompactionRecap::Unavailable),
+                Err(_) => None,
+            };
+            this.update(cx, |this, cx| {
+                match fetched {
+                    Some(recap) => {
+                        this.compaction_recaps.insert(fetch_key, recap);
+                    }
+                    None => {
+                        this.compaction_recaps.remove(&fetch_key);
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        });
+        self.compaction_recaps
+            .insert(key, CompactionRecap::Loading(task));
+    }
+
+    /// Recap key: chat-qualified, and namespace-tagged so a compaction id can
+    /// never collide with a tool part id in a cache.
+    fn recap_key(chat_id: &str, compaction_id: &str) -> SharedString {
+        SharedString::from(format!("{chat_id}/recap/{compaction_id}"))
+    }
+
     /// Drop the live reasoning subscription and clear its text (chat switch,
     /// end of turn, unmount-equivalent paths). Render-local like `folds`.
     fn stop_reasoning(&mut self) {
@@ -3054,6 +3511,176 @@ impl Transcript {
             }
         });
         self.reasoning_task = Some(task);
+    }
+
+    /// The device that ran the selected chat, when it is not this machine: the
+    /// `targetDeviceId` every live watch sends so the host answers from its own
+    /// journal. `None` for a local chat (and for a new-chat canvas).
+    fn remote_host(&self, cx: &App) -> Option<String> {
+        self.state
+            .read(cx)
+            .selected_chat_row()
+            .map(|chat| chat.device_id.clone())
+            .filter(|device_id| {
+                self.state.read(cx).local_device_id.as_deref() != Some(device_id.as_str())
+            })
+    }
+
+    /// Drop the live tool-output watch and clear its buffers. Render-local
+    /// like `folds`: nothing here is ever written to the doc.
+    fn stop_activity(&mut self) {
+        self.activity_task = None;
+        self.activity_chat = None;
+        self.tool_progress.clear();
+        self.subagent_live.clear();
+        self.run_phase = None;
+    }
+
+    /// Start the live tool-output watch (transparency plan Task 7) while the
+    /// selected chat has a run going; clear it when the turn ends. Mirrors
+    /// [`Self::maybe_start_reasoning`], with a bounded retry budget: an older
+    /// engine on the other end of a relay simply has no `WatchActivity`
+    /// method, and a permanently re-subscribing loop would be pure churn.
+    fn maybe_start_activity(&mut self, cx: &mut Context<Self>) {
+        const RETRY_BUDGET: u32 = 3;
+        let Some(chat_id) = self.chat_id.clone() else {
+            if self.activity_task.is_some() {
+                self.stop_activity();
+            }
+            return;
+        };
+        let live = matches!(
+            self.state
+                .read(cx)
+                .indicator_for(&chat_id, chrono::Utc::now()),
+            crate::state::Indicator::Working | crate::state::Indicator::AwaitingInput
+        );
+        if !live {
+            if self.activity_task.is_some()
+                || !self.tool_progress.is_empty()
+                || !self.subagent_live.is_empty()
+            {
+                self.stop_activity();
+                cx.notify();
+            }
+            return;
+        }
+        if self.activity_chat.as_deref() == Some(chat_id.as_str()) {
+            return;
+        }
+        let Some(engine) = self.state.read(cx).engine().cloned() else {
+            return;
+        };
+        let target = self.remote_host(cx);
+        self.activity_task = None;
+        self.activity_chat = Some(chat_id.clone());
+        self.tool_progress.clear();
+        self.subagent_live.clear();
+        self.run_phase = None;
+        let task = cx.spawn(async move |this, cx| {
+            const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+            let mut retries = 0u32;
+            loop {
+                let mut payload = serde_json::json!({ "chatId": chat_id });
+                if let Some(target) = target.clone()
+                    && let Some(obj) = payload.as_object_mut()
+                {
+                    obj.insert(
+                        "targetDeviceId".to_string(),
+                        serde_json::Value::String(target),
+                    );
+                }
+                let mut rx = match engine
+                    .client()
+                    .subscribe(komet_rpc::methods::WATCH_ACTIVITY, payload)
+                    .await
+                {
+                    Ok(rx) => rx,
+                    Err(_) if retries < RETRY_BUDGET => {
+                        retries += 1;
+                        cx.background_executor().timer(RETRY_DELAY).await;
+                        let alive = this
+                            .update(cx, |this, _| {
+                                this.activity_chat.as_deref() == Some(chat_id.as_str())
+                            })
+                            .unwrap_or(false);
+                        if !alive {
+                            return;
+                        }
+                        continue;
+                    }
+                    Err(_) => return,
+                };
+                while let Some(value) = rx.recv().await {
+                    let alive = this
+                        .update(cx, |this, cx| {
+                            if this.activity_chat.as_deref() != Some(chat_id.as_str()) {
+                                return false;
+                            }
+                            // Frames are kind-tagged (transparency plan Task 4).
+                            // An untagged frame is an older engine's tool-output
+                            // frame, which is exactly what this branch did
+                            // before the tag existed — so the tag is additive on
+                            // the wire and here.
+                            match value.get("kind").and_then(|v| v.as_str()) {
+                                Some("subagentStatus") => {
+                                    let parent =
+                                        value.get("parentToolUseId").and_then(|v| v.as_str());
+                                    if let Some(parent) = parent
+                                        && let Some(frame) =
+                                            SubagentLive::from_frame(&value, parent)
+                                    {
+                                        this.subagent_live.insert(parent.into(), frame);
+                                        cx.notify();
+                                    }
+                                }
+                                // A boundary's live sizes: the context line owns
+                                // that story (and the recap is an explicit fetch),
+                                // so the transcript keeps its hands off.
+                                Some("compaction") => {}
+                                // The phase the user is waiting on. Broadcast
+                                // only, never replayed: a frame that does not
+                                // parse is ignored, and the trailer falls back
+                                // to its flavour word — never to a blank.
+                                Some("runPhase") => {
+                                    if let Some(phase) = value.get("phase").and_then(|p| {
+                                        serde_json::from_value::<komet_proto::RunPhase>(p.clone())
+                                            .ok()
+                                    }) {
+                                        this.run_phase = Some(phase);
+                                        cx.notify();
+                                    }
+                                }
+                                _ => {
+                                    let id = value.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                                    let text =
+                                        value.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                                    if !id.is_empty() && !text.is_empty() {
+                                        // Coalesced frames are tail snapshots: replace.
+                                        this.tool_progress.insert(id.into(), text.into());
+                                        cx.notify();
+                                    }
+                                }
+                            }
+                            true
+                        })
+                        .unwrap_or(false);
+                    if !alive {
+                        return;
+                    }
+                }
+                // The engine closes the stream at Done; live output is
+                // ephemeral, so the buffers leave with it.
+                let _ = this.update(cx, |this, cx| {
+                    if this.activity_chat.as_deref() == Some(chat_id.as_str()) {
+                        this.stop_activity();
+                        cx.notify();
+                    }
+                });
+                return;
+            }
+        });
+        self.activity_task = Some(task);
     }
 
     fn toggle_fold(&mut self, row_id: SharedString, open_height: f32) {
@@ -3385,16 +4012,15 @@ impl Transcript {
                 .unwrap_or(0);
             (sending, elapsed)
         };
-        let word = if sending {
-            "Sending"
-        } else {
-            flavour_word(flavour_seed(&chat_id), elapsed_secs)
-        };
-        let orb_state = if sending {
-            crate::thinking_orbs::OrbState::Listening
-        } else {
-            crate::thinking_orbs::OrbState::from_flavour_word(word)
-        };
+        let (word, orb_state) = phase_trailer(
+            self.run_phase,
+            sending,
+            if sending {
+                "Sending"
+            } else {
+                flavour_word(flavour_seed(&chat_id), elapsed_secs)
+            },
+        );
         let theme = Theme::of(cx).clone();
         Some(
             div()
@@ -3498,6 +4124,7 @@ impl Transcript {
         let Some(row) = self.rows.get(ix).cloned() else {
             return gpui::Empty.into_any_element();
         };
+        let _row = crate::perf::row_frame(row_kind_tag(&row.kind), row.id.as_ref());
         let theme = Theme::of(cx).clone();
         // The viewport spans the full window (under the titlebar): the first
         // row's gap adds the titlebar's height so a top-scrolled transcript
@@ -3690,15 +4317,73 @@ impl Transcript {
                 summary,
                 auto_open,
             } => self.render_tool_group(&row.id, tools, summary, *auto_open, &theme, cx),
-            RowKind::InputChip { header, resolved } => {
-                input_chip(header.clone(), *resolved, &theme)
-            }
+            RowKind::QuestionRow {
+                header,
+                question,
+                source,
+                status,
+                responses,
+                secret_question_ids,
+            } => question_row(
+                header.clone(),
+                question.clone(),
+                *source,
+                *status,
+                responses,
+                secret_question_ids,
+                &theme,
+            ),
+            RowKind::PermissionRow {
+                summary,
+                resolved,
+                decision,
+                decided_by,
+                decided_at,
+                tool_call_id,
+            } => permission_row(
+                summary.clone(),
+                *resolved,
+                decision.as_ref(),
+                decided_by.as_deref(),
+                *decided_at,
+                tool_call_id.as_deref(),
+                &theme,
+            ),
             RowKind::ErrorChip {
                 message,
                 kind,
                 detail,
                 retryable,
             } => self.render_error_chip(&row.id, message, kind, detail, *retryable, &theme, cx),
+            RowKind::Compaction {
+                compaction_id,
+                status,
+                trigger,
+                tokens_before,
+                tokens_after,
+                error,
+                summary,
+                summary_bytes,
+                summary_in_journal,
+                created_at,
+                live,
+            } => self.render_compaction_row(
+                &row.id,
+                compaction_id,
+                *status,
+                trigger.as_deref(),
+                *tokens_before,
+                *tokens_after,
+                error.as_deref(),
+                summary.as_deref(),
+                *summary_bytes,
+                *summary_in_journal,
+                *created_at,
+                *live,
+                window,
+                &theme,
+                cx,
+            ),
         };
         // Hover-revealed timestamp strip (komet chat-view.tsx `Timestamp`):
         // a RESERVED 16px lane under the entry's last row — the label only
@@ -4136,6 +4821,21 @@ impl Transcript {
         // always answers "what exactly was this call?", output or not.
         let invocations: Vec<Option<Arc<ToolDetail>>> =
             tools.iter().map(|tool| tool.invocation.clone()).collect();
+        // Live output of the tools still running (WatchActivity). Resolved
+        // per paint like the fetched blobs: arrival is a cx.notify, never a
+        // row rebuild. A resolved tool has its doc output — the ephemeral
+        // stream would only duplicate it.
+        let live: Vec<Option<Arc<ToolDetail>>> = tools
+            .iter()
+            .map(|tool| {
+                if tool.resolved {
+                    return None;
+                }
+                self.tool_progress
+                    .get(&tool.part_id)
+                    .map(|text| Arc::new(live_output_detail(text.as_ref())))
+            })
+            .collect();
         // Fetch affordance under each open detail whose full payload is still
         // sidecar-only: `(ref, label)`. Diff offered first (the richer
         // upgrade), then the output — a fetched ref hands the affordance to
@@ -4250,6 +4950,7 @@ impl Transcript {
                     };
                     invocation_height
                         + details[ix].as_deref().map_or(0.0, detail_section_height)
+                        + live[ix].as_deref().map_or(0.0, detail_section_height)
                         + if affordances[ix].is_some() {
                             BLOB_AFFORDANCE_HEIGHT
                         } else {
@@ -4342,6 +5043,7 @@ impl Transcript {
             .children(tools.iter().enumerate().map(|(ix, tool)| {
                 let detail = details[ix].clone();
                 let invocation = invocations[ix].clone();
+                let live = live[ix].clone();
                 let affordance = affordances[ix].clone();
                 let affordance_h = if affordance.is_some() {
                     BLOB_AFFORDANCE_HEIGHT
@@ -4369,6 +5071,7 @@ impl Transcript {
                         invocation.as_deref().map_or(0.0, detail_section_height)
                     }
                     + detail.as_deref().map_or(0.0, detail_section_height)
+                    + live.as_deref().map_or(0.0, detail_section_height)
                     + affordance_h
                     + if detail.is_none() {
                         journal_extras[ix]
@@ -4388,6 +5091,52 @@ impl Transcript {
                     None
                 };
                 let action_toggle_key = key.clone();
+                // A spawn chip's badge doubles as the entry point to the child's
+                // transcript tab — and it carries the counters that make it worth
+                // opening: the host's live numbers while the child works, the
+                // doc's terminal write once it settled.
+                let spawn_badge = match (self.chat_id.as_ref(), tool.subagent_status) {
+                    (Some(chat_id), Some(_)) => {
+                        let target = self.remote_host(cx).map(SharedString::from);
+                        let spawn = subagent::SubagentSpawn {
+                            parent_tool_use_id: tool.part_id.clone(),
+                            title: SharedString::from(tool.chip_label.to_string()),
+                            model: tool.call.subagent_model().map(SharedString::from),
+                            status: tool.subagent_status,
+                            duration_ms: tool.subagent_duration_ms,
+                            tool_count: tool.subagent_tool_count,
+                        };
+                        let open = subagent::SubagentOpen {
+                            chat_id: chat_id.clone().into(),
+                            target_device_id: target,
+                            spawn,
+                        };
+                        subagent_badge(
+                            tool.subagent_status,
+                            self.subagent_live.get(&tool.part_id),
+                            tool.subagent_duration_ms,
+                            tool.subagent_tool_count,
+                            theme,
+                        )
+                        .map(|badge| {
+                            badge
+                                .id(SharedString::from(format!("{key}-feed")))
+                                .cursor_pointer()
+                                .on_click(cx.listener(move |_this, _, _, cx| {
+                                    // The chip's own click expands its detail;
+                                    // opening the tab is the badge's, and stops
+                                    // there.
+                                    cx.stop_propagation();
+                                    cx.emit(TranscriptEvent::OpenSubagent {
+                                        chat_id: open.chat_id.clone(),
+                                        target_device_id: open.target_device_id.clone(),
+                                        spawn: open.spawn.clone(),
+                                    });
+                                }))
+                        })
+                    }
+                    _ => None,
+                };
                 let mut action = div()
                     .h(px(action_height))
                     .min_w_0()
@@ -4396,7 +5145,7 @@ impl Transcript {
                     .flex_col()
                     .overflow_hidden()
                     .child(
-                        chip_header_row(tool, theme, action_is_open)
+                        chip_header_row(tool, theme, action_is_open, spawn_badge)
                             .id(SharedString::from(format!("{key}-hdr")))
                             .cursor_pointer()
                             .on_click(cx.listener(move |this, _, _, cx| {
@@ -4434,6 +5183,13 @@ impl Transcript {
                                 "Output"
                             },
                             detail_body(detail, detail_highlights[ix].clone(), theme),
+                            theme,
+                        ));
+                    }
+                    if let Some(live) = live.as_deref() {
+                        action = action.child(detail_section(
+                            "Live output",
+                            detail_body(live, None, theme),
                             theme,
                         ));
                     }
@@ -4765,6 +5521,200 @@ impl Transcript {
         }
         card.into_any_element()
     }
+
+    /// The compaction marker: one quiet line per boundary, its recap behind a
+    /// disclosure. The recap TEXT is deliberately not in the doc by default
+    /// (`CompactionSummaryPolicy::JournalOnly`) — it lives in the host's run
+    /// journal, so expanding fetches it (`GetCompactionSummary`) and a viewer
+    /// who cannot read that journal is told so, rather than shown an empty
+    /// panel that looks like a bug.
+    #[allow(clippy::too_many_arguments)]
+    fn render_compaction_row(
+        &mut self,
+        row_id: &SharedString,
+        compaction_id: &SharedString,
+        status: komet_proto::CompactionStatus,
+        trigger: Option<&str>,
+        tokens_before: Option<u64>,
+        tokens_after: Option<u64>,
+        error: Option<&str>,
+        summary: Option<&str>,
+        summary_bytes: Option<u64>,
+        summary_in_journal: bool,
+        created_at: i64,
+        live: bool,
+        window: &mut Window,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use komet_proto::CompactionStatus as S;
+        let line = compaction_line(status, trigger, tokens_before, tokens_after, created_at);
+        let failed = matches!(status, S::Failed);
+        let has_recap = compaction_has_recap(summary, summary_in_journal);
+        let expanded = has_recap && self.recaps_open.contains(row_id);
+
+        let mut card = div().py(px(4.0)).w_full().flex().flex_col().gap(px(4.0));
+
+        let wave = live.then(|| {
+            motion::pulse_wave(motion::pulse_delta(
+                &motion::KOMET_PULSE,
+                cx.entity_id(),
+                window,
+                cx,
+            ))
+        });
+        let mut head = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .min_w_0()
+            .px(px(10.0))
+            .child(
+                crate::icons::icon(crate::icons::ARCHIVE_UP_MINIMALISTIC)
+                    .size(px(13.0))
+                    .flex_none()
+                    .text_color(if failed {
+                        theme.danger
+                    } else {
+                        theme.text_faint
+                    })
+                    .when_some(wave, |el, wave| el.opacity(0.45 + 0.55 * wave)),
+            )
+            .child(
+                div()
+                    .min_w_0()
+                    .text_size(px(11.5))
+                    .text_color(if failed {
+                        theme.danger
+                    } else {
+                        theme.text_muted
+                    })
+                    .child(SharedString::from(line)),
+            );
+
+        if has_recap {
+            let key = row_id.clone();
+            let label: SharedString = (if expanded { "Hide recap" } else { "Recap" }).into();
+            let fetch = if summary.is_none() && summary_in_journal {
+                self.chat_id
+                    .as_ref()
+                    .map(|chat_id| (chat_id.clone(), compaction_id.to_string()))
+            } else {
+                None
+            };
+            head = head.child(
+                div()
+                    .id(SharedString::from(format!("recap-toggle-{key}")))
+                    .flex_none()
+                    .cursor_pointer()
+                    .text_size(px(11.0))
+                    .text_color(theme.text_faint)
+                    .hover(|s| s.text_color(theme.text_muted))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        let opening = !this.recaps_open.remove(&key);
+                        if opening {
+                            this.recaps_open.insert(key.clone());
+                            if let Some((chat_id, compaction_id)) = &fetch {
+                                this.spawn_recap_fetch(chat_id.clone(), compaction_id.clone(), cx);
+                            }
+                        }
+                        cx.notify();
+                    }))
+                    .child(label),
+            );
+        }
+        card = card.child(head);
+
+        // A failed boundary's reason is part of the marker, not a disclosure:
+        // it explains why the line says "failed".
+        if failed && let Some(error) = error.map(str::trim).filter(|e| !e.is_empty()) {
+            card = card.child(
+                div()
+                    .px(px(10.0))
+                    .text_size(px(11.5))
+                    .line_height(px(16.0))
+                    .text_color(theme.text_muted)
+                    .child(SharedString::from(error.to_owned())),
+            );
+        }
+
+        if expanded {
+            let body: Option<(AnyElement, bool)> = if let Some(text) = summary {
+                Some((recap_text(text, theme), false))
+            } else {
+                let cached = self
+                    .chat_id
+                    .as_ref()
+                    .map(|chat_id| Self::recap_key(chat_id, compaction_id))
+                    .and_then(|key| self.compaction_recaps.get(&key));
+                match cached {
+                    Some(CompactionRecap::Ready(text)) => Some((recap_text(text, theme), false)),
+                    Some(CompactionRecap::Unavailable) => Some((
+                        recap_note(
+                            &summary_bytes
+                                .map(|bytes| {
+                                    format!(
+                                        "The recap ({bytes} B) is in the host's run journal — this device cannot read it."
+                                    )
+                                })
+                                .unwrap_or_else(
+                                    || "The recap is in the host's run journal — this device cannot read it."
+                                        .to_string()
+                                ),
+                            theme,
+                        ),
+                        true,
+                    )),
+                    // Loading, or the click's spawn has not landed yet: say
+                    // something rather than render a blank panel.
+                    Some(CompactionRecap::Loading(_)) | None => {
+                        Some((recap_note("Fetching the recap from the host…", theme), true))
+                    }
+                }
+            };
+            if let Some((body, muted)) = body {
+                card = card.child(
+                    div()
+                        .mx(px(10.0))
+                        .rounded(px(6.0))
+                        .bg(crate::theme::ink(0.04))
+                        .px(px(8.0))
+                        .py(px(6.0))
+                        .when(muted, |el| el.text_color(theme.text_faint))
+                        .child(body),
+                );
+            }
+        }
+        card.into_any_element()
+    }
+}
+
+/// The recap body: the agent's own prose, wrapped, mono-free. Kept as plain
+/// text (like the error chip's raw detail) — it is a summary OF the thread,
+/// not thread content to re-parse and re-highlight.
+fn recap_text(text: &str, theme: &Theme) -> AnyElement {
+    div()
+        .w_full()
+        .min_w_0()
+        .text_size(px(12.0))
+        .line_height(px(17.0))
+        .text_color(theme.text_muted)
+        .child(SharedString::from(text.to_owned()))
+        .into_any_element()
+}
+
+/// A recap state that is not the recap itself (loading, journal unreachable).
+fn recap_note(text: &str, theme: &Theme) -> AnyElement {
+    div()
+        .w_full()
+        .min_w_0()
+        .text_size(px(11.5))
+        .line_height(px(16.0))
+        .text_color(theme.text_faint)
+        .child(SharedString::from(text.to_owned()))
+        .into_any_element()
 }
 
 /// The transcript ErrorChip — a port of komet chat-view.tsx `ErrorChip`
@@ -4776,7 +5726,7 @@ impl Transcript {
 /// message WRAPS instead of truncating: startup-crash errors carry the
 /// agent's exit status and stderr, and a one-line ellipsis was exactly what
 /// made the npm fatal-fs-error case undiagnosable from the screenshot.
-fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
+pub(crate) fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
     let red_300 = theme.danger_muted; // tailwind red-300
     let danger = theme.danger; // red-400
     div()
@@ -4830,68 +5780,242 @@ fn error_chip(message: SharedString, theme: &Theme) -> AnyElement {
         .into_any_element()
 }
 
-/// A passive one-line chip marking a question the agent asked — the
-/// interactive controls live in the composer (chat-view.tsx `InputChip`):
-/// 34px row, `rounded-[10px] border-white/[0.08] bg-white/[0.045] px-2
-/// text-[12px]`, a 20px `bg-white/[0.09]` icon tile with a 12px
-/// ChatRoundLine, the medium "Question" label, then the truncating value —
-/// the first question's header once resolved, "Awaiting your answer…" while
-/// pending. Neutral tones throughout; resolution never recolors the chip.
-fn input_chip(header: SharedString, resolved: bool, theme: &Theme) -> AnyElement {
-    let value: SharedString = if resolved {
-        header
-    } else {
-        "Awaiting your answer…".into()
+pub(crate) fn question_row(
+    header: SharedString,
+    question: SharedString,
+    source: komet_proto::QuestionSource,
+    status: QuestionStatus,
+    responses: &[komet_doc::InputResponse],
+    secret_question_ids: &[String],
+    theme: &Theme,
+) -> AnyElement {
+    let source_label = match source {
+        komet_proto::QuestionSource::Native => "Agent question",
+        komet_proto::QuestionSource::Elicitation => "Agent elicitation",
+        komet_proto::QuestionSource::PermissionShaped => "Question via permission",
     };
-    div()
+    let mut card = div()
         .py(px(4.0))
         .w_full()
+        .rounded(px(10.0))
+        .border_1()
+        .border_color(crate::theme::hairline(0.08))
+        .bg(crate::theme::ink(0.045))
+        .px(px(10.0))
+        .py(px(8.0))
+        .flex()
+        .flex_col()
+        .gap(px(4.0))
         .child(
             div()
-                .h(px(34.0))
-                .w_full()
                 .flex()
                 .items_center()
                 .gap(px(8.0))
-                .overflow_hidden()
-                .rounded(px(10.0))
-                .border_1()
-                .border_color(crate::theme::hairline(0.08))
-                .bg(crate::theme::ink(0.045))
-                .px(px(8.0))
-                .text_size(px(12.0))
-                .child(
-                    div()
-                        .flex_none()
-                        .size(px(20.0))
-                        .rounded(px(6.0))
-                        .bg(crate::theme::ink(0.09))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(
-                            crate::icons::icon(crate::icons::CHAT_ROUND_LINE)
-                                .size(px(12.0))
-                                .text_color(theme.text_muted),
-                        ),
-                )
-                .child(
-                    div()
-                        .flex_none()
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(theme.text_muted)
-                        .child(SharedString::from("Question")),
-                )
-                .child(
-                    div()
-                        .min_w_0()
-                        .flex_1()
-                        .truncate()
-                        .text_color(theme.text.opacity(0.9))
-                        .child(value),
-                ),
+                .text_size(px(11.0))
+                .text_color(theme.text_muted)
+                .child(SharedString::from(source_label))
+                .child(div().flex_1())
+                .child(SharedString::from(match status {
+                    QuestionStatus::Answered => "Answered",
+                    QuestionStatus::RunEnded => "Run ended",
+                    QuestionStatus::Awaiting => "Awaiting answer",
+                })),
         )
-        .into_any_element()
+        .child(
+            div()
+                .text_size(px(12.5))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(theme.text)
+                .child(header),
+        );
+    if !question.is_empty() {
+        card = card.child(
+            div()
+                .text_size(px(12.0))
+                .text_color(theme.text.opacity(0.82))
+                .child(question),
+        );
+    }
+    for response in responses {
+        let answer_text = response
+            .answers
+            .iter()
+            .map(|answer| {
+                if secret_question_ids
+                    .iter()
+                    .any(|id| id == &answer.question_id)
+                {
+                    "••••••".to_owned()
+                } else {
+                    answer
+                        .free_text
+                        .clone()
+                        .unwrap_or_default()
+                        .chars()
+                        .chain(if answer.free_text.is_some() && !answer.labels.is_empty() {
+                            Some(' ')
+                        } else {
+                            None
+                        })
+                        .collect::<String>()
+                        + &answer.labels.join(", ")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let answer_text = if answer_text.is_empty() {
+            // An empty answer set is a cancel/decline (Escape, a turn ending,
+            // a reaped run) — say that, not "nothing happened".
+            "(cancelled — no answer sent)".to_owned()
+        } else {
+            answer_text
+        };
+        let mark = if response.applied {
+            " · delivered to agent"
+        } else {
+            " · concurrent answer"
+        };
+        card = card.child(
+            div()
+                .text_size(px(11.5))
+                .text_color(theme.text_muted)
+                .child(SharedString::from(format!(
+                    "{}{}{}",
+                    answer_text, mark, response.device
+                ))),
+        );
+    }
+    card.into_any_element()
+}
+
+fn permission_choice_label(choice: &komet_proto::PermissionChoice) -> &'static str {
+    match choice {
+        komet_proto::PermissionChoice::Allow => "Allow",
+        komet_proto::PermissionChoice::AllowAlways { .. } => "Allow always",
+        komet_proto::PermissionChoice::Deny => "Deny",
+    }
+}
+
+pub(crate) fn permission_row(
+    summary: SharedString,
+    resolved: bool,
+    decision: Option<&komet_proto::PermissionChoice>,
+    decided_by: Option<&str>,
+    decided_at: Option<i64>,
+    tool_call_id: Option<&str>,
+    theme: &Theme,
+) -> AnyElement {
+    let outcome = decision
+        .map(permission_choice_label)
+        .unwrap_or(if resolved {
+            "No decision recorded"
+        } else {
+            "Awaiting decision"
+        });
+    let mut card = div()
+        .py(px(4.0))
+        .w_full()
+        .rounded(px(10.0))
+        .border_1()
+        .border_color(crate::theme::hairline(0.08))
+        .bg(crate::theme::ink(0.045))
+        .px(px(10.0))
+        .py(px(8.0))
+        .flex()
+        .flex_col()
+        .gap(px(4.0))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .text_size(px(11.0))
+                .font_weight(gpui::FontWeight::MEDIUM)
+                .text_color(
+                    if matches!(decision, Some(komet_proto::PermissionChoice::Deny)) {
+                        theme.danger
+                    } else {
+                        theme.text_muted
+                    },
+                )
+                .child(SharedString::from(format!("Permission · {outcome}"))),
+        );
+    card = card.child(
+        div()
+            .text_size(px(12.5))
+            .text_color(theme.text)
+            .child(summary),
+    );
+    if let Some(tool_call_id) = tool_call_id {
+        card = card.child(
+            div()
+                .text_size(px(10.5))
+                .text_color(theme.text_faint)
+                .child(SharedString::from(format!("Tool call {tool_call_id}"))),
+        );
+    }
+    if decided_by.is_some() || decided_at.is_some() {
+        let time = decided_at
+            .and_then(chrono::DateTime::from_timestamp_millis)
+            .map(|date| date.format("%H:%M").to_string());
+        let metadata = match (decided_by, time.as_deref()) {
+            (Some(device), Some(time)) => format!("{device} · {time}"),
+            (Some(device), None) => device.to_owned(),
+            (None, Some(time)) => time.to_owned(),
+            (None, None) => String::new(),
+        };
+        card = card.child(
+            div()
+                .text_size(px(10.5))
+                .text_color(theme.text_faint)
+                .child(SharedString::from(metadata)),
+        );
+    }
+    card.into_any_element()
+}
+
+/// The one-line marker for a compaction boundary: what happened, how much it
+/// squeezed, why, and when — each segment only when the agent actually said
+/// it. No invented numbers: an unknown `tokens_after` renders `165k → ?`, and
+/// an unknown `tokens_before` drops the token segment entirely rather than
+/// guessing from the gauge (the gauge is a different measurement, and a later
+/// native reading can fill the field in without rewriting history here).
+pub(crate) fn compaction_line(
+    status: komet_proto::CompactionStatus,
+    trigger: Option<&str>,
+    tokens_before: Option<u64>,
+    tokens_after: Option<u64>,
+    created_at: i64,
+) -> String {
+    use komet_proto::CompactionStatus as S;
+    let head = match status {
+        S::InProgress => "Compacting context",
+        S::Completed => "Context compacted",
+        S::Failed => "Context compaction failed",
+        S::Cancelled => "Context compaction cancelled",
+    };
+    let mut segments = vec![head.to_string()];
+    if let Some(before) = tokens_before {
+        let after = match tokens_after {
+            Some(after) => komet_proto::format_tokens(after),
+            None => "?".to_string(),
+        };
+        segments.push(format!("{} → {after}", komet_proto::format_tokens(before)));
+    }
+    if let Some(trigger) = trigger.map(str::trim).filter(|t| !t.is_empty()) {
+        segments.push(trigger.to_owned());
+    }
+    if let Some(at) = chrono::DateTime::from_timestamp_millis(created_at) {
+        segments.push(at.format("%H:%M").to_string());
+    }
+    segments.join(" · ")
+}
+
+/// Whether a boundary still has a recap to show: text already in the doc
+/// (`SummaryInDoc`), or a complete one in the host's journal. A cycle that
+/// produced no summary gets no affordance — the arrow alone is the story.
+fn compaction_has_recap(summary: Option<&str>, summary_in_journal: bool) -> bool {
+    summary.is_some() || summary_in_journal
 }
 
 /// A small glyph standing in for the tool's icon (komet uses an icon set; a
@@ -4917,7 +6041,7 @@ fn tool_icon_path(call: &ToolCall) -> &'static str {
 /// syntax runs — so an inline tool diff is indistinguishable from the
 /// checkout diff sidebar. Output renders as a code block: verbatim mono
 /// lines, indentation intact, counted-tail truncation.
-fn detail_body(
+pub(crate) fn detail_body(
     detail: &ToolDetail,
     diff_highlights: Option<Arc<crate::changes::DiffHighlights>>,
     theme: &Theme,
@@ -5001,7 +6125,17 @@ fn detail_body(
 }
 
 /// One tool action row: icon, operation, concise target, and completion state.
-fn chip_header_row(tool: &ToolItem, theme: &Theme, open: bool) -> gpui::Div {
+/// `badge` is the caller's — a spawn chip's lifecycle badge, which is also the
+/// click target that opens the child's transcript, and so belongs to whichever
+/// view owns the click ([`crate::subagent::subagent_badge`] builds the styling).
+/// It is generic because that click handler is what makes a badge
+/// `Stateful<Div>` rather than the plain `Div` the builder returns.
+pub(crate) fn chip_header_row<B: gpui::IntoElement + 'static>(
+    tool: &ToolItem,
+    theme: &Theme,
+    open: bool,
+    badge: Option<B>,
+) -> gpui::Div {
     let (state_label, state_tint) = if tool.is_error {
         ("Failed", theme.danger)
     } else if tool.resolved {
@@ -5067,6 +6201,7 @@ fn chip_header_row(tool: &ToolItem, theme: &Theme, open: bool) -> gpui::Div {
                     .child(SharedString::from(model.to_owned())),
             )
         })
+        .when_some(badge, |row, badge| row.child(badge))
         .child(
             crate::icons::icon(if open {
                 crate::icons::ALT_ARROW_DOWN
@@ -5093,13 +6228,72 @@ fn entry_fingerprint(entry: &SessionMessageEntry, pending: bool) -> u64 {
         acc.extend_from_slice(part.id().as_bytes());
         acc.extend_from_slice(&(part.byte_len() as u64).to_le_bytes());
         if let MessagePart::Tool {
-            is_error, resolved, ..
+            is_error,
+            resolved,
+            subagent_status,
+            subagent_duration_ms,
+            subagent_tool_count,
+            ..
         } = part
         {
             acc.push(*is_error as u8 | (*resolved as u8) << 1);
+            acc.push(subagent_status_code(*subagent_status));
+            // The chip's one terminal write has to re-splice the row: it is the
+            // only moment a spawn chip gains its numbers, and a stale fingerprint
+            // would keep rendering "running" over a doc that says otherwise.
+            acc.extend_from_slice(&subagent_duration_ms.unwrap_or(u64::MAX).to_le_bytes());
+            acc.extend_from_slice(&subagent_tool_count.unwrap_or(u64::MAX).to_le_bytes());
         }
-        if let MessagePart::Input { resolved, .. } = part {
-            acc.push(0x10 | *resolved as u8);
+        match part {
+            MessagePart::Input {
+                resolved,
+                source,
+                responses,
+                ..
+            } => {
+                acc.push(0x10 | *resolved as u8);
+                acc.push(match source {
+                    komet_proto::QuestionSource::Native => 0,
+                    komet_proto::QuestionSource::Elicitation => 1,
+                    komet_proto::QuestionSource::PermissionShaped => 2,
+                });
+                acc.extend_from_slice(format!("{responses:?}").as_bytes());
+            }
+            MessagePart::Permission {
+                resolved,
+                decision,
+                decided_by,
+                decided_at,
+                ..
+            } => {
+                acc.push(0x20 | *resolved as u8);
+                acc.extend_from_slice(
+                    format!("{decision:?}{decided_by:?}{decided_at:?}").as_bytes(),
+                );
+            }
+            // A compaction part refines in place (status, then tokens, then
+            // the recap), and `byte_len` only sees its summary/trigger text —
+            // so the fields the line renders have to be in the fingerprint,
+            // or the cached row never rebuilds.
+            MessagePart::Compaction {
+                status,
+                trigger,
+                tokens_before,
+                tokens_after,
+                error,
+                summary_bytes,
+                summary_in_journal,
+                ..
+            } => {
+                acc.extend_from_slice(
+                    format!(
+                        "{status:?}{trigger:?}{tokens_before:?}{tokens_after:?}{error:?}\
+                         {summary_bytes:?}{summary_in_journal}"
+                    )
+                    .as_bytes(),
+                );
+            }
+            _ => {}
         }
     }
     fnv1a(&acc)
@@ -5108,6 +6302,12 @@ fn entry_fingerprint(entry: &SessionMessageEntry, pending: bool) -> u64 {
 impl Render for Transcript {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let _child = crate::perf::child_frame(crate::perf::ChildView::Transcript);
+        // Live row ids let `perf` prune counters of rows that disappeared;
+        // skipped entirely when the window-stats knob is off.
+        if crate::perf::rows_enabled() {
+            let ids: Vec<&str> = self.rows().iter().map(|row| row.id.as_ref()).collect();
+            crate::perf::rows_live(&ids);
+        }
         // Release gpui-side decoded copies of any images the attachment LRU
         // evicted since the last frame (no-op when nothing was evicted).
         crate::attachments::flush_evicted(Some(window), cx);
@@ -5468,6 +6668,8 @@ mod tests {
             subagent_ref: None,
             subagent_status: None,
             subagent_tail: None,
+            subagent_duration_ms: None,
+            subagent_tool_count: None,
         }
     }
 
@@ -5480,12 +6682,76 @@ mod tests {
             chip_detail: SharedString::from(chip_detail),
             is_error: false,
             resolved: true,
+            subagent_status: None,
+            subagent_duration_ms: None,
+            subagent_tool_count: None,
             detail: None,
             invocation: None,
             output_ref: None,
             output_bytes: None,
             diff_ref: None,
         }
+    }
+
+    #[test]
+    fn subagent_status_is_carried_on_the_spawn_chip() {
+        let spawn = |status, duration_ms, tool_count| MessagePart::Tool {
+            id: "spawn".into(),
+            call: ToolCall::Unknown {
+                name: "Agent: scan".into(),
+                input: None,
+            },
+            is_error: false,
+            resolved: true,
+            output: None,
+            diff: None,
+            output_ref: None,
+            output_bytes: None,
+            diff_stats: None,
+            diff_ref: None,
+            subagent_ref: None,
+            subagent_status: status,
+            subagent_tail: None,
+            subagent_duration_ms: duration_ms,
+            subagent_tool_count: tool_count,
+        };
+        let rows = rows_for_entry(
+            &assistant(
+                "m1",
+                MessageStatus::Complete,
+                vec![spawn(Some(komet_doc::SubagentStatus::Running), None, None)],
+            ),
+            false,
+            &mut parse,
+        );
+        let RowKind::ToolGroup { tools, .. } = &rows[0].kind else {
+            panic!("expected a tool group");
+        };
+        assert_eq!(
+            tools[0].subagent_status,
+            Some(komet_doc::SubagentStatus::Running)
+        );
+        assert_eq!(
+            (tools[0].subagent_duration_ms, tools[0].subagent_tool_count),
+            (None, None),
+            "a chip mid-run carries no numbers, and the row invents none"
+        );
+        // A lifecycle flip must invalidate the cached row.
+        let mut settled = tools.as_ref().clone();
+        settled[0].subagent_status = Some(komet_doc::SubagentStatus::Done);
+        assert_ne!(
+            tool_fingerprint(tools, false),
+            tool_fingerprint(&settled, false)
+        );
+        // So must the terminal write, which arrives with the flip and is the
+        // only moment the chip gains its duration and count.
+        settled[0].subagent_duration_ms = Some(41_000);
+        settled[0].subagent_tool_count = Some(3);
+        assert_ne!(
+            tool_fingerprint(tools, false),
+            tool_fingerprint(&settled, false),
+            "a stamped chip must not render from the stale cached row"
+        );
     }
 
     const MD: &str = "# Title\n\npara one\n\n```rust\nlet x = 1;\n```";
@@ -5897,6 +7163,46 @@ mod tests {
     }
 
     #[test]
+    fn live_output_detail_shows_the_tail_under_a_bounded_height() {
+        let lines = |count: usize| {
+            (0..count)
+                .map(|i| format!("line {i}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let ToolDetail::Output {
+            lines: shown,
+            truncated_by,
+        } = live_output_detail(&lines(30))
+        else {
+            panic!("expected output detail");
+        };
+        assert_eq!(
+            truncated_by, 0,
+            "the elided part is above the tail, so it renders as a first line"
+        );
+        assert_eq!(shown.len(), LIVE_OUTPUT_MAX_LINES + 1);
+        assert_eq!(
+            shown[0].as_ref(),
+            format!("… {} earlier lines", 30 - LIVE_OUTPUT_MAX_LINES)
+        );
+        assert_eq!(shown[shown.len() - 1].as_ref(), "line 29");
+
+        // A short burst is verbatim, no marker.
+        let ToolDetail::Output { lines: shown, .. } = live_output_detail("a\nb\n") else {
+            panic!("expected output detail");
+        };
+        assert_eq!(shown.len(), 2);
+
+        // The open-chip fold height is analytic: it must not grow with the
+        // stream, or expanding a long-running tool would mis-measure the fold.
+        assert_eq!(
+            detail_height(&live_output_detail(&lines(30))),
+            detail_height(&live_output_detail(&lines(4_000)))
+        );
+    }
+
+    #[test]
     fn tool_group_summaries() {
         let exec = |command: &str| {
             test_tool_item(ToolCall::Exec {
@@ -6165,6 +7471,45 @@ mod tests {
     }
 
     #[test]
+    fn working_trailer_names_the_phase() {
+        use crate::thinking_orbs::OrbState;
+        use komet_proto::RunPhase;
+
+        // Three phases, three labels — each names the wait, none of them a
+        // flavour word, and the orb state comes from the existing set.
+        let (starting, starting_orb) = phase_trailer(Some(RunPhase::Starting), false, "Musing");
+        let (waiting, waiting_orb) = phase_trailer(Some(RunPhase::WaitingModel), false, "Musing");
+        let (tool, tool_orb) = phase_trailer(Some(RunPhase::Tool), false, "Musing");
+        assert_eq!(starting, "Starting the harness");
+        assert_eq!(starting_orb, OrbState::Connecting);
+        assert_eq!(waiting, "Waiting for the model");
+        assert_eq!(waiting_orb, OrbState::Working);
+        assert_eq!(tool, "Running a tool");
+        assert_eq!(tool_orb, OrbState::Searching);
+        assert_eq!(
+            phase_trailer(Some(RunPhase::Streaming), false, "Musing").0,
+            "Answering"
+        );
+        for label in [starting, waiting, tool] {
+            assert_ne!(label, "Musing");
+            assert!(!FLAVOUR_WORDS.contains(&label), "{label} is a flavour word");
+        }
+
+        // No phase frame: exactly the old behavior, so an engine without the
+        // frames is unchanged.
+        assert_eq!(
+            phase_trailer(None, false, "Musing"),
+            ("Musing", OrbState::from_flavour_word("Musing"))
+        );
+
+        // A stale frame from the previous turn never outranks the send bridge.
+        assert_eq!(
+            phase_trailer(Some(RunPhase::Starting), true, "Sending"),
+            ("Sending", OrbState::Listening)
+        );
+    }
+
+    #[test]
     fn empty_text_parts_produce_no_rows() {
         let entry = assistant(
             "m9",
@@ -6242,6 +7587,208 @@ mod tests {
         assert_eq!(
             lines.iter().map(|l| l.as_ref()).collect::<Vec<_>>(),
             vec!["+ new", "✓ done"]
+        );
+    }
+
+    fn compaction_part(
+        compaction_id: &str,
+        status: komet_proto::CompactionStatus,
+        tokens_before: Option<u64>,
+        tokens_after: Option<u64>,
+    ) -> MessagePart {
+        MessagePart::Compaction {
+            id: format!("cmp-{compaction_id}"),
+            compaction_id: compaction_id.into(),
+            status,
+            trigger: Some("auto".into()),
+            tokens_before,
+            tokens_after,
+            error: None,
+            summary: None,
+            summary_bytes: None,
+            summary_in_journal: false,
+        }
+    }
+
+    #[test]
+    fn compaction_line_only_says_what_the_agent_said() {
+        use komet_proto::CompactionStatus as S;
+        // The plan's sample line, at epoch 0 (the local `%H:%M` the row uses).
+        let at = chrono::DateTime::from_timestamp_millis(0)
+            .unwrap()
+            .format("%H:%M")
+            .to_string();
+        assert_eq!(
+            compaction_line(S::Completed, Some("auto"), Some(165_000), Some(12_000), 0),
+            format!("Context compacted · 165k → 12k · auto · {at}")
+        );
+        // An unknown `tokens_after` is a question mark, never a derived
+        // number: the gauge is a different measurement and may arrive later.
+        assert_eq!(
+            compaction_line(S::Completed, None, Some(165_000), None, 0),
+            format!("Context compacted · 165k → ? · {at}")
+        );
+        // No tokens at all: no arrow segment, and no reason either.
+        assert_eq!(
+            compaction_line(S::Completed, None, None, None, 0),
+            format!("Context compacted · {at}")
+        );
+        assert_eq!(
+            compaction_line(S::InProgress, None, None, None, 0),
+            format!("Compacting context · {at}")
+        );
+        assert!(
+            compaction_line(S::Failed, None, None, None, 0)
+                .starts_with("Context compaction failed")
+        );
+    }
+
+    #[test]
+    fn compaction_row_is_not_grouped_with_tools() {
+        use komet_proto::CompactionStatus::Completed;
+        let mut parse = |_: &str, text: &str| -> Arc<BlockTree> { Arc::new(parse_full(text)) };
+        let entry = assistant(
+            "a1",
+            MessageStatus::Complete,
+            vec![
+                tool_part("t1", "ls"),
+                compaction_part("c1", Completed, Some(165_000), Some(12_000)),
+                tool_part("t2", "pwd"),
+            ],
+        );
+        let rows = rows_for_entry(&entry, false, &mut parse);
+        // A boundary is not an action: it ends the tool group before it and
+        // starts a new one after, instead of being swallowed as a third chip.
+        assert_eq!(rows.len(), 3, "a tool group, a marker, a tool group");
+        assert!(matches!(rows[0].kind, RowKind::ToolGroup { .. }));
+        assert!(matches!(rows[1].kind, RowKind::Compaction { .. }));
+        assert!(matches!(rows[2].kind, RowKind::ToolGroup { .. }));
+        let RowKind::Compaction {
+            compaction_id,
+            tokens_after,
+            live,
+            ..
+        } = &rows[1].kind
+        else {
+            unreachable!()
+        };
+        assert_eq!(compaction_id.as_ref(), "c1");
+        assert_eq!(*tokens_after, Some(12_000));
+        assert!(!*live, "a settled boundary does not pulse");
+    }
+
+    #[test]
+    fn compaction_row_rebuilds_when_the_cycle_is_refined() {
+        use komet_proto::CompactionStatus::{Completed, InProgress};
+        let mut parse = |_: &str, text: &str| -> Arc<BlockTree> { Arc::new(parse_full(text)) };
+        let open = assistant(
+            "a1",
+            MessageStatus::Complete,
+            vec![compaction_part("c1", InProgress, None, None)],
+        );
+        let closed = assistant(
+            "a1",
+            MessageStatus::Complete,
+            vec![compaction_part(
+                "c1",
+                Completed,
+                Some(165_000),
+                Some(12_000),
+            )],
+        );
+        let before = rows_for_entry(&open, false, &mut parse).remove(0);
+        let after = rows_for_entry(&closed, false, &mut parse).remove(0);
+        // Same row id (the cycle stays one line) — different version, so the
+        // row diff splices it instead of keeping the cached "Compacting".
+        assert_eq!(before.id, after.id);
+        assert_ne!(before.version, after.version);
+        assert_ne!(
+            entry_fingerprint(&open, false),
+            entry_fingerprint(&closed, false)
+        );
+    }
+
+    #[test]
+    fn compaction_row_does_not_move_the_viewport_when_at_bottom() {
+        use komet_proto::CompactionStatus::{Completed, InProgress};
+        let mut parse = |_: &str, text: &str| -> Arc<BlockTree> { Arc::new(parse_full(text)) };
+        let open = assistant(
+            "a1",
+            MessageStatus::Complete,
+            vec![
+                tool_part("t1", "ls"),
+                compaction_part("c1", InProgress, None, None),
+            ],
+        );
+        let closed = assistant(
+            "a1",
+            MessageStatus::Complete,
+            vec![
+                tool_part("t1", "ls"),
+                compaction_part("c1", Completed, Some(165_000), Some(12_000)),
+            ],
+        );
+        let old = rows_for_entry(&open, false, &mut parse);
+        let new = rows_for_entry(&closed, false, &mut parse);
+        // A refined cycle must land on sync()'s remeasure path, not splice:
+        // remeasure keeps old size hints and holds the absolute anchor, so a
+        // user at the bottom (or scrolled back up) keeps their viewport.
+        let (range, count) = diff_rows(&old, &new).expect("the compaction row is refined");
+        assert_eq!(range, 1..2, "only the boundary row's line moves");
+        assert_eq!(range.len(), count, "same-count in-place update");
+        assert_eq!(old[1].id, new[1].id, "the boundary stays one line");
+        assert_eq!(
+            diff_rows(&new, &new),
+            None,
+            "an unchanged row set touches nothing"
+        );
+    }
+
+    #[test]
+    fn failed_compaction_row_keeps_its_error() {
+        use komet_proto::CompactionStatus::Failed;
+        let mut part = compaction_part("c1", Failed, Some(165_000), None);
+        if let MessagePart::Compaction {
+            error,
+            summary_in_journal,
+            summary_bytes,
+            ..
+        } = &mut part
+        {
+            *error = Some("the engine restarted mid-compaction".into());
+            *summary_bytes = Some(4_200);
+            *summary_in_journal = true;
+        }
+        let mut parse = |_: &str, text: &str| -> Arc<BlockTree> { Arc::new(parse_full(text)) };
+        let rows = rows_for_entry(
+            &assistant("a1", MessageStatus::Complete, vec![part]),
+            false,
+            &mut parse,
+        );
+        let RowKind::Compaction {
+            error,
+            summary_in_journal,
+            summary_bytes,
+            live,
+            ..
+        } = &rows[0].kind
+        else {
+            panic!("compaction row expected");
+        };
+        assert_eq!(
+            error.as_deref(),
+            Some("the engine restarted mid-compaction")
+        );
+        assert!(*summary_in_journal);
+        assert_eq!(*summary_bytes, Some(4_200));
+        assert!(!*live, "a failed cycle is settled, not in flight");
+        assert!(
+            compaction_has_recap(None, *summary_in_journal),
+            "a journal-held recap gets a disclosure"
+        );
+        assert!(
+            !compaction_has_recap(None, false),
+            "a cycle with no summary promises nothing"
         );
     }
 }

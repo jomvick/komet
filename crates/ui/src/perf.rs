@@ -13,9 +13,16 @@
 //! instrumented children (`children_*`) are complete. `total_*` is the sum of
 //! the two per frame, so "Shell alone" and "children" are comparable.
 //!
-//! `transcript_renders`, `composer_renders` and `changes_renders` count child
-//! renders per window. With gpui view caching enabled, a burst that only
-//! animates a Shell-owned element must show zero renders for the models.
+//! `transcript_renders`, `composer_renders`, `changes_renders`,
+//! `context_usage_renders` and `rail_renders` count child renders per window.
+//! With gpui view caching enabled, a burst that only animates a Shell-owned
+//! element must show zero renders for the models.
+//!
+//! Row renders are counted separately, keyed by `(kind tag, row id)`: the
+//! window-level child count says *whether* the transcript re-rendered, the
+//! per-row map says *which* lines it rebuilt. The map is dropped with the
+//! window, and a row the transcript no longer lists is pruned at the next
+//! frame boundary — a deleted line must not keep a stale count.
 //!
 //! This complements the per-row cost already logged by `transcript`'s own
 //! `KOMET_FRAME_STATS` knob: that one measures one transcript row's render,
@@ -48,6 +55,7 @@
 //! shorter `children_*`.
 
 use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 /// One frame at 60 Hz. The budget a frame is scored against.
@@ -70,7 +78,19 @@ pub enum ChildView {
     Transcript = 0,
     Composer = 1,
     Changes = 2,
+    ContextUsage = 3,
+    Rail = 4,
 }
+
+impl ChildView {
+    /// Number of instrumented child views; sizes the per-frame counters.
+    pub const COUNT: usize = 5;
+}
+
+/// Window key for one transcript row: a small kind tag (`RowKind` carries
+/// `Arc`s and `SharedString`s, so the value itself is not hashable) plus the
+/// row's stable id.
+type RowKey = (&'static str, String);
 
 /// `KOMET_WINDOW_STATS=1` enables the measurement. Zero cost when off.
 fn enabled() -> bool {
@@ -81,7 +101,7 @@ fn enabled() -> bool {
 }
 
 /// One logged window of samples.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Summary {
     /// Active frame intervals scored in this window.
     pub frames: usize,
@@ -110,6 +130,37 @@ pub struct Summary {
     pub transcript_renders: u32,
     pub composer_renders: u32,
     pub changes_renders: u32,
+    pub context_usage_renders: u32,
+    pub rail_renders: u32,
+    /// Rows that re-rendered in this window, most-rendered first.
+    pub rows: Vec<RowRenders>,
+}
+
+impl Summary {
+    /// Total row renders in this window, across every row.
+    pub fn row_renders(&self) -> u32 {
+        self.rows.iter().map(|row| row.renders).sum()
+    }
+}
+
+/// One transcript row's render count in a window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowRenders {
+    /// Row kind tag (`user`, `markdown`, `tools`, `compaction`, …).
+    pub kind: &'static str,
+    pub id: String,
+    pub renders: u32,
+}
+
+/// Row renders between two frame boundaries, plus the transcript's live row
+/// ids at capture time. `live` is `None` until the transcript reports its
+/// rows (and in the collector's own tests, which have no transcript); a row
+/// missing from a reported set is pruned from the window map, so a deleted
+/// line does not keep a stale count.
+#[derive(Debug, Default)]
+pub struct FrameRows {
+    pub counts: HashMap<RowKey, u32>,
+    pub live: Option<HashSet<String>>,
 }
 
 /// Rolling collector. Split from the clock so the arithmetic is unit-tested.
@@ -119,7 +170,8 @@ pub struct FrameBudget {
     builds: Vec<u64>,
     children: Vec<u64>,
     totals: Vec<u64>,
-    counts: [u32; 3],
+    counts: [u32; ChildView::COUNT],
+    rows: HashMap<RowKey, u32>,
     missed: usize,
     window: usize,
 }
@@ -137,7 +189,8 @@ impl FrameBudget {
             builds: Vec::with_capacity(window),
             children: Vec::with_capacity(window),
             totals: Vec::with_capacity(window),
-            counts: [0; 3],
+            counts: [0; ChildView::COUNT],
+            rows: HashMap::new(),
             missed: 0,
             window: window.max(1),
         }
@@ -156,7 +209,8 @@ impl FrameBudget {
         interval_us: Option<u64>,
         build_us: u64,
         children_us: u64,
-        counts: [u32; 3],
+        counts: [u32; ChildView::COUNT],
+        rows: FrameRows,
         active: bool,
     ) -> Option<Summary> {
         if !active {
@@ -178,6 +232,17 @@ impl FrameBudget {
         for (slot, count) in self.counts.iter_mut().zip(counts) {
             *slot = slot.saturating_add(count);
         }
+        let FrameRows {
+            counts: frame_rows,
+            live,
+        } = rows;
+        if let Some(live) = live {
+            self.rows.retain(|(_, id), _| live.contains(id));
+        }
+        for (key, count) in frame_rows {
+            let slot = self.rows.entry(key).or_default();
+            *slot = slot.saturating_add(count);
+        }
         // The window is one frame long per build sample; an idle-gap frame
         // contributes a build but no interval, so the frame count can trail it.
         if self.builds.len() < self.window && !(burst_ended && self.builds.len() >= MIN_FLUSH) {
@@ -192,6 +257,17 @@ impl FrameBudget {
         let (children_p50_us, children_p95_us, children_p99_us, children_max_us) =
             stats(&mut children);
         let (total_p50_us, total_p95_us, total_p99_us, total_max_us) = stats(&mut totals);
+        let mut rows: Vec<RowRenders> = std::mem::take(&mut self.rows)
+            .into_iter()
+            .filter(|(_, renders)| *renders > 0)
+            .map(|((kind, id), renders)| RowRenders { kind, id, renders })
+            .collect();
+        rows.sort_by(|a, b| {
+            b.renders
+                .cmp(&a.renders)
+                .then_with(|| a.kind.cmp(b.kind))
+                .then_with(|| a.id.cmp(&b.id))
+        });
         let summary = Summary {
             frames: intervals.len(),
             missed: self.missed,
@@ -214,12 +290,15 @@ impl FrameBudget {
             transcript_renders: self.counts[ChildView::Transcript as usize],
             composer_renders: self.counts[ChildView::Composer as usize],
             changes_renders: self.counts[ChildView::Changes as usize],
+            context_usage_renders: self.counts[ChildView::ContextUsage as usize],
+            rail_renders: self.counts[ChildView::Rail as usize],
+            rows,
         };
         self.intervals = Vec::with_capacity(self.window);
         self.builds = Vec::with_capacity(self.window);
         self.children = Vec::with_capacity(self.window);
         self.totals = Vec::with_capacity(self.window);
-        self.counts = [0; 3];
+        self.counts = [0; ChildView::COUNT];
         self.missed = 0;
         Some(summary)
     }
@@ -253,13 +332,27 @@ thread_local! {
     static PENDING_BUILD_US: Cell<u64> = const { Cell::new(0) };
     /// Child render bodies accumulated since the last frame start.
     static PENDING_CHILDREN_US: Cell<u64> = const { Cell::new(0) };
-    static PENDING_RENDERS: Cell<[u32; 3]> = const { Cell::new([0; 3]) };
+    static PENDING_RENDERS: Cell<[u32; ChildView::COUNT]> =
+        const { Cell::new([0; ChildView::COUNT]) };
+    /// Rows rendered since the last frame start, keyed by `(kind tag, id)`.
+    static PENDING_ROWS: RefCell<HashMap<RowKey, u32>> = RefCell::new(HashMap::new());
+    /// The transcript's live row ids as of its last render; `None` until it
+    /// reports (a cached transcript keeps the previous set, which is still
+    /// the live set).
+    static LIVE_ROWS: RefCell<Option<HashSet<String>>> = const { RefCell::new(None) };
 }
 
-fn record(interval_us: Option<u64>, build: u64, children: u64, counts: [u32; 3], active: bool) {
+fn record(
+    interval_us: Option<u64>,
+    build: u64,
+    children: u64,
+    counts: [u32; ChildView::COUNT],
+    rows: FrameRows,
+    active: bool,
+) {
     let summary = BUDGET.with(|b| {
         b.borrow_mut()
-            .record(interval_us, build, children, counts, active)
+            .record(interval_us, build, children, counts, rows, active)
     });
     if let Some(s) = summary {
         tracing::warn!(
@@ -284,8 +377,19 @@ fn record(interval_us: Option<u64>, build: u64, children: u64, counts: [u32; 3],
             transcript_renders = s.transcript_renders,
             composer_renders = s.composer_renders,
             changes_renders = s.changes_renders,
+            context_usage_renders = s.context_usage_renders,
+            rail_renders = s.rail_renders,
+            row_renders = s.row_renders(),
             "window frame budget"
         );
+        for row in &s.rows {
+            tracing::warn!(
+                kind = row.kind,
+                id = %row.id,
+                renders = row.renders,
+                "row frame budget"
+            );
+        }
     }
 }
 
@@ -318,10 +422,19 @@ pub fn frame(window_active: bool) -> Option<FrameGuard> {
     let prev_active = LAST_ACTIVE.replace(window_active);
     let build = PENDING_BUILD_US.replace(0);
     let children = PENDING_CHILDREN_US.replace(0);
-    let counts = PENDING_RENDERS.replace([0; 3]);
+    let counts = PENDING_RENDERS.replace([0; ChildView::COUNT]);
+    let rows = PENDING_ROWS.with(|rows| std::mem::take(&mut *rows.borrow_mut()));
+    let live = LIVE_ROWS.with(|live| live.borrow().clone());
     if let Some(prev) = prev_start {
         let interval_us = now.saturating_duration_since(prev).as_micros() as u64;
-        record(Some(interval_us), build, children, counts, prev_active);
+        record(
+            Some(interval_us),
+            build,
+            children,
+            counts,
+            FrameRows { counts: rows, live },
+            prev_active,
+        );
     }
     Some(FrameGuard { start: now })
 }
@@ -356,9 +469,73 @@ pub fn child_frame(view: ChildView) -> Option<ChildGuard> {
     })
 }
 
+/// Count one transcript row's render, keyed by a small kind tag and the row's
+/// stable id. `RowKind` carries `Arc`s and `SharedString`s — pass
+/// [`RowTag`]-style constants (e.g. `"compaction"`), not the value. `None`
+/// when the knob is off, so the call site pays one env-free branch.
+pub struct RowGuard {
+    kind: &'static str,
+    id: String,
+}
+
+impl Drop for RowGuard {
+    fn drop(&mut self) {
+        PENDING_ROWS.with(|rows| {
+            let mut rows = rows.borrow_mut();
+            let slot = rows.entry((self.kind, self.id.clone())).or_default();
+            *slot = slot.saturating_add(1);
+        });
+    }
+}
+
+/// Count a transcript row render, if enabled.
+pub fn row_frame(kind: &'static str, id: &str) -> Option<RowGuard> {
+    if !enabled() {
+        return None;
+    }
+    Some(RowGuard {
+        kind,
+        id: id.to_owned(),
+    })
+}
+
+/// Whether per-row counters are active — lets the transcript skip collecting
+/// its live ids when the knob is off.
+pub fn rows_enabled() -> bool {
+    enabled()
+}
+
+/// Record the transcript's live row ids for this frame. Ids missing from the
+/// next reported set are pruned from the window map; no-op when the knob is
+/// off.
+pub fn rows_live(ids: &[&str]) {
+    if !enabled() {
+        return;
+    }
+    LIVE_ROWS.with(|live| {
+        *live.borrow_mut() = Some(ids.iter().map(|id| (*id).to_owned()).collect());
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Three-view counters padded with the newer views zeroed.
+    fn counts(three: [u32; 3]) -> [u32; ChildView::COUNT] {
+        let mut all = [0; ChildView::COUNT];
+        all[..3].copy_from_slice(&three);
+        all
+    }
+
+    /// One render per `(kind, id)` entry, no live-row report.
+    fn frame_rows(entries: &[(&'static str, &str)]) -> FrameRows {
+        let mut counts = HashMap::new();
+        for (kind, id) in entries {
+            *counts.entry((*kind, (*id).to_owned())).or_default() += 1;
+        }
+        FrameRows { counts, live: None }
+    }
 
     #[test]
     fn percentile_uses_nearest_rank_and_never_overruns() {
@@ -375,13 +552,34 @@ mod tests {
         // 200ms gap: the app was idle, so it is neither sampled nor missed.
         assert!(
             budget
-                .record(Some(200_000), 1_000, 0, [0; 3], true)
+                .record(
+                    Some(200_000),
+                    1_000,
+                    0,
+                    counts([0; 3]),
+                    FrameRows::default(),
+                    true
+                )
                 .is_none()
         );
         // Two frames inside the burst, one over budget.
-        budget.record(Some(8_000), 1_000, 0, [0; 3], true);
+        budget.record(
+            Some(8_000),
+            1_000,
+            0,
+            counts([0; 3]),
+            FrameRows::default(),
+            true,
+        );
         let summary = budget
-            .record(Some(30_000), 1_000, 0, [0; 3], true)
+            .record(
+                Some(30_000),
+                1_000,
+                0,
+                counts([0; 3]),
+                FrameRows::default(),
+                true,
+            )
             .expect("window full");
         assert_eq!(summary.frames, 2);
         assert_eq!(summary.missed, 1);
@@ -395,21 +593,43 @@ mod tests {
         // or render count — the window does not even advance.
         assert!(
             budget
-                .record(Some(33_000), 1_000, 100, [3, 2, 1], false)
+                .record(
+                    Some(33_000),
+                    1_000,
+                    100,
+                    counts([3, 2, 1]),
+                    frame_rows(&[("user", "a")]),
+                    false
+                )
                 .is_none()
         );
         assert!(budget.intervals.is_empty());
         assert!(budget.builds.is_empty());
         assert!(budget.children.is_empty());
-        assert_eq!(budget.counts, [0; 3]);
+        assert_eq!(budget.counts, [0; ChildView::COUNT]);
+        assert!(budget.rows.is_empty());
         // The next focused frames alone fill the window.
         assert!(
             budget
-                .record(Some(16_000), 500, 50, [1, 0, 0], true)
+                .record(
+                    Some(16_000),
+                    500,
+                    50,
+                    counts([1, 0, 0]),
+                    FrameRows::default(),
+                    true
+                )
                 .is_none()
         );
         let summary = budget
-            .record(Some(16_000), 600, 60, [1, 0, 0], true)
+            .record(
+                Some(16_000),
+                600,
+                60,
+                counts([1, 0, 0]),
+                FrameRows::default(),
+                true,
+            )
             .expect("window full");
         assert_eq!(summary.frames, 2);
         assert_eq!(summary.missed, 0);
@@ -421,9 +641,20 @@ mod tests {
     #[test]
     fn first_frame_is_not_scored_and_clears_after_a_window() {
         let mut budget = FrameBudget::new(2);
-        assert!(budget.record(None, 900, 0, [0; 3], true).is_none());
+        assert!(
+            budget
+                .record(None, 900, 0, counts([0; 3]), FrameRows::default(), true)
+                .is_none()
+        );
         let summary = budget
-            .record(Some(16_000), 700, 0, [0; 3], true)
+            .record(
+                Some(16_000),
+                700,
+                0,
+                counts([0; 3]),
+                FrameRows::default(),
+                true,
+            )
             .expect("window full");
         assert_eq!(summary.frames, 1);
         assert_eq!(summary.missed, 0);
@@ -431,9 +662,27 @@ mod tests {
         assert_eq!(summary.build_p50_us, 900);
         assert_eq!(summary.build_max_us, 900);
         // The window resets: the next full one starts from zero.
-        assert!(budget.record(Some(16_000), 500, 0, [0; 3], true).is_none());
+        assert!(
+            budget
+                .record(
+                    Some(16_000),
+                    500,
+                    0,
+                    counts([0; 3]),
+                    FrameRows::default(),
+                    true
+                )
+                .is_none()
+        );
         let next = budget
-            .record(Some(16_000), 500, 0, [0; 3], true)
+            .record(
+                Some(16_000),
+                500,
+                0,
+                counts([0; 3]),
+                FrameRows::default(),
+                true,
+            )
             .expect("second window");
         assert_eq!(next.frames, 2);
         assert_eq!(next.missed, 0);
@@ -445,17 +694,46 @@ mod tests {
         let mut budget = FrameBudget::new(240);
         // A burst too short to fill the window: nothing is emitted yet.
         for _ in 0..40 {
-            assert!(budget.record(Some(8_000), 1_000, 0, [0; 3], true).is_none());
+            assert!(
+                budget
+                    .record(
+                        Some(8_000),
+                        1_000,
+                        0,
+                        counts([0; 3]),
+                        FrameRows::default(),
+                        true
+                    )
+                    .is_none()
+            );
         }
         // The pause ends the burst, so the partial window is emitted instead
         // of being lost. The pause itself is not one of the scored frames.
         let summary = budget
-            .record(Some(500_000), 1_000, 0, [0; 3], true)
+            .record(
+                Some(500_000),
+                1_000,
+                0,
+                counts([0; 3]),
+                FrameRows::default(),
+                true,
+            )
             .expect("burst closed");
         assert_eq!(summary.frames, 40);
         assert_eq!(summary.missed, 0);
         // And the samples are cleared for the next burst.
-        assert!(budget.record(Some(8_000), 1_000, 0, [0; 3], true).is_none());
+        assert!(
+            budget
+                .record(
+                    Some(8_000),
+                    1_000,
+                    0,
+                    counts([0; 3]),
+                    FrameRows::default(),
+                    true
+                )
+                .is_none()
+        );
     }
 
     #[test]
@@ -463,7 +741,14 @@ mod tests {
         let mut budget = FrameBudget::new(4);
         let mut summary = None;
         for (build, children) in [(100, 10), (400, 40), (200, 20), (300, 30)] {
-            summary = budget.record(Some(16_000), build, children, [0; 3], true);
+            summary = budget.record(
+                Some(16_000),
+                build,
+                children,
+                counts([0; 3]),
+                FrameRows::default(),
+                true,
+            );
         }
         let summary = summary.expect("window full");
         assert_eq!(summary.frames, 4);
@@ -481,19 +766,143 @@ mod tests {
         let mut budget = FrameBudget::new(2);
         assert!(
             budget
-                .record(Some(16_000), 100, 10, [1, 0, 2], true)
+                .record(
+                    Some(16_000),
+                    100,
+                    10,
+                    counts([1, 0, 2]),
+                    FrameRows::default(),
+                    true
+                )
                 .is_none()
         );
         let summary = budget
-            .record(Some(16_000), 100, 10, [1, 3, 0], true)
+            .record(
+                Some(16_000),
+                100,
+                10,
+                counts([1, 3, 0]),
+                FrameRows::default(),
+                true,
+            )
             .expect("window full");
         assert_eq!(summary.transcript_renders, 2);
         assert_eq!(summary.composer_renders, 3);
         assert_eq!(summary.changes_renders, 2);
-        assert!(budget.record(Some(16_000), 100, 10, [0; 3], true).is_none());
+        assert!(
+            budget
+                .record(
+                    Some(16_000),
+                    100,
+                    10,
+                    counts([0; 3]),
+                    FrameRows::default(),
+                    true
+                )
+                .is_none()
+        );
         let next = budget
-            .record(Some(16_000), 100, 10, [0; 3], true)
+            .record(
+                Some(16_000),
+                100,
+                10,
+                counts([0; 3]),
+                FrameRows::default(),
+                true,
+            )
             .expect("second window");
         assert_eq!(next.transcript_renders, 0);
+    }
+
+    #[test]
+    fn per_view_and_per_row_counters_count_once_and_leave_neighbours_alone() {
+        let mut budget = FrameBudget::new(2);
+        let mut views = counts([0; 3]);
+        views[ChildView::ContextUsage as usize] = 1;
+        assert!(
+            budget
+                .record(
+                    Some(16_000),
+                    100,
+                    10,
+                    views,
+                    frame_rows(&[("tools", "call_1"), ("tools", "call_2")]),
+                    true
+                )
+                .is_none()
+        );
+        let summary = budget
+            .record(
+                Some(16_000),
+                100,
+                10,
+                counts([0; 3]),
+                FrameRows::default(),
+                true,
+            )
+            .expect("window full");
+        assert_eq!(summary.context_usage_renders, 1);
+        assert_eq!(summary.rail_renders, 0);
+        assert_eq!(summary.transcript_renders, 0);
+        assert_eq!(summary.composer_renders, 0);
+        assert_eq!(summary.changes_renders, 0);
+        // Two distinct rows, one render each — and the window map is drained.
+        assert_eq!(summary.row_renders(), 2);
+        assert_eq!(summary.rows.len(), 2);
+        assert!(
+            summary
+                .rows
+                .iter()
+                .all(|row| row.kind == "tools" && row.renders == 1)
+        );
+        assert!(budget.rows.is_empty());
+    }
+
+    #[test]
+    fn removed_rows_are_pruned_at_the_next_frame_boundary() {
+        let mut budget = FrameBudget::new(3);
+        budget.record(
+            Some(16_000),
+            100,
+            10,
+            counts([0; 3]),
+            frame_rows(&[("user", "gone"), ("user", "kept")]),
+            true,
+        );
+        // The transcript now lists only `kept`: `gone` must not keep a count.
+        let live = FrameRows {
+            counts: HashMap::new(),
+            live: Some(["kept".to_owned()].into_iter().collect()),
+        };
+        budget.record(Some(16_000), 100, 10, counts([0; 3]), live, true);
+        let summary = budget
+            .record(
+                Some(16_000),
+                100,
+                10,
+                counts([0; 3]),
+                frame_rows(&[("user", "kept")]),
+                true,
+            )
+            .expect("window full");
+        assert_eq!(summary.rows.len(), 1);
+        assert_eq!(summary.rows[0].id, "kept");
+        assert_eq!(summary.rows[0].renders, 2);
+    }
+
+    #[test]
+    fn row_and_child_counters_are_inert_when_the_knob_is_off() {
+        // The env switch latches once per process, so only assert in a
+        // capture-free test run (CI never sets KOMET_WINDOW_STATS).
+        if enabled() {
+            return;
+        }
+        assert!(child_frame(ChildView::ContextUsage).is_none());
+        assert!(child_frame(ChildView::Rail).is_none());
+        assert!(row_frame("user", "row").is_none());
+        assert!(!rows_enabled());
+        rows_live(&["row"]);
+        assert!(LIVE_ROWS.with(|live| live.borrow().is_none()));
+        assert!(PENDING_ROWS.with(|rows| rows.borrow().is_empty()));
     }
 }

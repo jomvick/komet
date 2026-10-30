@@ -36,12 +36,17 @@ use tokio::{
     task::{AbortHandle, JoinSet},
 };
 
-pub(super) type Input =
-    dyn Fn(Vec<UserInputQuestion>) -> oneshot::Receiver<Vec<UserInputAnswer>> + Send + Sync;
+pub(super) type Input = dyn Fn(
+        Vec<UserInputQuestion>,
+        komet_proto::QuestionSource,
+    ) -> oneshot::Receiver<Vec<UserInputAnswer>>
+    + Send
+    + Sync;
 pub(super) type Permission = dyn Fn(
         komet_proto::PermissionKind,
         String,
         Vec<komet_proto::PermissionChoice>,
+        Option<String>,
     ) -> oneshot::Receiver<komet_proto::PermissionChoice>
     + Send
     + Sync;
@@ -667,6 +672,8 @@ impl Runner {
         } else if self.request.auto_approve {
             Some(komet_proto::PermissionChoice::Allow)
         } else if let Some(request) = self.permission.as_ref() {
+            // A Muse approval names an `approvalId`, not a tool call, so there
+            // is no chip for the decision to link back to.
             let receiver = request(
                 kind,
                 summary,
@@ -674,6 +681,7 @@ impl Runner {
                     komet_proto::PermissionChoice::Allow,
                     komet_proto::PermissionChoice::Deny,
                 ],
+                None,
             );
             let choices = choices.clone();
             let client = self.client.clone();
@@ -752,22 +760,8 @@ impl Runner {
             return Ok(());
         };
         let raw: Vec<Value> = params["questions"].as_array().cloned().unwrap_or_default();
-        let questions: Vec<UserInputQuestion> = raw
-            .iter()
-            .map(|q| UserInputQuestion {
-                id: string(q, "id").into(),
-                header: string(q, "header").into(),
-                question: string(q, "question").into(),
-                options: q["options"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|o| o["label"].as_str().map(str::to_owned))
-                    .collect(),
-                multi_select: q["selection"]["mode"] == "multiple",
-            })
-            .collect();
-        let answers = (input)(questions.clone());
+        let questions = parse_questions(&raw);
+        let answers = (input)(questions.clone(), komet_proto::QuestionSource::Native);
         let id = user_input.clone();
         let tx = self.tx.clone();
         let task = self.dialogs.spawn(async move {
@@ -841,6 +835,29 @@ fn offered_choice<'a>(choices: &'a [Value], decision: &str) -> Option<&'a Value>
                 })
                 .flatten()
         })
+}
+
+/// Parse the host's `questions` into Komet's shared question model.
+fn parse_questions(raw: &[Value]) -> Vec<UserInputQuestion> {
+    raw.iter()
+        .map(|q| UserInputQuestion {
+            id: string(q, "id").into(),
+            header: string(q, "header").into(),
+            question: string(q, "question").into(),
+            options: q["options"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|o| o["label"].as_str().map(str::to_owned))
+                .collect(),
+            multi_select: q["selection"]["mode"] == "multiple",
+            option_descriptions: Vec::new(),
+            // `answer` already carries unmatched labels as freeText/note.
+            allow_free_text: true,
+            secret: false,
+            default: None,
+        })
+        .collect()
 }
 
 /// One MSP answer: offered labels select, anything else is free text
@@ -958,7 +975,40 @@ mod tests {
             question: "?".into(),
             options: vec!["Yes".into(), "No".into()],
             multi_select: multi,
+            option_descriptions: Vec::new(),
+            allow_free_text: true,
+            secret: false,
+            default: None,
         }
+    }
+
+    #[test]
+    fn questions_parse_with_free_text_ordered_labels_and_selection_mode() {
+        let raw = vec![
+            json!({
+                "id": "q1",
+                "header": "Database",
+                "question": "Which database?",
+                "options": [{"label": "Postgres"}, {"label": "SQLite"}],
+                "selection": {"mode": "single"},
+            }),
+            json!({
+                "id": "q2",
+                "header": "Extras",
+                "question": "Anything else?",
+                "options": [{"label": "Indexes"}, {"label": "Backups"}],
+                "selection": {"mode": "multiple"},
+            }),
+        ];
+        let questions = parse_questions(&raw);
+        assert_eq!(questions.len(), 2);
+        assert!(questions.iter().all(|q| q.allow_free_text));
+        assert!(!questions[0].multi_select);
+        assert!(questions[1].multi_select);
+        assert_eq!(questions[0].options, ["Postgres", "SQLite"]);
+        assert_eq!(questions[1].options, ["Indexes", "Backups"]);
+        // The host's option shape carries no description field we can rely on.
+        assert!(questions.iter().all(|q| q.option_descriptions.is_empty()));
     }
 
     #[test]

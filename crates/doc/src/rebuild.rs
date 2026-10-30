@@ -180,6 +180,8 @@ mod tests {
                     subagent_ref: None,
                     subagent_status: None,
                     subagent_tail: None,
+                    subagent_duration_ms: None,
+                    subagent_tool_count: None,
                 },
             ],
             created_at: 5,

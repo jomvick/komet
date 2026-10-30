@@ -172,6 +172,7 @@ icon_assets![
     (ANTIGRAVITY_MARK, "antigravity-mark"),
     (PI_MARK, "pi-mark"),
     (CLINE_MARK, "cline-mark"),
+    (QODER_MARK, "qoder-mark"),
     (DEVIN_MARK, "devin-mark"),
     (MUSE_MARK, "muse-mark"),
     (COPILOT_MARK, "copilot-mark"),

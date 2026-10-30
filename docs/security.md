@@ -9,6 +9,22 @@ Komet's sandbox settings configure the **agent CLI's own permission and sandbox 
 - The flags/permissions passed to each agent CLI at spawn time.
 - With explicit `SandboxOptions`, komet maps your choices to native provider options instead of escalating to full access.
 
+### Full access is a delegation, not a missing prompt
+
+`Full access` exists to give the agent total control: it acts without asking, and
+komet writes **no permission row per auto-approved call**. That silence is the
+contract of the level, not a dropped fact — the level itself is the authorisation
+(the composer access chip, and `SandboxLevel` on the run request), and narrating
+every auto-approved call would only bury the transcript in the consequences of a
+choice the user already made. The same rule governs `Read only`'s auto-denials
+(the refused tool call is still visible through its error).
+
+What komet never allows silently is a decision that **contradicts** the level: an
+implicit `AllowAlways` outside Full access, a deny overwritten by a later
+resolution, or a dropped permission request degrading to an allow. See
+`acp_auto_permission` (`crates/harness/src/acp/mod.rs`) and the deny-wins fold in
+`crates/doc/src/parts.rs`.
+
 ### What it does NOT constrain
 
 - There is **no container or VM isolation**. Agent processes run directly on the host with your user's privileges.

@@ -61,19 +61,20 @@ fn controls(
     let (steer_tx, steer_rx) = mpsc::channel(8);
     let token = CancellationToken::new();
     let controls = RunControls {
-        request_input: Box::new(move |questions| {
+        request_input: Box::new(move |questions, _source| {
             let (tx, rx) = oneshot::channel();
             let answers: Vec<UserInputAnswer> = questions
                 .iter()
                 .map(|q| UserInputAnswer {
                     question_id: q.id.clone(),
                     labels: vec![answer_label.into()],
+                    free_text: None,
                 })
                 .collect();
             let _ = tx.send(answers);
             rx
         }),
-        request_permission: Box::new(move |_kind, _summary, _choices| {
+        request_permission: Box::new(move |_kind, _summary, _choices, _tool_call_id| {
             let (tx, rx) = oneshot::channel();
             let choice = if answer_label == "Yes" {
                 PermissionChoice::Allow
@@ -396,8 +397,8 @@ async fn approvals_round_trip_as_permission_requests() {
     let token = CancellationToken::new();
     let seen = permissions.clone();
     let controls = RunControls {
-        request_input: Box::new(|_| oneshot::channel().1),
-        request_permission: Box::new(move |kind, summary, _choices| {
+        request_input: Box::new(|_, _| oneshot::channel().1),
+        request_permission: Box::new(move |kind, summary, _choices, _tool_call_id| {
             seen.lock().unwrap().push((kind, summary));
             let (tx, rx) = oneshot::channel();
             let _ = tx.send(PermissionChoice::Allow);

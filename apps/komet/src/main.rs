@@ -396,6 +396,7 @@ fn harness_from_env() -> komet_engine::HarnessId {
         Ok("opencode") => komet_engine::HarnessId::Opencode,
         Ok("pi") => komet_engine::HarnessId::Pi,
         Ok("cline") => komet_engine::HarnessId::Cline,
+        Ok("qoder") => komet_engine::HarnessId::Qoder,
         _ => komet_engine::HarnessId::ClaudeCode,
     }
 }

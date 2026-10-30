@@ -68,8 +68,8 @@ use crate::{
     send_signal, shutdown_child,
 };
 use normalize::{
-    billed_usage_event, map_update, native_context_event, parse_commands, preferred_allow_option,
-    session_info_window,
+    ElicitationForm, billed_usage_event, elicitation_form, elicitation_response, map_update,
+    native_context_event, parse_commands, preferred_allow_option, session_info_window,
 };
 use subagent::SubagentTracker;
 use subagent_opencode::OpencodeTracker;
@@ -728,6 +728,72 @@ fn cline_spec() -> AcpAgentSpec {
     }
 }
 
+fn qoder_install_paths() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        dirs.push(home.join(".qoder").join("bin").join("qoder"));
+        dirs.push(home.join(".local").join("bin").join("qoder"));
+        dirs.push(home.join(".npm-global").join("bin").join("qoder"));
+    }
+    dirs.push(PathBuf::from("/opt/homebrew/bin/qoder"));
+    dirs.push(PathBuf::from("/usr/local/bin/qoder"));
+    dirs
+}
+
+fn qoder_spec() -> AcpAgentSpec {
+    AcpAgentSpec {
+        id: HarnessId::Qoder,
+        display_name: "Qoder",
+        executable: "qoder",
+        env_override: "QODER_EXECUTABLE",
+        // Qoder CLI implements ACP natively: `qoder --acp` speaks the
+        // protocol over stdio. Auth is the CLI's own login (shared with the
+        // TUI) or QODER_PERSONAL_ACCESS_TOKEN in the environment.
+        args: &["--acp"],
+        // The CLI is the ACP server (`npm install -g @qoder-ai/qodercli`
+        // installs the same binary) — no adapter to prewarm or pin.
+        npm_package: None,
+        extra_paths: qoder_install_paths,
+        cli_executable: "qoder",
+        cli_extra_paths: qoder_install_paths,
+        install_hint: "qoder (searched PATH, the login shell's PATH, ~/.qoder/bin, \
+             ~/.local/bin, ~/.npm-global/bin, /opt/homebrew/bin, /usr/local/bin, and \
+             fnm/nvm/volta/pnpm/bun install dirs; install with \
+             `curl -fsSL https://qoder.com/install | bash` or \
+             `npm install -g @qoder-ai/qodercli`, then run `qoder login` (or set \
+             QODER_PERSONAL_ACCESS_TOKEN); set QODER_EXECUTABLE to override)",
+        // Qoder's ACP session/new does not document a model config option;
+        // the picker shows the pass-through entry and Qoder keeps the model
+        // configured in its own CLI. A discovered catalog wins when present.
+        models: || {
+            vec![Model {
+                id: "default".into(),
+                label: "Qoder default".into(),
+                description: Some("Runs the model configured in Qoder (`qoder` settings)".into()),
+                reasoning_levels: Vec::new(),
+                options: Vec::new(),
+            }]
+        },
+        // No `_session/steering` extension in Qoder's ACP surface: steers
+        // deliver at turn boundaries. Default/bypass-permissions modes ride
+        // the ACP session modes, not komet's steering.
+        steering_mode: SteeringMode::TurnBoundary,
+        // Qoder's ACP surface exposes no `thought_level` config option today.
+        reasoning_levels: &[],
+        prompt_transform: identity_transform,
+        effort_values: default_effort_values,
+        ladder_extras: &[],
+        prompt_complete_extension: false,
+        // A native CLI with a login check before the ACP handshake; total
+        // silence past this is a wedge (expired token, hung update check).
+        prompt_stall: Some(Duration::from_secs(45)),
+        stall_hint: "Check Qoder CLI authentication with `qoder login` (or set \
+             QODER_PERSONAL_ACCESS_TOKEN), then run `qoder --acp` once in a \
+             terminal to see the raw error.",
+        http_sidecar: false,
+    }
+}
+
 fn opencode_install_paths() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
@@ -994,6 +1060,11 @@ impl AcpHarness {
         harness.handshake_timeout = startup_timeout;
         harness.model_discovery_timeout = startup_timeout;
         harness
+    }
+
+    /// Qoder CLI (`qoder --acp`) — Alibaba's native ACP agent.
+    pub fn qoder() -> Self {
+        Self::with_spec(qoder_spec())
     }
 
     /// Use a fixed agent binary instead of PATH/known-location resolution.
@@ -2143,11 +2214,58 @@ struct Session {
     cline_data_dir: Option<PathBuf>,
 }
 
-fn initialize_params(_harness: HarnessId) -> Value {
-    let capabilities = json!({
+/// Whether a draft ACP signal is allowed for this harness, given the raw value
+/// of its experiment variable.
+///
+/// The value is a comma-separated list of harness slugs, and a global "on" is
+/// refused (`1`, `true`, `*`…): validating a draft signal means watching one
+/// pinned CLI accept it and send something back, and that evidence belongs to
+/// one agent — advertising it for every ACP agent behind the same wire would
+/// make unvalidated agents inherit another's verification.
+fn draft_signal_allows(env_value: Option<&str>, harness: HarnessId) -> bool {
+    env_value.is_some_and(|value| {
+        value
+            .split(',')
+            .filter_map(|slug| HarnessId::from_slug(slug.trim()))
+            .any(|allowed| allowed == harness)
+    })
+}
+
+/// The two draft-signal opt-ins for one harness: `(elicitation, compaction)`.
+fn experiment_gates(harness: HarnessId) -> (bool, bool) {
+    (
+        draft_signal_allows(
+            std::env::var("KOMET_ACP_ELICITATION").ok().as_deref(),
+            harness,
+        ),
+        draft_signal_allows(
+            std::env::var("KOMET_ACP_COMPACTION").ok().as_deref(),
+            harness,
+        ),
+    )
+}
+
+fn initialize_params(harness: HarnessId) -> Value {
+    let (elicitation, compaction) = experiment_gates(harness);
+    initialize_params_with(elicitation, compaction)
+}
+
+/// `initialize_params` with the two experiment gates passed explicitly, so the
+/// wire shape is testable without mutating the process environment.
+fn initialize_params_with(elicitation: bool, compaction: bool) -> Value {
+    let mut capabilities = json!({
         "fs": { "readTextFile": false, "writeTextFile": false },
         "terminal": false,
     });
+    // Draft RFD signals, opt-in per agent (see `draft_signal_allows`). A client
+    // that understands a signal is not a claim that the agent sends it: the
+    // declared surface stays `None`/`PermissionShaped` until Gate B is passed.
+    if elicitation {
+        capabilities["elicitation"] = json!({ "form": {} });
+    }
+    if compaction {
+        capabilities["session"] = json!({ "compaction": {} });
+    }
     json!({
         "protocolVersion": 1,
         "clientInfo": {
@@ -3117,7 +3235,10 @@ fn handle_server_request(
 }
 
 type RequestInputFn = Box<
-    dyn Fn(Vec<UserInputQuestion>) -> tokio::sync::oneshot::Receiver<Vec<UserInputAnswer>>
+    dyn Fn(
+            Vec<UserInputQuestion>,
+            komet_proto::QuestionSource,
+        ) -> tokio::sync::oneshot::Receiver<Vec<UserInputAnswer>>
         + Send
         + Sync,
 >;
@@ -3127,6 +3248,7 @@ type RequestPermissionFn = Box<
             komet_proto::PermissionKind,
             String,
             Vec<komet_proto::PermissionChoice>,
+            Option<String>,
         ) -> tokio::sync::oneshot::Receiver<komet_proto::PermissionChoice>
         + Send
         + Sync,
@@ -3274,8 +3396,67 @@ fn acp_auto_permission(
     }
 }
 
-/// The live-run request handler. Three shapes:
-/// - non-permission methods → [`handle_server_request`];
+/// ACP draft `elicitation/create` for a live run.
+///
+/// Gate B: reachable only when this harness was allowed to advertise
+/// `capabilities.elicitation` (`KOMET_ACP_ELICITATION` names its slug) — a
+/// request without the advertisement is answered `-32601`, not served. The
+/// form mapping refuses anything it cannot render faithfully (`-32602`)
+/// rather than guessing a shape the agent never asked for; `url` mode is
+/// declared in the RFD but unsupported here.
+fn handle_elicitation(
+    client: &RpcClient,
+    id: Value,
+    params: &Value,
+    request_input: &std::sync::Arc<RequestInputFn>,
+    open_questions: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    allowed: bool,
+) -> Vec<AgentEvent> {
+    if !allowed {
+        tracing::warn!(
+            target: "komet_harness::acp",
+            "elicitation/create refused: elicitation was not advertised for this agent"
+        );
+        client.respond_error(&id, -32601, "elicitation is not enabled for this agent");
+        return Vec::new();
+    }
+    let form = elicitation_form(params);
+    if let ElicitationForm::Unsupported(reason) = &form {
+        tracing::warn!(
+            target: "komet_harness::acp",
+            "elicitation/create refused: {reason}"
+        );
+        client.respond_error(
+            &id,
+            -32602,
+            &format!("unsupported elicitation request: {reason}"),
+        );
+        return Vec::new();
+    }
+    let ElicitationForm::Ask { fields } = &form else {
+        return Vec::new();
+    };
+    let questions: Vec<UserInputQuestion> =
+        fields.iter().map(|field| field.question.clone()).collect();
+    let client = client.clone();
+    let request_input = std::sync::Arc::clone(request_input);
+    // Pending questions block the agent — the quiet-settle must not read that
+    // silence as a finished turn.
+    let open_questions = std::sync::Arc::clone(open_questions);
+    open_questions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    tokio::spawn(async move {
+        let answers = (request_input)(questions, komet_proto::QuestionSource::Elicitation)
+            .await
+            .unwrap_or_default();
+        client.respond(&id, elicitation_response(&form, &answers));
+        open_questions.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    });
+    Vec::new()
+}
+
+/// The live-run request handler. Four shapes:
+/// - `elicitation/create` → [`handle_elicitation`] (Gate B, opt-in per agent);
+/// - other non-permission methods → [`handle_server_request`];
 /// - question-shaped permission requests (options without allow/reject kinds)
 ///   block on the engine's input bridge;
 /// - real tool permissions honor [`SandboxLevel`]: Full access auto-allows,
@@ -3292,7 +3473,18 @@ fn handle_server_request_live(
     request_permission: &std::sync::Arc<RequestPermissionFn>,
     open_questions: &std::sync::Arc<std::sync::atomic::AtomicUsize>,
     sandbox: SandboxLevel,
+    elicitation: bool,
 ) -> Vec<AgentEvent> {
+    if method == "elicitation/create" {
+        return handle_elicitation(
+            client,
+            id,
+            params,
+            request_input,
+            open_questions,
+            elicitation,
+        );
+    }
     if method != "session/request_permission" {
         return handle_server_request(client, id, method, params);
     }
@@ -3305,6 +3497,14 @@ fn handle_server_request_live(
         let tool_call = params.get("toolCall");
         let (kind, summary) = parse_acp_permission(tool_call);
         if let Some(choice) = acp_auto_permission(sandbox, &kind) {
+            // Delegated level: no permission row by design (I6, docs/security.md
+            // "Full access is a delegation") — keep the decision diagnosable.
+            tracing::debug!(
+                target: "komet_harness::acp",
+                sandbox = ?sandbox,
+                decision = ?choice,
+                "auto-resolved ACP permission by access level"
+            );
             let outcome = match option_for_choice(&options, &choice) {
                 Some(option_id) => {
                     json!({ "outcome": { "outcome": "selected", "optionId": option_id } })
@@ -3321,12 +3521,19 @@ fn handle_server_request_live(
             },
             komet_proto::PermissionChoice::Deny,
         ];
+        // ACP names the gated call when there is one (`toolCall.toolCallId`);
+        // a bare `request_permission` (no tool call) leaves the link absent.
+        let tool_call_id = params
+            .get("toolCall")
+            .and_then(|call| call.get("toolCallId"))
+            .and_then(Value::as_str)
+            .map(|id| id.to_string());
         let client = client.clone();
         let request_permission = std::sync::Arc::clone(request_permission);
         let open_questions = std::sync::Arc::clone(open_questions);
         open_questions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         tokio::spawn(async move {
-            let choice = request_permission(kind, summary, choices)
+            let choice = request_permission(kind, summary, choices, tool_call_id)
                 .await
                 .unwrap_or(komet_proto::PermissionChoice::Deny);
             let outcome = match option_for_choice(&options, &choice) {
@@ -3360,6 +3567,10 @@ fn handle_server_request_live(
             .to_owned(),
         options: names.clone(),
         multi_select: false,
+        option_descriptions: Vec::new(),
+        allow_free_text: false,
+        secret: false,
+        default: None,
     };
     let client = client.clone();
     let request_input = std::sync::Arc::clone(request_input);
@@ -3368,9 +3579,12 @@ fn handle_server_request_live(
     let open_questions = std::sync::Arc::clone(open_questions);
     open_questions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     tokio::spawn(async move {
-        let answers = (request_input)(vec![question.clone()])
-            .await
-            .unwrap_or_default();
+        let answers = (request_input)(
+            vec![question.clone()],
+            komet_proto::QuestionSource::PermissionShaped,
+        )
+        .await
+        .unwrap_or_default();
         let picked = answers
             .iter()
             .find(|a| a.question_id == question.id)
@@ -3546,11 +3760,17 @@ async fn run_session(session: Session) {
     } = controls;
     let request_input = std::sync::Arc::new(request_input);
     let request_permission = std::sync::Arc::new(request_permission);
+    // One read of the Gate B opt-ins: the advertisement and the
+    // `elicitation/create` branch must never disagree inside a run.
+    let (elicitation, compaction) = experiment_gates(harness);
 
     // ---- handshake + session (interruptible) ------------------------------
     let setup = async {
         let init = client
-            .request("initialize", initialize_params(harness))
+            .request(
+                "initialize",
+                initialize_params_with(elicitation, compaction),
+            )
             .await?;
         let steer_ext = steering_supported(&init);
         let init_commands = scan_available_commands(&init);
@@ -4097,6 +4317,7 @@ async fn run_session(session: Session) {
                                         &request_permission,
                                         &open_questions,
                                         request.sandbox,
+                                        elicitation,
                                     ) {
                                         if !send(&event_tx, ev).await {
                                             consumer_gone = true;
@@ -4347,6 +4568,7 @@ async fn run_session(session: Session) {
                                 &request_permission,
                                 &open_questions,
                                 request.sandbox,
+                                elicitation,
                             ) {
                                 if !send(&event_tx, ev).await {
                                     break 'main;
@@ -4538,6 +4760,7 @@ async fn run_session(session: Session) {
                                                 &request_permission,
                                                 &open_questions,
                                                 request.sandbox,
+                                        elicitation,
                                             ) {
                                                 if !send(&event_tx, ev).await {
                                                     consumer_gone = true;
@@ -4999,6 +5222,61 @@ async fn run_session(session: Session) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn acp_capabilities_are_unchanged_when_experiments_off() {
+        // Golden: with neither gate open, the `initialize` payload is exactly
+        // what every ACP agent has been seeing. A draft signal must not leak
+        // into the default handshake.
+        assert_eq!(
+            initialize_params_with(false, false),
+            json!({
+                "protocolVersion": 1,
+                "clientInfo": {
+                    "name": "komet",
+                    "title": "Komet",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+                "clientCapabilities": {
+                    "fs": { "readTextFile": false, "writeTextFile": false },
+                    "terminal": false,
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn acp_capabilities_advertise_when_enabled() {
+        let params = initialize_params_with(true, true);
+        let capabilities = &params["clientCapabilities"];
+        assert_eq!(capabilities["elicitation"], json!({ "form": {} }));
+        assert_eq!(capabilities["session"], json!({ "compaction": {} }));
+        // Advertising more must not regress what was already declined.
+        assert_eq!(
+            capabilities["fs"],
+            json!({ "readTextFile": false, "writeTextFile": false })
+        );
+        assert_eq!(capabilities["terminal"], json!(false));
+    }
+
+    #[test]
+    fn draft_signals_are_allowed_per_agent_and_never_globally() {
+        for global in ["1", "true", "on", "*", "all", "yes"] {
+            assert!(
+                !draft_signal_allows(Some(global), HarnessId::Grok),
+                "`{global}` would extend one agent's verification to all of them"
+            );
+        }
+        assert!(!draft_signal_allows(None, HarnessId::Grok));
+        assert!(!draft_signal_allows(Some("grok"), HarnessId::Cline));
+        assert!(draft_signal_allows(Some("grok"), HarnessId::Grok));
+        // Whitespace, an unknown slug and the slug aliases all behave.
+        assert!(draft_signal_allows(
+            Some(" cline, bogus-agent "),
+            HarnessId::Cline
+        ));
+        assert!(draft_signal_allows(Some("open-code"), HarnessId::Opencode));
+    }
 
     #[test]
     fn mcp_servers_are_scoped_to_the_run_request() {

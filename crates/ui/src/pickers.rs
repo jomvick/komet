@@ -893,7 +893,9 @@ impl Pickers {
         }
     }
 
-    fn close(&mut self, cx: &mut Context<Self>) {
+    /// Dismiss the mounted picker. Crate-visible: the shell's « See in thread »
+    /// action closes the Context popover before jumping.
+    pub(crate) fn close(&mut self, cx: &mut Context<Self>) {
         self.animate_close(cx);
         cx.notify();
     }
@@ -2696,6 +2698,7 @@ impl Pickers {
                 let popover_theme = Theme::of(cx).clone();
                 let content = crate::context_usage::render_context_popover(
                     &context_stats,
+                    &self.state.read(cx).thread_compactions(),
                     chat_harness,
                     chat_model,
                     &popover_theme,
@@ -3944,6 +3947,7 @@ pub(crate) fn harness_brand_icon(harness: HarnessId) -> (&'static str, Option<gp
         HarnessId::Copilot => (crate::icons::COPILOT_MARK, None),
         // Cline's official brand mark (same LobeHub set), monochrome.
         HarnessId::Cline => (crate::icons::CLINE_MARK, None),
+        HarnessId::Qoder => (crate::icons::QODER_MARK, None),
     }
 }
 
@@ -4704,6 +4708,7 @@ mod tests {
             reasoning_levels: vec![],
             installed: true,
             enabled: None,
+            surface: komet_proto::HarnessInteractionSurface::default(),
         };
         let mixed = vec![
             descriptor(HarnessId::Mock, "Mock"),
@@ -4730,6 +4735,7 @@ mod tests {
             reasoning_levels: vec![],
             installed: true,
             enabled,
+            surface: komet_proto::HarnessInteractionSurface::default(),
         };
         let catalog = |claude: Option<bool>, codex: Option<bool>, grok: Option<bool>| {
             vec![

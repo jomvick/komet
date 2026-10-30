@@ -145,6 +145,13 @@ case "$prompt" in
         emit '{"event":"step_update","step_update":{"conversation_id":"fake-readonly","step_index":1,"state":"ACTIVE","step_type":"agent_response","text_delta":"readonly ok"}}'
         emit '{"event":"result","result":{"conversation_id":"fake-readonly","status":"SUCCESS","response":"readonly ok"}}'
         ;;
+    *scenario:ask_question*)
+        emit '{"event":"init","conversation_id":"fake-convo-q","init":{"model":"gemini-3.8-flash","tools":["ask_question"],"cwd":"/test/project"}}'
+        emit '{"event":"step_update","step_update":{"conversation_id":"fake-convo-q","step_index":1,"state":"ACTIVE","step_type":"tool","tool_name":"ask_question","tool_info":{"name":"ask_question","parameters":{"questions":[{"question":"Which database should I use?","options":["Postgres","SQLite"],"is_multi_select":false}]}}}}'
+        emit '{"event":"step_update","step_update":{"conversation_id":"fake-convo-q","step_index":1,"state":"DONE","step_type":"tool","tool_name":"ask_question","tool_info":{"name":"ask_question","parameters":{"questions":[{"question":"Which database should I use?","options":["Postgres","SQLite"],"is_multi_select":false}]},"output":"no answer channel"}}}'
+        emit '{"event":"step_update","step_update":{"conversation_id":"fake-convo-q","step_index":2,"state":"ACTIVE","step_type":"agent_response","text_delta":"Proceeding with Postgres."}}'
+        emit '{"event":"result","result":{"conversation_id":"fake-convo-q","status":"SUCCESS","response":"Proceeding with Postgres."}}'
+        ;;
     *scenario:crash*)
         echo "Fatal runtime error in agy" >&2
         exit 1

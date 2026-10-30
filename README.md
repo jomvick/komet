@@ -1,6 +1,6 @@
 # Komet
 
-> Control your coding agents (Claude Code, Codex, Cursor, Devin, GitHub Copilot, Grok, Hermes, Muse Code, OpenCode, Pi, Cline) — **100% local by default**, optional multi-device sync.
+> Control your coding agents (Claude Code, Codex, Cursor, Devin, GitHub Copilot, Cline, Grok, Hermes, Muse Code, OpenCode, Pi, Antigravity, Qoder) — **100% local by default**, optional multi-device sync.
 
 Komet is a native **Rust + gpui** controller in a single binary. Each device runs a small engine that stores sessions locally. No account, no network required at install — sync only activates if you self-host it.
 
@@ -11,7 +11,7 @@ Komet is a native **Rust + gpui** controller in a single binary. Each device run
 - **Local-first** — works fully offline, data stays on device
 - **Single binary** — UI + engine, headed or headless mode
 - **Multiple agents** — native CLI, MSP, and ACP integrations with mid-conversation provider switching
-- **Optional sync** — Loro CRDT via a self-hosted `komet-sync` server (SQLite + bearer token)
+- **Optional sync** — Loro CRDT via a self-hosted `komet-sync-server` (SQLite + bearer token)
 
 > **Security:** komet's sandbox settings constrain the agent CLI's own permissions — they are not an OS-level boundary. See [docs/security.md](docs/security.md).
 
@@ -46,7 +46,7 @@ Download `komet-<version>-linux-<arch>.tar.gz` then run `./install.sh` inside th
 | Method | File | Action |
 |--------|------|--------|
 | Disk Image | `komet-<version>-macos-arm64.dmg` | Drag `Komet.app` to `Applications` |
-| CLI / Daemon | — | `komet daemon install && komet status` |
+| CLI / Daemon | — | The installer links no `komet` CLI: run `Komet.app/Contents/MacOS/komet daemon install` (or `… status`) from the bundle |
 
 ### Windows
 
@@ -111,16 +111,20 @@ Disabled by default. To sync across devices via your own server:
 **1. On your VPS / server:**
 ```bash
 komet sync-init                              # prints KOMET_SYNC_TOKEN
+export KOMET_SYNC_TOKEN=xxx                  # or put it in .env for compose
 docker compose -f docker-compose.sync.yml up -d
 # or locally: KOMET_SYNC_TOKEN=xxx komet sync-server
 ```
 
 **2. On each device:**
 ```bash
-export KOMET_EDGE_URL=http://YOUR_VPS:8787
+export KOMET_EDGE_URL=https://sync.example.com
 export KOMET_SYNC_TOKEN=xxx
 komet
 ```
+
+Plain `http://` is only for a LAN you control (e.g. `http://192.168.1.10:8787`);
+the token travels as a bearer, so never expose it unencrypted on the internet.
 
 > Full details: [`docs/self-hosted-sync.md`](docs/self-hosted-sync.md)
 
@@ -137,14 +141,28 @@ curl -fsSL https://raw.githubusercontent.com/jomvick/komet/main/install.sh \
   | sh -s -- --serve --lan
 ```
 
-It installs a UI-less Komet, registers it as a service, and prints a
-`komet://pair/…` link. Paste that link in **Komet → Settings → Sync → Add
-device**, then pick the machine from the **Devices** menu at the top of the
-sidebar to chat on it and manage its agents. `--lan` serves plain HTTP, so the
-dialog asks you to confirm you are on a network you control; behind TLS, use
+It installs the same `komet` binary as the desktop app, registers it as a user
+service, and prints a `komet://pair/…` link. `komet serve` never opens a
+window, but the binary still links gpui's system libraries: on a minimal
+Debian/Ubuntu image install them first (no display server or desktop session is
+needed):
+
+```bash
+# Debian/Ubuntu
+sudo apt install libxcb1 libxkbcommon0 libxkbcommon-x11-0 libdbus-1-3
+# Fedora
+sudo dnf install libxcb libxkbcommon libxkbcommon-x11 dbus-libs
+```
+
+Paste the link in **Komet → Settings → Sync → Add device**, then pick the
+machine from the **Devices** menu at the top of the sidebar to chat on it and
+manage its agents. `--lan` serves plain HTTP, so the dialog asks you to confirm
+you are on a network you control; behind TLS, use
 `komet serve --public-url https://sync.example.com --install-service` instead.
 The token and namespace are generated once and saved in `~/.komet/serve.json`
 (0600); the link is a secret — it grants the bearer a shell on that machine.
+On a VPS, also run `loginctl enable-linger $USER` so the user service keeps
+running after you log out.
 
 To stop being an environment: **Settings → Sync → Remove** on the desktop (tick
 *purge* to delete its local mirror too), then `systemctl --user disable --now
@@ -169,7 +187,7 @@ gpui UI ── RPC (localhost / in-proc) ── engine A ══ komet-sync serve
 | `komet-doc` | Loro schemas + mirror layer |
 | `komet-sync` | room client + SQLite snapshots |
 | `komet-sync-server` | self-hosted sync server (rooms, blobs, bearer auth) |
-| `komet-harness` | ACP adapters (7 agents) |
+| `komet-harness` | ACP adapters (8 agents) |
 
 Learn more: [`ARCHITECTURE.md`](ARCHITECTURE.md) · [`docs/`](docs/)
 

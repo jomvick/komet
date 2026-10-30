@@ -85,11 +85,13 @@ fn controls(
     let interrupt = CancellationToken::new();
     (
         RunControls {
-            request_input: Box::new(|_| {
+            request_input: Box::new(|_, _| {
                 let (_tx, rx) = oneshot::channel();
                 rx
             }),
-            request_permission: Box::new(request_permission),
+            request_permission: Box::new(move |kind, summary, choices, _tool_call_id| {
+                request_permission(kind, summary, choices)
+            }),
             steering,
             interrupt: interrupt.clone(),
             env: Vec::new(),
@@ -104,7 +106,7 @@ fn deny_permission(
     summary: String,
     choices: Vec<PermissionChoice>,
 ) -> oneshot::Receiver<PermissionChoice> {
-    RunControls::noop_permission()(kind, summary, choices)
+    RunControls::noop_permission()(kind, summary, choices, None)
 }
 
 async fn start(

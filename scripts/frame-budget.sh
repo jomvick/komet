@@ -20,9 +20,12 @@
 # unfocused window is excluded too (gpui throttles it to ~30 fps).
 #
 # The table splits the frame into `build` (Shell's own render body),
-# `children` (Transcript/Composer/Changes renders) and `total`. The
-# `renders/frame` line counts child renders: with view caching active, a
-# sidebar-only animation must leave the models at 0.
+# `children` (Transcript/Composer/Changes/ContextUsage/Rail renders) and
+# `total`. The `renders/frame` line counts child renders: with view caching
+# active, a sidebar-only animation must leave the models at 0. A second line
+# breaks row renders down per row kind (`user`, `tools`, `compaction`, …), and
+# the most-rendered rows are listed by id: a doc update that only touches the
+# compaction line must leave the other kinds at 0.
 #
 # Needs a graphical session and a running demo daemon: start
 # `scripts/dev-demo.sh --daemon-only` first (or a `komet headless` engine on
@@ -90,16 +93,27 @@ import re, statistics, sys
 log_path, csv_path = sys.argv[1], sys.argv[2]
 ansi_re = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 window_re = re.compile(r'window frame budget\b')
+row_re = re.compile(r'row frame budget\b')
+row_field_re = re.compile(r'kind="?(\w+)"? id=(\S+) renders=(\d+)')
 kv_re = re.compile(r"(\w+)=(\d+)")
 
 windows = []
+rows_by_kind = {}
+rows_by_id = {}
 for line in open(log_path, encoding="utf-8", errors="replace"):
     line = ansi_re.sub("", line)
-    if not window_re.search(line):
+    if window_re.search(line):
+        fields = {k: int(v) for k, v in kv_re.findall(line)}
+        if "frames" in fields and "interval_p50_us" in fields:
+            windows.append(fields)
         continue
-    fields = {k: int(v) for k, v in kv_re.findall(line)}
-    if "frames" in fields and "interval_p50_us" in fields:
-        windows.append(fields)
+    if row_re.search(line):
+        m = row_field_re.search(line)
+        if m:
+            kind, row_id, renders = m.group(1), m.group(2), int(m.group(3))
+            rows_by_kind[kind] = rows_by_kind.get(kind, 0) + renders
+            key = (kind, row_id)
+            rows_by_id[key] = rows_by_id.get(key, 0) + renders
 
 active_windows = [w for w in windows if w["frames"] > 0]
 total_frames = sum(w["frames"] for w in active_windows)
@@ -133,7 +147,20 @@ print(f"{'total':<10}{ms('total_p50_us'):>8}{ms('total_p95_us'):>8}"
       f"{ms('total_p99_us'):>8}{peak_ms('total_max_us'):>8}")
 print(f"renders/frame: transcript={ratio('transcript_renders'):.2f}"
       f"  composer={ratio('composer_renders'):.2f}"
-      f"  changes={ratio('changes_renders'):.2f}")
+      f"  changes={ratio('changes_renders'):.2f}"
+      f"  context_usage={ratio('context_usage_renders'):.2f}"
+      f"  rail={ratio('rail_renders'):.2f}"
+      f"  rows={ratio('row_renders'):.2f}")
+
+ROW_KINDS = ["user", "markdown", "live_markdown", "tools",
+             "question", "permission", "error", "compaction"]
+print("lignes re-rendues: "
+      + "  ".join(f"{kind}={rows_by_kind.get(kind, 0)}" for kind in ROW_KINDS))
+top_rows = sorted(rows_by_id.items(), key=lambda item: item[1], reverse=True)[:5]
+if top_rows:
+    print("lignes les plus re-rendues: "
+          + ", ".join(f"{kind}[{row_id}]×{renders}"
+                      for (kind, row_id), renders in top_rows))
 
 if csv_path:
     keys = ["frames", "missed", "interval_p50_us", "interval_p95_us",
@@ -142,7 +169,8 @@ if csv_path:
             "children_p50_us", "children_p95_us", "children_p99_us",
             "children_max_us", "total_p50_us", "total_p95_us",
             "total_p99_us", "total_max_us", "transcript_renders",
-            "composer_renders", "changes_renders"]
+            "composer_renders", "changes_renders", "context_usage_renders",
+            "rail_renders", "row_renders"]
     with open(csv_path, "w", encoding="utf-8") as out:
         out.write(",".join(keys) + "\n")
         for w in active_windows:

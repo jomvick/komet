@@ -22,6 +22,7 @@ pub enum HarnessIdArg {
     Pi,
     #[value(alias = "gemini")]
     Antigravity,
+    Qoder,
     Mock,
 }
 
@@ -37,6 +38,7 @@ impl From<HarnessIdArg> for HarnessId {
             HarnessIdArg::Hermes => HarnessId::Hermes,
             HarnessIdArg::Pi => HarnessId::Pi,
             HarnessIdArg::Antigravity => HarnessId::Antigravity,
+            HarnessIdArg::Qoder => HarnessId::Qoder,
             HarnessIdArg::Mock => HarnessId::Mock,
         }
     }

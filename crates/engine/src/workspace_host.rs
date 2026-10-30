@@ -20,6 +20,7 @@
 //! serves the full sidebar before any server contact; the old `ws4` rooms are
 //! simply never joined again. The legacy snapshot is kept for rollback.
 
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use chrono::Utc;
@@ -166,6 +167,12 @@ struct WorkspaceHostInner {
     peer_alive: Mutex<Option<PeerAliveHook>>,
     /// Deaf-socket tripwire state — see `check_presence_deafness`.
     presence_watch: Mutex<PresenceWatch>,
+    /// This host's run journal, attached after assembly by the engine that owns
+    /// it. The journal is not registry state — it lives on the machine that ran
+    /// the chat — so `delete_chat` needs the handle to take a chat's transcript
+    /// (and its revival budget) down with the row. `None` for a workspace with
+    /// no journal of its own (a remote environment, seen only as a registry).
+    journal: Mutex<Option<Arc<crate::run_journal::RunJournal>>>,
 }
 
 /// "This peer is alive" callback (device id) — see `WorkspaceHost::set_peer_alive_hook`.
@@ -281,6 +288,7 @@ impl WorkspaceHost {
                 presence_seen: Mutex::new(std::collections::HashMap::new()),
                 peer_alive: Mutex::new(None),
                 presence_watch: Mutex::new(PresenceWatch::default()),
+                journal: Mutex::new(None),
             }),
         };
         // Persist immediately: after this boot the migration source is never
@@ -368,8 +376,15 @@ impl WorkspaceHost {
                         loop {
                             tokio::select! {
                                 event = events.recv() => match event {
-                                    Ok(komet_sync::RegistryEvent::Applied)
-                                    | Ok(komet_sync::RegistryEvent::Connected) => {
+                                    Ok(komet_sync::RegistryEvent::Applied) => {
+                                        let Some(inner) = weak.upgrade() else { return };
+                                        // A tombstone applied from a server frame never
+                                        // runs `delete_chat` here; this host still owns
+                                        // the journal those chats wrote.
+                                        inner.discard_orphan_journals();
+                                        inner.bump_changed();
+                                    }
+                                    Ok(komet_sync::RegistryEvent::Connected) => {
                                         let Some(inner) = weak.upgrade() else { return };
                                         inner.bump_changed();
                                     }
@@ -428,6 +443,12 @@ impl WorkspaceHost {
     /// the engine points this at `LinkCache::reset_cooldown`.
     pub fn set_peer_alive_hook(&self, hook: PeerAliveHook) {
         *lock(&self.inner.peer_alive) = Some(hook);
+    }
+
+    /// Attach this host's run journal so deleting a chat deletes what the
+    /// journal holds for it. Idempotent; the engine calls it once at assembly.
+    pub fn attach_journal(&self, journal: Arc<crate::run_journal::RunJournal>) {
+        *lock(&self.inner.journal) = Some(journal);
     }
 
     pub fn device_id(&self) -> &str {
@@ -793,9 +814,17 @@ impl WorkspaceHost {
 
     /// Hard-delete a space and its chats (registry cascade — one atomic batch).
     /// The caller (rpc layer) tears down live runs / doc-host handles for the
-    /// returned chat ids.
+    /// returned chat ids; the journals those chats wrote die here with them.
     pub fn delete_space(&self, space_id: &str) -> Result<DeletedSpace, EngineError> {
-        Ok(self.mutate(|doc| doc.delete_space(space_id))?)
+        let deleted = self.mutate(|doc| doc.delete_space(space_id))?;
+        if let Some(journal) = lock(&self.inner.journal).clone() {
+            for chat_id in &deleted.chat_ids {
+                if let Err(err) = journal.discard(chat_id) {
+                    tracing::warn!(chat = %chat_id, error = %err, "run journal delete failed");
+                }
+            }
+        }
+        Ok(deleted)
     }
 
     /// Synced seen marker (any device; LWW + monotonic guard in the doc layer).
@@ -909,8 +938,22 @@ impl WorkspaceHost {
 
     /// Tombstone: removes the chats (and session-status) row; the per-chat session
     /// doc remains untouched.
+    ///
+    /// On the host that ran the chat it also drops the run journal: a deleted
+    /// chat must not keep its transcript (or a subagent's) readable, and its
+    /// `.resume` file must not survive to hand a revival budget to a run whose
+    /// chat no longer exists. A device that converges a tombstone does not come
+    /// through here; the registry apply sweep (`discard_orphan_journals`) drops
+    /// any journal it does own.
     pub fn delete_chat(&self, chat_id: &str) -> Result<bool, EngineError> {
-        Ok(self.mutate(|doc| doc.delete_chat(chat_id))?)
+        let deleted = self.mutate(|doc| doc.delete_chat(chat_id))?;
+        if deleted
+            && let Some(journal) = lock(&self.inner.journal).as_ref()
+            && let Err(err) = journal.discard(chat_id)
+        {
+            tracing::warn!(chat = %chat_id, error = %err, "run journal delete failed");
+        }
+        Ok(deleted)
     }
 
     pub fn rename_device(&self, device_id: &str, name: &str) -> Result<bool, EngineError> {
@@ -955,6 +998,39 @@ impl WorkspaceHost {
 }
 
 impl WorkspaceHostInner {
+    /// Drop the journal (and its `.resume` budget) of every chat the registry
+    /// no longer holds. Remote chat tombstones and space cascades are applied
+    /// by the registry client, never through this host's delete methods, so a
+    /// delete made on another device would otherwise leave the transcript on
+    /// the machine that ran it.
+    fn discard_orphan_journals(&self) {
+        let Some(journal) = lock(&self.journal).clone() else {
+            return;
+        };
+        let known: HashSet<String> = match lock(&self.reg).read_chats() {
+            Ok(chats) => chats.into_iter().map(|chat| chat.id).collect(),
+            Err(err) => {
+                tracing::warn!(error = %err, "registry chat read failed; journals kept");
+                return;
+            }
+        };
+        let ids = match journal.chat_ids() {
+            Ok(ids) => ids,
+            Err(err) => {
+                tracing::warn!(error = %err, "run journal scan failed");
+                return;
+            }
+        };
+        for chat_id in ids {
+            if known.contains(&chat_id) {
+                continue;
+            }
+            if let Err(err) = journal.discard(&chat_id) {
+                tracing::warn!(chat = %chat_id, error = %err, "orphan journal delete failed");
+            }
+        }
+    }
+
     fn bump_changed(&self) {
         self.changed_tx.send_modify(|v| *v = v.wrapping_add(1));
     }

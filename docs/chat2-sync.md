@@ -65,6 +65,40 @@ expand; offline shows the summary + a greyed affordance.
 
 Estimate: 2–3 days. Ships in the next release; immediately cuts new-session growth ~7×.
 
+**A4. Transparency policy (implemented — what the doc is allowed to carry).** The
+rule is one sentence: **the doc carries the durable facts, the host's run journal
+carries the payload.** Concretely:
+
+- Tool outputs stay journal-only (A2). The doc keeps metadata plus the failure
+  summary: a failed output of 160 characters or fewer is stored in the synced
+  doc in full (it is not truncated); a longer one keeps a 160-character
+  summary (its first non-empty line, capped). A successful output never enters
+  the doc, however short.
+- Compaction writes `MessagePart::Compaction` (one part per cycle, `id` per
+  compaction — a session may compact several times) with `status`, `trigger`,
+  `tokens_before`/`tokens_after`, `error` and `summary_bytes`. The summary text
+  is journal-only unless `KOMET_COMPACTION_SUMMARY_IN_DOC` opts in (then capped
+  at 8 KiB on a UTF-8 boundary); it is read back with `GetCompactionSummary`,
+  host-only, answering a typed `unavailable` on a device without the journal.
+  `tokens_after` is never invented: absent until the next native context window.
+- Sub-agents: nothing child-scoped enters the doc or the sync stream. The parent
+  chip gets status and, once at the terminal transition only, duration and tool
+  count; the transcript is a host-local projection of the run journal
+  (`WatchSubagent`, subscribe-then-replay).
+- The journal is a resource of the chat, not of the device: `delete_chat` on the
+  host calls `RunJournal::discard` (journal + `.resume` budget), it is covered by
+  retention, and it is never synced. A chat deleted on one device must not leave
+  a readable subagent transcript behind.
+- Ephemeral facts never reach the journal or the doc: `ToolProgress`, `RunPhase`
+  and the rest of `WatchActivity` are broadcast-only, so a replayed run shows
+  `Final` states rather than a fake live stream.
+- Old clients: every new field is serde-additive with a default, so an older
+  build re-serializes without them. An older *reader* that meets
+  `kind: "compaction"` degrades the unknown part to an empty `Text` part
+  (`schema.rs` `_ =>`); that is documented behaviour, not licence for an old
+  build to start rewriting those parts — upgrade rather than patch the doc by
+  hand.
+
 ---
 
 ## Workstream B — chat2 edge room (dumb authenticated log relay)

@@ -53,7 +53,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use serde::Deserialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::Duration;
 use tokio::sync::watch;
 
@@ -190,6 +190,24 @@ struct QueueCommandParams {
 struct ToolDetailParams {
     chat_id: String,
     part_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CompactionSummaryParams {
+    chat_id: String,
+    compaction_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SubagentWatchParams {
+    chat_id: String,
+    parent_tool_use_id: String,
+    /// Resume cursor: journal seqs `<= afterSeq` are already on the viewer's
+    /// screen (a reconnect), so the replay starts above it.
+    #[serde(default)]
+    after_seq: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1197,7 +1215,14 @@ fn forwardable(method: &str) -> bool {
             | methods::QUEUE_COMMAND
             | methods::WATCH_DOC_MESSAGES
             | methods::WATCH_REASONING
+            | methods::WATCH_ACTIVITY
             | methods::GET_TOOL_DETAIL
+            // A subagent's transcript is a projection of the host's journal, so
+            // the tab has to reach the host — a viewer's own disk has nothing.
+            | methods::WATCH_SUBAGENT
+            // The recap lives in the host's run journal, so the fetch has to
+            // reach the host rather than answer empty on the asking device.
+            | methods::GET_COMPACTION_SUMMARY
             // Repos/worktrees/folders are device-local filesystem state.
             | methods::LIST_REPOS
             | methods::ADD_REPO
@@ -1268,6 +1293,8 @@ fn is_stream_method(method: &str) -> bool {
         method,
         methods::WATCH_DOC_MESSAGES
             | methods::WATCH_REASONING
+            | methods::WATCH_ACTIVITY
+            | methods::WATCH_SUBAGENT
             | methods::SUBSCRIBE_TERMINAL
             | methods::WATCH_CHECKOUT_DIFFS
             | methods::WATCH_WORKSPACE_FILES
@@ -1302,6 +1329,181 @@ fn reasoning_stream(
     .boxed()
 }
 
+/// Live activity stream: the ephemeral frames of the in-progress turn, each
+/// tagged with the `kind` a viewer keys its surfaces on — a tool's output tail,
+/// a subagent's live counters, a compaction's progress. From "now" (nothing here
+/// is journaled, so there is nothing to replay) and ends at `Done`, exactly like
+/// the reasoning stream it mirrors.
+///
+/// A `subagentStatus` frame is emitted per event that CHANGED a feed (a tool it
+/// ran, its lifecycle), never per streamed delta: the count only moves on those,
+/// and a frame per token would be a spinner with extra steps. The numbers are the
+/// host's own (`feeds`), so a viewer never measures anything on its own clock.
+fn activity_stream(
+    rx: tokio::sync::broadcast::Receiver<crate::sessions::JournaledEvent>,
+    feeds: crate::sessions::SubagentFeeds,
+    chat_id: String,
+) -> BoxStream<'static, serde_json::Value> {
+    futures::stream::unfold(
+        (rx, feeds, chat_id, VecDeque::new()),
+        |(mut rx, feeds, chat_id, mut queue)| async move {
+            loop {
+                if let Some(frame) = queue.pop_front() {
+                    return Some((frame, (rx, feeds, chat_id, queue)));
+                }
+                let je = match rx.recv().await {
+                    Ok(je) => je,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => return None,
+                };
+                match &je.event {
+                    AgentEvent::ToolProgress { id, text, .. } => {
+                        return Some((
+                            serde_json::json!({ "kind": "toolProgress", "id": id, "text": text }),
+                            (rx, feeds, chat_id, queue),
+                        ));
+                    }
+                    AgentEvent::RunPhase { phase } => {
+                        return Some((
+                            serde_json::json!({ "kind": "runPhase", "phase": phase }),
+                            (rx, feeds, chat_id, queue),
+                        ));
+                    }
+                    // Progress only: a compaction's recap is model prose about the
+                    // whole conversation, and it reaches a viewer through
+                    // `GetCompactionSummary` (host-local, opt-in), not this stream.
+                    AgentEvent::ContextCompaction {
+                        id,
+                        status,
+                        tokens_before,
+                        tokens_after,
+                        ..
+                    } => {
+                        return Some((
+                            serde_json::json!({
+                                "kind": "compaction",
+                                "compactionId": id,
+                                "status": status,
+                                "tokensBefore": tokens_before,
+                                "tokensAfter": tokens_after,
+                            }),
+                            (rx, feeds, chat_id, queue),
+                        ));
+                    }
+                    AgentEvent::Done { .. } => return None,
+                    other => {
+                        // Any touched feed is worth one frame; the hit kind
+                        // (a tool versus a status change) makes no difference
+                        // to the snapshot a viewer gets.
+                        for (parent, _) in crate::sessions::touched_feeds(other) {
+                            let Some(feed) = feeds.get(&chat_id, &parent) else {
+                                continue;
+                            };
+                            queue.push_back(serde_json::json!({
+                                "kind": "subagentStatus",
+                                "parentToolUseId": parent,
+                                "status": feed.status,
+                                "toolCount": feed.tool_count,
+                                // The child's current tool NAME only (null before
+                                // its first call): the arguments of a command line
+                                // can carry a secret, and this frame is ephemeral
+                                // traffic to any viewer of the chat.
+                                "lastTool": feed.last_tool,
+                                "elapsedMs": crate::now_ms().saturating_sub(feed.started_at_ms),
+                            }));
+                        }
+                        if !queue.is_empty() {
+                            return Some((
+                                queue.pop_front().expect("queued"),
+                                (rx, feeds, chat_id, queue),
+                            ));
+                        }
+                    }
+                }
+            }
+        },
+    )
+    .boxed()
+}
+
+/// One frame of `WatchSubagent`: a position in the host's journal plus the
+/// child's own event, unwrapped (the wrapper says who spawned it — the viewer
+/// already knows which feed it asked for). `phase` separates the replayed past
+/// from the live tail so a client can dedupe the overlap by `seq`.
+fn subagent_frame(seq: u64, phase: &str, event: &AgentEvent) -> serde_json::Value {
+    serde_json::json!({ "seq": seq, "phase": phase, "event": event })
+}
+
+/// The live half of a subagent transcript: the chat's hub, filtered to one
+/// parent's feed by the journal's own attribution rule, closing at the run's
+/// `Done` like the reasoning and activity streams.
+fn live_subagent_frames(
+    rx: tokio::sync::broadcast::Receiver<crate::sessions::JournaledEvent>,
+    parent: String,
+) -> BoxStream<'static, serde_json::Value> {
+    futures::stream::unfold(
+        (VecDeque::new(), rx, parent),
+        |(mut queue, mut rx, parent)| async move {
+            loop {
+                if let Some(frame) = queue.pop_front() {
+                    return Some((frame, (queue, rx, parent)));
+                }
+                let next = match rx.recv().await {
+                    Ok(next) => next,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => return None,
+                };
+                let mut feed = Vec::new();
+                crate::run_journal::project_feed(&next.event, &parent, next.seq, &mut feed);
+                queue.extend(
+                    feed.into_iter()
+                        .map(|(seq, event)| subagent_frame(seq, "live", &event)),
+                );
+                // Another feed's traffic (the parent's own, a sibling child's)
+                // leaves the queue empty and the loop awaits again.
+                if matches!(next.event, AgentEvent::Done { .. }) {
+                    // The run ended: flush what this last line produced, and the
+                    // next poll finds an empty queue and a closed tail.
+                    return queue.pop_front().map(|frame| (frame, (queue, rx, parent)));
+                }
+            }
+        },
+    )
+    .boxed()
+}
+
+/// `WatchSubagent`'s reply: a header that says whether this host can show the
+/// feed at all, then the journaled replay, then the live tail. The header is
+/// what makes the host-local journal honest — a device that never ran the chat
+/// answers `unavailable` instead of opening a transcript that reads as "the
+/// subagent said nothing".
+fn subagent_stream(
+    replay: Option<Vec<crate::sessions::JournaledEvent>>,
+    rx: tokio::sync::broadcast::Receiver<crate::sessions::JournaledEvent>,
+    parent: String,
+) -> BoxStream<'static, serde_json::Value> {
+    let Some(replay) = replay else {
+        return futures::stream::once(async {
+            serde_json::json!({
+                "status": "unavailable",
+                "reason": "no run journal for this chat on this device",
+            })
+        })
+        .boxed();
+    };
+    let replayed = replay.len();
+    let head = std::iter::once(serde_json::json!({ "status": "ok", "replayed": replayed }))
+        .chain(
+            replay
+                .iter()
+                .map(|frame| subagent_frame(frame.seq, "replay", &frame.event)),
+        )
+        .collect::<Vec<_>>();
+    futures::stream::iter(head)
+        .chain(live_subagent_frames(rx, parent))
+        .boxed()
+}
+
 /// `GetToolDetail` reply (issue #10): `ok` with rebuilt request/response,
 /// or explicit `unavailable` when the journal has nothing for the part —
 /// host offline, file absent/rotated, unknown id. Pure so the Unavailable
@@ -1316,6 +1518,20 @@ fn tool_detail_reply(events: &[AgentEvent]) -> serde_json::Value {
         "request": view.request,
         "response": view.response,
     })
+}
+
+/// `GetCompactionSummary` reply: the recap the host's journal kept, or an
+/// explicit `unavailable` with the reason. Never `ok` with an empty text — a
+/// blank recap would read as "the agent summarized nothing", a different claim
+/// from "this device has no journal to look in".
+fn compaction_summary_reply(summary: Option<String>) -> serde_json::Value {
+    match summary {
+        Some(text) => serde_json::json!({ "status": "ok", "text": text }),
+        None => serde_json::json!({
+            "status": "unavailable",
+            "reason": "no summary in this host's run journal",
+        }),
+    }
 }
 
 /// A watch receiver as a stream: current value first, then every change.
@@ -1706,6 +1922,19 @@ impl RpcService for EngineRpc {
                     .map_err(|e| RpcError::Failed(e.to_string()))?;
                 Ok(RpcReply::Stream(reasoning_stream(rx)))
             }
+            // Live activity: same hub, ephemeral frames only. The engine's
+            // in-memory subagent counters ride along so a viewer reads the
+            // host's numbers rather than measuring the wire.
+            methods::WATCH_ACTIVITY => {
+                let p: ChatParams = parse_params(params)?;
+                let from = self.sessions.latest_seq(&p.chat_id);
+                let (_replay, rx) = self
+                    .sessions
+                    .subscribe(&p.chat_id, from)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let feeds = self.sessions.subagent_feeds();
+                Ok(RpcReply::Stream(activity_stream(rx, feeds, p.chat_id)))
+            }
             // Per-tool request/response detail from the journal (issue #10,
             // complement of #31): explicit Unavailable when the journal has
             // nothing — host offline, file absent/rotated, unknown id. Never
@@ -1714,6 +1943,38 @@ impl RpcService for EngineRpc {
                 let p: ToolDetailParams = parse_params(params)?;
                 let events = self.sessions.tool_events(&p.chat_id, &p.part_id);
                 RpcReply::value(&tool_detail_reply(&events))
+            }
+            // A subagent's transcript, projected from the journal (Task 4):
+            // subscribe before the projection so the two halves of the view
+            // overlap on `seq` rather than leave a hole, and answer with an
+            // explicit header when this host has nothing to project.
+            methods::WATCH_SUBAGENT => {
+                let p: SubagentWatchParams = parse_params(params)?;
+                let (replay, rx) = self
+                    .sessions
+                    .subscribe_subagent(&p.chat_id, &p.parent_tool_use_id, p.after_seq)
+                    .map_err(|e| RpcError::Failed(e.to_string()))?;
+                let parent = p.parent_tool_use_id;
+                match replay {
+                    Some(replay) => Ok(RpcReply::Stream(subagent_stream(Some(replay), rx, parent))),
+                    // No journal here — unless a run is live on this host, in
+                    // which case the feed is starting and the next frame will
+                    // carry it.
+                    None if self.sessions.is_running(&p.chat_id) => Ok(RpcReply::Stream(
+                        subagent_stream(Some(Vec::new()), rx, parent),
+                    )),
+                    None => Ok(RpcReply::Stream(subagent_stream(None, rx, parent))),
+                }
+            }
+            // The recap a compaction line offers on demand. The journal is
+            // host-local, so this is answered by the device that ran the agent
+            // (hence `forwardable`); anywhere else it is an honest Unavailable.
+            methods::GET_COMPACTION_SUMMARY => {
+                let p: CompactionSummaryParams = parse_params(params)?;
+                let summary = self
+                    .sessions
+                    .compaction_summary(&p.chat_id, &p.compaction_id);
+                RpcReply::value(&compaction_summary_reply(summary))
             }
             methods::PROBE_SYNC => {
                 self.workspace.probe();
@@ -2608,6 +2869,9 @@ mod tests {
         assert!(forwardable(methods::GET_TOOL_DETAIL));
         assert!(is_stream_method(methods::WATCH_REASONING));
         assert!(!is_stream_method(methods::GET_TOOL_DETAIL));
+        // Live tool output rides the same hub as reasoning (ephemeral twin).
+        assert!(forwardable(methods::WATCH_ACTIVITY));
+        assert!(is_stream_method(methods::WATCH_ACTIVITY));
     }
 
     #[test]
@@ -2647,6 +2911,121 @@ mod tests {
         out
     }
 
+    /// One child frame as the hub carries it: wrapped in its DIRECT parent.
+    fn nested(parent: &str, text: &str) -> AgentEvent {
+        AgentEvent::Subagent {
+            parent_tool_use_id: parent.into(),
+            event: Box::new(AgentEvent::TextDelta { text: text.into() }),
+        }
+    }
+
+    /// One feed frame as `subscribe_subagent` hands it back: `project_feed`
+    /// already stripped the wrapper, so a replay frame is the child's own
+    /// payload, not the hub's `Subagent` envelope.
+    fn unwrapped(text: &str) -> AgentEvent {
+        AgentEvent::TextDelta { text: text.into() }
+    }
+
+    fn frame_text(frame: &serde_json::Value) -> Option<String> {
+        frame
+            .get("event")
+            .and_then(|event| event.get("text"))
+            .and_then(|text| text.as_str())
+            .map(str::to_owned)
+    }
+
+    #[tokio::test]
+    async fn subagent_stream_headers_the_feed_then_goes_live() {
+        let (tx, rx) = tokio::sync::broadcast::channel::<JournaledEvent>(16);
+        let mut stream = subagent_stream(
+            Some(vec![
+                JournaledEvent {
+                    seq: 2,
+                    event: unwrapped("past one"),
+                },
+                JournaledEvent {
+                    seq: 4,
+                    event: unwrapped("past two"),
+                },
+            ]),
+            rx,
+            "spawn-a".into(),
+        );
+
+        let head = stream.next().await.expect("header");
+        assert_eq!(head.get("status").and_then(|s| s.as_str()), Some("ok"));
+        assert_eq!(head.get("replayed").and_then(|r| r.as_u64()), Some(2));
+        let first = stream.next().await.expect("replay frame");
+        assert_eq!(first.get("phase").and_then(|p| p.as_str()), Some("replay"));
+        assert_eq!(first.get("seq").and_then(|s| s.as_u64()), Some(2));
+        assert_eq!(frame_text(&first).as_deref(), Some("past one"));
+        stream.next().await.expect("second replay frame");
+
+        // Live: the parent's own traffic and a sibling child's are not this
+        // feed; only A's frames arrive, unwrapped and with their journal seq.
+        tx.send(JournaledEvent {
+            seq: 7,
+            event: AgentEvent::TextDelta {
+                text: "the parent".into(),
+            },
+        })
+        .unwrap();
+        tx.send(JournaledEvent {
+            seq: 8,
+            event: nested("spawn-b", "a sibling"),
+        })
+        .unwrap();
+        tx.send(JournaledEvent {
+            seq: 9,
+            event: nested("spawn-a", "live one"),
+        })
+        .unwrap();
+        let live = stream.next().await.expect("live frame");
+        assert_eq!(live.get("phase").and_then(|p| p.as_str()), Some("live"));
+        assert_eq!(live.get("seq").and_then(|s| s.as_u64()), Some(9));
+        assert_eq!(frame_text(&live).as_deref(), Some("live one"));
+
+        // The run's terminal Done closes the stream (a CHILD's Done is a feed
+        // frame, not the end of the view).
+        tx.send(JournaledEvent {
+            seq: 10,
+            event: nested("spawn-a", "settled"),
+        })
+        .unwrap();
+        assert!(frame_text(&stream.next().await.expect("child settle")).is_some());
+        tx.send(JournaledEvent {
+            seq: 11,
+            event: done_event(),
+        })
+        .unwrap();
+        assert!(stream.next().await.is_none(), "the view ends with the run");
+    }
+
+    #[tokio::test]
+    async fn subagent_stream_without_a_journal_says_so() {
+        let (_tx, rx) = tokio::sync::broadcast::channel::<JournaledEvent>(1);
+        let mut stream = subagent_stream(None, rx, "spawn-a".into());
+        let head = stream.next().await.expect("header");
+        assert_eq!(
+            head.get("status").and_then(|s| s.as_str()),
+            Some("unavailable"),
+            "an absent host journal is a typed answer, not an empty transcript"
+        );
+        assert!(
+            head.get("reason").and_then(|r| r.as_str()).is_some(),
+            "and it says why: {head}"
+        );
+        assert!(stream.next().await.is_none(), "nothing follows the banner");
+    }
+
+    #[test]
+    fn watch_subagent_is_a_forwardable_stream() {
+        // The transcript lives on the host that ran the agent, so a viewer's
+        // own device must never answer it locally.
+        assert!(forwardable(methods::WATCH_SUBAGENT));
+        assert!(is_stream_method(methods::WATCH_SUBAGENT));
+    }
+
     #[tokio::test]
     async fn reasoning_stream_passes_deltas_and_goes_quiet_after_done() {
         let (tx, rx) = tokio::sync::broadcast::channel::<JournaledEvent>(16);
@@ -2678,6 +3057,177 @@ mod tests {
         assert_eq!(
             collect_texts(stream).await,
             vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn activity_stream_carries_tool_progress_and_closes_at_done() {
+        let (tx, rx) = tokio::sync::broadcast::channel::<JournaledEvent>(16);
+        let mut stream = activity_stream(rx, crate::sessions::SubagentFeeds::default(), "c".into());
+        tx.send(JournaledEvent {
+            // Ephemeral frames have no durable position.
+            seq: 0,
+            event: AgentEvent::ToolProgress {
+                id: "call-1".into(),
+                text: "compiling 42 files".into(),
+                append: false,
+            },
+        })
+        .unwrap();
+        tx.send(JournaledEvent {
+            seq: 1,
+            event: AgentEvent::TextDelta {
+                text: "ignored".into(),
+            },
+        })
+        .unwrap();
+        tx.send(JournaledEvent {
+            seq: 2,
+            event: done_event(),
+        })
+        .unwrap();
+        drop(tx);
+        let frame = stream.next().await.expect("progress frame");
+        assert_eq!(
+            frame.get("kind").and_then(|v| v.as_str()),
+            Some("toolProgress")
+        );
+        assert_eq!(frame.get("id").and_then(|v| v.as_str()), Some("call-1"));
+        assert_eq!(
+            frame.get("text").and_then(|v| v.as_str()),
+            Some("compiling 42 files")
+        );
+        assert!(stream.next().await.is_none(), "Done closes the stream");
+    }
+
+    /// The chip's live "3 tools · 12 s" preview: a frame per event that changed
+    /// a feed, carrying the HOST's counters — and nothing for a streamed delta,
+    /// which changes no count.
+    #[tokio::test]
+    async fn activity_stream_reports_live_subagent_counters() {
+        use crate::sessions::{FeedHit, SubagentFeeds};
+        let feeds = SubagentFeeds::default();
+        let started = crate::now_ms() - 12_000;
+        feeds.record(
+            "c",
+            &[
+                (
+                    "spawn-a".into(),
+                    FeedHit::Status(komet_doc::SubagentStatus::Running),
+                ),
+                ("spawn-a".into(), FeedHit::Tool("Read")),
+                ("spawn-a".into(), FeedHit::Tool("Read")),
+                ("spawn-a".into(), FeedHit::Tool("Search")),
+            ],
+            started,
+        );
+        let (tx, rx) = tokio::sync::broadcast::channel::<JournaledEvent>(16);
+        let mut stream = activity_stream(rx, feeds, "c".into());
+
+        // A delta is streamed, not counted: no frame.
+        tx.send(JournaledEvent {
+            seq: 1,
+            event: nested("spawn-a", "reading"),
+        })
+        .unwrap();
+        let tool = AgentEvent::Subagent {
+            parent_tool_use_id: "spawn-a".into(),
+            event: Box::new(AgentEvent::ToolCall {
+                id: "bash-4".into(),
+                call: komet_proto::ToolCall::Exec {
+                    command: "cargo test".into(),
+                },
+            }),
+        };
+        tx.send(JournaledEvent {
+            seq: 2,
+            event: tool,
+        })
+        .unwrap();
+        let frame = stream.next().await.expect("subagent frame");
+        assert_eq!(
+            frame.get("kind").and_then(|v| v.as_str()),
+            Some("subagentStatus")
+        );
+        assert_eq!(
+            frame.get("parentToolUseId").and_then(|v| v.as_str()),
+            Some("spawn-a")
+        );
+        assert_eq!(
+            frame.get("toolCount").and_then(|v| v.as_u64()),
+            Some(3),
+            "the stream reports the counters the run loop maintains — it counts nothing itself"
+        );
+        assert_eq!(
+            frame.get("status").and_then(|v| v.as_str()),
+            Some("running")
+        );
+        assert_eq!(
+            frame.get("lastTool").and_then(|v| v.as_str()),
+            Some("Search"),
+            "the preview is the last tool the feed started, by name"
+        );
+        assert!(
+            !frame.to_string().contains("cargo test"),
+            "a child's tool ARGUMENTS never ride this frame: {frame}"
+        );
+        assert!(
+            frame
+                .get("elapsedMs")
+                .and_then(|v| v.as_u64())
+                .is_some_and(|ms| ms >= 12_000),
+            "the elapsed clock is the host's, not the viewer's: {frame}"
+        );
+        tx.send(JournaledEvent {
+            seq: 3,
+            event: done_event(),
+        })
+        .unwrap();
+        assert!(stream.next().await.is_none(), "Done closes the stream");
+    }
+
+    /// A compaction's live progress is a size and a status, never its recap: the
+    /// summary is model prose about the whole conversation and reaches a viewer
+    /// through `GetCompactionSummary` on the host that chose to keep it.
+    #[tokio::test]
+    async fn activity_stream_reports_compaction_without_its_summary() {
+        let (tx, rx) = tokio::sync::broadcast::channel::<JournaledEvent>(16);
+        let mut stream = activity_stream(rx, crate::sessions::SubagentFeeds::default(), "c".into());
+        tx.send(JournaledEvent {
+            seq: 1,
+            event: AgentEvent::ContextCompaction {
+                id: "cmp-1".into(),
+                status: komet_proto::CompactionStatus::InProgress,
+                trigger: Some("auto".into()),
+                tokens_before: Some(165_000),
+                tokens_after: None,
+                summary: Some("the user asked about the private token".into()),
+                summary_delta: None,
+                error: None,
+            },
+        })
+        .unwrap();
+        let frame = stream.next().await.expect("compaction frame");
+        assert_eq!(
+            frame.get("kind").and_then(|v| v.as_str()),
+            Some("compaction")
+        );
+        assert_eq!(
+            frame.get("compactionId").and_then(|v| v.as_str()),
+            Some("cmp-1")
+        );
+        assert_eq!(
+            frame.get("status").and_then(|v| v.as_str()),
+            Some("inProgress")
+        );
+        assert_eq!(
+            frame.get("tokensAfter").and_then(|v| v.as_u64()),
+            None,
+            "an unknown post-compaction count stays unknown"
+        );
+        assert!(
+            !frame.to_string().contains("private token"),
+            "the recap never rides the activity stream: {frame}"
         );
     }
 
@@ -2736,6 +3286,31 @@ mod tests {
             Some("Run: ls")
         );
         assert_eq!(reply.get("response").and_then(|r| r.as_str()), Some("a\nb"));
+    }
+
+    #[test]
+    fn compaction_summary_reply_distinguishes_absent_from_empty() {
+        // The plan's rule: an unavailable journal is a TYPED answer, not the
+        // empty vec/string shape `GetToolDetail` settled for — an opening
+        // summary line must be able to say "available on the host" out loud.
+        let missing = compaction_summary_reply(None);
+        assert_eq!(
+            missing.get("status").and_then(|s| s.as_str()),
+            Some("unavailable")
+        );
+        assert!(
+            missing
+                .get("reason")
+                .and_then(|r| r.as_str())
+                .is_some_and(|r| !r.is_empty()),
+            "the caller has to be able to explain the gap: {missing}"
+        );
+        assert_eq!(
+            compaction_summary_reply(Some(String::new())).get("status"),
+            Some(&serde_json::json!("ok")),
+            "an empty text only ever comes from a real empty recap, never from a missing one"
+        );
+        assert!(forwardable(methods::GET_COMPACTION_SUMMARY));
     }
 
     #[test]

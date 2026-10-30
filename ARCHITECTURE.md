@@ -2,7 +2,7 @@
 
 > Fork of [zeronsh/comet](https://github.com/zeronsh/comet) — MIT, Copyright Wing. See `LICENSE` and `THIRD_PARTY_NOTICES.md`.
 
-A native controller for coding agents (Claude Code, Codex, Cursor, Grok, Hermes, OpenCode, Pi, Cline, Devin, GitHub Copilot, Muse Code) —
+A native controller for coding agents (Claude Code, Codex, Cursor, Grok, Hermes, OpenCode, Pi, Cline, Devin, GitHub Copilot, Muse Code, Qoder) —
 Rust engine + gpui UI, single binary. **100% local by default**: no account, no login
 screen, no network calls. Multi-device sync is built (Loro CRDT docs through the self-hosted
 `komet-sync` server) but **disabled by default** — see "Multi-device sync" in the README.
@@ -146,9 +146,10 @@ komet/
                                  # ephemeral presence, DocsStore (SQLite snapshots +
                                  # processed-command ledger)
     harness/      komet-harness  # Harness trait over the ACP protocol (claude/codex/cursor/
-                                 # grok/hermes/pi/opencode/cline via org-maintained
-                                 # adapters + managed npm install), mock; steering mailbox,
-                                 # requestInput, models/reasoning/options catalogs
+                                 # grok/hermes/pi/opencode/cline/qoder/devin/copilot via
+                                 # org-maintained adapters + managed npm install), mock;
+                                 # steering mailbox, requestInput, models/reasoning/
+                                 # options catalogs
     engine/       komet-engine   # sessions engine (pub/sub, run journal, recovery, stall
                                  # watchdog), doc host + command executor, repos/worktrees,
                                  # checkout-diff sync, terminals (portable-pty), uploads,
@@ -278,7 +279,7 @@ Live reference matrix (branch + mechanism):
 | Grok | 1 | native CLI flags `--sandbox` / `--permission-mode` / `--always-approve` (`grok_args_for_sandbox`) |
 | Antigravity | 1 | native CLI `--sandbox` + `--mode plan` (`crates/harness/src/antigravity/mod.rs`) |
 | Cline | 1 (partial) | native `auto_approve` boolean on Full access + native `provider` select injection; ReadOnly/WorkspaceWrite rely on branch 2 |
-| Devin / GitHub Copilot | 2 | native ACP permission requests mapped through the engine permission bridge |
+| Devin / GitHub Copilot / Qoder | 2 | native ACP permission requests mapped through the engine permission bridge |
 | Muse Code | 1 | native Muse Session Protocol permission requests and sandbox mode (`--disable-sandbox` only for Full access) |
 | Cursor | 1 | `sandbox` passed through the shim into SDK params (`crates/harness/src/cursor/mod.rs`) |
 | Hermes / Pi | 2 | documented "no CLI sandbox, so the ACP permission policy is their access control" (branch-2 fallback) |
@@ -287,6 +288,38 @@ Live reference matrix (branch + mechanism):
 A new harness must declare its branch explicitly (see the "sandbox surface"
 declaration test, pattern of `cline_descriptor_surface_matches_registry_expectations`
 in `crates/harness/tests/acp.rs`); a silent no-op must never ship unnoticed.
+
+### Interaction surface (same rule, transparency columns)
+
+The same "declare, don't paper over" rule applies to what Komet *shows* of a
+run. The single source of truth is `capabilities::interaction_surface(HarnessId)`
+in `crates/harness/src/capabilities.rs` (exhaustive `match`, no `_ =>` arm);
+`HarnessDescriptor.surface` and Settings → Agents project that table instead of
+declaring a second copy. `crates/harness/tests/surfaces.rs` fails when a
+harness has no golden row or declares an all-`None` surface (a disguised
+no-op).
+
+| Harness | Questions | Compaction | Subagents | Plans | Tool progress |
+| --- | --- | --- | --- | --- | --- |
+| Claude Code | `Native` (`AskUserQuestion`) | `LifecycleWithSummary` | `Tagged` | `ToolChip` (`TodoWrite`) | `None` (the CLI streams no partial tool stdout) |
+| Codex | `Native` (`item/tool/requestUserInput`) | `BoundaryOnly` | `Tagged` | `LivePanel` | `Streaming` (`outputDelta`) |
+| Cursor | `None` (`askQuestion` has no answer channel in the SDK) | `BoundaryOnly` | `Tagged` (`taskUpdate`) | `ToolChip` | `Final` (the shim maps no partial content) |
+| Grok / OpenCode | `PermissionShaped` | `None` (Gate B) | `NestedSession` | `ToolChip` | `Streaming` |
+| Devin / GitHub Copilot / Hermes / Pi / Cline / Qoder | `PermissionShaped` | `None` (Gate B) | `TaggedIfEmitted` | `ToolChip` | `Streaming` |
+| Antigravity | `None` (one-shot NDJSON run: no way to answer in-run) | `None` (no signal observed) | `None` | `ToolChip` | `Final` |
+| Muse Code | `Native` (`request_user_input`) | `Lifecycle` | `Tagged` (`subagent_spawn`) | `LivePanel` | `Streaming` |
+| Mock | `Native` | `LifecycleWithSummary` | `Tagged` (recursive) | `LivePanel` | `Streaming` |
+
+Each cell says what the **adapter maps**, never what a CLI is hoped to send: an
+ACP `Streaming` row means intermediate content is carried, not that a given
+agent was observed emitting it. The ACP draft capabilities (`elicitation.form`,
+`session.compaction`) stay behind the per-`HarnessId` allowlists
+`KOMET_ACP_ELICITATION` / `KOMET_ACP_COMPACTION` (comma-separated slugs, no
+global `on`), and **no agent is enrolled** until `docs/research/acp.md` records
+live evidence for it (Gate B). Until then every ACP agent keeps
+`PermissionShaped` questions and `None` compaction, and the UI shows no
+affordance it cannot honour — a harness that cannot answer a question renders
+the question as a visible notice, never a reply field that goes nowhere.
 
 ## 7. Parity exclusions & deliberate changes
 

@@ -19,11 +19,92 @@ use crate::{AuthState, Chat, ChatIndicator, Session, SessionStatus, Space, Works
 // ---------------------------------------------------------------------------
 
 /// Viewport ⇄ engine connection lifecycle.
+///
+/// `Reconnecting`/`Degraded` exist so a lost link is an *explained wait*, not a
+/// silent blank frame: the shell keeps the last transcript up and shows a
+/// discreet banner naming the attempt, the delay and the reason. The type is
+/// view-model only (never serialized), so its shape can evolve freely.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionStatus {
+    /// First boot / probe — the splash covers this.
     Connecting,
+    /// The link dropped after a working session and the bounded auto-retry
+    /// chain is running: `attempt` is the ordinal of the retry in flight
+    /// (1-based), `retry_in_ms` the delay that was waited before it.
+    Reconnecting {
+        attempt: u32,
+        retry_in_ms: u64,
+        reason: String,
+    },
+    /// The engine link is usable but the run it carries is degraded (e.g. the
+    /// harness never produced output) — say what, keep the shell.
+    Degraded {
+        reason: String,
+    },
     Ready,
-    Failed(String),
+    /// Engine unreachable or boot failed. `retryable: true` means the auto
+    /// backoff hit its ceiling and a manual Retry (which resets the counter)
+    /// can still bring the engine back.
+    Failed {
+        message: String,
+        retryable: bool,
+    },
+}
+
+/// Auto-reconnect schedule, in order; attempts past the table saturate at the
+/// last entry (10 s). 500 ms → 1 s → 2 s → 5 s → 10 s.
+pub const RECONNECT_SCHEDULE_MS: [u64; 5] = [500, 1_000, 2_000, 5_000, 10_000];
+
+/// Ceiling on automatic retries. Past it the state is
+/// `Failed { retryable: true }` and the next attempt is the user's.
+pub const RECONNECT_MAX_ATTEMPTS: u32 = 6;
+
+/// Pre-jitter delay for retry `attempt` (1-based): the schedule saturates at
+/// its last entry so the chain never grows past 10 s. Pure.
+pub fn reconnect_base_delay_ms(attempt: u32) -> u64 {
+    let idx = (attempt.saturating_sub(1) as usize).min(RECONNECT_SCHEDULE_MS.len() - 1);
+    RECONNECT_SCHEDULE_MS[idx]
+}
+
+/// Apply ±20 % jitter to a base delay. `unit` ∈ [0, 1]: 0 → −20 %, 0.5 → no
+/// change, 1 → +20 %; clamped, so a bad source can never leave the band. Pure.
+pub fn reconnect_jittered_delay_ms(base: u64, unit: f64) -> u64 {
+    let factor = 0.8 + 0.4 * unit.clamp(0.0, 1.0);
+    (base as f64 * factor).round() as u64
+}
+
+/// Whether retry `attempt` (1-based) may still run automatically, or the chain
+/// is exhausted and the UI hands the Retry button to the user. Pure.
+pub fn reconnect_should_retry(attempt: u32) -> bool {
+    attempt <= RECONNECT_MAX_ATTEMPTS
+}
+
+/// The next link of the auto-retry chain after the attempt `failed_attempt`
+/// (0 for the live connection that just dropped) gave out: `Some((attempt,
+/// wait_ms))` to schedule, `None` once the ceiling is reached and the Retry
+/// button belongs to the user. `jitter_unit` ∈ [0,1] keeps it pure — the caller
+/// draws it from the clock. Pure.
+pub fn next_reconnect_step(failed_attempt: u32, jitter_unit: f64) -> Option<(u32, u64)> {
+    let next = failed_attempt + 1;
+    if !reconnect_should_retry(next) {
+        return None;
+    }
+    Some((
+        next,
+        reconnect_jittered_delay_ms(reconnect_base_delay_ms(next), jitter_unit),
+    ))
+}
+
+/// A duration short enough to read in a status label: "480 ms" under a second,
+/// "2.5s" below ten, "12s" past that. Pure.
+pub fn format_ms(ms: u64) -> String {
+    if ms < 1_000 {
+        format!("{ms} ms")
+    } else if ms < 10_000 {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    } else {
+        format!("{}s", ms / 1_000)
+    }
 }
 
 /// What a chat's status dot / working indicator should show right now.
@@ -178,8 +259,15 @@ pub fn gate_phase(
 ) -> GatePhase {
     match connection {
         ConnectionStatus::Connecting => GatePhase::Loading,
-        ConnectionStatus::Failed(err) => GatePhase::Failed(err.clone()),
+        // A bounded auto-retry or a degraded-but-attached engine keeps the
+        // shell up: the gate card is for a dead engine, not a slow one. The
+        // discreet banner (shell.rs) narrates these two without emptying the
+        // frame.
+        ConnectionStatus::Reconnecting { .. } | ConnectionStatus::Degraded { .. } => {
+            GatePhase::Ready
+        }
         ConnectionStatus::Ready => GatePhase::Ready,
+        ConnectionStatus::Failed { message, .. } => GatePhase::Failed(message.clone()),
     }
 }
 

@@ -22,7 +22,7 @@ use gpui::{
 
 use komet_engine::harness_cli::HarnessCliStatus;
 use komet_engine::registry::{HarnessDescriptor, descriptor_enabled};
-use komet_proto::{AgentAccountsSnapshot, HarnessId};
+use komet_proto::{AgentAccountsSnapshot, HarnessId, HarnessInteractionSurface};
 use komet_rpc::methods;
 
 use crate::pickers::visible_harnesses;
@@ -52,6 +52,7 @@ pub fn blurb(harness: HarnessId) -> &'static str {
         HarnessId::Muse => "Muse's session-based agent, driven through the MSP flow.",
         HarnessId::Copilot => "GitHub Copilot, driven through the official Copilot CLI.",
         HarnessId::Cline => "Cline's autonomous coding agent, driven through the cline CLI (ACP).",
+        HarnessId::Qoder => "Alibaba's Qoder CLI, driven over its native ACP server.",
         HarnessId::Mock => "Scripted test harness.",
     }
 }
@@ -71,8 +72,56 @@ pub fn cli_name(harness: HarnessId) -> &'static str {
         HarnessId::Muse => "muse",
         HarnessId::Copilot => "copilot",
         HarnessId::Cline => "cline",
+        HarnessId::Qoder => "qoder",
         HarnessId::Mock => "mock",
     }
+}
+
+/// The declared interaction surface, phrased for the settings row — what the
+/// adapters carry, never what an agent might gain later. An absent signal is
+/// said out loud ("not visible"), because silence on a capability the user is
+/// deciding about reads as approval.
+///
+/// `None` (empty) is the unknown case: a catalog from an engine predating the
+/// surface field, which must not be presented as "unsupported".
+pub fn surface_phrases(surface: &HarnessInteractionSurface) -> Vec<&'static str> {
+    use komet_proto::{
+        CompactionSurface as C, PlanSurface as P, ProgressSurface as T, QuestionSurface as Q,
+        SubagentSurface as S,
+    };
+    if *surface == HarnessInteractionSurface::default() {
+        return Vec::new();
+    }
+    vec![
+        match surface.questions {
+            Q::None => "Questions: not supported",
+            Q::PermissionShaped => "Questions: as permission requests",
+            Q::Elicitation => "Questions: agent prompts back",
+            Q::Native => "Questions: the agent's own tool",
+        },
+        match surface.compaction {
+            C::None => "Compaction: not visible",
+            C::BoundaryOnly => "Compaction: boundary only",
+            C::Lifecycle => "Compaction: live status",
+            C::LifecycleWithSummary => "Compaction: status + summary",
+        },
+        match surface.subagents {
+            S::None => "Subagents: not visible",
+            S::Tagged => "Subagents: shown inline",
+            S::TaggedIfEmitted => "Subagents: shown when emitted",
+            S::NestedSession => "Subagents: separate session",
+        },
+        match surface.plans {
+            P::None => "Plan: not visible",
+            P::ToolChip => "Plan: in the transcript",
+            P::LivePanel => "Plan: card above the composer",
+        },
+        match surface.tool_progress {
+            T::None => "Tool output: not streamed",
+            T::Final => "Tool output: result only",
+            T::Streaming => "Tool output: live while running",
+        },
+    ]
 }
 
 #[derive(Default)]
@@ -138,6 +187,7 @@ fn harness_display_name(harness: HarnessId) -> &'static str {
         HarnessId::Muse => "Muse",
         HarnessId::Copilot => "Copilot",
         HarnessId::Cline => "Cline",
+        HarnessId::Qoder => "Qoder",
         HarnessId::Mock => "Mock",
     }
 }
@@ -698,6 +748,17 @@ impl HarnessesPage {
                         .child(SharedString::from(blurb(harness)))
                         .into_any_element(),
                 ];
+                // One compact capability line, not five: the row stays scannable
+                // while every declared absence is still spelled out.
+                let phrases = surface_phrases(&descriptor.surface);
+                if !phrases.is_empty() {
+                    meta.push(
+                        div()
+                            .text_color(theme.text_muted.opacity(0.75))
+                            .child(SharedString::from(phrases.join("  ·  ")))
+                            .into_any_element(),
+                    );
+                }
                 if !installed {
                     meta.push(
                         div()
@@ -980,6 +1041,53 @@ impl Render for HarnessesPage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_declared_capability_is_spoken_including_the_absences() {
+        for harness in [
+            HarnessId::ClaudeCode,
+            HarnessId::Codex,
+            HarnessId::Cursor,
+            HarnessId::Devin,
+            HarnessId::Grok,
+            HarnessId::Hermes,
+            HarnessId::Pi,
+            HarnessId::Opencode,
+            HarnessId::Cline,
+            HarnessId::Qoder,
+            HarnessId::Antigravity,
+            HarnessId::Muse,
+            HarnessId::Copilot,
+            HarnessId::Mock,
+        ] {
+            let phrases =
+                surface_phrases(&komet_harness::capabilities::interaction_surface(harness));
+            assert_eq!(
+                phrases.len(),
+                5,
+                "{}'s row must answer all five capability questions",
+                harness.as_str()
+            );
+            assert!(
+                phrases.iter().all(|p| !p.is_empty()),
+                "{}'s row has an empty capability phrase",
+                harness.as_str()
+            );
+        }
+        // An absent signal is said as an absence, never left implicit.
+        let cursor = surface_phrases(&komet_harness::capabilities::interaction_surface(
+            HarnessId::Cursor,
+        ));
+        assert_eq!(cursor[0], "Questions: not supported");
+        assert_eq!(cursor[4], "Tool output: result only");
+    }
+
+    #[test]
+    fn an_unknown_surface_prints_no_capability_claim() {
+        // A catalog from an engine predating the field decodes to all-absent,
+        // which is not the same statement as "this agent supports nothing".
+        assert!(surface_phrases(&HarnessInteractionSurface::default()).is_empty());
+    }
 
     #[test]
     fn connect_is_only_offered_for_unconnected_app_managed_accounts() {

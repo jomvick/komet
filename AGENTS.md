@@ -47,9 +47,11 @@ the crate table in `ARCHITECTURE.md` §3 is authoritative.
   `komet`, `komet-sync-server` and the `komet-rpc` `e2e_driver` example, so expect a warm target;
   prebuilt binaries can be supplied with `KOMET_E2E_KOMET_BIN` / `KOMET_E2E_DRIVER_BIN` /
   `KOMET_E2E_SYNC_BIN`. For an offline UI demo without sync, use `scripts/dev-demo.sh`.
-- A new agent harness must declare its sandbox branch in the `ARCHITECTURE.md` §6 matrix and add a
-  surface-declaration test (pattern: `cline_descriptor_surface_matches_registry_expectations` in
-  `crates/harness/tests/acp.rs`); a silent no-op must not ship.
+- A new agent harness must declare its sandbox branch in the `ARCHITECTURE.md` §6 matrix **and** its
+  interaction-surface row in `crates/harness/src/capabilities.rs` (golden-tested by
+  `crates/harness/tests/surfaces.rs`; sandbox test pattern:
+  `cline_descriptor_surface_matches_registry_expectations` in `crates/harness/tests/acp.rs`), plus a
+  fixture per signal family it claims. A silent no-op must not ship.
 - komet sandbox settings constrain the *agent CLI's* own permissions, not an OS boundary — see
   `docs/security.md` before touching sandbox/permission code.
 - Do not run the release packaging scripts for verification; CI (`.github/workflows/release.yml`)

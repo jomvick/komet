@@ -39,6 +39,7 @@ pub mod settings;
 pub mod shell;
 pub mod sound;
 pub mod state;
+pub mod subagent;
 pub mod syntax_cache;
 pub mod terminal;
 pub mod theme;

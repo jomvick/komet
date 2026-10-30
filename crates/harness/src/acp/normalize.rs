@@ -2,14 +2,16 @@
 //! claude/codex adapters and Grok Build speak today).
 //!
 //! Tolerant by construction, like the codex normalizer: decoded from raw
-//! [`Value`]s, unknown `sessionUpdate` kinds and content types map to nothing,
-//! and missing fields degrade to empty strings rather than errors. Wire shapes
+//! [`Value`]s, unknown `sessionUpdate` kinds and content types map to nothing
+//! (traced at debug, never silently), and missing fields degrade to empty
+//! strings rather than errors. Wire shapes
 //! verified against `agent-client-protocol-schema` 1.3.0 (`SessionUpdate` is
 //! tagged `sessionUpdate`/snake_case; structs are camelCase; tool kinds and
 //! statuses are snake_case).
 
 use komet_proto::{
     AgentEvent, ContextUsageSource, ContextUsageStats, SlashCommand, TodoItem, ToolCall, ToolDiff,
+    UserInputAnswer, UserInputQuestion,
 };
 use serde_json::Value;
 
@@ -482,8 +484,17 @@ pub(crate) fn map_update(update: &Value) -> Vec<AgentEvent> {
                     call: typed_call(update),
                 });
             }
-            if let Some(resolved) = resolved_result(update, id) {
+            if let Some(resolved) = resolved_result(update, id.clone()) {
                 events.push(resolved);
+            } else if let Some(text) = tool_output(update) {
+                // Intermediate content: what the tool has printed so far.
+                // ACP replaces a tool call's content array on every update,
+                // so this is a snapshot, not a delta (append=false).
+                events.push(AgentEvent::ToolProgress {
+                    id,
+                    text,
+                    append: false,
+                });
             }
             events
         }
@@ -531,8 +542,84 @@ pub(crate) fn map_update(update: &Value) -> Vec<AgentEvent> {
         }
         // Mode/config updates carry nothing we render.
         "current_mode_update" | "config_option_update" => Vec::new(),
-        _ => Vec::new(),
+        // Draft ACP Session Compaction RFD — optional signals, and this client
+        // only announces them to an agent validated in Gate B. Field spellings
+        // are not settled, so every name below is read where it appears.
+        "compaction_update" => {
+            let id = str_field(update, "compactionId");
+            if id.is_empty() {
+                // Without an id there is no cycle to refine: the row would be
+                // an orphan that nothing can ever settle.
+                tracing::debug!("dropping an ACP compaction_update without a compactionId");
+                return Vec::new();
+            }
+            vec![AgentEvent::ContextCompaction {
+                id,
+                // Absent or unknown status stays `inProgress`: the adapter does
+                // not infer a lifecycle it was not told.
+                status: draft_compaction_status(update.get("status")),
+                trigger: opt_str(update, &["trigger", "reason"]),
+                tokens_before: u64_keys(update, &["tokensBefore", "preTokens"]),
+                tokens_after: u64_keys(update, &["tokensAfter", "postTokens"]),
+                summary: opt_str(update, &["summary"]),
+                summary_delta: None,
+                error: opt_str(update, &["error", "message"]),
+            }]
+        }
+        "compaction_summary_chunk" => {
+            let id = str_field(update, "compactionId");
+            if id.is_empty() {
+                tracing::debug!("dropping an ACP compaction_summary_chunk without a compactionId");
+                return Vec::new();
+            }
+            let Some(text) = opt_str(update, &["summaryDelta", "delta", "text"]) else {
+                return Vec::new();
+            };
+            vec![AgentEvent::ContextCompaction {
+                id,
+                // A chunk says nothing about the cycle's state; `inProgress` is
+                // the field's default, not a claim — and the engine never
+                // reopens a settled cycle on it.
+                status: komet_proto::CompactionStatus::default(),
+                trigger: None,
+                tokens_before: None,
+                tokens_after: None,
+                summary: None,
+                summary_delta: Some(text),
+                error: None,
+            }]
+        }
+        _ => {
+            // Unknown kinds still degrade to nothing, but not silently: a draft
+            // signal this build does not map must show up in the log, or an
+            // agent that started sending one reads as an agent that sends none.
+            if !kind.is_empty() {
+                tracing::debug!(update_kind = kind, "unmapped ACP sessionUpdate dropped");
+            }
+            Vec::new()
+        }
     }
+}
+
+/// Status of a draft compaction signal. Snake and camel spellings both appear
+/// in the RFD discussion; anything unrecognized (including absent) is
+/// `inProgress`.
+fn draft_compaction_status(value: Option<&Value>) -> komet_proto::CompactionStatus {
+    use komet_proto::CompactionStatus;
+    match value.and_then(Value::as_str).unwrap_or("") {
+        "completed" | "complete" | "done" | "success" => CompactionStatus::Completed,
+        "failed" | "error" | "errored" => CompactionStatus::Failed,
+        "cancelled" | "canceled" => CompactionStatus::Cancelled,
+        _ => CompactionStatus::InProgress,
+    }
+}
+
+/// First non-blank string under any of `keys`.
+fn opt_str(v: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| v.get(*key).and_then(Value::as_str))
+        .map(str::to_owned)
+        .filter(|text| !text.trim().is_empty())
 }
 
 /// A terminal `status` on a tool_call/tool_call_update resolves the call:
@@ -590,10 +677,452 @@ pub(crate) fn preferred_allow_option(options: &[Value]) -> Option<String> {
         .filter(|id| !id.is_empty())
 }
 
+/// Byte cap for one free-text elicitation answer, before it reaches the agent
+/// and the doc (the same 4 KiB bound as tool output).
+pub(crate) const ELICITATION_TEXT_CAP: usize = 4096;
+
+/// What a mapped elicitation field expects back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ElicitationKind {
+    /// `string` — free text, constraints in the question.
+    Text,
+    /// `number` — free text answered back as a JSON number.
+    Number,
+    /// `integer` — free text answered back as a JSON integer.
+    Integer,
+    /// `boolean` — rendered Yes/No, answered as a bool.
+    Boolean,
+    /// `enum`/`oneOf`/`anyOf` — exactly one label.
+    Single,
+    /// `array` of an enum — several labels.
+    Multi,
+}
+
+/// One property of an elicitation form, mapped to one question.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ElicitationField {
+    /// Schema property name; doubles as the question id so the answer maps
+    /// back without a side table.
+    pub(crate) name: String,
+    pub(crate) required: bool,
+    pub(crate) kind: ElicitationKind,
+    /// Option label → the value the agent receives. Empty for Text/Boolean.
+    pub(crate) choices: Vec<(String, Value)>,
+    pub(crate) question: UserInputQuestion,
+}
+
+/// A mapped `elicitation/create` form, or why it cannot be rendered.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ElicitationForm {
+    Ask {
+        fields: Vec<ElicitationField>,
+    },
+    /// Never approximated into a form: the caller refuses explicitly.
+    Unsupported(String),
+}
+
+/// Map an ACP draft `elicitation/create` request (`mode: "form"`) to
+/// questions. Draft RFD, no agent verified emitting it (Gate B) — the schema
+/// subset follows the RFD: an object of scalar/enum properties, `required[]
+/// naming required ones, optional `mode` (absent = form).
+///
+/// Anything outside that subset (url mode, nested objects, arrays of
+/// non-enums, empty or typeless properties) is [`ElicitationForm::Unsupported`]
+/// with a human reason — a guessed form would ask the user something the agent
+/// never asked. Properties come in key order (serde_json's map is sorted), so
+/// the wizard's pagination is deterministic but not necessarily the agent's
+/// declaration order.
+pub(crate) fn elicitation_form(params: &Value) -> ElicitationForm {
+    let mode = params.get("mode").and_then(Value::as_str).unwrap_or("form");
+    if mode != "form" {
+        return ElicitationForm::Unsupported(format!(
+            "elicitation mode `{mode}` is not supported (form only)"
+        ));
+    }
+    let Some(schema) = params.get("requestedSchema").and_then(Value::as_object) else {
+        return ElicitationForm::Unsupported("the request carries no requestedSchema".into());
+    };
+    if schema.get("type").and_then(Value::as_str) != Some("object") {
+        return ElicitationForm::Unsupported("the requestedSchema is not an object".into());
+    }
+    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+        return ElicitationForm::Unsupported("the requestedSchema has no properties".into());
+    };
+    if properties.is_empty() {
+        return ElicitationForm::Unsupported("the requestedSchema asks nothing".into());
+    }
+    let required: Vec<&str> = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let message = params
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let mut fields = Vec::with_capacity(properties.len());
+    for (name, prop) in properties {
+        match elicitation_field(name, prop, required.contains(&name.as_str()), message) {
+            Ok(field) => fields.push(field),
+            Err(reason) => {
+                return ElicitationForm::Unsupported(format!("property `{name}`: {reason}"));
+            }
+        }
+    }
+    ElicitationForm::Ask { fields }
+}
+
+fn elicitation_field(
+    name: &str,
+    prop: &Value,
+    required: bool,
+    message: &str,
+) -> Result<ElicitationField, String> {
+    let title = prop
+        .get("title")
+        .and_then(Value::as_str)
+        .filter(|t| !t.is_empty())
+        .unwrap_or(name);
+    let description = prop
+        .get("description")
+        .and_then(Value::as_str)
+        .filter(|t| !t.is_empty());
+    let mut question = description
+        .or((!message.is_empty()).then_some(message))
+        .unwrap_or(title)
+        .to_owned();
+
+    let (kind, choices, descriptions) = if prop.get("type").and_then(Value::as_str) == Some("array")
+    {
+        let items = prop.get("items").unwrap_or(&Value::Null);
+        let values = items.get("enum").and_then(Value::as_array);
+        let variants = items
+            .get("oneOf")
+            .or_else(|| items.get("anyOf"))
+            .and_then(Value::as_array);
+        if let Some(values) = values.filter(|v| !v.is_empty()) {
+            (
+                ElicitationKind::Multi,
+                enum_choices(values, items.get("enumNames")),
+                Vec::new(),
+            )
+        } else if let Some(variants) = variants.filter(|v| !v.is_empty()) {
+            let (choices, descriptions) = variant_choices(variants)?;
+            (ElicitationKind::Multi, choices, descriptions)
+        } else {
+            return Err("array without an enum of items".into());
+        }
+    } else if let Some(values) = prop.get("enum").and_then(Value::as_array) {
+        if values.is_empty() {
+            return Err("empty enum".into());
+        }
+        (
+            ElicitationKind::Single,
+            enum_choices(values, prop.get("enumNames")),
+            Vec::new(),
+        )
+    } else if let Some(variants) = prop
+        .get("oneOf")
+        .or_else(|| prop.get("anyOf"))
+        .and_then(Value::as_array)
+        .filter(|v| !v.is_empty())
+    {
+        let (choices, descriptions) = variant_choices(variants)?;
+        (ElicitationKind::Single, choices, descriptions)
+    } else {
+        match prop.get("type").and_then(Value::as_str) {
+            Some("string" | "integer" | "number") => {
+                if let Some(hint) = constraint_hint(prop) {
+                    question = format!("{question}\n({hint})");
+                }
+                let kind = match prop.get("type").and_then(Value::as_str) {
+                    Some("number") => ElicitationKind::Number,
+                    Some("integer") => ElicitationKind::Integer,
+                    _ => ElicitationKind::Text,
+                };
+                (kind, Vec::new(), Vec::new())
+            }
+            Some("boolean") => (
+                ElicitationKind::Boolean,
+                vec![
+                    ("Yes".to_owned(), Value::Bool(true)),
+                    ("No".to_owned(), Value::Bool(false)),
+                ],
+                Vec::new(),
+            ),
+            Some(other) => return Err(format!("unsupported property type `{other}`")),
+            None => return Err("property without a type".into()),
+        }
+    };
+
+    let default = match kind {
+        ElicitationKind::Single => prop.get("default").and_then(|default| {
+            choices
+                .iter()
+                .find(|(_, value)| value == default)
+                .map(|(label, _)| label.clone())
+        }),
+        ElicitationKind::Boolean => prop
+            .get("default")
+            .and_then(Value::as_bool)
+            .map(|b| if b { "Yes" } else { "No" }.to_owned()),
+        // A multi-select default is an array; `default` carries one label.
+        ElicitationKind::Multi => None,
+        ElicitationKind::Text | ElicitationKind::Number | ElicitationKind::Integer => {
+            prop.get("default").map(|default| match default {
+                Value::String(text) => text.clone(),
+                other => other.to_string(),
+            })
+        }
+    };
+    let options: Vec<String> = choices.iter().map(|(label, _)| label.clone()).collect();
+    Ok(ElicitationField {
+        name: name.to_owned(),
+        required,
+        kind,
+        choices,
+        question: UserInputQuestion {
+            id: name.to_owned(),
+            header: title.to_owned(),
+            question,
+            options,
+            multi_select: kind == ElicitationKind::Multi,
+            option_descriptions: descriptions,
+            // Free text only where the schema actually allows any value.
+            allow_free_text: matches!(
+                kind,
+                ElicitationKind::Text | ElicitationKind::Number | ElicitationKind::Integer
+            ),
+            secret: prop.get("format").and_then(Value::as_str) == Some("password"),
+            default,
+        },
+    })
+}
+
+/// `enum` + optional `enumNames` (aligned labels) → label/value pairs.
+fn enum_choices(values: &[Value], names: Option<&Value>) -> Vec<(String, Value)> {
+    let names: Vec<&str> = names
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    values
+        .iter()
+        .enumerate()
+        .map(|(ix, value)| {
+            let label = match value {
+                Value::String(text) => text.clone(),
+                other => other.to_string(),
+            };
+            let label = names
+                .get(ix)
+                .filter(|name| !name.is_empty())
+                .map(|name| (*name).to_owned())
+                .unwrap_or(label);
+            (label, value.clone())
+        })
+        .collect()
+}
+
+/// `oneOf`/`anyOf` `{const, title, description}` variants → label/value pairs
+/// plus descriptions aligned with them (empty only when all are empty).
+fn variant_choices(variants: &[Value]) -> Result<(Vec<(String, Value)>, Vec<String>), String> {
+    let mut choices = Vec::with_capacity(variants.len());
+    let mut descriptions = Vec::with_capacity(variants.len());
+    for variant in variants {
+        let Some(value) = variant.get("const").cloned() else {
+            return Err("oneOf/anyOf entry without const".into());
+        };
+        let label = variant
+            .get("title")
+            .and_then(Value::as_str)
+            .filter(|t| !t.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| match &value {
+                Value::String(text) => text.clone(),
+                other => other.to_string(),
+            });
+        descriptions.push(
+            variant
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+        );
+        choices.push((label, value));
+    }
+    if descriptions.iter().all(String::is_empty) {
+        descriptions.clear();
+    }
+    Ok((choices, descriptions))
+}
+
+/// A one-line hint for a text field's constraints, so the user sees the rule
+/// rather than discovering it in the agent's rejection.
+fn constraint_hint(prop: &Value) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(pattern) = prop.get("pattern").and_then(Value::as_str) {
+        parts.push(format!("must match `{pattern}`"));
+    }
+    if let Some(min) = prop.get("minLength").or_else(|| prop.get("minimum")) {
+        parts.push(format!("min {min}"));
+    }
+    if let Some(max) = prop.get("maxLength").or_else(|| prop.get("maximum")) {
+        parts.push(format!("max {max}"));
+    }
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
+/// Build the `elicitation/create` response from the user's answers.
+///
+/// The three outcomes are distinct: no answers at all is `cancel` (the user
+/// dismissed the form), a missing required field is `decline`, and only a form
+/// with values is `accept`. There is no path to `accept` with invented content
+/// — a dropped resolver reads as `cancel`, never as consent.
+pub(crate) fn elicitation_response(form: &ElicitationForm, answers: &[UserInputAnswer]) -> Value {
+    let fields = match form {
+        ElicitationForm::Ask { fields } => fields,
+        ElicitationForm::Unsupported(_) => return serde_json::json!({ "action": "decline" }),
+    };
+    if answers.is_empty() {
+        return serde_json::json!({ "action": "cancel" });
+    }
+    let mut content = serde_json::Map::new();
+    for field in fields {
+        let answer = answers.iter().find(|a| a.question_id == field.name);
+        match field_value(field, answer) {
+            Some((name, value)) => {
+                content.insert(name, value);
+            }
+            None if field.required => return serde_json::json!({ "action": "decline" }),
+            None => {}
+        }
+    }
+    if content.is_empty() {
+        return serde_json::json!({ "action": "decline" });
+    }
+    serde_json::json!({ "action": "accept", "content": Value::Object(content) })
+}
+
+fn field_value(
+    field: &ElicitationField,
+    answer: Option<&UserInputAnswer>,
+) -> Option<(String, Value)> {
+    let answer = answer?;
+    let typed = answer
+        .free_text
+        .as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty());
+    let label = || typed.or_else(|| answer.labels.first().map(String::as_str));
+    let value = match field.kind {
+        ElicitationKind::Text => {
+            let text = label()?;
+            Value::String(cap_text(text, ELICITATION_TEXT_CAP))
+        }
+        ElicitationKind::Number => {
+            let text = label()?;
+            let number = text
+                .parse::<i64>()
+                .map(serde_json::Number::from)
+                .ok()
+                .or_else(|| {
+                    text.parse::<f64>()
+                        .ok()
+                        .and_then(serde_json::Number::from_f64)
+                })?;
+            Value::Number(number)
+        }
+        ElicitationKind::Integer => {
+            let text = label()?;
+            Value::Number(text.parse::<i64>().ok()?.into())
+        }
+        ElicitationKind::Boolean => {
+            let text = label()?;
+            if text.eq_ignore_ascii_case("yes") || text.eq_ignore_ascii_case("true") {
+                Value::Bool(true)
+            } else if text.eq_ignore_ascii_case("no") || text.eq_ignore_ascii_case("false") {
+                Value::Bool(false)
+            } else {
+                return None;
+            }
+        }
+        ElicitationKind::Single => {
+            let text = label()?;
+            field
+                .choices
+                .iter()
+                .find(|(choice, _)| choice == text)
+                .map(|(_, value)| value.clone())?
+        }
+        ElicitationKind::Multi => {
+            let picked: Vec<Value> = match typed {
+                // Free text on a closed list only matches an exact label.
+                Some(text) => field
+                    .choices
+                    .iter()
+                    .filter(|(choice, _)| choice == text)
+                    .map(|(_, value)| value.clone())
+                    .collect(),
+                None => field
+                    .choices
+                    .iter()
+                    .filter(|(choice, _)| answer.labels.iter().any(|label| label == choice))
+                    .map(|(_, value)| value.clone())
+                    .collect(),
+            };
+            if picked.is_empty() {
+                return None;
+            }
+            Value::Array(picked)
+        }
+    };
+    Some((field.name.clone(), value))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn acp_intermediate_tool_content_emits_progress() {
+        // Non-terminal content is a SNAPSHOT (ACP replaces the content array),
+        // so it maps to ToolProgress with append=false, not to a ToolResult.
+        let events = map_update(&json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "c1",
+            "status": "in_progress",
+            "content": [
+                {"type": "content", "content": {"type": "text", "text": "compiling…"}}
+            ]
+        }));
+        assert_eq!(
+            events,
+            vec![AgentEvent::ToolProgress {
+                id: "c1".into(),
+                text: "compiling…".into(),
+                append: false,
+            }]
+        );
+        // A terminal update still resolves as a result — never progress.
+        let done = map_update(&json!({
+            "sessionUpdate": "tool_call_update",
+            "toolCallId": "c1",
+            "status": "completed",
+            "content": [
+                {"type": "content", "content": {"type": "text", "text": "ok"}}
+            ]
+        }));
+        assert!(
+            done.iter()
+                .all(|e| !matches!(e, AgentEvent::ToolProgress { .. })),
+            "{done:?}"
+        );
+        assert!(matches!(
+            done.last(),
+            Some(AgentEvent::ToolResult { output: Some(o), .. }) if o == "ok"
+        ));
+    }
 
     #[test]
     fn opencode_todo_tracker_maps_to_todo_chip() {
@@ -860,6 +1389,159 @@ mod tests {
             other => panic!("expected ContextWindow, got {other:?}"),
         }
         assert!(map_update(&json!({"sessionUpdate": "current_mode_update"})).is_empty());
+    }
+
+    /// The draft Session Compaction RFD as one cycle: an opening notice, chunks
+    /// that only add recap text, and a terminal status. The normalizer maps each
+    /// frame as it arrives — accumulating the chunks is the doc fold's job, not
+    /// the adapter's.
+    #[test]
+    fn acp_compaction_update_maps_lifecycle_and_chunks() {
+        let opened = map_update(&json!({
+            "sessionUpdate": "compaction_update",
+            "compactionId": "cmp-7",
+            "status": "in_progress",
+        }));
+        assert!(
+            matches!(
+                &opened[..],
+                [AgentEvent::ContextCompaction {
+                    id,
+                    status: komet_proto::CompactionStatus::InProgress,
+                    summary: None,
+                    ..
+                }] if id == "cmp-7"
+            ),
+            "{opened:?}"
+        );
+
+        let deltas: Vec<_> = ["First part. ", "second part."]
+            .iter()
+            .flat_map(|text| {
+                map_update(&json!({
+                    "sessionUpdate": "compaction_summary_chunk",
+                    "compactionId": "cmp-7",
+                    "summaryDelta": text,
+                }))
+            })
+            .collect();
+        assert_eq!(deltas.len(), 2);
+        for (event, text) in deltas.iter().zip(["First part. ", "second part."]) {
+            assert!(
+                matches!(
+                    event,
+                    AgentEvent::ContextCompaction {
+                        id,
+                        summary_delta: Some(delta),
+                        summary: None,
+                        ..
+                    } if id == "cmp-7" && delta == text
+                ),
+                "{event:?}"
+            );
+        }
+
+        let closed = map_update(&json!({
+            "sessionUpdate": "compaction_update",
+            "compactionId": "cmp-7",
+            "status": "completed",
+            "trigger": "auto",
+            "tokensBefore": 165_000,
+            "summary": "the whole recap",
+        }));
+        assert!(
+            matches!(
+                &closed[..],
+                [AgentEvent::ContextCompaction {
+                    id,
+                    status: komet_proto::CompactionStatus::Completed,
+                    trigger: Some(trigger),
+                    tokens_before: Some(165_000),
+                    // The RFD carries no post-compaction size: stays unknown.
+                    tokens_after: None,
+                    summary: Some(summary),
+                    ..
+                }] if id == "cmp-7" && trigger == "auto" && summary == "the whole recap"
+            ),
+            "{closed:?}"
+        );
+    }
+
+    /// An unannounced status is not a completed cycle, and a chunk that arrives
+    /// alone does not claim one either.
+    #[test]
+    fn compaction_status_is_never_inferred() {
+        let events =
+            map_update(&json!({"sessionUpdate": "compaction_update", "compactionId": "c"}));
+        assert!(
+            matches!(
+                &events[..],
+                [AgentEvent::ContextCompaction {
+                    status: komet_proto::CompactionStatus::InProgress,
+                    ..
+                }]
+            ),
+            "{events:?}"
+        );
+        let events = map_update(&json!({
+            "sessionUpdate": "compaction_summary_chunk",
+            "compactionId": "c",
+            "summaryDelta": "x",
+        }));
+        assert!(
+            matches!(
+                &events[..],
+                [AgentEvent::ContextCompaction {
+                    status: komet_proto::CompactionStatus::InProgress,
+                    summary_delta: Some(_),
+                    ..
+                }]
+            ),
+            "{events:?}"
+        );
+        for status in ["failed", "cancelled"] {
+            let events = map_update(&json!({
+                "sessionUpdate": "compaction_update",
+                "compactionId": "c",
+                "status": status,
+                "error": "summarization timed out",
+            }));
+            assert!(
+                matches!(
+                    &events[..],
+                    [AgentEvent::ContextCompaction {
+                        status: komet_proto::CompactionStatus::Failed
+                            | komet_proto::CompactionStatus::Cancelled,
+                        error: Some(message),
+                        ..
+                    }] if message == "summarization timed out"
+                ),
+                "{status}: {events:?}"
+            );
+        }
+    }
+
+    /// A compaction signal with no id cannot refine anything: it is dropped, and
+    /// so is every unmapped kind — each through a categorized debug log rather
+    /// than a silent `continue` (transparency plan, Task 12 Step 1).
+    #[test]
+    fn unknown_update_kind_is_logged_and_dropped() {
+        assert!(
+            map_update(&json!({"sessionUpdate": "compaction_update", "status": "completed"}))
+                .is_empty(),
+            "a cycle without an id has nothing to refine"
+        );
+        for update in [
+            json!({"sessionUpdate": "something_from_a_future_draft", "value": 1}),
+            json!({"sessionUpdate": "compaction_summary_chunk"}),
+            json!({
+                "sessionUpdate": "compaction_summary_chunk",
+                "summaryDelta": "no id to settle",
+            }),
+            json!({"sessionUpdate": ""}),
+        ] {
+            assert!(map_update(&update).is_empty(), "{update:?}");
+        }
     }
 
     #[test]
@@ -1173,5 +1855,296 @@ mod tests {
                 AgentEvent::ToolResult { is_error: false, .. },
             ] if name == "Agent: Viz probe"
         ));
+    }
+
+    fn answer(question: &str, labels: &[&str]) -> UserInputAnswer {
+        UserInputAnswer {
+            question_id: question.into(),
+            labels: labels.iter().map(|label| (*label).to_owned()).collect(),
+            free_text: None,
+        }
+    }
+
+    fn typed(question: &str, text: &str) -> UserInputAnswer {
+        UserInputAnswer {
+            question_id: question.into(),
+            labels: vec![text.to_owned()],
+            free_text: Some(text.to_owned()),
+        }
+    }
+
+    fn fields(form: &ElicitationForm) -> &[ElicitationField] {
+        match form {
+            ElicitationForm::Ask { fields } => fields,
+            ElicitationForm::Unsupported(reason) => panic!("unexpected refusal: {reason}"),
+        }
+    }
+
+    #[test]
+    fn elicitation_single_select_maps_to_one_question() {
+        let params = json!({
+            "message": "Which environment should I deploy to?",
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "env": {
+                        "type": "string",
+                        "title": "Environment",
+                        "description": "Pick the target",
+                        "enum": ["staging", "prod"],
+                        "enumNames": ["Staging", "Production"],
+                        "default": "staging",
+                    },
+                },
+                "required": ["env"],
+            },
+        });
+        let form = elicitation_form(&params);
+        let fields = fields(&form);
+        assert_eq!(fields.len(), 1);
+        let field = &fields[0];
+        assert_eq!(field.name, "env");
+        assert!(field.required);
+        assert_eq!(field.kind, ElicitationKind::Single);
+        assert_eq!(
+            field.question.id, "env",
+            "the property name doubles as the question id"
+        );
+        assert_eq!(field.question.header, "Environment");
+        assert_eq!(field.question.question, "Pick the target");
+        assert_eq!(field.question.options, ["Staging", "Production"]);
+        assert_eq!(field.question.default.as_deref(), Some("Staging"));
+        assert!(!field.question.allow_free_text && !field.question.multi_select);
+        assert_eq!(
+            elicitation_response(&form, &[answer("env", &["Production"])]),
+            json!({ "action": "accept", "content": { "env": "prod" } }),
+            "the label maps back to the schema value, not its display name"
+        );
+    }
+
+    #[test]
+    fn elicitation_one_of_carries_descriptions() {
+        let params = json!({
+            "message": "How should the change land?",
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "strategy": {
+                        "oneOf": [
+                            { "const": "squash", "title": "Squash", "description": "One commit" },
+                            { "const": "rebase", "title": "Rebase", "description": "Keep history" },
+                        ],
+                    },
+                },
+            },
+        });
+        let form = elicitation_form(&params);
+        let field = &fields(&form)[0];
+        assert_eq!(field.kind, ElicitationKind::Single);
+        assert_eq!(field.choices.len(), 2);
+        assert_eq!(
+            field.question.option_descriptions,
+            ["One commit", "Keep history"]
+        );
+        assert_eq!(
+            elicitation_response(&form, &[answer("strategy", &["Rebase"])]),
+            json!({ "action": "accept", "content": { "strategy": "rebase" } })
+        );
+    }
+
+    #[test]
+    fn elicitation_multi_select_array_maps_labels_back() {
+        let params = json!({
+            "message": "Which checks should run?",
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "checks": {
+                        "type": "array",
+                        "title": "Checks",
+                        "items": {
+                            "type": "string",
+                            "enum": ["clippy", "fmt", "test"],
+                            "enumNames": ["Clippy", "Format", "Tests"],
+                        },
+                    },
+                },
+                "required": ["checks"],
+            },
+        });
+        let form = elicitation_form(&params);
+        let field = &fields(&form)[0];
+        assert_eq!(field.kind, ElicitationKind::Multi);
+        assert!(field.question.multi_select);
+        assert_eq!(field.question.options, ["Clippy", "Format", "Tests"]);
+        assert_eq!(
+            elicitation_response(&form, &[answer("checks", &["Tests", "Clippy"])]),
+            json!({
+                "action": "accept",
+                "content": { "checks": ["clippy", "test"] },
+            }),
+            "picked labels come back in enum order as wire values"
+        );
+    }
+
+    #[test]
+    fn elicitation_boolean_and_text_fields_keep_their_shape() {
+        let params = json!({
+            "message": "Confirm the release",
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "confirm": { "type": "boolean", "title": "Confirm", "default": true },
+                    "tag": {
+                        "type": "string",
+                        "title": "Tag",
+                        "pattern": "^v[0-9]+\\.[0-9]+$",
+                        "minLength": 3,
+                        "maxLength": 20,
+                        "default": "v1.0",
+                    },
+                    "token": { "type": "string", "format": "password", "title": "Token" },
+                    "retries": { "type": "integer", "minimum": 1, "maximum": 5 },
+                },
+                "required": ["confirm", "tag"],
+            },
+        });
+        let form = elicitation_form(&params);
+        let fields = fields(&form);
+        // serde_json's default map is a BTreeMap, so properties arrive in key
+        // order — the assertion below is by name for that reason.
+        let by_name = |name: &str| {
+            fields
+                .iter()
+                .find(|field| field.name == name)
+                .unwrap_or_else(|| panic!("no field `{name}`"))
+        };
+        let confirm = by_name("confirm");
+        assert_eq!(confirm.kind, ElicitationKind::Boolean);
+        assert_eq!(confirm.question.options, ["Yes", "No"]);
+        assert_eq!(confirm.question.default.as_deref(), Some("Yes"));
+        let tag = by_name("tag");
+        assert_eq!(tag.kind, ElicitationKind::Text);
+        assert!(tag.question.allow_free_text);
+        assert!(
+            tag.question
+                .question
+                .contains("must match `^v[0-9]+\\.[0-9]+$`")
+                && tag.question.question.contains("min 3")
+                && tag.question.question.contains("max 20"),
+            "{}",
+            tag.question.question
+        );
+        assert_eq!(tag.question.default.as_deref(), Some("v1.0"));
+        let token = by_name("token");
+        assert!(token.question.secret, "format:password is a masked field");
+        let retries = by_name("retries");
+        assert_eq!(retries.kind, ElicitationKind::Integer);
+        assert!(!confirm.question.allow_free_text && !confirm.question.multi_select);
+        assert_eq!(
+            elicitation_response(
+                &form,
+                &[
+                    answer("confirm", &["No"]),
+                    answer("tag", &["v2.1"]),
+                    typed("retries", "3"),
+                ],
+            ),
+            json!({
+                "action": "accept",
+                "content": { "confirm": false, "tag": "v2.1", "retries": 3 },
+            }),
+            "an integer field goes back as a number, not the typed string"
+        );
+    }
+
+    #[test]
+    fn elicitation_refuses_what_it_cannot_render() {
+        let url = json!({ "mode": "url", "message": "Sign in", "requestedSchema": {} });
+        assert!(matches!(
+            elicitation_form(&url),
+            ElicitationForm::Unsupported(reason) if reason.contains("url")
+        ));
+        let nested = json!({
+            "requestedSchema": {
+                "type": "object",
+                "properties": { "cfg": { "type": "object", "properties": {} } },
+            },
+        });
+        assert!(matches!(
+            elicitation_form(&nested),
+            ElicitationForm::Unsupported(reason)
+                if reason.contains("cfg") && reason.contains("object")
+        ));
+        let loose_array = json!({
+            "requestedSchema": {
+                "type": "object",
+                "properties": { "tags": { "type": "array", "items": { "type": "string" } } },
+            },
+        });
+        assert!(matches!(
+            elicitation_form(&loose_array),
+            ElicitationForm::Unsupported(reason) if reason.contains("enum")
+        ));
+        let empty = json!({
+            "requestedSchema": { "type": "object", "properties": {} },
+        });
+        assert!(matches!(
+            elicitation_form(&empty),
+            ElicitationForm::Unsupported(reason) if reason.contains("asks nothing")
+        ));
+    }
+
+    #[test]
+    fn elicitation_declines_missing_required_and_cancels_on_no_answer() {
+        let params = json!({
+            "message": "Name it",
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "title": "Name" },
+                    "note": { "type": "string", "title": "Note" },
+                },
+                "required": ["name"],
+            },
+        });
+        let form = elicitation_form(&params);
+        assert_eq!(
+            elicitation_response(&form, &[]),
+            json!({ "action": "cancel" }),
+            "a dropped/unanswered form is never consent"
+        );
+        assert_eq!(
+            elicitation_response(&form, &[answer("note", &["hi"])]),
+            json!({ "action": "decline" }),
+            "a missing required field declines rather than inventing a value"
+        );
+        let optional_only = elicitation_form(&json!({
+            "requestedSchema": {
+                "type": "object",
+                "properties": { "note": { "type": "string", "title": "Note" } },
+            },
+        }));
+        assert_eq!(
+            elicitation_response(&optional_only, &[answer("note", &["hi"])]),
+            json!({ "action": "accept", "content": { "note": "hi" } })
+        );
+    }
+
+    #[test]
+    fn elicitation_free_text_is_capped() {
+        let params = json!({
+            "requestedSchema": {
+                "type": "object",
+                "properties": { "story": { "type": "string", "title": "Story" } },
+                "required": ["story"],
+            },
+        });
+        let form = elicitation_form(&params);
+        let long = "é".repeat(ELICITATION_TEXT_CAP);
+        let response = elicitation_response(&form, &[typed("story", &long)]);
+        let value = response["content"]["story"].as_str().unwrap();
+        assert!(value.len() < long.len());
+        assert!(value.ends_with("… [truncated]"));
     }
 }

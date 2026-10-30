@@ -1,7 +1,7 @@
 //! Frame → [`AgentEvent`] normalization (init dedupe, subagent tagging, tool
 //! decoding, error-code mapping).
 
-use komet_proto::{AgentEvent, DoneStatus, HarnessId, TodoItem, ToolCall};
+use komet_proto::{AgentEvent, CompactionStatus, DoneStatus, HarnessId, TodoItem, ToolCall};
 use serde_json::Value;
 
 use super::wire::{ContentBlock, Frame};
@@ -189,6 +189,37 @@ fn is_synthetic_user_text(text: &str) -> bool {
     text.starts_with("<system-reminder>") || text.starts_with("[Request interrupted")
 }
 
+/// The compaction cycle the wire is currently describing. `settled` records
+/// that a boundary already closed it — which is what tells a second boundary
+/// "new compaction" from a recap "same compaction".
+#[derive(Clone, Debug)]
+struct CompactionCycle {
+    id: String,
+    settled: bool,
+}
+
+/// A `ContextCompaction` carrying only what a frame actually reported. Unknown
+/// fields stay `None`: the engine derives `tokens_after` from the next native
+/// window, and the UI shows no arrow rather than an invented one.
+fn compaction_event(
+    id: String,
+    status: CompactionStatus,
+    trigger: Option<String>,
+    tokens_before: Option<u64>,
+    summary: Option<String>,
+) -> AgentEvent {
+    AgentEvent::ContextCompaction {
+        id,
+        status,
+        trigger,
+        tokens_before,
+        tokens_after: None,
+        summary,
+        summary_delta: None,
+        error: None,
+    }
+}
+
 /// Per-run normalization state.
 ///
 /// `saw_init` dedupes `system:init` — the CLI re-emits it every time the model
@@ -226,6 +257,9 @@ pub(crate) struct Normalizer {
     /// Rotates at each assistant-frame close and at each steer; SessionStarted
     /// carries the first value so folds can attribute deltas from the start.
     assistant_message_id: String,
+    /// The compaction cycle being described across frames (notice → boundary →
+    /// recap). Cleared when a new session starts.
+    compaction: Option<CompactionCycle>,
     /// Last session id seen (init or result) — used for synthetic Dones.
     pub session_id: Option<String>,
 }
@@ -237,8 +271,36 @@ impl Normalizer {
             agent_tasks: std::collections::HashMap::new(),
             agent_spawn_tools: std::collections::HashSet::new(),
             assistant_message_id: new_message_id(),
+            compaction: None,
             session_id: None,
         }
+    }
+
+    /// The cycle a `compact_boundary` closes: the open one if it is still open,
+    /// otherwise a fresh id. A boundary on an ALREADY settled cycle means a
+    /// second compaction, so it must not rewrite the first row.
+    fn boundary_cycle(&mut self) -> String {
+        let open = match &self.compaction {
+            Some(cycle) if !cycle.settled => Some(cycle.id.clone()),
+            _ => None,
+        };
+        let id = open.unwrap_or_else(new_message_id);
+        self.compaction = Some(CompactionCycle {
+            id: id.clone(),
+            settled: true,
+        });
+        id
+    }
+
+    /// The cycle a recap belongs to, opening one for the silent-auto-compaction
+    /// shape where the CLI reports no notice and no boundary.
+    fn recap_cycle(&mut self) -> CompactionCycle {
+        let cycle = self.compaction.clone().unwrap_or_else(|| CompactionCycle {
+            id: new_message_id(),
+            settled: false,
+        });
+        self.compaction = Some(cycle.clone());
+        cycle
     }
 
     /// Rotate the assistant message id for a steer boundary; returns
@@ -260,6 +322,7 @@ impl Normalizer {
                 self.agent_tasks.clear();
                 self.agent_spawn_tools.clear();
                 self.assistant_message_id = new_message_id();
+                self.compaction = None;
                 Vec::new()
             }
             Frame::System(f) => {
@@ -316,6 +379,40 @@ impl Normalizer {
                     self.agent_tasks.insert(task.to_owned(), tool.to_owned());
                     self.agent_spawn_tools.insert(tool.to_owned());
                     return Vec::new();
+                }
+                // The CLI's own compaction notices. `status` is a shared field
+                // (a `task_notification` settles through it with `completed`),
+                // so only `subtype == "status"` + `status == "compacting"` is a
+                // compaction — everything else stays harness bookkeeping.
+                if f.subtype == "status" && f.status.as_deref() == Some("compacting") {
+                    // A re-sent notice re-announces the compaction already open;
+                    // emitting it again would restart the row's pulse.
+                    if self.compaction.as_ref().is_some_and(|cycle| !cycle.settled) {
+                        return Vec::new();
+                    }
+                    let id = new_message_id();
+                    self.compaction = Some(CompactionCycle {
+                        id: id.clone(),
+                        settled: false,
+                    });
+                    return vec![compaction_event(
+                        id,
+                        CompactionStatus::InProgress,
+                        None,
+                        None,
+                        None,
+                    )];
+                }
+                if f.subtype == "compact_boundary" {
+                    let meta = f.compact_metadata.unwrap_or_default();
+                    let id = self.boundary_cycle();
+                    return vec![compaction_event(
+                        id,
+                        CompactionStatus::Completed,
+                        meta.trigger.filter(|trigger| !trigger.trim().is_empty()),
+                        meta.pre_tokens,
+                        None,
+                    )];
                 }
                 if f.subtype != "init" || self.saw_init {
                     return Vec::new();
@@ -505,6 +602,35 @@ impl Normalizer {
             }
 
             Frame::User(f) => {
+                if f.is_compact_summary {
+                    // The CLI's recap of the context it just rewrote. Read as
+                    // conversation it would be a phantom turn the user never
+                    // typed; on a subagent feed it would be a steer announcing
+                    // more work from a spawn that is already settled.
+                    if let Some(parent) = &f.parent_tool_use_id {
+                        tracing::debug!(parent, "dropping a subagent's own compaction recap");
+                        return Vec::new();
+                    }
+                    let text = f
+                        .message
+                        .blocks()
+                        .filter(|b| b.kind == "text")
+                        .map(|b| b.text)
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                    if text.trim().is_empty() {
+                        return Vec::new();
+                    }
+                    let cycle = self.recap_cycle();
+                    let status = if cycle.settled {
+                        CompactionStatus::Completed
+                    } else {
+                        // The compaction is real but never reported a boundary;
+                        // stay with what the wire said rather than guessing.
+                        CompactionStatus::InProgress
+                    };
+                    return vec![compaction_event(cycle.id, status, None, None, Some(text))];
+                }
                 if let Some(parent) = &f.parent_tool_use_id {
                     // A subagent's tool results echo on the main channel too;
                     // they belong to its transcript, attributed like its calls.
@@ -1211,5 +1337,190 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    // ── compaction frames ───────────────────────────────────────────────────
+
+    /// One run's worth of frames through a single [`Normalizer`] — a
+    /// compaction cycle spans several frames, so per-frame helpers cannot see
+    /// it.
+    fn normalize_seq(frames: &[&str]) -> Vec<AgentEvent> {
+        let mut norm = Normalizer::new();
+        frames
+            .iter()
+            .map(|raw| crate::claude::wire::parse_frame(raw).expect("frame parses"))
+            .flat_map(|frame| norm.normalize(frame, false))
+            .collect()
+    }
+
+    fn only_compactions(events: &[AgentEvent]) -> Vec<&AgentEvent> {
+        events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::ContextCompaction { .. }))
+            .collect()
+    }
+
+    fn compaction_id(event: &AgentEvent) -> &str {
+        match event {
+            AgentEvent::ContextCompaction { id, .. } => id,
+            other => panic!("not a compaction: {other:?}"),
+        }
+    }
+
+    const COMPACTING: &str = r#"{"type":"system","subtype":"status","status":"compacting"}"#;
+    const BOUNDARY: &str = r#"{"type":"system","subtype":"compact_boundary","compact_metadata":{"trigger":"manual","pre_tokens":18875}}"#;
+
+    /// `system/status` with `compacting` is the CLI's own notice that it is
+    /// rewriting the context. A re-sent notice describes the SAME compaction:
+    /// one cycle, one event, so the row never restarts its pulse.
+    #[test]
+    fn status_compacting_emits_in_progress() {
+        let events = normalize_seq(&[COMPACTING, COMPACTING]);
+        let found = only_compactions(&events);
+        assert_eq!(found.len(), 1, "{events:?}");
+        assert!(
+            matches!(
+                found[0],
+                AgentEvent::ContextCompaction {
+                    status: CompactionStatus::InProgress,
+                    trigger: None,
+                    tokens_before: None,
+                    ..
+                }
+            ),
+            "{:?}",
+            found[0]
+        );
+        assert!(!compaction_id(found[0]).is_empty());
+    }
+
+    #[test]
+    fn compact_boundary_snake_case() {
+        let events = normalize_seq(&[BOUNDARY]);
+        let found = only_compactions(&events);
+        assert_eq!(found.len(), 1, "{events:?}");
+        assert!(
+            matches!(
+                found[0],
+                AgentEvent::ContextCompaction {
+                    status: CompactionStatus::Completed,
+                    trigger: Some(trigger),
+                    tokens_before: Some(18875),
+                    tokens_after: None,
+                    ..
+                } if trigger == "manual"
+            ),
+            "{:?}",
+            found[0]
+        );
+    }
+
+    /// The CLI spells this frame both ways across versions; neither spelling
+    /// may silently read as "no compaction happened".
+    #[test]
+    fn compact_boundary_camel_case() {
+        let events = normalize_seq(&[
+            r#"{"type":"system","subtype":"compact_boundary","compactMetadata":{"trigger":"auto","preTokens":900}}"#,
+        ]);
+        let found = only_compactions(&events);
+        assert_eq!(found.len(), 1, "{events:?}");
+        assert!(
+            matches!(
+                found[0],
+                AgentEvent::ContextCompaction {
+                    status: CompactionStatus::Completed,
+                    trigger: Some(trigger),
+                    tokens_before: Some(900),
+                    ..
+                } if trigger == "auto"
+            ),
+            "{:?}",
+            found[0]
+        );
+    }
+
+    #[test]
+    fn boundary_lands_on_the_open_cycle() {
+        let events = normalize_seq(&[COMPACTING, BOUNDARY]);
+        let found = only_compactions(&events);
+        assert_eq!(found.len(), 2, "{events:?}");
+        assert_eq!(
+            compaction_id(found[0]),
+            compaction_id(found[1]),
+            "the boundary refines the cycle the notice opened"
+        );
+    }
+
+    /// Two compactions in one run are two facts in the thread. Reusing the id
+    /// would rewrite the first row over and the second one would never appear.
+    #[test]
+    fn two_boundaries_in_one_run_get_two_ids() {
+        let events = normalize_seq(&[BOUNDARY, BOUNDARY]);
+        let found = only_compactions(&events);
+        assert_eq!(found.len(), 2, "{events:?}");
+        assert_ne!(
+            compaction_id(found[0]),
+            compaction_id(found[1]),
+            "a second boundary is a second compaction, not a refinement"
+        );
+    }
+
+    /// The recap rides a `user` frame the user never typed. Read as
+    /// conversation it would appear as a phantom turn — and on a subagent feed
+    /// it would read as the parent steering a finished spawn.
+    #[test]
+    fn compact_summary_is_not_a_user_turn() {
+        let summary = r#"{"type":"user","isCompactSummary":true,"message":{"content":[{"type":"text","text":"Summary of the conversation so far."}]}}"#;
+        let events = normalize_seq(&[COMPACTING, BOUNDARY, summary]);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::UserMessage { .. })),
+            "the CLI's recap must not become a user turn: {events:?}"
+        );
+        let found = only_compactions(&events);
+        assert_eq!(found.len(), 3, "{events:?}");
+        assert_eq!(
+            compaction_id(found[2]),
+            compaction_id(found[1]),
+            "the recap rides its own compaction's id"
+        );
+        assert!(
+            matches!(
+                found[2],
+                AgentEvent::ContextCompaction {
+                    summary: Some(text),
+                    status: CompactionStatus::Completed,
+                    ..
+                } if text == "Summary of the conversation so far."
+            ),
+            "{:?}",
+            found[2]
+        );
+
+        let tagged = r#"{"type":"user","parent_tool_use_id":"toolu_spawn","isCompactSummary":true,"message":{"content":[{"type":"text","text":"Summary."}]}}"#;
+        assert!(
+            !normalize_seq(&[tagged])
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Subagent { .. })),
+            "a subagent's own recap is not a steer"
+        );
+    }
+
+    /// A CLI that ships none of these fields still parses, and no other
+    /// `status` value — including a subagent's terminal `completed` — is a
+    /// compaction.
+    #[test]
+    fn old_wire_without_compact_fields_still_parses() {
+        let events = normalize_seq(&[
+            r#"{"type":"system","subtype":"init","model":"m","tools":["Bash"],"cwd":"/x","session_id":"s1"}"#,
+            r#"{"type":"system","subtype":"status","status":"requesting"}"#,
+            r#"{"type":"system","subtype":"task_notification","task_id":"t1","tool_use_id":"toolu_agent","status":"completed","summary":"DONE."}"#,
+        ]);
+        assert!(
+            matches!(&events[..], [AgentEvent::SessionStarted { .. }]),
+            "{events:?}"
+        );
+        assert!(only_compactions(&events).is_empty(), "{events:?}");
     }
 }

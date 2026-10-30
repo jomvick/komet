@@ -60,6 +60,22 @@ pub(crate) struct SystemFrame {
     /// absent on subagent-owned background shell tasks.
     #[serde(default)]
     pub subagent_type: Option<String>,
+    /// `compact_boundary`: what the CLI knows about the compaction it just
+    /// performed. Field spelling moves between versions, hence the aliases.
+    #[serde(default, alias = "compactMetadata")]
+    pub compact_metadata: Option<CompactMetadata>,
+}
+
+/// `compact_metadata` on a `compact_boundary` frame. `trigger` is the CLI's own
+/// wording (`manual`, `auto`, …); `pre_tokens` is the size it replaced. There is
+/// no post-compaction size on this frame — the UI shows no arrow rather than an
+/// invented one.
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct CompactMetadata {
+    #[serde(default)]
+    pub trigger: Option<String>,
+    #[serde(default, alias = "preTokens")]
+    pub pre_tokens: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -107,6 +123,9 @@ pub(crate) struct MessageFrame {
     /// Terse assistant-level error code (`rate_limit`, `billing_error`, …).
     #[serde(default)]
     pub error: Option<String>,
+    /// The CLI's own post-compaction recap, riding a `user` frame nobody typed.
+    #[serde(default, alias = "isCompactSummary")]
+    pub is_compact_summary: bool,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -209,6 +228,10 @@ pub(crate) struct ControlRequestBody {
     pub tool_name: String,
     #[serde(default)]
     pub input: Value,
+    /// The gated tool call, when the CLI names one. Absent on versions that
+    /// don't send it, which is `None` (no link) rather than a guessed id.
+    #[serde(default)]
+    pub tool_use_id: Option<String>,
 }
 
 /// Parse one stdout JSONL line. `Err` = not JSON; unknown types = `Other`.

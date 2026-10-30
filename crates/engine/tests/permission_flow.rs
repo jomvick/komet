@@ -125,7 +125,7 @@ impl Harness for PermitHarness {
                 return;
             }
             let _ = tx.send(Ok(session_started())).await;
-            let resolved = (controls.request_permission)(kind, summary, choices).await;
+            let resolved = (controls.request_permission)(kind, summary, choices, None).await;
             match resolved {
                 Ok(PermissionChoice::Deny) | Err(_) => {
                     // The agent ignores the denial and reaches for its next

@@ -3989,6 +3989,7 @@ fn harness_slug(harness: HarnessId) -> &'static str {
         HarnessId::Muse => "muse",
         HarnessId::Copilot => "copilot",
         HarnessId::Cline => "cline",
+        HarnessId::Qoder => "qoder",
         HarnessId::Mock => "mock",
     }
 }
