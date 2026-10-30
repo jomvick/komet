@@ -118,6 +118,50 @@ const USAGE_TTL: Duration = Duration::from_secs(60);
 const FLOW_TTL: Duration = Duration::from_secs(15 * 60);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(8);
 
+/// Credential stores owned by the CLI-managed providers that have an in-app
+/// sign-in (`devin`, `grok`, `muse`, `cline`, `qoder`). They keep a single live
+/// login in their own home; komet only reads the store after the flow lands.
+#[derive(Debug, Clone)]
+pub struct CliProviderFiles {
+    pub grok_auth: PathBuf,
+    pub muse_auth: PathBuf,
+    pub cline_providers: PathBuf,
+    pub qoder_auth: PathBuf,
+    pub devin_credentials: PathBuf,
+}
+
+impl CliProviderFiles {
+    pub fn detect() -> Self {
+        let home = home_dir();
+        let config_dir = std::env::var_os("XDG_CONFIG_HOME")
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".config"));
+        let data_dir = std::env::var_os("XDG_DATA_HOME")
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".local/share"));
+        Self {
+            grok_auth: home.join(".grok/auth.json"),
+            muse_auth: config_dir.join("muse/auth.json"),
+            cline_providers: home.join(".cline/data/settings/providers.json"),
+            qoder_auth: home.join(".qoder/.auth/user"),
+            devin_credentials: data_dir.join("devin/credentials.toml"),
+        }
+    }
+
+    /// Isolated layout for tests (nothing outside `root` is ever read).
+    pub fn under(root: &Path) -> Self {
+        Self {
+            grok_auth: root.join("grok/auth.json"),
+            muse_auth: root.join("muse/auth.json"),
+            cline_providers: root.join("cline/providers.json"),
+            qoder_auth: root.join("qoder/user"),
+            devin_credentials: root.join("devin/credentials.toml"),
+        }
+    }
+}
+
 /// Filesystem knobs — env-resolved in production ([`AgentAccountsConfig::detect`]),
 /// explicit in tests.
 #[derive(Debug, Clone)]
@@ -134,6 +178,8 @@ pub struct AgentAccountsConfig {
     pub antigravity_home: PathBuf,
     /// Cursor SDK login (`~/.cursor/sdk/auth.json`) — separate from `cursor-agent`.
     pub cursor_auth_file: PathBuf,
+    /// Auth stores of the CLI-managed providers with in-app sign-in.
+    pub cli_files: CliProviderFiles,
 }
 
 impl AgentAccountsConfig {
@@ -159,6 +205,7 @@ impl AgentAccountsConfig {
                 .unwrap_or_else(|| home_dir().join(".gemini/antigravity-cli")),
             cursor_auth_file: env_dir("CURSOR_AUTH_FILE")
                 .unwrap_or_else(|| home_dir().join(".cursor/sdk/auth.json")),
+            cli_files: CliProviderFiles::detect(),
         }
     }
 
@@ -176,6 +223,18 @@ impl AgentAccountsConfig {
 
     fn cursor_auth_file(&self) -> PathBuf {
         self.cursor_auth_file.clone()
+    }
+
+    /// The store a CLI-managed provider rewrites once its sign-in completes.
+    fn cli_auth_file(&self, harness: HarnessId) -> Option<&Path> {
+        match harness {
+            HarnessId::Devin => Some(&self.cli_files.devin_credentials),
+            HarnessId::Grok => Some(&self.cli_files.grok_auth),
+            HarnessId::Muse => Some(&self.cli_files.muse_auth),
+            HarnessId::Cline => Some(&self.cli_files.cline_providers),
+            HarnessId::Qoder => Some(&self.cli_files.qoder_auth),
+            _ => None,
+        }
     }
 
     fn root_dir(&self) -> PathBuf {
@@ -235,6 +294,68 @@ struct Detected {
 
 // ── login flows ─────────────────────────────────────────────────────────────
 
+/// Headless sign-in shape of a CLI-managed provider: the CLI is spawned behind
+/// a PTY (some refuse to sign in without a TTY), prints an authorize URL, and
+/// writes its own credential store when the browser/paste step lands.
+struct CliLoginSpec {
+    harness: HarnessId,
+    binary: &'static str,
+    args: &'static [&'static str],
+    mode: AgentLoginMode,
+    /// The authorize URL starts with this — scoping keeps TUI noise out.
+    url_prefix: &'static str,
+    /// Muse asks for Enter to open the browser; Komet opens the URL itself and
+    /// sends the keystroke so the CLI starts waiting for approval.
+    send_enter: bool,
+}
+
+const CLI_LOGIN_SPECS: &[CliLoginSpec] = &[
+    CliLoginSpec {
+        harness: HarnessId::Devin,
+        binary: "devin",
+        args: &["auth", "login", "--force-manual-token-flow"],
+        mode: AgentLoginMode::PasteCode,
+        url_prefix: "https://windsurf.com/devin/account/login",
+        send_enter: false,
+    },
+    CliLoginSpec {
+        harness: HarnessId::Grok,
+        binary: "grok",
+        args: &["login", "--device-auth"],
+        mode: AgentLoginMode::Browser,
+        url_prefix: "https://accounts.x.ai/oauth2/device",
+        send_enter: false,
+    },
+    CliLoginSpec {
+        harness: HarnessId::Qoder,
+        binary: "qoder",
+        args: &["login"],
+        mode: AgentLoginMode::Browser,
+        url_prefix: "https://qoder.com/device",
+        send_enter: false,
+    },
+    CliLoginSpec {
+        harness: HarnessId::Muse,
+        binary: "muse",
+        args: &["login"],
+        mode: AgentLoginMode::Browser,
+        url_prefix: "https://auth.meta.com/oauth/device",
+        send_enter: true,
+    },
+    CliLoginSpec {
+        harness: HarnessId::Cline,
+        binary: "cline",
+        args: &["auth", "cline"],
+        mode: AgentLoginMode::Browser,
+        url_prefix: "https://authkit.cline.bot/device",
+        send_enter: false,
+    },
+];
+
+fn cli_login_spec(harness: HarnessId) -> Option<&'static CliLoginSpec> {
+    CLI_LOGIN_SPECS.iter().find(|spec| spec.harness == harness)
+}
+
 enum LoginFlow {
     Claude {
         verifier: String,
@@ -289,6 +410,25 @@ enum LoginFlow {
         output: Arc<Mutex<String>>,
         exit: Arc<Mutex<Option<Option<i32>>>>,
     },
+    /// A CLI-managed provider's own headless sign-in (`devin auth login …`,
+    /// `grok login --device-auth`, …). Success is the provider's credential
+    /// store appearing/updating — never the CLI's exit code alone (several
+    /// print "Waiting for authorization…" and stay alive).
+    #[allow(dead_code)]
+    Cli {
+        harness: HarnessId,
+        mode: AgentLoginMode,
+        /// PTY master — held alive for the flow's lifetime.
+        master: Mutex<Option<Box<dyn portable_pty::MasterPty + Send>>>,
+        writer: Arc<Mutex<Option<Box<dyn std::io::Write + Send>>>>,
+        killer: Arc<Mutex<Option<Box<dyn portable_pty::ChildKiller + Send + Sync>>>>,
+        started_at: Instant,
+        output: Arc<Mutex<String>>,
+        /// `Some(code)` once the child exited (`None` code = killed by signal).
+        exit: Arc<Mutex<Option<Option<i32>>>>,
+        /// Digest of the provider's store before the flow — success = changed.
+        initial_digest: Option<String>,
+    },
 }
 
 impl LoginFlow {
@@ -298,7 +438,8 @@ impl LoginFlow {
             | LoginFlow::Codex { started_at, .. }
             | LoginFlow::GithubCli { started_at, .. }
             | LoginFlow::Antigravity { started_at, .. }
-            | LoginFlow::Cursor { started_at, .. } => *started_at,
+            | LoginFlow::Cursor { started_at, .. }
+            | LoginFlow::Cli { started_at, .. } => *started_at,
         }
     }
 }
@@ -442,6 +583,7 @@ mod usage_mode_tests {
             codex_home: dir.join("codex"),
             antigravity_home: dir.join("antigravity"),
             cursor_auth_file: dir.join("cursor/auth.json"),
+            cli_files: CliProviderFiles::under(&dir),
         });
         let make_slot = |id: &str, username: &str, token: &str| Slot {
             id: id.into(),
@@ -534,6 +676,7 @@ mod usage_mode_tests {
             codex_home: dir.join("codex"),
             antigravity_home: dir.join("antigravity"),
             cursor_auth_file: dir.join("sdk").join("auth.json"),
+            cli_files: CliProviderFiles::under(&dir),
         };
         let accounts = AgentAccounts::new(config);
         let slot = Slot {
@@ -734,6 +877,48 @@ fn scan_github_device_code(output: &str) -> Option<String> {
         .map(|code| String::from_utf8_lossy(code).to_string())
 }
 
+/// The PATH a login child needs: engine PATH first, then the user's login
+/// shell snapshot (npm shims find their `node`, and `qoder`'s `~/.qoder/entry`
+/// only exists there on some installs).
+fn composed_login_path() -> Option<std::ffi::OsString> {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    if let Some(path) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&path));
+    }
+    if let Some(path) = komet_harness::shell_env::login_shell_path() {
+        paths.extend(std::env::split_paths(path));
+    }
+    (!paths.is_empty())
+        .then(|| std::env::join_paths(paths).ok())
+        .flatten()
+}
+
+/// Pull the authorize URL out of a PTY's output. Scoped by the provider's
+/// prefix so unrelated links in TUI banners never win.
+fn scan_cli_url(output: &str, prefix: &str) -> Option<String> {
+    let start = output.find(prefix)?;
+    let rest = &output[start..];
+    let end = rest
+        .find(|c: char| c.is_whitespace() || matches!(c, '\x1b' | '"' | '\'' | '<' | '>' | ')'))
+        .unwrap_or(rest.len());
+    let url = rest[..end].trim_end_matches(['.', ',', ';']);
+    (!url.is_empty()).then(|| url.to_string())
+}
+
+/// Device code carried in the authorize URL (`?user_code=…` / `?code=…`).
+fn login_code_from_url(url: &str) -> Option<String> {
+    ["user_code", "userCode", "code"]
+        .into_iter()
+        .find_map(|key| {
+            let needle = format!("{key}=");
+            let start = url.find(&needle)? + needle.len();
+            let rest = &url[start..];
+            let end = rest.find(['&', '#']).unwrap_or(rest.len());
+            let value = rest[..end].trim();
+            (!value.is_empty()).then(|| value.to_string())
+        })
+}
+
 #[derive(Clone)]
 pub struct AgentAccounts {
     inner: Arc<Inner>,
@@ -820,6 +1005,18 @@ impl AgentAccounts {
             active_keys.insert(HarnessId::Cursor, detected.account_key.clone());
             self.snapshot_detected(HarnessId::Cursor, &detected)?;
         }
+        for harness in [
+            HarnessId::Devin,
+            HarnessId::Grok,
+            HarnessId::Muse,
+            HarnessId::Cline,
+            HarnessId::Qoder,
+        ] {
+            if let Some(detected) = self.detect_cli_provider(harness) {
+                active_keys.insert(harness, detected.account_key.clone());
+                self.snapshot_detected(harness, &detected)?;
+            }
+        }
         if let Some(active_id) = self.read_copilot_active_id()
             && let Some(slot) = self
                 .read_slots(HarnessId::Copilot)
@@ -892,6 +1089,11 @@ impl AgentAccounts {
             HarnessId::Antigravity,
             HarnessId::Cursor,
             HarnessId::Copilot,
+            HarnessId::Devin,
+            HarnessId::Grok,
+            HarnessId::Muse,
+            HarnessId::Cline,
+            HarnessId::Qoder,
         ] {
             let active_key = active_keys.get(&harness).cloned();
             let slots = self.read_slots(harness);
@@ -915,7 +1117,7 @@ impl AgentAccounts {
                     display_name: slot.profile.display_name.clone(),
                     organization: slot.profile.organization.clone(),
                     auth_kind: Some(slot.profile.auth_kind),
-                    switchable: true,
+                    switchable: supports_switching(harness),
                     saved_at: Some(slot.saved_at),
                 });
             }
@@ -1193,6 +1395,11 @@ impl AgentAccounts {
             HarnessId::Antigravity => self.start_antigravity_login().await,
             HarnessId::Cursor => self.start_cursor_login().await,
             HarnessId::Copilot => self.start_github_cli_login().await,
+            HarnessId::Devin
+            | HarnessId::Grok
+            | HarnessId::Muse
+            | HarnessId::Cline
+            | HarnessId::Qoder => self.start_cli_login(harness).await,
             other => Err(EngineError::Other(format!(
                 "agent logins are not supported for {other:?}"
             ))),
@@ -1668,6 +1875,200 @@ impl AgentAccounts {
         }
     }
 
+    /// Start a CLI-managed provider's own headless sign-in behind a PTY.
+    ///
+    /// Each CLI is the authority on its login: we only spawn it, relay the
+    /// authorize URL (plus device code, when it prints one) into the dialog,
+    /// and watch the provider's credential store. Nothing is copied into the
+    /// app — the CLI writes its own login exactly as it would in a terminal.
+    async fn start_cli_login(&self, harness: HarnessId) -> Result<AgentLoginStart, EngineError> {
+        let Some(spec) = cli_login_spec(harness) else {
+            return Err(EngineError::Other(format!(
+                "agent logins are not supported for {harness:?}"
+            )));
+        };
+        // One flow per provider: these CLIs keep a single live login, so a new
+        // attempt supersedes (and reaps) any in-flight one.
+        let stale: Vec<String> = lock(&self.inner.flows)
+            .iter()
+            .filter(|(_, flow)| matches!(flow, LoginFlow::Cli { harness: h, .. } if *h == harness))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in stale {
+            self.cancel_login(&id);
+        }
+
+        let Some(binary) = komet_harness::find_cli_path(spec.binary) else {
+            return Err(EngineError::Other(format!(
+                "The `{}` CLI was not found on this device — install it first.",
+                spec.binary
+            )));
+        };
+        let Some(auth_file) = self
+            .inner
+            .config
+            .cli_auth_file(harness)
+            .map(Path::to_path_buf)
+        else {
+            return Err(EngineError::Other(
+                "This provider has no in-app sign-in flow.".into(),
+            ));
+        };
+
+        let login_id = new_id();
+        let pair = portable_pty::native_pty_system()
+            .openpty(portable_pty::PtySize {
+                rows: 40,
+                // Wide enough that long OAuth URLs are never wrapped by the
+                // PTY mid-query (the dialog must open the complete URL).
+                cols: 400,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|e| EngineError::Other(format!("could not open a pty: {e}")))?;
+        let mut cmd = portable_pty::CommandBuilder::new(&binary);
+        for arg in spec.args {
+            cmd.arg(arg);
+        }
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("NO_COLOR", "1");
+        if let Some(path) = composed_login_path() {
+            cmd.env("PATH", path);
+        }
+        let child = match pair.slave.spawn_command(cmd) {
+            Ok(child) => child,
+            Err(err) => {
+                let not_found = err
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+                return Err(EngineError::Other(if not_found {
+                    format!(
+                        "The `{}` CLI was not found on this device — install it first.",
+                        spec.binary
+                    )
+                } else {
+                    format!("Could not start {} sign-in: {err}", spec.binary)
+                }));
+            }
+        };
+        drop(pair.slave);
+        let killer = child.clone_killer();
+        let reader = pair
+            .master
+            .try_clone_reader()
+            .map_err(|e| EngineError::Other(format!("pty reader: {e}")))?;
+        let writer = pair
+            .master
+            .take_writer()
+            .map_err(|e| EngineError::Other(format!("pty writer: {e}")))?;
+        let output = Arc::new(Mutex::new(String::new()));
+        let exit: Arc<Mutex<Option<Option<i32>>>> = Arc::new(Mutex::new(None));
+        {
+            let sink = output.clone();
+            std::thread::spawn(move || {
+                use std::io::Read;
+                let mut reader = reader;
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = reader.read(&mut buf) {
+                    if n == 0 {
+                        break;
+                    }
+                    lock(&sink).push_str(&String::from_utf8_lossy(&buf[..n]));
+                }
+            });
+        }
+        {
+            let child = Arc::new(Mutex::new(Some(child)));
+            let exit = exit.clone();
+            tokio::spawn(async move {
+                loop {
+                    {
+                        let mut slot = lock(&child);
+                        match slot.as_mut().map(|c| c.try_wait()) {
+                            None => break,
+                            Some(Ok(Some(status))) => {
+                                *lock(&exit) = Some(Some(status.exit_code() as i32));
+                                *slot = None;
+                                break;
+                            }
+                            Some(Ok(None)) => {}
+                            Some(Err(_)) => {
+                                *lock(&exit) = Some(None);
+                                *slot = None;
+                                break;
+                            }
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+            });
+        }
+        let writer = Arc::new(Mutex::new(Some(writer)));
+        let initial_digest = file_digest(&auth_file);
+        lock(&self.inner.flows).insert(
+            login_id.clone(),
+            LoginFlow::Cli {
+                harness,
+                mode: spec.mode,
+                master: Mutex::new(Some(pair.master)),
+                writer: writer.clone(),
+                killer: Arc::new(Mutex::new(Some(killer))),
+                started_at: Instant::now(),
+                output: output.clone(),
+                exit: exit.clone(),
+                initial_digest: initial_digest.clone(),
+            },
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let url = loop {
+            let out = lock(&output).clone();
+            if let Some(url) = scan_cli_url(&out, spec.url_prefix) {
+                break Some(url);
+            }
+            if lock(&exit).is_some() || Instant::now() > deadline {
+                // The store may have landed without a URL (an already-approved
+                // device flow): keep the flow alive in Browser mode so the
+                // dialog's poll adopts it instead of reporting a false failure.
+                if file_digest(&auth_file) != initial_digest {
+                    break None;
+                }
+                let tail = last_output_line(&out);
+                self.cancel_login(&login_id);
+                return Err(EngineError::Other(match tail {
+                    Some(line) => format!("{} sign-in failed: {line}", spec.binary),
+                    None => format!(
+                        "{} did not open a sign-in page — is the CLI installed and up to date?",
+                        spec.binary
+                    ),
+                }));
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        };
+        let Some(url) = url else {
+            return Ok(AgentLoginStart {
+                login_id,
+                url: String::new(),
+                mode: AgentLoginMode::Browser,
+                user_code: None,
+            });
+        };
+        if spec.send_enter {
+            use std::io::Write as _;
+            let mut slot = lock(&writer);
+            if let Some(w) = slot.as_mut() {
+                let _ = w.write_all(b"\r").and_then(|_| w.flush());
+            }
+        }
+        let user_code = login_code_from_url(&url);
+        Ok(AgentLoginStart {
+            login_id,
+            url,
+            mode: spec.mode,
+            user_code,
+        })
+    }
+
     /// Exchange the pasted `code#state` for tokens and save the account as a slot
     /// (the live login is untouched — switching is an explicit, separate act).
     pub async fn complete_login(
@@ -1682,6 +2083,14 @@ impl AgentAccounts {
             Some(LoginFlow::Antigravity { .. })
         ) {
             return self.complete_antigravity_login(login_id, code).await;
+        }
+        // CLI-managed providers (Devin today) also take the code over a PTY;
+        // completion is their own credential store changing.
+        if matches!(
+            lock(&self.inner.flows).get(login_id),
+            Some(LoginFlow::Cli { .. })
+        ) {
+            return self.complete_cli_login(login_id, code).await;
         }
         let verifier = match lock(&self.inner.flows).get(login_id) {
             Some(LoginFlow::Claude { verifier, .. }) => verifier.clone(),
@@ -1940,6 +2349,101 @@ impl AgentAccounts {
         }
     }
 
+    /// Feed the pasted code into a CLI-managed provider's PTY, then wait for
+    /// that provider's own credential store to change.
+    async fn complete_cli_login(
+        &self,
+        login_id: &str,
+        code: &str,
+    ) -> Result<AgentAccountsSnapshot, EngineError> {
+        if code.trim().is_empty() {
+            return Err(EngineError::Other(
+                "That code looks empty — paste the whole code.".into(),
+            ));
+        }
+        let (harness, writer, initial_digest, exit, output) =
+            match lock(&self.inner.flows).get(login_id) {
+                Some(LoginFlow::Cli {
+                    harness,
+                    writer,
+                    initial_digest,
+                    exit,
+                    output,
+                    ..
+                }) => (
+                    *harness,
+                    writer.clone(),
+                    initial_digest.clone(),
+                    exit.clone(),
+                    output.clone(),
+                ),
+                _ => {
+                    return Err(EngineError::Other(
+                        "This sign-in attempt expired — start again.".into(),
+                    ));
+                }
+            };
+        {
+            use std::io::Write;
+            let mut slot = lock(&writer);
+            if let Some(w) = slot.as_mut() {
+                w.write_all(format!("{}\r", code.trim()).as_bytes())
+                    .and_then(|_| w.flush())
+                    .map_err(|e| {
+                        EngineError::Other(format!("could not send the code to the CLI: {e}"))
+                    })?;
+            } else {
+                return Err(EngineError::Other(
+                    "The sign-in process is no longer running — start again.".into(),
+                ));
+            }
+        }
+        let auth_file = self
+            .inner
+            .config
+            .cli_auth_file(harness)
+            .ok_or_else(|| EngineError::Other("This provider has no in-app sign-in flow.".into()))?
+            .to_path_buf();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            if file_digest(&auth_file) != initial_digest
+                && let Some(detected) = self.detect_cli_provider(harness)
+            {
+                self.finish_cli_login(login_id, harness, &detected)?;
+                return self.list(UsageMode::Offline).await;
+            }
+            if (*lock(&exit)).is_some() {
+                let tail = last_output_line(&lock(&output));
+                self.cancel_login(login_id);
+                return Err(EngineError::Other(match tail {
+                    Some(line) => format!("Sign-in failed: {line}"),
+                    None => "Sign-in failed — the CLI exited without a new login. Check the \
+                             code and try again."
+                        .into(),
+                }));
+            }
+            if Instant::now() > deadline {
+                return Err(EngineError::Other(
+                    "The sign-in didn't complete in time — check the code and try again.".into(),
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    /// Persist a CLI-managed provider's freshly-written login, then stop its
+    /// CLI (nothing is restored: the store IS the new account).
+    fn finish_cli_login(
+        &self,
+        login_id: &str,
+        harness: HarnessId,
+        detected: &Detected,
+    ) -> Result<(), EngineError> {
+        self.snapshot_detected(harness, detected)?;
+        self.cancel_login(login_id);
+        Ok(())
+    }
+
     /// Adopt a freshly-written Antigravity keyring secret as the new slot.
     ///
     /// Returns `true` once `value` is a usable login that DIFFERS from the
@@ -2040,6 +2544,22 @@ impl AgentAccounts {
                         status: AgentLoginStatus::Pending,
                         message: None,
                     });
+                }
+                Some(LoginFlow::Cli {
+                    harness,
+                    initial_digest,
+                    exit,
+                    output,
+                    ..
+                }) => {
+                    let tuple = (
+                        *harness,
+                        initial_digest.clone(),
+                        exit.clone(),
+                        output.clone(),
+                    );
+                    drop(flows);
+                    return self.poll_cli_login(login_id, tuple.0, tuple.1, tuple.2, tuple.3);
                 }
             }
         };
@@ -2170,6 +2690,60 @@ impl AgentAccounts {
                 format!("{tail} ({home_state})")
             };
             tracing::warn!(login_id, code = ?code, home = %home.display(), output_tail = %tail, "{home_state}");
+            return Ok(AgentLoginPoll {
+                status: AgentLoginStatus::Error,
+                message: Some(message),
+            });
+        }
+        Ok(AgentLoginPoll {
+            status: AgentLoginStatus::Pending,
+            message: None,
+        })
+    }
+
+    fn poll_cli_login(
+        &self,
+        login_id: &str,
+        harness: HarnessId,
+        initial_digest: Option<String>,
+        exit: Arc<Mutex<Option<Option<i32>>>>,
+        output: Arc<Mutex<String>>,
+    ) -> Result<AgentLoginPoll, EngineError> {
+        let auth_file = self
+            .inner
+            .config
+            .cli_auth_file(harness)
+            .ok_or_else(|| EngineError::Other("This provider has no in-app sign-in flow.".into()))?
+            .to_path_buf();
+        if file_digest(&auth_file) != initial_digest
+            && let Some(detected) = self.detect_cli_provider(harness)
+        {
+            self.finish_cli_login(login_id, harness, &detected)?;
+            return Ok(AgentLoginPoll {
+                status: AgentLoginStatus::Done,
+                message: None,
+            });
+        }
+        if let Some(status) = *lock(&exit) {
+            let output_snapshot = lock(&output).clone();
+            // The store write can land a hair before the exit is observed.
+            if file_digest(&auth_file) != initial_digest
+                && let Some(detected) = self.detect_cli_provider(harness)
+            {
+                self.finish_cli_login(login_id, harness, &detected)?;
+                return Ok(AgentLoginPoll {
+                    status: AgentLoginStatus::Done,
+                    message: None,
+                });
+            }
+            self.cancel_login(login_id);
+            let tail = last_output_line(&output_snapshot);
+            let message = match (status, tail) {
+                (Some(0), Some(line)) => format!("Sign-in ended without a new login: {line}"),
+                (Some(0), None) => "Sign-in ended without a new login.".to_string(),
+                (_, Some(line)) => format!("Sign-in failed: {line}"),
+                (_, None) => "Sign-in failed — the CLI exited before the login landed.".to_string(),
+            };
             return Ok(AgentLoginPoll {
                 status: AgentLoginStatus::Error,
                 message: Some(message),
@@ -2372,6 +2946,13 @@ impl AgentAccounts {
                 #[cfg(not(target_os = "linux"))]
                 let _ = initial;
             }
+            Some(LoginFlow::Cli { killer, .. }) => {
+                // Nothing to restore: the provider owns its store. Killing the
+                // PTY child also ends any "Waiting for authorization…" spinner.
+                if let Some(k) = lock(&killer).as_mut() {
+                    let _ = k.kill();
+                }
+            }
             _ => {}
         }
     }
@@ -2482,6 +3063,23 @@ impl AgentAccounts {
             }
         }
         None
+    }
+
+    /// Read a CLI-managed provider's own credential store. These providers
+    /// keep exactly one live login, so the store's presence is the account.
+    fn detect_cli_provider(&self, harness: HarnessId) -> Option<Detected> {
+        let path = self.inner.config.cli_auth_file(harness)?;
+        match harness {
+            HarnessId::Grok => read_json(path).and_then(|v| parse_grok_auth(&v)),
+            HarnessId::Muse => read_json(path).and_then(|v| parse_muse_auth(&v)),
+            HarnessId::Cline => read_json(path).and_then(|v| parse_cline_auth(&v)),
+            HarnessId::Devin => std::fs::read_to_string(path)
+                .ok()
+                .filter(|raw| !raw.trim().is_empty())
+                .and_then(|raw| parse_devin_credentials(&raw)),
+            HarnessId::Qoder => parse_qoder_auth(path),
+            _ => None,
+        }
     }
 
     async fn detect_antigravity(&self) -> Option<Detected> {
@@ -3994,6 +4592,20 @@ fn harness_slug(harness: HarnessId) -> &'static str {
     }
 }
 
+/// Providers whose live store komet can rewrite to select a saved account.
+/// The CLI-managed sign-in providers keep one login in their own home, so
+/// their rows are shown active but never switchable.
+fn supports_switching(harness: HarnessId) -> bool {
+    matches!(
+        harness,
+        HarnessId::ClaudeCode
+            | HarnessId::Codex
+            | HarnessId::Antigravity
+            | HarnessId::Cursor
+            | HarnessId::Copilot
+    )
+}
+
 fn read_json(file: &Path) -> Option<serde_json::Value> {
     read_json_resilient(file, 3)
 }
@@ -4348,6 +4960,169 @@ fn parse_cursor_auth(auth: serde_json::Value) -> Option<Detected> {
             auth_kind: AgentAuthKind::Oauth,
         },
         credentials: Some(auth),
+        claude_config: None,
+    })
+}
+
+fn parse_grok_auth(auth: &serde_json::Value) -> Option<Detected> {
+    for entry in auth.as_object()?.values() {
+        let Some(email) = entry
+            .get("email")
+            .and_then(serde_json::Value::as_str)
+            .filter(|email| !email.is_empty())
+        else {
+            continue;
+        };
+        let display_name = match (
+            entry.get("first_name").and_then(serde_json::Value::as_str),
+            entry.get("last_name").and_then(serde_json::Value::as_str),
+        ) {
+            (Some(first), Some(last)) => Some(format!("{first} {last}")),
+            (Some(first), None) => Some(first.to_string()),
+            (None, Some(last)) => Some(last.to_string()),
+            (None, None) => None,
+        };
+        let account_key = ["user_id", "principal_id"]
+            .into_iter()
+            .find_map(|key| entry.get(key).and_then(serde_json::Value::as_str))
+            .filter(|key| !key.is_empty())
+            .unwrap_or(email);
+        return Some(Detected {
+            account_key: account_key.to_string(),
+            profile: SlotProfile {
+                email: email.to_string(),
+                display_name,
+                organization: entry
+                    .get("team_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                plan: None,
+                auth_kind: AgentAuthKind::Oauth,
+            },
+            credentials: Some(serde_json::json!({ "managedBy": "grok" })),
+            claude_config: None,
+        });
+    }
+    None
+}
+
+fn parse_muse_auth(auth: &serde_json::Value) -> Option<Detected> {
+    for provider in auth.get("providers")?.as_object()?.values() {
+        let Some(email) = provider
+            .get("user_email")
+            .and_then(serde_json::Value::as_str)
+            .filter(|email| !email.is_empty())
+        else {
+            continue;
+        };
+        return Some(Detected {
+            account_key: email.to_lowercase(),
+            profile: SlotProfile {
+                email: email.to_string(),
+                display_name: provider
+                    .get("user_full_name")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                organization: None,
+                plan: None,
+                auth_kind: AgentAuthKind::Oauth,
+            },
+            credentials: Some(serde_json::json!({ "managedBy": "muse" })),
+            claude_config: None,
+        });
+    }
+    None
+}
+
+fn parse_cline_auth(auth: &serde_json::Value) -> Option<Detected> {
+    for provider in auth.get("providers")?.as_object()?.values() {
+        let Some(provider_auth) = provider.pointer("/settings/auth") else {
+            continue;
+        };
+        let user = provider_auth.pointer("/metadata/userInfo");
+        let email = user
+            .and_then(|user| user.get("email"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|email| !email.is_empty());
+        let account_key = provider_auth
+            .get("accountId")
+            .and_then(serde_json::Value::as_str)
+            .filter(|key| !key.is_empty())
+            .or(email);
+        let Some(account_key) = account_key else {
+            continue;
+        };
+        return Some(Detected {
+            account_key: account_key.to_string(),
+            profile: SlotProfile {
+                email: email.unwrap_or(account_key).to_string(),
+                display_name: user
+                    .and_then(|user| user.get("name"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+                organization: None,
+                plan: None,
+                auth_kind: AgentAuthKind::Oauth,
+            },
+            credentials: Some(serde_json::json!({ "managedBy": "cline" })),
+            claude_config: None,
+        });
+    }
+    None
+}
+
+fn parse_devin_credentials(raw: &str) -> Option<Detected> {
+    if raw.trim().is_empty() {
+        return None;
+    }
+    let email = toml_string(raw, &["email", "user_email", "account_email"]);
+    let account_key = toml_string(raw, &["user_id", "account_id", "id"])
+        .or_else(|| email.clone())
+        .unwrap_or_else(|| "devin".to_string());
+    Some(Detected {
+        account_key,
+        profile: SlotProfile {
+            email: email.unwrap_or_else(|| "Devin account".into()),
+            display_name: toml_string(raw, &["name", "full_name", "display_name"]),
+            organization: toml_string(raw, &["organization", "org_name", "team"]),
+            plan: None,
+            auth_kind: AgentAuthKind::Oauth,
+        },
+        credentials: Some(serde_json::json!({ "managedBy": "devin" })),
+        claude_config: None,
+    })
+}
+
+fn toml_string(raw: &str, keys: &[&str]) -> Option<String> {
+    raw.lines().find_map(|line| {
+        let line = line.trim();
+        if line.starts_with('#') {
+            return None;
+        }
+        let (key, value) = line.split_once('=')?;
+        if !keys.contains(&key.trim()) {
+            return None;
+        }
+        let value = value.trim().trim_matches(['"', '\'']).trim();
+        (!value.is_empty()).then(|| value.to_string())
+    })
+}
+
+/// Qoder's store is an opaque encrypted blob — no identity to read. The CLI
+/// keeps a single live login, so one stable key keeps a token refresh or a
+/// re-sign-in on the same row instead of piling up duplicates.
+fn parse_qoder_auth(path: &Path) -> Option<Detected> {
+    file_digest(path)?;
+    Some(Detected {
+        account_key: "qoder".into(),
+        profile: SlotProfile {
+            email: "Qoder account".into(),
+            display_name: None,
+            organization: None,
+            plan: None,
+            auth_kind: AgentAuthKind::Oauth,
+        },
+        credentials: Some(serde_json::json!({ "managedBy": "qoder" })),
         claude_config: None,
     })
 }
@@ -4947,6 +5722,105 @@ mod tests {
         assert!(parse_cursor_auth(serde_json::json!({"unrelated": 1})).is_none());
     }
 
+    #[test]
+    fn cli_provider_parsers_read_identity() {
+        let grok = parse_grok_auth(&serde_json::json!({
+            "https://auth.x.ai::client": {
+                "email": "a@b.c",
+                "first_name": "Ada",
+                "last_name": "Lovelace",
+                "user_id": "grok-user",
+            }
+        }))
+        .expect("grok auth");
+        assert_eq!(grok.account_key, "grok-user");
+        assert_eq!(grok.profile.email, "a@b.c");
+        assert_eq!(grok.profile.display_name.as_deref(), Some("Ada Lovelace"));
+
+        let muse = parse_muse_auth(&serde_json::json!({
+            "providers": {"meta": {"user_email": "M@Example.com", "user_full_name": "Muse User"}}
+        }))
+        .expect("muse auth");
+        assert_eq!(muse.account_key, "m@example.com");
+        assert_eq!(muse.profile.display_name.as_deref(), Some("Muse User"));
+
+        let cline = parse_cline_auth(&serde_json::json!({
+            "providers": {"cline": {"settings": {"auth": {
+                "accountId": "usr-1",
+                "metadata": {"userInfo": {"email": "c@d.e", "name": "Cline User"}}
+            }}}}
+        }))
+        .expect("cline auth");
+        assert_eq!(cline.account_key, "usr-1");
+        assert_eq!(cline.profile.email, "c@d.e");
+        assert_eq!(cline.profile.display_name.as_deref(), Some("Cline User"));
+
+        let devin = parse_devin_credentials(
+            "email = \"d@e.f\"\nuser_id = \"dev-1\"\nname = \"Devin User\"\n",
+        )
+        .expect("devin credentials");
+        assert_eq!(devin.account_key, "dev-1");
+        assert_eq!(devin.profile.email, "d@e.f");
+        assert_eq!(devin.profile.display_name.as_deref(), Some("Devin User"));
+    }
+
+    #[test]
+    fn cli_login_url_and_code_scan() {
+        let output =
+            "\r\nVisit https://accounts.x.ai/oauth2/device?user_code=S2NS-VSFM to sign in\r\n";
+        let url = scan_cli_url(output, "https://accounts.x.ai/oauth2/device").expect("url");
+        assert_eq!(
+            url,
+            "https://accounts.x.ai/oauth2/device?user_code=S2NS-VSFM"
+        );
+        assert_eq!(login_code_from_url(&url).as_deref(), Some("S2NS-VSFM"));
+        assert_eq!(
+            login_code_from_url("https://auth.meta.com/oauth/device/?code=WDDX-BTWH").as_deref(),
+            Some("WDDX-BTWH")
+        );
+        assert_eq!(
+            scan_cli_url("no link here", "https://qoder.com/device"),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn cli_managed_provider_is_listed_as_active() {
+        let root = std::env::temp_dir().join(format!(
+            "komet-cli-detect-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let config = AgentAccountsConfig {
+            data_dir: root.join("data"),
+            claude_config_dir: root.join("claude"),
+            claude_config_file: root.join("claude.json"),
+            codex_home: root.join("codex"),
+            antigravity_home: root.join("antigravity"),
+            cursor_auth_file: root.join("sdk").join("auth.json"),
+            cli_files: CliProviderFiles::under(&root),
+        };
+        let grok = config.cli_files.grok_auth.clone();
+        std::fs::create_dir_all(grok.parent().unwrap()).unwrap();
+        std::fs::write(
+            &grok,
+            r#"{"https://auth.x.ai::c":{"email":"g@rok.dev","user_id":"grok-user"}}"#,
+        )
+        .unwrap();
+        let accounts = AgentAccounts::new(config);
+        let snapshot = accounts.list(UsageMode::Offline).await.expect("list");
+        let rows: Vec<_> = snapshot
+            .accounts
+            .iter()
+            .filter(|a| a.harness == HarnessId::Grok)
+            .collect();
+        assert_eq!(rows.len(), 1, "{snapshot:?}");
+        assert!(rows[0].active);
+        assert!(!rows[0].switchable);
+        assert_eq!(rows[0].email.as_deref(), Some("g@rok.dev"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[tokio::test]
     async fn cursor_store_is_listed_as_active_account() {
         let root = std::env::temp_dir().join(format!(
@@ -4961,6 +5835,7 @@ mod tests {
             codex_home: root.join("codex"),
             antigravity_home: root.join("antigravity"),
             cursor_auth_file: root.join("sdk").join("auth.json"),
+            cli_files: CliProviderFiles::under(&root),
         };
         let live = config.cursor_auth_file.clone();
         std::fs::create_dir_all(live.parent().unwrap()).unwrap();
@@ -4990,6 +5865,7 @@ mod tests {
             codex_home: root.join("codex"),
             antigravity_home: root.join("antigravity"),
             cursor_auth_file: root.join("sdk").join("auth.json"),
+            cli_files: CliProviderFiles::under(root),
         }
     }
 
@@ -5161,6 +6037,7 @@ mod tests {
             codex_home: root.join("codex"),
             antigravity_home: root.join("antigravity"),
             cursor_auth_file: root.join("cursor-sdk-auth.json"),
+            cli_files: CliProviderFiles::under(&root),
         };
         let accounts = AgentAccounts::new(config);
 
@@ -5245,6 +6122,7 @@ mod tests {
             codex_home: root.join("codex"),
             antigravity_home: root.join("antigravity"),
             cursor_auth_file: root.join("cursor-sdk-auth.json"),
+            cli_files: CliProviderFiles::under(&root),
         };
         let accounts = AgentAccounts::new(config);
 
@@ -5734,6 +6612,7 @@ mod tests {
             codex_home: root.join("codex"),
             antigravity_home: root.join("antigravity"),
             cursor_auth_file: root.join("sdk").join("auth.json"),
+            cli_files: CliProviderFiles::under(root),
         }
     }
 

@@ -164,37 +164,38 @@ pub fn requires_login(harness: HarnessId) -> bool {
         .any(|(provider, _, _)| *provider == harness)
 }
 
+pub fn supports_in_app_login(harness: HarnessId) -> bool {
+    matches!(
+        harness,
+        HarnessId::ClaudeCode
+            | HarnessId::Codex
+            | HarnessId::Antigravity
+            | HarnessId::Cursor
+            | HarnessId::Copilot
+            | HarnessId::Devin
+            | HarnessId::Grok
+            | HarnessId::Muse
+            | HarnessId::Cline
+            | HarnessId::Qoder
+    )
+}
+
+/// Providers whose sign-in has no in-app flow yet: the page explains the CLI
+/// command instead of showing an Add account button that cannot work.
 pub fn cli_login_command(harness: HarnessId) -> Option<&'static str> {
     match harness {
-        HarnessId::Devin => Some("devin auth login"),
-        HarnessId::Grok => Some("grok"),
         HarnessId::Hermes => Some("hermes"),
         HarnessId::Opencode => Some("opencode auth login"),
         HarnessId::Pi => Some("pi"),
-        HarnessId::Muse => Some("muse"),
-        HarnessId::Copilot => None,
-        HarnessId::Cline => Some("cline"),
-        HarnessId::Qoder => Some("qoder login"),
-        HarnessId::ClaudeCode | HarnessId::Codex | HarnessId::Cursor | HarnessId::Antigravity => {
-            None
-        }
-        HarnessId::Mock => None,
+        _ => None,
     }
 }
 
 pub fn login_instructions(harness: HarnessId) -> &'static str {
     match harness {
-        HarnessId::Devin => {
-            "Run `devin auth login` in a terminal and complete the browser sign-in."
-        }
-        HarnessId::Grok => "Run `grok` and sign in when prompted.",
         HarnessId::Hermes => "Run `hermes` and configure/sign in to a model provider.",
         HarnessId::Opencode => "Run `opencode auth login` and choose your model provider.",
         HarnessId::Pi => "Run `pi` and use `/login` to connect a model provider.",
-        HarnessId::Muse => "Run `muse` and use `/login` to connect your account.",
-        HarnessId::Copilot => "Use GitHub's device sign-in to connect and switch Copilot accounts.",
-        HarnessId::Cline => "Run `cline` and choose a provider in its sign-in flow.",
-        HarnessId::Qoder => "Run `qoder login` and complete the browser sign-in.",
         _ => "Use the Add account flow to sign in.",
     }
 }
@@ -215,6 +216,20 @@ pub fn provider_accounts(
 /// Only the selected account's quota is meaningful for the live CLI session.
 fn displayed_usage(account: &AgentAccount) -> Option<&[AgentUsageWindow]> {
     account.active.then_some(account.usage_windows.as_slice())
+}
+
+/// Providers whose quota the engine can actually probe. The CLI-managed
+/// sign-in providers expose no usage endpoint here, so an empty reading says
+/// nothing about their credentials.
+fn supports_usage_probe(harness: HarnessId) -> bool {
+    matches!(
+        harness,
+        HarnessId::ClaudeCode
+            | HarnessId::Codex
+            | HarnessId::Antigravity
+            | HarnessId::Cursor
+            | HarnessId::Copilot
+    )
 }
 
 fn retain_previous_usage(
@@ -285,7 +300,10 @@ impl LoginFlow {
             HarnessId::Antigravity => "Add Antigravity account",
             HarnessId::Cursor => "Add Cursor account",
             HarnessId::Devin => "Add Devin account",
+            HarnessId::Grok => "Add Grok account",
             HarnessId::Muse => "Add Muse account",
+            HarnessId::Cline => "Add Cline account",
+            HarnessId::Qoder => "Add Qoder account",
             HarnessId::Copilot => "Add Copilot account",
             _ => "Add Claude account",
         }
@@ -738,7 +756,9 @@ impl AccountsPage {
                         .map_err(|e| komet_rpc::RpcError::Failed(e.to_string()))
                 }) {
                     Ok(start) => {
-                        cx.open_url(&start.url);
+                        if !start.url.is_empty() {
+                            cx.open_url(&start.url);
+                        }
                         match start.mode {
                             AgentLoginMode::PasteCode => {
                                 page.code_input
@@ -1166,17 +1186,21 @@ impl AccountsPage {
                                         .truncate()
                                         .text_size(px(11.5))
                                         .text_color(theme.text_muted.opacity(0.6))
-                                        .child(SharedString::from(if account.switchable {
-                                            // Cursor is probed too (its usage DB is
-                                            // read for the ACTIVE login only), so an
-                                            // empty reading here is a real miss, not
-                                            // a coverage gap. "Credentials
-                                            // unavailable" stays reserved for a
-                                            // live login we could not read.
-                                            "Usage unavailable"
-                                        } else {
-                                            "Credentials unavailable"
-                                        })),
+                                        .child(SharedString::from(
+                                            if account.switchable
+                                                || !supports_usage_probe(account.harness)
+                                            {
+                                                // Cursor is probed too (its usage DB is
+                                                // read for the ACTIVE login only), so an
+                                                // empty reading here is a real miss, not
+                                                // a coverage gap. "Credentials
+                                                // unavailable" stays reserved for a
+                                                // live login we could not read.
+                                                "Usage unavailable"
+                                            } else {
+                                                "Credentials unavailable"
+                                            },
+                                        )),
                                 )
                             } else {
                                 el.child(
@@ -1266,6 +1290,10 @@ impl AccountsPage {
                          the browser, then paste the authorization code Google shows \
                          you below. Your current login is untouched until you switch."
                     }
+                    HarnessId::Devin => {
+                        "The Devin CLI started a manual sign-in. Approve access in the \
+                         browser, then paste the token Devin shows you below."
+                    }
                     _ => {
                         "A browser window opened. Sign in to the account you want to add, \
                          approve access, then paste the code Anthropic shows you below. Your \
@@ -1348,6 +1376,18 @@ impl AccountsPage {
                     HarnessId::Cursor => {
                         "Finish signing in to Cursor in your browser. Your current session is untouched until you switch."
                     }
+                    HarnessId::Grok => {
+                        "Finish signing in to Grok in your browser. The CLI writes the new login to its own store once you approve the code."
+                    }
+                    HarnessId::Muse => {
+                        "Approve the Meta account code in your browser. Komet waits for the Muse CLI to finish the sign-in."
+                    }
+                    HarnessId::Cline => {
+                        "Finish signing in to Cline in your browser. The Cline CLI stores the account and Komet picks it up automatically."
+                    }
+                    HarnessId::Qoder => {
+                        "Finish signing in to Qoder in your browser. Komet waits for the Qoder CLI to store the new account."
+                    }
                     _ => "Finish signing in to the provider in your browser.",
                 };
                 div()
@@ -1369,7 +1409,12 @@ impl AccountsPage {
                                     div()
                                         .text_size(px(11.5))
                                         .text_color(theme.text_muted)
-                                        .child("Enter this one-time code on GitHub"),
+                                        .child(SharedString::from(match *harness {
+                                            HarnessId::Copilot => {
+                                                "Enter this one-time code on GitHub"
+                                            }
+                                            _ => "Enter this one-time code in your browser",
+                                        })),
                                 )
                                 .child(
                                     div()
@@ -1780,7 +1825,7 @@ impl Render for AccountsPage {
                                             .child(SharedString::from(name)),
                                     )
                                     .child(div().flex_1())
-                                    .when(cli_login_command(harness).is_none(), |el| {
+                                    .when(supports_in_app_login(harness), |el| {
                                         el.child(
                                             widgets::ghost_action(&theme)
                                                 .id(add_id)

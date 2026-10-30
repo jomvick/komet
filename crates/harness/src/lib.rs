@@ -284,6 +284,7 @@ pub fn find_cli_path(binary: &str) -> Option<std::path::PathBuf> {
             home.join(".grok/bin"),
             home.join(".hermes/bin"),
             home.join(".cursor/bin"),
+            home.join(".qoder/entry"),
         ]);
     }
     search.extend([

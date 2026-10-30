@@ -40,7 +40,7 @@ pub mod workspace_files;
 pub mod workspace_host;
 pub mod workspace_runtime;
 
-pub use agent_accounts::{AgentAccounts, AgentAccountsConfig, UsageMode};
+pub use agent_accounts::{AgentAccounts, AgentAccountsConfig, CliProviderFiles, UsageMode};
 pub use auth::{Auth, AuthConfig, AuthState, AuthUser, OrgMembership};
 pub use diff_sync::{
     CheckoutDiffSync, DiffFileTextPair, DiffSidecar, DiffSnapshot, TurnSnapshot,
