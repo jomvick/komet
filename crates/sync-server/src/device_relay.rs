@@ -16,6 +16,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::time::{Duration, Instant};
 
 use axum::Json;
 use axum::body::Bytes;
@@ -42,6 +43,13 @@ const PONG: &str = "pong";
 /// oldest (recency wins, like the DO's `pending_nudges` bound).
 const NUDGE_MAX_PENDING: usize = 256;
 
+/// A room with no host, client or queued nudge is dropped after this idle period.
+const ROOM_IDLE_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// Global ceiling on device rooms. Only idle rooms are evicted to stay under it,
+/// so a busy room — or one holding nudges for an offline host — is never dropped.
+const MAX_DEVICE_ROOMS: usize = 512;
+
 enum Out {
     Frame(Vec<u8>),
     /// Text `pong` — the answer to the protocol's text `ping`.
@@ -51,7 +59,6 @@ enum Out {
     Close,
 }
 
-#[derive(Default)]
 struct DeviceRoom {
     host: Option<UnboundedSender<Out>>,
     clients: HashMap<String, UnboundedSender<Out>>,
@@ -59,6 +66,26 @@ struct DeviceRoom {
     /// next host join. Memory-only (the DO persisted them; a sync-server
     /// restart loses a nudge, and the command itself stays durable in the doc).
     pending_nudges: VecDeque<String>,
+    last_seen: Instant,
+}
+
+impl Default for DeviceRoom {
+    fn default() -> Self {
+        Self {
+            host: None,
+            clients: HashMap::new(),
+            pending_nudges: VecDeque::new(),
+            last_seen: Instant::now(),
+        }
+    }
+}
+
+impl DeviceRoom {
+    /// A room must outlive pruning while someone is attached or a nudge is
+    /// waiting for the next host join.
+    fn is_in_use(&self) -> bool {
+        self.host.is_some() || !self.clients.is_empty() || !self.pending_nudges.is_empty()
+    }
 }
 
 /// Live device rooms, keyed by the URL's room (the host's device id).
@@ -97,6 +124,25 @@ impl DeviceRelay {
         Self::default()
     }
 
+    fn prune_inactive_rooms(rooms: &mut HashMap<String, DeviceRoom>) {
+        let now = Instant::now();
+        rooms.retain(|_, room| {
+            room.is_in_use() || now.duration_since(room.last_seen) < ROOM_IDLE_TTL
+        });
+
+        while rooms.len() >= MAX_DEVICE_ROOMS {
+            let Some(oldest_idle) = rooms
+                .iter()
+                .filter(|(_, room)| !room.is_in_use())
+                .min_by_key(|(_, room)| room.last_seen)
+                .map(|(room_id, _)| room_id.clone())
+            else {
+                break;
+            };
+            rooms.remove(&oldest_idle);
+        }
+    }
+
     /// Deliver a nudge frame to the device's live host, or queue it for the
     /// next host join. True = delivered now.
     ///
@@ -107,7 +153,9 @@ impl DeviceRelay {
     /// which a single-token server has no way to express.
     pub fn nudge(&self, room: &str, chat_id: &str) -> bool {
         let mut rooms = lock(&self.rooms);
+        Self::prune_inactive_rooms(&mut rooms);
         let entry = rooms.entry(room.to_string()).or_default();
+        entry.last_seen = Instant::now();
         match &entry.host {
             Some(host) if !host.is_closed() => {
                 send_nudge(host, chat_id);
@@ -176,7 +224,9 @@ impl DeviceRelay {
 
     fn join(&self, room: &str, is_host: bool, conn_id: &str, tx: &UnboundedSender<Out>) {
         let mut rooms = lock(&self.rooms);
+        Self::prune_inactive_rooms(&mut rooms);
         let entry = rooms.entry(room.to_string()).or_default();
+        entry.last_seen = Instant::now();
         if is_host {
             // One host per device: a restart or a second claim supersedes the predecessor
             // rather than splitting its RPC surface across two sockets.
@@ -207,10 +257,11 @@ impl DeviceRelay {
         let Ok((header, payload)) = decode_device_frame(&bytes) else {
             return false;
         };
-        let rooms = lock(&self.rooms);
-        let Some(entry) = rooms.get(room) else {
+        let mut rooms = lock(&self.rooms);
+        let Some(entry) = rooms.get_mut(room) else {
             return true;
         };
+        entry.last_seen = Instant::now();
         // Only the current registration may speak for its role: a socket that a
         // reconnect superseded must not route through the live one.
         let owns_registration = if is_host {
@@ -266,6 +317,7 @@ impl DeviceRelay {
         let Some(entry) = rooms.get_mut(room) else {
             return;
         };
+        entry.last_seen = Instant::now();
         if is_host {
             if !entry
                 .host
@@ -279,6 +331,9 @@ impl DeviceRelay {
             let payload = relay_error(HOST_CLOSED);
             for client in entry.clients.values() {
                 send_frame(client, &header, &payload);
+            }
+            if !entry.is_in_use() {
+                rooms.remove(room);
             }
             return;
         }
@@ -294,6 +349,9 @@ impl DeviceRelay {
             let mut header = DeviceFrameHeader::new("", RELAY_KIND);
             header.from = Some(conn_id.to_string());
             send_frame(host, &header, &relay_error(CLIENT_CLOSED));
+        }
+        if !entry.is_in_use() {
+            rooms.remove(room);
         }
     }
 }
@@ -435,6 +493,79 @@ mod tests {
         assert!(
             !relay.route("dev", false, "c1", &old_client, client_frame),
             "a superseded client socket must not speak for its connId"
+        );
+    }
+
+    #[test]
+    fn idle_rooms_are_pruned_and_the_room_cap_holds() {
+        let relay = DeviceRelay::new();
+        {
+            let mut rooms = lock(&relay.rooms);
+            rooms.insert(
+                "stale".into(),
+                DeviceRoom {
+                    last_seen: Instant::now() - ROOM_IDLE_TTL - Duration::from_secs(1),
+                    ..DeviceRoom::default()
+                },
+            );
+            for index in 0..MAX_DEVICE_ROOMS {
+                rooms.insert(
+                    format!("idle-{index}"),
+                    DeviceRoom {
+                        last_seen: Instant::now() - Duration::from_millis(index as u64 + 1),
+                        ..DeviceRoom::default()
+                    },
+                );
+            }
+        }
+
+        let (host, _host_rx) = unbounded_channel();
+        relay.join("fresh", true, "host", &host);
+
+        let rooms = lock(&relay.rooms);
+        assert!(
+            !rooms.contains_key("stale"),
+            "an empty room past its TTL is dropped"
+        );
+        assert!(
+            !rooms.contains_key("idle-511"),
+            "the oldest idle room makes way for the cap"
+        );
+        assert!(rooms.contains_key("fresh"));
+        assert!(rooms.len() <= MAX_DEVICE_ROOMS);
+    }
+
+    #[test]
+    fn queued_nudges_survive_pruning_and_replay_to_the_host() {
+        let relay = DeviceRelay::new();
+        assert!(!relay.nudge("device-a", "chat-1"));
+        {
+            let mut rooms = lock(&relay.rooms);
+            let room = rooms.get_mut("device-a").expect("created by nudge");
+            room.last_seen = Instant::now() - ROOM_IDLE_TTL - Duration::from_secs(1);
+            for index in 0..MAX_DEVICE_ROOMS {
+                rooms.insert(
+                    format!("idle-{index}"),
+                    DeviceRoom {
+                        last_seen: Instant::now() - Duration::from_millis(index as u64 + 1),
+                        ..DeviceRoom::default()
+                    },
+                );
+            }
+        }
+
+        let (other, _other_rx) = unbounded_channel();
+        relay.join("other", true, "host", &other);
+        assert!(
+            lock(&relay.rooms).contains_key("device-a"),
+            "a room holding a queued nudge is never pruned"
+        );
+
+        let (host, mut host_rx) = unbounded_channel();
+        relay.join("device-a", true, "host", &host);
+        assert!(
+            matches!(host_rx.try_recv(), Ok(Out::Frame(_))),
+            "the queued nudge replays to the first host join"
         );
     }
 

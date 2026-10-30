@@ -1,11 +1,12 @@
 use axum::{
     Json, Router,
     extract::{
-        DefaultBodyLimit, Path, State, WebSocketUpgrade,
+        DefaultBodyLimit, Path, Request, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
     },
     http::{HeaderMap, StatusCode},
-    response::IntoResponse,
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use futures_util::{SinkExt, StreamExt};
@@ -240,6 +241,21 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         return false;
     }
     a.iter().zip(b).fold(0u8, |diff, (x, y)| diff | (x ^ y)) == 0
+}
+
+/// Reject unauthenticated uploads before axum buffers the body. The handlers
+/// still check the bearer themselves; this layer runs first so an anonymous
+/// caller cannot make the server hold a multi-megabyte request.
+async fn require_bearer(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    request: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    if !check_auth(&state, &headers) {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+    Ok(next.run(request).await)
 }
 
 async fn health() -> impl IntoResponse {
@@ -591,6 +607,9 @@ pub fn router(state: AppState) -> Router {
     // Checkpoint and sidecar uploads are MB-scale by design; axum's 2 MB
     // default would reject them before the handlers can answer `too_large`.
     let upload_limit = DefaultBodyLimit::max(32 * 1024 * 1024);
+    // Handler-level auth runs after `Bytes` has buffered the body, so gate the
+    // upload routes here as well.
+    let upload_auth = middleware::from_fn_with_state(state.clone(), require_bearer);
     Router::new()
         .route("/health", get(health))
         .route("/env", get(env_descriptor))
@@ -603,19 +622,22 @@ pub fn router(state: AppState) -> Router {
             "/chat2/:room/checkpoint",
             get(chat_room::checkpoint_get)
                 .post(chat_room::checkpoint_post)
-                .layer(upload_limit),
+                .layer(upload_limit)
+                .layer(upload_auth.clone()),
         )
         .route(
             "/chat2/:room/tail",
             get(chat_room::tail_get)
                 .put(chat_room::tail_put)
-                .layer(upload_limit),
+                .layer(upload_limit)
+                .layer(upload_auth.clone()),
         )
         .route(
             "/chat2/:room/diff",
             get(chat_room::diff_get)
                 .put(chat_room::diff_put)
-                .layer(upload_limit),
+                .layer(upload_limit)
+                .layer(upload_auth),
         )
         .route("/registry/:room/ws", get(registry_ws_handler))
         .route("/device/:room/ws", get(device_ws_handler))
@@ -725,6 +747,33 @@ mod tests {
             assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
         }
         assert!(!escaped.exists());
+    }
+
+    // The upload routes answer an anonymous caller before the body extractor
+    // runs; a handler-level check alone would buffer the upload first.
+    #[tokio::test]
+    async fn chat2_uploads_require_the_bearer() {
+        let root = tempfile::tempdir().unwrap();
+        let app = router(test_state(root.path()));
+
+        for (method, uri) in [
+            (Method::POST, "/chat2/chat-1/checkpoint?seqCovered=0"),
+            (Method::PUT, "/chat2/chat-1/tail"),
+            (Method::PUT, "/chat2/chat-1/diff"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .body(Body::from(vec![0u8; 1024]))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
+        }
     }
 
     #[tokio::test]

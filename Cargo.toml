@@ -90,6 +90,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 
 # misc
+base64 = "0.22"
 # Global allocator for the binaries: returns freed pages to the OS. System
 # malloc (macOS libmalloc especially) retains the churn high-water mark as
 # permanent RSS - measured as the top residency cause in docs/memory-plan.md.
