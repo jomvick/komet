@@ -11,7 +11,7 @@ use komet_rpc::{
     HostRelay, HostRelayConfig, LinkCache, LinkCacheConfig, NudgeHandler, RpcError, RpcReply,
     RpcService, StaticToken,
 };
-use komet_sync_server::{AppState, DeviceRelay, ServerIdentity, router};
+use komet_sync_server::{AppState, ChatHub, DeviceRelay, ServerIdentity, router};
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 
@@ -53,6 +53,7 @@ async fn start_server(data_dir: &std::path::Path) -> TestServer {
         token: TOKEN.to_string(),
         rooms: Arc::new(RwLock::new(HashMap::new())),
         device: DeviceRelay::new(),
+        chat: ChatHub::new(data_dir.to_path_buf()),
         identity: ServerIdentity {
             org_id: "org-1".into(),
             user_id: "user-1".into(),
